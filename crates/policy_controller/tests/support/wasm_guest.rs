@@ -47,8 +47,9 @@ pub mod mode {
     pub const DRAW_IN_PICK: u8 = 12;
     /// `filter` grows the table past the host's cap first.
     pub const GROW_TABLE: u8 = 13;
-    /// `score` fills the whole memory (grown to the cap) in a loop: cheap in
-    /// fuel, long on the clock.
+    /// `score` fills the whole memory (grown to the cap) in a loop: fuel
+    /// prices each fill by its size, so the loop is long on the clock and
+    /// cheap in fuel only under a calibration that underprices it.
     pub const FILL_IN_SCORE: u8 = 14;
     /// `filter` traps when the decision has four candidates: the decode side
     /// of a pair of three prefills and four decodes.
@@ -64,7 +65,8 @@ pub mod mode {
     pub const SLOW_DESTRUCTOR: u8 = 18;
     /// The lifecycle export traps.
     pub const TRAP_IN_OBSERVE: u8 = 19;
-    /// The destructor fills its memory without end: wall, little fuel.
+    /// The destructor fills its memory without end: the clock ends it where
+    /// the calibration underprices a fill, its fuel elsewhere.
     pub const FILL_IN_DESTRUCTOR: u8 = 20;
     /// `init` burns eight fixed loops: heavier than a small decision budget.
     pub const BURN_IN_INIT: u8 = 21;
@@ -74,6 +76,24 @@ pub mod mode {
     pub const SPIN_IN_PICK: u8 = 23;
     /// The decision's constructor traps.
     pub const TRAP_IN_CONSTRUCTOR: u8 = 24;
+    /// `score` writes a log line first: a host call a test can hold the
+    /// thread in. On three candidates it traps after the line: a call a test
+    /// can hold that then fails by itself.
+    pub const LOG_IN_SCORE: u8 = 26;
+    /// The destructor writes a log line, then loops once: a host call a test
+    /// can hold the thread in, and a check of the clock after it.
+    pub const LOG_IN_DESTRUCTOR: u8 = 27;
+    /// `score` writes a log line first and `pick` burns a fixed loop first:
+    /// a call a test can hold the thread in, then one that needs a burn's
+    /// fuel.
+    pub const LOG_THEN_BURN: u8 = 28;
+    /// `score` writes a log line, then declines as not applicable: a call a
+    /// test can hold that then declines.
+    pub const LOG_THEN_DECLINE: u8 = 29;
+    /// `filter` fills the whole memory eight times and returns, then `score`
+    /// fills it in a loop: a call of milliseconds that answers, then an
+    /// endless one.
+    pub const FILL_BRIEFLY_THEN_FILL: u8 = 30;
     /// A second config byte: `init` asks the host's live clock once. An
     /// answer of zero lets it go on, of one makes it refuse, of two spin
     /// without end, of three trap at once.
@@ -378,10 +398,12 @@ fn guest_wat(guest: Guest) -> String {
     (if (i32.eq (global.get $mode) (i32.const {trap_in_filter})) (then unreachable))
     (if (i32.and (i32.eq (global.get $mode) (i32.const {trap_on_four})) (i32.eq (local.get $len) (i32.const 4)))
       (then unreachable))
-    (if (i32.eq (global.get $mode) (i32.const {fill_then_fill}))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {fill_then_fill})) (i32.eq (global.get $mode) (i32.const {fill_briefly})))
       (then
-        (drop (memory.grow (i32.const 252)))
-        (local.set $i (i32.const 800))
+        ;; Grown once: on an instance a decision kept, a second grow
+        ;; past the cap would trap.
+        (if (i32.lt_u (memory.size) (i32.const 256)) (then (drop (memory.grow (i32.const 252)))))
+        (local.set $i (select (i32.const 8) (i32.const 800) (i32.eq (global.get $mode) (i32.const {fill_briefly}))))
         (loop $some
           (memory.fill (i32.const 0) (i32.const 0) (i32.mul (memory.size) (i32.const 65536)))
           (local.set $i (i32.sub (local.get $i) (i32.const 1)))
@@ -427,7 +449,13 @@ fn guest_wat(guest: Guest) -> String {
     (local.set $len (i32.load offset=4 (local.get $rep)))
     (if (i32.eq (global.get $mode) (i32.const {spin})) (then (loop $spin (br $spin))))
     (if (i32.eq (global.get $mode) (i32.const {burn})) (then (call $burn)))
-    (if (i32.or (i32.eq (global.get $mode) (i32.const {fill})) (i32.eq (global.get $mode) (i32.const {fill_then_fill})))
+    (if (i32.eq (global.get $mode) (i32.const {log_in_score}))
+      (then
+        (call $log (i32.const 2) (i32.const 32) (i32.const 8))
+        (if (i32.eq (local.get $len) (i32.const 3)) (then unreachable))))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {log_then_burn})) (i32.eq (global.get $mode) (i32.const {log_then_decline})))
+      (then (call $log (i32.const 2) (i32.const 32) (i32.const 8))))
+    (if (i32.or (i32.or (i32.eq (global.get $mode) (i32.const {fill})) (i32.eq (global.get $mode) (i32.const {fill_then_fill}))) (i32.eq (global.get $mode) (i32.const {fill_briefly})))
       (then
         ;; The filter of the second mode grew the memory already: a second
         ;; grow past the cap would trap.
@@ -436,7 +464,7 @@ fn guest_wat(guest: Guest) -> String {
           (memory.fill (i32.const 0) (i32.const 0) (i32.mul (memory.size) (i32.const 65536)))
           (br $fill))))
     (local.set $r (call $alloc (i32.const 16) (i32.const 4)))
-    (if (i32.eq (global.get $mode) (i32.const {decline_score}))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {decline_score})) (i32.eq (global.get $mode) (i32.const {log_then_decline})))
       (then
         (i32.store8 (local.get $r) (i32.const 1))
         (i32.store8 offset=4 (local.get $r) (i32.const 0))
@@ -467,7 +495,7 @@ fn guest_wat(guest: Guest) -> String {
     (if (i32.eq (global.get $mode) (i32.const {spin_pick})) (then (loop $spin (br $spin))))
     (local.set $r (call $alloc (i32.const 16) (i32.const 4)))
     (i32.store8 (local.get $r) (i32.const 0))
-    (if (i32.eq (global.get $mode) (i32.const {burn})) (then (call $burn)))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {burn})) (i32.eq (global.get $mode) (i32.const {log_then_burn}))) (then (call $burn)))
     (if (i32.eq (global.get $mode) (i32.const {draw_in_pick}))
       (then (call $counter (i32.const 5) (call $random))))
     (if (i32.eq (global.get $mode) (i32.const {decline_pick}))
@@ -527,6 +555,10 @@ fn guest_wat(guest: Guest) -> String {
           (drop (call $now))
           (local.set $i (i32.sub (local.get $i) (i32.const 1)))
           (br_if $calls (local.get $i)))))
+    (if (i32.eq (global.get $mode) (i32.const {log_dtor}))
+      (then
+        (call $log (i32.const 2) (i32.const 32) (i32.const 8))
+        (loop $once (br_if $once (i32.const 0)))))
     (global.set $heap (i32.const 1024)))
 )"#,
         iface = iface,
@@ -558,6 +590,11 @@ fn guest_wat(guest: Guest) -> String {
         fill_dtor = mode::FILL_IN_DESTRUCTOR,
         burn_init = mode::BURN_IN_INIT,
         trap_ctor = mode::TRAP_IN_CONSTRUCTOR,
+        log_in_score = mode::LOG_IN_SCORE,
+        log_dtor = mode::LOG_IN_DESTRUCTOR,
+        log_then_burn = mode::LOG_THEN_BURN,
+        log_then_decline = mode::LOG_THEN_DECLINE,
+        fill_briefly = mode::FILL_BRIEFLY_THEN_FILL,
     )
 }
 

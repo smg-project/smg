@@ -2,7 +2,8 @@ name: Engine Version Watch
 
 # Weekly: detect newer engine releases and have Claude file one
 # researched upgrade issue per engine (deduped against open issues, so a
-# version is only reported once).
+# version is only reported once). A run that is handed an engine and
+# leaves it without an issue fails.
 
 on:
   schedule:
@@ -53,22 +54,7 @@ jobs:
             --description "Automated engine release tracking" --color 0e8a16 --force
           gh label create enhancement --repo "$GITHUB_REPOSITORY" \
             --description "New feature or request" --color a2eeef --force
-          # Exact substring match on fetched titles: GitHub's in:title search
-          # normalizes dots/hyphens, so "sglang 0.5.16" can match unrelated
-          # issues (or miss).
-          titles=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
-            --label engine-watch --limit 200 --json title --jq '[.[].title]')
-          pending='[]'
-          while IFS= read -r row; do
-            engine=$(jq -r .engine <<<"$row")
-            latest=$(jq -r .latest <<<"$row")
-            existing=$(jq --arg t "$engine $latest" '[.[] | select(contains($t))] | length' <<<"$titles")
-            if [ "$existing" = "0" ]; then
-              pending=$(jq -c --argjson r "$row" '. + [$r]' <<<"$pending")
-            else
-              echo "Skipping $engine $latest: open issue exists"
-            fi
-          done < <(jq -c '.[]' updates.json)
+          pending=$(bash scripts/engine_watch_pending.sh < updates.json)
           echo "pending=$pending" >> "$GITHUB_OUTPUT"
           echo "has_pending=$(jq 'length > 0' <<<"$pending")" >> "$GITHUB_OUTPUT"
 
@@ -90,14 +76,32 @@ jobs:
       - name: Install gh CLI
         uses: ./.github/actions/setup-gh
 
+      # A re-run of this job alone is handed the first attempt's list again: what
+      # an issue reports by now is not filed a second time.
+      - name: List the engines still unreported
+        id: unfiled
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PENDING: ${{ needs.detect.outputs.pending }}
+        run: |
+          rows=$(bash scripts/engine_watch_pending.sh <<<"$PENDING")
+          echo "rows=$rows" >> "$GITHUB_OUTPUT"
+
       # No key in the job: the runner pod's key-proxy sidecar holds it (see
       # scripts/k8s-runner-resources/runner-values-cpu.yaml); Claude gets a placeholder.
+      #
+      # The step ends green whether or not it filed anything and logs counters
+      # only, so its report goes to the job summary: the one account of a run
+      # that filed nothing. Only the schedule and a manual dispatch start this
+      # workflow; no issue or pull request text reaches the prompt.
       - uses: anthropics/claude-code-action@v1
+        if: steps.unfiled.outputs.rows != '[]'
         with:
           anthropic_api_key: sk-ant-placeholder-the-sidecar-holds-the-key
+          display_report: true
           prompt: |
             REPO: ${{ github.repository }}
-            PENDING ENGINE UPDATES (JSON): ${{ needs.detect.outputs.pending }}
+            PENDING ENGINE UPDATES (JSON): ${{ steps.unfiled.outputs.rows }}
 
             For EACH entry, research the upgrade and create ONE GitHub issue.
 
@@ -138,3 +142,14 @@ jobs:
         env:
           ANTHROPIC_BASE_URL: http://127.0.0.1:8787/anthropic
           GH_TOKEN: ${{ github.token }}
+
+      - name: Fail when an engine was handed over and no issue reports it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PENDING: ${{ needs.detect.outputs.pending }}
+        run: |
+          unfiled=$(bash scripts/engine_watch_pending.sh <<<"$PENDING")
+          if [ "$(jq length <<<"$unfiled")" != "0" ]; then
+            echo "::error::no engine-watch issue was filed for: $(jq -r '[.[] | "\(.engine) \(.latest)"] | join(", ")' <<<"$unfiled")"
+            exit 1
+          fi

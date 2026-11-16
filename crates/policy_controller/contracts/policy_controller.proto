@@ -5,7 +5,11 @@
 //
 // Versioning: design appendix A (additive within v1). The package is
 // pre-release until the first shipped release that carries it; the rule
-// binds from then on.
+// binds from then on. Hello carries the range of protocol versions the
+// gateway speaks and Welcome the one the controller picked; a range that
+// holds no version the controller speaks is refused with
+// FAILED_PRECONDITION, the status message naming the range and the
+// controller's version.
 //
 // Scopes and principals: design 5.2. Four credentialed scopes, each
 // mountable on its own listener; the verified principal is transport
@@ -19,6 +23,12 @@
 // ReplicaHello.replica_id must equal the subject. Leader is served to every
 // scope; a standby serves Leader, WatchWorkers, GetSnapshot and GetPolicySpec
 // and answers Session and Decide with NotLeader / Busy { NOT_LEADER }.
+// A listener its operator names takes a caller's identity as told: the
+// caller states its name in the `x-smg-principal` metadata entry of every
+// call, once (one token of printable ASCII, 1 to 253 bytes), nothing is
+// verified, and the principal reads METHOD_AS_TOLD. Such a listener has no
+// other credential rule. Leader needs no principal: it tells a caller where
+// to go before the caller holds a session.
 // Fencing: design 5.3. Every ControllerFrame and DecideAnswer carries the
 // leader's term, every GatewayFrame the gateway's term floor. A gateway
 // raises its floor from Leader and rejects frames below it; the controller
@@ -30,18 +40,28 @@
 // no credit the gateway decides locally; a Decide whose budget is gone on
 // arrival is answered Busy { BUDGET_GONE_ON_ARRIVAL } without a lease; a
 // Decision that arrives after a fallback is answered with Released.
-// Errors (gRPC status): UNAUTHENTICATED no verified principal, or Hello's
-// id is not the subject (the stream closes); PERMISSION_DENIED the scope or
+// Errors (gRPC status): UNAUTHENTICATED no principal, or Hello's id is not
+// the subject (the stream closes); PERMISSION_DENIED the scope or
 // role does not cover the RPC; FAILED_PRECONDITION not the leader (a
-// NotLeader in the status details), a floor above the term, a revision or
+// NotLeader in the status details; on Session, the NotLeader frame ahead
+// of the status), a first frame that is not Hello or a second Hello, no
+// protocol version in common, a floor above the term, a revision or
 // digest guard, or a rejoin position not held under its term (a
 // resync_required batch precedes it; the rejoin opens a new Replicate
 // stream); INVALID_ARGUMENT a spec or registration rejected (the field
 // path in ApplyResult.issues and the status detail); RESOURCE_EXHAUSTED a
 // relay over its per-subscriber budget or a standby over its backlog (a
-// resync_required batch precedes it); UNAVAILABLE a standby not yet synced;
-// ABORTED fenced mid-stream, reconnect through Leader; OUT_OF_RANGE and
-// DATA_LOSS never raised, forwarded as RelayResync. In-band within a stream:
+// resync_required batch precedes it), a Hello past the controller's
+// ceiling of present gateways, or a Session frame over the transport's
+// limit of 4 MiB a message; ALREADY_EXISTS a Hello whose id collides
+// with another present gateway's, refused while that one stands;
+// UNAVAILABLE a standby not yet synced;
+// ABORTED fenced mid-stream, reconnect through Leader, a Hello read
+// under a term the election left before its seat was taken, or a session
+// a newer one of its gateway replaced; OUT_OF_RANGE and
+// DATA_LOSS never raised, forwarded as RelayResync. Any other read of a
+// Session frame that the transport fails ends the stream under the
+// transport's own status. In-band within a stream:
 // Busy, NotLeader, SpecAck { accepted: false }, Decline.
 
 syntax = "proto3";
@@ -103,7 +123,7 @@ message GatewayFrame {
 // What the gateway holds; the leases, pins and vetoes follow in HelloPage
 // frames, the counts here size the restore.
 message Hello {
-  // Must equal the verified subject.
+  // Must equal the principal's subject.
   string gateway_id = 1;
   uint32 protocol_min = 2;
   uint32 protocol_max = 3;
@@ -150,6 +170,8 @@ message LeaseAssertion {
 
 // A session pin the gateway holds.
 message Pin {
+  // The session's value (Identity in policy_plugin.proto: the key within
+  // `model` and its phase), never the key's own fingerprint.
   fixed64 key = 1;
   fixed64 worker_id = 2;
   uint32 dp_rank = 3;
@@ -198,7 +220,7 @@ message ControllerFrame {
   }
 }
 
-// The answer to Hello; `principal` echoes what the transport verified.
+// The answer to Hello; `principal` echoes the session's principal.
 message Welcome {
   uint32 protocol = 1;
   uint64 generation = 2;
@@ -219,7 +241,8 @@ message Welcome {
   uint32 pins_restored = 13;
 }
 
-// What the transport verified.
+// What the transport verified, or what the caller stated on a listener that
+// takes identities as told (METHOD_AS_TOLD).
 message Principal {
   string subject = 1;
   enum Scope {
@@ -235,6 +258,8 @@ message Principal {
     METHOD_MTLS = 1;
     METHOD_BEARER = 2;
     METHOD_PEER_CREDENTIAL = 3;
+    // The subject is the name the caller stated; nothing was verified.
+    METHOD_AS_TOLD = 4;
   }
   Method method = 3;
   // Control scope only: `user` or `admin`.
@@ -664,6 +689,7 @@ message LoadSample {
 }
 
 message SessionRow {
+  // The session's value, as in Pin.
   fixed64 key = 1;
   fixed64 worker_id = 2;
   uint32 dp_rank = 3;

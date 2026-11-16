@@ -77,11 +77,18 @@ pub(crate) fn convert_proto_to_openai_logprobs(
     top_logprobs: Option<u32>,
 ) -> ChatLogProbs {
     let requested = Some(requested_alternatives(top_logprobs));
-    convert_proto_logprobs(proto_logprobs, requested, |token_id| {
+    convert_proto_logprobs(proto_logprobs, requested, token_decoder(tokenizer))
+}
+
+/// One token id's text as the logprobs carry it: the tokenizer's decode of
+/// the id alone, or a placeholder naming the id when the decode fails. The
+/// one decode every logprobs conversion and writer shares.
+pub(crate) fn token_decoder(tokenizer: &Arc<dyn Tokenizer>) -> impl Fn(u32) -> String + '_ {
+    move |token_id| {
         tokenizer
             .decode(&[token_id], false)
             .unwrap_or_else(|_| format!("<token_{token_id}>"))
-    })
+    }
 }
 
 /// Whether `logprobs` carries at least one token's entry.
@@ -154,11 +161,12 @@ pub(crate) fn convert_proto_to_completion_logprobs(
     top_logprobs: u32,
     text_offset: &mut u32,
 ) -> LogProbs {
-    completion_logprobs(proto_logprobs, top_logprobs, text_offset, |token_id| {
-        tokenizer
-            .decode(&[token_id], false)
-            .unwrap_or_else(|_| format!("<token_{token_id}>"))
-    })
+    completion_logprobs(
+        proto_logprobs,
+        top_logprobs,
+        text_offset,
+        token_decoder(tokenizer),
+    )
 }
 
 /// [`convert_proto_to_completion_logprobs`] over any token decode.

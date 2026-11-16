@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 
 use super::*;
 use crate::{
+    config::ParserChoice,
     routers::grpc::{
         client::GrpcClient, context::SharedComponents, multimodal::MediaPlan,
         regular::symphony::template::Templates, test_engine::mock_engine,
@@ -36,7 +37,7 @@ async fn context_with_media_refs() -> (RequestContext, JoinHandle<()>) {
         multimodal: None,
         tokenizer_autoload: true,
         tokenizer_load_failures: Arc::default(),
-        parser: crate::config::ParserChoice::Legacy,
+        parser: ParserChoice::Legacy,
     });
     let request: GenerateRequest = serde_json::from_value(serde_json::json!({
         "model": "test-model",

@@ -158,7 +158,7 @@ impl PlaneSet {
 
     /// The complement within the plane.
     fn negate(&mut self) {
-        for word in self.0.iter_mut() {
+        for word in &mut *self.0 {
             *word = !*word;
         }
     }
@@ -348,6 +348,23 @@ impl Class {
             self.plane.contains(code)
         } else {
             self.contains_slow(code)
+        }
+    }
+
+    /// Every code point above `from` at which membership of the class can
+    /// change: the bounds of its own ranges and of the tables of its
+    /// categories and exclusions.
+    pub(super) fn changes_from(&self, from: u32, changes: &mut Vec<u32>) {
+        let mut bounds = |ranges: &[(u32, u32)]| {
+            for &(start, end) in ranges {
+                changes.extend([start, end + 1].into_iter().filter(|&code| code > from));
+            }
+        };
+        bounds(&self.ranges);
+        for &(bit, table) in &CATEGORY_TABLES {
+            if (self.categories | self.without) & bit != 0 {
+                bounds(table);
+            }
         }
     }
 
@@ -643,6 +660,11 @@ enum Matcher {
 /// matcher recursed with a continuation (an alternative, a greedy run) is an
 /// entry on an explicit stack of [`Choice`]s instead of a stack frame.
 #[derive(Debug, Clone, Copy)]
+// A plain tag byte. Left to the default layout the tag hides in the spare
+// values of the widest op's payload (the lookahead's end), and the program
+// loop decodes it at every op: a tenth of the instructions of an encode
+// that runs the program.
+#[repr(u8)]
 enum Op {
     /// One character of the class.
     Char(usize),

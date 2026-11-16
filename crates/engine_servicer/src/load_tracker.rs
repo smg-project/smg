@@ -82,7 +82,8 @@ pub(crate) struct LoadEstimate {
 }
 
 struct Pending {
-    request_id: String,
+    /// The wire's id, shared with its guard.
+    request_id: Arc<str>,
     prompt_tokens: u32,
     /// The rank the request went to.
     rank: i32,
@@ -218,9 +219,9 @@ impl LoadTracker {
 
     /// A request with `prompt_tokens` was handed to `rank`: queued work
     /// there until its first output.
-    pub(crate) fn submitted(&self, rank: i32, request_id: &str, prompt_tokens: u32) {
+    pub(crate) fn submitted(&self, rank: i32, request_id: &Arc<str>, prompt_tokens: u32) {
         self.lock().pending.push_back(Pending {
-            request_id: request_id.to_string(),
+            request_id: Arc::clone(request_id),
             prompt_tokens,
             rank,
         });
@@ -480,7 +481,7 @@ impl PrefillProbe {
 /// What a wire knows when it hands a request to the engine, for
 /// [`LoadTracker::submit`].
 pub(crate) struct Submission<'a> {
-    pub(crate) request_id: &'a str,
+    pub(crate) request_id: &'a Arc<str>,
     /// The rank the request's first choice went to: the choice that reports
     /// the prompt, so the queued work and the hit rate land there.
     pub(crate) rank: i32,
@@ -587,14 +588,14 @@ impl ChoiceLoad {
 /// the engine never started it; the request's stream holds one.
 pub(crate) struct PendingGuard<S: WireState> {
     state: Arc<S>,
-    request_id: String,
+    request_id: Arc<str>,
 }
 
 impl<S: WireState> PendingGuard<S> {
-    pub(crate) fn new(state: Arc<S>, request_id: &str) -> Self {
+    pub(crate) fn new(state: Arc<S>, request_id: &Arc<str>) -> Self {
         Self {
             state,
-            request_id: request_id.to_string(),
+            request_id: Arc::clone(request_id),
         }
     }
 }
@@ -609,7 +610,7 @@ fn drop_pending(inner: &mut Inner, request_id: &str) {
     if let Some(index) = inner
         .pending
         .iter()
-        .position(|pending| pending.request_id == request_id)
+        .position(|pending| &*pending.request_id == request_id)
     {
         inner.pending.remove(index);
     }
@@ -681,9 +682,9 @@ mod tests {
 
         // Three in flight, none started: the engine says two are waiting, so
         // the oldest is in prefill and the two youngest are queued work.
-        tracker.submitted(0, "a", 1_000);
-        tracker.submitted(0, "b", 300);
-        tracker.submitted(0, "c", 200);
+        tracker.submitted(0, &Arc::from("a"), 1_000);
+        tracker.submitted(0, &Arc::from("b"), 300);
+        tracker.submitted(0, &Arc::from("c"), 200);
         assert_eq!(tracker.estimate_at(0, 2, now).queued_token_work, 500);
         assert_eq!(tracker.estimate_at(0, 0, now).queued_token_work, 0);
         assert_eq!(
@@ -741,7 +742,7 @@ mod tests {
     fn the_hit_rate_averages_recent_first_outputs_and_ignores_empty_prompts() {
         let tracker = LoadTracker::default();
         let now = Instant::now();
-        tracker.submitted(0, "x", 0);
+        tracker.submitted(0, &Arc::from("x"), 0);
         tracker.first_output(0, "x", 0, 0);
         assert_eq!(tracker.estimate_at(0, 0, now).cache_hit_rate, 0.0);
         for index in 0..HIT_RATE_SAMPLES {
@@ -845,7 +846,7 @@ mod tests {
         // past the epoch and a measured quotient is off by an ulp).
         let now = loads.epoch;
         let second = Duration::from_secs(1);
-        let submit = |request_id: &str, at: Instant| {
+        let submit = |request_id: &Arc<str>, at: Instant| {
             loads.submit(Submission {
                 request_id,
                 rank: 0,
@@ -855,7 +856,7 @@ mod tests {
         };
         // A batch of eight, 1_000 computed tokens each, answered together
         // two seconds after the submit: 8_000 tokens over two seconds.
-        let ids: Vec<String> = (0..8).map(|index| format!("b{index}")).collect();
+        let ids: Vec<Arc<str>> = (0..8).map(|index| Arc::from(format!("b{index}"))).collect();
         let mut batch: Vec<ChoiceLoad> = ids
             .iter()
             .map(|id| ChoiceLoad::new(0, 0, submit(id, now)))
@@ -872,8 +873,8 @@ mod tests {
         // Two handed over together and answered one after the other, a
         // second each: the second one's wait was the first one's prefill.
         let later = now + 10 * second;
-        let mut ahead = ChoiceLoad::new(0, 0, submit("ahead", later));
-        let mut behind = ChoiceLoad::new(0, 0, submit("behind", later));
+        let mut ahead = ChoiceLoad::new(0, 0, submit(&Arc::from("ahead"), later));
+        let mut behind = ChoiceLoad::new(0, 0, submit(&Arc::from("behind"), later));
         ahead.count_prompt(&loads, "ahead", 1_000, 0, later + second);
         behind.count_prompt(&loads, "behind", 1_000, 0, later + 2 * second);
         assert_eq!(loads.prefill_samples(0), 10);
@@ -1079,7 +1080,7 @@ mod tests {
         let loads = LoadTracker::default();
         let now = Instant::now();
         let probe = loads.submit(Submission {
-            request_id: "r",
+            request_id: &Arc::from("r"),
             rank: 0,
             prompt_tokens: 100,
             at: now,
@@ -1106,7 +1107,7 @@ mod tests {
         assert_eq!((rank0.gen_throughput, rank1.gen_throughput), (1.5, 3.5));
         assert_eq!((rank0.cache_hit_rate, rank1.cache_hit_rate), (0.4, 0.0));
         let armed = loads.submit(Submission {
-            request_id: "s",
+            request_id: &Arc::from("s"),
             rank: 1,
             prompt_tokens: 100,
             at: later,
@@ -1151,9 +1152,9 @@ mod tests {
     fn each_rank_keeps_its_own_hit_rate_throughput_and_queue() {
         let tracker = LoadTracker::default();
         let now = Instant::now();
-        tracker.submitted(0, "a", 1_000);
-        tracker.submitted(1, "b", 400);
-        tracker.submitted(1, "c", 600);
+        tracker.submitted(0, &Arc::from("a"), 1_000);
+        tracker.submitted(1, &Arc::from("b"), 400);
+        tracker.submitted(1, &Arc::from("c"), 600);
         tracker.first_output(0, "a", 1_000, 0);
         tracker.first_output(1, "b", 400, 400);
         tracker.generated_at(0, 100, now);
