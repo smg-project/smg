@@ -148,12 +148,15 @@ fn a_suffixed_stamp_over_another_id_is_an_error() {
     let other_separator = format!("chatcmpl-mw+{uuid}");
     // The base's length falls inside this id's two-byte letter.
     let split_letter = format!("chatcmpl-mé{uuid}");
+    // A tail of a uuid's length that is not a uuid.
+    let not_a_uuid = format!("chatcmpl-mw-{}", "x".repeat(uuid.len()));
     for other in [
         "",
         "chatcmpl-mw",
         prefixed.as_str(),
         other_separator.as_str(),
         split_letter.as_str(),
+        not_a_uuid.as_str(),
     ] {
         let mut plan = single_plan(other);
         let response = stamp

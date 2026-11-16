@@ -236,8 +236,10 @@ fn suffixed_id(base: &str, uuid: uuid::Uuid) -> String {
 /// `None` for any other text (see [`IdStamp::Suffixed`]).
 fn suffixed_base(id: &str, base_len: usize) -> Option<&str> {
     let (base, suffix) = id.split_at_checked(base_len)?;
-    let is_uuid_suffix =
-        suffix.len() == 1 + uuid::fmt::Hyphenated::LENGTH && suffix.starts_with('-');
+    let is_uuid_suffix = suffix.len() == 1 + uuid::fmt::Hyphenated::LENGTH
+        && suffix
+            .strip_prefix('-')
+            .is_some_and(|uuid| uuid::Uuid::try_parse(uuid).is_ok());
     is_uuid_suffix.then_some(base)
 }
 
