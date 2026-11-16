@@ -124,7 +124,13 @@ the output, where anything but a list is prose; `Framed` (Llama Nemotron) is the
 markers, where text in place of it is malformed; `ObjectOrList` (the `json` table) also reads a
 `{` at the first byte as one call alone and every further object after it, behind a `;` or behind
 whitespace alone, as another call, and carries the family's call marker the output may open with
-(Llama 3.1's `<|python_tag|>`), dropped as the template's wrapping where it does. The stages
+(Llama 3.1's `<|python_tag|>`), dropped as the template's wrapping where it does; `Forced` (a
+required call's list under the request's JSON schema) reads as `ObjectOrList` with no marker and
+differs at the end of the stream alone, where the engine held the output to the list and no byte of
+an open one is prose: the separators held after a call, an object cut before its arguments began and
+what a started call's object held behind its arguments are refused (`tagged::refuse`: an event of no
+bytes counts each run and the bytes are `Dropped`), where every other framing returns them as
+`Malformed`. The stages
 (deciding at the first byte that is not whitespace, inside the marker, between objects, inside one,
 after the `]` or the lone object) and what they say of the bytes around the objects (the brackets,
 the commas, the `;` and the wrapping whitespace `Dropped`; text between objects `Malformed`, one run

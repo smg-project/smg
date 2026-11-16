@@ -128,6 +128,7 @@ use crate::{
     observability::{cache_trace, metrics::Metrics},
     worker::{
         health::liveness,
+        identity::endpoint::Endpoint,
         load::state::{LoadReceiver, LoadSnapshot},
         KvEventMonitor, KvIndex, Worker,
     },
@@ -740,81 +741,25 @@ impl CacheAwarePolicy {
         bounds
     }
 
-    /// Initialize the trees with worker URLs (used only during initial setup)
-    /// Initializes both string trees (HTTP) and token trees (gRPC) for each model.
+    /// Give every worker a root in the two trees of its model (the string
+    /// tree for text, the token tree for tokens), so the trees route to it
+    /// before it has served a request.
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
-        // Hash mode keeps no tree state.
-        if self.config.cache_index == CacheIndexKind::Hash {
-            return;
-        }
-        // Group workers by model
-        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in workers {
-            let tree_key = normalize_model_key(worker.model_id());
-            model_workers
-                .entry(tree_key.to_string())
-                .or_default()
-                .push(worker);
-        }
-
-        // Initialize trees for each model (both string and token trees)
-        for (tree_key, model_workers) in model_workers {
-            // Initialize string tree (HTTP)
-            let string_tree = self
-                .string_trees
-                .entry(tree_key.clone())
-                .or_insert_with(|| Arc::new(Tree::new()));
-            // Initialize token tree (gRPC)
-            let token_tree = self
-                .token_trees
-                .entry(tree_key)
-                .or_insert_with(|| Arc::new(self.new_token_tree()));
-
-            for worker in model_workers {
-                string_tree.insert_text("", worker.url());
-                token_tree.insert_tokens(&[], worker.url());
-            }
+            self.add_worker(worker.as_ref());
         }
     }
 
-    /// Add a single worker to the trees (incremental update)
+    /// Give one worker its root in the two trees of its model. Hash mode
+    /// keeps no tree state.
     pub fn add_worker(&self, worker: &dyn Worker) {
         if self.config.cache_index == CacheIndexKind::Hash {
             return;
         }
-        let tree_key = normalize_model_key(worker.model_id()).to_string();
-        // Add to string tree (HTTP)
-        let string_tree = self
-            .string_trees
-            .entry(tree_key.clone())
-            .or_insert_with(|| Arc::new(Tree::new()));
-        string_tree.insert_text("", worker.url());
-        // Add to token tree (gRPC)
-        let token_tree = self
-            .token_trees
-            .entry(tree_key)
-            .or_insert_with(|| Arc::new(self.new_token_tree()));
-        token_tree.insert_tokens(&[], worker.url());
-    }
-
-    /// Add a worker by URL and model (for backward compatibility)
-    pub fn add_worker_by_url(&self, url: &str, model_id: &str) {
-        if self.config.cache_index == CacheIndexKind::Hash {
-            return;
-        }
-        let model_id_string = model_id.to_string();
-        // Add to string tree (HTTP)
-        let string_tree = self
-            .string_trees
-            .entry(model_id_string.clone())
-            .or_insert_with(|| Arc::new(Tree::new()));
-        string_tree.insert_text("", url);
-        // Add to token tree (gRPC)
-        let token_tree = self
-            .token_trees
-            .entry(model_id_string)
-            .or_insert_with(|| Arc::new(self.new_token_tree()));
-        token_tree.insert_tokens(&[], url);
+        let tree_key = normalize_model_key(worker.model_id());
+        tree_for_model(&self.string_trees, tree_key, Tree::new).insert_text("", worker.url());
+        tree_for_model(&self.token_trees, tree_key, || self.new_token_tree())
+            .insert_tokens(&[], worker.url());
     }
 
     /// Remove a worker from the trees
@@ -893,8 +838,10 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Run cache eviction to prevent unbounded growth
-    pub fn evict_cache(&self, max_size: usize) {
+    /// Test-only: one eviction pass over every tree at `max_size`, what the
+    /// eviction task does on its interval (without the gauges it publishes).
+    #[cfg(test)]
+    pub(crate) fn evict_cache(&self, max_size: usize) {
         // Evict string trees (HTTP)
         for tree_ref in self.string_trees.iter() {
             let model_id = tree_ref.key();
@@ -985,7 +932,7 @@ impl CacheAwarePolicy {
 
         debug!(
             branch = "kv_pressure_expected_wait",
-            worker = worker_url,
+            worker = workers[selected].redacted_url(),
             model_id,
             "Cache-aware selection"
         );
@@ -1572,7 +1519,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if released > 0 {
             Metrics::record_policy_inflight_reconciled(self.name(), released);
             debug!(
-                worker = worker_url,
+                worker = Endpoint::redacted_url(worker_url).as_str(),
                 in_flight, released, "Released bookings whose completion never arrived"
             );
         }
@@ -1621,7 +1568,7 @@ impl CacheAwarePolicy {
             let eligible = info.admits(state);
             if cache_trace::enabled() && !eligible {
                 cache_trace::gate(serde_json::json!({
-                    "phase": "eligibility", "worker": worker.url(),
+                    "phase": "eligibility", "worker": worker.redacted_url(),
                     "load": state.load, "overloaded": state.overloaded,
                     "eligible": false,
                 }));
@@ -2137,7 +2084,7 @@ impl CacheAwarePolicy {
         let spill = self.over_count_pressure_gate(load, avg_load, held_tokens);
         if cache_trace::enabled() {
             cache_trace::gate(serde_json::json!({
-                "worker": workers[selected].url(), "load": load, "average_load": avg_load,
+                "worker": workers[selected].redacted_url(), "load": load, "average_load": avg_load,
                 "relative_threshold": self.config.balance_rel_threshold,
                 "absolute_threshold": self.config.balance_abs_threshold,
                 "held_tokens": held_tokens,
@@ -2554,8 +2501,10 @@ impl CacheAwarePolicy {
                 cache_trace::mark_truncated();
             }
             for candidate in inputs.iter().take(32) {
+                // The candidate's address stays whole for the policies that
+                // match on it; the row names the worker masked.
                 cache_trace::score(serde_json::json!({
-                    "source": "policy_affinity", "worker": candidate.url,
+                    "source": "policy_affinity", "worker": workers[candidate.idx].redacted_url(),
                     "device_blocks": candidate.device_blocks, "effective_score": candidate.effective_score,
                     "request_blocks": request.request_blocks, "block_size": request.block_size,
                     "selection_policy": self.selection.name(),
@@ -2684,7 +2633,7 @@ impl CacheAwarePolicy {
                     .iter()
                     .any(|tenant| tenant.as_ref() == workers[idx].url());
                 cache_trace::score(serde_json::json!({
-                    "source": "approximate_tree", "worker": workers[idx].url(),
+                    "source": "approximate_tree", "worker": workers[idx].redacted_url(),
                     "matched_units": holder.then_some(matched_units),
                     "match_status": if holder { "deepest_holder" } else { "shallower_match_unknown" },
                     "input_units": request.prompt_tokens, "block_size": self.config.block_size,
@@ -2811,7 +2760,7 @@ impl CacheAwarePolicy {
                 Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
                 observe(overlap_of(idx));
                 debug!(
-                    worker = workers[idx].url(),
+                    worker = workers[idx].redacted_url(),
                     branch = "warmup_slice",
                     request_blocks = content_hashes.len(),
                     "Cache miss routed to a warming worker"
@@ -2829,7 +2778,7 @@ impl CacheAwarePolicy {
             Metrics::record_worker_cache_aware_policy_branch("warmup_divert");
             observe(overlap_of(idx));
             debug!(
-                worker = workers[idx].url(),
+                worker = workers[idx].redacted_url(),
                 branch = "warmup_divert",
                 overlap_blocks = best_overlap as u64,
                 request_blocks = content_hashes.len(),
@@ -2862,7 +2811,7 @@ impl CacheAwarePolicy {
         Metrics::record_worker_cache_aware_policy_branch(branch);
         observe(overlap);
         debug!(
-            worker = workers[idx].url(),
+            worker = workers[idx].redacted_url(),
             branch,
             overlap_blocks,
             request_blocks = content_hashes.len(),
@@ -3271,7 +3220,11 @@ impl CacheAwarePolicy {
         debug!(
             index = "tree",
             branch,
-            worker = selected_url.or(fallback_url).unwrap_or("none"),
+            worker = selected_url
+                .or(fallback_url)
+                .map(Endpoint::redacted_url)
+                .as_deref()
+                .unwrap_or("none"),
             model_id,
             matched_ratio = f64::from(matched_ratio),
             threshold = f64::from(self.config.cache_threshold),
@@ -3283,7 +3236,8 @@ impl CacheAwarePolicy {
     }
 
     /// One decision line per hash-mode selection. `level` is the matched
-    /// boundary (0 for the fallback branches).
+    /// boundary (0 for the fallback branches), `worker` the selected worker's
+    /// masked address.
     fn log_hash_decision(branch: &'static str, level: usize, worker: &str, model_id: &str) {
         if cache_trace::enabled() {
             cache_trace::prediction(serde_json::json!({
@@ -3388,7 +3342,7 @@ impl CacheAwarePolicy {
                 workers[selected].url(),
                 now,
             );
-            Self::log_hash_decision(branch, boundary, workers[selected].url(), model_id);
+            Self::log_hash_decision(branch, boundary, workers[selected].redacted_url(), model_id);
             return Some(selected);
         }
 
@@ -3432,7 +3386,7 @@ impl CacheAwarePolicy {
                 now,
             );
         }
-        Self::log_hash_decision(branch, 0, workers[idx].url(), model_id);
+        Self::log_hash_decision(branch, 0, workers[idx].redacted_url(), model_id);
         Some(idx)
     }
 

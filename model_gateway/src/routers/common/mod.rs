@@ -216,7 +216,10 @@ pub(crate) fn attach_sized_body(
 pub mod bench_support {
     use std::sync::Arc;
 
-    use super::placement::{select_pair, select_single, PlacementInputs};
+    use super::{
+        attempt_ledger::AttemptLedger,
+        placement::{select_pair, select_single, PlacementInputs},
+    };
     use crate::{
         observability::cache_trace,
         policies::PolicyRegistry,
@@ -262,16 +265,30 @@ pub mod bench_support {
             })
         }
 
-        /// [`Self::place`] under a candidate filter that refuses nobody, the
-        /// sequence both routers run on a request's first attempt: the HTTP
-        /// router hands its attempt ledger as the filter, the gRPC pipeline
-        /// the request's media and context demands.
+        /// [`Self::place`] under a candidate filter that refuses nobody and
+        /// costs nothing itself: what the selection adds when a router hands
+        /// it a filter, as the gRPC pipeline does on a request's first
+        /// attempt for its media and context demands.
         pub fn place_filtered(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
             let everyone = |_: &dyn Worker| true;
             self.select(PlacementInputs {
                 tokens,
                 candidate_filter: Some(&everyone),
                 ..Default::default()
+            })
+        }
+
+        /// [`Self::place`] as the HTTP router runs a request's first
+        /// attempt: under the candidate filter a new request's attempt
+        /// ledger hands. The filter and the entry are that router's; the
+        /// pool is this path's, the gRPC pipeline's regular one.
+        pub fn place_first_attempt(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
+            AttemptLedger::default().with_candidate_filter(|candidate_filter| {
+                self.select(PlacementInputs {
+                    tokens,
+                    candidate_filter,
+                    ..Default::default()
+                })
             })
         }
 
@@ -333,7 +350,6 @@ pub mod bench_support {
                     &self.model,
                     &self.pairs,
                     None,
-                    true,
                     None,
                     inputs,
                 )

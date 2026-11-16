@@ -5,8 +5,9 @@
 //! calls whatever ended them and a lazy `init` the decision paid, over the
 //! decision's budget) counts as slowness; either opens the breaker for a
 //! cool-down, during which every stage of the plugin takes its fallback
-//! without a call. A report made during the cool-down, by a call admitted
-//! before the open, is dropped: one incident is one opening. One breaker
+//! without a call. A report stamped during the cool-down, by a call admitted
+//! before the open, is dropped whenever it arrives: one incident is one
+//! opening. One breaker
 //! per plugin, shared by its instances; the latency ring is per thread,
 //! kept across the thread's rebuilds (no shared write per call).
 
@@ -32,8 +33,11 @@ pub(crate) struct Breaker {
     /// starts a window and one that counts in it never interleave. A failure
     /// is a fault, rare beside a call, and a call reads `open_until` alone.
     window: Mutex<Window>,
-    /// Microseconds on the runtime's clock until which the breaker is open;
-    /// `0` when closed.
+    /// Microseconds on the runtime's clock at which the last opening ends:
+    /// the breaker is open before it, and a report stamped before it is
+    /// dropped. It stays there once the cool-down has passed (zero before
+    /// the first opening), so no read of the breaker hides it from a report
+    /// that was stamped inside the cool-down and arrives after its end.
     open_until: AtomicU64,
     opens: AtomicU64,
 }
@@ -48,27 +52,17 @@ impl Breaker {
         }
     }
 
-    /// Whether the plugin is bypassed at `now`. A cool-down that has passed
-    /// closes the breaker on this read: the calls resume, and the failure
-    /// window counts afresh from the next failure.
+    /// Whether the plugin is bypassed at `now`: before the last opening's
+    /// end. Past it the calls resume, and the failure window counts afresh
+    /// from the next failure (the opening forgot its count).
     pub(crate) fn is_open(&self, now_micros: u64) -> bool {
-        let until = self.open_until.load(Ordering::Relaxed);
-        if until == 0 {
-            return false;
-        }
-        if now_micros < until {
-            return true;
-        }
-        let _ = self
-            .open_until
-            .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Relaxed);
-        false
+        now_micros < self.open_until.load(Ordering::Relaxed)
     }
 
     /// One failure at `now`: opens the breaker at the window's threshold,
-    /// and says whether this one opened it. A failure reported while the
-    /// breaker is open, by a call admitted before it opened, is dropped: it
-    /// counts in no window and opens nothing again.
+    /// and says whether this one opened it. A failure stamped while the
+    /// breaker was open, by a call admitted before it opened, is dropped
+    /// whenever it arrives: it counts in no window and opens nothing again.
     pub(crate) fn failure(&self, now_micros: u64) -> bool {
         let mut window = self.window.lock();
         if now_micros < self.open_until.load(Ordering::Relaxed) {
@@ -110,7 +104,7 @@ impl Breaker {
     /// one crossing of the threshold is one open.
     fn open(&self, window: &mut Window, now_micros: u64) {
         self.open_until.store(
-            now_micros.saturating_add(self.spec.cooldown_micros).max(1),
+            now_micros.saturating_add(self.spec.cooldown_micros),
             Ordering::Relaxed,
         );
         window.failures = 0;
@@ -155,15 +149,32 @@ impl Latency {
         }
     }
 
-    /// Records one call of `micros` under a frame of `frame_micros` (a call
-    /// without a frame is not a sample); `true` when this call completed a
-    /// window and the window reads slow, which forgets the window.
-    pub(crate) fn record(&mut self, micros: u32, frame_micros: u32) -> bool {
+    /// What a sample is: a charge of `micros` as a share of a frame of
+    /// `frame_micros`, in the ring's unit. A call without a frame is none.
+    /// Whoever asks whether a call is a sample asks here.
+    pub(crate) fn share(micros: u32, frame_micros: u32) -> Option<u32> {
         if frame_micros == 0 {
-            return false;
+            return None;
         }
         let share = u64::from(micros) * u64::from(Self::FRAME) / u64::from(frame_micros);
-        self.ring[self.next] = u32::try_from(share).unwrap_or(u32::MAX);
+        Some(u32::try_from(share).unwrap_or(u32::MAX))
+    }
+
+    /// How many of the two marks a read holds a window to a sample of
+    /// `share` is past: half the frame, where the median reads slow, and
+    /// the frame, where the tail does.
+    pub(crate) fn marks(share: u32) -> u8 {
+        u8::from(share > Self::FRAME / 2) + u8::from(share > Self::FRAME)
+    }
+
+    /// Records one call of `micros` under a frame of `frame_micros`, when
+    /// it is a sample ([`Latency::share`]); `true` when this call completed
+    /// a window and the window reads slow, which forgets the window.
+    pub(crate) fn record(&mut self, micros: u32, frame_micros: u32) -> bool {
+        let Some(share) = Self::share(micros, frame_micros) else {
+            return false;
+        };
+        self.ring[self.next] = share;
         self.next = (self.next + 1) % Self::SAMPLES;
         self.filled = (self.filled + 1).min(Self::SAMPLES);
         if !self.next.is_multiple_of(Self::EVERY) || self.filled < 2 {
@@ -177,7 +188,7 @@ impl Latency {
         // is the window's second-slowest call, so one outlier is not it.
         let p50 = window[(self.filled.div_ceil(2)).saturating_sub(1)];
         let p99 = window[self.filled - 2];
-        let slow = p50 > Self::FRAME / 2 || p99 > Self::FRAME;
+        let slow = Self::marks(p50) >= 1 || Self::marks(p99) == 2;
         if slow {
             self.next = 0;
             self.filled = 0;
@@ -191,7 +202,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{Breaker, Latency};
-    use crate::wasm::config::BreakerSpec;
+    use crate::plugins::config::BreakerSpec;
 
     fn spec() -> BreakerSpec {
         BreakerSpec {
@@ -325,6 +336,31 @@ mod tests {
         assert!(!b.is_open(5_100), "the cool-down was not restarted");
     }
 
+    /// A report stamped inside a cool-down is dropped whenever it arrives:
+    /// after the cool-down's end too, and after another thread read the
+    /// breaker closed there. The opening's end stays where it was, so the
+    /// guard still finds it.
+    #[test]
+    fn a_report_stamped_inside_the_cooldown_is_dropped_after_a_closed_read() {
+        let b = Breaker::new(BreakerSpec {
+            failures: 1,
+            window_micros: 1_000,
+            cooldown_micros: 100,
+        });
+        assert!(b.failure(100), "the threshold of one opens until 200");
+        // Another thread reads the breaker closed at the cool-down's end;
+        // then a call that was in flight at the opening reports, with the
+        // instant it read before that end.
+        assert!(!b.is_open(200));
+        assert!(!b.failure(199), "stamped inside the cool-down: dropped");
+        assert!(!b.slow(199), "and a slow window stamped there");
+        assert_eq!(b.opens(), 1, "nothing opened again");
+        assert!(!b.is_open(200), "and the breaker reads closed");
+        // A report stamped at the end is counted.
+        assert!(b.failure(200));
+        assert_eq!(b.opens(), 2);
+    }
+
     #[test]
     fn a_report_says_whether_it_opened_the_breaker() {
         let b = Breaker::new(spec());
@@ -456,6 +492,17 @@ mod tests {
         assert!(
             !tripped,
             "one call past the frame is not the p99 of the ring"
+        );
+
+        let mut at_the_frame = Latency::new();
+        let mut tripped = false;
+        for i in 0..Latency::SAMPLES {
+            let micros = if i == 5 || i == 9 { 100 } else { 10 };
+            tripped |= at_the_frame.record(micros, 100);
+        }
+        assert!(
+            !tripped,
+            "two calls at the frame, past its half, are not a slow p99"
         );
 
         let mut tail = Latency::new();

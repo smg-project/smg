@@ -1,3 +1,4 @@
+mod dispatch_on_the_door;
 mod running_window_label;
 
 use std::{thread, time::Duration};
@@ -915,10 +916,12 @@ fn test_capacity_pushback_does_not_close_half_open_breaker() {
 
 #[test]
 fn engine_rejections_do_not_open_the_circuit_breaker() {
+    // The case never waits for the breaker's timeout, so the timeout is one
+    // it cannot outlive: a slow host reads the open state all the same.
     let config = CircuitBreakerConfig {
         failure_threshold: 2,
         success_threshold: 1,
-        timeout_duration: Duration::from_millis(50),
+        timeout_duration: Duration::from_secs(60),
         window_duration: Duration::from_secs(60),
     };
     let worker = BasicWorkerBuilder::new("http://test:8080")
@@ -942,24 +945,32 @@ fn engine_rejections_do_not_open_the_circuit_breaker() {
 
 #[test]
 fn test_worker_with_circuit_breaker_config() {
-    let config = CircuitBreakerConfig {
-        failure_threshold: 2,
-        success_threshold: 1,
-        timeout_duration: Duration::from_millis(100),
-        window_duration: Duration::from_secs(60),
+    let build = |timeout_duration| {
+        BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .circuit_breaker_config(CircuitBreakerConfig {
+                failure_threshold: 2,
+                success_threshold: 1,
+                timeout_duration,
+                window_duration: Duration::from_secs(60),
+            })
+            .health_config(no_health_check())
+            .build()
     };
 
-    let worker = BasicWorkerBuilder::new("http://test:8080")
-        .worker_type(WorkerType::Regular)
-        .circuit_breaker_config(config)
-        .health_config(no_health_check())
-        .build();
-
+    // The trip, on a breaker whose timeout the case cannot outlive: a slow
+    // host between two lines reads the open state all the same.
+    let worker = build(Duration::from_secs(60));
     worker.record_outcome(503);
     assert!(worker.is_available());
     worker.record_outcome(503);
     assert!(!worker.is_available());
 
+    // The timeout's move to half-open, on a breaker with a short one, read
+    // only after the sleep, however long the host made it.
+    let worker = build(Duration::from_millis(100));
+    worker.record_outcome(503);
+    worker.record_outcome(503);
     thread::sleep(Duration::from_millis(150));
 
     assert!(worker.is_available());
@@ -1131,7 +1142,6 @@ fn test_lazy_discovered_models_override_wildcard() {
 
     // Wildcard worker starts with no models listed, but accepts any model
     assert!(worker.models().is_empty());
-    assert!(!worker.has_models_discovered());
     assert!(worker.supports_model("gpt-4o-mini")); // wildcard accepts anything
 
     // Simulate lazy discovery via set_models
@@ -1146,7 +1156,6 @@ fn test_lazy_discovered_models_override_wildcard() {
     assert!(worker.supports_model("gpt-4o-mini"));
     assert!(worker.supports_model("text-embedding-3-small"));
     assert!(!worker.supports_model("non-existent-model"));
-    assert!(worker.has_models_discovered());
 }
 
 #[test]
@@ -1287,7 +1296,7 @@ async fn zmq_health_check_evicts_a_dead_client_and_resets_the_guard() {
     worker.zmq_connect_started.store(true, Ordering::SeqCst);
 
     // A live client stays cached and reports healthy.
-    assert!(worker.zmq_health_check().await.unwrap());
+    assert!(worker.zmq_health_check());
     assert!(worker.backend_client.load().get().is_some());
 
     // Kill the engine and wait for the dispatcher to latch the client closed.
@@ -1317,7 +1326,7 @@ async fn zmq_health_check_evicts_a_dead_client_and_resets_the_guard() {
 
     // The next probe evicts the dead client and resets the guard so a later
     // probe re-runs the handshake for a replacement engine.
-    assert!(!worker.zmq_health_check().await.unwrap());
+    assert!(!worker.zmq_health_check());
     assert!(
         worker.backend_client.load().get().is_none(),
         "dead client must be evicted from the cell"
@@ -1325,6 +1334,42 @@ async fn zmq_health_check_evicts_a_dead_client_and_resets_the_guard() {
     assert!(
         !worker.zmq_connect_started.load(Ordering::SeqCst),
         "handshake guard must reset to allow a reconnect"
+    );
+}
+
+/// A ZMQ worker's health check is its probe's answer, as the checker reads
+/// it: no client yet fails the check, a live one passes it. The probe's own
+/// cases call the probe.
+#[tokio::test]
+async fn a_zmq_workers_health_check_is_its_probes_answer() {
+    use engine_zmq_client::mock_engine::default_ready_response;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (connected, _engine) =
+        zmq_worker_on_a_mock_rank(dir.path(), default_ready_response()).await;
+    // The same address with its check on, and its connect marked as started
+    // so the probe starts no driver of its own.
+    let worker = BasicWorkerBuilder::new(connected.url())
+        .connection_mode(ConnectionMode::Zmq)
+        .build();
+    worker.zmq_connect_started.store(true, Ordering::SeqCst);
+    assert!(
+        worker.check_health_async().await.is_err(),
+        "no client yet: the probe says no"
+    );
+
+    let client = connected
+        .backend_client_if_initialized()
+        .expect("the connect landed");
+    worker
+        .backend_client
+        .load_full()
+        .set(client)
+        .ok()
+        .expect("cell empty");
+    assert!(
+        worker.check_health_async().await.is_ok(),
+        "a live client: the probe says yes"
     );
 }
 
@@ -1640,7 +1685,7 @@ async fn abort_background_tasks_cancels_the_zmq_handshake_driver() {
     let (worker, input_socket) = unattended_zmq_worker(base.path());
 
     assert!(
-        !worker.zmq_health_check().await.unwrap(),
+        !worker.zmq_health_check(),
         "worker is not ready until the handshake lands"
     );
     let handle = worker
@@ -1673,19 +1718,19 @@ fn output_silence_is_read_only_while_a_stream_that_produced_output_is_open() {
     let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://decode:30000").build());
     // Nothing in flight it has shown output on: nothing to judge.
     assert!(worker.output_silence().is_none());
-    worker.note_output_started();
-    worker.note_token_progress();
+    worker.runtime_state().unwrap().note_output_started();
+    worker.runtime_state().unwrap().note_token_progress();
     thread::sleep(Duration::from_millis(20));
     let silence = worker.output_silence().expect("a producing stream is open");
     assert!(silence >= Duration::from_millis(20), "{silence:?}");
     // A token: the silence restarts.
-    worker.note_token_progress();
+    worker.runtime_state().unwrap().note_token_progress();
     assert!(worker.output_silence().expect("still open") < silence);
     // The stream ended: nothing to judge again, however quiet the worker.
-    worker.note_output_ended();
+    worker.runtime_state().unwrap().note_output_ended();
     assert!(worker.output_silence().is_none());
     // The count never goes negative.
-    worker.note_output_ended();
+    worker.runtime_state().unwrap().note_output_ended();
     assert!(worker.output_silence().is_none());
 }
 /// The `smg_worker_state` samples of the test worker in a rendered

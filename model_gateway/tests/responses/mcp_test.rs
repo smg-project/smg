@@ -251,6 +251,7 @@ async fn test_tool_execution_with_mock() {
             label: "mock_server".to_string(),
             server_key: "mock_server".to_string(),
             allowed_tools: None,
+            list_error: None,
         }],
         "test-request-1",
     );
@@ -322,6 +323,7 @@ async fn test_web_search_transform_handles_openai_search_response_with_mock() {
             label: "openai_search_server".to_string(),
             server_key: "openai_search_server".to_string(),
             allowed_tools: None,
+            list_error: None,
         }],
         "test-request-openai-search",
     );
@@ -397,6 +399,7 @@ async fn test_web_search_transform_sets_action_query_for_brave_search_with_mock(
             label: "brave_response_server".to_string(),
             server_key: "brave_response_server".to_string(),
             allowed_tools: None,
+            list_error: None,
         }],
         "test-request-brave",
     );
@@ -462,6 +465,7 @@ async fn test_concurrent_tool_execution() {
             label: "mock_server".to_string(),
             server_key: "mock_server".to_string(),
             allowed_tools: None,
+            list_error: None,
         }],
         "test-concurrent",
     );
@@ -525,6 +529,7 @@ async fn test_tool_execution_errors() {
             label: "mock_server".to_string(),
             server_key: "mock_server".to_string(),
             allowed_tools: None,
+            list_error: None,
         }],
         "test-error",
     );
@@ -779,6 +784,7 @@ async fn test_complete_workflow() {
             label: "integration_test".to_string(),
             server_key: "integration_test".to_string(),
             allowed_tools: None,
+            list_error: None,
         }],
         "test-workflow",
     );
@@ -849,6 +855,7 @@ async fn internal_mcp_visibility_preserves_namespaced_client_function() {
             label: "internal".into(),
             server_key: "internal".into(),
             allowed_tools: None,
+            list_error: None,
         }],
         "visibility-test",
     );

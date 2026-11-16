@@ -1360,6 +1360,109 @@ fn compatibility_characters_spell_out_under_nfkc_as_the_library_does() {
     }
 }
 
+/// The cut check's three span lists are the calling thread's scratch,
+/// apart from its piece cache: they grow at the thread's first search and
+/// keep their room through the next, the cut the same, and the search
+/// gives the thread no piece cache (a thread is counted when it encodes).
+#[test]
+fn the_cut_check_keeps_its_span_lists_in_the_threads_scratch() {
+    let mut state = 0x5C5C_A11A_0000_0002u64;
+    let shape = Shape {
+        name: "prose-for-the-cut-check",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(r"\s", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let prose = "the pool cuts a long text at a space before a letter ".repeat(2_000);
+    assert!(native.cut_spans.get().is_none());
+    let cut = native.stable_cut(&prose, PARALLEL_CHUNK_BYTES);
+    assert!(cut.is_some());
+    let room = |native: &NativeEncoder| -> Vec<usize> {
+        native
+            .cut_spans
+            .get()
+            .expect("this thread's scratch")
+            .borrow()
+            .iter()
+            .map(Vec::capacity)
+            .collect()
+    };
+    let grown = room(&native);
+    assert!(grown.iter().all(|&slots| slots > 0), "{grown:?}");
+    assert_eq!(native.stable_cut(&prose, PARALLEL_CHUNK_BYTES), cut);
+    assert_eq!(room(&native), grown);
+    assert!(
+        native.piece_cache.get().is_none(),
+        "the search gave the thread a cache"
+    );
+}
+
+/// A window over a long blob under a digit split grows the cut check's
+/// lists to thousands of spans; the search gives such lists back once it is
+/// done (`CUT_SPANS_KEPT`), and prose regrows them to tens at the next.
+#[test]
+fn a_blob_grows_the_cut_checks_lists_past_the_cap_and_the_search_gives_them_back() {
+    let mut state = 0x5C5C_A11A_0000_0003u64;
+    let shape = Shape {
+        name: "digits-and-prose-for-the-cut-check",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(r"[0-9,]|\s", SplitDelimiterBehavior::Isolated, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let tokenizer = tokenizer_of(&shape, &mut state);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let prose = "the pool cuts a long text at a space before a letter ".repeat(600);
+    let blob: String = (0..7_000).map(|i| format!("{},", i % 1_000)).collect();
+    let text = format!("{prose}{blob} {prose}");
+    assert!(prose.len() < PARALLEL_CHUNK_BYTES && prose.len() + blob.len() > PARALLEL_CHUNK_BYTES);
+    let room = |native: &NativeEncoder| -> Vec<usize> {
+        native
+            .cut_spans
+            .get()
+            .expect("this thread's scratch")
+            .borrow()
+            .iter()
+            .map(Vec::capacity)
+            .collect()
+    };
+    // The first candidate past the chunk follows the blob; its window reaches
+    // back through the blob, one span per digit and comma.
+    let cut = native.stable_cut(&text, PARALLEL_CHUNK_BYTES);
+    assert_eq!(cut, Some(prose.len() + blob.len()));
+    // The window's list and the one before the candidate grew past the cap
+    // and are given back; the one after it (prose) stays within the cap.
+    let given_back = room(&native);
+    assert!(
+        given_back[0] == 0 && given_back[1] == 0 && given_back[2] <= CUT_SPANS_KEPT,
+        "{given_back:?}"
+    );
+    // Prose alone: the lists hold tens of spans and stay.
+    assert!(native.stable_cut(&prose, 0).is_some());
+    let grown = room(&native);
+    assert!(
+        grown
+            .iter()
+            .all(|&slots| slots > 0 && slots <= CUT_SPANS_KEPT),
+        "{grown:?}"
+    );
+    assert!(native.stable_cut(&prose, 0).is_some());
+    assert_eq!(room(&native), grown);
+}
+
 #[test]
 fn an_end_anchored_chain_keeps_a_long_text_whole() {
     // `\s+$` reads the end of the text it runs over: a cut for the thread
@@ -4211,6 +4314,117 @@ fn long_pieces_stay_within_their_byte_share() {
     assert!(cache.long_bytes <= share, "{} > {share}", cache.long_bytes);
     assert!(cache.long.len() < words as usize, "{}", cache.long.len());
     assert!(!cache.long.is_empty());
+}
+
+/// A thread's long tier grown under an earlier share keeps its map's slots
+/// through an eviction at the bound (four times the share at most); once
+/// the share fell below a quarter of what the tier holds (threads joined)
+/// the thread's next encode call makes the tier anew.
+#[test]
+fn a_thread_whose_long_tier_outgrew_its_share_makes_it_anew_at_its_next_encode() {
+    let mut state = 0x1D1D_3C3C_5B5B_7A7Au64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let held = |native: &NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow()
+            .long_held_bytes()
+    };
+    let head: String = (0..20).map(|i| format!("{}\n", letters(80, i))).collect();
+    let text: String = (0..16_000)
+        .map(|i| format!("{}\n", letters(80, i)))
+        .collect();
+    let before = native.encode(Some(model), &head, false).expect("ids");
+    native.encode(Some(model), &text, false).expect("ids");
+    let share = native.long_piece_bytes_share();
+    let grown = held(&native);
+    assert!(grown <= 4 * share, "{grown} for a share of {share}");
+    // Threads join: the share falls far below a quarter of what the tier
+    // holds (its slots alone are more); the next call makes the tier anew,
+    // the ids as before.
+    native.threads.store(1_024, Ordering::Relaxed);
+    let share = native.long_piece_bytes_share();
+    assert!(grown > 4 * share, "{grown} for a share of {share}");
+    // A call that meets no long piece: only the check at the call's start
+    // can make the tier anew (a miss would, through the eviction).
+    native.encode(Some(model), &word(1), false).expect("ids");
+    let kept = held(&native);
+    assert!(kept <= 4 * share, "{kept} for a share of {share}");
+    assert_eq!(
+        native.encode(Some(model), &head, false).expect("ids"),
+        before
+    );
+}
+
+/// A long tier made anew for a smaller share keeps what the calls after
+/// it add: the check at a call's start counts the entries and the empty
+/// slots, and a clear in place would have kept a map grown under the wider
+/// share to just under the bound, over it again with its first entries
+/// back and emptied at every call.
+#[test]
+fn a_long_tier_made_anew_for_a_smaller_share_keeps_what_the_next_calls_add() {
+    let mut state = 0x2E2E_4D4D_6C6C_8B8Bu64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let long = |native: &NativeEncoder| -> (usize, usize, usize) {
+        let cache = native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow();
+        (
+            cache.long.len(),
+            cache.long.capacity() * LONG_PIECE_ENTRY_BYTES,
+            cache.long_held_bytes(),
+        )
+    };
+    let text: String = (0..64).map(|i| format!("{}\n", letters(80, i))).collect();
+    let before = native.encode(Some(model), &text, false).expect("ids");
+    let fill: String = (0..16_000)
+        .map(|i| format!("{}\n", letters(80, i)))
+        .collect();
+    native.encode(Some(model), &fill, false).expect("ids");
+    let (_, slots, grown) = long(&native);
+    // Threads join until four times the share is just above the map's
+    // slots: the tier holds more than that, and a clear in place would keep
+    // the slots and leave the share's payload no room under the bound.
+    native
+        .threads
+        .store(4 * LONG_PIECE_BYTES_TOTAL / slots - 1, Ordering::Relaxed);
+    let share = native.long_piece_bytes_share();
+    assert!(grown > 4 * share, "{grown} for a share of {share}");
+    assert!(
+        slots <= 4 * share && 4 * share - slots < share / 8,
+        "{slots} of slots for a share of {share}"
+    );
+    assert_eq!(
+        native.encode(Some(model), &text, false).expect("ids"),
+        before
+    );
+    let (entries, _, held) = long(&native);
+    assert!(held <= share, "{held} for a share of {share}");
+    // The text's pieces are within the share. One more long piece, then the
+    // text again: the tier keeps the text's entries through both calls (a
+    // clear would take them, and the text's pieces would miss) and adds the
+    // one.
+    native
+        .encode(Some(model), &letters(80, 777_777), false)
+        .expect("ids");
+    let (added, _, held) = long(&native);
+    assert_eq!(added, entries + 1, "{held} for a share of {share}");
+    assert_eq!(
+        native.encode(Some(model), &text, false).expect("ids"),
+        before
+    );
+    let (after, _, held) = long(&native);
+    assert_eq!(after, entries + 1, "{held} for a share of {share}");
 }
 
 #[test]

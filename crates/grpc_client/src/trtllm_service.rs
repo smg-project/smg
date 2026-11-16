@@ -33,7 +33,8 @@ pub mod proto {
 
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
-pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, TrtllmServiceClient>;
+pub type AbortOnDropStream =
+    crate::AbortOnDropStream<Box<proto::GenerateResponse>, TrtllmServiceClient>;
 
 /// gRPC client for TensorRT-LLM service
 #[derive(Clone)]
@@ -61,7 +62,9 @@ impl TrtllmServiceClient {
     crate::impl_engine_client_basics!(
         proto,
         proto::trtllm_service_client::TrtllmServiceClient<Channel>,
-        "TensorRT-LLM"
+        "TensorRT-LLM",
+        "trtllm.TrtllmService",
+        proto::trtllm_service_server::SERVICE_NAME
     );
 
     /// Abort a request

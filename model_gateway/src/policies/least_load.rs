@@ -999,7 +999,7 @@ impl LeastLoadPolicy {
                 let report = candidate.report;
                 if let Some(resident) = &resident {
                     cache_trace::score(serde_json::json!({
-                        "source": "resident_work", "worker": worker.url(), "score": score,
+                        "source": "resident_work", "worker": worker.redacted_url(), "score": score,
                         "score_unit": if resident.fleet_has_resident { "tokens" } else { "requests" },
                         "resident_tokens": report.and_then(|report| report.resident_tokens),
                         "reported_requests": report.map(|report| report.reported_requests),
@@ -1017,7 +1017,7 @@ impl LeastLoadPolicy {
                     return;
                 }
                 cache_trace::score(serde_json::json!({
-                    "source": "expected_wait", "worker": worker.url(), "score": score,
+                    "source": "expected_wait", "worker": worker.redacted_url(), "score": score,
                     "score_unit": if inputs.fleet_has_loads { "seconds" } else { "requests" },
                     "queued_tokens": report.map(|report| report.queued_tokens),
                     "running_estimated_tokens": report.map(|report| report.running_estimated_tokens),
@@ -1102,7 +1102,7 @@ impl LeastLoadPolicy {
 
         debug!(
             "{policy} selected {} (score {:.4}, in_flight {})",
-            workers[best].url(),
+            workers[best].redacted_url(),
             best_score,
             workers[best].load()
         );
@@ -1176,6 +1176,24 @@ mod tests {
             BasicWorkerBuilder, WorkerType,
         },
     };
+
+    /// The selection's debug line names the worker it selected masked.
+    #[test]
+    #[tracing_test::traced_test]
+    fn the_selection_line_names_the_worker_masked() {
+        let workers = [
+            make_worker("http://user:s3cret@a:8000/v1?token=s3cret"),
+            make_worker("http://user:s3cret@b:8000/v1?token=s3cret"),
+        ];
+        let selected = LeastLoadPolicy::new()
+            .select_worker(&workers, &SelectWorkerInfo::default())
+            .expect("one of two healthy workers");
+        let host = ["a", "b"][selected];
+        assert!(logs_contain(&format!(
+            "least_load selected http://***@{host}:8000/v1 (score"
+        )));
+        assert!(!logs_contain("s3cret"));
+    }
 
     /// Invalid or incomplete rank capacity falls back to the fleet input rate.
     #[test]

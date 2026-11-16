@@ -582,6 +582,31 @@ mod tests {
         assert_eq!(probe_partners_bootstrap_port(&decode).await, None);
     }
 
+    /// The registration probe dials the bootstrap host a client dials, and
+    /// its line names that host: for a worker with no rank whose address is
+    /// a token before a host of digits, the host and never the token.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_registration_probe_dials_the_host_a_client_dials() {
+        let refused = RefusedAddress::reserve();
+        let worker = BasicWorkerBuilder::new("http://s3cret-token@2130706433")
+            .worker_type(WorkerType::Prefill)
+            .runtime_type(RuntimeType::Sglang)
+            .bootstrap_port(Some(refused.port()))
+            .build();
+
+        let (host, port, source) = partners_bootstrap_address(&worker)
+            .expect("a prefill side registered with a port is probed");
+        assert_eq!(host, "127.0.0.1");
+        let worker_type = worker.worker_type().as_metric_label();
+        let accepted =
+            report_bootstrap_port_probe(worker.url(), worker_type, &host, port, source).await;
+
+        assert!(!accepted);
+        assert!(logs_contain("bootstrap_host=\"127.0.0.1\""));
+        assert!(!logs_contain("bootstrap_host=\"s3cret-token\""));
+    }
+
     #[tokio::test]
     async fn a_bootstrap_port_probe_fails_a_closed_port_and_counts_it() {
         let refused = RefusedAddress::reserve();

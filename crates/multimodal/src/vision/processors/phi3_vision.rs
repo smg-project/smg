@@ -21,6 +21,8 @@
 //! - CLIP normalization: mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]
 //! - Token count formula: `((h//336)*(w//336)+1)*144 + 1 + (h//336+1)*12`
 
+use std::borrow::Cow;
+
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
 use ndarray::{s, Array3, Array4, IxDyn};
 
@@ -201,12 +203,13 @@ impl Phi3VisionProcessor {
     pub fn hd_transform(&self, image: &DynamicImage) -> DynamicImage {
         let (width, height) = image.dimensions();
 
-        let (img, transposed) = if width < height {
+        let transposed = width < height;
+        let img = if transposed {
             // Transpose (PIL's Image.TRANSPOSE): equivalent to fliph + rotate270 (ccw 90°)
             // This swaps x and y coordinates: pixel at (x, y) goes to (y, x)
-            (image.fliph().rotate270(), true)
+            Cow::Owned(image.fliph().rotate270())
         } else {
-            (image.clone(), false)
+            Cow::Borrowed(image)
         };
 
         let (width, height) = img.dimensions();
@@ -219,7 +222,7 @@ impl Phi3VisionProcessor {
         let resized = transforms::resize_bilinear_pil(&img, new_w, new_h);
 
         // Pad height to multiple of 336
-        let padded = self.padding_336(&resized);
+        let padded = DynamicImage::ImageRgb8(self.padding_336(resized.into_rgb8()));
 
         // Transpose back if needed (transpose is self-inverse)
         if transposed {
@@ -234,24 +237,25 @@ impl Phi3VisionProcessor {
         clippy::unused_self,
         reason = "method logically belongs to the processor; keeps API consistent"
     )]
-    fn padding_336(&self, image: &DynamicImage) -> DynamicImage {
+    fn padding_336(&self, image: RgbImage) -> RgbImage {
         let (width, height) = image.dimensions();
         let target_h = ((height as f64 / TILE_SIZE as f64).ceil() * TILE_SIZE as f64) as u32;
 
         if height == target_h {
-            return image.clone();
+            return image;
         }
 
         let top_padding = (target_h - height) / 2;
 
         // Create white-padded image
-        let mut new_image =
-            DynamicImage::from(RgbImage::from_pixel(width, target_h, Rgb([255, 255, 255])));
+        let mut padded = RgbImage::from_pixel(width, target_h, Rgb([255, 255, 255]));
 
-        // Copy original image to center
-        image::imageops::overlay(&mut new_image, image, 0, top_padding as i64);
-
-        new_image
+        // Copy original image to center: the two have one width, so its
+        // rows are one block of the canvas.
+        let top = top_padding as usize * width as usize * 3;
+        let canvas: &mut [u8] = &mut padded;
+        canvas[top..top + image.as_raw().len()].copy_from_slice(image.as_raw());
+        padded
     }
 
     /// Create global image by bicubic interpolation to 336x336.
@@ -316,7 +320,10 @@ impl Phi3VisionProcessor {
     /// Process a single image through the full pipeline.
     fn process_single_image(&self, image: &DynamicImage) -> (Array4<f32>, (usize, usize), usize) {
         // 1. Convert to RGB
-        let image = DynamicImage::ImageRgb8(image.to_rgb8());
+        let image = match image {
+            DynamicImage::ImageRgb8(_) => Cow::Borrowed(image),
+            other => Cow::Owned(DynamicImage::ImageRgb8(other.to_rgb8())),
+        };
 
         // 2. HD transform
         let hd_image = self.hd_transform(&image);
