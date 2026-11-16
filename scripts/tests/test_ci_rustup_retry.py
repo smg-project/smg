@@ -1,7 +1,7 @@
 """The rustup installs of the CI jobs go through scripts/ci_retry.sh: the toolchain install of
 scripts/ci_install_rust.sh and the wasm32-wasip2 target install of the WASM fixture build each survive a
 failed download, a failure that stays is still the step's, and no workflow step installs a toolchain or a
-target by a bare rustup call.
+target by a bare rustup call or leaves the policy guest's target to the guest's own build script.
 
 Run with: pytest -q scripts/tests/test_ci_rustup_retry.py
 """
@@ -18,6 +18,7 @@ REPO = Path(__file__).resolve().parents[2]
 INSTALL = REPO / "scripts" / "ci_install_rust.sh"
 RETRY = REPO / "scripts" / "ci_retry.sh"
 FIXTURES = REPO / "crates" / "wasm" / "tests" / "fixtures" / "build_fixtures.sh"
+WORKFLOW = REPO / ".github" / "workflows" / "pr-test-rust.yml"
 
 # The utilities the scripts, the retry helper and the stubs call, linked into
 # the bed's own PATH so the host's rustup, cargo and curl are never found by
@@ -217,3 +218,13 @@ def test_no_workflow_installs_a_toolchain_or_a_target_by_a_bare_rustup_call() ->
         if BARE_INSTALL.match(line)
     ]
     assert bare == []
+
+
+def test_the_policy_plugin_step_adds_the_guest_target_before_the_script_that_would() -> None:
+    # The guest's build.sh is the copy a user starts from: it adds a missing
+    # target by one attempt. The step adds it first, behind the helper.
+    step = WORKFLOW.read_text().split("- name: Build the example policy plugin", 1)[1]
+    step = step.split("\n      - name:", 1)[0]
+    install = "bash scripts/ci_retry.sh 3 10 rustup target add wasm32-unknown-unknown"
+    assert install in step
+    assert step.index(install) < step.index("bash examples/wasm/wasm-guest-policy/build.sh")
