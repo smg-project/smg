@@ -583,6 +583,10 @@ pub(in crate::elector) mod tests {
         let mut a = cell.candidate("a@host:1");
         let t0 = Instant::now() + S;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        // Term zero is no holder's word, and an apply that replaces the
+        // object leaves this shape under a live leader: the fence stays
+        // closed for one renew deadline, as over no record.
+        assert_eq!(a.fence().leader_term(t0), None);
         let calls = cell.server.calls();
         assert!(calls.iter().any(|call| call.starts_with("PUT ")));
         assert!(!calls.iter().any(|call| call.starts_with("POST ")));
@@ -705,7 +709,14 @@ pub(in crate::elector) mod tests {
             "the take landed"
         );
         assert_eq!(a.tick(t0 + S).expect("own"), Tick::Acquired { term: 1 });
-        assert_eq!(a.fence().leader_term(t0 + S), Some(1));
+        // No Lease record stood at the attempt: the fence opens one renew
+        // deadline after it, at the renewal that lands then.
+        assert_eq!(a.fence().leader_term(t0 + S), None);
+        assert_eq!(
+            a.tick(t0 + 2 * S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        assert_eq!(a.fence().leader_term(t0 + 2 * S), Some(1));
     }
 
     #[test]

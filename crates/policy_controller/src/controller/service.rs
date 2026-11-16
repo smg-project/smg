@@ -986,12 +986,22 @@ mod tests {
             answer("", "", 0, false)
         );
 
-        let taken = Instant::now();
+        // The lease held no record: the take opens no fence, and the answer
+        // names nobody under the take's term until the first renewal a renew
+        // deadline later. The instants are ahead of the clock: the wait is
+        // dated by the later of the two.
+        let took = Instant::now() + ElectionSettings::default().renew_period;
         assert_eq!(
-            elector.tick(taken).expect("the take"),
+            elector.tick(took).expect("the take"),
             Tick::Acquired { term: 1 }
         );
         standing.send_replace(saw(IDENTITY, 1));
+        assert_eq!(service.leader_info(took), answer("", "", 1, false));
+        let taken = took + ElectionSettings::default().renew_deadline;
+        assert_eq!(
+            elector.tick(taken).expect("the renewal"),
+            Tick::Renewed { term: 1 }
+        );
         assert_eq!(service.leader_info(taken), answer(ID, ADDRESS, 1, true));
 
         // Past the renew deadline the fence is closed: the record still

@@ -507,7 +507,7 @@ mod tests {
             service::{Service, Shared},
             PROTOCOL_VERSION,
         },
-        elector::{ElectionSettings, Elector, MemoryLease, Tick},
+        elector::{ElectionSettings, Elector, Tick},
         lease::LeaseId,
         proto::{
             self, controller_frame, gateway_frame::Frame,
@@ -543,8 +543,7 @@ mod tests {
         ceiling: Option<usize>,
         hello_deadline: Option<Duration>,
     ) -> Bed {
-        let elector = Elector::new(Box::new(MemoryLease::new()), IDENTITY, settings)
-            .expect("the settings are in order");
+        let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
         let mut shared = Shared::new(
             ID.to_owned(),
@@ -586,14 +585,21 @@ mod tests {
     }
 
     impl Bed {
-        /// The candidate takes or renews its lease now, under `term`, and
-        /// the election publishes the look.
+        /// The candidate leads now under `term`, by a take or a renewal, and
+        /// the election publishes the look. The bed's candidate is alone
+        /// over its own lease: its first take leads at once.
         fn leads(&mut self, term: u64) {
-            let tick = self.elector.tick(Instant::now()).expect("a step");
-            assert!(
-                tick == Tick::Acquired { term } || tick == Tick::Renewed { term },
-                "{tick:?}"
-            );
+            let now = Instant::now();
+            if self.elector.is_holder() || self.elector.observed().is_some() {
+                let tick = self.elector.tick(now).expect("a step");
+                assert!(
+                    tick == Tick::Acquired { term } || tick == Tick::Renewed { term },
+                    "{tick:?}"
+                );
+            } else {
+                self.elector.lead_at(now);
+                assert_eq!(self.elector.fence().leader_term(now), Some(term));
+            }
             self.step(IDENTITY, term);
         }
 
