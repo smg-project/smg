@@ -340,7 +340,7 @@ impl<'a> McpToolSession<'a> {
     }
 
     /// Set the approval mode of every tool that a binding labelled
-    /// `server_label` admits, optionally narrowed to a subset of resolved
+    /// `server_label` admits, optionally narrowed by a second allowlist of
     /// tool names. A server bound under several labels attributes each tool
     /// to one of them, and every label that admits a tool still gates it: the
     /// stricter mode stays.
@@ -356,6 +356,7 @@ impl<'a> McpToolSession<'a> {
             .filter(|b| b.label == server_label)
             .map(|b| (b, b.allowed_tools.as_deref().map(Self::allowlist)))
             .collect();
+        let names = allowed_tool_names.map(Self::allowlist);
         for entry in &self.mcp_tools {
             let key = Self::associated_server_key(entry);
             let admitted = bindings.iter().any(|(b, allowed)| {
@@ -365,8 +366,9 @@ impl<'a> McpToolSession<'a> {
                         .is_none_or(|allowed| Self::matches_allowed_tool_name(entry, allowed))
             });
             if !admitted
-                || allowed_tool_names
-                    .is_some_and(|names| !names.iter().any(|n| n == entry.tool_name()))
+                || names
+                    .as_ref()
+                    .is_some_and(|names| !Self::matches_allowed_tool_name(entry, names))
             {
                 continue;
             }
@@ -945,6 +947,36 @@ mod tests {
             Some(ApprovalMode::Interactive),
             "the stricter mode stays"
         );
+    }
+
+    #[test]
+    fn a_labels_approval_reaches_an_alias_and_a_padded_name_its_allowlist_admits() {
+        let orchestrator = McpOrchestrator::new_test();
+        insert_test_tool(&orchestrator, "server1", "brave_web_search");
+        insert_test_tool(&orchestrator, "server1", "echo");
+        orchestrator
+            .register_alias("web_search", "server1", "brave_web_search", None)
+            .expect("alias registration should succeed");
+        // The alias is listed by its target's name, `echo` with a space.
+        let listed = vec!["brave_web_search".to_string(), " echo".to_string()];
+        let mut session = McpToolSession::new(
+            &orchestrator,
+            vec![McpServerBinding {
+                label: "brave".to_string(),
+                server_key: "server1".to_string(),
+                allowed_tools: Some(listed.clone()),
+                list_error: None,
+            }],
+            "test-request",
+        );
+        session.set_approval_mode("brave", Some(&listed), ApprovalMode::Interactive);
+        for tool in ["web_search", "echo"] {
+            assert_eq!(
+                session.exposed_name_map.get(tool).map(|b| b.approval_mode),
+                Some(ApprovalMode::Interactive),
+                "{tool}"
+            );
+        }
     }
 
     #[test]
