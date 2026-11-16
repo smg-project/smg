@@ -314,7 +314,7 @@ impl TrtllmServiceClient {
             top_p_decay: None,
             seed: None,
             temperature: Some(request.temperature.unwrap_or(1.0)),
-            min_tokens: None,
+            min_tokens: request.min_tokens,
             beam_search_diversity_rate: None,
             repetition_penalty: Some(request.repetition_penalty.unwrap_or(1.0)),
             presence_penalty: request.presence_penalty,
@@ -815,6 +815,36 @@ mod tests {
         .unwrap();
         assert_eq!(request.sampling_config.unwrap().seed, Some(7));
         assert_eq!(request.stop_token_ids, vec![1, 2]);
+    }
+
+    /// A chat request's `min_tokens` reaches the sampling config, as a
+    /// completion request's does; a request without one leaves it unset.
+    #[test]
+    fn chat_and_completion_sampling_configs_carry_min_tokens() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "min_tokens": 30
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&chat).min_tokens,
+            Some(30)
+        );
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "min_tokens": 30
+        }))
+        .expect("a completion request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_completion(&completion).min_tokens,
+            Some(30)
+        );
+        let unset: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&unset).min_tokens,
+            None
+        );
     }
 
     /// A `response_format` set aside for the builder reads as absent: the tag
