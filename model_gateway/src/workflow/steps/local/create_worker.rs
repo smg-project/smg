@@ -524,7 +524,7 @@ pub(super) fn warn_on_conflicting_parser_overrides(
         ] {
             if let (Some(new_name), Some(existing_name)) = (new_name, existing_name) {
                 if new_name != existing_name {
-                    tracing::warn!(
+                    warn!(
                         model = %card.id,
                         new_worker = %Endpoint::redacted_str(worker_url),
                         existing_worker = existing.redacted_url(),
@@ -551,13 +551,9 @@ pub(super) fn validate_parser_overrides(
     tool_parser_factory: Option<&tool_parser::ParserFactory>,
     reasoning_parser_factory: Option<&reasoning_parser::ParserFactory>,
 ) -> Result<(), String> {
-    let names = Names {
-        tool: card.tool_parser.clone(),
-        reasoning: card.reasoning_parser.clone(),
-    };
     check_names(
         parser,
-        &names,
+        &card_names(card),
         tool_parser_factory,
         reasoning_parser_factory,
     )
@@ -569,6 +565,17 @@ pub(super) fn validate_parser_overrides(
             card.id
         )
     })
+}
+
+/// The parser names a worker's card sets for its model: `tool_parser` and
+/// `reasoning_parser`, from the operator's card or the worker's labels
+/// (`card_from_labels`), as the override check and the two Symphony reads
+/// below take them.
+fn card_names(card: &ModelCard) -> Names {
+    Names {
+        tool: card.tool_parser.clone(),
+        reasoning: card.reasoning_parser.clone(),
+    }
 }
 
 /// Under `--parser symphony`, the table whose failure classes the registration step publishes at
@@ -589,10 +596,7 @@ fn symphony_table_of(
     if parser != ParserChoice::Symphony || connection_mode == ConnectionMode::Http {
         return None;
     }
-    let labels = Names {
-        tool: card.tool_parser.clone(),
-        reasoning: card.reasoning_parser.clone(),
-    };
+    let labels = card_names(card);
     table_label_read(&ModelNames { labels, flags }, &card.id)
 }
 
@@ -612,12 +616,8 @@ fn registry_reads_over_the_flags(
     flags: &Names,
     registry: &WorkerRegistry,
 ) -> Option<String> {
-    let labels = Names {
-        tool: card.tool_parser.clone(),
-        reasoning: card.reasoning_parser.clone(),
-    };
     if parser != ParserChoice::Symphony
-        || !labels_select_nothing(&labels)
+        || !labels_select_nothing(&card_names(card))
         || !registry.get_by_model(&card.id).is_empty()
     {
         return None;
@@ -779,16 +779,15 @@ fn card_from_labels(
         .map(|s| s == "true")
         .unwrap_or(false);
 
-    if !user_provided {
-        let is_embedding = labels.get("is_embedding").is_some_and(|s| s == "true");
-        let is_non_generation = labels.get("is_generation").is_some_and(|s| s == "false");
-
-        if is_embedding || is_non_generation {
-            card.model_type = infer_non_generation_type(labels);
-        } else if has_vision && !card.model_type.supports_vision() {
-            card.model_type |= ModelType::VISION;
-        }
-    } else if has_vision && !card.model_type.supports_vision() {
+    // A card built from the labels follows an embedding or non-generation
+    // signal (which wins over vision); otherwise, the operator's card or a
+    // generation card from the labels gains vision.
+    let non_generation = !user_provided
+        && (labels.get("is_embedding").is_some_and(|s| s == "true")
+            || labels.get("is_generation").is_some_and(|s| s == "false"));
+    if non_generation {
+        card.model_type = infer_non_generation_type(labels);
+    } else if has_vision {
         card.model_type |= ModelType::VISION;
     }
 

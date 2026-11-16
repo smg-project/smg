@@ -3,9 +3,10 @@
 //! a field fails to compile) and, per field, the WIT spelling of its Rust type
 //! against the descriptor in [`super::types`] (a retyped field fails the WIT
 //! test; the WIT order is the descriptor's, held by the byte-for-byte test,
-//! a struct's declaration order binding nothing). The host-only fields (a candidate's position and
-//! sample instant, a request's host clock and affinity column, a lease's issue instant and
-//! session verdict, a target's and a pair's positions) are named as such.
+//! a struct's declaration order binding nothing). The host-only fields (a load row's
+//! resident-count flag, a candidate's position and
+//! sample instant, a request's host clock, affinity column and model fingerprint, a lease's
+//! issue instant and session verdict, a target's and a pair's positions) are named as such.
 //! A `candidate` is tied to two structs, the engine's row and its entry of
 //! the request's affinity column: each is destructured whole, and the
 //! record's order, which neither struct holds, is named beside them.
@@ -18,8 +19,8 @@ use crate::{
     sessions::SessionVerdict,
     view::{
         AffinityFacts, Candidate, HashKind, Header, Health, Identity, LoadRow, MediaCounts,
-        OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource, WireModes, WorkerId,
-        ZoneCapacity,
+        ModelFingerprint, OverloadRegime, Phase, PoolFacts, RequestFacts, Role, Session,
+        SignalSource, WireModes, WorkerId, ZoneCapacity,
     },
 };
 
@@ -67,8 +68,12 @@ wit! {
     &[ZoneCapacity] => "list<zone-capacity>",
     Option<LoadRow> => "option<load>",
     Option<Pair> => "option<pair>",
-    // Host-only: a lease's session verdict never reaches a guest.
+    // A session crosses as its value.
+    Session => "u64",
+    // Host-only: a lease's session verdict never reaches a guest, and a
+    // request's model crosses as its name, never as the host's fingerprint.
     SessionVerdict => "host-only",
+    ModelFingerprint => "host-only",
     // Host-only: a guest reads the request's affinity column as five fields
     // of each candidate.
     &[AffinityFacts] => "host-only",
@@ -78,6 +83,7 @@ wit! {
 // moves stops the build here, the table being typed by hand.
 const _: fn(WorkerId) -> u64 = |id| id.0;
 const _: fn(LeaseId) -> u64 = |id| id.0;
+const _: fn(Session) -> u64 = Session::get;
 const _: fn(Header<'_>) -> (u8, &str) = |Header { name, value }| (name, value);
 
 fn ty<T: Wit>(_: &T) -> &'static str {
@@ -100,14 +106,25 @@ fn kebab(field: &'static str) -> String {
 }
 
 macro_rules! probe {
-    ($record:literal, before [$($bn:literal: $bt:literal),*], $ty:ident { $($field:ident),+ $(,)? } host [$($host:ident),*], $value:expr) => {{
+    (@spelled $field:ident) => { stringify!($field) };
+    (@spelled $field:ident $spelled:literal) => { $spelled };
+    ($record:literal, before [$($bn:literal: $bt:literal),*], $ty:ident { $($field:ident $(as $spelled:literal)?),+ $(,)? } host [$($host:ident),*], $value:expr) => {{
         // The pattern names every field without `..`: the exhaustiveness
-        // proof, and the bindings each field's type for its WIT spelling.
+        // proof, and the bindings each field's type for its WIT spelling. A
+        // field written `name as "wit-name"` is held to the name the WIT
+        // spells, the pattern still naming the struct's own: a pair, both
+        // sides checked.
         let $ty { $($field),+ } = $value;
         $(let _ = $host;)*
         let host: &[&str] = &[$(stringify!($host)),*];
-        let fields: Vec<(&'static str, &'static str)> = vec![$((stringify!($field), ty($field))),+];
-        let fields = fields.into_iter().filter(|(name, _)| !host.contains(name)).collect();
+        // The struct's name (the host-only list is by it), the WIT's, the type.
+        let fields: Vec<(&'static str, &'static str, &'static str)> =
+            vec![$((stringify!($field), probe!(@spelled $field $($spelled)?), ty($field))),+];
+        let fields = fields
+            .into_iter()
+            .filter(|(name, _, _)| !host.contains(name))
+            .map(|(_, spelled, ty)| (spelled, ty))
+            .collect();
         Probe { record: $record, before: &[$(($bn, $bt)),*], fields }
     }};
     // A record tied to two structs. Each pattern names every field of its
@@ -159,8 +176,8 @@ pub(crate) fn all() -> Vec<Probe> {
     vec![
         probe!("load", before [], LoadRow {
             running, queued, waiting_uncached_tokens, kv_usage_permille, active_kv_permille,
-            live_rate, resident_tokens, report_age_ms, source, max_running,
-        } host [], &load),
+            live_rate, resident_tokens, resident_counted, report_age_ms, source, max_running,
+        } host [resident_counted], &load),
         probe!("candidate", before [],
             Candidate {
                 position, id, role, dp_rank, dp_size, health, wire_modes, engine_kind, connector,
@@ -182,15 +199,19 @@ pub(crate) fn all() -> Vec<Probe> {
             model, namespace_seed, tenant, priority, streaming, max_output_tokens,
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
             budget_micros, headers, media, seed, block_size, now_micros, affinity,
-        } host [now_micros, affinity], &request),
+            model_fingerprint,
+        } host [now_micros, affinity, model_fingerprint], &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),
         probe!("pool", before [], PoolFacts {
             pool_size, membership_epoch, ring_epoch, regime, generation, zones,
         } host [], &pool),
+        // The lease's session crosses under the name both contracts still
+        // spell, `session-key`: the change that first reads a lease from the
+        // wire renames the field in both and takes this pair out.
         probe!("lease", before [], Lease {
-            id, kind, side, target_index, generation, session_key, session, issued_micros,
-            tokens,
-        } host [session, issued_micros], &lease),
+            id, kind, side, target_index, generation, session as "session-key", session_verdict,
+            issued_micros, tokens,
+        } host [session_verdict, issued_micros], &lease),
         probe!("pair", before [], Pair { decode_position, decode_id, decode_dp_rank } host [decode_position], &pair),
         probe!("target", before [], Target { position, id, dp_rank, pair } host [position], &target),
         probe!("completed", before ["lease": "lease"], Outcome {

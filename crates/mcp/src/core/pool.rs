@@ -44,8 +44,8 @@ impl PoolKey {
                 url,
                 token,
                 headers,
-            } => (url.clone(), Self::hash_auth(token.as_ref(), headers)),
-            McpTransport::Sse {
+            }
+            | McpTransport::Sse {
                 url,
                 token,
                 headers,
@@ -91,15 +91,30 @@ impl PoolKey {
     }
 }
 
+/// Where a pooled connection's tool listing stands: not returned yet (the
+/// connection is pooled before its opener lists, so a hit meanwhile lists
+/// for itself), made, or failed with the server's message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Listing {
+    Pending,
+    Listed,
+    Failed(String),
+}
+
 /// Cached MCP connection.
 #[derive(Clone)]
 pub(crate) struct CachedConnection {
     pub client: Arc<McpClient>,
+    /// The connection's tool listing. It leaves the pool with the connection.
+    pub listing: Listing,
 }
 
 impl CachedConnection {
     pub fn new(client: Arc<McpClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            listing: Listing::Pending,
+        }
     }
 }
 
@@ -246,6 +261,30 @@ impl McpConnectionPool {
             total_connections: self.connection_count.load(Ordering::Relaxed),
             capacity: self.max_connections,
         }
+    }
+
+    /// Record where `client`'s tool listing stands. The record is the listing
+    /// connection's: a key the pool no longer holds, or holds for a connection
+    /// pooled since (the lister evicted during its listing), is left alone.
+    pub(crate) fn set_listing(&self, key: &PoolKey, client: &Arc<McpClient>, listing: Listing) {
+        if let Some(cached) = self
+            .connections
+            .lock()
+            .peek_mut(key)
+            .filter(|cached| Arc::ptr_eq(&cached.client, client))
+        {
+            cached.listing = listing;
+        }
+    }
+
+    /// Whether the connection under `key` is pooled with its tools listed
+    /// (a plain hit); false for a pending or failed listing and for a key the
+    /// pool does not hold. No promotion.
+    pub(crate) fn is_listed(&self, key: &PoolKey) -> bool {
+        matches!(
+            self.connections.lock().peek(key),
+            Some(cached) if cached.listing == Listing::Listed
+        )
     }
 
     pub fn list_keys(&self) -> Vec<PoolKey> {

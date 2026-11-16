@@ -280,7 +280,8 @@ pub mod bench_support {
 
         /// [`Self::place`] as the HTTP router runs a request's first
         /// attempt: under the candidate filter a new request's attempt
-        /// ledger hands.
+        /// ledger hands. The filter and the entry are that router's; the
+        /// pool is this path's, the gRPC pipeline's regular one.
         pub fn place_first_attempt(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
             AttemptLedger::default().with_candidate_filter(|candidate_filter| {
                 self.select(PlacementInputs {
@@ -349,7 +350,6 @@ pub mod bench_support {
                     &self.model,
                     &self.pairs,
                     None,
-                    true,
                     None,
                     inputs,
                 )

@@ -138,13 +138,15 @@ pub struct Trace {
 }
 
 /// A pick: ordered targets, the trace, and what a sessions rule did with
-/// the request's key (`None` without one); the host copies the verdict onto
-/// the lease it commits.
+/// the request's key (`None` without one). The host copies that verdict
+/// onto the lease it commits, and fills the lease's session from the
+/// request ([`crate::RequestFacts::session`]) for every keyed request, rule
+/// or no rule: the verdict alone says whether the commit moves a pin.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Pick {
     pub targets: Targets,
     pub trace: Trace,
-    pub session: SessionVerdict,
+    pub session_verdict: SessionVerdict,
 }
 
 /// A shed: the reason, the stage that emptied the pool, and the pacing hint.
@@ -245,7 +247,7 @@ mod tests {
         let pick = Decision::Pick(Pick {
             targets: Targets::new(),
             trace,
-            session: SessionVerdict::None,
+            session_verdict: SessionVerdict::None,
         });
         assert!(pick.pick().is_some());
     }

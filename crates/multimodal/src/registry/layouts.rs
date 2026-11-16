@@ -1,4 +1,5 @@
-//! The field-layout tables more than one registry entry declares.
+//! The field-layout tables more than one registry entry declares, and the
+//! grid-patch tower's legacy field map beside its per-modality table.
 //!
 //! A tower that patchifies its images ships the pixels of a batch flat over
 //! the patches, with each item's grid and patch count one row per item

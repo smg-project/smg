@@ -32,6 +32,9 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
             }
             if super::places_by_rendezvous_room(&state.model) {
                 client.note_engine_places_by_rendezvous_room();
+                if super::ranks_are_replicas(&state.model) {
+                    client.note_engine_ranks_are_replicas();
+                }
             }
             Ok(())
         },

@@ -8,7 +8,7 @@ mod state;
 pub mod types;
 
 pub use definition::{StepDefinition, ValidationError, WorkflowDefinition};
-pub use engine::WorkflowEngine;
+pub use engine::{completion_outcome, WorkflowEngine};
 pub use event::{EventBus, EventSubscriber, LoggingSubscriber, WorkflowEvent};
 pub use executor::{FunctionStep, StepExecutor};
 pub use state::{InMemoryStore, StateStore};

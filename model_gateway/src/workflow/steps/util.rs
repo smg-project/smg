@@ -17,9 +17,17 @@ fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
         .map(|_| &url[scheme.len()..])
 }
 
+/// The scheme `url` starts with, lowercased: a word of scheme characters
+/// (RFC 3986's, a digit or a sign first too, and the empty word) before a
+/// `://`, as every scheme the address type knows is.
+/// An address that starts with no such word has no scheme, as the address
+/// type reads it. A `://` further in belongs to its path or its query, and
+/// what stands before it may hold a userinfo, which a refusal would name.
 fn url_scheme(url: &str) -> Option<String> {
-    url.split_once("://")
-        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+    let (word, _) = url.split_once("://")?;
+    word.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        .then(|| word.to_ascii_lowercase())
 }
 
 /// Strip protocol prefix (http://, https://, grpc://, grpcs://) from URL.
@@ -98,7 +106,7 @@ pub(crate) async fn try_http_reachable(
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| format!("Health check failed: {e}"))?;
+        .map_err(|e| format!("Health check failed: {}", e.without_url()))?;
 
     Ok(())
 }
@@ -311,6 +319,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::{server::http_client, worker::test_support::RefusedAddress};
 
     struct DropFlag(Arc<AtomicBool>);
 
@@ -340,6 +349,21 @@ mod tests {
     fn http_health_url_rejects_grpc_schemes() {
         assert!(http_health_url("grpc://localhost:30001").is_err());
         assert!(http_health_url("grpcs://localhost:30001").is_err());
+    }
+
+    /// An address registered with a query, at a port nobody listens on: the
+    /// failure does not repeat the query. The HTTP client's own error text
+    /// ends with the request URL, the query kept.
+    #[tokio::test]
+    async fn a_failed_http_probe_goes_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}?token=s3cret", refused.http_url());
+
+        let err = try_http_reachable(&url, 1, &http_client())
+            .await
+            .expect_err("nothing listens at the address");
+
+        assert!(!err.contains("s3cret"), "{err}");
     }
 
     #[test]
@@ -376,6 +400,38 @@ mod tests {
         let unknown = grpc_reachable_url("ftp://user:secret@worker:3000").unwrap_err();
         assert!(!unknown.contains("secret"), "{unknown}");
         assert!(unknown.contains("'ftp'"), "{unknown}");
+    }
+
+    /// A scheme is read at the start of an address alone. An address with
+    /// none may hold a `://` further in, in a path or a query: both probes
+    /// dial it as they dial any address with no scheme. Read as a scheme,
+    /// what stood before that `://` was refused by name, a userinfo in it,
+    /// in the detection step's failure message, which a log line carries.
+    /// A word of scheme characters is a scheme, known or not, and one the
+    /// probes do not know is still refused by name.
+    #[test]
+    fn a_scheme_is_read_at_the_start_of_a_probed_address_alone() {
+        for url in [
+            "user:secret@10.0.0.11:8000/a://b",
+            "10.0.0.11:8000/a://b",
+            "10.0.0.11:8000/proxy/http://backend:9000",
+            "decode.internal:8000/v1?next=http://x",
+        ] {
+            assert_eq!(
+                http_health_url(url).as_deref(),
+                Ok(format!("http://{url}/health").as_str()),
+                "{url}"
+            );
+            assert_eq!(
+                grpc_reachable_url(url).as_deref(),
+                Ok(format!("grpc://{url}").as_str()),
+                "{url}"
+            );
+        }
+
+        let unknown = http_health_url("X-tls+v1.2://user:secret@worker:3000").unwrap_err();
+        assert!(!unknown.contains("secret"), "{unknown}");
+        assert!(unknown.contains("'x-tls+v1.2'"), "{unknown}");
     }
 
     #[test]
@@ -501,5 +557,82 @@ mod tests {
             not_healthy_error("  "),
             "gRPC health check reports the engine not healthy"
         );
+    }
+
+    /// For an address the door takes, the host and port the probes dial are
+    /// the ones every line names. Where a client and the gateway's own type
+    /// read an address apart (a caller's rank suffix, whose digits a client
+    /// dials as the host), the door refuses it.
+    #[test]
+    fn the_probes_dial_the_host_a_line_names() {
+        use crate::config::validate_worker_url;
+        let dialled = |address: &str| {
+            let health = http_health_url(address).expect(address);
+            let health = url::Url::parse(&health).expect(address);
+            format!(
+                "{}:{}",
+                health.host_str().expect(address),
+                health.port_or_known_default().expect(address)
+            )
+        };
+        for (address, host_and_port) in [
+            ("http://user:s3cret@127.0.0.1:8000", "127.0.0.1:8000"),
+            ("http://worker:3000/v1", "worker:3000"),
+            ("https://[::1]:8443", "[::1]:8443"),
+        ] {
+            validate_worker_url(address).expect(address);
+            assert_eq!(dialled(address), host_and_port);
+            let named = Endpoint::redacted_str(address);
+            assert!(named.contains(host_and_port), "{address}: {named}");
+        }
+        for (address, named, dialled_at) in [
+            (
+                "http://127.0.0.1:35099@2130706433",
+                "127.0.0.1:35099",
+                "127.0.0.1:80",
+            ),
+            (
+                "http://user:s3cret@127.0.0.1:52605@2130706433",
+                "127.0.0.1:52605",
+                "127.0.0.1:80",
+            ),
+            (
+                "http://user:s3cret@127.0.0.1:57697@3",
+                "127.0.0.1:57697",
+                "0.0.0.3:80",
+            ),
+        ] {
+            assert!(Endpoint::redacted_str(address).contains(named), "{address}");
+            assert_eq!(dialled(address), dialled_at, "{address}");
+            assert!(
+                validate_worker_url(address).is_err(),
+                "{address} is refused at the door"
+            );
+        }
+        // The gRPC channel reads the digits as its host too.
+        let address = "grpc://127.0.0.1:61845@2130706433";
+        let channel: http::Uri = grpc_reachable_url(address)
+            .expect(address)
+            .parse()
+            .expect(address);
+        assert_eq!(channel.host(), Some("2130706433"));
+        assert!(Endpoint::redacted_str(address).contains("127.0.0.1:61845"));
+        assert!(
+            validate_worker_url(address).is_err(),
+            "{address} is refused at the door"
+        );
+        // To the gateway's type these two hold no userinfo, only a host and
+        // its rank: a token alone, a user and a password of digits. A line
+        // would name each whole.
+        for address in [
+            "http://s3cret-token@8080",
+            "http://s3cret-user:8080@2130706433",
+        ] {
+            assert_eq!(Endpoint::redacted_str(address), address);
+            assert!(
+                validate_worker_url(address).is_err(),
+                "{address} is refused at the door"
+            );
+        }
     }
 }

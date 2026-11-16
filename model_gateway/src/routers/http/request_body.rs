@@ -808,27 +808,6 @@ mod tests {
         fn set_status(&self, status: WorkerStatus) {
             self.0.set_status(status);
         }
-        fn consecutive_failures_increment(&self) -> usize {
-            self.0.consecutive_failures_increment()
-        }
-        fn consecutive_failures_reset(&self) {
-            self.0.consecutive_failures_reset();
-        }
-        fn consecutive_successes_increment(&self) -> usize {
-            self.0.consecutive_successes_increment()
-        }
-        fn consecutive_successes_reset(&self) {
-            self.0.consecutive_successes_reset();
-        }
-        fn total_pending_probes(&self) -> usize {
-            self.0.total_pending_probes()
-        }
-        fn total_pending_probes_increment(&self) -> usize {
-            self.0.total_pending_probes_increment()
-        }
-        fn total_pending_probes_reset(&self) {
-            self.0.total_pending_probes_reset();
-        }
         fn load(&self) -> usize {
             self.0.load()
         }
@@ -882,15 +861,6 @@ mod tests {
         }
         async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
             self.0.get_backend_client().await
-        }
-        async fn grpc_health_check(&self) -> WorkerResult<bool> {
-            self.0.grpc_health_check().await
-        }
-        async fn zmq_health_check(&self) -> WorkerResult<bool> {
-            self.0.zmq_health_check().await
-        }
-        async fn http_health_check(&self) -> WorkerResult<bool> {
-            self.0.http_health_check().await
         }
         fn prepare_request(&self, mut req: Value) -> WorkerResult<Value> {
             if let Some(obj) = req.as_object_mut() {

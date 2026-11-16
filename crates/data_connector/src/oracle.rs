@@ -2091,12 +2091,12 @@ impl ResponseStorage for OracleResponseStorage {
                     )
                 };
 
+                let terminal = sql_string_list(&TERMINAL_RESPONSE_STATUSES);
                 // The predicate is the expression the table's unstored index
                 // holds (see the bootstrap), so the sweep reads those rows only.
                 conn.execute(
                     &format!(
-                        "DELETE FROM {table} WHERE {} IN ('completed', 'incomplete', 'failed', 'cancelled') \
-                         AND {ended} < :1",
+                        "DELETE FROM {table} WHERE {} IN ({terminal}) AND {ended} < :1",
                         unstored_status_expr(col_raw)
                     ),
                     &[&cutoff_secs],

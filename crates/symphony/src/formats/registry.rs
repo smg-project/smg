@@ -32,9 +32,9 @@ use rustc_hash::FxBuildHasher;
 
 use super::{
     deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma,
-    gemma4, glm, glm4, hy4, hy_v3, inkling, iquest, json, k2_horizon, kimi_k2, kimi_k3, lfm2_5,
-    ling, llama4, llama_nemotron, longcat, minicpm5, minimax_m2, minimax_m3, mistral, mistral_v13,
-    muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    gemma4, glm, glm4, hy4, hy_v3, inkling, inkling2, iquest, json, k2_horizon, kimi_k2, kimi_k3,
+    lfm2_5, ling, llama4, llama_nemotron, longcat, minicpm5, minimax_m2, minimax_m3, mistral,
+    mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -114,6 +114,8 @@ tables! {
     KimiK3 => "kimi_k3", kimi_k3;
     /// [`inkling()`].
     Inkling => "inkling", inkling;
+    /// [`inkling2()`].
+    Inkling2 => "inkling2", inkling2;
     /// [`minicpm5()`].
     MiniCpm5 => "minicpm5", minicpm5;
     /// [`dots3()`].
@@ -518,6 +520,14 @@ mod tests {
             Some(Table::Inkling)
         );
         assert_eq!(
+            table_for("thinkingmachines/Inkling-2-Small"),
+            Some(Table::Inkling2)
+        );
+        assert_eq!(
+            table_for("thinkingmachines/Inkling-2-Small-MXFP8"),
+            Some(Table::Inkling2)
+        );
+        assert_eq!(
             table_for("deepseek-ai/DeepSeek-V4.1-Flash-1017"),
             Some(Table::DeepSeekV4_1)
         );
@@ -593,6 +603,22 @@ mod tests {
                 "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
                 Table::Qwen3Tagged,
             ),
+            ("inclusionAI/Ling-3.1-flash-1019", Table::Ling),
+            ("inclusionAI/Ling-3.0-flash-Sante", Table::Ling),
+            ("ibm-granite/granite-switch-4.1-30b", Table::Qwen2_5),
+            ("h2oai/h2o-lightning-4b-nemotron-nano", Table::Qwen3Tagged),
+            ("inclusionAI/ZoomGain-4B", Table::Qwen3Tagged),
+            ("inclusionAI/ZwZ2-4B", Table::Qwen3Tagged),
+            (
+                "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB",
+                Table::Qwen3Tagged,
+            ),
+            ("openbmb/MiniCPM-V-4.7-1B-GPTQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-Jev-AWQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-Jev-GPTQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-1.0-AWQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-1.0-GPTQ", Table::Qwen3Tagged),
+            ("XHToken/Spark-X2.6-1.7B", Table::Glm),
         ] {
             assert_eq!(table_for(model), Some(table), "{model}");
             assert!(for_model(model).is_some(), "{model}");

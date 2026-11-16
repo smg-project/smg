@@ -6,12 +6,10 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
     registry::{
-        layouts::{grid_patch_fields, grid_patch_layouts_for},
-        MediaItemInfo, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
+        layouts::grid_patch_layouts_for, MediaItemInfo, ModelMetadata, ModelProcessorSpec,
+        ModelRegistryError, RegistryResult,
     },
-    types::{
-        EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId, VideoSamplingInfo,
-    },
+    types::{EncoderFieldLayouts, Modality, PromptReplacement, TokenId, VideoSamplingInfo},
     vision::{PreProcessorConfig, Qwen3VLProcessor, VisionPreProcessor},
 };
 
@@ -405,18 +403,13 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         FrameSampling::EvenRounded
     }
 
-    fn field_layouts(&self) -> HashMap<String, FieldLayout> {
-        // encoder_input is patchified: [total_patches, patch_features].
-        // patches_per_image tells how many patches belong to each image.
-        // image_grid_thw is [num_images, 3].
-        grid_patch_fields()
-    }
-
     fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
         // One layout per modality. A video batch carries `patches_per_video`
         // and `video_grid_thw` and no image tensor at all, so slicing its
-        // patches by `patches_per_image` (the legacy map's one answer) fails
-        // at assembly for every video; the image batch is the mirror case.
+        // patches by `patches_per_image` fails at assembly for every video;
+        // the image batch is the mirror case. The entry declares no legacy
+        // field map: the trait's default reads one, and this override
+        // replaces that default.
         grid_patch_layouts_for(modality)
     }
 

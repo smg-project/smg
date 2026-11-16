@@ -274,36 +274,40 @@ impl NemotronOmniProcessor {
         )
     }
 
-    /// Resize, normalize and patchify one RGB image: `rows * cols * 3 * p * p` values.
+    /// Resize, normalize and patchify one RGB image: appends its
+    /// `rows * cols * 3 * p * p` values to `out`.
     fn patches(
         raw: &[u8],
         width: u32,
         height: u32,
         rows: usize,
         cols: usize,
-    ) -> Result<Vec<f32>, TransformError> {
+        out: &mut Vec<f32>,
+    ) -> Result<(), TransformError> {
         let p = PATCH_SIZE;
         let (out_w, out_h) = (cols * p, rows * p);
-        let resized = resize_bicubic_torch_aa_f32(raw, width, height, out_w as u32, out_h as u32)?;
+        let mut resized =
+            resize_bicubic_torch_aa_f32(raw, width, height, out_w as u32, out_h as u32)?;
         let scale = CLIP_STD.map(|s| s as f32);
         let mean = CLIP_MEAN.map(|m| m as f32);
-        let patch_len = 3 * p * p;
-        let mut out = vec![0.0_f32; rows * cols * patch_len];
+        let (pixels, _) = resized.as_chunks_mut::<3>();
+        for pixel in pixels.iter_mut() {
+            for ((value, mean), scale) in pixel.iter_mut().zip(mean).zip(scale) {
+                // f32 op order matches the reference: x / 255, - mean, / std.
+                *value = (*value / 255.0 - mean) / scale;
+            }
+        }
         for i in 0..rows {
             for j in 0..cols {
-                let patch = &mut out[(i * cols + j) * patch_len..][..patch_len];
                 for c in 0..3 {
                     for dy in 0..p {
-                        for dx in 0..p {
-                            let v = resized[((i * p + dy) * out_w + j * p + dx) * 3 + c];
-                            // f32 op order matches the reference: x / 255, - mean, / std.
-                            patch[(c * p + dy) * p + dx] = (v / 255.0 - mean[c]) / scale[c];
-                        }
+                        let row = &pixels[(i * p + dy) * out_w + j * p..][..p];
+                        out.extend(row.iter().map(|pixel| pixel[c]));
                     }
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// One clip's frames as patches plus its `video_grid_thw`.
@@ -325,13 +329,14 @@ impl NemotronOmniProcessor {
                     first.width, first.height, frame.width, frame.height
                 )));
             }
-            encoder_input.extend(Self::patches(
+            Self::patches(
                 frame.data,
                 frame.width,
                 frame.height,
                 rows,
                 cols,
-            )?);
+                &mut encoder_input,
+            )?;
         }
         let tubelets = frames.len().div_ceil(VIDEO_TEMPORAL_PATCH_SIZE);
         let encoder_input =
@@ -379,7 +384,7 @@ impl VisionPreProcessor for NemotronOmniProcessor {
 
     #[expect(
         clippy::expect_used,
-        reason = "per-image patch arrays are standard-layout and the concatenation is sized by construction"
+        reason = "the patch buffer is filled from the planned grids it is reshaped by"
     )]
     fn preprocess_with_context(
         &self,
@@ -395,20 +400,26 @@ impl VisionPreProcessor for NemotronOmniProcessor {
             .collect();
         let planned = Self::plan_grids(&sizes, context.token_budget)?;
         let patch_len = 3 * PATCH_SIZE * PATCH_SIZE;
-        let mut encoder_input = Vec::new();
+        let mut encoder_input = Vec::with_capacity(
+            planned
+                .iter()
+                .map(|(rows, cols)| rows * cols * patch_len)
+                .sum(),
+        );
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len() * 2);
         let mut patches_per_image = Vec::with_capacity(images.len());
-        for (image, (rows, cols)) in images.iter().zip(planned) {
+        for (image, &(rows, cols)) in images.iter().zip(&planned) {
             let (width, height, raw) = Self::rgb_on_white(image);
-            encoder_input.extend(Self::patches(
+            Self::patches(
                 &raw,
                 width as u32,
                 height as u32,
                 rows,
                 cols,
-            )?);
+                &mut encoder_input,
+            )?;
             feature_token_counts.push(grid_tokens(rows, cols));
             item_sizes.push((image.width(), image.height()));
             grids.extend([rows as i64, cols as i64]);

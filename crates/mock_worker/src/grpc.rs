@@ -318,7 +318,8 @@ struct Rank {
 }
 
 impl Rank {
-    /// The worker's ranks: `--grpc-dp-size` realistic engines, rank `r` named
+    /// The worker's ranks: `--grpc-dp-size` realistic engines with the
+    /// worker's parameters ([`Config::engine_for`]), rank `r` named
     /// `<worker>:r<r>` in the process fleet (a single rank keeps the worker's
     /// name) and stamping `r` on its KV-event batches; none for a canned
     /// worker.
@@ -327,9 +328,10 @@ impl Rank {
             return Vec::new();
         }
         let size = usize::from(cfg.grpc_dp_size.max(1));
+        let engine = cfg.engine_for(worker);
         (0..size)
             .map(|rank| {
-                let mut params = cfg.engine.clone();
+                let mut params = engine.clone();
                 params.dp_rank = i32::try_from(rank).unwrap_or(i32::MAX);
                 let name = if size > 1 {
                     format!("{worker}:r{rank}")
@@ -588,6 +590,15 @@ pub(crate) type TokenizerStream =
 /// a transfer backend, or as the connector that carries it): the mock moves
 /// no KV cache, and the gateway pairs its workers on this one transport.
 pub(crate) const KV_TRANSPORT: &str = "mooncake";
+
+/// The vector the mock embeds an input into, deterministic from its ids so a
+/// bed can check an answer: eight dimensions, the first eight ids each over
+/// 1024, zero where the input is shorter.
+pub(super) fn embedding_of(input_ids: &[u32]) -> Vec<f32> {
+    (0..8)
+        .map(|i| input_ids.get(i).copied().unwrap_or(0) as f32 / 1024.0)
+        .collect()
+}
 
 /// The name of the scheduler service a worker of `wire` serves: what the
 /// standard health service answers for, and what a gateway's detection asks.
@@ -2817,6 +2828,38 @@ mod tests {
         assert_eq!(counts, vec![0, 0, 0]);
     }
 
+    /// Every rank of the worker `--worker-kv-tokens` names reports the
+    /// worker's own pool in `GetLoads`; a worker it does not name reports the
+    /// fleet's.
+    #[tokio::test]
+    async fn the_worker_an_override_names_reports_its_own_pool_on_every_rank() {
+        let cfg = Config {
+            realistic: true,
+            grpc_dp_size: 2,
+            engine: engine::EngineParams {
+                kv_capacity_tokens: 131_072,
+                ..Default::default()
+            },
+            worker_kv_tokens: [("grpc:65121".to_string(), 65_536)].into(),
+            ..Default::default()
+        };
+        let (named, _stop) = MockScheduler::for_tests(cfg.clone(), 65_121);
+        let (other, _stop_other) = MockScheduler::for_tests(cfg, 65_122);
+        for (service, tokens) in [(named, 65_536), (other, 131_072)] {
+            let loads = service
+                .get_loads(Request::new(ts::GetLoadsRequest::default()))
+                .await
+                .expect("loads")
+                .into_inner();
+            let pools: Vec<i32> = loads
+                .loads
+                .iter()
+                .map(|load| load.max_total_num_tokens)
+                .collect();
+            assert_eq!(pools, vec![tokens, tokens], "{}", service.name);
+        }
+    }
+
     /// `GetLoads` lists one entry per rank, the request's `dp_rank` keeping
     /// one; `GetServerInfo` advertises the width.
     #[tokio::test]
@@ -3344,6 +3387,22 @@ mod tests {
             service.ranks[0].prefill_pending.load(Ordering::Relaxed),
             0,
             "settled once the queued choice streamed"
+        );
+    }
+
+    /// The mock's embedding of an input is deterministic from its ids: eight
+    /// dimensions, the first eight ids each over 1024, zero past the input.
+    #[test]
+    fn the_mock_embedding_is_the_first_eight_ids_over_1024() {
+        assert_eq!(
+            embedding_of(&[1024, 512, 0]),
+            vec![1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(embedding_of(&[]), vec![0.0; 8]);
+        let long: Vec<u32> = (1..=12).map(|i| i * 1024).collect();
+        assert_eq!(
+            embedding_of(&long),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
         );
     }
 }
