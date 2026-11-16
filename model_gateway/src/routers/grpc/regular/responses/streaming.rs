@@ -30,6 +30,7 @@ use openai_protocol::{
         ChatCompletionStreamResponse,
     },
     common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage},
+    event_types::McpEvent,
     responses::{ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesUsage},
 };
 use serde::{
@@ -830,9 +831,15 @@ async fn stream_mcp_call(
     // Emit arguments events for mcp_call only (skip for builtin tools)
     if matches!(response_format, ResponseFormat::Passthrough) {
         // Emit mcp_call_arguments.delta (simulate streaming by sending full arguments)
-        let event =
-            emitter.emit_mcp_call_arguments_delta(output_index, &item_id, &tool_call.arguments);
-        emitter.send_event(&event, tx).await?;
+        emitter
+            .send_arguments_delta(
+                McpEvent::CALL_ARGUMENTS_DELTA,
+                &tool_call.arguments,
+                output_index,
+                &item_id,
+                tx,
+            )
+            .await?;
 
         // Emit mcp_call_arguments.done
         let event =
