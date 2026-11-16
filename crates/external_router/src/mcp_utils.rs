@@ -377,10 +377,10 @@ pub async fn ensure_request_mcp_client(
     ensure_mcp_servers(mcp_orchestrator, format_registry, &inputs, &builtin_types).await
 }
 
-/// The Responses routes' MCP routing, under the rule the gRPC router applies:
-/// a request that names an `mcp` tool and binds no server is refused on the
-/// missing connection (424 `connect_mcp_server_failed`) before anything goes
-/// upstream; built-in tools without MCP routing pass through to the model
+/// The Responses routes' MCP routing, one rule for the HTTP and the gRPC
+/// routers: a request that names an `mcp` tool and binds no server is refused
+/// on the missing connection (424 `connect_mcp_server_failed`) before anything
+/// goes upstream; built-in tools without MCP routing pass through to the model
 /// (`Ok(None)`).
 pub async fn ensure_request_mcp_routing(
     mcp_orchestrator: &Arc<McpOrchestrator>,
@@ -396,7 +396,8 @@ pub async fn ensure_request_mcp_routing(
             warn!("Failed to connect to MCP servers: the request names an mcp tool and none bound");
             Err(error::failed_dependency(
                 "connect_mcp_server_failed",
-                "Failed to connect to MCP servers. Check server_url and authorization.",
+                "Failed to connect to MCP servers. Check server_url and authorization, or that \
+                 a server_label without server_url names a configured server.",
             ))
         }
         None => Ok(None),
@@ -1168,6 +1169,16 @@ mod tests {
             ensure_request_mcp_routing(&orchestrator, &format_registry, &[mcp("conf")]).await;
         let response = refused.expect_err("a lone unknown label is refused");
         assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the refusal's body");
+        let body: Value = serde_json::from_slice(&body).expect("a JSON error");
+        assert_eq!(body["error"]["code"], "connect_mcp_server_failed");
+        assert_eq!(
+            body["error"]["message"],
+            "Failed to connect to MCP servers. Check server_url and authorization, or that a \
+             server_label without server_url names a configured server."
+        );
 
         let routed = ensure_request_mcp_routing(
             &orchestrator,
