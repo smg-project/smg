@@ -153,6 +153,11 @@ impl MemoryStore {
     /// [`build_view`](Self::build_view) and a pair decision through
     /// [`build_pair`](Self::build_pair): both borrow the world and write
     /// no shared count.
+    ///
+    /// A world kept across two publications of a pool keeps the rows it
+    /// lists as they are: the second publication writes over other rows,
+    /// and allocates that pool's rows when the writer holds none alone
+    /// ([`publication_allocations`](Self::publication_allocations)).
     pub fn world(&self) -> Arc<World> {
         self.world.load_full()
     }
@@ -265,6 +270,12 @@ impl MemoryStore {
         self.loads.lock().ranks.len()
     }
 
+    /// How many rows that left their pool the writer still keeps.
+    #[cfg(test)]
+    pub(super) fn held_rows(&self) -> usize {
+        self.loads.lock().writer.held_rows()
+    }
+
     /// A worker's row is gone (removed, or replaced by a new incarnation):
     /// the store's tables that live exactly as long as the row leave with
     /// it, here and nowhere else. The health tables and the load rows today;
@@ -280,6 +291,18 @@ impl MemoryStore {
         health.forget(id);
         let mut loads = self.loads.lock();
         loads.ranks.remove(&id);
+    }
+
+    /// How many times a publication allocated a pool's rows since the store
+    /// was made. A publication writes a pool's rows over rows no world
+    /// lists any more: the ones the pool published before its last, else
+    /// any of its length that left a pool. It allocates when it finds
+    /// none: at a pool's first publication after a membership write,
+    /// unless rows that write retired fit it, and past that only while a
+    /// reader holds a world from before the pool's last publication. A
+    /// membership write's own rows are not counted.
+    pub fn publication_allocations(&self) -> u64 {
+        self.loads.lock().writer.allocations()
     }
 
     /// How many resyncs were recorded for `reason`.
