@@ -107,7 +107,8 @@ pub struct Config {
     /// The bound on a shutdown, the settle window included: when it runs
     /// out the listeners are closed with their streams. The controller's
     /// streams reconnect on a drain, so the default is far below the
-    /// gateway's, which waits for generations to finish.
+    /// gateway's, which waits for generations to finish. A period the clock
+    /// cannot add to the present is no bound.
     pub shutdown_grace: Duration,
     /// How often the load driver polls an engine whose stream is not
     /// serving it, and the freshness bound a pushed record must meet to

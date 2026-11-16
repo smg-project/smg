@@ -55,15 +55,14 @@ use prost::{
 };
 use tonic::{
     client::GrpcService,
-    codec::{BufferSettings, Streaming},
+    codec::Streaming,
     codegen::http::{self, header::HeaderValue, Method, Request as HttpRequest, Version},
     Status,
 };
-use tonic_prost::ProstCodec;
 
 use crate::{
     channel::Channel,
-    codec::{encode_prompt_carrier, reserves_for, EAGER_BUFFER_BYTES},
+    codec::{encode_prompt_carrier, reserves_for, FrameDecoder, EAGER_BUFFER_BYTES},
     sglang_proto as sg,
     tokenspeed_scheduler::tokenspeed_proto as ts,
     vllm_proto as vllm,
@@ -746,7 +745,7 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     R: Message + Default + Send + 'static,
 {
-    let decoder = ProstCodec::<ts::GenerateRequest, R>::raw_decoder(BufferSettings::default());
+    let decoder = FrameDecoder::<R>::default();
     if let Some(status) = Status::from_header_map(response.headers()) {
         if status.code() != tonic::Code::Ok {
             return Err(status);
