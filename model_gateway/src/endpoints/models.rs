@@ -468,7 +468,10 @@ async fn fetch_models_from(
     match resp.json::<Value>().await {
         Ok(json) => upstream_models(&json, ProviderType::from_url(&url), page.as_ref()),
         Err(e) => {
-            warn!("Failed to parse upstream models from {shown}: {e}");
+            warn!(
+                "Failed to parse upstream models from {shown}: {}",
+                e.without_url()
+            );
             None
         }
     }
@@ -1475,5 +1478,40 @@ mod tests {
         assert_eq!(bearer_token(&headers), None);
         headers.insert("x-api-key", HeaderValue::from_static("key-1"));
         assert_eq!(bearer_token(&headers).as_deref(), Some("key-1"));
+    }
+
+    /// An upstream at an address with a query whose model list is no JSON:
+    /// the line about it does not repeat the query. The HTTP client's text of
+    /// a failed body read ends with the request URL too.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn an_unparsed_upstream_list_goes_without_the_clients_url_in_its_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only server answering no JSON; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|| async { "not json" }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let models = fetch_models_from(
+            http_client(),
+            format!("http://127.0.0.1:{port}?token=s3cret"),
+            None,
+            None,
+        )
+        .await;
+        server.abort();
+
+        assert!(models.is_none());
+        assert!(logs_contain("Failed to parse upstream models"));
+        assert!(!logs_contain("s3cret"));
     }
 }

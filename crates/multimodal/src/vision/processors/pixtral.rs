@@ -486,6 +486,39 @@ mod tests {
         }
     }
 
+    /// A container may be longer than its image: `ImageBuffer::from_raw` takes
+    /// any that is long enough.
+    #[test]
+    fn a_longer_container_gives_the_planes_of_its_image() {
+        let processor = PixtralProcessor::new();
+        let exact = lcg_rgb_image(64, 48, 5);
+        let mut container = exact.to_rgb8().into_raw();
+        container.extend_from_slice(&[0xAB; 7]);
+        let longer = RgbImage::from_raw(64, 48, container).unwrap();
+        let longer = DynamicImage::ImageRgb8(longer);
+
+        assert_eq!(
+            processor.planes_of(&longer).unwrap(),
+            processor.planes_of(&exact).unwrap()
+        );
+    }
+
+    /// The same through the resize: 65x48 is not a target size.
+    #[test]
+    fn a_longer_container_resizes_as_its_image() {
+        let processor = PixtralProcessor::new();
+        let exact = lcg_rgb_image(65, 48, 5);
+        let mut container = exact.to_rgb8().into_raw();
+        container.extend_from_slice(&[0xAB; 7]);
+        let longer = RgbImage::from_raw(65, 48, container).unwrap();
+        let longer = DynamicImage::ImageRgb8(longer);
+
+        assert_eq!(
+            processor.planes_of(&longer).unwrap(),
+            processor.planes_of(&exact).unwrap()
+        );
+    }
+
     /// The reference's rule on a mixed-size batch of solid images, written
     /// out: inside its grid an image holds the fused normalize value of its
     /// level (the bits the single-image test above pins), beyond it +0.0;

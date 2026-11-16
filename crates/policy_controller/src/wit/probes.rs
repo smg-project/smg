@@ -19,8 +19,8 @@ use crate::{
     sessions::SessionVerdict,
     view::{
         AffinityFacts, Candidate, HashKind, Header, Health, Identity, LoadRow, MediaCounts,
-        ModelFingerprint, OverloadRegime, Phase, PoolFacts, RequestFacts, Role, Session,
-        SignalSource, WireModes, WorkerId, ZoneCapacity,
+        ModelFingerprint, NamedAffinity, OverloadRegime, Phase, PoolFacts, RequestFacts, Role,
+        Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
     },
 };
 
@@ -77,6 +77,9 @@ wit! {
     // Host-only: a guest reads the request's affinity column as five fields
     // of each candidate.
     &[AffinityFacts] => "host-only",
+    // Host-only: the rows a host names in that column's place stay in
+    // process, as the column does.
+    Option<NamedAffinity<'_>> => "host-only",
 }
 
 // The spellings above that look inside a type, tied to it: an inner width that
@@ -198,9 +201,9 @@ pub(crate) fn all() -> Vec<Probe> {
         probe!("request", before [], RequestFacts {
             model, namespace_seed, tenant, priority, streaming, max_output_tokens,
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
-            budget_micros, headers, media, seed, block_size, now_micros, affinity,
+            budget_micros, headers, media, seed, block_size, now_micros, affinity, named,
             model_fingerprint,
-        } host [now_micros, affinity, model_fingerprint], &request),
+        } host [now_micros, affinity, named, model_fingerprint], &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),
         probe!("pool", before [], PoolFacts {
             pool_size, membership_epoch, ring_epoch, regime, generation, zones,

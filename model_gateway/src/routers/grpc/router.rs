@@ -886,6 +886,7 @@ impl GrpcRouter {
             &*tokenizer,
             prompt.messages,
             record_media,
+            !tools.is_empty(),
         )
         .await?;
         message_utils::count_input_tokens(

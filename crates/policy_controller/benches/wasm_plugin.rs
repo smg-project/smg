@@ -102,6 +102,7 @@ fn engine_of(profile: Profile) -> Engine {
             profile: 0,
             decode_profile: None,
             sessions: None,
+            overload: None,
         }],
         1,
         Needs::default(),

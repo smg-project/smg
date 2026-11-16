@@ -68,6 +68,10 @@ pub struct LoadSample {
 /// whose row is the newer; a poll never counts as the stream working, so the
 /// worker stays polled until its records resume.
 ///
+/// Every write that changes what is on file for an engine judges the
+/// engine's overload verdict once, when the write is whole: a record, a
+/// report, the word that no report came, an eviction.
+///
 /// A worker's rows live exactly as long as its membership row: the write
 /// that removes or replaces the worker deletes them, and a record or a
 /// report for a worker that is not a member is dropped, so a read that lands
@@ -84,9 +88,26 @@ pub trait LoadSink: Send + Sync {
         source: LoadSource,
     );
 
-    /// A poll's report of the worker, one row per rank, asked at
-    /// `polled_at`.
-    fn report(&self, id: WorkerId, rows: &[(u16, LoadRow)], polled_at: Instant, source: LoadSource);
+    /// One engine's answer to the poll asked at `polled_at`, whole: for
+    /// each rank the poll was for, under the rank's own id, the row the
+    /// answer brought, or `None` where it brought none. The rows are
+    /// written and the engine is judged once, so two ranks that trade
+    /// their load in one answer are never read as one new rank beside one
+    /// old. A rank the answer omits keeps what is on file. An answer with
+    /// no row for any rank of an engine is the word that no report came:
+    /// nothing on file changes, and the engine's overload verdict reads
+    /// clear until its next record or report. The word stands over no
+    /// engine a rank of which pushed since the poll began, whether the
+    /// answer names that rank or not. Whether a stream still serves a
+    /// rank the poll was not for is the caller's to know, by the
+    /// freshness it chose the poll's ranks with: it says the word only
+    /// for a poll that left out no such rank.
+    fn report(
+        &self,
+        answer: &[(WorkerId, u16, Option<LoadRow>)],
+        polled_at: Instant,
+        source: LoadSource,
+    );
 
     /// The poll decision for the worker at `now` under the poll `interval`.
     fn poll_mode(&self, id: WorkerId, now: Instant, interval: Duration) -> PollMode;

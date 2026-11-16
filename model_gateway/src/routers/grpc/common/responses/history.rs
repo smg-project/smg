@@ -552,7 +552,7 @@ async fn resolve_item_references(
         };
         // a stored item that has no input form (a built-in tool call, an older
         // schema) exists but cannot be re-injected: say so, not "not found"
-        match serde_json::from_value::<ResponseInputOutputItem>(candidate.clone()) {
+        match ResponseInputOutputItem::deserialize(candidate) {
             Ok(found) => resolved.push(found),
             Err(e) => {
                 let item_type = candidate
