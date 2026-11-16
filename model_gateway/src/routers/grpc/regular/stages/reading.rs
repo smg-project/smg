@@ -1026,7 +1026,8 @@ mod tests {
     /// replay decides alone, a new turn the prompt leaves outside the thought is not reasoning
     /// whatever the thinking switch says: the forced call's tag is the same with the switch on
     /// and off, wherever the model's workers start a grammar, and request building says the
-    /// same of the turn. A channel the prompt opened is still read as open with the switch off.
+    /// same of the turn from the replay preparation stored. A channel the prompt opened is
+    /// still read as open with the switch off.
     #[test]
     fn preparation_reads_the_thought_by_request_buildings_rule() {
         const NEW_TURN: &str = "<|turn>user\nhi<turn|>\n<|turn>model\n";
@@ -1043,9 +1044,9 @@ mod tests {
             ctx.state.parser = Some(ParserChoice::Symphony);
             ctx.state.tokenizer = Some(Arc::clone(&tokenizer));
             let tools = chat.tools.clone().unwrap_or_default();
-            let tag = |prompt: &str, switch: bool| {
-                let prepared = prepare(
-                    &ctx,
+            let prepared_for = |ctx: &RequestContext, prompt: &str, switch: bool| {
+                prepare(
+                    ctx,
                     Asks::Chat(&chat),
                     &tools,
                     prompt,
@@ -1054,8 +1055,10 @@ mod tests {
                     "test",
                 )
                 .map_err(|response| response.status())
-                .expect("nothing refused");
-                format!("{:?}", prepared.constraint)
+                .expect("nothing refused")
+            };
+            let tag = |prompt: &str, switch: bool| {
+                format!("{:?}", prepared_for(&ctx, prompt, switch).constraint)
             };
             let new_turn = tag(NEW_TURN, false);
             assert!(
@@ -1079,17 +1082,24 @@ mod tests {
                     "the open channel's close stands before the call"
                 );
             }
-            for switch in [true, false] {
-                assert_eq!(
-                    reasoning_decision(&ctx, SERVED, NEW_TURN, |_| switch),
-                    (false, false),
-                    "request building over a new turn, the switch {switch}"
-                );
-                assert_eq!(
-                    reasoning_decision(&ctx, SERVED, OPENED, |_| switch),
-                    (true, false),
-                    "request building over an opened channel, the switch {switch}"
-                );
+            // Request building reads what preparation stored for the request, as the chat and
+            // Messages stages store it: the table's replay of the prompt, not one built again.
+            for (prompt, open) in [(NEW_TURN, false), (OPENED, true)] {
+                for switch in [true, false] {
+                    let prepared = prepared_for(&ctx, prompt, switch);
+                    let table = match &prepared.reading {
+                        Some(Reading::Table(format, _)) => Some(format.name()),
+                        _ => None,
+                    };
+                    assert_eq!(table, Some("gemma4"), "the table the card names reads");
+                    ctx.state.parser_names = Some(prepared.names);
+                    ctx.state.prompt_thought = Some(prepared.prompt_thought);
+                    assert_eq!(
+                        reasoning_decision(&ctx, SERVED, prompt, |_| switch),
+                        (open, false),
+                        "request building over {prompt:?}, the switch {switch}"
+                    );
+                }
             }
         }
     }
