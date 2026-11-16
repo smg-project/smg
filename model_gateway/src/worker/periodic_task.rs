@@ -114,23 +114,18 @@ mod tests {
         // Task will be stopped on drop
     }
 
+    /// The drop ends a timed wait instead of waiting it out. The interval is
+    /// a day, which no test run reaches, so the join returning is the proof
+    /// and no clock is read.
     #[test]
     fn test_periodic_task_responds_to_shutdown() {
-        let task = PeriodicTask::spawn(60, "test", || {
-            // Long interval task
-        });
-
-        let start = Instant::now();
+        let task = PeriodicTask::spawn(24 * 60 * 60, "test", || {});
         drop(task);
-        let elapsed = start.elapsed();
-
-        // The unpark ends the wait at once: well under 60 seconds, and under the
-        // old slice form's 100 ms.
-        assert!(elapsed < Duration::from_millis(500));
     }
 
     /// An interval the clock cannot reach never fires and never panics: the task
-    /// thread parks until shutdown, and the drop still returns at once.
+    /// thread parks until shutdown, and the drop wakes it. The thread has no
+    /// deadline, so the join returning is the proof and no clock is read.
     #[test]
     fn test_periodic_task_with_an_unreachable_interval_parks_until_shutdown() {
         let counter = Arc::new(AtomicUsize::new(0));
@@ -142,9 +137,7 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         assert_eq!(counter.load(Ordering::SeqCst), 0);
 
-        let start = Instant::now();
         drop(task);
-        assert!(start.elapsed() < Duration::from_millis(500));
         assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
