@@ -135,10 +135,21 @@ impl MemoryStore {
     /// standing one is refused by naming the standing one, and nothing is
     /// published: a reader that saw a generation never sees a lower one,
     /// and a document that names no generation (number 0) is never applied.
+    ///
+    /// The generation applied before the standing one is let go here, by
+    /// the applying thread and outside the store's lock, and so is a
+    /// generation the store refuses.
     pub fn apply(&self, spec: AppliedSpec) -> Result<(), StaleGeneration> {
-        let mut loads = self.loads.lock();
-        let world = loads.writer.apply(Arc::new(spec))?;
-        self.world.store(world);
+        // The writer takes a second reference: when it refuses, the last
+        // one is this one, let go after the lock.
+        let spec = Arc::new(spec);
+        let before = {
+            let mut loads = self.loads.lock();
+            let (world, before) = loads.writer.apply(Arc::clone(&spec))?;
+            self.world.store(world);
+            before
+        };
+        drop(before);
         Ok(())
     }
 

@@ -26,7 +26,10 @@
 //!   gateway's vetoes by a walk, the third by a search;
 //! - `policy_store/veto_write/512` and `policy_store/member_write/512`: one
 //!   veto's write and one membership write beside 512 standing vetoes of
-//!   eight other gateways.
+//!   eight other gateways;
+//! - `policy_store/member_write_spread/512`: one membership write beside
+//!   6,144 standing vetoes of twelve other gateways, the 512 members spread
+//!   over 64 pools.
 //!
 //! `policy_store_vetoes/*` are the veto cells outside the gate: `k3/<n>`
 //! with three vetoes of the asking gateway, `foreign8/<n>` with eight other
@@ -225,12 +228,14 @@ fn floor(c: &mut Criterion, fixtures: &mut [Fixture]) {
 /// with one and eight, and `policy_store_vetoes/k3/<n>` with three. Of other
 /// gateways alone, which mask nothing for the asking one:
 /// `policy_store_vetoes/foreign8/<n>` (eight gateways on one member) and
-/// `policy_store_vetoes/foreign64/<n>` (eight gateways on eight members).
-/// Of the asking gateway and of others on one member, one veto each, which
-/// is every gateway vetoing one sick worker:
-/// `policy_store/view_build_gateways8/8` and
-/// `policy_store/view_build_gateways64/8`, beside eight and sixty-four
-/// others.
+/// `policy_store_vetoes/foreign64/<n>` (eight gateways on eight members),
+/// which the pool of eight reads again as the gated
+/// `policy_store/view_build_foreign64/8`. Of the asking gateway and of
+/// others on one member, one veto each, which is every gateway vetoing one
+/// sick worker: `policy_store/view_build_gateways8/8`,
+/// `policy_store/view_build_gateways64/8` and
+/// `policy_store/view_build_gateways512/8`, beside eight, sixty-four and
+/// 512 others.
 fn vetoed(c: &mut Criterion, fixtures: &mut [Fixture]) {
     for fixture in fixtures.iter_mut() {
         let n = fixture.n;
@@ -402,6 +407,73 @@ fn writes_beside_vetoes(c: &mut Criterion, fixtures: &mut [Fixture]) {
     }
     assert_eq!(build(store, &ask, &mut fixture.out), n);
     assert!(fixture.out.candidates.iter().all(|row| !row.health.stalled));
+}
+
+/// A membership write beside vetoes spread over pools, in a store of its
+/// own: 512 members, eight to a pool over 64 pools, and twelve other
+/// gateways each holding a veto on every member, 6,144 in all.
+/// `policy_store/member_write_spread/<n>` is one membership write, a worker
+/// joining the first pool and leaving it in turn. Each is a full rebuild of
+/// every pool's runs, where a gateway's list spans the pools and a run
+/// holds one pool's share of it.
+fn member_write_beside_spread_vetoes(c: &mut Criterion) {
+    const MEMBERS: usize = 512;
+    const POOLS: usize = 64;
+    let store = MemoryStore::new();
+    let opened = Instant::now();
+    let facts = |key: String, pool: usize| WorkerFacts {
+        engine: key.clone(),
+        key,
+        incarnation: 1,
+        models: vec![format!("spread-{pool}")],
+        dp_size: 1,
+        max_running: Some(4),
+        ..WorkerFacts::default()
+    };
+    let ids: Vec<WorkerId> = (0..MEMBERS)
+        .map(|index| {
+            let id = store
+                .upsert(facts(format!("http://s{index}:8000"), index % POOLS))
+                .id();
+            let revision = WorkersStore::get(&store, id).expect("the row").revision;
+            store
+                .set_status(id, WorkerStatus::Ready, revision)
+                .expect("ready");
+            store.record(id, 0, record_of(index, 0), opened, LoadSource::Stream);
+            id
+        })
+        .collect();
+    let opened = opened + PUBLISH_WINDOW;
+    store.publish(opened);
+    assert_eq!(store.publish_due(), None);
+    let until = opened + Duration::from_secs(3_600);
+    for gateway in (2..14).map(GatewayId) {
+        for id in &ids {
+            store.gateway_veto(gateway, *id, Some(until));
+        }
+    }
+    let joining = facts("http://joining-spread:8000".to_string(), 0);
+    let mut joined = None;
+    let mut group = c.benchmark_group("policy_store");
+    group.bench_with_input(
+        BenchmarkId::new("member_write_spread", MEMBERS),
+        &MEMBERS,
+        |b, _| {
+            b.iter(|| match joined.take() {
+                Some((id, revision)) => {
+                    store
+                        .remove(id, revision)
+                        .expect("the joined worker leaves");
+                }
+                None => {
+                    let id = store.upsert(black_box(joining.clone())).id();
+                    let revision = WorkersStore::get(&store, id).expect("the row").revision;
+                    joined = Some((id, revision));
+                }
+            });
+        },
+    );
+    group.finish();
 }
 
 fn view_build(c: &mut Criterion, fixtures: &mut [Fixture]) {
@@ -685,6 +757,7 @@ fn store_view(c: &mut Criterion) {
     cadence(c, &mut fixtures);
     vetoed(c, &mut fixtures);
     writes_beside_vetoes(c, &mut fixtures);
+    member_write_beside_spread_vetoes(c);
 }
 
 criterion_group!(benches, store_view);
