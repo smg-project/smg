@@ -39,7 +39,14 @@ pub(super) const BLOCK: usize = 64;
 pub(super) const MIN_BYTES: usize = 8 * BLOCK;
 
 /// The farthest the scanner walks before it tries the pass again where the
-/// pass found no ASCII stretch.
+/// pass found no ASCII stretch. The walk doubles from two blocks to this
+/// cap: a long part beyond ASCII pays one test of two blocks per walk, and
+/// the ASCII behind such a part waits for the pass no longer than the cap.
+/// The cap is chosen, not tuned. Counted on mixed text: a cap of 8 blocks
+/// runs 1.7 to 2.3 % fewer instructions at 32k to 500k tokens and within
+/// 0.4 % either way at 2k tokens; a cap of 512 blocks runs 2.3 to 3.6 %
+/// more at 32k to 500k tokens and the same at 2k. Time was measured at
+/// neither.
 pub(super) const MAX_WALK: usize = 64 * BLOCK;
 
 /// Moves the flag in byte `i` of a word to bit `56 + i` of the product, no

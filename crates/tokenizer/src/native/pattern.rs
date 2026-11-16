@@ -5215,6 +5215,45 @@ mod tests {
         let mut cut = Vec::new();
         reader.for_each_match(&late, false, |s, e| cut.push((s, e)));
         assert_eq!(cut, template.find_iter(&late).collect::<Vec<_>>());
+        // A blank run behind a line break that runs through the whole next
+        // block, which no generated text is likely to hold. Where the run
+        // ends beyond ASCII the pass declines the block: that character may
+        // be whitespace too, and then the run goes on to a later break and
+        // the blank behind the first break starts no piece. The scanner
+        // says, and the text is cut the same.
+        let lead = "ab ".repeat(40);
+        let tail = " cd".repeat(200);
+        for beyond in ["\u{A0}", "\u{2028}", "é"] {
+            let declined = format!("{lead}\n{}{beyond}\n x{tail}", " ".repeat(140));
+            let reader = template
+                .by_blocks(&declined)
+                .expect("a stretch at the first place");
+            let mut cut = Vec::new();
+            reader.for_each_match(&declined, false, |s, e| cut.push((s, e)));
+            assert_eq!(
+                cut,
+                template.find_iter(&declined).collect::<Vec<_>>(),
+                "{beyond:?}"
+            );
+        }
+        // Where the run goes to the end of the text no break follows it:
+        // the blank behind the break starts the last piece, and the pass
+        // cuts every piece before it.
+        let to_the_end = format!("{}\n{}", "ab ".repeat(168), " ".repeat(140));
+        let by_scanner: Vec<(usize, usize)> = template.find_iter(&to_the_end).collect();
+        let Matcher::Template(scanner) = &template.matcher else {
+            panic!("the template's scanner");
+        };
+        let mut cut = Vec::new();
+        let open = block::pieces(
+            to_the_end.as_bytes(),
+            0,
+            scanner.digit_cap,
+            |pos| clitic_match(&template.classes, &to_the_end, pos, &scanner.clitics),
+            &mut |start, end| cut.push((start, end)),
+        );
+        let (last, before_last) = by_scanner.split_last().expect("pieces");
+        assert_eq!((cut.as_slice(), open), (before_last, last.0));
         for other in [
             CL100K.replace(r"[\r\n]*", r"[\r\n/]*"),
             CL100K.replace(r"\p{L}+", "[A-Za-z]+"),
