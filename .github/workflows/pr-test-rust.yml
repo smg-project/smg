@@ -886,6 +886,7 @@ jobs:
               - 'scripts/ci_rust_tests.sh'
               - 'examples/wasm/wasm-guest-storage-hook/**'
               - 'examples/wasm/wasm-guest-storage-hook-passthrough/**'
+              - 'examples/policy-controller/**'
             # --- The Rust test shards (scripts/ci_rust_tests.sh) ---
             # A shard of rust-tests runs on a pull request that touches a crate
             # of its dependency closure (the directories below: every
@@ -982,6 +983,7 @@ jobs:
               - 'crates/mesh/**'
               - 'crates/mm_rdma/**'
               - 'crates/policy_controller/**'
+              - 'examples/policy-controller/**'
               - 'examples/wasm/wasm-guest-policy/**'
               - 'scripts/ci_install_wasm_tools.sh'
               - 'crates/radix_tree/**'

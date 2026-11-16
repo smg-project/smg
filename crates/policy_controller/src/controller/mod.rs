@@ -30,6 +30,7 @@ mod gateways;
 pub mod metrics;
 mod principal;
 pub mod readiness;
+mod run;
 mod service;
 mod session;
 pub mod tls;
@@ -53,6 +54,7 @@ pub use self::{
     election::{Election, LeaseError, LeasePlace},
     principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},
+    run::run,
     tls::TlsError,
 };
 use self::{
@@ -62,6 +64,7 @@ use self::{
     service::{Service, Shared},
 };
 use crate::{
+    catalog::Catalog,
     elector::{Elector, Fence},
     ingest::{
         loads::{LoadDriver, LoadDriverConfig},
@@ -91,6 +94,9 @@ pub const SERVICE_NAME: &str = "smg.policy.v1.PolicyController";
 /// A controller with its listeners bound and nothing served yet.
 pub struct Controller {
     config: Config,
+    /// The stages a policy document may name, fixed at the bind: the stock
+    /// build's, or the host's own.
+    catalog: Catalog,
     phase: watch::Sender<Phase>,
     readiness: Readiness,
     metrics: Arc<metrics::Metrics>,
@@ -251,14 +257,29 @@ pub enum Error {
 }
 
 impl Controller {
+    /// [`Controller::bind_with`] over the stock build's stages.
+    pub async fn bind(config: Config) -> Result<Self, Error> {
+        Self::bind_with(config, Catalog::builtin()).await
+    }
+
     /// Validates the configuration, installs the process crypto provider,
     /// reads and parses every listener's TLS material, binds every address,
     /// opens the lease's place and builds the store. Nothing is served yet
     /// and no lease is taken, so a refusal arrives before a client can
-    /// connect.
-    pub async fn bind(config: Config) -> Result<Self, Error> {
+    /// connect. A policy document names the stages `catalog` holds: the
+    /// stock build's and the ones the host added.
+    pub async fn bind_with(config: Config, catalog: Catalog) -> Result<Self, Error> {
         config.validate()?;
         tls::install_crypto_provider();
+        // The stages a policy document may name in this build, the host's
+        // own among them.
+        info!(
+            controller_id = %config.controller_id,
+            filters = ?catalog.filters().collect::<Vec<_>>(),
+            scorers = ?catalog.scorers().collect::<Vec<_>>(),
+            pickers = ?catalog.pickers().collect::<Vec<_>>(),
+            "stages held"
+        );
         let mut listeners = Vec::with_capacity(config.listeners.len());
         for listener in &config.listeners {
             let name = listener.name.clone();
@@ -347,6 +368,7 @@ impl Controller {
         let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
         Ok(Self {
             config,
+            catalog,
             phase,
             readiness,
             metrics: Arc::new(metrics::Metrics::new()),
@@ -414,6 +436,13 @@ impl Controller {
             "identities are taken as told on this listener: nothing is verified, and whoever reaches it acts as any principal of its scopes"
         );
         Ok(())
+    }
+
+    /// The stages a policy document may name in this controller, fixed at
+    /// the bind. No call hands it a document yet, so a host judges one
+    /// against them here, as the controller will.
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
     }
 
     /// The store the ingestion drivers and the scopes' calls feed and read.

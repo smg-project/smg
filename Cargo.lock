@@ -5793,6 +5793,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "policy-controller-example"
+version = "0.1.0"
+dependencies = [
+ "serde_yaml",
+ "smg-policy-controller",
+ "tokio",
+]
+
+[[package]]
 name = "polling"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
