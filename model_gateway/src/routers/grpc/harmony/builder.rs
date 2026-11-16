@@ -25,7 +25,7 @@ use openai_protocol::{
     },
 };
 use serde_json::json;
-use tracing::{debug, trace, warn};
+use tracing::{debug, enabled, trace, warn, Level};
 
 use super::types::HarmonyBuildOutput;
 use crate::routers::grpc::{
@@ -529,18 +529,21 @@ impl HarmonyBuilder {
             .flat_map(|set| set.into_iter())
             .collect();
 
-        // Decode tokens to see what the model actually receives
-        let decoded_text = encoding
-            .tokenizer()
-            .decode_utf8(&token_ids)
-            .unwrap_or_else(|_| "<decode error>".to_string());
-        trace!(
-            token_count = token_ids.len(),
-            token_preview = ?&token_ids[..token_ids.len().min(20)],
-            decoded_length = decoded_text.len(),
-            "Encoded conversation to tokens - decoded text follows:"
-        );
-        trace!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
+        // What the model receives, decoded back for the trace lines alone:
+        // a pass over every prompt token, so it runs only when they print.
+        if enabled!(Level::TRACE) {
+            let decoded_text = encoding
+                .tokenizer()
+                .decode_utf8(&token_ids)
+                .unwrap_or_else(|_| "<decode error>".to_string());
+            trace!(
+                token_count = token_ids.len(),
+                token_preview = ?&token_ids[..token_ids.len().min(20)],
+                decoded_length = decoded_text.len(),
+                "Encoded conversation to tokens - decoded text follows:"
+            );
+            trace!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
+        }
 
         Ok(HarmonyBuildOutput {
             input_ids: token_ids,
@@ -1363,6 +1366,7 @@ mod tests {
         responses::{ImageGenerationTool, ResponseInput, ResponseTool, ResponsesRequest},
     };
     use smg_grpc_client::vllm_proto as vllm;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::routers::grpc::common::responses::utils::namespace_test_request;
@@ -2254,5 +2258,29 @@ mod tests {
             "messages": [{"role": "user", "content": "Check Hangzhou weather."}]
         }));
         assert_eq!(prompt, REQUEST_TOOLS);
+    }
+
+    /// With trace logging on, a Responses build still writes its two trace
+    /// lines from the prompt decoded back: the decoded length on the first,
+    /// the text under the marker of the second.
+    #[test]
+    #[traced_test]
+    fn build_from_responses_traces_the_decoded_prompt() {
+        let request = ResponsesRequest {
+            model: "gpt-oss-120b".to_string(),
+            input: ResponseInput::Text("draw a cat".to_string()),
+            ..Default::default()
+        };
+        let output = HarmonyBuilder::new()
+            .build_from_responses(&request)
+            .expect("harmony build must succeed");
+        let decoded = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .expect("decode harmony tokens back to UTF-8");
+
+        assert!(logs_contain(&format!("decoded_length={}", decoded.len())));
+        assert!(logs_contain("DECODED_TEXT_START"));
     }
 }
