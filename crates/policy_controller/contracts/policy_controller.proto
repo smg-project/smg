@@ -82,18 +82,18 @@
 // frame over the transport's limit of 4 MiB a message, a Decide frame over
 // 64 KiB as encoded, or a ceiling of the controller's: a Hello past 4,096
 // present gateways, a Hello that lists more than 4,096 vetoes or more than
-// eight kinds for one worker, a ninth kind of veto on one worker;
-// ALREADY_EXISTS a Hello whose id collides with another present gateway's,
-// refused while that one stands, or an add of a registered URL; NOT_FOUND a
-// replace of an absent URL, or no worker under the id; DEADLINE_EXCEEDED a
-// Session stream that said no Hello within 5 s of its open; UNAVAILABLE a
-// standby not yet synced, a read a standby cannot serve yet (WatchWorkers
-// until its replica follows the leader's log, a NotLeader in the status
-// details), a leader that does not write under its term (the moment after
-// its take: retry; and for as long as its log followed a term at or above
-// the one it took: no registration numbers a life under it), or a Decide
-// stream open when the controller closes its listeners at its shutdown (its
-// gateway opens the next one on the leader);
+// eight kinds for one worker, a ninth kind of veto on one worker, a veto
+// past the 4,096 one gateway holds; ALREADY_EXISTS a Hello whose id collides
+// with another present gateway's, refused while that one stands, or an add
+// of a registered URL; NOT_FOUND a replace of an absent URL, or no worker
+// under the id; DEADLINE_EXCEEDED a Session stream that said no Hello within
+// 5 s of its open; UNAVAILABLE a standby not yet synced, a read a standby
+// cannot serve yet (WatchWorkers until its replica follows the leader's log,
+// a NotLeader in the status details), a leader that does not write under its
+// term (the moment after its take: retry; and for as long as its log
+// followed a term at or above the one it took: no registration numbers a
+// life under it), or a Decide stream open when the controller closes its
+// listeners at its shutdown (its gateway opens the next one on the leader);
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read
 // under a term the election left before its seat was taken, or a session
 // a newer one of its gateway replaced, or a worker row that moved under a
@@ -195,8 +195,9 @@ message Hello {
   // veto the list omits is lifted, whether or not the Hello says `resume`.
   // An entry with nothing remaining is no veto; of two entries of one
   // worker and kind the later end stands. A list holds at most 4,096
-  // vetoes and at most eight kinds for one worker: a Hello past either is
-  // refused RESOURCE_EXHAUSTED and makes no session.
+  // vetoes and, of those with time remaining, at most eight kinds for one
+  // worker: a Hello past either is refused RESOURCE_EXHAUSTED and makes no
+  // session.
   repeated VetoAssertion vetoes = 17;
   // Never assigned; kept out of use so a later field takes a fresh number.
   reserved 12 to 15;
@@ -255,9 +256,10 @@ message GatewayVeto {
   // for stands and clears like the named ones. KIND_UNSPECIFIED is no kind:
   // the session ends with INVALID_ARGUMENT, and a Hello that lists it is
   // refused the same way. A worker holds at most eight kinds for one
-  // gateway: a frame that would set a ninth ends the session with
-  // RESOURCE_EXHAUSTED, and what stands stays. A clear, and a frame of a
-  // kind that stands, are always taken.
+  // gateway, and a gateway at most 4,096 vetoes, what its Hello lists
+  // whole: a frame that would set a ninth kind, or one veto more, ends the
+  // session with RESOURCE_EXHAUSTED, and what stands stays. A clear, and a
+  // frame of a kind that stands, are always taken.
   enum Kind {
     KIND_UNSPECIFIED = 0;
     KIND_BREAKER = 1;

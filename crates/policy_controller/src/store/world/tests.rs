@@ -19,8 +19,8 @@ use crate::{
     spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
         pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MembershipTail,
-        MemoryStore, Overload, PairingDescriptor, Reachability, WorkerFacts, WorkerPatch,
-        WorkerRow, WorkerStatus, WorkersStore,
+        MemoryStore, Overload, PairingDescriptor, Reachability, VetoWrite, WorkerFacts,
+        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
@@ -1158,6 +1158,32 @@ fn a_gateways_veto_masks_the_worker_for_that_gateway_until_its_end_or_its_clear(
     let again = member(&store, "http://b:8000");
     assert_eq!(again, other, "the same key and incarnation is the same id");
     assert_eq!(stalled(ASKER, t0), []);
+}
+
+/// The noted write shows the world what the plain one shows: a veto set
+/// with no note behind it masks the worker for its gateway alone, a later
+/// end behind a note that stands is the end shown, and a noted clear lifts
+/// the mask.
+#[test]
+fn a_noted_veto_is_shown_and_lifted_in_the_published_world() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let vetoed = member(&store, "http://a:8000");
+    let until = t0 + Duration::from_secs(1);
+    let written = store.gateway_veto_noted(ASKER, vetoed, Some(until), false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(stalled(&store, ASKER, t0), [vetoed]);
+    assert_eq!(stalled(&store, GatewayId(2), t0), []);
+    assert_eq!(stalled(&store, ASKER, until), []);
+
+    let later = until + Duration::from_secs(1);
+    let written = store.gateway_veto_noted(ASKER, vetoed, Some(later), true, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(stalled(&store, ASKER, until), [vetoed]);
+
+    let written = store.gateway_veto_noted(ASKER, vetoed, None, true, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(stalled(&store, ASKER, t0), []);
 }
 
 #[test]

@@ -52,7 +52,7 @@ use tracing::{debug, info};
 
 use super::{
     decide,
-    gateways::{over_kinds, Refused, Seat, Vetoed, KINDS_MAX},
+    gateways::{over_kinds, Refused, Seat, Vetoed, KINDS_MAX, VETOES_MAX},
     lifecycle,
     principal::Principal,
     service::Shared,
@@ -83,8 +83,8 @@ pub(crate) const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 /// The refusal of a `Hello` on a replica that does not lead.
 const NOT_LEADING: &str = "this controller does not lead: find the leader through Leader";
 
-/// How many vetoes a `Hello` lists at most.
-const LISTED_MAX: usize = 4_096;
+/// How many vetoes a `Hello` lists at most: what a gateway holds.
+const LISTED_MAX: usize = VETOES_MAX;
 
 /// How often a gateway polls `Leader` for its term floor (design 5.3).
 const LEADER_POLL: Duration = Duration::from_secs(1);
@@ -472,9 +472,12 @@ fn listed(hello: &proto::Hello) -> Option<Status> {
             "Hello lists a veto of no kind: KIND_UNSPECIFIED is not a veto",
         ));
     }
+    // An entry with nothing remaining is no veto: it takes no place among
+    // a worker's kinds.
     let kinds = hello
         .vetoes
         .iter()
+        .filter(|veto| veto.remaining_micros > 0)
         .map(|veto| (WorkerId(veto.worker_id), veto.kind));
     over_kinds(kinds).then(|| {
         Status::resource_exhausted(format!(
@@ -512,6 +515,9 @@ fn vetoed(seat: &Seat, veto: &proto::GatewayVeto, now: Instant) -> Option<Status
         // store does not hold: the session ends by name.
         Vetoed::Full => Some(Status::resource_exhausted(format!(
             "GatewayVeto would stand one kind more than the {KINDS_MAX} a worker holds for one gateway"
+        ))),
+        Vetoed::Over => Some(Status::resource_exhausted(format!(
+            "GatewayVeto would stand one veto more than the {VETOES_MAX} a gateway holds"
         ))),
     }
 }
@@ -596,7 +602,7 @@ mod tests {
             election::{LeasePlace, Standing},
             gateways::{
                 tests::{lease, PATIENT},
-                Gateways, Refused, KINDS_MAX,
+                Gateways, Refused, KINDS_MAX, VETOES_MAX,
             },
             lifecycle::tests::{a_completed, a_dispatched, a_released, worker},
             principal::{tests::told, Layer, ENTRY},
@@ -1734,6 +1740,97 @@ mod tests {
         assert_eq!(welcome.vetoes_restored, 1);
         // No wait: the veto was held before the Welcome left.
         assert!(vetoed(&bed, w));
+    }
+
+    /// A `Hello` of [`GATEWAY`] that lists `vetoes`, counted right.
+    fn hello_listing(vetoes: Vec<proto::VetoAssertion>) -> proto::GatewayFrame {
+        frame(
+            0,
+            Some(Frame::Hello(proto::Hello {
+                gateway_id: GATEWAY.to_owned(),
+                protocol_min: PROTOCOL_VERSION,
+                protocol_max: PROTOCOL_VERSION,
+                veto_count: u32::try_from(vetoes.len()).expect("a small number"),
+                vetoes,
+                ..proto::Hello::default()
+            })),
+        )
+    }
+
+    /// An entry with nothing remaining is no veto: it takes no place among
+    /// a worker's kinds. A ceiling of kinds that stand and one more that
+    /// ran out are a list the controller holds.
+    #[tokio::test]
+    async fn a_hellos_entry_with_nothing_remaining_takes_no_place_among_a_workers_kinds() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let w = worker(&bed.shared.store, "http://a:8000");
+        let kinds = i32::try_from(KINDS_MAX).expect("a small number");
+        let mut vetoes: Vec<proto::VetoAssertion> = (1..=kinds)
+            .map(|kind| proto::VetoAssertion {
+                worker_id: w.0,
+                kind,
+                remaining_micros: MINUTE,
+            })
+            .collect();
+        vetoes.push(proto::VetoAssertion {
+            worker_id: w.0,
+            kind: kinds + 1,
+            remaining_micros: 0,
+        });
+        let mut session = open(bed.addr).await;
+        session.send(hello_listing(vetoes)).await;
+        let welcome = match session.frame().await.frame {
+            Some(controller_frame::Frame::Welcome(welcome)) => welcome,
+            other => panic!("a Welcome answers a Hello: {other:?}"),
+        };
+        assert_eq!(
+            usize::try_from(welcome.vetoes_restored).ok(),
+            Some(KINDS_MAX)
+        );
+    }
+
+    /// A gateway holds a ceiling of vetoes, what its `Hello` lists whole:
+    /// the frame that would set one more ends the session by name, and
+    /// nothing of it is written.
+    #[tokio::test]
+    async fn a_veto_of_one_more_than_a_gateway_holds_ends_the_session_by_name() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let kinds = i32::try_from(KINDS_MAX).expect("a small number");
+        let vetoes: Vec<proto::VetoAssertion> = (0..VETOES_MAX / KINDS_MAX)
+            .flat_map(|n| {
+                let w = worker(&bed.shared.store, &format!("http://w{n}:8000"));
+                (1..=kinds).map(move |kind| proto::VetoAssertion {
+                    worker_id: w.0,
+                    kind,
+                    remaining_micros: MINUTE,
+                })
+            })
+            .collect();
+        let one_more = worker(&bed.shared.store, "http://one-more:8000");
+        let mut session = open(bed.addr).await;
+        session.send(hello_listing(vetoes)).await;
+        let welcome = match session.frame().await.frame {
+            Some(controller_frame::Frame::Welcome(welcome)) => welcome,
+            other => panic!("a Welcome answers a Hello: {other:?}"),
+        };
+        assert_eq!(
+            usize::try_from(welcome.vetoes_restored).ok(),
+            Some(VETOES_MAX)
+        );
+
+        session.send(veto(one_more, 1, MINUTE, false)).await;
+        assert_eq!(
+            session.status().await,
+            (
+                Code::ResourceExhausted,
+                format!(
+                    "GatewayVeto would stand one veto more than the {VETOES_MAX} a gateway holds"
+                )
+            )
+        );
+        assert!(!vetoed(&bed, one_more), "the refused veto is not written");
     }
 
     /// A worker holds a ceiling of kinds for one gateway: the frame that

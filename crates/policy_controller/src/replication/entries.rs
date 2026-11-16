@@ -44,6 +44,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("HealthSink", "probe_outcome", Fate::Journaled),
     ("HealthSink", "connected", Fate::Journaled),
     ("HealthSink", "gateway_veto", Fate::Rebuilt(HELLO)),
+    ("HealthSink", "gateway_veto_noted", Fate::Rebuilt(HELLO)),
     ("HealthSink", "vetoed", Fate::Read),
     (
         "HealthSink",

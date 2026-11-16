@@ -20,7 +20,7 @@ use crate::{
     lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
     spec::AppliedSpec,
     store::{
-        health::HealthSink,
+        health::{HealthSink, VetoWrite},
         index::{indexed_under, KvEvent, KvTables, LaneCounts},
         journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
@@ -1036,6 +1036,44 @@ impl HealthSink for MemoryStore {
                 self.show_veto(gateway, id, None);
             }
         }
+    }
+
+    fn gateway_veto_noted(
+        &self,
+        gateway: GatewayId,
+        id: WorkerId,
+        until: Option<Instant>,
+        stands: bool,
+        now: Instant,
+    ) -> VetoWrite {
+        // The workers lock first, as every writer takes it, and held to the
+        // end: a row leaves and comes back under it, so the note's check
+        // and the write read one membership.
+        let workers = self.workers.lock();
+        let mut health = self.health.lock();
+        // Asked only behind a note: a write with none reads no entry.
+        let left = stands
+            && !health
+                .vetoes
+                .get(&(gateway, id))
+                .is_some_and(|until| *until > now);
+        if left {
+            return VetoWrite::Left;
+        }
+        match until {
+            Some(until) => {
+                if !workers.rows.contains_key(&id) {
+                    return VetoWrite::NoRow;
+                }
+                health.vetoes.insert((gateway, id), until);
+                self.show_veto(gateway, id, Some(until));
+            }
+            None => {
+                health.vetoes.remove(&(gateway, id));
+                self.show_veto(gateway, id, None);
+            }
+        }
+        VetoWrite::Written
     }
 
     fn vetoed(&self, gateway: GatewayId, id: WorkerId, now: Instant) -> bool {
