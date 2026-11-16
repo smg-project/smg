@@ -320,7 +320,8 @@ impl Phi3VisionProcessor {
         // 4. The global image (336x336) comes first
         let tile = TILE_SIZE as usize;
         let end = values.len() + (self.num_crops + 1) * 3 * tile * tile;
-        values.extend(self.create_global_image(&tensor).iter());
+        let (global, _) = self.create_global_image(&tensor).into_raw_vec_and_offset();
+        values.extend_from_slice(&global);
 
         // 5. The HD image's tiles, row-major, as far as the crops go
         let (h, w) = (hd_h as usize, hd_w as usize);
