@@ -92,7 +92,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Single-worker: one model per job, one TP1 worker. The same models, images
-  # and runner as the multi-worker job.
+  # and runner as the multi-worker jobs.
   # ---------------------------------------------------------------------------
 
   # Bound GPU fan-out to two original rows per wave. Keep each row's full
@@ -101,7 +101,7 @@ jobs:
   single-vllm:
     name: "${{ matrix.model.id }} / single-${{ matrix.variant.id }}"
     needs: build-wheel
-    if: ${{ !cancelled() && needs.build-wheel.result == 'success' }}
+    if: ${{ !cancelled() && needs.build-wheel.result == 'success' && contains(fromJSON('["all","vllm"]'), github.event.inputs.runtime || 'all') }}
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
     container:
       image: ${{ matrix.variant.image }}
@@ -123,9 +123,7 @@ jobs:
         model:
           - { id: meta-llama/Llama-3.1-8B-Instruct, slug: meta-llama-Llama-3.1-8B-Instruct, test_class: TestNightlyLlama8bSingle }
           - { id: Qwen/Qwen3-30B-A3B, slug: Qwen-Qwen3-30B-A3B, test_class: TestNightlyQwen30bSingle }
-        # Each engine in its ROCm image of the CI's pin (scripts/ci_install_sglang.sh,
-        # scripts/ci_install_vllm.sh). SGLang builds its ROCm images per GPU
-        # architecture: mi30x for MI300X and MI325X, mi35x for MI355X.
+        # vLLM runs in the ROCm image pinned by CI.
         variant:
           - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f", setup: ci_setup_vllm_rocm_image.sh }
 
@@ -214,7 +212,7 @@ jobs:
   single-sglang:
     name: "${{ matrix.model.id }} / single-${{ matrix.variant.id }}"
     needs: [build-wheel, single-vllm]
-    if: ${{ !cancelled() && needs.build-wheel.result == 'success' }}
+    if: ${{ !cancelled() && needs.build-wheel.result == 'success' && contains(fromJSON('["all","sglang"]'), github.event.inputs.runtime || 'all') }}
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
     container:
       image: ${{ matrix.variant.image }}
@@ -327,7 +325,7 @@ jobs:
   multi-vllm:
     name: "${{ matrix.model.id }} / multi-${{ matrix.variant.id }}"
     needs: [build-wheel, single-sglang]
-    if: ${{ !cancelled() && needs.build-wheel.result == 'success' }}
+    if: ${{ !cancelled() && needs.build-wheel.result == 'success' && contains(fromJSON('["all","vllm"]'), github.event.inputs.runtime || 'all') }}
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
     container:
       image: ${{ matrix.variant.image }}
@@ -337,7 +335,7 @@ jobs:
     # and wait if the whole occupancy would cross Router's 05:00 UTC start.
     timeout-minutes: 360
     env:
-      E2E_STARTUP_TIMEOUT: "900" # as in single-worker
+      E2E_STARTUP_TIMEOUT: "900" # as in the single-worker jobs
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -395,7 +393,7 @@ jobs:
       - name: Run benchmark
         if: steps.filter.outputs.skip != 'true'
         env:
-          GPU_TYPE: MI300 # as in single-worker
+          GPU_TYPE: MI300 # as in the single-worker jobs
           E2E_NIGHTLY: "1"
           E2E_MODEL_TP_OVERRIDES: '{"meta-llama/Llama-3.1-8B-Instruct":1,"Qwen/Qwen3-30B-A3B":1}'
           E2E_LOG_DIR: nightly_gateway_logs
@@ -428,7 +426,7 @@ jobs:
   multi-sglang:
     name: "${{ matrix.model.id }} / multi-${{ matrix.variant.id }}"
     needs: [build-wheel, multi-vllm]
-    if: ${{ !cancelled() && needs.build-wheel.result == 'success' }}
+    if: ${{ !cancelled() && needs.build-wheel.result == 'success' && contains(fromJSON('["all","sglang"]'), github.event.inputs.runtime || 'all') }}
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
     container:
       image: ${{ matrix.variant.image }}
@@ -438,7 +436,7 @@ jobs:
     # and wait if the whole occupancy would cross Router's 05:00 UTC start.
     timeout-minutes: 360
     env:
-      E2E_STARTUP_TIMEOUT: "900" # as in single-worker
+      E2E_STARTUP_TIMEOUT: "900" # as in the single-worker jobs
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -496,7 +494,7 @@ jobs:
       - name: Run benchmark
         if: steps.filter.outputs.skip != 'true'
         env:
-          GPU_TYPE: MI300 # as in single-worker
+          GPU_TYPE: MI300 # as in the single-worker jobs
           E2E_NIGHTLY: "1"
           E2E_MODEL_TP_OVERRIDES: '{"meta-llama/Llama-3.1-8B-Instruct":1,"Qwen/Qwen3-30B-A3B":1}'
           E2E_LOG_DIR: nightly_gateway_logs
