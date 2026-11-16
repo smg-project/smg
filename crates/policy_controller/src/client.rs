@@ -15,11 +15,12 @@
 //! (`x-smg-principal`); a stated id is no credential. [`blocking::Client`]
 //! drives the same calls for a caller that runs no runtime.
 //!
-//! No wait of [`Client::connect`] outlasts [`ANSWER_WAIT`]. With
-//! [`Client::connect_with`] the dial and the calls keep the caller's
-//! time-outs, and the wait for the welcome keeps that bound.
+//! No wait of the client for its peer outlasts [`ANSWER_WAIT`], on any
+//! endpoint: the dial, each call from its send to its answer's end, and the
+//! session's call with its first frame. An endpoint's own time-outs end a
+//! wait sooner.
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use tokio::sync::mpsc;
 use tonic::{
@@ -41,11 +42,11 @@ use crate::{
 /// Frames the client may queue toward the controller.
 const SESSION_QUEUE: usize = 16;
 
-/// The bound on each wait of the client for its peer, as long as a
-/// controller waits for a session's hello: the dial and each call's answer
-/// on the endpoint [`Client::connect`] builds, and the session's first frame
-/// on any endpoint. An endpoint's own time-outs end at a call's response
-/// headers, which a controller sends before it reads the hello.
+/// The bound on each wait of the client for its peer: an answer a leader
+/// under load can give, and a wait a blocking caller can afford. The client
+/// lays it over the dial and over each call whole, since an endpoint's own
+/// time-outs end at a call's response headers and a peer may stall after
+/// them.
 pub const ANSWER_WAIT: Duration = Duration::from_secs(5);
 
 type Stub = PolicyControllerClient<InterceptedService<Channel, Principal>>;
@@ -62,6 +63,16 @@ pub enum Error {
     /// The dial failed.
     #[error("the connection failed: {0}")]
     Connect(#[source] tonic::transport::Error),
+    /// The peer did not answer inside the client's bound. Every wait of the
+    /// client that runs out ends as this kind and names the wait: the dial,
+    /// the `Leader` ask or the session's welcome.
+    #[error("no answer within {wait:?}: {what}")]
+    NoAnswer {
+        /// The wait that ran out.
+        what: &'static str,
+        /// The bound it ran out under.
+        wait: Duration,
+    },
     /// The controller answered the call with a status.
     #[error("the controller answered: {0}")]
     Status(#[source] Box<Status>),
@@ -69,8 +80,8 @@ pub enum Error {
     /// replica names it, empty when it knows none.
     #[error("the replica does not lead; it names the leader at {0:?}")]
     NotLeader(String),
-    /// The session ended, answered the hello with a frame that is no
-    /// welcome, or sent no frame within its bound.
+    /// The session ended, or answered the hello with a frame that is no
+    /// welcome.
     #[error("the session answered the hello with no welcome: {0}")]
     NoWelcome(String),
     /// The blocking form could not build its runtime.
@@ -126,8 +137,8 @@ struct Session {
 
 impl Session {
     /// Opens the stream with the hello as its first frame and takes the
-    /// welcome, which must come within `wait`. Returns the session and the
-    /// term its welcome came under.
+    /// welcome: the call's answer and its first frame must come within
+    /// `wait`. Returns the session and the term its welcome came under.
     async fn open(
         stub: &mut Stub,
         gateway_id: &str,
@@ -139,13 +150,15 @@ impl Session {
             .send(hello(gateway_id, floor))
             .await
             .map_err(|_| Error::NoWelcome("the session's queue is closed".to_owned()))?;
-        let mut answers = stub
-            .session(ReceiverStream::new(queued))
-            .await?
-            .into_inner();
-        let first = tokio::time::timeout(wait, answers.message())
-            .await
-            .map_err(|_| Error::NoWelcome(format!("no frame within {wait:?}")))??;
+        let opened = async {
+            let mut answers = stub
+                .session(ReceiverStream::new(queued))
+                .await?
+                .into_inner();
+            let first = answers.message().await?;
+            Ok::<_, Status>((answers, first))
+        };
+        let (answers, first) = answered("the session's welcome", wait, opened).await??;
         match first {
             Some(ControllerFrame {
                 term,
@@ -185,16 +198,26 @@ fn hello(gateway_id: &str, floor: u64) -> GatewayFrame {
     }
 }
 
-/// The endpoint with its dial and each of its calls bounded by `wait`.
-fn bounded(endpoint: Endpoint, wait: Duration) -> Endpoint {
-    endpoint.connect_timeout(wait).timeout(wait)
+/// `step` under the client's bound: a wait for the peer that outlasts
+/// `wait` is [`Error::NoAnswer`] and names `what`.
+async fn answered<T>(
+    what: &'static str,
+    wait: Duration,
+    step: impl Future<Output = T>,
+) -> Result<T, Error> {
+    tokio::time::timeout(wait, step)
+        .await
+        .map_err(|_| Error::NoAnswer { what, wait })
 }
 
-async fn ask_leader(stub: &mut Stub) -> Result<LeaderInfo, Error> {
+/// The `Leader` ask, whole: its send, its answer and the answer's end.
+async fn ask_leader(stub: &mut Stub, wait: Duration) -> Result<LeaderInfo, Error> {
     let request = LeaderRequest {
         model: String::new(),
     };
-    Ok(stub.leader(request).await?.into_inner())
+    Ok(answered("the Leader ask", wait, stub.leader(request))
+        .await??
+        .into_inner())
 }
 
 /// One gateway's side of the protocol over one channel.
@@ -202,6 +225,8 @@ async fn ask_leader(stub: &mut Stub) -> Result<LeaderInfo, Error> {
 pub struct Client {
     gateway_id: String,
     stub: Stub,
+    /// The bound on each wait for the peer.
+    wait: Duration,
     session: Session,
     /// The highest term an answer named.
     floor: u64,
@@ -210,45 +235,60 @@ pub struct Client {
 impl Client {
     /// Dials `address`, a URI such as `http://127.0.0.1:30100`, in the
     /// clear, as the gateway `gateway_id`: [`Client::connect_with`] over a
-    /// plain endpoint whose dial and calls each end within [`ANSWER_WAIT`].
+    /// plain endpoint.
     pub async fn connect(address: &str, gateway_id: &str) -> Result<Self, Error> {
         let endpoint = Endpoint::from_shared(address.to_owned())
             .map_err(|error| Error::Address(error.to_string()))?;
-        Self::connect_within(bounded(endpoint, ANSWER_WAIT), gateway_id, ANSWER_WAIT).await
+        Self::connect_with(endpoint, gateway_id).await
     }
 
     /// Dials an endpoint the caller configured (its TLS material and its
     /// time-outs, or none) as the gateway `gateway_id`, takes its term floor
     /// from the replica's `Leader` answer and opens the gateway's session.
     /// An id no metadata entry carries is refused before the dial; a replica
-    /// that does not lead is [`Error::NotLeader`]; a welcome that does not
-    /// come within [`ANSWER_WAIT`] is [`Error::NoWelcome`].
+    /// that does not lead is [`Error::NotLeader`]. No wait for the replica
+    /// outlasts [`ANSWER_WAIT`]: a dial, a `Leader` ask or a welcome that
+    /// would is [`Error::NoAnswer`].
     pub async fn connect_with(endpoint: Endpoint, gateway_id: &str) -> Result<Self, Error> {
         Self::connect_within(endpoint, gateway_id, ANSWER_WAIT).await
     }
 
-    /// [`Client::connect_with`] with the welcome's bound as `wait`.
+    /// [`Client::connect_with`] with the bound on each wait as `wait`.
     async fn connect_within(
         endpoint: Endpoint,
         gateway_id: &str,
         wait: Duration,
     ) -> Result<Self, Error> {
+        Self::over(endpoint.connect(), gateway_id, wait).await
+    }
+
+    /// The client over the channel `dial` makes: the dial, the `Leader` ask
+    /// and the session's open, each under `wait`.
+    async fn over(
+        dial: impl Future<Output = Result<Channel, tonic::transport::Error>>,
+        gateway_id: &str,
+        wait: Duration,
+    ) -> Result<Self, Error> {
         let principal = Principal::of(gateway_id)?;
-        let channel = endpoint.connect().await.map_err(Error::Connect)?;
+        let channel = answered("the dial", wait, dial)
+            .await?
+            .map_err(Error::Connect)?;
         let mut stub = PolicyControllerClient::with_interceptor(channel, principal);
-        let floor = ask_leader(&mut stub).await?.term;
+        let floor = ask_leader(&mut stub, wait).await?.term;
         let (session, term) = Session::open(&mut stub, gateway_id, floor, wait).await?;
         Ok(Self {
             gateway_id: gateway_id.to_owned(),
             stub,
+            wait,
             session,
             floor: floor.max(term),
         })
     }
 
-    /// Asks the replica who leads. The answer's term raises the floor.
+    /// Asks the replica who leads, within the client's bound. The answer's
+    /// term raises the floor.
     pub async fn leader(&mut self) -> Result<LeaderInfo, Error> {
-        let info = ask_leader(&mut self.stub).await?;
+        let info = ask_leader(&mut self.stub, self.wait).await?;
         self.floor = self.floor.max(info.term);
         Ok(info)
     }
@@ -336,6 +376,7 @@ mod tests {
     use std::{
         convert::Infallible,
         net::{Ipv4Addr, SocketAddr},
+        sync::mpsc,
         time::Duration,
     };
 
@@ -346,15 +387,15 @@ mod tests {
     };
     use tokio::{net::TcpListener, task::JoinSet, time::timeout};
     use tonic::{
-        codegen::tokio_stream::pending,
+        codegen::tokio_stream::{once, pending, StreamExt},
         service::{Interceptor, Routes},
         transport::{server::TcpIncoming, Endpoint, Server},
         Request,
     };
 
     use super::{
-        blocking, bounded, gateway_frame, hello, Client, Error, PolicyControllerClient, Principal,
-        Session, ANSWER_WAIT, PRINCIPAL_ENTRY, PROTOCOL_VERSION,
+        blocking, gateway_frame, hello, Client, Error, PolicyControllerClient, Principal, Session,
+        Stub, ANSWER_WAIT, PRINCIPAL_ENTRY, PROTOCOL_VERSION,
     };
 
     /// The bound a case gives a wait it wants ended.
@@ -406,26 +447,40 @@ mod tests {
         );
     }
 
-    /// A peer that answers each call with its headers and sends no frame,
-    /// for as long as the case holds its task.
-    async fn headers_alone() -> (SocketAddr, JoinSet<Result<(), tonic::transport::Error>>) {
+    /// A peer that answers each call with gRPC headers and `body`, for as
+    /// long as the case holds its task.
+    async fn answering(
+        body: fn() -> Body,
+    ) -> (SocketAddr, JoinSet<Result<(), tonic::transport::Error>>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("a listener");
         let address = listener.local_addr().expect("its address");
-        let headers = Router::new().fallback(|| async {
+        let answer = Router::new().fallback(move || async move {
             Response::builder()
                 .header("content-type", "application/grpc")
-                .body(Body::from_stream(pending::<Result<Bytes, Infallible>>()))
+                .body(body())
                 .expect("a response")
         });
         let mut serving = JoinSet::new();
         serving.spawn(
             Server::builder()
-                .add_routes(Routes::from(headers))
+                .add_routes(Routes::from(answer))
                 .serve_with_incoming(TcpIncoming::from(listener)),
         );
         (address, serving)
+    }
+
+    /// An answer of headers and no frame.
+    fn headers_alone() -> Body {
+        Body::from_stream(pending::<Result<Bytes, Infallible>>())
+    }
+
+    /// An answer of headers and one message of no bytes (its flag and its
+    /// length: five zeros) that never ends.
+    fn one_message() -> Body {
+        let message = once(Ok::<_, Infallible>(Bytes::from_static(&[0; 5])));
+        Body::from_stream(message.chain(pending()))
     }
 
     /// A peer that takes each connection and answers nothing, for as long
@@ -445,36 +500,137 @@ mod tests {
         (address, serving)
     }
 
-    #[tokio::test]
-    async fn a_welcome_that_never_comes_ends_the_wait_at_its_bound() {
-        assert_eq!(ANSWER_WAIT, Duration::from_secs(5));
-        let (address, _serving) = headers_alone().await;
+    /// Whether `ended` is the client's own bound of `wait` run out on `what`.
+    fn ran_out<T>(ended: &Result<T, Error>, what: &str, wait: Duration) -> bool {
+        matches!(
+            ended,
+            Err(Error::NoAnswer { what: named, wait: bound }) if *named == what && *bound == wait
+        )
+    }
+
+    /// The gateway's stub over a dial of `address`.
+    async fn stub(address: SocketAddr) -> Stub {
         let channel = Endpoint::from_shared(format!("http://{address}"))
             .expect("a URI")
             .connect()
             .await
             .expect("the dial");
         let principal = Principal::of("gateway-1").expect("a plain id");
-        let mut stub = PolicyControllerClient::with_interceptor(channel, principal);
+        PolicyControllerClient::with_interceptor(channel, principal)
+    }
+
+    /// The session's open against a peer whose answer stalls: the client's
+    /// own bound ends it and names the welcome.
+    async fn stalled_open(address: SocketAddr, ends: &'static str) {
+        let mut stub = stub(address).await;
         let opened = timeout(ROOM, Session::open(&mut stub, "gateway-1", 0, SHORT))
             .await
-            .expect("the client's own bound ends the wait for the welcome");
+            .expect(ends);
         assert!(
-            matches!(&opened, Err(Error::NoWelcome(why)) if why.starts_with("no frame within")),
+            ran_out(&opened, "the session's welcome", SHORT),
             "{opened:?}"
         );
     }
 
-    #[tokio::test]
-    async fn the_plain_form_ends_a_call_that_nothing_answers() {
-        let (address, _serving) = mute().await;
+    /// The client's connect against a peer whose `Leader` answer stalls: the
+    /// client's own bound ends it and names the ask.
+    async fn stalled_ask(address: SocketAddr, ends: &'static str) {
         let endpoint = Endpoint::from_shared(format!("http://{address}")).expect("a URI");
-        let asked = timeout(
+        let asked = timeout(ROOM, Client::connect_within(endpoint, "gateway-1", SHORT))
+            .await
+            .expect(ends);
+        assert!(ran_out(&asked, "the Leader ask", SHORT), "{asked:?}");
+    }
+
+    #[tokio::test]
+    async fn a_welcome_that_never_comes_ends_the_wait_at_its_bound() {
+        assert_eq!(ANSWER_WAIT, Duration::from_secs(5));
+        let (address, _serving) = answering(headers_alone).await;
+        stalled_open(
+            address,
+            "the client's own bound ends the wait for the welcome",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_session_call_nothing_answers_ends_the_wait_at_its_bound() {
+        let (address, _serving) = mute().await;
+        stalled_open(
+            address,
+            "the client's own bound ends a session call nothing answers",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_leader_ask_nothing_answers_ends_at_its_bound() {
+        let (address, _serving) = mute().await;
+        stalled_ask(
+            address,
+            "the client's own bound ends a Leader ask nothing answers",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_leader_ask_whose_headers_came_alone_ends_at_its_bound() {
+        let (address, _serving) = answering(headers_alone).await;
+        stalled_ask(
+            address,
+            "the client's own bound ends a Leader ask whose headers came alone",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_leader_ask_whose_answer_never_ends_ends_at_its_bound() {
+        let (address, _serving) = answering(one_message).await;
+        stalled_ask(
+            address,
+            "the client's own bound ends a Leader ask whose answer never ends",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_dial_that_never_ends_ends_at_its_bound() {
+        let dialed = timeout(
             ROOM,
-            Client::connect_within(bounded(endpoint, SHORT), "gateway-1", SHORT),
+            Client::over(std::future::pending(), "gateway-1", SHORT),
         )
         .await
-        .expect("the endpoint's own bound ends the ask");
-        assert!(matches!(asked, Err(Error::Status(_))), "{asked:?}");
+        .expect("the client's own bound ends a dial that never ends");
+        assert!(ran_out(&dialed, "the dial", SHORT), "{dialed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_first_frame_that_is_no_welcome_ends_the_open_with_no_wait() {
+        let (address, _serving) = answering(one_message).await;
+        let mut stub = stub(address).await;
+        let opened = timeout(ROOM / 2, Session::open(&mut stub, "gateway-1", 0, ROOM))
+            .await
+            .expect("a first frame that is no welcome ends the open with no wait for more");
+        assert!(
+            matches!(&opened, Err(Error::NoWelcome(why)) if why.contains("frame: None")),
+            "{opened:?}"
+        );
+    }
+
+    #[test]
+    fn the_blocking_plain_form_ends_a_stalled_ask_at_the_named_bound() {
+        // The peer's runtime is the case's own: the blocking client brings
+        // its own, from a thread that runs none.
+        let peers = tokio::runtime::Runtime::new().expect("a runtime");
+        let (address, _serving) = peers.block_on(answering(headers_alone));
+        let (told, asked) = mpsc::channel();
+        std::thread::spawn(move || {
+            let asked = blocking::Client::connect(&format!("http://{address}"), "gateway-1");
+            told.send(asked.map(|_| ()))
+        });
+        let asked = asked
+            .recv_timeout(ROOM)
+            .expect("the named bound ends the blocking plain form's stalled ask");
+        assert!(ran_out(&asked, "the Leader ask", ANSWER_WAIT), "{asked:?}");
     }
 }
