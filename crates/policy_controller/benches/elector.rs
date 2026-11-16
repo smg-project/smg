@@ -30,13 +30,24 @@ use smg_policy_controller::{
     Constraints, PoolFacts, RequestFacts, Scratch,
 };
 
+/// A holder whose fence is open, as a leader's is. Its lease, which no
+/// record held, is taken one renew deadline back and renewed now: that
+/// renewal opens the fence.
 fn holder(backend: Box<dyn LeaseBackend>, identity: &str) -> Elector {
-    let mut elector =
-        Elector::new(backend, identity, ElectionSettings::default()).expect("valid settings");
+    let settings = ElectionSettings::default();
+    let mut elector = Elector::new(backend, identity, settings).expect("valid settings");
+    let now = Instant::now();
     assert_eq!(
-        elector.tick(Instant::now()).expect("the take"),
+        elector
+            .tick(now - settings.renew_deadline)
+            .expect("the take"),
         Tick::Acquired { term: 1 }
     );
+    assert_eq!(
+        elector.tick(now).expect("the renewal"),
+        Tick::Renewed { term: 1 }
+    );
+    assert!(elector.fence().leader_term(now).is_some());
     elector
 }
 

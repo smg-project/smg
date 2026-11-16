@@ -484,8 +484,8 @@ pub(crate) mod tests {
         renew_deadline: Duration::from_secs(1800),
     };
 
-    /// A candidate that took its own lease at the returned instant, a store,
-    /// and the table over that candidate's fence and that store.
+    /// A candidate that leads under its own lease from the returned instant,
+    /// a store, and the table over that candidate's fence and that store.
     pub(crate) fn leading(grace: Duration) -> (Elector, Arc<MemoryStore>, Arc<Gateways>, Instant) {
         ceiled(grace, 1_024)
     }
@@ -502,10 +502,8 @@ pub(crate) mod tests {
         )
         .expect("the settings are in order");
         let taken = Instant::now();
-        assert_eq!(
-            elector.tick(taken).expect("the take"),
-            Tick::Acquired { term: 1 }
-        );
+        elector.lead_at(taken);
+        assert_eq!(elector.fence().leader_term(taken), Some(1));
         let store = Arc::new(MemoryStore::new());
         let gateways = Arc::new(Gateways::new(
             grace,

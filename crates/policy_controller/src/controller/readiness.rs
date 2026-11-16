@@ -182,10 +182,19 @@ pub(crate) mod tests {
         phase.send_replace(Phase::Serving);
         assert_eq!(readiness.state(), State::Follower);
 
-        // The take opens the fence: the leader, with no message sent.
+        // The take of a lease that held no record opens no fence: still a
+        // follower. The first renewal a renew deadline later opens it: the
+        // leader, with no message sent.
+        let taken = Instant::now();
         assert_eq!(
-            elector.tick(Instant::now()).expect("the take"),
+            elector.tick(taken).expect("the take"),
             Tick::Acquired { term: 1 }
+        );
+        assert_eq!(readiness.state(), State::Follower);
+        let opens = taken + elector.settings().renew_deadline;
+        assert_eq!(
+            elector.tick(opens).expect("the renewal"),
+            Tick::Renewed { term: 1 }
         );
         assert_eq!(readiness.state(), State::Leader);
 
@@ -199,15 +208,12 @@ pub(crate) mod tests {
         let (mut elector, phase, _steps, readiness) = fenced();
         phase.send_replace(Phase::Serving);
 
-        // A take dated a second past the renew deadline: the holder still
-        // holds the record, and its fence is closed at the read.
+        // A last renewal dated a second past the renew deadline: the holder
+        // still holds the record, and its fence is closed at the read.
         let stale = Instant::now()
             .checked_sub(ElectionSettings::default().renew_deadline + Duration::from_secs(1))
             .expect("an instant three seconds back");
-        assert_eq!(
-            elector.tick(stale).expect("the take"),
-            Tick::Acquired { term: 1 }
-        );
+        elector.lead_at(stale);
         assert!(elector.is_holder());
         assert_eq!(readiness.state(), State::Follower);
 
@@ -244,7 +250,7 @@ pub(crate) mod tests {
         let mut waiter = reader.clone();
         let (waited, ()) = tokio::join!(within(&mut waiter, State::Leader), async {
             tokio::task::yield_now().await;
-            elector.tick(Instant::now()).expect("the take");
+            elector.lead_at(Instant::now() + elector.settings().renew_deadline);
             steps.send_replace(Standing::default());
         });
         assert_eq!(waited, Some(State::Leader));

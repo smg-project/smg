@@ -586,14 +586,21 @@ mod tests {
     }
 
     impl Bed {
-        /// The candidate takes or renews its lease now, under `term`, and
-        /// the election publishes the look.
+        /// The candidate leads now under `term`, by a take or a renewal, and
+        /// the election publishes the look. A take of a lease no record held
+        /// leads one renew deadline later, so that one is made in the past.
         fn leads(&mut self, term: u64) {
-            let tick = self.elector.tick(Instant::now()).expect("a step");
-            assert!(
-                tick == Tick::Acquired { term } || tick == Tick::Renewed { term },
-                "{tick:?}"
-            );
+            let now = Instant::now();
+            if self.elector.is_holder() || self.elector.observed().is_some() {
+                let tick = self.elector.tick(now).expect("a step");
+                assert!(
+                    tick == Tick::Acquired { term } || tick == Tick::Renewed { term },
+                    "{tick:?}"
+                );
+            } else {
+                self.elector.lead_at(now);
+                assert_eq!(self.elector.fence().leader_term(now), Some(term));
+            }
             self.step(IDENTITY, term);
         }
 

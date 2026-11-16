@@ -1,16 +1,18 @@
 //! The two-process lease-file cell (design 10; the step's gate for the lease
 //! file): two controllers on one host, each in its own process, over one
-//! lease file. The holder takes the lease and renews it twice, then stalls
-//! until the lease changed hands and tries once more; the taker follows,
-//! takes the lease when its sight of the record is a duration old, and
-//! renews. The parent reads both logs and checks what the fence promises: a
-//! fenced instant under a term begins only when each fence under a lower
-//! term has closed, and a renewal is refused once the record moved. A loaded
-//! host may hold either child back for a record's duration, and the lease
-//! then changes hands once more: the parent reads each log as a walk the
-//! election allows and holds the promises over every pair of lines, never
-//! over a count of steps. The children are this test binary run again with
-//! a role, so the lock and the rename cross real process boundaries.
+//! lease file. The holder takes the lease where no record stood and renews
+//! it four times: its fence opens at the third renewal, one renew deadline
+//! after such a take. Then it stalls until the lease changed hands and
+//! tries once more; the taker follows, takes the lease when its sight of
+//! the record is a duration old, and renews. The parent reads both logs and
+//! checks what the fence promises: a fenced instant under a term begins
+//! only when each fence under a lower term has closed, and a renewal is
+//! refused once the record moved. A loaded host may hold either child back
+//! for a record's duration, and the lease then changes hands once more: the
+//! parent reads each log as a walk the election allows and holds the
+//! promises over every pair of lines, never over a count of steps. The
+//! children are this test binary run again with a role, so the lock and the
+//! rename cross real process boundaries.
 #![expect(
     clippy::expect_used,
     reason = "the cell's helpers run inside the test and its child processes; a failure there is the test's failure"
@@ -93,7 +95,7 @@ fn run_child(role: &str, path: &Path) -> Vec<String> {
     let period = settings().renew_period;
     match role {
         "holder" => {
-            for _ in 0..3 {
+            for _ in 0..5 {
                 step(&mut elector, &mut lines);
                 thread::sleep(period);
             }
@@ -184,8 +186,8 @@ fn parse(log: &str) -> Vec<Line> {
 /// or after following or a loss, above the term read there. A renewal stays
 /// in its run and a loss ends it, both under the run's term. Following comes
 /// first of all, after a loss under a higher term, or after following under
-/// no lower one. A line carries its fence exactly when it holds the lease: a
-/// take opens the fence and a renewal that landed keeps it open.
+/// no lower one. A line that holds no lease holds no fence, and a fence that
+/// is open stays open at each later renewal of its run.
 fn walk(lines: &[Line], told: &str) {
     for (at, line) in lines.iter().enumerate() {
         let prior = at.checked_sub(1).and_then(|before| lines.get(before));
@@ -201,9 +203,10 @@ fn walk(lines: &[Line], told: &str) {
         };
         assert!(allowed, "line {at} is no step of an election: {told}");
         if line.holds() {
+            let open = prior.is_some_and(|prior| prior.holds() && prior.closes.is_some());
             assert!(
-                line.closes.is_some(),
-                "line {at} holds the lease without its fence: {told}"
+                line.closes.is_some() || !open,
+                "line {at} lets an open fence go at a renewal: {told}"
             );
         } else {
             assert!(
@@ -285,15 +288,16 @@ fn two_processes_over_one_lease_file_hand_over_without_an_overlap() {
     walk(&holder, &told);
     walk(&taker, &told);
 
-    // The holder takes, renews twice and reads its loss at the late step. A
-    // holder descheduled for the record's duration between two of its first
-    // three steps reads the loss at an earlier one, after fewer renewals.
+    // The holder takes, renews four times and reads its loss at the late
+    // step. A holder descheduled for the record's duration between two of
+    // its first five steps reads the loss at an earlier one, after fewer
+    // renewals.
     let lost = holder_words
         .iter()
         .position(|w| w == "lost:1")
         .expect("the holder read its loss");
     assert!(
-        (1..=3).contains(&lost)
+        (1..=5).contains(&lost)
             && holder_words[0] == "acquired:1"
             && holder_words[1..lost].iter().all(|w| w == "renewed:1"),
         "the holder's run: {told}"
@@ -360,6 +364,26 @@ fn two_processes_over_one_lease_file_hand_over_without_an_overlap() {
         "one take a term: {told}"
     );
 
+    // The lease file was not there: the take opens no fence, and the third
+    // renewal, three periods after it, is past the renew deadline. A holder
+    // that read its loss before that renewal never led. Every later take
+    // found a record that stood still its duration and leads from the take.
+    assert!(
+        holder[0].closes.is_none(),
+        "the take of an absent record opens no fence"
+    );
+    assert!(
+        lost <= 3 || holder[3].closes.is_some(),
+        "the fence opens at the first renewal a renew deadline after the take"
+    );
+    assert!(
+        holder
+            .iter()
+            .chain(&taker)
+            .filter(|l| l.holds() && l.term() > 1)
+            .all(|l| l.closes.is_some()),
+        "a take of a record that stood still leads from the take: {told}"
+    );
     // The fence's promise across processes: a fenced instant under a term
     // begins only when each fence under a lower term has closed.
     for (lower, higher) in [(&holder, &taker), (&taker, &holder)] {
