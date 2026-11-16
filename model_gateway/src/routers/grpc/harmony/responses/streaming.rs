@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::{
     common::{
-        build_next_request_with_tools, open_mcp_session, owned_request,
+        build_next_request_with_tools, ended_on_its_calls, open_mcp_session, owned_request,
         strip_image_generation_from_request_tools, withhold_server_tools, McpCallTracking,
     },
     execution::execute_mcp_tools,
@@ -354,8 +354,8 @@ async fn execute_mcp_tool_loop_streaming(
                 usage,
                 request_id: _,
                 // The stored object and the terminal read the finish the
-                // emitter was told.
-                finish_reason: _,
+                // emitter was told; the loop reads it for the server calls.
+                finish_reason,
             } => {
                 debug!(
                     tool_call_count = tool_calls.len(),
@@ -383,8 +383,13 @@ async fn execute_mcp_tool_loop_streaming(
                 // results, the server tools withheld (the public contract at
                 // `max_tool_calls`); the internal safety cap ends the stream as
                 // failed with nothing of the batch executed. The final turn's
-                // own server calls, made with the tools withheld, do not run.
-                let overflow = if final_turn {
+                // own server calls, made with the tools withheld, do not run,
+                // and neither do those of a turn that did not end on its
+                // calls: the stream ends without them. The stream processor
+                // closed the items of such a turn's server calls as cut, by
+                // the same rule, so the response reads the turn as cut.
+                let unfinished = !ended_on_its_calls(finish_reason.as_deref(), &mcp_tool_calls);
+                let overflow = if final_turn || unfinished {
                     mcp_tool_calls.clear();
                     None
                 } else {
@@ -492,9 +497,10 @@ async fn execute_mcp_tool_loop_streaming(
                     emitter.update_mcp_call_outputs(&mcp_results);
                 }
 
-                // A client call, or the final turn's answer, exits the MCP
-                // loop and emits the completion
-                if !function_tool_calls.is_empty() || final_turn {
+                // A client call, the final turn's answer, or a turn that did
+                // not end on its calls exits the MCP loop and emits the
+                // completion
+                if !function_tool_calls.is_empty() || final_turn || unfinished {
                     debug!(
                         final_turn,
                         "Function tool calls present or the final turn answered - exiting MCP loop and emitting completion"

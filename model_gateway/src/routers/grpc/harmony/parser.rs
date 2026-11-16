@@ -7,6 +7,7 @@ use openai_protocol::common::{FunctionCallResponse, ToolCall};
 use uuid::Uuid;
 
 use super::types::{HarmonyChannelDelta, HarmonyChannelOutput};
+use crate::routers::grpc::common::responses::utils::cut_call;
 
 /// Get the global Harmony encoding
 ///
@@ -50,7 +51,9 @@ fn append_reasoning(analysis: &mut Option<String>, text: String) {
 /// complete responses and streaming chunks.
 pub(crate) struct HarmonyParserAdapter {
     parser: StreamableParser,
-    prev_recipient: Option<String>,
+    /// The call the stream announced last: the closed messages when it opened, and its place
+    /// among the turn's calls.
+    announced_call: Option<(usize, usize)>,
     reasoning_token_count: u32,
 }
 
@@ -63,7 +66,7 @@ impl HarmonyParserAdapter {
 
         Ok(Self {
             parser,
-            prev_recipient: None,
+            announced_call: None,
             reasoning_token_count: 0,
         })
     }
@@ -105,6 +108,14 @@ impl HarmonyParserAdapter {
         analysis: &mut Option<String>,
         final_text: &mut String,
     ) {
+        // A message addressed to a function is a call whatever its channel: its open content
+        // is neither reasoning nor answer text (`extract_incomplete_commentary` reads it).
+        if parser
+            .current_recipient()
+            .is_some_and(|r| r.starts_with("functions."))
+        {
+            return;
+        }
         if let Ok(current_content) = parser.current_content() {
             if !current_content.is_empty() {
                 let current_channel = parser.current_channel();
@@ -253,16 +264,34 @@ impl HarmonyParserAdapter {
 
     fn output(&self, finish_reason: String, reasoning_token_count: u32) -> HarmonyChannelOutput {
         let messages = self.parser.messages();
-        let (mut analysis, commentary, mut final_text) = Self::parse_messages(messages);
+        let (mut analysis, closed, mut final_text) = Self::parse_messages(messages);
         Self::handle_incomplete_content(&self.parser, &mut analysis, &mut final_text);
-        let finish_reason = if commentary.is_some() {
+        // A turn none of whose calls closed returns the call it ended inside, as far as it
+        // came: every read takes it as the stream's recovery does.
+        let open = if closed.is_none() {
+            self.extract_incomplete_commentary()
+        } else {
+            None
+        };
+        // A turn ended on its calls when one closed, or when it stopped inside a whole one:
+        // a worker may stop at a call's closing token without delivering it. A turn the
+        // token limit or a failure ended, or one that stopped inside a call's arguments,
+        // keeps the engine's finish, and the Responses loops run none of its server calls.
+        let stopped_on_a_whole_call = finish_reason == "stop"
+            && open.as_deref().is_some_and(|calls| {
+                let arguments = calls
+                    .iter()
+                    .filter_map(|call| call.function.arguments.as_deref());
+                !cut_call(None, arguments)
+            });
+        let finish_reason = if closed.is_some() || stopped_on_a_whole_call {
             "tool_calls".to_string()
         } else {
             finish_reason
         };
         HarmonyChannelOutput {
             analysis,
-            commentary,
+            commentary: closed.or(open),
             final_text,
             finish_reason,
             reasoning_token_count,
@@ -273,44 +302,20 @@ impl HarmonyParserAdapter {
     ///
     /// Returns the raw messages extracted by the Harmony parser.
     /// Used for validation checks.
-    pub fn get_messages(&self) -> Vec<openai_harmony::chat::Message> {
-        self.parser.messages().to_vec()
+    pub fn get_messages(&self) -> &[openai_harmony::chat::Message] {
+        self.parser.messages()
     }
 
-    /// Extract incomplete commentary content from parser state
-    ///
-    /// When the stream ends, there may be incomplete commentary content in the parser
-    /// that hasn't been finalized into a completed message. This method extracts
-    /// such content and converts it to tool calls.
-    ///
-    /// # Returns
-    ///
-    /// Optional vector of ToolCall if incomplete commentary is found
+    /// The call the turn ended in: the open message addressed to a function, whatever its
+    /// channel, as `parse_messages` reads a closed one. A worker may stop at a call's closing
+    /// token without delivering it, so a turn's last call is often still open.
     pub fn extract_incomplete_commentary(&self) -> Option<Vec<ToolCall>> {
-        // Check if current channel is commentary
-        let current_channel = self.parser.current_channel();
-        if current_channel.as_deref() != Some("commentary") {
-            return None;
-        }
-
-        // Get current recipient (should be "functions.{name}")
         let recipient = self.parser.current_recipient()?;
-        if !recipient.starts_with("functions.") {
-            return None;
-        }
-
-        // Get current incomplete content
+        let function_name = recipient.strip_prefix("functions.")?;
         let content = self.parser.current_content().ok()?;
         if content.is_empty() {
             return None;
         }
-
-        // Extract function name from recipient
-        let Some(function_name) = recipient.strip_prefix("functions.") else {
-            // guarded by starts_with("functions.") check above
-            return None;
-        };
-
         Some(vec![function_call(function_name, content)])
     }
 
@@ -331,11 +336,8 @@ impl HarmonyParserAdapter {
         chunk_ids: &[u32],
     ) -> Result<Option<HarmonyChannelDelta>, String> {
         let mut analysis_delta: Option<String> = None;
-        let mut commentary_delta = None;
+        let mut commentary_deltas: Vec<super::types::ToolCallDelta> = Vec::new();
         let mut final_delta: Option<String> = None;
-
-        // Accumulate delta text for commentary channel
-        let mut accumulated_delta = String::new();
 
         // Process each token
         for &token_id in chunk_ids {
@@ -346,88 +348,92 @@ impl HarmonyParserAdapter {
             if self.in_reasoning_channel() {
                 self.reasoning_token_count += 1;
             }
+            let text = self.parser.last_content_delta().ok().flatten();
 
-            // Check for content delta
-            if let Ok(Some(delta_text)) = self.parser.last_content_delta() {
-                // Determine which channel this delta belongs to
-                let channel = self.parser.current_channel();
-                match channel.as_deref() {
+            // A message addressed to a function is a tool call whatever its channel, as
+            // `parse_messages` reads it. Every call of the chunk leaves its own delta, in the
+            // turn's order: a chunk may hold a whole call, or the end of one and the start
+            // of the next. A call is new by its place among the turn's calls, not by its
+            // recipient: two calls in a row may name one tool. The closed messages do not
+            // grow inside a call, so its recipient is read and its place counted once, when
+            // it opens, not on every token of it.
+            let closed = self.parser.messages().len();
+            let mut call = match self.announced_call {
+                Some((at, index)) if at == closed => Some(index),
+                _ => None,
+            };
+            if call.is_none() {
+                let recipient = self.parser.current_recipient();
+                if let Some(tool_name) = recipient
+                    .as_deref()
+                    .and_then(|recipient| recipient.strip_prefix("functions."))
+                {
+                    let index = self
+                        .parser
+                        .messages()
+                        .iter()
+                        .filter(|msg| {
+                            msg.recipient
+                                .as_deref()
+                                .is_some_and(|r| r.starts_with("functions."))
+                        })
+                        .count();
+                    self.announced_call = Some((closed, index));
+                    commentary_deltas.push(super::types::ToolCallDelta {
+                        index,
+                        id: Some(call_id()),
+                        function: Some(super::types::FunctionDelta {
+                            name: Some(tool_name.to_string()),
+                            arguments: Some(String::new()),
+                        }),
+                    });
+                    call = Some(index);
+                }
+            }
+            if let Some(index) = call {
+                if let Some(text) = text.filter(|text| !text.is_empty()) {
+                    let open = commentary_deltas
+                        .last_mut()
+                        .filter(|delta| delta.index == index)
+                        .and_then(|delta| delta.function.as_mut()?.arguments.as_mut());
+                    match open {
+                        Some(arguments) => arguments.push_str(&text),
+                        None => commentary_deltas.push(super::types::ToolCallDelta {
+                            index,
+                            id: None,
+                            function: Some(super::types::FunctionDelta {
+                                name: None,
+                                arguments: Some(text),
+                            }),
+                        }),
+                    }
+                }
+                continue;
+            }
+
+            if let Some(text) = text {
+                match self.parser.current_channel().as_deref() {
                     Some("analysis") => {
                         analysis_delta
                             .get_or_insert_with(String::new)
-                            .push_str(&delta_text);
+                            .push_str(&text);
                     }
                     Some("final") | None => {
-                        final_delta
-                            .get_or_insert_with(String::new)
-                            .push_str(&delta_text);
-                    }
-                    Some("commentary") => {
-                        // Accumulate delta for commentary
-                        accumulated_delta.push_str(&delta_text);
+                        final_delta.get_or_insert_with(String::new).push_str(&text);
                     }
                     _ => {}
                 }
             }
         }
 
-        // Handle commentary channel tool call deltas
-        if self.parser.current_channel().as_deref() == Some("commentary") {
-            if let Some(cur_recipient) = self.parser.current_recipient() {
-                if let Some(tool_name) = cur_recipient.strip_prefix("functions.") {
-                    // Count completed tool calls for index
-                    let base_index = self
-                        .parser
-                        .messages()
-                        .iter()
-                        .filter(|msg| {
-                            msg.channel.as_deref() == Some("commentary")
-                                && msg
-                                    .recipient
-                                    .as_deref()
-                                    .is_some_and(|r| r.starts_with("functions."))
-                        })
-                        .count();
-
-                    // Check if recipient changed (new tool call)
-                    let recipient_changed = self.prev_recipient.as_deref() != Some(&cur_recipient);
-
-                    if recipient_changed {
-                        // NEW tool call: emit name + id
-                        commentary_delta = Some(super::types::ToolCallDelta {
-                            index: base_index,
-                            id: Some(call_id()),
-                            function: Some(super::types::FunctionDelta {
-                                name: Some(tool_name.to_string()),
-                                arguments: Some(String::new()),
-                            }),
-                        });
-
-                        // Update prev_recipient
-                        self.prev_recipient = Some(cur_recipient);
-                    } else if !accumulated_delta.is_empty() {
-                        // CONTINUING tool call: emit arguments delta
-                        commentary_delta = Some(super::types::ToolCallDelta {
-                            index: base_index,
-                            id: None,
-                            function: Some(super::types::FunctionDelta {
-                                name: None,
-                                arguments: Some(accumulated_delta),
-                            }),
-                        });
-                    }
-                }
-            }
-        }
-
         // Only emit a delta if at least one channel produced output
         let has_delta =
-            analysis_delta.is_some() || commentary_delta.is_some() || final_delta.is_some();
+            analysis_delta.is_some() || !commentary_deltas.is_empty() || final_delta.is_some();
 
         if has_delta {
             Ok(Some(HarmonyChannelDelta {
                 analysis_delta,
-                commentary_delta,
+                commentary_deltas,
                 final_delta,
             }))
         } else {
@@ -448,5 +454,104 @@ impl HarmonyParserAdapter {
     /// Final HarmonyChannelOutput with complete parsed content
     pub fn finalize(&mut self, finish_reason: String) -> HarmonyChannelOutput {
         self.output(finish_reason, self.reasoning_token_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routers::grpc::harmony::types::ToolCallDelta;
+
+    const CALL: &str = "<|channel|>commentary to=functions.get_time <|constrain|>json<|message|>{\"city\": \"Paris\"}<|call|>";
+
+    fn ids(text: &str) -> Vec<u32> {
+        try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .encode_with_special_tokens(text)
+    }
+
+    /// The call deltas a turn leaves when its tokens come `size` at a time.
+    fn call_deltas(turn: &str, size: usize) -> Vec<ToolCallDelta> {
+        let mut parser = HarmonyParserAdapter::new().expect("a parser");
+        ids(turn)
+            .chunks(size)
+            .filter_map(|chunk| parser.parse_chunk(chunk).expect("a parsed chunk"))
+            .flat_map(|delta| delta.commentary_deltas)
+            .collect()
+    }
+
+    #[test]
+    fn each_call_is_named_once_and_its_argument_deltas_add_up_however_the_chunks_fall() {
+        // Two calls in a row to one tool: the second is new by its place, not its recipient.
+        let turn = format!("{CALL}<|start|>assistant{CALL}");
+        // The last size holds the whole turn in one chunk.
+        for size in (1..=8).chain([usize::MAX]) {
+            let deltas = call_deltas(&turn, size);
+            assert!(
+                deltas.iter().all(|delta| delta.index < 2),
+                "chunks of {size}: {deltas:?}"
+            );
+            for index in 0..2 {
+                let call: Vec<&ToolCallDelta> =
+                    deltas.iter().filter(|delta| delta.index == index).collect();
+                let names: Vec<&str> = call
+                    .iter()
+                    .filter_map(|delta| delta.function.as_ref()?.name.as_deref())
+                    .collect();
+                let arguments: String = call
+                    .iter()
+                    .filter_map(|delta| delta.function.as_ref()?.arguments.as_deref())
+                    .collect();
+                assert_eq!(names, ["get_time"], "call {index}, chunks of {size}");
+                assert!(call[0].id.is_some(), "call {index}, chunks of {size}");
+                assert_eq!(
+                    arguments, r#"{"city": "Paris"}"#,
+                    "call {index}, chunks of {size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_call_on_the_analysis_channel_is_a_call_as_the_final_list_reads_it() {
+        let turn = CALL.replace("commentary", "analysis");
+        let mut parser = HarmonyParserAdapter::new().expect("a parser");
+        let delta = parser
+            .parse_chunk(&ids(&turn))
+            .expect("a parsed chunk")
+            .expect("a delta");
+        assert_eq!(delta.analysis_delta, None);
+        let [call] = delta.commentary_deltas.as_slice() else {
+            panic!("one call delta: {:?}", delta.commentary_deltas);
+        };
+        let function = call.function.as_ref().expect("the call's function");
+        assert_eq!(function.name.as_deref(), Some("get_time"));
+        assert_eq!(function.arguments.as_deref(), Some(r#"{"city": "Paris"}"#));
+    }
+
+    #[test]
+    fn a_call_cut_before_its_closing_token_is_read_on_any_channel() {
+        for channel in ["commentary", "analysis"] {
+            let turn = CALL.replace("commentary", channel);
+            let cut = turn
+                .strip_suffix("<|call|>")
+                .expect("the call's closing token");
+            let mut parser = HarmonyParserAdapter::new().expect("a parser");
+            parser.parse_chunk(&ids(cut)).expect("a parsed chunk");
+
+            let calls = parser
+                .extract_incomplete_commentary()
+                .expect("the open call");
+            let [call] = calls.as_slice() else {
+                panic!("{channel}: one call, not {}", calls.len());
+            };
+            assert_eq!(call.function.name, "get_time", "{channel}");
+            assert_eq!(
+                call.function.arguments.as_deref(),
+                Some(r#"{"city": "Paris"}"#),
+                "{channel}"
+            );
+        }
     }
 }

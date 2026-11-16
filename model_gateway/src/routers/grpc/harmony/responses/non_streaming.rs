@@ -19,8 +19,9 @@ use tracing::{debug, error, warn};
 
 use super::{
     common::{
-        build_next_request_with_tools, inject_mcp_metadata, open_mcp_session, owned_request,
-        strip_image_generation_from_request_tools, withhold_server_tools, McpCallTracking,
+        build_next_request_with_tools, ended_on_its_calls, inject_mcp_metadata, open_mcp_session,
+        owned_request, strip_image_generation_from_request_tools, withhold_server_tools,
+        McpCallTracking,
     },
     execution::{execute_mcp_tools, ToolResult},
 };
@@ -234,8 +235,13 @@ async fn execute_with_mcp_loop(
                 // `max_tool_calls`); the internal safety cap ends the response
                 // as failed with nothing of the batch executed. The final
                 // turn's own server calls, made with the tools withheld, do
-                // not run.
-                let overflow = if final_turn {
+                // not run, and neither do those of a turn that did not end on
+                // its calls: the response returns without them. The final
+                // turn's is its answer; the other's reads the turn as cut,
+                // never as completed.
+                let unfinished = !ended_on_its_calls(finish_reason.as_deref(), &mcp_tool_calls);
+                let cut_server_call = unfinished && !mcp_tool_calls.is_empty();
+                let overflow = if final_turn || unfinished {
                     mcp_tool_calls.clear();
                     None
                 } else {
@@ -275,6 +281,7 @@ async fn execute_with_mcp_loop(
                         vec![],         // No MCP results
                         all_tool_calls, // All tools returned as function calls (not executed)
                         finish_reason.as_deref(),
+                        false,
                         analysis,
                         partial_text,
                         usage_total.take(),
@@ -331,9 +338,10 @@ async fn execute_with_mcp_loop(
                     .await?
                 };
 
-                // A client call, or the final turn's answer, exits the MCP
-                // loop and returns the response
-                if !function_tool_calls.is_empty() || final_turn {
+                // A client call, the final turn's answer, or a turn that did
+                // not end on its calls exits the MCP loop and returns the
+                // response
+                if !function_tool_calls.is_empty() || final_turn || unfinished {
                     debug!(
                         final_turn,
                         "Function tool calls present or the final turn answered - exiting MCP loop and returning to caller"
@@ -351,6 +359,7 @@ async fn execute_with_mcp_loop(
                         mcp_results,
                         function_tool_calls,
                         finish_reason.as_deref(),
+                        cut_server_call,
                         analysis,
                         partial_text,
                         usage_total.take(),
@@ -462,6 +471,7 @@ async fn execute_without_mcp_loop(
                 vec![],
                 tool_calls,
                 finish_reason.as_deref(),
+                false,
                 analysis,
                 partial_text,
                 Some(ResponseUsage::from(&usage)),
@@ -479,13 +489,16 @@ async fn execute_without_mcp_loop(
 
 /// Build ResponsesResponse with tool calls (MCP and/or function tools). The
 /// function calls' status and the response's are read under `finish_reason`,
-/// the turn's as the parser reads it.
+/// the turn's as the parser reads it. `cut_server_call` says the turn left a
+/// server call un-run (it did not end on its calls): the call is not handed
+/// to the client, and the response does not read completed.
 #[expect(clippy::too_many_arguments)]
 fn build_tool_response(
     mcp_tool_calls: Vec<ToolCall>,
     mcp_results: Vec<ToolResult>,
     function_tool_calls: Vec<ToolCall>,
     finish_reason: Option<&str>,
+    cut_server_call: bool,
     analysis: Option<String>, // Analysis channel content (reasoning)
     partial_text: String,     // Final channel content (message)
     usage: Option<ResponseUsage>,
@@ -546,8 +559,9 @@ fn build_tool_response(
 
     // Add function tool calls WITHOUT output (need caller execution): each
     // call's status under the turn's finish, which a cut call reads as
-    // incomplete, and the response as cut.
-    let mut cut_call = false;
+    // incomplete, and the response as cut. A server call the turn left
+    // un-run is not in the output, and cuts the response all the same.
+    let mut cut_call = cut_server_call;
     for tool_call in function_tool_calls {
         let call_id = tool_call.id.clone();
         let arguments = tool_call.function.arguments.unwrap_or_default();
@@ -608,6 +622,7 @@ mod namespace_tests {
             vec![],
             vec![call],
             Some("tool_calls"),
+            false,
             None,
             String::new(),
             None,
@@ -645,6 +660,7 @@ mod status_tests {
             vec![],
             vec![call(arguments)],
             finish_reason,
+            false,
             None,
             String::new(),
             None,
@@ -683,5 +699,38 @@ mod status_tests {
         assert!(wire["incomplete_details"].is_null());
         assert!(wire["error"].is_null());
         assert_eq!(wire["output"][0]["status"], "completed");
+    }
+
+    /// A turn that did not end on its calls leaves its server call un-run and
+    /// out of the output: the response keeps the truncation under any finish.
+    #[test]
+    fn a_turn_that_left_a_server_call_un_run_never_reads_completed() {
+        let left = |finish_reason: Option<&str>| {
+            let response = build_tool_response(
+                vec![],
+                vec![],
+                vec![],
+                finish_reason,
+                true,
+                None,
+                String::new(),
+                None,
+                "resp_test".into(),
+                Arc::new(ResponsesRequest::default()),
+            );
+            serde_json::to_value(response).unwrap()
+        };
+        for finish_reason in [Some("stop"), Some("abort"), None] {
+            let wire = left(finish_reason);
+            assert_eq!(wire["status"], "incomplete", "{finish_reason:?}: {wire}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason:?}");
+            assert_eq!(wire["output"], json!([]), "{finish_reason:?}");
+        }
+        let limit = left(Some("length"));
+        assert_eq!(limit["status"], "incomplete", "{limit}");
+        assert_eq!(limit["incomplete_details"]["reason"], "max_output_tokens");
+        let failed = left(Some("failed"));
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert!(failed["incomplete_details"].is_null(), "{failed}");
     }
 }

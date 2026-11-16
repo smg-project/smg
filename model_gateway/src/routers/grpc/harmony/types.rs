@@ -47,8 +47,8 @@ pub(crate) struct HarmonyChannelDelta {
     /// Delta for analysis/reasoning content
     pub analysis_delta: Option<String>,
 
-    /// Delta for tool calls
-    pub commentary_delta: Option<ToolCallDelta>,
+    /// Deltas for tool calls: one per call the chunk touched, in the turn's order
+    pub commentary_deltas: Vec<ToolCallDelta>,
 
     /// Delta for final text content
     pub final_delta: Option<String>,

@@ -1207,6 +1207,47 @@ impl ResponseStreamEventEmitter {
         }
     }
 
+    /// The response reads its turn as cut, as it does for a function call the
+    /// finish cut: the turn left a server call un-run, whether or not the
+    /// call had an item (one past the turn's allowance opens none).
+    pub(crate) fn mark_cut_call(&mut self) {
+        self.cut_call = true;
+    }
+
+    /// Closes the item of a server call the loop will not run, its turn not
+    /// having ended on its calls: `response.output_item.done` with the call
+    /// as cut, in a status its item type defines (`unrun_call_status`;
+    /// `in_progress` under a failed or cancelled generation, as a function
+    /// call reads there), and nothing kept. The call is not the response's,
+    /// so the terminal event and the stored object leave it out, as the
+    /// non-streamed response does.
+    pub(crate) async fn send_unrun_call_done(
+        &mut self,
+        output_index: usize,
+        mut item: serde_json::Value,
+        response_format: ResponseFormat,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        let failed = matches!(
+            self.finish_reason.as_deref(),
+            Some("failed" | "error" | "cancelled")
+        );
+        item["status"] = json!(if failed {
+            "in_progress"
+        } else {
+            Self::unrun_call_status(response_format)
+        });
+        let sent = self.send_output_item_done(output_index, item, tx).await;
+        if let Some(tracked) = self
+            .output_items
+            .iter_mut()
+            .find(|tracked| tracked.output_index == output_index)
+        {
+            tracked.item_data = None;
+        }
+        sent
+    }
+
     /// Finalize and return the complete ResponsesResponse
     ///
     /// This constructs the final ResponsesResponse from all accumulated output items
@@ -1392,6 +1433,19 @@ impl ResponseStreamEventEmitter {
             .await;
         self.complete_output_item(reasoning.output_index);
         sent.and(item_sent)
+    }
+
+    /// The status the item of a server call of `format` closes with when the
+    /// loop will not run the call: `incomplete`, or `failed` for an image
+    /// generation call, whose item type defines no `incomplete`.
+    const fn unrun_call_status(format: ResponseFormat) -> &'static str {
+        match format {
+            ResponseFormat::ImageGenerationCall => "failed",
+            ResponseFormat::Passthrough
+            | ResponseFormat::WebSearchCall
+            | ResponseFormat::CodeInterpreterCall
+            | ResponseFormat::FileSearchCall => "incomplete",
+        }
     }
 
     /// The status of the message or reasoning item a stream closes, under the turn's finish

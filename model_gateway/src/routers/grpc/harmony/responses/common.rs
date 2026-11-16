@@ -19,7 +19,9 @@ use super::execution::{convert_mcp_tools_to_response_tools, ToolResult};
 use crate::routers::{
     common::openai_bridge::{self, FormatRegistry, ResponseFormat},
     grpc::common::responses::{
-        streaming::OutputItemKind, utils::resolve_function_identity, ResponsesContext,
+        streaming::OutputItemKind,
+        utils::{cut_call, resolve_function_identity},
+        ResponsesContext,
     },
 };
 
@@ -298,6 +300,32 @@ pub(super) fn strip_image_generation_from_request_tools(
     }
 }
 
+/// Whether a turn ended on its calls, so that the loop may run its server calls. The
+/// parser's finish reads `tool_calls` when a call of the turn closed, or when the turn
+/// stopped inside a call whose arguments are whole. Any other finish left the turn inside
+/// a call: the token limit, a failure, or a stop inside the arguments. Running that call
+/// would dispatch arguments the model never wrote, so, like the calls of a truncated or
+/// failed generation in the regular loop, it is not run. A stream that ended before its
+/// terminal frame names no finish: its server calls run when their arguments are whole,
+/// which is how the regular loop reads a server call under any finish. The stream
+/// processor closes the items of a turn's server calls by this rule too, so a call the
+/// loop does not run is never announced as completed.
+pub(crate) fn ended_on_its_calls<'a>(
+    finish_reason: Option<&str>,
+    server_calls: impl IntoIterator<Item = &'a ToolCall>,
+) -> bool {
+    match finish_reason {
+        Some("tool_calls") => true,
+        None => !cut_call(
+            None,
+            server_calls
+                .into_iter()
+                .filter_map(|call| call.function.arguments.as_deref()),
+        ),
+        Some(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod namespace_tests {
     use serde_json::from_value;
@@ -348,5 +376,36 @@ mod namespace_tests {
                 serde_json::json!(["mcp", serde_json::Value::Null]),
             ]
         );
+    }
+
+    #[test]
+    fn the_server_calls_run_only_when_the_turn_ended_on_its_calls() {
+        let call = |arguments: &str| -> ToolCall {
+            from_value(serde_json::json!({
+                "id": "call_test", "type": "function",
+                "function": {"name": "search", "arguments": arguments}
+            }))
+            .unwrap()
+        };
+        let whole = [call(r#"{"city": "Paris"}"#)];
+        let cut = [call(r#"{"city": "Par"#)];
+        // The parser's finish for a turn whose calls closed, or that stopped inside a
+        // whole call.
+        assert!(ended_on_its_calls(Some("tool_calls"), &whole));
+        // A stream that ended before its terminal frame names no finish: its calls
+        // run when their arguments are whole, and a cut one keeps them all from it.
+        assert!(ended_on_its_calls(None, &whole));
+        assert!(!ended_on_its_calls(None, &cut));
+        assert!(!ended_on_its_calls(None, whole.iter().chain(&cut)));
+        // The token limit, a stop inside a call's arguments, or a failure ended the
+        // turn inside its call, whatever its arguments.
+        for finish_reason in ["length", "stop", "abort", "failed", "error", "cancelled"] {
+            for calls in [&whole, &cut] {
+                assert!(
+                    !ended_on_its_calls(Some(finish_reason), calls),
+                    "{finish_reason}"
+                );
+            }
+        }
     }
 }

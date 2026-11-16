@@ -25,6 +25,7 @@ use tracing::{debug, error};
 use super::{
     builder::{convert_harmony_logprobs, try_harmony_encoding},
     processor::{chat_usage, iteration_usage, ResponsesIterationResult},
+    responses::common::ended_on_its_calls,
     stop::TextStopScanner,
     types::{HarmonyChannelDelta, ToolCallDelta as HarmonyToolCallDelta},
     HarmonyParserAdapter,
@@ -428,17 +429,20 @@ impl HarmonyStreamingProcessor {
         let chat_delta = ChatMessageDelta {
             role: None,
             content: delta.final_delta,
-            tool_calls: delta.commentary_delta.map(|tc_delta| {
-                let tool_type = tc_delta.id.is_some().then(|| "function".to_string());
-                vec![ToolCallDelta {
-                    index: tc_delta.index as u32,
-                    id: tc_delta.id,
-                    tool_type,
-                    function: tc_delta.function.map(|f| FunctionCallDelta {
-                        name: f.name,
-                        arguments: f.arguments,
-                    }),
-                }]
+            tool_calls: (!delta.commentary_deltas.is_empty()).then(|| {
+                delta
+                    .commentary_deltas
+                    .into_iter()
+                    .map(|tc_delta| ToolCallDelta {
+                        index: tc_delta.index as u32,
+                        tool_type: tc_delta.id.is_some().then(|| "function".to_string()),
+                        id: tc_delta.id,
+                        function: tc_delta.function.map(|f| FunctionCallDelta {
+                            name: f.name,
+                            arguments: f.arguments,
+                        }),
+                    })
+                    .collect()
             }),
             reasoning_content: delta.analysis_delta,
         };
@@ -920,7 +924,7 @@ impl ResponsesDecode {
                 if scanner.push(&text).stopped {
                     stop_matched = scanner.matched().map(str::to_string);
                     delta.final_delta = None;
-                    delta.commentary_delta = None;
+                    delta.commentary_deltas.clear();
                 }
             }
         }
@@ -931,7 +935,7 @@ impl ResponsesDecode {
                     delta.final_delta = (!scan.emit.is_empty()).then_some(scan.emit);
                     if scan.stopped {
                         stop_matched = scanner.matched().map(str::to_string);
-                        delta.commentary_delta = None;
+                        delta.commentary_deltas.clear();
                     }
                 }
             }
@@ -942,7 +946,7 @@ impl ResponsesDecode {
         if let Some(text) = delta.final_delta.as_deref().filter(|text| !text.is_empty()) {
             self.text(text, emitter, tx).await;
         }
-        if let Some(call) = &delta.commentary_delta {
+        for call in &delta.commentary_deltas {
             self.commentary(call, emitter, tx, session, format_registry)
                 .await;
         }
@@ -1051,7 +1055,6 @@ impl ResponsesDecode {
         if let Some(call_id) = &call.id {
             self.open_call(call, call_id, emitter, tx, session, format_registry)
                 .await;
-            return;
         }
         let Some((output_index, item_id, response_format)) = self.calls.get(&call.index) else {
             return;
@@ -1099,15 +1102,16 @@ impl ResponsesDecode {
         // A server call past the turn's allowance opens no item: the loop will not run it (the
         // request's cap, or the final turn after it), so it is parsed for the loop and dropped
         // here, never emitted or stored as a completed call. Its place among the turn's server
-        // calls is read from the parser's completed messages, where the loop reads its
-        // permitted prefix, not counted over the deltas: a chunk that holds a whole call
-        // brings no delta for it.
+        // calls is read from the calls before it in the parser's completed messages, where
+        // the loop reads its permitted prefix: the parser has read the whole chunk by now,
+        // this call and any after it included.
         if let (Some(server), Some(allowance)) = (server, self.server_call_allowance) {
             let earlier = self
                 .parser
                 .get_messages()
                 .iter()
                 .filter_map(|message| message.recipient.as_deref()?.strip_prefix("functions."))
+                .take(call.index)
                 .filter(|name| server.has_exposed_tool(name))
                 .count();
             if earlier >= allowance {
@@ -1223,7 +1227,10 @@ impl ResponsesDecode {
 
     /// Every call found closes its item: `arguments.done` where the tool streams its arguments
     /// (the hosted built-in tools close out through the `*.completed` structured event instead),
-    /// the MCP `completed` event, and `output_item.done` with the call as completed.
+    /// the MCP `completed` event, and `output_item.done` with the call as completed. A server
+    /// call of a turn that did not end on its calls (`ended_on_its_calls`) is one the loop
+    /// will not run: it closes as cut, with no `completed` event, and is not the response's,
+    /// and the response reads the turn as cut, with or without an item of the call.
     async fn close_calls(
         &self,
         emitter: &mut ResponseStreamEventEmitter,
@@ -1233,12 +1240,26 @@ impl ResponsesDecode {
         let Some(tool_calls) = &self.tool_calls else {
             return;
         };
+        let is_server = |name: &str| session.is_some_and(|session| session.has_exposed_tool(name));
+        let unfinished = !ended_on_its_calls(
+            self.finish_reason.as_deref(),
+            tool_calls
+                .iter()
+                .filter(|call| is_server(&call.function.name)),
+        );
+        // The response reads a turn that left a server call un-run as cut, whether or not the
+        // call has an item to close below: one past the turn's allowance opened none.
+        if unfinished && tool_calls.iter().any(|call| is_server(&call.function.name)) {
+            emitter.mark_cut_call();
+        }
         for (call_index, tool_call) in tool_calls.iter().enumerate() {
             let Some((output_index, item_id, response_format)) = self.calls.get(&call_index) else {
                 continue;
             };
             let tool_name = &tool_call.function.name;
             let args_str = tool_call.function.arguments.as_deref().unwrap_or("");
+            // The loop runs none of the server calls of a turn that did not end on its calls.
+            let unrun = unfinished && response_format.is_some();
 
             if streams_arguments(response_format.as_ref()) {
                 let event = match response_format {
@@ -1252,8 +1273,8 @@ impl ResponsesDecode {
                 emitter.send_event_best_effort(&event, tx).await;
             }
 
-            // Emit completed event for MCP tools
-            if let Some(fmt) = *response_format {
+            // Emit completed event for MCP tools, the ones the loop will run
+            if let (Some(fmt), false) = (*response_format, unrun) {
                 let event = emitter.emit_tool_call_completed(*output_index, item_id, fmt);
                 emitter.send_event_best_effort(&event, tx).await;
             }
@@ -1264,7 +1285,7 @@ impl ResponsesDecode {
             // finish (none when the stream ended before its terminal frame): a recovered call
             // the finish cut is `incomplete`, and the response reads it as cut on its terminal
             // event and stored object. A hosted or MCP call's item keeps `completed`; its
-            // result replaces the item.
+            // result replaces the item. One the loop will not run closes as cut, below.
             let status = match response_format {
                 Some(_) => "completed",
                 None => emitter.function_call_status(args_str),
@@ -1282,6 +1303,14 @@ impl ResponsesDecode {
                 .unwrap_or_else(|| DEFAULT_SERVER_LABEL.to_string());
             attach_mcp_server_label(&mut item, Some(label.as_str()), response_format.as_ref());
 
+            if let (Some(format), true) = (*response_format, unrun) {
+                ResponseStreamEventEmitter::sent(
+                    emitter
+                        .send_unrun_call_done(*output_index, item, format, tx)
+                        .await,
+                );
+                continue;
+            }
             ResponseStreamEventEmitter::sent(
                 emitter.send_output_item_done(*output_index, item, tx).await,
             );
@@ -1349,7 +1378,7 @@ impl ResponsesDecode {
         let messages = self.parser.get_messages();
         // Try extracting from completed messages first
         let (analysis_opt, commentary_opt, final_text_extracted) =
-            HarmonyParserAdapter::parse_messages(&messages);
+            HarmonyParserAdapter::parse_messages(messages);
         self.tool_calls.clone_from(&commentary_opt);
         // If no tool calls found, check for incomplete commentary in parser state
         if self.tool_calls.is_none() {
@@ -1637,7 +1666,7 @@ impl ChatDecode {
             Some(delta) => delta,
             None if bare_logprobs => HarmonyChannelDelta {
                 analysis_delta: None,
-                commentary_delta: None,
+                commentary_deltas: Vec::new(),
                 final_delta: None,
             },
             None => return Ok(()),
@@ -1654,7 +1683,7 @@ impl ChatDecode {
                 if scan.stopped {
                     stop_matched = scanner.matched().map(str::to_string);
                     delta.final_delta = None;
-                    delta.commentary_delta = None;
+                    delta.commentary_deltas.clear();
                 }
             }
             if stop_matched.is_none() {
@@ -1667,7 +1696,7 @@ impl ChatDecode {
                     delta.final_delta = (!scan.emit.is_empty()).then_some(scan.emit);
                     if scan.stopped {
                         stop_matched = scanner.matched().map(str::to_string);
-                        delta.commentary_delta = None;
+                        delta.commentary_deltas.clear();
                     }
                 }
             }
@@ -1675,7 +1704,7 @@ impl ChatDecode {
 
         let has_payload = delta.analysis_delta.is_some()
             || delta.final_delta.is_some()
-            || delta.commentary_delta.is_some();
+            || !delta.commentary_deltas.is_empty();
         let is_first = self.is_firsts.get(&index).copied().unwrap_or(false);
         if has_payload || is_first || bare_logprobs {
             HarmonyStreamingProcessor::emit_chunk_delta(
@@ -1824,7 +1853,7 @@ impl ChatDecode {
                 .get_mut(&index)
                 .map(TextStopScanner::flush)
                 .filter(|s| !s.is_empty()),
-            commentary_delta: None,
+            commentary_deltas: Vec::new(),
             final_delta: self
                 .final_scanners
                 .get_mut(&index)
