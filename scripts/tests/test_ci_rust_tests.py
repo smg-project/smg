@@ -282,6 +282,37 @@ class ShardTableTests(unittest.TestCase):
             filter_matches(filters["rust-kv"], "examples/wasm/wasm-guest-storage-hook/src/lib.rs")
         )
 
+    def test_the_kv_shard_turns_on_every_feature_a_policy_test_target_requires(self):
+        # cargo skips a test target whose required features are off, in
+        # silence: the shard's line turns each of them on.
+        manifest = tomllib.loads((REPO / "crates/policy_controller/Cargo.toml").read_text())
+        package = manifest["package"]["name"]
+        line = next(
+            text
+            for text in SCRIPT.read_text().splitlines()
+            if f"-p {package} " in text and "--features" in text
+        )
+        todo = ["default"] + [
+            feature.split("/", 1)[1]
+            for feature in re.search(r"--features ([^\s\"]+)", line).group(1).split(",")
+            if feature.startswith(f"{package}/")
+        ]
+        features = manifest.get("features", {})
+        on = set()
+        while todo:
+            feature = todo.pop()
+            if feature in on:
+                continue
+            on.add(feature)
+            todo.extend(
+                name
+                for name in features.get(feature, [])
+                if not name.startswith("dep:") and "/" not in name
+            )
+        for target in manifest.get("test", []):
+            for need in target.get("required-features", []):
+                self.assertIn(need, on, f"the kv shard would skip tests/{target['name']}.rs")
+
     def test_every_shard_has_a_filter_and_setup_flags_the_workflow_knows(self):
         filters = path_filters()
         workflow = WORKFLOW.read_text()
