@@ -26,6 +26,9 @@ rustc-hash = "2"
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+# The document's digest (SHA-256), at the version the gRPC client crate under
+# `ingest` and the gateway already link.
+sha2 = "0.11"
 thiserror = { workspace = true }
 # The WebAssembly plugin host (`wasm`): the runtime and one kept instance per
 # module per deciding thread. The log lines a plugin writes go through the
@@ -78,6 +81,10 @@ tonic-health = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
+# The spec file's YAML form, and the path of a field its reader refuses
+# (in the tree already, under the web framework).
+serde_path_to_error = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
 
 # The plugin host measures a call's bound on the CPU its thread had: the
 # thread CPU clock, read at a tick a call is still in flight, at the start of
@@ -126,6 +133,8 @@ controller = [
     "dep:prost",
     "dep:rustix",
     "dep:rustls",
+    "dep:serde_path_to_error",
+    "dep:serde_yaml",
     "dep:thread_local",
     "dep:tokio",
     "dep:tokio-stream",
@@ -194,6 +203,10 @@ required-features = ["controller"]
 
 [[test]]
 name = "binary"
+required-features = ["controller"]
+
+[[test]]
+name = "spec_file"
 required-features = ["controller"]
 
 # Replays recorded rows through the row builder of `ingest`: a bare test run builds no part of it.

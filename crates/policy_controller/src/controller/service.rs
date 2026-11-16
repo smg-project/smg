@@ -4,7 +4,8 @@
 //!
 //! `Leader` is served, on every listener and by every replica, to a caller
 //! with a principal or with none. `Session` is served to a gateway
-//! ([`session`](super::session)). Every other call is refused:
+//! ([`session`](super::session)). `GetPolicySpec` is served on the control
+//! scope by a controller given a spec source. Every other call is refused:
 //! `PERMISSION_DENIED` where the listener mounts none of the call's scopes
 //! (the contract: the scope does not cover the RPC), `UNAUTHENTICATED`
 //! where it does and the listener's layer placed no principal on the call
@@ -26,10 +27,12 @@ use super::{
     config::Scope,
     election::{split_identity, Standing},
     gateways::Gateways,
+    generations::Generations,
     principal::{self, Layer, Principal},
     session, PROTOCOL_VERSION,
 };
 use crate::{
+    catalog::Catalog,
     elector::{Elector, Fence},
     proto::{
         self,
@@ -58,6 +61,9 @@ pub(crate) struct Shared {
     /// Who is present: the gateways a `Session` welcomed, over this fence
     /// and this store.
     pub(crate) gateways: Arc<Gateways>,
+    /// The spec's generations over that store: the door a spec source
+    /// applies through, and the document the spec calls read.
+    pub(crate) generations: Arc<Generations>,
     /// How long a `Session` stream may stand with no `Hello`.
     pub(crate) hello_deadline: Duration,
 }
@@ -79,13 +85,15 @@ impl Shared {
     /// its state as a field and fills it here, from these arguments where
     /// it can, so the other builders do not change. The identity and the
     /// fence are `elector`'s, so no instance answers under an identity
-    /// another fence guards.
+    /// another fence guards. A spec document names the stages `catalog`
+    /// holds.
     pub(crate) fn new(
         controller_id: String,
         address: String,
         elector: &Elector,
         standing: watch::Receiver<Standing>,
         store: Arc<MemoryStore>,
+        catalog: Arc<Catalog>,
     ) -> Self {
         let gateways = Arc::new(Gateways::new(
             session::GRACE_PERIOD,
@@ -99,6 +107,7 @@ impl Shared {
             identity: elector.identity().to_owned(),
             fence: elector.fence(),
             standing,
+            generations: Arc::new(Generations::new(Arc::clone(&store), catalog)),
             store,
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
@@ -292,6 +301,17 @@ impl Service {
         )))
     }
 
+    /// The answer to a spec call on a controller that was given no spec
+    /// source, behind the listener's admission: this build serves the call,
+    /// and this controller's start named no source for it.
+    fn sourceless<T, R>(&self, call: Call, request: &Request<T>) -> Result<R, Status> {
+        self.admit(call, request)?;
+        Err(Status::unimplemented(format!(
+            "{} is not served by a controller started with no spec file",
+            call.name()
+        )))
+    }
+
     /// The `Leader` call's answer at `now`: [`Shared::leader`] at one read
     /// of the fence.
     fn leader_info(&self, now: Instant) -> proto::LeaderInfo {
@@ -405,11 +425,23 @@ impl PolicyController for Service {
         self.unserved(Call::ApplyPolicySpec, &request)
     }
 
+    /// The standing generation's document as its source wrote it, with the
+    /// number and the digest beside it: every replica answers from its own
+    /// holder. A controller that was given no spec source serves no spec
+    /// call.
     async fn get_policy_spec(
         &self,
         request: Request<proto::GetPolicySpecRequest>,
     ) -> Result<Response<proto::PolicySpecDocument>, Status> {
-        self.unserved(Call::GetPolicySpec, &request)
+        let generations = &self.shared.generations;
+        if !generations.bound() {
+            return self.sourceless(Call::GetPolicySpec, &request);
+        }
+        self.admit(Call::GetPolicySpec, &request)?;
+        generations
+            .document(request.get_ref().generation)
+            .map(Response::new)
+            .map_err(|not_held| Status::not_found(not_held.to_string()))
     }
 
     async fn rollback_policy_spec(
@@ -471,9 +503,11 @@ mod tests {
 
     use super::{Call, Service, Shared};
     use crate::{
+        catalog::Catalog,
         controller::{
             config::Scope,
             election::{self, Standing},
+            generations::{tests::LEAST_LOAD, Format},
             principal::{
                 tests::{stating, told, NO_PRINCIPAL},
                 Layer,
@@ -508,6 +542,7 @@ mod tests {
             &elector,
             stood,
             Arc::new(MemoryStore::new()),
+            Arc::new(Catalog::builtin()),
         ));
         (elector, standing, Service::new(scopes.to_vec(), shared))
     }
@@ -564,6 +599,7 @@ mod tests {
             &elector,
             stood,
             Arc::clone(&store),
+            Arc::new(Catalog::builtin()),
         ));
         let service = Service::new(vec![Scope::Gateway], shared);
         let mut running = election::start(elector, store, standing).expect("a thread");
@@ -733,7 +769,7 @@ mod tests {
         assert_eq!(unserved.code(), Code::Unimplemented);
         assert_eq!(
             unserved.message(),
-            "GetPolicySpec is not served by this build"
+            "GetPolicySpec is not served by a controller started with no spec file"
         );
         // A caller no layer placed is refused before the call is named
         // unserved: no call body is reached without a principal.
@@ -857,6 +893,11 @@ mod tests {
                         "no session stands on this stream: Hello is the first frame, a frame of no kind came first"
                             .to_owned(),
                     )
+                } else if layer == Layer::AsTold && stated && *method == "GetPolicySpec" {
+                    (
+                        Code::Unimplemented,
+                        format!("{method} is not served by a controller started with no spec file"),
+                    )
                 } else if layer == Layer::AsTold && stated {
                     (
                         Code::Unimplemented,
@@ -932,6 +973,7 @@ mod tests {
                 &elector,
                 stood,
                 Arc::new(MemoryStore::new()),
+                Arc::new(Catalog::builtin()),
             )),
         );
 
@@ -1066,5 +1108,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A controller with a spec source serves the read call on the control
+    /// scope: the source's bytes under the standing number, to a caller with
+    /// a principal. A number that does not stand is not found, by name, and
+    /// the scope's rules stand as for every call.
+    #[tokio::test]
+    async fn the_read_call_answers_the_standing_document_once_a_source_applied_one() {
+        let (_elector, _standing, control) = service(&[Scope::Control]);
+        let (_elector, _standing, gateway) = service(&[Scope::Gateway, Scope::Ingestion]);
+        for service in [&control, &gateway] {
+            service
+                .shared
+                .generations
+                .apply(LEAST_LOAD.into(), Format::Yaml)
+                .expect("a valid document");
+        }
+        let read = |generation| from("operator-a", proto::GetPolicySpecRequest { generation });
+
+        let answer = control
+            .get_policy_spec(read(0))
+            .await
+            .expect("the standing document")
+            .into_inner();
+        assert_eq!(answer.generation, 1);
+        assert_eq!(answer.document, LEAST_LOAD.as_bytes());
+        assert_eq!(answer.format, "yaml");
+        assert!(answer.digest.starts_with("sha256:"), "{}", answer.digest);
+
+        let older = control.get_policy_spec(read(4)).await.expect_err("refused");
+        assert_eq!(older.code(), Code::NotFound);
+        assert_eq!(
+            older.message(),
+            "no document is held for generation 4: the spec source's document is generation 1, generation 1 stands, and the standing generation's document alone is retained"
+        );
+
+        let unplaced = control
+            .get_policy_spec(Request::new(proto::GetPolicySpecRequest::default()))
+            .await
+            .expect_err("refused");
+        assert_eq!(unplaced.code(), Code::Unauthenticated);
+        let denied = gateway.get_policy_spec(read(0)).await.expect_err("refused");
+        assert_eq!(denied.code(), Code::PermissionDenied);
     }
 }

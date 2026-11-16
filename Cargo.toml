@@ -70,6 +70,7 @@ rand = "0.10.1"
 reqwest = { version = "0.13.4", default-features = false }
 serde = { version = "1.0" }
 serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_path_to_error = "0.1"
 serde_with = { version = "3", features = ["macros"] }
 # serde_yaml is archived upstream (0.9 is its last line); every YAML reader inherits this one pin.
 serde_yaml = "0.9"

@@ -10,6 +10,7 @@
 //! share, included by path.
 
 use std::{
+    ffi::OsStr,
     io::{BufRead, BufReader, Write},
     net::SocketAddr,
     path::Path,
@@ -162,7 +163,7 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
     ) -> Result<Self, String> {
-        Self::start_as(id, None, lease, settings, settle_secs)
+        Self::start_as(id, None, lease, settings, settle_secs, &[])
     }
 
     /// Starts the binary as [`Replica::start`] does, under an advertised
@@ -176,7 +177,18 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
     ) -> Result<Self, String> {
-        Self::start_as(id, Some(advertise), lease, settings, settle_secs)
+        Self::start_as(id, Some(advertise), lease, settings, settle_secs, &[])
+    }
+
+    /// [`Replica::start`] with `flags` after its own on the command line.
+    pub fn start_with(
+        id: &str,
+        lease: Lease<'_>,
+        settings: ElectionSettings,
+        settle_secs: u64,
+        flags: &[&OsStr],
+    ) -> Result<Self, String> {
+        Self::start_as(id, None, lease, settings, settle_secs, flags)
     }
 
     fn start_as(
@@ -185,6 +197,7 @@ impl Replica {
         lease: Lease<'_>,
         settings: ElectionSettings,
         settle_secs: u64,
+        flags: &[&OsStr],
     ) -> Result<Self, String> {
         let millis = |duration: Duration| duration.as_millis().to_string();
         let grace_secs = (2 * settle_secs).max(5);
@@ -225,6 +238,7 @@ impl Replica {
             // certificate: its gateway listener takes the name as told.
             .args(["--identity-as-told", "gateway"])
             .args(["--log-level", "info", "--log-json"])
+            .args(flags)
             .env_remove("RUST_LOG")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

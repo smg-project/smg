@@ -16,7 +16,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    fmt, io,
     sync::LazyLock,
 };
 
@@ -26,6 +26,7 @@ use serde::{
     ser::SerializeMap,
     Deserialize, Deserializer, Serialize, Serializer,
 };
+use sha2::{Digest as _, Sha256};
 
 use crate::{
     affinity::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
@@ -1485,6 +1486,8 @@ pub enum SpecError {
     Empty,
     #[error("unknown preset {0:?}")]
     UnknownPreset(String),
+    #[error("the document has no canonical form to digest: {0}")]
+    NoCanonicalForm(String),
 }
 
 /// A field path under construction, for the messages.
@@ -2819,6 +2822,102 @@ impl PolicySpec {
         text.push('\n');
         Ok(text)
     }
+
+    /// The document's digest ([`Digest`]): a change of the file's form or of
+    /// the `generation` line leaves it as it was, and any other change to a
+    /// document the validator admits moves it. A `kind` line is in no
+    /// canonical form and so in no digest: the validator refuses it, and
+    /// equal digests say nothing of a document that was not validated.
+    pub fn digest(&self) -> Result<Digest, SpecError> {
+        let mut hash = Sha256::new();
+        serde_json::to_writer(HashWriter(&mut hash), &self.lineless())
+            .map_err(|error| SpecError::NoCanonicalForm(error.to_string()))?;
+        Ok(Digest(hash.finalize().into()))
+    }
+
+    /// The document's canonical form, borrowed: a digest copies none of the
+    /// document. Every field is named here, so a field the type gains does
+    /// not compile until this form takes it or leaves it out by name.
+    fn lineless(&self) -> Lineless<'_> {
+        let Self {
+            api_version,
+            generation: _,
+            kind: _,
+            view,
+            index,
+            profiles,
+            plans,
+            bindings,
+        } = self;
+        Lineless {
+            api_version,
+            generation: 0,
+            view,
+            index,
+            profiles,
+            plans,
+            bindings,
+        }
+    }
+}
+
+/// A document's canonical form ([`Digest`]) by reference: [`PolicySpec`]'s
+/// fields in its order and under its attributes, the `generation` line
+/// zeroed and no `kind` line. It serializes as the document itself does
+/// under a zeroed line, byte for byte.
+#[derive(Serialize)]
+struct Lineless<'a> {
+    #[serde(rename = "apiVersion")]
+    api_version: &'a str,
+    generation: u64,
+    #[serde(skip_serializing_if = "is_default::<ViewSpec>")]
+    view: &'a ViewSpec,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    index: &'a BTreeMap<String, IndexSpec>,
+    profiles: &'a BTreeMap<String, ProfileSpec>,
+    #[serde(skip_serializing_if = "is_default::<PlansSpec>")]
+    plans: &'a PlansSpec,
+    bindings: &'a [BindingSpec],
+}
+
+/// A document's digest: SHA-256 over its canonical bytes, which are the
+/// document's JSON as [`PolicySpec`] serializes (its maps ordered, its fields
+/// in the type's order) with the `generation` line zeroed. Two files that
+/// parse into one document share it whatever their form (YAML or JSON, the
+/// order of their keys, their comments), and a document applied again under
+/// a higher number keeps it. It is written `sha256:` and 64 hex digits.
+///
+/// The canonical bytes are this build's: two builds whose schema differs may
+/// print two digests for one file.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Digest([u8; 32]);
+
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("sha256:")?;
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+impl fmt::Debug for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// What a serializer writes, fed to a hash: the canonical bytes are never
+/// held whole.
+struct HashWriter<'a>(&'a mut Sha256);
+
+impl io::Write for HashWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// One generation as a store applies it: the engine validated from a
@@ -2837,9 +2936,16 @@ impl PolicySpec {
 /// document is applied, and the only generation 0 a store ever holds. A
 /// document that names no generation validates to number 0 too, and the
 /// store's apply refuses it as not above the standing one.
+///
+/// It carries the document's digest beside the number ([`Digest`]): the
+/// number says which generation a replica runs, the digest which document,
+/// and one load reads the pair.
 #[derive(Debug)]
 pub struct AppliedSpec {
     engine: Engine,
+    /// The digest of the document the engine was validated from; none for
+    /// the unbound start, which has no document.
+    digest: Option<Digest>,
 }
 
 impl AppliedSpec {
@@ -2854,9 +2960,28 @@ impl AppliedSpec {
         document: &PolicySpec,
         denied_headers: &[&str],
     ) -> Result<Self, SpecError> {
-        document
-            .validate_with(denied_headers)
-            .map(|engine| Self { engine })
+        let engine = document.validate_with(denied_headers)?;
+        Ok(Self {
+            engine,
+            digest: Some(document.digest()?),
+        })
+    }
+
+    /// [`AppliedSpec::validate`] over the stages `catalog` holds, under a
+    /// digest its caller took already: the controller's door reads the
+    /// document's digest against the standing one and hands it on, so an
+    /// apply digests its document once.
+    #[cfg(feature = "controller")]
+    pub(crate) fn validate_digested(
+        document: &PolicySpec,
+        digest: Digest,
+        catalog: &Catalog,
+    ) -> Result<Self, SpecError> {
+        let engine = document.validate_in(catalog, &[])?;
+        Ok(Self {
+            engine,
+            digest: Some(digest),
+        })
     }
 
     /// The generation a store holds before any document is applied: number
@@ -2866,6 +2991,7 @@ impl AppliedSpec {
     pub fn unbound() -> Self {
         Self {
             engine: Engine::new(Vec::new(), Vec::new(), 0, Needs::default()),
+            digest: None,
         }
     }
 
@@ -2873,6 +2999,14 @@ impl AppliedSpec {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.engine.generation()
+    }
+
+    /// The digest of the document this generation was validated from
+    /// ([`PolicySpec::digest`]); `None` for the unbound start, which has no
+    /// document.
+    #[must_use]
+    pub fn digest(&self) -> Option<Digest> {
+        self.digest
     }
 
     /// The engine a decision under this generation runs.
@@ -4528,5 +4662,237 @@ mod tests {
             0,
             "under the default gate the loaded holder spills"
         );
+    }
+
+    /// The digest names the document, not the file: the form (YAML or JSON,
+    /// the order of the keys, a comment) and the `generation` line leave it
+    /// as it was, and any other field moves it. Its input is the document's
+    /// JSON with the line zeroed, under SHA-256.
+    #[test]
+    fn a_digest_holds_across_the_form_and_the_line_and_moves_with_any_other_field() {
+        let written = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"filter":["healthy"],"score":["least-load"],"pick":"best"}}}"#,
+        );
+        let digest = written.digest().expect("a digest");
+
+        let numbered = PolicySpec {
+            generation: 7,
+            ..written.clone()
+        };
+        assert_eq!(numbered.digest(), Ok(digest), "the line is not in it");
+        let yaml: PolicySpec = serde_yaml::from_str(
+            "profiles:\n  p:\n    pick: best   # a comment\n    score: [least-load]\n    filter: [healthy]\ngeneration: 3\napiVersion: smg.policy/v1\n",
+        )
+        .expect("the same document in YAML, its keys in another order");
+        assert_eq!(yaml.digest(), Ok(digest), "the form is not in it");
+
+        let mut moved = written.clone();
+        moved
+            .profiles
+            .get_mut("p")
+            .expect("the profile")
+            .filter
+            .push("not-tried".to_owned());
+        assert_ne!(moved.digest(), Ok(digest), "a filter more is in it");
+
+        // The one line a document can write that no canonical form carries:
+        // the validator refuses it, and the digest does not read it.
+        let kinded: PolicySpec = serde_yaml::from_str(
+            "kind: PolicySpec\napiVersion: smg.policy/v1\nprofiles:\n  p:\n    filter: [healthy]\n    score: [least-load]\n    pick: best\n",
+        )
+        .expect("a kind line parses");
+        assert_eq!(kinded.digest(), Ok(digest), "a kind line is not in it");
+        assert_eq!(
+            kinded.validate().err(),
+            Some(SpecError::Kind("PolicySpec".into()))
+        );
+
+        let canonical = serde_json::to_string(&PolicySpec {
+            generation: 0,
+            ..numbered
+        })
+        .expect("serializes");
+        assert!(
+            canonical.starts_with(r#"{"apiVersion":"smg.policy/v1","generation":0,"#),
+            "{canonical}"
+        );
+        let hex: String = Sha256::digest(canonical.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(digest.to_string(), format!("sha256:{hex}"));
+    }
+
+    /// The digest's "any", over the type's fields: a change to each field
+    /// the schema names moves the digest, the `generation` line alone
+    /// excepted. The names are the schema's, so a field added to the type
+    /// joins the case, and fails it until a change to it is shown here.
+    #[test]
+    fn a_digest_moves_with_every_field_the_schema_names_but_the_line() {
+        let base = PolicySpec::preset("least_load").expect("a preset");
+        let digest = base.digest().expect("a digest");
+
+        let mut bindings = base.bindings.clone();
+        bindings.push(BindingSpec::default());
+        let mut index = base.index.clone();
+        index.insert("another*".to_owned(), IndexSpec::default());
+        let mut profiles = base.profiles.clone();
+        let profile = profiles.values().next().expect("a profile").clone();
+        profiles.insert("another".to_owned(), profile);
+        let plans = PlansSpec {
+            pd_pair: PdPairPlanSpec {
+                pairing: Pairing::Off,
+            },
+        };
+        let view = ViewSpec {
+            headers: vec!["x-team".to_owned()],
+            ..base.view.clone()
+        };
+        let changed = [
+            (
+                "apiVersion",
+                PolicySpec {
+                    api_version: "smg.policy/v2".to_owned(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "bindings",
+                PolicySpec {
+                    bindings,
+                    ..base.clone()
+                },
+            ),
+            (
+                "generation",
+                PolicySpec {
+                    generation: base.generation + 9,
+                    ..base.clone()
+                },
+            ),
+            (
+                "index",
+                PolicySpec {
+                    index,
+                    ..base.clone()
+                },
+            ),
+            (
+                "plans",
+                PolicySpec {
+                    plans,
+                    ..base.clone()
+                },
+            ),
+            (
+                "profiles",
+                PolicySpec {
+                    profiles,
+                    ..base.clone()
+                },
+            ),
+            (
+                "view",
+                PolicySpec {
+                    view,
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        let schema = serde_json::to_value(PolicySpec::schema()).expect("the schema is JSON");
+        let named: BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .expect("the type's fields")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let shown: BTreeSet<&str> = changed.iter().map(|(field, _)| *field).collect();
+        assert_eq!(named, shown, "one change a field the schema names");
+        for (field, document) in &changed {
+            assert_ne!(document, &base, "{field} is changed");
+            let moved = document.digest().expect("a digest") != digest;
+            assert_eq!(moved, *field != "generation", "{field}");
+        }
+    }
+
+    /// The digest copies none of the document: what it hashes is, byte for
+    /// byte, the JSON the document itself writes under a zeroed line. Held
+    /// for every preset, under a line and under none, for a document that
+    /// writes every field the schema names and for one that writes the
+    /// least: a field left out where it is the default is left out of both.
+    #[test]
+    fn a_digest_hashes_what_the_document_itself_writes_under_a_zeroed_line() {
+        let base = PolicySpec::preset("least_load").expect("a preset");
+        let every_field = PolicySpec {
+            view: ViewSpec {
+                headers: vec!["x-team".to_owned()],
+                ..base.view.clone()
+            },
+            index: BTreeMap::from([("another*".to_owned(), IndexSpec::default())]),
+            plans: PlansSpec {
+                pd_pair: PdPairPlanSpec {
+                    pairing: Pairing::Off,
+                },
+            },
+            bindings: vec![BindingSpec::default()],
+            ..base
+        };
+        let written = serde_json::to_value(&every_field).expect("the document is JSON");
+        let schema = serde_json::to_value(PolicySpec::schema()).expect("the schema is JSON");
+        let fields = |of: &serde_json::Value| -> BTreeSet<String> {
+            let fields = of.as_object().expect("a map of fields");
+            fields.keys().cloned().collect()
+        };
+        assert_eq!(
+            fields(&written),
+            fields(&schema["properties"]),
+            "the document writes every field the schema names"
+        );
+        let least = doc(r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}}}"#);
+        let mut documents = vec![every_field, least];
+        for name in PRESETS {
+            let preset = PolicySpec::preset(name).expect(name);
+            documents.push(PolicySpec {
+                generation: 7,
+                ..preset.clone()
+            });
+            documents.push(preset);
+        }
+        for document in documents {
+            let borrowed = serde_json::to_string(&document.lineless()).expect("serializes");
+            let owned = serde_json::to_string(&PolicySpec {
+                generation: 0,
+                ..document
+            })
+            .expect("serializes");
+            assert_eq!(borrowed, owned);
+        }
+    }
+
+    /// A validated generation carries its document's digest; the unbound
+    /// start has no document and no digest.
+    #[test]
+    fn an_applied_generation_carries_its_documents_digest_and_the_unbound_start_none() {
+        let document = PolicySpec::preset("least_load").expect("a preset");
+        let applied = AppliedSpec::validate(&document).expect("a preset validates");
+        assert_eq!(applied.digest(), Some(document.digest().expect("a digest")));
+        assert_eq!(AppliedSpec::unbound().digest(), None);
+    }
+
+    /// A digest handed on is the generation's, as given: the door's apply
+    /// digests its document once.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_digest_handed_on_is_carried_as_given() {
+        let document = PolicySpec::preset("least_load").expect("a preset");
+        let handed = PolicySpec::preset("random")
+            .expect("a preset")
+            .digest()
+            .expect("a digest");
+        assert_ne!(document.digest(), Ok(handed));
+        let applied = AppliedSpec::validate_digested(&document, handed, &Catalog::builtin())
+            .expect("a preset validates");
+        assert_eq!(applied.digest(), Some(handed));
     }
 }

@@ -551,6 +551,7 @@ mod tests {
             &elector,
             stood,
             Arc::new(MemoryStore::new()),
+            Arc::new(crate::Catalog::builtin()),
         );
         if let Some(ceiling) = ceiling {
             shared.gateways = Arc::new(Gateways::new(

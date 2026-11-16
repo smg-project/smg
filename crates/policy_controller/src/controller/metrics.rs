@@ -8,15 +8,15 @@
 //! driver carries no recorder handle.
 
 use std::{
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use metrics::{Counter, Gauge, Key, KeyName, Label, Level, Metadata, Recorder};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
 use parking_lot::Mutex;
 
-use super::readiness::State;
+use super::{generations::Generations, readiness::State};
 use crate::ingest::loads::{Failures, Stats};
 
 /// `1` for the controller's state (`starting`, `leader`, `follower`,
@@ -38,6 +38,9 @@ pub const LOAD_SCRAPES_TOTAL: &str = "smg_policy_controller_load_scrapes_total";
 pub const LOAD_SCRAPE_FAILURES_TOTAL: &str = "smg_policy_controller_load_scrape_failures_total";
 /// Rank rows the load driver wrote.
 pub const LOAD_ROWS_TOTAL: &str = "smg_policy_controller_load_rows_total";
+/// The generation of the policy spec the controller runs. Rendered by a
+/// controller with a spec source, from its first document on.
+pub const SPEC_GENERATION: &str = "smg_policy_spec_generation";
 
 /// The controller's series and the handle that renders them.
 pub(crate) struct Metrics {
@@ -48,6 +51,17 @@ pub(crate) struct Metrics {
     /// Held from a scrape's sample of the state to the end of its render:
     /// the four gauges are written from one sample and read back whole.
     scrape: Mutex<()>,
+    /// The recorder itself: the spec's series is registered on it when a
+    /// spec source is bound, so a controller with none renders none.
+    recorder: PrometheusRecorder,
+    /// The spec's series and the generations it reads, once bound.
+    spec: OnceLock<SpecSeries>,
+}
+
+/// The spec's series, set from the generations at each render.
+struct SpecSeries {
+    generations: Arc<Generations>,
+    generation: Gauge,
 }
 
 /// The load driver's counts as the recorder's counters, set absolute from
@@ -144,9 +158,31 @@ impl Metrics {
             state,
             loads,
             scrape: Mutex::new(()),
+            recorder,
+            spec: OnceLock::new(),
         };
         metrics.set_state(State::Starting);
         metrics
+    }
+
+    /// Renders the generation `generations` runs from here on. Bound once,
+    /// when a spec source has applied its first document; a controller with
+    /// no source renders no spec series.
+    pub(crate) fn spec(&self, generations: Arc<Generations>) {
+        self.spec.get_or_init(|| {
+            let metadata = Metadata::new(module_path!(), Level::INFO, Some(module_path!()));
+            self.recorder.describe_gauge(
+                KeyName::from_const_str(SPEC_GENERATION),
+                None,
+                "The generation of the policy spec the controller runs".into(),
+            );
+            SpecSeries {
+                generation: self
+                    .recorder
+                    .register_gauge(&Key::from_name(SPEC_GENERATION), &metadata),
+                generations,
+            }
+        });
     }
 
     /// One scrape's text form: the state sampled once by `state` and its
@@ -157,6 +193,9 @@ impl Metrics {
         let _one = self.scrape.lock();
         self.set_state(state());
         self.observe_loads(loads);
+        if let Some(spec) = self.spec.get() {
+            spec.generation.set(spec.generations.generation() as f64);
+        }
         self.handle.render()
     }
 
@@ -198,9 +237,9 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
-    use super::{Metrics, START_TIME_SECONDS, STATE};
+    use super::{Generations, Metrics, SPEC_GENERATION, START_TIME_SECONDS, STATE};
     use crate::{controller::readiness::State, ingest::loads::Stats};
 
     fn line(rendered: &str, series: &str, label: &str) -> Option<String> {
@@ -363,5 +402,39 @@ mod tests {
             .and_then(|v| v.parse::<f64>().ok())
             .expect("the start time line");
         assert!(start > 1.7e9, "seconds since the epoch, read {start}");
+    }
+
+    /// A controller with no spec source renders no spec series. Once one is
+    /// bound, every render reads the generation that stands at that render.
+    #[test]
+    fn the_spec_generation_renders_once_a_source_is_bound() {
+        use crate::{
+            controller::generations::{
+                tests::{LEAST_LOAD, RANDOM},
+                Format,
+            },
+            store::MemoryStore,
+        };
+
+        let metrics = Metrics::new();
+        let rendered = metrics.render(|| State::Leader, &Stats::default());
+        assert!(!rendered.contains("smg_policy_spec"), "{rendered}");
+
+        let generations = Arc::new(Generations::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(crate::Catalog::builtin()),
+        ));
+        metrics.spec(Arc::clone(&generations));
+        for (document, generation) in [(LEAST_LOAD, 1), (RANDOM, 2)] {
+            generations
+                .apply(document.into(), Format::Yaml)
+                .expect("a valid document");
+            let rendered = metrics.render(|| State::Leader, &Stats::default());
+            let line = format!("{SPEC_GENERATION} {generation}");
+            assert!(
+                rendered.lines().any(|rendered| rendered == line),
+                "no line {line:?} in {rendered}"
+            );
+        }
     }
 }
