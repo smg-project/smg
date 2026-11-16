@@ -74,6 +74,7 @@ use crate::{
     policies::PolicyRegistry,
     worker::{
         health::liveness,
+        identity::endpoint::Endpoint,
         load::state::{LoadReceiver, LoadSnapshot, LoadState},
         registry::event::WorkerEvent,
         ConnectionMode, Worker, WorkerRegistry,
@@ -83,6 +84,24 @@ use crate::{
 mod scrape;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The rank loads by worker as the update line writes them: each address
+/// masked. A worker's address may hold a credential in its userinfo or a
+/// token in its query. The address is read when the line is written, so
+/// nothing is parsed while debug logging is off.
+struct MaskedLoads<'a>(&'a HashMap<String, HashMap<isize, isize>>);
+
+impl Debug for MaskedLoads<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(url, ranks)| (Endpoint::redacted_str(url), ranks)),
+            )
+            .finish()
+    }
+}
 
 /// DP rank load cache used by load-aware routing policies.
 ///
@@ -109,7 +128,10 @@ impl WorkerLoadManager {
 
     /// Replace cached rank loads for the supplied workers, preserving other workers.
     pub fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
-        debug!("WorkerLoadManager update_dp_loads map:{:?}", loads);
+        debug!(
+            "WorkerLoadManager update_dp_loads map:{:?}",
+            MaskedLoads(loads)
+        );
         let mut cached = self.dp_cached_loads.write();
         cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
