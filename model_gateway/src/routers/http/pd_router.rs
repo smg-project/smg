@@ -2881,14 +2881,19 @@ impl RouterTrait for PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: CreateMessageRequest,
+        body: Arc<CreateMessageRequest>,
         model_id: &str,
     ) -> Response {
         if let Some(refused) = super::refuse_max_tokens_zero(body.max_tokens) {
             return refused;
         }
-        self.route_pd(headers, Some(tenant_meta), body, model_id)
-            .await
+        self.route_pd(
+            headers,
+            Some(tenant_meta),
+            Arc::unwrap_or_clone(body),
+            model_id,
+        )
+        .await
     }
 
     async fn route_messages_count_tokens(
@@ -4266,7 +4271,7 @@ mod tests {
         }))
         .expect("valid messages request");
         let response = router
-            .route_messages(None, &tenant, messages, UNKNOWN_MODEL_ID)
+            .route_messages(None, &tenant, Arc::new(messages), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -4675,7 +4680,7 @@ mod tests {
         };
 
         let response = router
-            .route_messages(None, &tenant, request(0), UNKNOWN_MODEL_ID)
+            .route_messages(None, &tenant, Arc::new(request(0)), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
@@ -4690,7 +4695,7 @@ mod tests {
         }
 
         let response = router
-            .route_messages(None, &tenant, request(16), UNKNOWN_MODEL_ID)
+            .route_messages(None, &tenant, Arc::new(request(16)), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         for seen in [&prefill_seen, &decode_seen] {
@@ -4949,7 +4954,7 @@ mod tests {
 
         let response = tokio::time::timeout(
             guard,
-            router.route_messages(None, &tenant, request, UNKNOWN_MODEL_ID),
+            router.route_messages(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID),
         )
         .await
         .expect("the client stream must not wait for the prefill body");
@@ -6521,7 +6526,7 @@ mod tests {
         }))
         .expect("valid messages request");
         let response = router
-            .route_messages(None, &tenant, messages, UNKNOWN_MODEL_ID)
+            .route_messages(None, &tenant, Arc::new(messages), UNKNOWN_MODEL_ID)
             .await;
         // The endpoint reaches PD selection (and fails on the empty fleet)
         // instead of falling through to the trait's 501 default.
@@ -7709,7 +7714,7 @@ mod tests {
         .unwrap();
 
         let response = router
-            .route_messages(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .route_messages(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);

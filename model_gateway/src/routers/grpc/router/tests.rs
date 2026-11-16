@@ -709,7 +709,12 @@ async fn max_tokens_zero_is_answered_with_an_empty_message() {
     });
 
     let response = router
-        .route_messages(None, &tenant_meta, message_request(body.clone()), "m")
+        .route_messages(
+            None,
+            &tenant_meta,
+            Arc::new(message_request(body.clone())),
+            "m",
+        )
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -730,7 +735,7 @@ async fn max_tokens_zero_is_answered_with_an_empty_message() {
     let mut with_rid = body.clone();
     with_rid["rid"] = json!("req-7");
     let response = router
-        .route_messages(None, &tenant_meta, message_request(with_rid), "m")
+        .route_messages(None, &tenant_meta, Arc::new(message_request(with_rid)), "m")
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -742,7 +747,7 @@ async fn max_tokens_zero_is_answered_with_an_empty_message() {
     let mut streamed = body.clone();
     streamed["stream"] = json!(true);
     let response = router
-        .route_messages(None, &tenant_meta, message_request(streamed), "m")
+        .route_messages(None, &tenant_meta, Arc::new(message_request(streamed)), "m")
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -775,10 +780,10 @@ async fn max_tokens_zero_is_answered_with_an_empty_message() {
         .route_messages(
             None,
             &tenant_meta,
-            message_request(json!({
+            Arc::new(message_request(json!({
                 "model": "nope", "max_tokens": 0,
                 "messages": [{"role": "user", "content": "hi"}]
-            })),
+            }))),
             "nope",
         )
         .await;
@@ -809,7 +814,12 @@ async fn max_tokens_zero_is_answered_with_an_empty_message() {
         .register(window_worker("grpc://worker-window-3:30000", 3))
         .expect("register worker");
     let response = router
-        .route_messages(None, &tenant_meta, message_request(body.clone()), "m")
+        .route_messages(
+            None,
+            &tenant_meta,
+            Arc::new(message_request(body.clone())),
+            "m",
+        )
         .await;
     assert_eq!(
         response.status(),
@@ -820,7 +830,7 @@ async fn max_tokens_zero_is_answered_with_an_empty_message() {
         .register(window_worker("grpc://worker-window-2:30000", 2))
         .expect("register worker");
     let response = router
-        .route_messages(None, &tenant_meta, message_request(body), "m")
+        .route_messages(None, &tenant_meta, Arc::new(message_request(body)), "m")
         .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -888,7 +898,7 @@ async fn counts_render_the_output_config_effort() {
         let mut message = body;
         message["max_tokens"] = json!(0);
         let empty = router
-            .route_messages(None, &tenant_meta, message_request(message), "m")
+            .route_messages(None, &tenant_meta, Arc::new(message_request(message)), "m")
             .await;
         for (response, field) in [(count, "/input_tokens"), (empty, "/usage/input_tokens")] {
             assert_eq!(response.status(), StatusCode::OK, "{output_config}");
@@ -1899,7 +1909,7 @@ fn max_tokens_zero_records_the_requests_media_and_count_tokens_does_not() {
 
             let body = json!({"model": "m", "max_tokens": 0, "messages": messages});
             let _ = router
-                .route_messages(None, &tenant_meta, message_request(body), "m")
+                .route_messages(None, &tenant_meta, Arc::new(message_request(body)), "m")
                 .await;
             assert_eq!(
                 items_total(&handle.render()),

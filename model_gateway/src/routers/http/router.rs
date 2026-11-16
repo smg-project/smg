@@ -2612,14 +2612,20 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: CreateMessageRequest,
+        body: Arc<CreateMessageRequest>,
         model_id: &str,
     ) -> Response {
         if let Some(refused) = super::refuse_max_tokens_zero(body.max_tokens) {
             return refused;
         }
-        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/messages", model_id)
-            .await
+        self.route_typed_request(
+            headers,
+            Some(tenant_meta),
+            Arc::unwrap_or_clone(body),
+            "/v1/messages",
+            model_id,
+        )
+        .await
     }
 
     async fn route_messages_count_tokens(
@@ -5091,7 +5097,12 @@ mod tests {
 
         for stream in [false, true] {
             let response = router
-                .route_messages(None, &tenant, request(0, stream), UNKNOWN_MODEL_ID)
+                .route_messages(
+                    None,
+                    &tenant,
+                    Arc::new(request(0, stream)),
+                    UNKNOWN_MODEL_ID,
+                )
                 .await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
@@ -5105,7 +5116,12 @@ mod tests {
         );
 
         let response = router
-            .route_messages(None, &tenant, request(16, false), UNKNOWN_MODEL_ID)
+            .route_messages(
+                None,
+                &tenant,
+                Arc::new(request(16, false)),
+                UNKNOWN_MODEL_ID,
+            )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let forwarded = rx.recv().await.unwrap();
