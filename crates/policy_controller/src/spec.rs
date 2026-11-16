@@ -16,7 +16,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    fmt, io,
     sync::LazyLock,
 };
 
@@ -26,6 +26,7 @@ use serde::{
     ser::SerializeMap,
     Deserialize, Deserializer, Serialize, Serializer,
 };
+use sha2::{Digest as _, Sha256};
 
 use crate::{
     affinity::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
@@ -1485,6 +1486,8 @@ pub enum SpecError {
     Empty,
     #[error("unknown preset {0:?}")]
     UnknownPreset(String),
+    #[error("the document has no canonical form to digest: {0}")]
+    NoCanonicalForm(String),
 }
 
 /// A field path under construction, for the messages.
@@ -2819,6 +2822,59 @@ impl PolicySpec {
         text.push('\n');
         Ok(text)
     }
+
+    /// The document's digest ([`Digest`]): a change of the file's form or of
+    /// the `generation` line leaves it as it was, any other change moves it.
+    pub fn digest(&self) -> Result<Digest, SpecError> {
+        let lineless = Self {
+            generation: 0,
+            ..self.clone()
+        };
+        let mut hash = Sha256::new();
+        serde_json::to_writer(HashWriter(&mut hash), &lineless)
+            .map_err(|error| SpecError::NoCanonicalForm(error.to_string()))?;
+        Ok(Digest(hash.finalize().into()))
+    }
+}
+
+/// A document's digest: SHA-256 over its canonical bytes, which are the
+/// document's JSON as [`PolicySpec`] serializes (its maps ordered, its fields
+/// in the type's order) with the `generation` line zeroed. Two files that
+/// parse into one document share it whatever their form (YAML or JSON, the
+/// order of their keys, their comments), and a document applied again under
+/// a higher number keeps it. It is written `sha256:` and 64 hex digits.
+///
+/// The canonical bytes are this build's: two builds whose schema differs may
+/// print two digests for one file.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Digest([u8; 32]);
+
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("sha256:")?;
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+impl fmt::Debug for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// What a serializer writes, fed to a hash: the canonical bytes are never
+/// held whole.
+struct HashWriter<'a>(&'a mut Sha256);
+
+impl io::Write for HashWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// One generation as a store applies it: the engine validated from a
@@ -2837,9 +2893,16 @@ impl PolicySpec {
 /// document is applied, and the only generation 0 a store ever holds. A
 /// document that names no generation validates to number 0 too, and the
 /// store's apply refuses it as not above the standing one.
+///
+/// It carries the document's digest beside the number ([`Digest`]): the
+/// number says which generation a replica runs, the digest which document,
+/// and one load reads the pair.
 #[derive(Debug)]
 pub struct AppliedSpec {
     engine: Engine,
+    /// The digest of the document the engine was validated from; none for
+    /// the unbound start, which has no document.
+    digest: Option<Digest>,
 }
 
 impl AppliedSpec {
@@ -2854,9 +2917,11 @@ impl AppliedSpec {
         document: &PolicySpec,
         denied_headers: &[&str],
     ) -> Result<Self, SpecError> {
-        document
-            .validate_with(denied_headers)
-            .map(|engine| Self { engine })
+        let engine = document.validate_with(denied_headers)?;
+        Ok(Self {
+            engine,
+            digest: Some(document.digest()?),
+        })
     }
 
     /// The generation a store holds before any document is applied: number
@@ -2866,6 +2931,7 @@ impl AppliedSpec {
     pub fn unbound() -> Self {
         Self {
             engine: Engine::new(Vec::new(), Vec::new(), 0, Needs::default()),
+            digest: None,
         }
     }
 
@@ -2873,6 +2939,14 @@ impl AppliedSpec {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.engine.generation()
+    }
+
+    /// The digest of the document this generation was validated from
+    /// ([`PolicySpec::digest`]); `None` for the unbound start, which has no
+    /// document.
+    #[must_use]
+    pub fn digest(&self) -> Option<Digest> {
+        self.digest
     }
 
     /// The engine a decision under this generation runs.
@@ -4528,5 +4602,62 @@ mod tests {
             0,
             "under the default gate the loaded holder spills"
         );
+    }
+
+    /// The digest names the document, not the file: the form (YAML or JSON,
+    /// the order of the keys, a comment) and the `generation` line leave it
+    /// as it was, and any other field moves it. Its input is the document's
+    /// JSON with the line zeroed, under SHA-256.
+    #[test]
+    fn a_digest_holds_across_the_form_and_the_line_and_moves_with_any_other_field() {
+        let written = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"filter":["healthy"],"score":["least-load"],"pick":"best"}}}"#,
+        );
+        let digest = written.digest().expect("a digest");
+
+        let numbered = PolicySpec {
+            generation: 7,
+            ..written.clone()
+        };
+        assert_eq!(numbered.digest(), Ok(digest), "the line is not in it");
+        let yaml: PolicySpec = serde_yaml::from_str(
+            "profiles:\n  p:\n    pick: best   # a comment\n    score: [least-load]\n    filter: [healthy]\ngeneration: 3\napiVersion: smg.policy/v1\n",
+        )
+        .expect("the same document in YAML, its keys in another order");
+        assert_eq!(yaml.digest(), Ok(digest), "the form is not in it");
+
+        let mut moved = written.clone();
+        moved
+            .profiles
+            .get_mut("p")
+            .expect("the profile")
+            .filter
+            .push("not-tried".to_owned());
+        assert_ne!(moved.digest(), Ok(digest), "a filter more is in it");
+
+        let canonical = serde_json::to_string(&PolicySpec {
+            generation: 0,
+            ..numbered
+        })
+        .expect("serializes");
+        assert!(
+            canonical.starts_with(r#"{"apiVersion":"smg.policy/v1","generation":0,"#),
+            "{canonical}"
+        );
+        let hex: String = Sha256::digest(canonical.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(digest.to_string(), format!("sha256:{hex}"));
+    }
+
+    /// A validated generation carries its document's digest; the unbound
+    /// start has no document and no digest.
+    #[test]
+    fn an_applied_generation_carries_its_documents_digest_and_the_unbound_start_none() {
+        let document = PolicySpec::preset("least_load").expect("a preset");
+        let applied = AppliedSpec::validate(&document).expect("a preset validates");
+        assert_eq!(applied.digest(), Some(document.digest().expect("a digest")));
+        assert_eq!(AppliedSpec::unbound().digest(), None);
     }
 }

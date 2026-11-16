@@ -4,7 +4,8 @@
 //!
 //! `Leader` is served, on every listener and by every replica, to a caller
 //! with a principal or with none. `Session` is served to a gateway
-//! ([`session`](super::session)). Every other call is refused:
+//! ([`session`](super::session)). `GetPolicySpec` is served on the control
+//! scope by a controller given a spec source. Every other call is refused:
 //! `PERMISSION_DENIED` where the listener mounts none of the call's scopes
 //! (the contract: the scope does not cover the RPC), `UNAUTHENTICATED`
 //! where it does and the listener's layer placed no principal on the call
@@ -26,6 +27,7 @@ use super::{
     config::Scope,
     election::{split_identity, Standing},
     gateways::Gateways,
+    generations::Generations,
     principal::{self, Layer, Principal},
     session, PROTOCOL_VERSION,
 };
@@ -58,6 +60,9 @@ pub(crate) struct Shared {
     /// Who is present: the gateways a `Session` welcomed, over this fence
     /// and this store.
     pub(crate) gateways: Arc<Gateways>,
+    /// The spec's generations over that store: the door a spec source
+    /// applies through, and the document the spec calls read.
+    pub(crate) generations: Arc<Generations>,
     /// How long a `Session` stream may stand with no `Hello`.
     pub(crate) hello_deadline: Duration,
 }
@@ -99,6 +104,7 @@ impl Shared {
             identity: elector.identity().to_owned(),
             fence: elector.fence(),
             standing,
+            generations: Arc::new(Generations::new(Arc::clone(&store))),
             store,
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
@@ -405,11 +411,23 @@ impl PolicyController for Service {
         self.unserved(Call::ApplyPolicySpec, &request)
     }
 
+    /// The standing generation's document as its source wrote it, with the
+    /// number and the digest beside it: every replica answers from its own
+    /// holder. A controller that was given no spec source serves no spec
+    /// call.
     async fn get_policy_spec(
         &self,
         request: Request<proto::GetPolicySpecRequest>,
     ) -> Result<Response<proto::PolicySpecDocument>, Status> {
-        self.unserved(Call::GetPolicySpec, &request)
+        let generations = &self.shared.generations;
+        if !generations.bound() {
+            return self.unserved(Call::GetPolicySpec, &request);
+        }
+        self.admit(Call::GetPolicySpec, &request)?;
+        generations
+            .document(request.get_ref().generation)
+            .map(Response::new)
+            .map_err(|not_held| Status::not_found(not_held.to_string()))
     }
 
     async fn rollback_policy_spec(
@@ -474,6 +492,7 @@ mod tests {
         controller::{
             config::Scope,
             election::{self, Standing},
+            generations::{tests::LEAST_LOAD, Format},
             principal::{
                 tests::{stating, told, NO_PRINCIPAL},
                 Layer,
@@ -1056,5 +1075,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A controller with a spec source serves the read call on the control
+    /// scope: the source's bytes under the standing number, to a caller with
+    /// a principal. A number that does not stand is not found, by name, and
+    /// the scope's rules stand as for every call.
+    #[tokio::test]
+    async fn the_read_call_answers_the_standing_document_once_a_source_applied_one() {
+        let (_elector, _standing, control) = service(&[Scope::Control]);
+        let (_elector, _standing, gateway) = service(&[Scope::Gateway, Scope::Ingestion]);
+        for service in [&control, &gateway] {
+            service
+                .shared
+                .generations
+                .apply(LEAST_LOAD.into(), Format::Yaml)
+                .expect("a valid document");
+        }
+        let read = |generation| from("operator-a", proto::GetPolicySpecRequest { generation });
+
+        let answer = control
+            .get_policy_spec(read(0))
+            .await
+            .expect("the standing document")
+            .into_inner();
+        assert_eq!(answer.generation, 1);
+        assert_eq!(answer.document, LEAST_LOAD.as_bytes());
+        assert_eq!(answer.format, "yaml");
+        assert!(answer.digest.starts_with("sha256:"), "{}", answer.digest);
+
+        let older = control.get_policy_spec(read(4)).await.expect_err("refused");
+        assert_eq!(older.code(), Code::NotFound);
+        assert_eq!(
+            older.message(),
+            "no document is held for generation 4: the spec source's document is generation 1, generation 1 stands, and the standing generation's document alone is retained"
+        );
+
+        let unplaced = control
+            .get_policy_spec(Request::new(proto::GetPolicySpecRequest::default()))
+            .await
+            .expect_err("refused");
+        assert_eq!(unplaced.code(), Code::Unauthenticated);
+        let denied = gateway.get_policy_spec(read(0)).await.expect_err("refused");
+        assert_eq!(denied.code(), Code::PermissionDenied);
     }
 }

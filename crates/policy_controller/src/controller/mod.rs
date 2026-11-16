@@ -6,7 +6,9 @@
 //! scopes' other call bodies arrive with the gateway, ingestion and control
 //! scope PRs, the other ingestion drivers with their move out of the
 //! gateway. In the
-//! `elected` mode the gateway runs this same loop inside its process.
+//! `elected` mode the gateway runs this same loop inside its process. A
+//! controller given a spec file runs its document and answers
+//! `GetPolicySpec` ([`Controller::spec_file`]).
 //!
 //! A controller is bound first and served second ([`Controller::bind`], then
 //! [`Controller::serve`]): the bind takes every address (port `0` for an
@@ -35,6 +37,7 @@ pub mod config;
 mod deciders;
 pub mod election;
 mod gateways;
+mod generations;
 mod lifecycle;
 pub mod metrics;
 mod principal;
@@ -42,6 +45,7 @@ pub mod readiness;
 mod run;
 mod service;
 mod session;
+mod spec_file;
 pub mod tls;
 #[cfg_attr(
     not(test),
@@ -52,7 +56,7 @@ pub mod tls;
 )]
 mod wire;
 
-use std::{future::Future, io, net::SocketAddr, pin::pin, sync::Arc};
+use std::{future::Future, io, net::SocketAddr, path::PathBuf, pin::pin, sync::Arc};
 
 use axum::serve::{ListenerExt as _, TapIo};
 use tokio::{
@@ -69,6 +73,7 @@ pub use self::{
     admin::{Version, VERSION},
     config::{Config, ConfigError, Listener, Scope, Tls},
     election::{Election, LeaseError, LeasePlace},
+    generations::SpecRejected,
     principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},
     run::run,
@@ -254,6 +259,15 @@ pub enum Error {
     /// The engines' HTTP client could not be built.
     #[error("the engines' probe: {0}")]
     Probe(#[source] reqwest::Error),
+    /// The spec file could not be read, or its document does not run.
+    #[error("the spec file {}: {source}", .path.display())]
+    SpecFile {
+        /// The file.
+        path: PathBuf,
+        /// Why its document was not applied.
+        #[source]
+        source: SpecRejected,
+    },
     /// The lease's place could not be opened, or the elector refused its
     /// identity.
     #[error("the election's lease: {0}")]
@@ -460,6 +474,36 @@ impl Controller {
     /// against them here, as the controller will.
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Takes the controller's policy spec from the file at `path` (design
+    /// 4.6): the document is read and applied now, as generation 1 or under
+    /// the number its `generation` line writes, and the control scope
+    /// answers `GetPolicySpec` with it. The file is read here and not again.
+    ///
+    /// A file that cannot be read, or a document the validator refuses, is
+    /// refused here, before anything serves. A controller that takes no
+    /// spec file serves no spec call and renders no spec series.
+    pub async fn spec_file(&mut self, path: impl Into<PathBuf>) -> Result<(), Error> {
+        let path = path.into();
+        let generations = Arc::clone(&self.shared.generations);
+        let read = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || spec_file::start(&path, &generations))
+        };
+        match read.await {
+            Ok(Ok(_applied)) => {}
+            Ok(Err(source)) => return Err(Error::SpecFile { path, source }),
+            Err(join) => return Err(Error::Task(join.to_string())),
+        }
+        info!(
+            controller_id = %self.config.controller_id,
+            path = %path.display(),
+            generation = self.shared.generations.generation(),
+            "spec file"
+        );
+        self.metrics.spec(Arc::clone(&self.shared.generations));
+        Ok(())
     }
 
     /// The store the ingestion drivers and the scopes' calls feed and read.

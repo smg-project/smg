@@ -167,6 +167,15 @@ struct Cli {
     #[arg(long, default_value_t = Config::DEFAULT_LOAD_POLL_INTERVAL.as_secs(), help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
 
+    /// The policy spec as a file, in YAML (JSON under a `.json` name): read
+    /// and applied at the start, as generation 1 or under the number its
+    /// `generation` line writes. A file that cannot be read, or a document
+    /// that is invalid, refuses the start. The file is read once: a change
+    /// to it takes a restart. With no file the controller runs no policy
+    /// spec.
+    #[arg(long, value_name = "PATH", help_heading = "Policy Spec")]
+    spec_file: Option<PathBuf>,
+
     // ==================== Shutdown ====================
     /// Seconds the listeners keep accepting after readiness fails, so the
     /// probes see the change first; at most half the grace period
@@ -442,13 +451,21 @@ fn runtime(worker_threads: Option<u16>) -> std::io::Result<Runtime> {
     }
 }
 
-/// Binds the controller over `catalog`, then names the listeners that take
-/// identities as told: a refusal of either arrives before anything is
-/// served.
-async fn bind(config: Config, catalog: Catalog, as_told: &[String]) -> Result<Controller, Error> {
+/// Binds the controller over `catalog`, names the listeners that take
+/// identities as told, then takes the spec file where one is given: a
+/// refusal of any arrives before anything is served.
+async fn bind(
+    config: Config,
+    catalog: Catalog,
+    as_told: &[String],
+    spec_file: Option<PathBuf>,
+) -> Result<Controller, Error> {
     let mut controller = Controller::bind_with(config, catalog).await?;
     for listener in as_told {
         controller.identity_as_told(listener)?;
+    }
+    if let Some(path) = spec_file {
+        controller.spec_file(path).await?;
     }
     Ok(controller)
 }
@@ -487,7 +504,13 @@ pub fn run(catalog: Catalog) -> ExitCode {
         }
     };
     runtime.block_on(async {
-        let controller = match bind(config, catalog, &cli.identity_as_told).await {
+        let bound = bind(
+            config,
+            catalog,
+            &cli.identity_as_told,
+            cli.spec_file.clone(),
+        );
+        let controller = match bound.await {
             Ok(controller) => controller,
             Err(error) => {
                 error!(%error, "start refused");
@@ -935,7 +958,7 @@ mod tests {
         let config = parse(&EPHEMERAL).config().expect("the flags are in order");
         let mut stages = Catalog::builtin();
         stages.filter("any", || Box::new(Any)).expect("a free name");
-        let controller = bind(config, stages, &[]).await.expect("binds");
+        let controller = bind(config, stages, &[], None).await.expect("binds");
         assert!(controller.catalog().filters().any(|name| name == "any"));
         // The stock build holds no such stage.
         assert!(Catalog::builtin().filters().all(|name| name != "any"));
@@ -951,9 +974,14 @@ mod tests {
             let cli = parse(&args);
             let config = cli.config().expect("the flags are in order");
             async move {
-                bind(config, Catalog::builtin(), &cli.identity_as_told)
-                    .await
-                    .map(drop)
+                bind(
+                    config,
+                    Catalog::builtin(),
+                    &cli.identity_as_told,
+                    cli.spec_file.clone(),
+                )
+                .await
+                .map(drop)
             }
         };
         // The relays' calls ride the gateways' listener unless they get
@@ -1047,5 +1075,18 @@ mod tests {
         assert!(truthy(one));
         assert!(!set(None));
         assert!(!truthy(None));
+    }
+
+    #[test]
+    fn the_spec_file_is_a_flag_with_no_default() {
+        assert_eq!(parse(&with_identity(&[])).spec_file, None);
+        assert_eq!(
+            parse(&with_identity(&[
+                "--spec-file",
+                "/etc/smg/policy/policy.yaml"
+            ]))
+            .spec_file,
+            Some(PathBuf::from("/etc/smg/policy/policy.yaml"))
+        );
     }
 }
