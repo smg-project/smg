@@ -148,6 +148,22 @@ impl Checked {
         self.id
     }
 
+    /// The wires the request's gateway states it speaks: `None` where it
+    /// states none. A bit this build does not know is dropped, as the
+    /// record drops it: a gateway that states such bits alone states wires,
+    /// and none that a member of this build shares.
+    pub(crate) fn wires(&self) -> Option<WireModes> {
+        let stated = self.constraints.wire_modes;
+        (stated != 0)
+            .then(|| WireModes::from_bits(u8::try_from(stated & 0b111).unwrap_or_default()))
+    }
+
+    /// The request's subset hint, absent where its gateway gives none: a
+    /// present 0 is a decision over no candidates.
+    pub(crate) const fn subset(&self) -> Option<u32> {
+        self.constraints.subset_hint
+    }
+
     /// Hands `decide` the request as the engine reads it, with what the
     /// decision's `view` adds to the frame, and returns its answer. The
     /// request borrows the frame and `lists`, for the time of `decide`.
@@ -216,11 +232,7 @@ impl Checked {
             },
             &Constraints {
                 excluded: &lists.excluded,
-                // A bit this build does not know names no wire it could
-                // match: dropped, as the record drops it.
-                wire_modes: WireModes::from_bits(
-                    u8::try_from(constraints.wire_modes & 0b111).unwrap_or_default(),
-                ),
+                wire_modes: self.wires().unwrap_or_default(),
                 overload_lifted: constraints.overload_lifted,
                 subset_hint: constraints.subset_hint,
             },
@@ -704,17 +716,33 @@ mod tests {
             Refusal::OutOfRange("facts.headers.name")
         );
         // A wire-mode bit this build does not know is dropped, wherever in
-        // the wire's 32 it stands.
-        let mut frame = full();
-        frame
-            .constraints
-            .as_mut()
-            .expect("the full frame has constraints")
-            .wire_modes = 0b1_0000_1001;
-        let modes = reading(frame, &mut Lists::default(), |_, constraints| {
-            constraints.wire_modes
-        });
-        assert_eq!(modes, WireModes::HTTP);
+        // the wire's 32 it stands. A gateway that states such bits alone
+        // still states wires: none this build knows, and the record reads
+        // that as it reads a gateway that states none.
+        let stating = |bits: u32| {
+            let mut frame = full();
+            frame
+                .constraints
+                .as_mut()
+                .expect("the full frame has constraints")
+                .wire_modes = bits;
+            let stated = Checked::new(frame.clone())
+                .expect("a frame the record holds")
+                .wires();
+            let read = reading(frame, &mut Lists::default(), |_, constraints| {
+                constraints.wire_modes
+            });
+            (stated, read)
+        };
+        assert_eq!(
+            stating(0b1_0000_1001),
+            (Some(WireModes::HTTP), WireModes::HTTP)
+        );
+        assert_eq!(
+            stating(0b1_0000_0000),
+            (Some(WireModes::NONE), WireModes::NONE)
+        );
+        assert_eq!(stating(0), (None, WireModes::NONE));
     }
 
     #[test]

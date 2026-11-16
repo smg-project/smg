@@ -24,10 +24,21 @@
 //!    `Busy`, and nothing is read for it;
 //! 3. the fence is closed: `Busy`, and nothing is built;
 //! 4. one load of the world ([`MemoryStore::deciding`]): the pool's rows as
-//!    the asking gateway reaches them, and the engine of the generation
+//!    the asking gateway reaches them, less the members that share no wire
+//!    with it where it states its wires, and the engine of the generation
 //!    those rows were published under;
 //! 5. the engine's decision, told what is left of the budget;
-//! 6. the fence again.
+//! 6. the fence again, and the budget at the same read: a decision whose
+//!    budget ended while it was made leaves as `Busy` under the reason a
+//!    late arrival is told, and under a count of its own ([`Counts`]).
+//!
+//! A gateway's wires are a fact before the profile, as its vetoes are: no
+//! filter of the catalog reads them, and no profile picks a member its
+//! gateway cannot dial. The candidates the wires take are counted, and a
+//! decision whose pool has rows and whose gateway shares a wire with none
+//! of them is shed under [`WIRES`]. One whose gateway hints a subset of 0,
+//! a decision over no candidates, is shed under [`SUBSET_HINT`]. A positive
+//! hint is read by no stage yet.
 //!
 //! A decision that panics costs its own request alone: that request is
 //! answered `Busy` with no reason, so the gateway decides it locally at
@@ -43,6 +54,7 @@ use std::{
     io,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
+        atomic::{AtomicU64, Ordering},
         mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
         Arc,
     },
@@ -63,12 +75,34 @@ use crate::{
     framework::{Plan, Scratch},
     proto::{self, busy::Reason},
     store::{Ask, GatewayId, MemoryStore, ViewBuffers, World},
-    view::{fingerprint, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role},
+    view::{fingerprint, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, WireModes},
 };
 
 /// The stage a prefill or decode request under a pair plan's binding is
 /// declined under: the pair door decides those, and no step serves it yet.
 pub(crate) const PAIR_PLAN: &str = "pair-plan";
+
+/// The stage a decision is shed under when its pool has rows and its
+/// gateway shares a wire with none of them.
+pub(crate) const WIRES: &str = "wires";
+
+/// The stage a decision is shed under when its gateway hints a subset of 0
+/// of a pool that has rows: a decision over no candidates, as it asked.
+pub(crate) const SUBSET_HINT: &str = "subset-hint";
+
+/// What the deciders count on the controller's own side: the candidates a
+/// gateway's wires took from its decisions, and the decisions whose budget
+/// ended while they were made. The step that serves the call renders them.
+#[derive(Debug, Default)]
+pub(crate) struct Counts {
+    /// Candidates the wires of their decision's gateway took from its
+    /// view: members that share no wire with it.
+    pub(crate) undialed: AtomicU64,
+    /// Decisions whose budget ended while they were made. Each leaves as
+    /// `Busy` under the reason a late arrival is told, and this count is
+    /// of them alone.
+    pub(crate) outlasted: AtomicU64,
+}
 
 /// The clock a decider reads, twice a decision.
 pub(crate) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
@@ -83,6 +117,7 @@ pub(crate) struct Reads {
     /// carries.
     pub(crate) standing: watch::Receiver<Standing>,
     pub(crate) clock: Clock,
+    pub(crate) counts: Arc<Counts>,
 }
 
 /// One request on its way to its decider.
@@ -212,6 +247,7 @@ impl Decider {
             store,
             fence,
             clock,
+            counts,
             ..
         } = &self.reads;
         let now = clock();
@@ -221,14 +257,22 @@ impl Decider {
         // nothing.
         let term = fence.leader_term(now).ok_or(Reason::NotLeader)?;
         let buffers = &mut self.buffers;
-        let decision = store.deciding(|world| decide_in(world, &taken, buffers));
+        let decision = store.deciding(|world| decide_in(world, &taken, buffers, counts));
         // The fence, read again where the answer is handed over: it leaves
         // under the term it was made under, or `Busy` leaves in its place.
-        if fence.leader_term(clock()) == Some(term) {
-            Ok((term, decision))
-        } else {
-            Err(Reason::NotLeader)
+        // The budget is judged at that read too, with no clock read more:
+        // a decision late by this clock since the receipt is late at its
+        // gateway, whose clock started earlier. It leaves as `Busy` under
+        // the reason a late arrival is told, and under a count of its own.
+        let handed = clock();
+        if fence.leader_term(handed) != Some(term) {
+            return Err(Reason::NotLeader);
         }
+        if Taken::at(request, gateway, received, handed).is_none() {
+            counts.outlasted.fetch_add(1, Ordering::Relaxed);
+            return Err(Reason::BudgetGoneOnArrival);
+        }
+        Ok((term, decision))
     }
 
     /// The highest term this replica knows, which a `Busy` carries: no
@@ -276,7 +320,7 @@ impl<'a> Taken<'a> {
 
 /// The engine's decision over the world of one load: the rows and the
 /// engine are of one publication.
-fn decide_in(world: &World, taken: &Taken<'_>, buffers: &mut Buffers) -> Decision {
+fn decide_in(world: &World, taken: &Taken<'_>, buffers: &mut Buffers, counts: &Counts) -> Decision {
     let spec = world.spec();
     let engine = spec.engine();
     let (model, phase) = (taken.request.model(), taken.request.phase());
@@ -286,37 +330,63 @@ fn decide_in(world: &World, taken: &Taken<'_>, buffers: &mut Buffers) -> Decisio
             .is_some_and(|binding| binding.plan != Plan::Single)
     {
         // Declined as the engine declines a request no binding covers.
-        return Decision::Shed(Shed {
-            reason: ShedReason::PolicyDeclined,
-            emptied_by: PAIR_PLAN,
-            retry_after_secs: 1,
-            wait_allowed: false,
-            trace: Trace {
-                seed: taken.request.seed(),
-                generation: spec.generation(),
-                ..Trace::default()
-            },
-        });
+        let (seed, generation) = (taken.request.seed(), spec.generation());
+        return shed(ShedReason::PolicyDeclined, PAIR_PLAN, seed, generation);
     }
     hand(
         world,
         taken,
         buffers,
+        counts,
         |facts, pool, candidates, constraints, scratch| {
+            if candidates.is_empty() && pool.pool_size > 0 {
+                // What the gateway states of itself left none of a pool
+                // that has rows: said under that constraint's name, where
+                // the engine would name no stage.
+                let emptied_by = if constraints.subset_hint == Some(0) {
+                    SUBSET_HINT
+                } else {
+                    WIRES
+                };
+                return shed(
+                    ShedReason::NoEndpoints,
+                    emptied_by,
+                    facts.seed,
+                    pool.generation,
+                );
+            }
             engine.decide(facts, pool, candidates, constraints, scratch)
         },
     )
 }
 
+/// A shed the deciders say in the engine's place, in the shape of the
+/// engine's own.
+fn shed(reason: ShedReason, emptied_by: &'static str, seed: u64, generation: u64) -> Decision {
+    Decision::Shed(Shed {
+        reason,
+        emptied_by,
+        retry_after_secs: 1,
+        wait_allowed: false,
+        trace: Trace {
+            seed,
+            generation,
+            ..Trace::default()
+        },
+    })
+}
+
 /// Hands `decide` what the engine reads for one request: the request with
 /// what is left of its budget, the pool's facts under the generation its
 /// rows were published under, and those rows as the asking gateway reaches
-/// them at the decision's instant, with the affinity column where the
-/// request's profile declares it.
+/// them at the decision's instant, less what the gateway states of itself
+/// takes ([`narrow`]), with the affinity column where the request's
+/// profile declares it. The rows its wires take are counted.
 fn hand<R>(
     world: &World,
     taken: &Taken<'_>,
     buffers: &mut Buffers,
+    counts: &Counts,
     decide: impl FnOnce(
         &RequestFacts<'_>,
         &PoolFacts<'_>,
@@ -351,7 +421,15 @@ fn hand<R>(
         lists,
     } = buffers;
     let (pool, now_micros) = match world.build(model, role, &ask, view) {
-        Some(built) => (built.pool_facts(), built.now_micros),
+        Some(built) => {
+            // The pool's facts are of the rows before the request's own
+            // narrowing.
+            let took = narrow(view, request.wires(), request.subset());
+            if took > 0 {
+                counts.undialed.fetch_add(took, Ordering::Relaxed);
+            }
+            (built.pool_facts(), built.now_micros)
+        }
         // No member serves the model in the role: the engine answers over
         // no candidate, as it answers any host that hands it none.
         None => (
@@ -372,12 +450,45 @@ fn hand<R>(
     })
 }
 
+/// Narrows a built view by what the request's gateway states of itself,
+/// and returns how many rows its wires took. A hint of 0 keeps none, and
+/// leaves the wires nothing to take. A gateway that states wires keeps the
+/// members that share one with it: a member that states none is taken as
+/// one that states another is, and a gateway that states none keeps every
+/// row. A positive hint cuts nothing. The kept rows keep their order and
+/// take their positions, and the affinity column follows them. A request
+/// that states neither pays the two compares.
+fn narrow(view: &mut ViewBuffers, wires: Option<WireModes>, subset: Option<u32>) -> u64 {
+    if subset == Some(0) {
+        view.candidates.clear();
+        view.affinity.clear();
+        return 0;
+    }
+    let Some(wires) = wires else {
+        return 0;
+    };
+    let rows = view.candidates.len();
+    let dialed = |row: &Candidate| row.wire_modes.intersects(wires);
+    // The column is by row, where the profile declared one: it is cut by
+    // the rows' wires before the rows are.
+    let mut beside = view.candidates.iter();
+    view.affinity.retain(|_| beside.next().is_some_and(dialed));
+    view.candidates.retain(dialed);
+    let took = rows - view.candidates.len();
+    if took > 0 {
+        for (row, position) in view.candidates.iter_mut().zip(0..) {
+            row.position = position;
+        }
+    }
+    took as u64
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeSet, VecDeque},
         mem,
-        sync::{mpsc as std_mpsc, Arc},
+        sync::{atomic::Ordering, mpsc as std_mpsc, Arc},
         thread,
         time::{Duration, Instant},
     };
@@ -388,7 +499,9 @@ mod tests {
         time::timeout,
     };
 
-    use super::{hand, Buffers, Clock, Deciders, Job, Reads, Refused, Taken, PAIR_PLAN};
+    use super::{
+        hand, narrow, Buffers, Clock, Counts, Deciders, Job, Reads, Refused, Taken, PAIR_PLAN,
+    };
     use crate::{
         controller::{
             election::Standing,
@@ -403,7 +516,10 @@ mod tests {
             Ask, GatewayId, HealthSink, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
             WorkersStore,
         },
-        view::{Constraints, PoolFacts, RequestFacts, Role, WorkerId},
+        view::{
+            AffinityFacts, Candidate, Constraints, PoolFacts, RequestFacts, Role, WireModes,
+            WorkerId,
+        },
     };
 
     /// How long a case waits for a decider before it fails.
@@ -465,6 +581,7 @@ mod tests {
         standing: watch::Sender<Standing>,
         store: Arc<MemoryStore>,
         script: Arc<Script>,
+        counts: Arc<Counts>,
         deciders: Deciders,
         /// The members serving [`MODEL`] in the single role, ready.
         workers: Vec<WorkerId>,
@@ -483,28 +600,42 @@ mod tests {
         applied(&document)
     }
 
-    /// Three ready members serving [`MODEL`] in the single role, and one in
-    /// each other role beside the phase that role serves.
-    fn fleet(store: &MemoryStore) -> (Vec<WorkerId>, [(proto::Phase, WorkerId); 3]) {
-        let member = |name: &str, role: Role| {
-            let key = format!("http://{name}:8000");
-            let facts = WorkerFacts {
-                key: key.clone(),
-                engine: key,
-                incarnation: 1,
-                role,
-                models: vec![MODEL.to_owned()],
-                dp_size: 1,
-                max_running: Some(4),
-                ..WorkerFacts::default()
-            };
-            let id = store.upsert(facts).id();
-            let revision = WorkersStore::get(store, id).expect("the row").revision;
-            store
-                .set_status(id, WorkerStatus::Ready, revision)
-                .expect("the row stands");
-            id
+    /// The member `name`, serving `model` in `role` and stating `wires`,
+    /// ready: written again where it stood, with its status as it was.
+    fn ready(
+        store: &MemoryStore,
+        name: &str,
+        model: &str,
+        role: Role,
+        wires: WireModes,
+    ) -> WorkerId {
+        let key = format!("http://{name}:8000");
+        let facts = WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            role,
+            wire_modes: wires,
+            models: vec![model.to_owned()],
+            dp_size: 1,
+            max_running: Some(4),
+            ..WorkerFacts::default()
         };
+        let id = store.upsert(facts).id();
+        let row = WorkersStore::get(store, id).expect("the row");
+        if row.status != WorkerStatus::Ready {
+            store
+                .set_status(id, WorkerStatus::Ready, row.revision)
+                .expect("the row stands");
+        }
+        id
+    }
+
+    /// Three ready members serving [`MODEL`] in the single role, and one in
+    /// each other role beside the phase that role serves. None states a
+    /// wire.
+    fn fleet(store: &MemoryStore) -> (Vec<WorkerId>, [(proto::Phase, WorkerId); 3]) {
+        let member = |name: &str, role: Role| ready(store, name, MODEL, role, WireModes::NONE);
         let singles = ["w0", "w1", "w2"].map(|name| member(name, Role::Single));
         let sides = [
             (proto::Phase::Prefill, member("p0", Role::Prefill)),
@@ -556,10 +687,12 @@ mod tests {
             fence: elector.fence(),
             standing: stood,
             clock,
+            counts: Arc::default(),
         };
         let deciders = Deciders::start(deciders, depth, &reads).expect("the threads start");
         let (sender, answers) = mpsc::channel(64);
         Bed {
+            counts: Arc::clone(&reads.counts),
             elector,
             standing,
             store,
@@ -970,8 +1103,13 @@ mod tests {
         let taken = Taken::at(&request, gateway, received, now).expect("budget is left");
         let mut buffers = Buffers::default();
         store.deciding(|world| {
-            hand(world, &taken, &mut buffers, |facts, pool, rows, _, _| {
-                Handed {
+            let counts = Counts::default();
+            hand(
+                world,
+                &taken,
+                &mut buffers,
+                &counts,
+                |facts, pool, rows, _, _| Handed {
                     now_micros: facts.now_micros,
                     budget_micros: facts.budget_micros,
                     column: facts.affinity.len(),
@@ -982,8 +1120,8 @@ mod tests {
                         .map(|row| row.id)
                         .collect(),
                     pool: (pool.pool_size, pool.generation),
-                }
-            })
+                },
+            )
         })
     }
 
@@ -1139,5 +1277,213 @@ mod tests {
         let answer = bed.ask(frame.clone()).await;
         assert!(matches!(outcome(&answer), Outcome::Shed(_)), "{answer:?}");
         assert_eq!(answer, bed.engines(&frame, 1));
+    }
+
+    /// Every worker a pick names, its alternates with it.
+    fn targets(answer: &proto::DecideAnswer) -> Vec<WorkerId> {
+        match outcome(answer) {
+            Outcome::Pick(pick) => pick.targets.iter().map(|t| WorkerId(t.id)).collect(),
+            other => panic!("a pick: {other:?}"),
+        }
+    }
+
+    /// `frame` with what its gateway alone knows.
+    fn constrained(
+        mut frame: proto::DecideRequest,
+        wires: u32,
+        hint: Option<u32>,
+    ) -> proto::DecideRequest {
+        frame.constraints = Some(proto::Constraints {
+            wire_modes: wires,
+            subset_hint: hint,
+            ..proto::Constraints::default()
+        });
+        frame
+    }
+
+    /// One ready member that speaks HTTP alone, asked for under each thing
+    /// a gateway states of itself. A gateway that states no wire, or one
+    /// the member speaks, is answered the member. One whose wires the
+    /// member shares none of is shed under the wires' stage, and so is one
+    /// that states only a wire this build does not know. A hint of 0 is a
+    /// decision over no candidates, shed under the hint's stage whatever
+    /// the wires, and a positive hint cuts nothing. Then a member the
+    /// gateway cannot dial and a second one it can, beside the first, which
+    /// it just failed to reach: the second is its whole answer.
+    #[tokio::test]
+    async fn a_gateway_is_answered_no_member_it_cannot_dial_and_none_under_a_hint_of_0() {
+        const SPOKEN: &str = "model-http";
+        let mut bed = leading([]);
+        let store = Arc::clone(&bed.store);
+        let first = ready(&store, "h0", SPOKEN, Role::Single, WireModes::HTTP);
+        let answer = bed.ask(frame_for(SPOKEN, 100, 100)).await;
+        assert_eq!(targets(&answer), [first], "no constraints");
+        // The wires a gateway states, its hint, and the stage its decision
+        // is shed under where it is shed.
+        let cells = [
+            (0b001, None, None),
+            (0b011, None, None),
+            (0b010, None, Some("wires")),
+            (0b110, None, Some("wires")),
+            (0b1000, None, Some("wires")),
+            (0b001, Some(0), Some("subset-hint")),
+            (0b010, Some(0), Some("subset-hint")),
+            (0, Some(0), Some("subset-hint")),
+            (0b001, Some(1), None),
+            (0, Some(7), None),
+        ];
+        for (id, (wires, hint, stage)) in (1..).zip(cells) {
+            let frame = constrained(frame_for(SPOKEN, id, u64::from(id)), wires, hint);
+            let answer = bed.ask(frame).await;
+            let cell = format!("wires {wires:#b}, a hint of {hint:?}");
+            match stage {
+                Some(stage) => assert_eq!(
+                    outcome(&answer),
+                    &declined(proto::ShedReason::NoEndpoints, stage),
+                    "{cell}"
+                ),
+                None => assert_eq!(targets(&answer), [first], "{cell}"),
+            }
+        }
+        // The wires took the member in three decisions: under a hint of 0
+        // they had none to take.
+        assert_eq!(bed.counts.undialed.load(Ordering::Relaxed), 3);
+        ready(&store, "g0", SPOKEN, Role::Single, WireModes::GRPC);
+        let second = ready(&store, "h1", SPOKEN, Role::Single, WireModes::HTTP);
+        for seed in 0..32_u8 {
+            let frame = frame_for(SPOKEN, 40 + seed, u64::from(seed));
+            let mut frame = constrained(frame, 0b001, None);
+            frame.constraints.get_or_insert_default().excluded = vec![first.0];
+            let answer = bed.ask(frame).await;
+            assert_eq!(targets(&answer), [second], "seed {seed}");
+        }
+        assert_eq!(bed.counts.undialed.load(Ordering::Relaxed), 3 + 32);
+    }
+
+    /// A gateway that states its wires is answered members that share one
+    /// with it, its alternates too, and each one its wires took is counted.
+    /// A member that states no wire is no candidate of a gateway that
+    /// states some: silence is no waiver. A gateway that states none is not
+    /// narrowed, and a positive hint, which no stage reads yet, cuts
+    /// nothing.
+    #[tokio::test]
+    async fn a_gateways_wires_narrow_its_decision_to_the_members_that_share_one() {
+        let mut bed = leading([]);
+        // The fleet's three members state no wire.
+        let answer = bed.ask(constrained(frame(1, 1), 0b111, None)).await;
+        let shed = declined(proto::ShedReason::NoEndpoints, "wires");
+        assert_eq!(outcome(&answer), &shed);
+        assert_eq!(bed.counts.undialed.load(Ordering::Relaxed), 3);
+        let store = Arc::clone(&bed.store);
+        let both = WireModes::HTTP.union(WireModes::GRPC);
+        let [_, grpc, either] = [
+            ("w0", WireModes::HTTP),
+            ("w1", WireModes::GRPC),
+            ("w2", both),
+        ]
+        .map(|(name, wires)| ready(&store, name, MODEL, Role::Single, wires));
+        let mut dialed = [grpc, either];
+        dialed.sort_unstable();
+        let mut named = BTreeSet::new();
+        for (id, seed) in (2..=33).zip(100..) {
+            let answer = bed.ask(constrained(frame(id, seed), 0b010, None)).await;
+            named.extend(targets(&answer));
+        }
+        assert_eq!(named.into_iter().collect::<Vec<_>>(), dialed);
+        // The member that speaks HTTP alone, in each of the 32 decisions.
+        assert_eq!(bed.counts.undialed.load(Ordering::Relaxed), 3 + 32);
+        for (id, hint) in (40..).zip([None, Some(1), Some(2), Some(64)]) {
+            let answer = bed.ask(constrained(frame(id, 40), 0, hint)).await;
+            assert_eq!(targets(&answer).len(), 3, "a hint of {hint:?}");
+        }
+        assert_eq!(bed.counts.undialed.load(Ordering::Relaxed), 3 + 32);
+    }
+
+    /// The budget is judged again where the answer is handed over, at the
+    /// read the fence takes there and with no clock read more. A decision
+    /// with a microsecond left leaves. One whose budget ended while it was
+    /// made leaves as `Busy` under the reason a late arrival is told, and
+    /// is counted apart from one.
+    #[tokio::test]
+    async fn a_decision_whose_budget_ended_while_it_was_made_leaves_as_busy_and_is_counted_apart() {
+        let short = BUDGET - Duration::from_micros(1);
+        let steps = [Duration::ZERO, short, Duration::ZERO, BUDGET, BUDGET].map(Step::At);
+        let mut bed = leading(steps);
+        let answer = bed.ask(frame(1, 1)).await;
+        assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
+        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 0);
+        let answer = bed.ask(frame(2, 2)).await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        assert_eq!((answer.request_id.as_slice(), answer.term), (&[2][..], 1));
+        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 1);
+        // A request that arrived late is told the same reason at its
+        // decider's first read, and is none of the count.
+        let answer = bed.ask(frame(3, 3)).await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 1);
+        assert_eq!(bed.script.readers.lock().len(), 5);
+    }
+
+    /// The pass over a view. The rows a gateway's wires keep hold their
+    /// order, take their positions and carry the affinity column beside
+    /// them, with a column or without, and the pass says how many rows the
+    /// wires took: a row that states no wire is taken as one that states
+    /// another is. A gateway that states only wires no row shares takes
+    /// every row, and one that states none takes none. A hint of 0 keeps
+    /// none and leaves the wires nothing to take; a positive hint cuts
+    /// nothing.
+    #[test]
+    fn a_narrowed_view_keeps_its_rows_order_their_positions_and_the_column_beside_them() {
+        let both = WireModes::HTTP.union(WireModes::GRPC);
+        let wires = [
+            WireModes::HTTP,
+            WireModes::GRPC,
+            both,
+            WireModes::GRPC,
+            WireModes::ZMQ,
+            WireModes::NONE,
+        ];
+        let built = |column: bool| {
+            let mut view = ViewBuffers::default();
+            for (position, wire_modes) in (0_u32..).zip(wires) {
+                view.candidates.push(Candidate {
+                    id: WorkerId(u64::from(position) + 10),
+                    position,
+                    wire_modes,
+                    ..Candidate::default()
+                });
+                if column {
+                    view.affinity.push(AffinityFacts {
+                        admitted_age_ms: position + 100,
+                        ..AffinityFacts::default()
+                    });
+                }
+            }
+            view
+        };
+        let read = |view: &ViewBuffers| {
+            let rows = view.candidates.iter().map(|row| (row.id.0, row.position));
+            let ages = view.affinity.iter().map(|facts| facts.admitted_age_ms);
+            (rows.collect::<Vec<_>>(), ages.collect::<Vec<_>>())
+        };
+        let kept = vec![(11, 0), (12, 1), (13, 2)];
+        let mut view = built(true);
+        assert_eq!(narrow(&mut view, Some(WireModes::GRPC), None), 3);
+        assert_eq!(read(&view), (kept.clone(), vec![101, 102, 103]));
+        let mut view = built(false);
+        assert_eq!(narrow(&mut view, Some(WireModes::GRPC), Some(2)), 3);
+        assert_eq!(read(&view), (kept, vec![]));
+        let mut view = built(true);
+        assert_eq!(narrow(&mut view, Some(both.union(WireModes::ZMQ)), None), 1);
+        assert_eq!(read(&view).1, [100, 101, 102, 103, 104]);
+        let mut view = built(true);
+        assert_eq!(narrow(&mut view, Some(WireModes::NONE), None), 6);
+        assert_eq!(read(&view), (vec![], vec![]));
+        let mut view = built(true);
+        assert_eq!(narrow(&mut view, None, Some(64)), 0);
+        assert_eq!(read(&view), read(&built(true)));
+        let mut view = built(true);
+        assert_eq!(narrow(&mut view, Some(WireModes::GRPC), Some(0)), 0);
+        assert_eq!(read(&view), (vec![], vec![]));
     }
 }
