@@ -462,24 +462,18 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ended.message().contains("Released.what"),
             "the refusal names the field: {ended:?}"
         );
-        // The session tells the status it ended with at each ask, and to a
-        // report once the connection has dropped the ended call's request.
+        // The session tells the status it ended with at each ask, and to
+        // each report from the first read on.
         let again = other.session_end().await.expect("the end is told again");
         assert_eq!(
             again.code(),
             Code::InvalidArgument,
             "a second ask reads the status the session ended with: {again:?}"
         );
-        let told = tokio::time::timeout(ROOM, async {
-            loop {
-                match other.released(Released::default()).await {
-                    Ok(()) => tokio::time::sleep(POLL_INTERVAL / 10).await,
-                    Err(error) => break error,
-                }
-            }
-        })
-        .await
-        .expect("a report into the ended session is refused");
+        let told = other
+            .released(Released::default())
+            .await
+            .expect_err("a report into the ended session is refused");
         assert!(
             matches!(&told, client::Error::Status(status) if status.code() == Code::InvalidArgument),
             "a report into the ended session tells the status it ended with: {told:?}"
