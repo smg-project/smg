@@ -3594,7 +3594,8 @@ impl ChatTemplateState {
 
     /// Decide the thinking switch's default by the template's behaviour, not
     /// its source: one bare user turn with the generation prompt, rendered
-    /// with the switch absent, on and off. The absent render is the default:
+    /// with the switch absent, on and off, at one instant (a template may
+    /// write the time). The absent render is the default:
     /// on where it equals the on render alone, off where it equals the off
     /// render alone. `None` where the renders do not say, and the text
     /// matcher's answer stands ([`detect_thinking_toggle`]): a template with
@@ -3603,12 +3604,16 @@ impl ChatTemplateState {
     fn rendered_thinking_default(&self) -> Option<ThinkingToggle> {
         let key = self.thinking_key_name?;
         let messages = [serde_json::json!({"role": "user", "content": "probe"})];
+        // One instant for the three renders: a template that writes the time
+        // (`strftime_now`) must not tell them apart by the clock alone.
+        let now = render_instant();
         let render = |thinking: Option<bool>| {
             let kwargs = thinking
                 .map(|thinking| HashMap::from([(key.as_kwarg().to_string(), key.value(thinking))]));
             let params = ChatTemplateParams {
                 add_generation_prompt: true,
                 template_kwargs: kwargs.as_ref(),
+                now: Some(now),
                 ..Default::default()
             };
             self.apply(&messages, params).ok()

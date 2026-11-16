@@ -1861,6 +1861,28 @@ fn the_thinking_default_is_what_the_template_renders_with_the_switch_absent() {
     assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOff);
 }
 
+/// The three probe renders share one instant. A template that writes the
+/// time would otherwise separate them by the clock alone, and its default
+/// would fall back to the text matcher's answer: here the time is written to
+/// the nanosecond, so three reads of the clock never agree.
+#[test]
+fn the_probe_renders_share_one_instant() {
+    let writes_the_time = "{{- strftime_now('%H:%M:%S.%f') -}}\
+                           {%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                           {%- if add_generation_prompt -%}<|assistant|>\
+                           {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    assert_eq!(
+        detect_thinking_toggle(writes_the_time),
+        (
+            ThinkingToggle::DefaultOn,
+            Some(ThinkingKeyName::EnableThinking)
+        ),
+        "the text matcher"
+    );
+    let state = ChatTemplateState::new(Some(writes_the_time.to_string())).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOff);
+}
+
 /// Where the renders do not say, the text matcher's answer stands: a bare
 /// turn that does not render, a switch that moves nothing on a bare turn,
 /// and an absent render that equals neither the on nor the off render.
