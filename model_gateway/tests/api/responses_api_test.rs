@@ -3787,4 +3787,57 @@ mod conversation_body_refusals {
         }
         ctx.shutdown().await;
     }
+
+    /// Create, update and create-items refuse a body with a repeated key at
+    /// the door, before a conversation is looked up: 400 `json_parse_error`
+    /// with serde's `duplicate field` words and the place as `param`. The
+    /// keys of `metadata` keep the last value.
+    #[tokio::test]
+    async fn the_posting_routes_refuse_a_repeated_key_outside_metadata() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+        let json = Some("application/json");
+        let twice = r#"{"metadata":{"a":"1"},"metadata":{"a":"2"}}"#;
+        let cases = [
+            ("/v1/conversations", twice, serde_json::Value::Null),
+            (
+                "/v1/conversations/conv_missing",
+                twice,
+                serde_json::Value::Null,
+            ),
+            (
+                "/v1/conversations/conv_missing/items",
+                r#"{"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}]}"#,
+                serde_json::json!("items[0].content[0]"),
+            ),
+        ];
+        for (path, body, param) in cases {
+            let (status, _, answer) = post(&app, path, json, body.as_bytes())
+                .await
+                .expect("an answer from the route");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}: {answer}");
+            assert_eq!(
+                answer["error"]["code"], "json_parse_error",
+                "{path} {body}: {answer}"
+            );
+            assert_eq!(answer["error"]["param"], param, "{path} {body}: {answer}");
+            assert!(
+                answer["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("duplicate field `")),
+                "{path} {body}: {answer}"
+            );
+        }
+        let (status, _, created) = post(
+            &app,
+            "/v1/conversations",
+            json,
+            br#"{"metadata":{"a":"1","a":"2"}}"#,
+        )
+        .await
+        .expect("an answer from the route");
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["metadata"]["a"], "2", "{created}");
+        ctx.shutdown().await;
+    }
 }

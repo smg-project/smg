@@ -14,13 +14,26 @@ use std::fmt;
 use serde::de::{DeserializeSeed, Deserializer, Error, MapAccess, SeqAccess, Visitor};
 use serde_json::{map::Entry, Map, Number, Value};
 
-/// The entries of an object, each value read by [`StrictValue`]. A repeated
-/// key is refused when it is met, before its value is read. One map slot per
-/// key, taken before the value is read and filled after: the read costs what
-/// the plain value read costs.
+/// The entries of an object, each value read by [`StrictValue`]: the read
+/// costs what the plain value read costs.
 pub(crate) fn strict_entries<'de, A: MapAccess<'de>>(
     entries: &mut A,
 ) -> Result<Map<String, Value>, A::Error> {
+    entries_with(entries, |_, entries| entries.next_value_seed(StrictValue))
+}
+
+/// The entries of an object, each value read by `read`, which is given the
+/// value's key. A repeated key is refused when it is met, before its value is
+/// read. One map slot per key, taken before the value is read and filled
+/// after.
+pub(crate) fn entries_with<'de, A, F>(
+    entries: &mut A,
+    mut read: F,
+) -> Result<Map<String, Value>, A::Error>
+where
+    A: MapAccess<'de>,
+    F: FnMut(&str, &mut A) -> Result<Value, A::Error>,
+{
     let mut fields = Map::new();
     while let Some(key) = entries.next_key::<String>()? {
         let slot = match fields.entry(key) {
@@ -29,7 +42,8 @@ pub(crate) fn strict_entries<'de, A: MapAccess<'de>>(
             }
             Entry::Vacant(slot) => slot,
         };
-        slot.insert(entries.next_value_seed(StrictValue)?);
+        let value = read(slot.key().as_str(), entries)?;
+        slot.insert(value);
     }
     Ok(fields)
 }
