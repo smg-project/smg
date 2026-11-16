@@ -4610,6 +4610,7 @@ async fn a_stop_during_the_handshake_wait_releases_the_handshake_endpoint() {
     assert_handshake_released(&handshake).await;
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_leftover_handshake_endpoint_does_not_fail_the_link() {
     use std::os::unix::net::{UnixListener, UnixStream};

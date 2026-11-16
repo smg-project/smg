@@ -4532,6 +4532,7 @@ async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_leftover_handshake_endpoint_does_not_fail_the_link() {
     use std::os::unix::net::{UnixListener, UnixStream};

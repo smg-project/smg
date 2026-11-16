@@ -633,10 +633,12 @@ mod tests {
             "a socket a listener answers at is a live process's"
         );
         drop(listener);
+        // The bind sequence sweeps a leftover on Linux alone.
+        let swept = cfg!(target_os = "linux").then(|| path.display().to_string());
         assert_eq!(
             own_handshake_endpoint(&address).await,
-            Some(path.display().to_string()),
-            "a leftover socket the bind sequence sweeps reads as free"
+            swept,
+            "a leftover socket reads as free where the bind sequence sweeps it"
         );
     }
 

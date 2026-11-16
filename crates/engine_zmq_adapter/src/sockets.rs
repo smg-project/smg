@@ -305,21 +305,23 @@ pub async fn knock_ipc_socket(path: &Path) -> std::io::Result<()> {
 /// socket's own owner is read too: a file of another owner is never removed
 /// either. Nor is a leftover in a directory of another owner, a leftover at
 /// an address with no directory part (no directory is read for it), or
-/// anything at the path that is not a socket.
-#[cfg(unix)]
+/// anything at the path that is not a socket. Linux alone sweeps: elsewhere
+/// a refusal may come from a live listener whose backlog is full (see
+/// [`knock_ipc_socket`]), so no file counts as a leftover there.
+#[cfg(target_os = "linux")]
 pub async fn is_leftover_handshake_socket(address: &str) -> bool {
     let uid = rustix::process::geteuid().as_raw();
     leftover_handshake_socket_of(address, uid, uid).await
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub fn is_leftover_handshake_socket(_address: &str) -> std::future::Ready<bool> {
     std::future::ready(false)
 }
 
 /// The two owners are one user outside the tests, which cannot make a file
 /// of another owner and read each clause as a user who is not the owner.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 async fn leftover_handshake_socket_of(address: &str, dir_owner: u32, socket_owner: u32) -> bool {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let Some(path) = address.strip_prefix("ipc://").map(Path::new) else {
@@ -380,7 +382,7 @@ mod tests {
 
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_leftover_handshake_socket_is_this_users_own() {
         use std::os::unix::{
