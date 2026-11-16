@@ -97,6 +97,9 @@ impl TryFrom<serde_json::Value> for ModelsResponseEntry {
 
     /// Keep original fields until card creation can supply provider-aware defaults.
     fn try_from(raw: serde_json::Value) -> Result<Self, Self::Error> {
+        if !raw.is_object() {
+            return Err(serde::de::Error::custom("model entry must be an object"));
+        }
         #[derive(Deserialize)]
         struct Identity {
             owned_by: Option<String>,
@@ -118,10 +121,32 @@ impl TryFrom<serde_json::Value> for ModelsResponseEntry {
 /// `/v1/models` response wrapper.
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct ModelsResponse {
+    #[serde(deserialize_with = "ModelsResponse::deserialize_entries")]
     pub data: Vec<ModelsResponseEntry>,
 }
 
 impl ModelsResponse {
+    /// A malformed sibling must not discard valid public model objects. Keep
+    /// their order, but fail a wholly malformed nonempty catalog so a strict
+    /// refresh cannot mistake a failed read for an empty catalog.
+    fn deserialize_entries<'de, D>(deserializer: D) -> Result<Vec<ModelsResponseEntry>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+        let was_empty = raw.is_empty();
+        let entries: Vec<_> = raw
+            .into_iter()
+            .filter_map(|entry| ModelsResponseEntry::try_from(entry).ok())
+            .collect();
+        if !was_empty && entries.is_empty() {
+            return Err(serde::de::Error::custom(
+                "model catalog has no valid entries",
+            ));
+        }
+        Ok(entries)
+    }
+
     /// Cache a bounded catalog, keeping the first occurrence of each model ID.
     /// Oversized metadata is omitted; identity and context discovery still proceed.
     fn record_model_objects(&self, labels: &mut HashMap<String, String>) {
@@ -1348,7 +1373,8 @@ mod tests {
         assert_eq!(oversized.data[0].id.as_deref(), Some("served"));
     }
 
-    /// Both HTTP runtimes preserve metadata through registration and refresh.
+    /// Both HTTP runtimes preserve valid sibling metadata through registration
+    /// and refresh, keeping the first valid identity and duplicate object.
     #[tokio::test]
     async fn http_model_metadata_survives_discovery_and_card_refresh() {
         use axum::{routing::get, Json, Router};
@@ -1365,7 +1391,18 @@ mod tests {
             "permission": [{"id": "permission-1", "allow_sampling": true}],
             "future_field": {"nested": [false, null, 5]}
         });
-        let body = json!({"object": "list", "data": [expected.clone()]});
+        let mut duplicate = expected.clone();
+        duplicate["root"] = json!("later/checkpoint");
+        duplicate["max_model_len"] = json!(8192);
+        let body = json!({"object": "list", "data": [
+            {"id": 42},
+            null,
+            ["vllm", "positional-model", "wrong/checkpoint", 1],
+            expected.clone(),
+            {"id": "malformed", "max_model_len": "invalid"},
+            duplicate,
+            "not a model object"
+        ]});
         let app = Router::new().route(
             "/v1/models",
             get(move || {
@@ -1381,9 +1418,18 @@ mod tests {
         let url = format!("http://{addr}");
         let vllm = fetch_vllm_http_metadata(&client, &url, None).await;
         let sglang = fetch_sglang_http_metadata(&client, &url, None).await;
+        let strict_vllm = fetch_vllm_http_metadata_checked(&client, &url, None, true)
+            .await
+            .expect("valid siblings survive a strict vLLM read");
+        let strict_sglang = fetch_sglang_http_metadata_checked(&client, &url, None, true)
+            .await
+            .expect("valid siblings survive a strict SGLang read");
         server.abort();
 
-        for labels in [vllm, sglang] {
+        for labels in [vllm, sglang, strict_vllm, strict_sglang] {
+            assert_eq!(label(&labels, "served_model_name"), Some("served-model"));
+            assert_eq!(label(&labels, "model_path"), Some("org/checkpoint"));
+            assert_eq!(label(&labels, "max_model_len"), Some("32768"));
             let card = build_model_card(
                 "served-model",
                 &WorkerSpec::new(&url),
@@ -1419,6 +1465,48 @@ mod tests {
                 serde_json::to_value(refreshed.into_model_object()).unwrap(),
                 updated
             );
+        }
+    }
+
+    /// Refresh rejects unusable catalogs, while an explicitly empty catalog is
+    /// still a successful read for both HTTP runtimes.
+    #[tokio::test]
+    async fn http_model_metadata_distinguishes_malformed_and_empty_catalogs() {
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+
+        let client = http_client();
+        for body in [
+            json!({}),
+            json!({"data": null}),
+            json!({"data": {"id": "served"}}),
+            json!({"data": [{"id": 42}, null, ["vllm", "positional", "root", 1]]}),
+        ] {
+            let base = serve_json_routes(vec![("/v1/models", StatusCode::OK, body)]).await;
+            assert!(fetch_vllm_http_metadata(&client, &base, None)
+                .await
+                .is_empty());
+            assert!(fetch_sglang_http_metadata(&client, &base, None)
+                .await
+                .is_empty());
+            for result in [
+                fetch_vllm_http_metadata_checked(&client, &base, None, true).await,
+                fetch_sglang_http_metadata_checked(&client, &base, None, true).await,
+            ] {
+                let error = result.expect_err("a malformed catalog must fail refresh");
+                assert!(error.starts_with("/v1/models: Failed to parse"), "{error}");
+            }
+        }
+
+        let base =
+            serve_json_routes(vec![("/v1/models", StatusCode::OK, json!({"data": []}))]).await;
+        for result in [
+            fetch_vllm_http_metadata_checked(&client, &base, None, true).await,
+            fetch_sglang_http_metadata_checked(&client, &base, None, true).await,
+        ] {
+            assert!(result.expect("an empty catalog is valid").is_empty());
         }
     }
 
