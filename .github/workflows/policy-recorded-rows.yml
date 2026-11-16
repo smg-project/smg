@@ -33,6 +33,7 @@ on:
     paths:
       - crates/policy_controller/**
       - crates/protocols/**
+      - crates/worker/**
       - Cargo.toml
       - Cargo.lock
       - .cargo/config.toml
@@ -52,6 +53,7 @@ on:
     paths:
       - crates/policy_controller/**
       - crates/protocols/**
+      - crates/worker/**
       - Cargo.toml
       - Cargo.lock
       - .cargo/config.toml

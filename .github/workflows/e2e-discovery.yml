@@ -27,7 +27,7 @@ on:
       # registers it.
       - model_gateway/src/worker/identity/endpoint.rs
       - model_gateway/src/workflow/**
-      - crates/protocols/src/worker.rs
+      - crates/worker/src/worker.rs
       - crates/mock_worker/**
       - model_gateway/tests/discovery/k8s_discovery_test.rs
       - e2e_test/discovery/**

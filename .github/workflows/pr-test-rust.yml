@@ -937,6 +937,7 @@ jobs:
               - *rust-infra
               - 'crates/tokenizer/**'
               - 'crates/protocols/**'
+              - 'crates/worker/**'
             rust-multimodal:
               - *rust-infra
               - 'crates/multimodal/**'
@@ -947,6 +948,7 @@ jobs:
               - 'crates/reasoning_parser/**'
               - 'crates/response_template/**'
               - 'crates/protocols/**'
+              - 'crates/worker/**'
             rust-agentic:
               - *rust-infra
               - 'crates/data_connector/**'
@@ -959,6 +961,7 @@ jobs:
             rust-protocols:
               - *rust-infra
               - 'crates/protocols/**'
+              - 'crates/worker/**'
               - 'crates/external_router/**'
               - 'crates/auth/**'
               - 'crates/rl/**'
@@ -975,6 +978,7 @@ jobs:
               - 'crates/mock_worker/**'
               - 'crates/gateway_perf/**'
               - 'crates/protocols/**'
+              - 'crates/worker/**'
               - 'crates/tokenizer/**'
               - 'crates/kv_index/**'
             rust-kv:
@@ -993,6 +997,7 @@ jobs:
               - 'crates/engine_servicer/**'
               - 'crates/mock_worker/**'
               - 'crates/protocols/**'
+              - 'crates/worker/**'
               - 'crates/tokenizer/**'
             rust-radix:
               - *rust-infra
