@@ -2199,10 +2199,6 @@ impl FanoutChild for ProtoStream {
         Self::mark_completed(self);
     }
 
-    fn defer_abort_until_first_item(self) -> Self {
-        Self::defer_abort_until_first_item(self)
-    }
-
     fn defer_abort_within(self, bound: Duration) -> Self {
         Self::defer_abort_within(self, bound)
     }
@@ -2227,12 +2223,8 @@ pub trait FanoutChild: Send {
     /// Mark the child completed so dropping it sends no abort.
     fn mark_completed(&mut self);
 
-    /// Defer the child's abort-on-drop until its first response.
-    #[must_use]
-    fn defer_abort_until_first_item(self) -> Self;
-
-    /// [`Self::defer_abort_until_first_item`] with the wait bounded by
-    /// `bound` where that is shorter than the house cap.
+    /// Defer the child's abort-on-drop until its first response, the wait
+    /// bounded by `bound` where that is shorter than the house cap.
     #[must_use]
     fn defer_abort_within(self, bound: Duration) -> Self;
 
@@ -2273,10 +2265,6 @@ impl<C: FanoutChild> FanoutChild for FanoutStream<C> {
 
     fn mark_completed(&mut self) {
         Self::mark_completed(self);
-    }
-
-    fn defer_abort_until_first_item(self) -> Self {
-        Self::defer_abort_until_first_item(self)
     }
 
     fn defer_abort_within(self, bound: Duration) -> Self {
@@ -2350,21 +2338,8 @@ impl<C: FanoutChild> FanoutStream<C> {
         }
     }
 
-    /// Defer every open child's abort-on-drop until its first response.
-    #[must_use]
-    pub fn defer_abort_until_first_item(self) -> Self {
-        Self {
-            children: self
-                .children
-                .into_iter()
-                .map(|child| child.map(FanoutChild::defer_abort_until_first_item))
-                .collect(),
-            cursor: self.cursor,
-        }
-    }
-
-    /// [`Self::defer_abort_until_first_item`] with every child's wait
-    /// bounded by `bound`.
+    /// Defer every open child's abort-on-drop until its first response,
+    /// each child's wait bounded by `bound`.
     #[must_use]
     pub fn defer_abort_within(self, bound: Duration) -> Self {
         Self {
@@ -2423,10 +2398,6 @@ mod fanout_tests {
 
         fn mark_completed(&mut self) {
             self.completed.store(true, Ordering::SeqCst);
-        }
-
-        fn defer_abort_until_first_item(self) -> Self {
-            self
         }
 
         fn defer_abort_within(self, _bound: Duration) -> Self {
