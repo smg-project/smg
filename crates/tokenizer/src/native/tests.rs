@@ -2601,8 +2601,9 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
 /// runs of a mark beyond ASCII), one whose prefixes stand whole (every
 /// token shorter than the prefix length), one the library declines as it
 /// stands (one-byte tab and newline tokens among twenty-two prefixes: the
-/// tokens' five first bytes stand in), and two sets of added words whose
-/// prefixes would be under the floor (they keep the automaton's search).
+/// tokens' five first bytes stand in), two sets of added words whose
+/// prefixes would be under the floor (they keep the automaton's search),
+/// and one cut to thirteen-byte prefixes for the narrow searcher.
 #[test]
 fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
     let sets: [(&[&str], bool); 5] = [

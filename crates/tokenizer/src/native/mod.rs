@@ -885,15 +885,17 @@ impl Prefixes {
     /// walk is cheaper), or when even the one-byte prefixes exceed
     /// [`Self::MAX_COUNT`].
     fn chosen(tokens: &[Added]) -> Option<Vec<&[u8]>> {
-        let longest = |most: usize| {
-            (1..=Self::MAX_LEN)
+        // The longest length from `shortest` up with at most `most` distinct
+        // prefixes. Their count never grows as the length shrinks, so the
+        // first length that fits, read from the longest down, is the one.
+        let longest = |shortest: usize, most: usize| {
+            (shortest..=Self::MAX_LEN)
                 .rev()
                 .map(|len| (len, Self::distinct(tokens, len)))
                 .find(|(_, prefixes)| prefixes.len() <= most)
         };
-        let (len, prefixes) = longest(Self::NARROW_COUNT)
-            .filter(|(len, _)| *len >= Self::NARROW_MIN_LEN)
-            .or_else(|| longest(Self::MAX_COUNT))?;
+        let (len, prefixes) = longest(Self::NARROW_MIN_LEN, Self::NARROW_COUNT)
+            .or_else(|| longest(1, Self::MAX_COUNT))?;
         let cut_short = tokens.iter().any(|token| token.content.len() > len);
         (!cut_short || len >= Self::MIN_LEN).then_some(prefixes)
     }
