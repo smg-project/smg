@@ -54,6 +54,7 @@ use wfaas::LoggingSubscriber;
 
 pub mod connection_limit;
 pub mod connection_timeouts;
+pub mod health;
 pub mod posture;
 mod rate_limit_document;
 pub(crate) mod tls;
@@ -78,7 +79,6 @@ use crate::{
         conversations, messages::MessagesHeaders, models, parse, responses as response_handlers,
         tokenize,
     },
-    health::{liveness_response, spawn_readiness_maintainer, start_probe_listener, ProbeState},
     mesh::{
         discovery::{start_mesh_discovery, MeshDiscoveryConfig},
         MeshAdapters,
@@ -103,6 +103,7 @@ use crate::{
     server::{
         connection_limit::{BoundedListener, ConnectionLimitAcceptor},
         connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
+        health::{liveness_response, spawn_readiness_maintainer, start_probe_listener, ProbeState},
     },
     service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig},
     tenant,
@@ -127,7 +128,7 @@ pub struct AppState {
     pub mesh_adapters: Option<Arc<MeshAdapters>>,
     /// Cached O(1) readiness state shared with the optional dedicated
     /// probe listener. Maintained event-driven by
-    /// [`crate::health::spawn_readiness_maintainer`].
+    /// [`crate::server::health::spawn_readiness_maintainer`].
     pub probe_state: Arc<ProbeState>,
     /// Where this start read its secrets (the command line, the environment
     /// or a file), for the configuration view; the values are not here.
@@ -186,9 +187,9 @@ async fn liveness() -> Response {
 }
 
 /// O(1) readiness: reads the event-maintained snapshot (see
-/// [`crate::health::spawn_readiness_maintainer`]) and the drain flag — no registry
+/// [`crate::server::health::spawn_readiness_maintainer`]) and the drain flag — no registry
 /// scan per probe. The decision logic lives in
-/// [`crate::health::ProbeState::recompute`] and is unchanged from the previous
+/// [`crate::server::health::ProbeState::recompute`] and is unchanged from the previous
 /// inline implementation, plus the drain gate (not-ready while draining).
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     state.probe_state.readiness_response()

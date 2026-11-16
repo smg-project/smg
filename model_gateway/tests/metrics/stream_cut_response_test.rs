@@ -20,10 +20,9 @@ use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg::{
-    health::ProbeState,
     middleware::AuthConfig,
     routers::RouterFactory,
-    server::{build_app, AppState},
+    server::{build_app, health::ProbeState, AppState},
     worker::{RuntimeType, Worker, WorkerType},
 };
 use smg_test_harness::{

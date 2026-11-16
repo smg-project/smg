@@ -13,10 +13,9 @@ use openai_protocol::chat::ChatCompletionRequest;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
-    health::ProbeState,
     middleware::{wasm_middleware, TenantRequestMeta},
     routers::RouterTrait,
-    server::AppState,
+    server::{health::ProbeState, AppState},
 };
 use tokio::{runtime::Runtime, sync::mpsc};
 use tower::{Layer, Service};
