@@ -20,7 +20,8 @@
 //! 1. its decider's queue is full: the request comes back to its submitter,
 //!    whose answer is `Busy` for the queue's depth;
 //! 2. the budget, counted from the frame's receipt, is gone when the
-//!    decider takes the request: `Busy`, and nothing is read for it;
+//!    decider takes the request, or under one microsecond of it is left:
+//!    `Busy`, and nothing is read for it;
 //! 3. the fence is closed: `Busy`, and nothing is built;
 //! 4. one load of the world ([`MemoryStore::deciding`]): the pool's rows as
 //!    the asking gateway reaches them, and the engine of the generation
@@ -150,8 +151,9 @@ impl Deciders {
     }
 }
 
-/// What a decider keeps across decisions: a decision allocates only while
-/// these grow.
+/// What a decider keeps across decisions: the engine's run of a decision
+/// allocates only while these grow. An answer is built anew a request: a
+/// pick's targets and its trace's top are each a list of its own.
 #[derive(Default)]
 struct Buffers {
     view: ViewBuffers,
@@ -175,6 +177,11 @@ impl Decider {
                 received,
                 answers,
             } = job;
+            // What the claim rests on: a decision writes neither the
+            // fence nor the store; the engine closes an open scope where it
+            // unwinds; the lists are cleared where a read begins and the
+            // view's rows where a build begins; nothing here holds a lock a
+            // panic poisons.
             let decided = catch_unwind(AssertUnwindSafe(|| {
                 self.decide(&request, gateway, received)
             }));
@@ -246,7 +253,9 @@ struct Taken<'a> {
 impl<'a> Taken<'a> {
     /// `request` as its decider takes it at `now`; `None` when its budget
     /// is gone. The budget counts from the frame's receipt: what the queue
-    /// used of it is not the decision's.
+    /// used of it is not the decision's. Under one microsecond left is
+    /// gone: the engine is told what is left in whole microseconds, and
+    /// reads 0 as none.
     fn at(
         request: &'a Checked,
         gateway: GatewayId,
@@ -256,7 +265,7 @@ impl<'a> Taken<'a> {
         let left = request
             .budget()
             .saturating_sub(now.saturating_duration_since(received));
-        (!left.is_zero()).then_some(Self {
+        (left.as_micros() > 0).then_some(Self {
             request,
             gateway,
             now,
@@ -781,15 +790,21 @@ mod tests {
     async fn a_budget_the_queue_used_up_is_busy_and_one_microsecond_of_it_is_a_decision() {
         let short = BUDGET - Duration::from_micros(1);
         // The first request is taken with one microsecond left, the second
-        // with none.
-        let mut bed = leading([Step::At(short), Step::At(short), Step::At(BUDGET)]);
+        // with none, the third with under one: the engine reads what is
+        // left in whole microseconds, and 0 as none.
+        let under = BUDGET - Duration::from_nanos(999);
+        let steps = [short, short, BUDGET, under].map(Step::At);
+        let mut bed = leading(steps);
         let answer = bed.ask(frame(1, 1)).await;
         assert!(bed.workers.contains(&picked(&answer)));
         let answer = bed.ask(frame(2, 2)).await;
         assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
         assert_eq!((answer.request_id.as_slice(), answer.term), (&[2][..], 1));
-        // One read of the clock: nothing was read for it after the budget.
-        assert_eq!(bed.script.readers.lock().len(), 3);
+        let answer = bed.ask(frame(3, 3)).await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        // One read of the clock each: nothing was read for either after
+        // the budget.
+        assert_eq!(bed.script.readers.lock().len(), 4);
     }
 
     #[tokio::test]
@@ -849,6 +864,50 @@ mod tests {
         let answer = bed.ask(frame(2, 2)).await;
         assert_eq!(answer.term, 2);
         assert!(bed.workers.contains(&picked(&answer)));
+    }
+
+    /// The term a decision leaves under is the fence's, the one both reads
+    /// showed. A higher one the election has seen since is a `Busy`'s to
+    /// carry.
+    #[tokio::test]
+    async fn a_decision_leaves_under_the_fences_term_while_the_election_has_seen_a_later_one() {
+        let mut bed = leading([]);
+        bed.standing.send_replace(Standing {
+            holder: "controller-1@10.0.0.8:30100".to_owned(),
+            term: 4,
+            looked: true,
+        });
+        let answer = bed.ask(frame(1, 1)).await;
+        assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
+        assert_eq!(answer.term, 1);
+    }
+
+    /// The deciders as they stand once their one thread ended: its queue
+    /// has no reader.
+    fn gone() -> Deciders {
+        let (queue, jobs) = std_mpsc::sync_channel(1);
+        drop(jobs);
+        Deciders {
+            queues: Box::new([queue]),
+        }
+    }
+
+    /// A decider's thread that ended takes no request: each one for its
+    /// models comes back whole, as gone and never as a full queue.
+    #[test]
+    fn a_request_for_a_decider_whose_thread_ended_comes_back_as_gone() {
+        let deciders = gone();
+        let (answers, _unread) = mpsc::channel(1);
+        let job = Job {
+            request: checked(frame(1, 1)),
+            gateway: GATEWAY,
+            received: Instant::now(),
+            answers,
+        };
+        let back = deciders
+            .submit(job)
+            .map(|(refused, job)| (refused, job.request.into_id()));
+        assert_eq!(back, Some((Refused::Gone, vec![1])));
     }
 
     #[tokio::test]

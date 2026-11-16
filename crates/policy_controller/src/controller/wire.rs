@@ -18,6 +18,16 @@
 //! header's name is a position, so one past the record's 256 is refused:
 //! saturated, it would read as another header's.
 //!
+//! A key is read in the form its frame carries, and the two keys' hash
+//! forms are two things (the contract's `Identity`). A tenant's is its
+//! key's fingerprint, which the record carries as it is. A session key's
+//! is the session's value, the key within the request's model and phase
+//! already, while the record carries a key's fingerprint and scopes it
+//! itself: the fingerprint is read back from the value
+//! ([`key_of_session`]), once, at the check. So one key names one session
+//! in either form, and a stage that reads the key itself reads one key.
+//! The one value that would give the fingerprint no key has is refused.
+//!
 //! An answer carries no lease here: a decision is written as the engine
 //! made it, and the call that issues leases adds them.
 
@@ -27,8 +37,8 @@ use crate::{
     decision::{Decision, ShedReason, Target, Trace},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     view::{
-        AffinityFacts, Constraints, HashKind, Header, Identity, MediaCounts, ModelFingerprint,
-        Phase, RequestFacts, WireModes, WorkerId,
+        fingerprint, key_of_session, AffinityFacts, Constraints, HashKind, Header, Identity,
+        MediaCounts, ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
     },
 };
 
@@ -52,6 +62,10 @@ pub(crate) struct Checked {
     constraints: proto::Constraints,
     phase: Phase,
     hash_kind: HashKind,
+    /// The session key's fingerprint, for a frame that carries the key as
+    /// the session's value; `0` for one that carries it plain or carries
+    /// none.
+    session_key: u64,
 }
 
 impl Checked {
@@ -85,12 +99,27 @@ impl Checked {
         if !facts.prompt_text.is_empty() {
             return Err(Refusal::Unserved("facts.prompt_text"));
         }
+        // A session key's hash form is the session's value: the key's
+        // fingerprint is read back from it within the request's model and
+        // phase. A value of zero is no session.
+        let session = facts.session_key.as_ref();
+        let session_key = match session.and_then(|key| key.form.as_ref()) {
+            Some(Form::Hash(value @ 1..)) => {
+                let model = fingerprint(facts.model.as_bytes());
+                match key_of_session(*value, model, phase) {
+                    0 => return Err(Refusal::OutOfRange("facts.session_key.hash")),
+                    key => key,
+                }
+            }
+            _ => 0,
+        };
         Ok(Self {
             id: request.request_id,
             facts,
             constraints: request.constraints.unwrap_or_default(),
             phase,
             hash_kind,
+            session_key,
         })
     }
 
@@ -164,7 +193,11 @@ impl Checked {
                 prompt_tokens: facts.prompt_tokens,
                 block_hashes: &facts.block_hashes,
                 hash_kind: self.hash_kind,
-                session_key: identity(facts.session_key.as_ref()),
+                session_key: match facts.session_key.as_ref().and_then(|key| key.form.as_ref()) {
+                    Some(Form::Plain(key)) if !key.is_empty() => Identity::plain(key),
+                    Some(Form::Hash(_)) => Identity::hashed(self.session_key),
+                    Some(Form::Plain(_)) | None => Identity::NONE,
+                },
                 phase: self.phase,
                 attempt: u8::try_from(facts.attempt).unwrap_or(u8::MAX),
                 tried: &lists.tried,
@@ -233,9 +266,9 @@ fn emptied<'a>(mut spent: Vec<Header<'_>>) -> Vec<Header<'a>> {
         .collect()
 }
 
-/// A key in the form its frame carries: the fingerprint, or the plain key,
-/// fingerprinted here. Absent when the frame carries none, a fingerprint of
-/// zero or an empty name.
+/// A tenant in the form its frame carries: the fingerprint, or the plain
+/// key, fingerprinted here. Absent when the frame carries none, a
+/// fingerprint of zero or an empty name.
 fn identity(wire: Option<&proto::Identity>) -> Identity<'_> {
     match wire.and_then(|identity| identity.form.as_ref()) {
         Some(Form::Hash(hash)) => Identity::hashed(*hash),
@@ -351,7 +384,7 @@ mod tests {
         },
     };
 
-    fn key(form: Form) -> proto::Identity {
+    fn key_form(form: Form) -> proto::Identity {
         proto::Identity { form: Some(form) }
     }
 
@@ -362,14 +395,14 @@ mod tests {
             facts: Some(proto::RequestFacts {
                 model: "model-a".to_owned(),
                 namespace_seed: 11,
-                tenant: Some(key(Form::Plain("tenant-a".to_owned()))),
+                tenant: Some(key_form(Form::Plain("tenant-a".to_owned()))),
                 priority: -100,
                 streaming: true,
                 max_output_tokens: 12,
                 prompt_tokens: 13,
                 block_hashes: vec![14, 15, 16],
                 hash_kind: proto::HashKind::Text.into(),
-                session_key: Some(key(Form::Hash(17))),
+                session_key: Some(key_form(Form::Hash(17))),
                 phase: proto::Phase::Decode.into(),
                 attempt: 2,
                 tried: vec![18, 19],
@@ -447,7 +480,9 @@ mod tests {
             assert_eq!((facts.max_output_tokens, facts.prompt_tokens), (12, 13));
             assert_eq!(facts.block_hashes, [14, 15, 16]);
             assert_eq!(facts.hash_kind, HashKind::Text);
-            assert_eq!(facts.session_key, Identity::hashed(17));
+            // The hash form is the session's value, as it was sent.
+            assert_eq!(facts.session().get(), 17);
+            assert_eq!(facts.session_key.plain, None);
             assert_eq!(facts.phase, Phase::Decode);
             assert_eq!(facts.attempt, 2);
             assert_eq!(facts.tried, [WorkerId(18), WorkerId(19)]);
@@ -581,6 +616,62 @@ mod tests {
             facts.session_key.hash
         });
         assert_eq!(read, 0);
+    }
+
+    /// The contract's own numbers: the key "conversation-7" under the model
+    /// "model-a" names one session a phase, and names it in either form.
+    /// The hash form is the session's value: it is never read as a key's
+    /// fingerprint and scoped again.
+    #[test]
+    fn a_session_key_names_the_contracts_session_in_its_plain_form_and_in_its_hash_form() {
+        let sessions: [(proto::Phase, u64); 4] = [
+            (proto::Phase::Single, 0x6e88_ff71_cc98_2a42),
+            (proto::Phase::Prefill, 0x619f_dbb0_c262_9a55),
+            (proto::Phase::Decode, 0x3e92_fbbd_183d_f4b6),
+            (proto::Phase::Encode, 0x3780_ba54_336a_57d0),
+        ];
+        let named = |phase: proto::Phase, form: Option<Form>| {
+            let frame = with(|facts| {
+                facts.phase = phase.into();
+                facts.session_key = Some(proto::Identity { form });
+            });
+            reading(frame, &mut Lists::default(), |facts, _| {
+                let key = facts.session_key;
+                (
+                    facts.session().get(),
+                    key.hash,
+                    key.plain.map(str::to_owned),
+                )
+            })
+        };
+        let key = fingerprint(b"conversation-7");
+        for (phase, session) in sessions {
+            let plain = "conversation-7".to_owned();
+            assert_eq!(
+                named(phase, Some(Form::Plain(plain.clone()))),
+                (session, key, Some(plain)),
+                "{phase:?}"
+            );
+            // The same session, and the same key for a stage that reads it.
+            assert_eq!(
+                named(phase, Some(Form::Hash(session))),
+                (session, key, None),
+                "{phase:?}"
+            );
+        }
+        // No form, a value of zero and an empty key are no session.
+        for absent in [None, Some(Form::Hash(0)), Some(Form::Plain(String::new()))] {
+            let read = named(proto::Phase::Single, absent.clone());
+            assert_eq!(read, (0, 0, None), "{absent:?}");
+        }
+        // The one value that would give the fingerprint no key has is no
+        // key's session.
+        let keyless = with(|facts| {
+            facts.phase = proto::Phase::Single.into();
+            facts.session_key = Some(key_form(Form::Hash(0xc771_96d2_b9cf_9497)));
+        });
+        let refused = Checked::new(keyless).expect_err("no key's session");
+        assert_eq!(refused, Refusal::OutOfRange("facts.session_key.hash"));
     }
 
     #[test]
