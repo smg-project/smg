@@ -12,13 +12,15 @@
 //! side is the mock-worker crate's canned worker, answering at once), the
 //! sequential shape's the vLLM proto (a prefill engine that completes at
 //! once); each decode engine holds its one response, or its first token, for
-//! a chosen time and records when the abort for the request reaches it.
+//! a chosen time and records when it took the request and when the abort for
+//! it arrived. The client's leave is counted from the engine taking the
+//! request and the engine's hold from the leave, so a slow host can neither
+//! have the client gone before the decode side has the request nor the
+//! answer sent before the client is gone.
 
 use std::{
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+    future::Future,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -40,7 +42,7 @@ use smg::{
     worker::{RuntimeType, Worker, WorkerType},
 };
 use smg_grpc_client::{tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -54,16 +56,19 @@ const BOUND: Duration = Duration::from_secs(3);
 /// What the deferred abort's wait may add past the bound before the case
 /// calls it held to the answer.
 const SLACK: Duration = Duration::from_secs(1);
-/// When the client leaves, counted from its request.
+/// When the client leaves, counted from the decode engine taking its request.
 const LEAVE_AFTER: Duration = Duration::from_millis(500);
-/// When a plain decode side's one response comes: well past the bound, so an
-/// abort that waits for it arrives late, and well within the case.
+/// When a plain decode side's one response comes, counted from the client's
+/// leave: well past the bound, so an abort that waits for it arrives late,
+/// and well within the case.
 const ANSWER_AFTER: Duration = Duration::from_secs(6);
-/// When a streaming decode side's first token comes: before the bound.
-const FIRST_TOKEN_AFTER: Duration = Duration::from_millis(1_500);
+/// When a streaming decode side's first token comes, counted from the
+/// client's leave: before the bound.
+const FIRST_TOKEN_AFTER: Duration = Duration::from_secs(1);
 const CASE_CAP: Duration = Duration::from_secs(20);
 
-/// What a decode engine does with a generate call's stream.
+/// What a decode engine does with a generate call's stream once the client
+/// has left.
 #[derive(Clone, Copy)]
 enum Answer {
     /// One `Complete` after [`ANSWER_AFTER`] (a non-streaming generation).
@@ -72,30 +77,67 @@ enum Answer {
     FirstTokenLate,
 }
 
-/// The instants the engine was asked to abort a request, and its calls.
+/// Instants a decode engine records for the case to read.
 #[derive(Clone, Default)]
-struct Aborts {
-    at: Arc<Mutex<Vec<Instant>>>,
-    calls: Arc<AtomicUsize>,
-}
+struct Instants(Arc<Mutex<Vec<Instant>>>);
 
-impl Aborts {
+impl Instants {
     #[expect(clippy::expect_used, reason = "test helper")]
     fn note(&self) {
-        self.at.lock().expect("aborts lock").push(Instant::now());
+        self.0.lock().expect("instants lock").push(Instant::now());
     }
 
-    /// The first abort's instant, waited for up to `within`.
+    /// The first instant, waited for up to `within`.
     #[expect(clippy::expect_used, reason = "test helper")]
     async fn first_within(&self, within: Duration) -> Option<Instant> {
         let started = Instant::now();
         while started.elapsed() < within {
-            if let Some(at) = self.at.lock().expect("aborts lock").first().copied() {
+            if let Some(at) = self.0.lock().expect("instants lock").first().copied() {
                 return Some(at);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         None
+    }
+
+    #[expect(clippy::expect_used, reason = "test helper")]
+    fn count(&self) -> usize {
+        self.0.lock().expect("instants lock").len()
+    }
+}
+
+/// When the engine took a generate call, and when it was asked to abort it;
+/// `client_left` starts the engine's hold.
+#[derive(Clone, Default)]
+struct Aborts {
+    calls: Instants,
+    at: Instants,
+    client_left: Arc<Notify>,
+}
+
+impl Aborts {
+    /// The client's leave, `after` from the engine taking the request: a slow
+    /// host cannot have the client gone before the decode side has it.
+    #[expect(clippy::expect_used, reason = "test helper")]
+    async fn leave(&self, after: Duration) {
+        let called_at = self
+            .calls
+            .first_within(CASE_CAP)
+            .await
+            .expect("the decode engine must take the request");
+        tokio::time::sleep_until((called_at + after).into()).await;
+    }
+}
+
+/// `routed`'s output, if it comes before the client's leave.
+async fn until_the_leave<T>(
+    aborts: &Aborts,
+    after: Duration,
+    routed: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        output = routed => Some(output),
+        () = aborts.leave(after) => None,
     }
 }
 
@@ -147,8 +189,10 @@ fn produce_ts(
     tx: mpsc::Sender<Result<ts::GenerateResponse, Status>>,
     request_id: String,
     answer: Answer,
+    client_left: Arc<Notify>,
 ) {
     tokio::spawn(async move {
+        client_left.notified().await;
         match answer {
             Answer::WholeAnswerLate => {
                 tokio::time::sleep(ANSWER_AFTER).await;
@@ -173,9 +217,14 @@ impl TokenSpeedAnswers for TokenSpeedDecode {
         &self,
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
-        self.aborts.calls.fetch_add(1, Ordering::SeqCst);
+        self.aborts.calls.note();
         let (tx, rx) = mpsc::channel(8);
-        produce_ts(tx, request.into_inner().request_id, self.answer);
+        produce_ts(
+            tx,
+            request.into_inner().request_id,
+            self.answer,
+            self.aborts.client_left.clone(),
+        );
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
@@ -183,7 +232,7 @@ impl TokenSpeedAnswers for TokenSpeedDecode {
         &self,
         _request: Request<ts::AbortRequest>,
     ) -> Result<Response<ts::AbortResponse>, Status> {
-        self.aborts.note();
+        self.aborts.at.note();
         Ok(Response::new(ts::AbortResponse::default()))
     }
 }
@@ -223,8 +272,13 @@ struct VllmDecode {
     clippy::disallowed_methods,
     reason = "test mock; the producer task ends with its stream"
 )]
-fn produce_vllm(tx: mpsc::Sender<Result<proto::GenerateResponse, Status>>, answer: Answer) {
+fn produce_vllm(
+    tx: mpsc::Sender<Result<proto::GenerateResponse, Status>>,
+    answer: Answer,
+    client_left: Arc<Notify>,
+) {
     tokio::spawn(async move {
+        client_left.notified().await;
         match answer {
             Answer::WholeAnswerLate => {
                 tokio::time::sleep(ANSWER_AFTER).await;
@@ -249,9 +303,9 @@ impl VllmAnswers for VllmDecode {
         &self,
         _request: Request<proto::GenerateRequest>,
     ) -> Result<Response<VllmGenerateStream>, Status> {
-        self.aborts.calls.fetch_add(1, Ordering::SeqCst);
+        self.aborts.calls.note();
         let (tx, rx) = mpsc::channel(8);
-        produce_vllm(tx, self.answer);
+        produce_vllm(tx, self.answer, self.aborts.client_left.clone());
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
@@ -259,7 +313,7 @@ impl VllmAnswers for VllmDecode {
         &self,
         _request: Request<proto::AbortRequest>,
     ) -> Result<Response<proto::AbortResponse>, Status> {
-        self.aborts.note();
+        self.aborts.at.note();
         Ok(Response::new(proto::AbortResponse::default()))
     }
 }
@@ -335,16 +389,20 @@ fn tenant() -> TenantRequestMeta {
     TenantRequestMeta::new(TenantKey::new("pd-client-departure-test-tenant"))
 }
 
-/// One chat through `router` whose client leaves [`LEAVE_AFTER`] in: a
-/// non-streaming request's future is dropped then (the whole answer was
-/// still being collected); a streaming request's response body is dropped
-/// then if its headers were in (its first token not yet), else its future
-/// is, as a connection's close drops the handler (the sequential shape opens
-/// the stream with the decode side's first token). The request's start and
-/// the instant the client left come back.
+/// One chat through `router` whose client leaves [`LEAVE_AFTER`] after the
+/// decode engine took its request: a non-streaming request's future is
+/// dropped then (the whole answer was still being collected); a streaming
+/// request's response body is dropped then if its headers were in (its first
+/// token not yet), else its future is, as a connection's close drops the
+/// handler (the sequential shape opens the stream with the decode side's
+/// first token). The decode engine is told the client left, and that
+/// instant comes back.
 #[expect(clippy::unwrap_used, reason = "test helper")]
-async fn chat_whose_client_leaves(router: &dyn RouterTrait, streaming: bool) -> (Instant, Instant) {
-    let started_at = Instant::now();
+async fn chat_whose_client_leaves(
+    router: &dyn RouterTrait,
+    aborts: &Aborts,
+    streaming: bool,
+) -> Instant {
     let request = serde_json::from_value(serde_json::json!({
         "model": MODEL,
         "messages": [{"role": "user", "content": "Hello world"}],
@@ -352,29 +410,31 @@ async fn chat_whose_client_leaves(router: &dyn RouterTrait, streaming: bool) -> 
         "stream": streaming,
     }))
     .unwrap();
-    let routed = tokio::time::timeout(
+    let routed = until_the_leave(
+        aborts,
         LEAVE_AFTER,
         router.route_chat(None, &tenant(), request, MODEL),
     )
     .await;
-    match routed {
-        // The streamed answer's headers came within the leave: its body is
-        // dropped at the leave, unread.
-        Ok(response) => {
-            assert!(
-                streaming,
-                "a non-streaming answer must not be in before its decode side's one response"
-            );
-            assert_eq!(response.status(), http::StatusCode::OK);
-            tokio::time::sleep(LEAVE_AFTER).await;
-            drop(response);
-        }
-        // The answer was still being collected (a non-streaming one), or
-        // the stream had not opened yet (one that opens with the first
-        // token): the request future is dropped at the leave.
-        Err(_elapsed) => {}
+    // The streamed answer's headers came within the leave: its body is
+    // dropped at the leave, unread. Else the answer was still being
+    // collected (a non-streaming one), or the stream had not opened yet (one
+    // that opens with the first token), and the request future was dropped
+    // at the leave.
+    if let Some(response) = routed {
+        assert!(
+            streaming,
+            "a non-streaming answer must not be in before its decode side's one response: \
+             one came with {}",
+            response.status()
+        );
+        assert_eq!(response.status(), http::StatusCode::OK);
+        aborts.leave(LEAVE_AFTER).await;
+        drop(response);
     }
-    (started_at, Instant::now())
+    let left_at = Instant::now();
+    aborts.client_left.notify_one();
+    left_at
 }
 
 /// The abort reached the decode engine within the bound of the client's
@@ -382,6 +442,7 @@ async fn chat_whose_client_leaves(router: &dyn RouterTrait, streaming: bool) -> 
 #[expect(clippy::expect_used, reason = "test assertion")]
 async fn assert_aborted_within_the_bound(aborts: &Aborts, left_at: Instant) {
     let aborted_at = aborts
+        .at
         .first_within(CASE_CAP)
         .await
         .expect("the decode engine must be asked to abort once the client left");
@@ -395,38 +456,24 @@ async fn assert_aborted_within_the_bound(aborts: &Aborts, left_at: Instant) {
         "the abort must reach the decode engine within the decode bound of the client's leave \
          ({BOUND:?} and {SLACK:?} of slack), not with the answer: it came {after_leave:?} after"
     );
-    assert_eq!(aborts.calls.load(Ordering::SeqCst), 1, "one decode call");
+    assert_eq!(aborts.calls.count(), 1, "one decode call");
 }
 
 /// The abort reached the decode engine after the first token (due
-/// [`FIRST_TOKEN_AFTER`] from the request's start; the client left before it,
-/// so the deferral held the abort for the handoff) and within the bound of
-/// the client's leave. The token is expected from the start, not from the
-/// leave: a streamed answer whose headers come in early is left
-/// [`LEAVE_AFTER`] after them, later than a request whose stream has not
-/// opened yet.
+/// [`FIRST_TOKEN_AFTER`] from the client's leave, so the deferral held the
+/// abort for the handoff) and within the bound of the client's leave.
 #[expect(clippy::expect_used, reason = "test assertion")]
-async fn assert_aborted_after_the_first_token(
-    aborts: &Aborts,
-    started_at: Instant,
-    left_at: Instant,
-) {
+async fn assert_aborted_after_the_first_token(aborts: &Aborts, left_at: Instant) {
     let aborted_at = aborts
+        .at
         .first_within(CASE_CAP)
         .await
         .expect("the decode engine must be asked to abort once the client left");
-    let token_at = started_at + FIRST_TOKEN_AFTER;
     let after_leave = aborted_at.saturating_duration_since(left_at);
     assert!(
-        left_at < token_at,
-        "the client must leave before the first token: it left {:?} after the start",
-        left_at.saturating_duration_since(started_at)
-    );
-    assert!(
-        aborted_at + Duration::from_millis(200) >= token_at,
-        "the abort must wait for the first token (due {FIRST_TOKEN_AFTER:?} after the start): \
-         it came {:?} after the start, {after_leave:?} after the leave",
-        aborted_at.saturating_duration_since(started_at)
+        after_leave >= FIRST_TOKEN_AFTER,
+        "the abort must wait for the first token (due {FIRST_TOKEN_AFTER:?} after the leave): \
+         it came {after_leave:?} after the leave"
     );
     assert!(
         after_leave <= BOUND + SLACK,
@@ -440,7 +487,7 @@ async fn assert_aborted_after_the_first_token(
 #[tokio::test]
 async fn a_parallel_plain_decode_is_aborted_within_the_bound_of_the_clients_leave() {
     let (router, aborts) = parallel_pair(Answer::WholeAnswerLate).await;
-    let (_started_at, left_at) = chat_whose_client_leaves(router.as_ref(), false).await;
+    let left_at = chat_whose_client_leaves(router.as_ref(), &aborts, false).await;
     assert_aborted_within_the_bound(&aborts, left_at).await;
 }
 
@@ -448,7 +495,7 @@ async fn a_parallel_plain_decode_is_aborted_within_the_bound_of_the_clients_leav
 #[tokio::test]
 async fn a_sequential_plain_decode_is_aborted_within_the_bound_of_the_clients_leave() {
     let (router, aborts) = sequential_pair(Answer::WholeAnswerLate).await;
-    let (_started_at, left_at) = chat_whose_client_leaves(router.as_ref(), false).await;
+    let left_at = chat_whose_client_leaves(router.as_ref(), &aborts, false).await;
     assert_aborted_within_the_bound(&aborts, left_at).await;
 }
 
@@ -459,14 +506,14 @@ async fn a_sequential_plain_decode_is_aborted_within_the_bound_of_the_clients_le
 #[tokio::test]
 async fn a_parallel_streamed_decode_left_before_its_first_token_is_aborted_after_that_token() {
     let (router, aborts) = parallel_pair(Answer::FirstTokenLate).await;
-    let (started_at, left_at) = chat_whose_client_leaves(router.as_ref(), true).await;
-    assert_aborted_after_the_first_token(&aborts, started_at, left_at).await;
+    let left_at = chat_whose_client_leaves(router.as_ref(), &aborts, true).await;
+    assert_aborted_after_the_first_token(&aborts, left_at).await;
 }
 
 /// The same on the sequential shape.
 #[tokio::test]
 async fn a_sequential_streamed_decode_left_before_its_first_token_is_aborted_after_that_token() {
     let (router, aborts) = sequential_pair(Answer::FirstTokenLate).await;
-    let (started_at, left_at) = chat_whose_client_leaves(router.as_ref(), true).await;
-    assert_aborted_after_the_first_token(&aborts, started_at, left_at).await;
+    let left_at = chat_whose_client_leaves(router.as_ref(), &aborts, true).await;
+    assert_aborted_after_the_first_token(&aborts, left_at).await;
 }
