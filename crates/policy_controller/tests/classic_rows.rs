@@ -22,7 +22,13 @@
 //! and a worker never picked on one side must never be picked on the other.
 //! A pair-index row picks nothing: it holds what the gateway's pair index
 //! made of a prefill pool and a decode pool, and must replay whole.
-//! No row is decided differently. A row whose form this crate does not
+//! An overload row picks nothing: it holds whether the gateway read one
+//! worker as overloaded after each write of its loads, and must replay
+//! verdict for verdict.
+//! No pick and no pair row is decided differently. A verdict is, where the
+//! overload module names the row: the store judges an engine by rules of
+//! its own, and a recorded row they decide apart from the gateway is held
+//! to the verdicts its entry gives. A row whose form this crate does not
 //! build yet is owed: [`OWED`] names it with the validator's words and the
 //! change that builds it, and the replay fails once the row is no longer
 //! refused in those words. A sheet whose module has not landed here is owed
@@ -40,6 +46,7 @@ use serde_json::{Map, Value};
 
 mod classic {
     pub mod manual;
+    pub mod overload;
     pub mod pair_index;
     pub mod power_of_two;
 }
@@ -99,10 +106,6 @@ const OWED_SHEETS: &[OwedSheet] = &[
     OwedSheet {
         policy: "encode_pair",
         by: "the placement of a request's encode items beside its pair",
-    },
-    OwedSheet {
-        policy: "overload",
-        by: "the replay of the overload verdict and the rule that ends a sample by its age",
     },
     OwedSheet {
         policy: "pair-select",
@@ -258,11 +261,17 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 
 /// Every module that replays, the one list. A sheet finds its module here
 /// ([`replay_sheet`]), and each entry is held to one sheet and to its copied
-/// rows ([`replay_sheets`]): a module added here has both. The pair index's
-/// rows pick nothing, so its module brings its own replay and its own rule
-/// for a copied row.
-const MODULES: [Module; 3] = [
+/// rows ([`replay_sheets`]): a module added here has both. The overload
+/// rows and the pair index's rows pick nothing, so each of the two modules
+/// brings its own replay and its own rule for a copied row.
+const MODULES: [Module; 4] = [
     module::<classic::manual::Row>(classic::manual::INLINE),
+    Module {
+        policy: classic::overload::POLICY,
+        inline: classic::overload::INLINE,
+        replay: classic::overload::replay_rows,
+        copied: classic::overload::copied_row_defects,
+    },
     Module {
         policy: classic::pair_index::POLICY,
         inline: classic::pair_index::INLINE,
@@ -497,6 +506,13 @@ fn the_classic_manual_rows_replay_pick_for_pick_and_share_for_share() {
     assert!(defects.is_empty(), "{defects:#?}");
 }
 
+#[test]
+fn the_classic_overload_rows_replay_verdict_for_verdict() {
+    let (rows, defects) = replay_sheet(classic::overload::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
 /// A sheet whose module has not landed is owed, not a defect: it replays no
 /// row, the report says what it waits for, and it still names the commit
 /// its rows were recorded from. No entry names a policy a module replays.
@@ -715,9 +731,10 @@ fn a_policy_with_no_sheet_is_a_defect_and_so_is_a_second_sheet() {
     assert_eq!(unheld, Vec::<String>::new());
     let (_, unheld) = replay_sheets(sheets.get(..1).expect("the first sheet"));
     assert!(
-        matches!(unheld.as_slice(), [one, other]
-            if one.starts_with("no sheet of pair-index")
-                && other.starts_with("no sheet of power_of_two")),
+        matches!(unheld.as_slice(), [one, other, third]
+            if one.starts_with("no sheet of overload")
+                && other.starts_with("no sheet of pair-index")
+                && third.starts_with("no sheet of power_of_two")),
         "{unheld:#?}"
     );
     let mut twice = sheets.clone();
@@ -828,6 +845,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "a_second_name.json",
             "broken.json",
             "manual.json",
+            "overload.json",
             "pair-index.json",
             "power_of_two.json",
             "stray.json",
@@ -857,6 +875,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
 fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
     let sheets = copied_sheets();
     let (manual, _) = replay_sheet(classic::manual::INLINE, "the inline rows");
+    let (overload, _) = replay_sheet(classic::overload::INLINE, "the inline rows");
     let (pair_index, _) = replay_sheet(classic::pair_index::INLINE, "the inline rows");
     let (power_of_two, _) = replay_sheet(classic::power_of_two::INLINE, "the inline rows");
     let (lines, defects) = replay_report(&sheets);
@@ -864,9 +883,11 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
         lines,
         [
             format!("manual.json: {manual} rows, 0 defects"),
+            format!("overload.json: {overload} rows, 0 defects"),
             format!("pair-index.json: {pair_index} rows, 0 defects"),
             format!("power_of_two.json: {power_of_two} rows, 0 defects"),
             format!("policy manual: {manual} rows, 0 defects"),
+            format!("policy overload: {overload} rows, 0 defects"),
             format!("policy pair-index: {pair_index} rows, 0 defects"),
             format!("policy power_of_two: {power_of_two} rows, 0 defects"),
         ]
@@ -879,14 +900,16 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
         [
             format!("manual.json: {manual} rows, 0 defects"),
             format!("policy manual: {manual} rows, 0 defects"),
+            "policy overload: no sheet".to_string(),
             "policy pair-index: no sheet".to_string(),
             "policy power_of_two: no sheet".to_string(),
         ]
     );
     assert!(
-        matches!(defects.as_slice(), [one, other]
-            if one.starts_with("no sheet of pair-index")
-                && other.starts_with("no sheet of power_of_two")),
+        matches!(defects.as_slice(), [one, other, third]
+            if one.starts_with("no sheet of overload")
+                && other.starts_with("no sheet of pair-index")
+                && third.starts_with("no sheet of power_of_two")),
         "{defects:#?}"
     );
 
@@ -894,7 +917,7 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
     twice.extend(sheets.first().cloned());
     let (lines, defects) = replay_report(&twice);
     assert_eq!(
-        lines.get(4).map(String::as_str),
+        lines.get(5).map(String::as_str),
         Some("policy manual: 2 sheets")
     );
     assert!(
@@ -906,7 +929,7 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
     broken.push(("broken.json".to_string(), "no sheet".to_string()));
     let (lines, defects) = replay_report(&broken);
     assert_eq!(
-        lines.get(3).map(String::as_str),
+        lines.get(4).map(String::as_str),
         Some("broken.json: 0 rows, 1 defects")
     );
     assert!(
@@ -946,9 +969,11 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
         lines,
         [
             format!("manual.json: {manual} rows, {found} defects"),
+            format!("overload.json: {overload} rows, 0 defects"),
             format!("pair-index.json: {pair_index} rows, 0 defects"),
             format!("power_of_two.json: {power_of_two} rows, 0 defects"),
             format!("policy manual: {manual} rows, {found} defects"),
+            format!("policy overload: {overload} rows, 0 defects"),
             format!("policy pair-index: {pair_index} rows, 0 defects"),
             format!("policy power_of_two: {power_of_two} rows, 0 defects"),
         ]

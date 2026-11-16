@@ -220,8 +220,7 @@ fails once the reason no longer holds.
   `a-record-s-usage-is-judged-over-the-ranks-that-have-pushed`). An answer with no entry changes nothing the store
   holds (`an-answer-that-names-no-rank-takes-the-ranks-that-pushed-before-it-off-the-report`). Each of these five
   rows repeats the step that leaves a rank unheard, and replays as recorded from its fourth repeat on. The other 19
-  rows replay. The module that replays the sheet arrives with the rule that ends a sample by its age;
-  until then the replay owes this sheet.
+  rows replay.
 - `manual.json`: one row is owed, `manual-one-key-pins-apart-under-the-prefill-and-the-decode-role`. The gateway
   keeps a key's pins apart under each role of a prefill and decode pair. The crate refuses a sessions rule under a
   pair plan today, so it cannot build the row; the other 13 rows replay.
