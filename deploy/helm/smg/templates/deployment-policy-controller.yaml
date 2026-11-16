@@ -14,7 +14,7 @@ metadata:
     {{- include "smg.labels" . | nindent 4 }}
     app.kubernetes.io/component: policy-controller
 spec:
-  replicas: {{ $controller.replicas }}
+  replicas: {{ include "smg.policyControllerReplicas" . }}
   {{- if $elected }}
   {{- /* With the election on, one pod more at a time and none unavailable:
        the new pod stands by, and the old leader's stop hands the Lease

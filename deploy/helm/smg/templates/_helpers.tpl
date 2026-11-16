@@ -1010,6 +1010,20 @@ elect a second leader beside the first.
 {{- end }}
 
 {{/*
+Policy controller replicas -- more than one only with the election on. With
+it off every replica is a controller of its own, and two would each lead
+alone: the render refuses them. The count is compared as a number and
+written as the values hold it: a null stays the API's default.
+*/}}
+{{- define "smg.policyControllerReplicas" -}}
+{{- $replicas := .Values.policyController.replicas -}}
+{{- if and (gt (int $replicas) 1) (not (include "smg.policyControllerElection" .)) -}}
+{{- fail (printf "policyController.replicas is %d with policyController.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" (int $replicas)) -}}
+{{- end -}}
+{{- $replicas -}}
+{{- end }}
+
+{{/*
 Policy controller selector labels -- the release's selector labels with the
 controller's own component, so no router or worker selector takes its pods.
 */}}
@@ -1060,10 +1074,11 @@ smg-policy-controller, each from a value. The controller's id is not here:
 the flag reads HOSTNAME, the pod's name. What the controller refuses at
 start is refused at render: two listeners on one port, a settle window
 over half the grace period (the controller's own default of 5 seconds when
-shutdownSettleSeconds is null) and, by the schema, a listener named to take
-identities as told that is none of the three. Those listeners are a set,
-said in the listeners' own order however the value was written: a reorder
-rolls no pod. With the election on the Lease is named,
+shutdownSettleSeconds is null) and a listener named to take identities as
+told that is none of the three: the schema names it first, and the helper
+does where the schema's check is skipped. Those listeners are a set, said
+in the listeners' own order however the value was written: a reorder rolls
+no pod. With the election on the Lease is named,
 and the pod's own address, which the kubelet writes in place of $(POD_IP):
 the holder of the Lease is named by an address the others can dial.
 */}}
@@ -1084,8 +1099,17 @@ the holder of the Lease is named by an address the others can dial.
 {{- end -}}
 {{- $elected := include "smg.policyControllerElection" . -}}
 {{- $told := list -}}
+{{- $named := $controller.identityAsTold | default list -}}
+{{- if not (kindIs "slice" $named) -}}
+{{- fail (printf "policyController.identityAsTold is %v: a list of listeners' names (gateway, control, replication)" $named) -}}
+{{- end -}}
+{{- range $name := $named -}}
+{{- if not (has $name (list "gateway" "control" "replication")) -}}
+{{- fail (printf "policyController.identityAsTold names %v, none of the chart's listeners (gateway, control, replication)" $name) -}}
+{{- end -}}
+{{- end -}}
 {{- range $listener := list "gateway" "control" "replication" -}}
-{{- if has $listener ($controller.identityAsTold | default list) -}}
+{{- if has $listener $named -}}
 {{- $told = append $told $listener -}}
 {{- end -}}
 {{- end -}}
