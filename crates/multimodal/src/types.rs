@@ -1001,8 +1001,6 @@ mod tests {
                     );
                     return;
                 }
-                // Each bound names itself in the panic, so a red run says
-                // which one fired.
                 // The quiet window runs from just after the read that last
                 // saw progress to just before the current read, so the span
                 // it judges is never longer than the span between the two:
