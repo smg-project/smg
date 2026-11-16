@@ -84,6 +84,15 @@ pub enum Error {
     /// welcome.
     #[error("the session answered the hello with no welcome: {0}")]
     NoWelcome(String),
+    /// The welcome came under a term below the client's floor. A gateway
+    /// rejects a frame below its floor, so the session is not taken.
+    #[error("the welcome's term {term} is below the floor {floor}")]
+    BelowFloor {
+        /// The term the welcome came under.
+        term: u64,
+        /// The floor the hello stated.
+        floor: u64,
+    },
     /// The blocking form could not build its runtime.
     #[error("no runtime for the blocking client: {0}")]
     Runtime(#[source] std::io::Error),
@@ -138,7 +147,9 @@ struct Session {
 impl Session {
     /// Opens the stream with the hello as its first frame and takes the
     /// welcome: the call's answer and its first frame must come within
-    /// `wait`. Returns the session and the term its welcome came under.
+    /// `wait`. Returns the session and the term its welcome came under. A
+    /// welcome under a term below `floor` is refused: the contract has a
+    /// gateway reject a frame below its floor.
     async fn open(
         stub: &mut Stub,
         gateway_id: &str,
@@ -164,7 +175,7 @@ impl Session {
                 term,
                 frame: Some(controller_frame::Frame::Welcome(welcome)),
                 ..
-            }) => Ok((
+            }) if term >= floor => Ok((
                 Self {
                     frames,
                     answers,
@@ -172,6 +183,11 @@ impl Session {
                 },
                 term,
             )),
+            Some(ControllerFrame {
+                term,
+                frame: Some(controller_frame::Frame::Welcome(_)),
+                ..
+            }) => Err(Error::BelowFloor { term, floor }),
             Some(ControllerFrame {
                 frame: Some(controller_frame::Frame::NotLeader(not_leader)),
                 ..
@@ -246,7 +262,8 @@ impl Client {
     /// time-outs, or none) as the gateway `gateway_id`, takes its term floor
     /// from the replica's `Leader` answer and opens the gateway's session.
     /// An id no metadata entry carries is refused before the dial; a replica
-    /// that does not lead is [`Error::NotLeader`]. No wait for the replica
+    /// that does not lead is [`Error::NotLeader`]; a welcome under a term
+    /// below the floor is [`Error::BelowFloor`]. No wait for the replica
     /// outlasts [`ANSWER_WAIT`]: a dial, a `Leader` ask or a welcome that
     /// would is [`Error::NoAnswer`].
     pub async fn connect_with(endpoint: Endpoint, gateway_id: &str) -> Result<Self, Error> {
@@ -311,6 +328,8 @@ impl Client {
 
 /// The client for a caller that runs no runtime.
 pub mod blocking {
+    use std::future::Future;
+
     use tokio::runtime::{Builder, Runtime};
     use tonic::transport::Endpoint;
 
@@ -320,7 +339,8 @@ pub mod blocking {
     /// [`super::Client`] driven to each call's end on a runtime of its own.
     /// It holds no protocol: every call is the async client's. The runtime
     /// is this client's alone, so a call, and the drop, must come from a
-    /// thread that runs no runtime.
+    /// thread that runs no runtime. The drop of a connected client waits
+    /// for a name lookup that runtime still runs.
     #[derive(Debug)]
     pub struct Client {
         runtime: Runtime,
@@ -330,16 +350,29 @@ pub mod blocking {
     impl Client {
         /// [`super::Client::connect`].
         pub fn connect(address: &str, gateway_id: &str) -> Result<Self, Error> {
-            let runtime = runtime()?;
-            let inner = runtime.block_on(super::Client::connect(address, gateway_id))?;
-            Ok(Self { runtime, inner })
+            Self::driven(super::Client::connect(address, gateway_id))
         }
 
         /// [`super::Client::connect_with`].
         pub fn connect_with(endpoint: Endpoint, gateway_id: &str) -> Result<Self, Error> {
+            Self::driven(super::Client::connect_with(endpoint, gateway_id))
+        }
+
+        /// Drives `connect` to its end on a runtime of the client's own. A
+        /// connect that fails shuts that runtime down without waiting for
+        /// it: a dial's name lookup runs on a thread no bound ends, and a
+        /// drop that waited for it would hold the caller past the bound.
+        pub(super) fn driven(
+            connect: impl Future<Output = Result<super::Client, Error>>,
+        ) -> Result<Self, Error> {
             let runtime = runtime()?;
-            let inner = runtime.block_on(super::Client::connect_with(endpoint, gateway_id))?;
-            Ok(Self { runtime, inner })
+            match runtime.block_on(connect) {
+                Ok(inner) => Ok(Self { runtime, inner }),
+                Err(error) => {
+                    runtime.shutdown_background();
+                    Err(error)
+                }
+            }
         }
 
         /// [`super::Client::leader`].
@@ -385,6 +418,7 @@ mod tests {
         response::Response,
         Router,
     };
+    use prost::Message as _;
     use tokio::{net::TcpListener, task::JoinSet, time::timeout};
     use tonic::{
         codegen::tokio_stream::{once, pending, StreamExt},
@@ -394,8 +428,9 @@ mod tests {
     };
 
     use super::{
-        blocking, gateway_frame, hello, Client, Error, PolicyControllerClient, Principal, Session,
-        Stub, ANSWER_WAIT, PRINCIPAL_ENTRY, PROTOCOL_VERSION,
+        blocking, controller_frame, gateway_frame, hello, Client, ControllerFrame, Error,
+        PolicyControllerClient, Principal, Session, Stub, Welcome, ANSWER_WAIT, PRINCIPAL_ENTRY,
+        PROTOCOL_VERSION,
     };
 
     /// The bound a case gives a wait it wants ended.
@@ -480,6 +515,23 @@ mod tests {
     /// length: five zeros) that never ends.
     fn one_message() -> Body {
         let message = once(Ok::<_, Infallible>(Bytes::from_static(&[0; 5])));
+        Body::from_stream(message.chain(pending()))
+    }
+
+    /// An answer of headers and one frame, a welcome under `term`, that
+    /// never ends.
+    fn welcome_under(term: u64) -> Body {
+        let frame = ControllerFrame {
+            term,
+            frame: Some(controller_frame::Frame::Welcome(Welcome::default())),
+            ..ControllerFrame::default()
+        };
+        // A message on the wire: its flag, its length, its bytes.
+        let length = u32::try_from(frame.encoded_len()).expect("a short frame");
+        let mut message = vec![0];
+        message.extend(length.to_be_bytes());
+        message.extend(frame.encode_to_vec());
+        let message = once(Ok::<_, Infallible>(Bytes::from(message)));
         Body::from_stream(message.chain(pending()))
     }
 
@@ -615,6 +667,58 @@ mod tests {
             matches!(&opened, Err(Error::NoWelcome(why)) if why.contains("frame: None")),
             "{opened:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_welcome_under_a_term_below_the_floor_is_refused() {
+        let (address, _serving) = answering(|| welcome_under(6)).await;
+        let mut stub = stub(address).await;
+        let opened = Session::open(&mut stub, "gateway-1", 7, ROOM).await;
+        assert!(
+            matches!(opened, Err(Error::BelowFloor { term: 6, floor: 7 })),
+            "{opened:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_welcome_under_the_floors_own_term_opens_the_session() {
+        let (address, _serving) = answering(|| welcome_under(7)).await;
+        let mut stub = stub(address).await;
+        let opened = Session::open(&mut stub, "gateway-1", 7, ROOM).await;
+        assert!(matches!(opened, Ok((_, 7))), "{opened:?}");
+    }
+
+    #[tokio::test]
+    async fn a_welcome_under_a_term_above_the_floor_opens_the_session() {
+        let (address, _serving) = answering(|| welcome_under(8)).await;
+        let mut stub = stub(address).await;
+        let opened = Session::open(&mut stub, "gateway-1", 7, ROOM).await;
+        assert!(matches!(opened, Ok((_, 8))), "{opened:?}");
+    }
+
+    #[test]
+    fn a_blocking_connect_that_fails_does_not_wait_for_a_lookup_it_started() {
+        // The dial starts a blocking task, as a connector's name lookup is
+        // one, and never ends. The task runs until the case lets it go.
+        let (release, held) = mpsc::channel::<()>();
+        let (told, ended) = mpsc::channel();
+        let connecting = std::thread::spawn(move || {
+            let dial = async move {
+                let _lookup = tokio::task::spawn_blocking(move || held.recv());
+                std::future::pending().await
+            };
+            let ended = blocking::Client::driven(Client::over(dial, "gateway-1", SHORT));
+            told.send(ended.map(|_| ()))
+        });
+        let ended = ended
+            .recv_timeout(ROOM)
+            .expect("a failed connect returns while its lookup still runs");
+        assert!(ran_out(&ended, "the dial", SHORT), "{ended:?}");
+        drop(release);
+        connecting
+            .join()
+            .expect("the connecting thread ends")
+            .expect("the case took the connect's end");
     }
 
     #[test]
