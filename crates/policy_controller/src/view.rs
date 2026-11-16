@@ -319,6 +319,89 @@ pub struct AffinityFacts {
     pub indexed_blocks: u32,
 }
 
+/// What a host that names rows feeds a decision in place of the affinity
+/// column: the rows that hold a leading part of the request and the pool's
+/// warming rows, as indices into the candidate slice the decision is made
+/// over. A host that derives them where it writes hands these and no
+/// column, so nothing of the pool's length is filled for a decision. Both
+/// lists are the host's to keep ascending by row and under the candidates'
+/// count: a debug build asserts it where a decision takes its inputs, and a
+/// release build reads them as they stand. In-process only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NamedAffinity<'a> {
+    /// The rows that hold a leading part of the request, ascending by row,
+    /// each with what it holds. A row not named reads as holding nothing.
+    pub holders: &'a [NamedHolder],
+    /// The pool's warming rows, ascending, by the warm-up stage's rule as
+    /// the host applied it: the thin whatever the fleet's age, else the
+    /// young unless every row is young.
+    pub warming: &'a [u32],
+    /// The warming rows are the thin.
+    pub thin: bool,
+}
+
+/// One row a host names as a holder: what the row's entry of a column says
+/// of what it holds, by both readings. Its age and its index size stay with
+/// the host, which ruled the warming rows from them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NamedHolder {
+    /// The row's index in the candidate slice.
+    pub row: u32,
+    /// As [`AffinityFacts::overlap_blocks`].
+    pub overlap_blocks: u32,
+    /// As [`AffinityFacts::predicted_blocks`].
+    pub predicted_blocks: u32,
+}
+
+impl NamedAffinity<'_> {
+    /// Row `index`'s entry: what the host said the row holds when it is
+    /// named, nothing held otherwise.
+    #[inline]
+    pub(crate) fn entry(&self, index: u32) -> AffinityFacts {
+        let Ok(at) = self
+            .holders
+            .binary_search_by_key(&index, |holder| holder.row)
+        else {
+            return AffinityFacts::default();
+        };
+        let holder = self.holders[at];
+        AffinityFacts {
+            overlap_blocks: holder.overlap_blocks,
+            predicted_blocks: holder.predicted_blocks,
+            ..AffinityFacts::default()
+        }
+    }
+}
+
+/// What a pass reads of what the candidates hold, taken once
+/// ([`RequestFacts::feed`]): the host's column, or the rows it named in the
+/// column's place.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Feed<'a> {
+    Column(&'a [AffinityFacts]),
+    Named(NamedAffinity<'a>),
+}
+
+impl Feed<'_> {
+    /// Nobody holds anything: an empty column, or no holder named.
+    pub(crate) fn is_empty(self) -> bool {
+        match self {
+            Self::Column(column) => column.is_empty(),
+            Self::Named(named) => named.holders.is_empty(),
+        }
+    }
+
+    /// Row `index`'s entry: a column's own, where an index past the end
+    /// fails, or a named row's ([`NamedAffinity::entry`]).
+    #[inline]
+    pub(crate) fn entry(self, index: u32) -> AffinityFacts {
+        match self {
+            Self::Column(column) => column[index as usize],
+            Self::Named(named) => named.entry(index),
+        }
+    }
+}
+
 /// One candidate row: a worker, or one DP rank of a data-parallel worker:
 /// what every decision reads. Its fields take 103 bytes, and the row is
 /// aligned to a 64-byte cache line: 128 bytes in memory, every row on a
@@ -493,6 +576,11 @@ pub struct RequestFacts<'a> {
     /// the candidates, until the decision is committed. In-process only: a
     /// wire carries each candidate's facts in its record.
     pub affinity: &'a [AffinityFacts],
+    /// The rows the host names in that column's place ([`NamedAffinity`]):
+    /// beside an empty column, the affinity stages read them. A pair
+    /// decision takes none: its sides read their pools' columns. In-process
+    /// only.
+    pub named: Option<NamedAffinity<'a>>,
     /// The fingerprint of `model` when the host holds it, as a host that
     /// keeps its models makes it once a model; [`ModelFingerprint::NONE`]
     /// when it does not, and each read of [`RequestFacts::session`] then
@@ -520,21 +608,45 @@ const fn session_phase(phase: Phase) -> u64 {
     }
 }
 
-impl RequestFacts<'_> {
+impl<'a> RequestFacts<'a> {
+    /// The rows the host named, where they answer: beside an empty column.
+    /// The column is asked first, so a host that fills one pays nothing for
+    /// the rows it does not name.
+    #[inline(always)]
+    pub(crate) fn named_alone(&self) -> Option<NamedAffinity<'a>> {
+        if self.affinity.is_empty() {
+            self.named
+        } else {
+            None
+        }
+    }
+
+    /// What the candidates hold as the host fed this decision: the rows it
+    /// named where they answer, else its column. A pass takes it once.
+    pub(crate) fn feed(&self) -> Feed<'a> {
+        match self.named_alone() {
+            Some(named) => Feed::Named(named),
+            None => Feed::Column(self.affinity),
+        }
+    }
+
     /// The affinity facts of the candidate at `index` of the slice the
     /// decision is made over. An empty column reads as nothing held for
     /// every candidate. Any other column holds the candidate's own entry,
     /// and the read is that entry: an index past its end is a host's
     /// mistake and fails as an index past the candidates does, never as a
-    /// default in the entry's place. Each read tests the column's emptiness
-    /// and its bound: a pass over a pool takes the column once
+    /// default in the entry's place. Where the host named rows in the
+    /// column's place ([`NamedAffinity`]), a named row reads what the host
+    /// said it holds and every other row nothing held. Each read tests the
+    /// feed and its bound: a pass over a pool takes the column once
     /// ([`RequestFacts::affinity`]) and walks it beside the rows, as this
     /// crate's stages and its packed plugin fill do.
     pub fn affinity_at(&self, index: u32) -> AffinityFacts {
-        if self.affinity.is_empty() {
+        let feed = self.feed();
+        if feed.is_empty() {
             AffinityFacts::default()
         } else {
-            self.affinity[index as usize]
+            feed.entry(index)
         }
     }
 
@@ -732,6 +844,59 @@ mod tests {
             ..RequestFacts::default()
         };
         let _ = facts.affinity_at(1);
+    }
+
+    /// Rows named in the column's place read through the same accessor: a
+    /// named row reads what the host said it holds, by both readings, and
+    /// every other row nothing held. Beside a column the column is read.
+    #[test]
+    fn rows_named_in_the_columns_place_read_what_each_holds() {
+        let holders = [
+            NamedHolder {
+                row: 1,
+                overlap_blocks: 9,
+                predicted_blocks: 0,
+            },
+            NamedHolder {
+                row: 4,
+                overlap_blocks: 3,
+                predicted_blocks: 7,
+            },
+        ];
+        let facts = RequestFacts {
+            named: Some(NamedAffinity {
+                holders: &holders,
+                ..NamedAffinity::default()
+            }),
+            ..RequestFacts::default()
+        };
+        let read = [0, 1, 2, 4, 511].map(|index| {
+            let held = facts.affinity_at(index);
+            (held.overlap_blocks, held.predicted_blocks)
+        });
+        assert_eq!(read, [(0, 0), (9, 0), (0, 0), (3, 7), (0, 0)]);
+        let nobody = RequestFacts {
+            named: Some(NamedAffinity::default()),
+            ..RequestFacts::default()
+        };
+        assert_eq!(nobody.affinity_at(3), AffinityFacts::default());
+        assert_eq!(
+            RequestFacts::default().affinity_at(1),
+            AffinityFacts::default()
+        );
+        // Beside a column the column is read.
+        let column = [
+            AffinityFacts::default(),
+            AffinityFacts {
+                overlap_blocks: 3,
+                ..AffinityFacts::default()
+            },
+        ];
+        let beside = RequestFacts {
+            affinity: &column,
+            ..facts
+        };
+        assert_eq!(beside.affinity_at(1).overlap_blocks, 3);
     }
 
     #[test]

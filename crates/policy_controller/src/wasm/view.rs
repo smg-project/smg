@@ -11,7 +11,7 @@ use crate::{
     decision::{Decision, Target, MAX_TARGETS},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
     view::{
-        AffinityFacts, Candidate, HashKind, Health, Identity, LoadRow, OverloadRegime, Phase,
+        AffinityFacts, Candidate, Feed, HashKind, Health, Identity, LoadRow, OverloadRegime, Phase,
         PoolFacts, RequestFacts, Role, SignalSource, WireModes, ZoneCapacity,
     },
 };
@@ -746,16 +746,27 @@ impl Packed {
         // fill 2.5 ns a row at 512 candidates. An empty column is nothing
         // held by any candidate. Any other holds one entry a candidate, and
         // one that ends before the candidates fails here, as an index past
-        // its end does.
-        if facts.affinity.is_empty() {
-            let nothing = AffinityFacts::default();
-            for (c, row) in candidates.iter().zip(rows) {
-                Self::fill_row(row, c, nothing);
+        // its end does. Rows the host named in the column's place are read
+        // by index: a holder's row carries its two depths, and every row
+        // reads its age, growth and index size as zero, so a host fills
+        // the column for a profile whose guest reads those.
+        match facts.feed() {
+            feed if feed.is_empty() => {
+                let nothing = AffinityFacts::default();
+                for (c, row) in candidates.iter().zip(rows) {
+                    Self::fill_row(row, c, nothing);
+                }
             }
-        } else {
-            let column = &facts.affinity[..candidates.len()];
-            for ((c, held), row) in candidates.iter().zip(column).zip(rows) {
-                Self::fill_row(row, c, *held);
+            Feed::Column(column) => {
+                let column = &column[..candidates.len()];
+                for ((c, held), row) in candidates.iter().zip(column).zip(rows) {
+                    Self::fill_row(row, c, *held);
+                }
+            }
+            Feed::Named(named) => {
+                for ((index, c), row) in (0u32..).zip(candidates).zip(rows) {
+                    Self::fill_row(row, c, named.entry(index));
+                }
             }
         }
     }
@@ -981,7 +992,7 @@ pub(crate) fn signal(s: &Signal, now_micros: u64) -> wit::Signal {
 mod tests {
     use super::{layout::*, *};
     use crate::{
-        view::{Header, MediaCounts, WorkerId},
+        view::{Header, MediaCounts, NamedAffinity, NamedHolder, WorkerId},
         wasm::config::HeaderSet,
     };
 
@@ -1116,6 +1127,43 @@ mod tests {
         };
         assert_eq!(held(&records.candidates[0]), (0, 0, 0, 0, 0));
         assert_eq!(held(&records.candidates[1]), (17, 18, 21, 22, 26));
+    }
+
+    /// Rows a host named in the column's place reach a guest as a column
+    /// would, on the record form and the packed one: a holder's row carries
+    /// its depth and every other row nothing.
+    #[test]
+    fn both_fills_give_a_named_holder_its_depth_and_every_other_row_nothing() {
+        let facts = RequestFacts {
+            named: Some(NamedAffinity {
+                holders: &[NamedHolder {
+                    row: 1,
+                    overlap_blocks: 17,
+                    predicted_blocks: 0,
+                }],
+                ..NamedAffinity::default()
+            }),
+            ..RequestFacts::default()
+        };
+        let rows = [Candidate::default(), candidate_row(), Candidate::default()];
+        let mut records = Records::default();
+        records.fill(&facts, &rows, &PoolFacts::default());
+        let record: Vec<u32> = records
+            .candidates
+            .iter()
+            .map(|r| r.overlap_blocks)
+            .collect();
+        assert_eq!(record, vec![0, 17, 0]);
+        let mut packed = Packed::default();
+        packed.fill_candidates(&facts, &rows);
+        let packed: Vec<u32> = packed
+            .candidates
+            .as_chunks::<ROW>()
+            .0
+            .iter()
+            .map(|row| le_u32(row, ROW_OVERLAP))
+            .collect();
+        assert_eq!(packed, vec![0, 17, 0]);
     }
 
     #[test]
@@ -1264,8 +1312,10 @@ mod tests {
             seed: 9,
             block_size: 16,
             now_micros: 0,
-            // Host-only: the request block carries no affinity column.
+            // Host-only: the request block carries no affinity column and
+            // no rows named in its place.
             affinity: &[],
+            named: None,
         };
         let exposure = Exposure {
             tenant: Reveal::Plain,
