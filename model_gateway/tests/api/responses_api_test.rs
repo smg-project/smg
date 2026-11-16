@@ -4,9 +4,10 @@ use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode};
 use openai_protocol::{
     common::{GenerationRequest, UsageInfo},
     responses::{
-        CodeInterpreterTool, McpTool, ReasoningEffort, RequireApproval, RequireApprovalMode,
-        ResponseContentPart, ResponseInput, ResponseReasoningParam, ResponseTool, ResponsesRequest,
-        ResponsesToolChoice, ServiceTier, ToolChoiceOptions, Truncation, WebSearchPreviewTool,
+        CodeInterpreterTool, McpAllowedTools, McpTool, ReasoningEffort, RequireApproval,
+        RequireApprovalMode, ResponseContentPart, ResponseInput, ResponseReasoningParam,
+        ResponseTool, ResponsesRequest, ResponsesToolChoice, ServiceTier, ToolChoiceOptions,
+        Truncation, WebSearchPreviewTool,
     },
 };
 use smg::{
@@ -513,6 +514,84 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
             .all(|entry| entry.get("type") != Some(&serde_json::Value::String("mcp_call".into()))),
         "response should interrupt before emitting mcp_call"
     );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+/// One server under two labels: each tool is attributed to one of them, and
+/// the approval the other label asks for still holds the call.
+#[tokio::test]
+async fn test_non_streaming_mcp_approval_holds_for_a_tool_listed_under_another_label() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let url = mcp.url();
+    let mcp_yaml = format!("servers:\n  - name: mock\n    protocol: streamable\n    url: {url}\n");
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+    let router_cfg = worker_router_config(worker_url);
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let label = |server_label: &str, narrow: bool, asks: bool| {
+        ResponseTool::Mcp(McpTool {
+            server_url: Some(url.clone()),
+            authorization: None,
+            headers: None,
+            server_label: server_label.to_string(),
+            server_description: None,
+            require_approval: asks.then_some(RequireApproval::Mode(RequireApprovalMode::Always)),
+            allowed_tools: narrow
+                .then(|| McpAllowedTools::List(vec!["brave_web_search".to_string()])),
+            connector_id: None,
+            defer_loading: None,
+        })
+    };
+    let mut seen = Vec::new();
+    for tools in [
+        vec![label("conf", false, false), label("conf-b", true, true)],
+        vec![label("conf-b", true, false), label("conf", false, true)],
+    ] {
+        let req = ResponsesRequest {
+            input: ResponseInput::Text("search something".to_string()),
+            model: "mock-model".to_string(),
+            store: Some(true),
+            stream: Some(false),
+            tools: Some(tools),
+            ..Default::default()
+        };
+        let resp = router
+            .route_responses(None, &test_tenant_meta(), req.clone(), req.model.as_str())
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("the response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+        let types: Vec<String> = body["output"]
+            .as_array()
+            .expect("the output items")
+            .iter()
+            .filter_map(|item| item["type"].as_str().map(str::to_string))
+            .collect();
+        seen.push(types);
+    }
+    for types in &seen {
+        assert!(
+            types.iter().any(|t| t == "mcp_approval_request")
+                && !types.iter().any(|t| t == "mcp_call"),
+            "each order waits for the approval before the call: {seen:?}"
+        );
+    }
 
     worker.stop().await;
     mcp.stop().await;
