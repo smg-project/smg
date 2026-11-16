@@ -109,7 +109,9 @@ def warmup_inputs(
     if args.disaggregation_mode != "null":
         # The engine's own warm-up convention for a disaggregation role: a
         # request bound for this host is a transfer to nobody on either side.
-        from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+        from smg_grpc_servicer.sglang.compat import get_disaggregation_types
+
+        _, FAKE_BOOTSTRAP_HOST = get_disaggregation_types()
 
         lone_leg_bootstrap = FAKE_BOOTSTRAP_HOST
     ranks = args.scheduler_count

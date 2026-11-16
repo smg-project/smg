@@ -51,7 +51,9 @@ impl Scheme {
     }
 
     /// Match a scheme prefix case-insensitively, returning it and the rest.
-    fn split_from(input: &str) -> Option<(Scheme, &str)> {
+    /// An address has a scheme when it starts with one of these, and has
+    /// none otherwise: a `://` further in is part of what follows.
+    pub(crate) fn split_from(input: &str) -> Option<(Scheme, &str)> {
         const SCHEMES: [Scheme; 6] = [
             Scheme::Http,
             Scheme::Https,
@@ -375,6 +377,16 @@ impl Endpoint {
     /// token.
     pub fn has_credentials(&self) -> bool {
         self.userinfo.is_some()
+    }
+
+    /// Whether the userinfo holds a character `ends` takes. The worker URL
+    /// door asks with the characters at which a URL client ends an
+    /// authority: the userinfo here runs to the last `@` before the path,
+    /// which starts behind a bracketed host, so it may run past one of them.
+    pub fn userinfo_holds(&self, ends: impl Fn(char) -> bool) -> bool {
+        self.userinfo
+            .as_deref()
+            .is_some_and(|userinfo| userinfo.contains(ends))
     }
 
     /// The address without its userinfo: what is written where an address

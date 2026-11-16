@@ -99,6 +99,7 @@ async fn a_client_that_leaves_while_the_engine_is_parked_ends_the_iteration_at_o
         None,
         None,
         &[],
+        None,
     );
     let (outcome, saw_text) = tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(read, read_then_leave(rx, Duration::from_millis(100)))
@@ -139,6 +140,7 @@ async fn a_client_that_left_before_the_first_read_reads_nothing() {
         None,
         None,
         &[],
+        None,
     )
     .await;
     let Err(error) = outcome else {
@@ -180,6 +182,7 @@ async fn a_client_that_stays_reads_the_answer_to_its_end() {
             None,
             None,
             &[],
+            None,
         )
         .await;
         drop(tx);

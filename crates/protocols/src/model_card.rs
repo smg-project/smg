@@ -43,7 +43,7 @@ fn default_model_type() -> ModelType {
 /// assert!(card.model_type.supports_vision());
 /// assert!(card.provider.is_none()); // Local model, no external provider
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ModelCard {
     // === Identity ===
     /// Primary model ID (e.g., "meta-llama/Llama-3.1-8B-Instruct")

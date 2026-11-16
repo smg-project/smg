@@ -666,7 +666,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
             worker.record_outcome(502);
             return (
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to forward request to OpenAI: {err}"),
+                format!("Failed to forward request to OpenAI: {}", err.without_url()),
             )
                 .into_response();
         }
@@ -677,10 +677,9 @@ pub(super) async fn handle_simple_streaming_passthrough(
     worker.record_outcome(status.as_u16());
 
     if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|err| format!("Failed to read upstream error body: {err}"));
+        let error_body = response.text().await.unwrap_or_else(|err| {
+            format!("Failed to read upstream error body: {}", err.without_url())
+        });
         let error_body = error::sanitize_error_body(&error_body);
         return (status, error_body).into_response();
     }
@@ -1266,7 +1265,7 @@ pub(super) fn handle_streaming_with_tool_interception(
 
 /// Main entry point for streaming responses
 pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
-    use crate::mcp_utils::{ensure_request_mcp_client, request_uses_mcp_routing};
+    use crate::mcp_utils::{ensure_request_mcp_routing, request_uses_mcp_routing};
 
     let worker = match ctx.worker() {
         Some(w) => w.clone(),
@@ -1299,9 +1298,10 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
                 );
             };
             let registry = registry.clone();
-            ensure_request_mcp_client(&mcp_orchestrator, &registry, tools)
-                .await
-                .map(|servers| (servers, mcp_orchestrator, registry))
+            match ensure_request_mcp_routing(&mcp_orchestrator, &registry, tools).await {
+                Ok(servers) => servers.map(|servers| (servers, mcp_orchestrator, registry)),
+                Err(refusal) => return refusal,
+            }
         }
         _ => None,
     };
@@ -1607,6 +1607,84 @@ mod tests {
             .expect("the routed-worker header");
         assert!(!header.contains("secret"), "{header}");
         assert_eq!(header, format!("http://***@127.0.0.1:{port}"));
+    }
+
+    /// A streamed forward nothing answers: the caller's 502 says why without
+    /// the worker's address. The HTTP client's own error text ends with the
+    /// request URL.
+    #[tokio::test]
+    async fn a_failed_streamed_forward_answers_without_the_workers_address() {
+        use axum::http::StatusCode;
+
+        use crate::test_support::{text_of, RefusedAddress};
+
+        let refused = RefusedAddress::reserve();
+
+        let response = streamed_answer_from(&format!("http://{}", refused.addr())).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = text_of(response).await;
+        assert!(!body.contains(&refused.addr().to_string()), "{body}");
+    }
+
+    /// A refusal whose body is lost mid-answer: the caller's answer says so
+    /// without the worker's address. The HTTP client's text of a failed body
+    /// read ends with the request URL.
+    #[tokio::test]
+    async fn an_unread_refusal_is_answered_without_the_workers_address() {
+        use axum::http::StatusCode;
+
+        use crate::test_support::{answering, text_of};
+
+        let addr = answering(500, "short", true).await;
+
+        let response = streamed_answer_from(&format!("http://{addr}")).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = text_of(response).await;
+        assert!(
+            body.contains("Failed to read upstream error body"),
+            "{body}"
+        );
+        assert!(!body.contains(&addr.to_string()), "{body}");
+    }
+
+    /// The plain streaming path's answer to a streamed request for the worker
+    /// at `worker_url`, over empty stores.
+    async fn streamed_answer_from(worker_url: &str) -> Response {
+        use std::sync::Arc;
+
+        use openai_protocol::responses::ResponsesRequest;
+        use serde_json::json;
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        };
+
+        use crate::{
+            openai::context::StorageHandles,
+            test_support::{http_client, StubWorker},
+        };
+
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
+                .expect("a request");
+        let req = StreamingRequest {
+            url: format!("{worker_url}/v1/responses"),
+            payload: json!({}),
+            original_body: request,
+            previous_response_id: None,
+            existing_mcp_list_tools_labels: Vec::new(),
+            storage: StorageHandles {
+                response: Arc::new(MemoryResponseStorage::new()),
+                conversation: Arc::new(MemoryConversationStorage::new()),
+                conversation_item: Arc::new(MemoryConversationItemStorage::new()),
+                request_context: None,
+                tenant: None,
+            },
+        };
+
+        handle_simple_streaming_passthrough(&http_client(), &StubWorker::at(worker_url), None, req)
+            .await
     }
 
     /// A header the upstream sent more than once reaches the client of a

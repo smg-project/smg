@@ -875,15 +875,17 @@ async fn wait_until(deadline: tokio::time::Instant, what: &str, done: impl Fn() 
 
 /// Registers `worker` demoted under the running manager and waits for the
 /// registration's probe to read the health stub (`hits`), which is held:
-/// the worker is still demoted once that read has landed.
+/// the worker is still demoted once that read has landed. Returns the
+/// instant read before the registration: the manager's schedule for the
+/// worker runs from the launch of that probe, not from its answer.
 async fn registered_and_held(
     registry: &WorkerRegistry,
     worker: &Arc<dyn Worker>,
     hits: &AtomicUsize,
-) {
+) -> tokio::time::Instant {
     worker.set_status(WorkerStatus::NotReady);
-    registry.register(worker.clone()).unwrap();
     let registered = tokio::time::Instant::now();
+    registry.register(worker.clone()).unwrap();
     wait_until(
         registered + Duration::from_secs(5),
         "the registration's probe did not read the health in time",
@@ -891,6 +893,7 @@ async fn registered_and_held(
     )
     .await;
     assert_eq!(worker.status(), WorkerStatus::NotReady);
+    registered
 }
 
 /// Through the running loop, against a `/health` that is held: the probe
@@ -976,20 +979,24 @@ async fn a_demoted_worker_returns_on_consecutive_reads_not_consecutive_intervals
 
     // Registered under the running manager: probed at once, and held.
     let worker = probed_worker_with(&url, ConnectionMode::Http, 2, 3);
-    registered_and_held(&registry, &worker, &hits).await;
+    let registered = registered_and_held(&registry, &worker, &hits).await;
 
-    // The engine is back; the next probe is a whole interval away.
+    // The engine is back; the next probe is an interval after the
+    // registration's, however long the held read took.
     serving.store(true, Ordering::SeqCst);
-    let back = tokio::time::Instant::now();
+    // The return is due 4 s after the registration. The deadline leaves
+    // 1.5 s for the launch lag and the two later round trips, which took
+    // under 0.1 s of it under load, and still ends before the 6 s of two
+    // whole intervals, the return this test rules out.
     wait_until(
-        back + Duration::from_millis(5500),
+        registered + Duration::from_millis(5500),
         "the worker did not return within one interval and a probe timeout",
         || worker.status() == WorkerStatus::Ready,
     )
     .await;
     let returned = tokio::time::Instant::now();
     assert!(
-        returned >= back + Duration::from_millis(3500),
+        returned >= registered + Duration::from_millis(3500),
         "the first passing read was the scheduled one, an interval after the launch, and the \
          promoting read a probe timeout after it"
     );
@@ -1017,19 +1024,18 @@ async fn a_brought_forward_read_never_lands_after_the_scheduled_one() {
     let mut manager = manager_over(&registry);
 
     let worker = probed_worker_with_timeout(&url, ConnectionMode::Http, 2, 2, 5);
-    registered_and_held(&registry, &worker, &hits).await;
+    let registered = registered_and_held(&registry, &worker, &hits).await;
 
     serving.store(true, Ordering::SeqCst);
-    let back = tokio::time::Instant::now();
     wait_until(
-        back + Duration::from_millis(5500),
+        registered + Duration::from_millis(5500),
         "the worker did not return within two intervals: the brought-forward read landed \
          after the scheduled one",
         || worker.status() == WorkerStatus::Ready,
     )
     .await;
     assert!(
-        tokio::time::Instant::now() >= back + Duration::from_millis(3500),
+        tokio::time::Instant::now() >= registered + Duration::from_millis(3500),
         "the scheduled pass an interval after the launch, the promoting read an interval later"
     );
     assert_eq!(
@@ -1772,11 +1778,14 @@ fn test_state_machine_pending_to_ready_after_success_threshold() {
     assert_eq!(worker.status(), WorkerStatus::Pending);
 
     // First success: not yet promoted (1 < 2)
-    assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
+    assert_eq!(
+        compute_next_status(&worker, worker.runtime_state().as_deref(), true, &cfg(2, 3)),
+        None
+    );
     assert_eq!(worker.status(), WorkerStatus::Pending);
 
     // Second success: promoted Pending → Ready
-    let next = compute_next_status(&worker, true, &cfg(2, 3));
+    let next = compute_next_status(&worker, worker.runtime_state().as_deref(), true, &cfg(2, 3));
     assert_eq!(next, Some(WorkerStatus::Ready));
 }
 
@@ -1786,13 +1795,34 @@ fn test_state_machine_ready_to_notready_after_failure_threshold() {
     worker.set_status(WorkerStatus::Ready);
 
     // 1 fail, 2 fail: still Ready
-    assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
-    assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+    assert_eq!(
+        compute_next_status(
+            &worker,
+            worker.runtime_state().as_deref(),
+            false,
+            &cfg(2, 3)
+        ),
+        None
+    );
+    assert_eq!(
+        compute_next_status(
+            &worker,
+            worker.runtime_state().as_deref(),
+            false,
+            &cfg(2, 3)
+        ),
+        None
+    );
     assert_eq!(worker.status(), WorkerStatus::Ready);
 
     // 3rd fail: Ready → NotReady
     assert_eq!(
-        compute_next_status(&worker, false, &cfg(2, 3)),
+        compute_next_status(
+            &worker,
+            worker.runtime_state().as_deref(),
+            false,
+            &cfg(2, 3)
+        ),
         Some(WorkerStatus::NotReady)
     );
 }
@@ -1805,7 +1835,12 @@ fn test_state_machine_notready_to_failed_after_liveness_threshold() {
     // liveness_threshold = 3 × failure_threshold = 9
     for i in 1..9 {
         assert_eq!(
-            compute_next_status(&worker, false, &cfg(2, 3)),
+            compute_next_status(
+                &worker,
+                worker.runtime_state().as_deref(),
+                false,
+                &cfg(2, 3)
+            ),
             None,
             "iteration {i}"
         );
@@ -1813,7 +1848,12 @@ fn test_state_machine_notready_to_failed_after_liveness_threshold() {
 
     // 9th consecutive failure → Failed
     assert_eq!(
-        compute_next_status(&worker, false, &cfg(2, 3)),
+        compute_next_status(
+            &worker,
+            worker.runtime_state().as_deref(),
+            false,
+            &cfg(2, 3)
+        ),
         Some(WorkerStatus::Failed)
     );
 }
@@ -1826,13 +1866,32 @@ fn test_state_machine_pending_to_failed_after_max_pending_probes() {
     // Simulate 30 failed probes — increment counter manually since the
     // loop usually does this before calling compute_next_status.
     for _ in 0..29 {
-        worker.total_pending_probes_increment();
-        assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+        worker
+            .runtime_state()
+            .unwrap()
+            .total_pending_probes_increment();
+        assert_eq!(
+            compute_next_status(
+                &worker,
+                worker.runtime_state().as_deref(),
+                false,
+                &cfg(2, 3)
+            ),
+            None
+        );
     }
-    worker.total_pending_probes_increment();
+    worker
+        .runtime_state()
+        .unwrap()
+        .total_pending_probes_increment();
     // 30th: Pending → Failed
     assert_eq!(
-        compute_next_status(&worker, false, &cfg(2, 3)),
+        compute_next_status(
+            &worker,
+            worker.runtime_state().as_deref(),
+            false,
+            &cfg(2, 3)
+        ),
         Some(WorkerStatus::Failed)
     );
 }
@@ -1845,13 +1904,40 @@ fn test_state_machine_pending_to_failed_on_success_when_cap_exceeded() {
 
     // Simulate 30 attempts with the counter, then call compute on success.
     for _ in 0..30 {
-        worker.total_pending_probes_increment();
+        worker
+            .runtime_state()
+            .unwrap()
+            .total_pending_probes_increment();
     }
     // Even on success, the cap fires.
     assert_eq!(
-        compute_next_status(&worker, true, &cfg(2, 3)),
+        compute_next_status(&worker, worker.runtime_state().as_deref(), true, &cfg(2, 3)),
         Some(WorkerStatus::Failed)
     );
+}
+
+/// A worker that keeps no state has no probe counted on it, so the Pending
+/// cap reads no pending probe for it: the verdict leaves it Pending on a
+/// passing probe and on a failing one, however many it was sent.
+#[test]
+fn the_pending_cap_reads_no_pending_probe_for_a_worker_with_no_state() {
+    let worker = make_worker("http://w:1", 2, 3);
+    assert_eq!(worker.status(), WorkerStatus::Pending);
+    // The worker's own state is past the cap; the verdict is handed none.
+    for _ in 0..30 {
+        worker
+            .runtime_state()
+            .unwrap()
+            .total_pending_probes_increment();
+    }
+    for probe_ok in [true, false] {
+        assert_eq!(
+            compute_next_status(&worker, None, probe_ok, &cfg(2, 3)),
+            None,
+            "probe_ok {probe_ok}"
+        );
+    }
+    assert_eq!(worker.status(), WorkerStatus::Pending);
 }
 
 #[test]
@@ -1860,15 +1946,26 @@ fn test_state_machine_failed_recovers_after_success_threshold() {
     worker.set_status(WorkerStatus::Failed);
 
     // Failures keep it Failed.
-    assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+    assert_eq!(
+        compute_next_status(
+            &worker,
+            worker.runtime_state().as_deref(),
+            false,
+            &cfg(2, 3)
+        ),
+        None
+    );
     assert_eq!(worker.status(), WorkerStatus::Failed);
 
     // The engine came back on the same address: success_threshold
     // consecutive successes promote it exactly like NotReady, because a
     // static fleet has no other way to rejoin.
-    assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
     assert_eq!(
-        compute_next_status(&worker, true, &cfg(2, 3)),
+        compute_next_status(&worker, worker.runtime_state().as_deref(), true, &cfg(2, 3)),
+        None
+    );
+    assert_eq!(
+        compute_next_status(&worker, worker.runtime_state().as_deref(), true, &cfg(2, 3)),
         Some(WorkerStatus::Ready)
     );
 }
@@ -1878,9 +1975,12 @@ fn test_state_machine_notready_to_ready_on_success_threshold() {
     let worker = make_worker("http://w:1", 2, 3);
     worker.set_status(WorkerStatus::NotReady);
 
-    assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
     assert_eq!(
-        compute_next_status(&worker, true, &cfg(2, 3)),
+        compute_next_status(&worker, worker.runtime_state().as_deref(), true, &cfg(2, 3)),
+        None
+    );
+    assert_eq!(
+        compute_next_status(&worker, worker.runtime_state().as_deref(), true, &cfg(2, 3)),
         Some(WorkerStatus::Ready)
     );
 }
@@ -1891,20 +1991,60 @@ fn test_state_machine_success_resets_failure_counter() {
     worker.set_status(WorkerStatus::Ready);
 
     // 2 failures (not yet at threshold)
-    assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
-    assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+    assert_eq!(
+        compute_next_status(
+            &worker,
+            worker.runtime_state().as_deref(),
+            false,
+            &cfg(2, 3)
+        ),
+        None
+    );
+    assert_eq!(
+        compute_next_status(
+            &worker,
+            worker.runtime_state().as_deref(),
+            false,
+            &cfg(2, 3)
+        ),
+        None
+    );
 
     // Single success resets the counter
-    assert_eq!(compute_next_status(&worker, true, &cfg(2, 3)), None);
+    assert_eq!(
+        compute_next_status(&worker, worker.runtime_state().as_deref(), true, &cfg(2, 3)),
+        None
+    );
 
     // Now 2 failures again — still no transition because counter was reset
-    assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
-    assert_eq!(compute_next_status(&worker, false, &cfg(2, 3)), None);
+    assert_eq!(
+        compute_next_status(
+            &worker,
+            worker.runtime_state().as_deref(),
+            false,
+            &cfg(2, 3)
+        ),
+        None
+    );
+    assert_eq!(
+        compute_next_status(
+            &worker,
+            worker.runtime_state().as_deref(),
+            false,
+            &cfg(2, 3)
+        ),
+        None
+    );
     assert_eq!(worker.status(), WorkerStatus::Ready);
 
     // 3rd failure now triggers transition
     assert_eq!(
-        compute_next_status(&worker, false, &cfg(2, 3)),
+        compute_next_status(
+            &worker,
+            worker.runtime_state().as_deref(),
+            false,
+            &cfg(2, 3)
+        ),
         Some(WorkerStatus::NotReady)
     );
 }
@@ -2165,6 +2305,45 @@ async fn test_worker_manager_start_is_deterministic_with_preexisting_workers() {
         None,
     );
     manager.shutdown().await;
+}
+
+/// A worker that never passes a probe leaves `Pending` through its probes'
+/// own count: every completion of a probe launched while it was pending
+/// adds one, and the cap (ten times the failure threshold) fails it.
+/// Nothing else adds to that count, so a completion that did not would
+/// leave such a worker pending for good.
+#[tokio::test]
+async fn a_pending_worker_that_never_passes_fails_at_the_cap_through_its_probes_own_count() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = make_worker("http://w:1", 2, 1);
+    let worker_id = registry.register(worker.clone()).unwrap();
+    assert_eq!(worker.status(), WorkerStatus::Pending);
+    let failed_probe = || ProbeCompletion {
+        worker_id: worker_id.clone(),
+        worker: worker.clone(),
+        expected_revision: worker.revision(),
+        launched_status: WorkerStatus::Pending,
+        probe_result: Err(WorkerError::HealthCheckFailed {
+            url: worker.url().to_string(),
+            reason: "refused".to_string(),
+        }),
+    };
+
+    // A failure threshold of one: the cap is ten probes.
+    for probe in 1..10 {
+        let applied = apply_probe_completion(&registry, failed_probe(), None, None).await;
+        assert!(
+            matches!(applied, ProbeApplyResult::Applied(None)),
+            "probe {probe} of ten leaves it pending"
+        );
+        assert_eq!(worker.status(), WorkerStatus::Pending);
+    }
+    let applied = apply_probe_completion(&registry, failed_probe(), None, None).await;
+    assert!(matches!(
+        applied,
+        ProbeApplyResult::Applied(Some((WorkerStatus::Pending, WorkerStatus::Failed)))
+    ));
+    assert_eq!(worker.status(), WorkerStatus::Failed);
 }
 
 #[tokio::test]
@@ -2431,6 +2610,39 @@ fn fleet_loads_with_no_polled_workers_has_no_aggregate() {
     assert_eq!(body.dp_rank_count, 0);
     assert!(body.loads.is_empty());
     assert!(body.aggregate.is_none());
+}
+
+/// The fleet's loads are answered on a public route: a worker registered
+/// with a password and a token in its query is named by its masked address,
+/// one with nothing to mask by the address as registered, byte for byte: its
+/// trailing slash stays, where the parsed rendering drops it.
+#[test]
+fn fleet_loads_names_a_worker_by_its_masked_address() {
+    let registry = WorkerRegistry::new();
+    let with_secrets = "http://user:s3cret@w:1/?token=s3cret";
+    let plain = "http://w:2/";
+    registry.register(make_worker(with_secrets, 1, 1)).unwrap();
+    registry.register(make_worker(plain, 1, 1)).unwrap();
+    let snapshot = LoadSnapshot::from_loads_for_test(vec![
+        (with_secrets.to_string(), load_report(&[(0, 4, 1, 0.25)])),
+        (plain.to_string(), load_report(&[(0, 2, 0, 0.5)])),
+    ]);
+
+    let body = WorkerManager::fleet_loads(&registry, &snapshot, None);
+
+    let answered = serde_json::to_string(&body).expect("the answer as JSON");
+    assert!(
+        !answered.contains("s3cret"),
+        "the answer carries the secret: {answered}"
+    );
+    let named: Vec<_> = body
+        .loads
+        .iter()
+        .filter_map(|rank| rank.worker.as_deref())
+        .collect();
+    assert_eq!(named.len(), 2, "{named:?}");
+    assert!(named[0].starts_with("http://***@w:1"), "{named:?}");
+    assert_eq!(named[1], plain);
 }
 
 /// A fleet where one worker's admin endpoint fails: both calls count the failed worker in

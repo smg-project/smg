@@ -37,6 +37,7 @@ use crate::{
             utils::{Names, ALIASES},
         },
     },
+    server::http_client_builder,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
         connection::http_client::{
@@ -704,7 +705,7 @@ impl AppContextBuilder {
         }
 
         let make_builder = || {
-            let mut client_builder = crate::server::http_client_builder()
+            let mut client_builder = http_client_builder()
                 .pool_idle_timeout(pool_idle_timeout)
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))
@@ -1554,17 +1555,19 @@ pub(crate) mod testing {
         config::RouterConfig,
         middleware::{AuthConfig, TokenBucket},
         observability::inflight_tracker::InFlightRequestTracker,
+        policies::PolicyRegistry,
         routers::{
             common::{openai_bridge, realtime::RealtimeRegistry},
             grpc::multimodal::MultimodalConfigRegistry,
         },
-        worker::{WorkerRegistry, WorkerService},
+        server::http_client,
+        worker::{WorkerHttpClientCache, WorkerRegistry, WorkerService},
     };
 
     /// An `AppContext` over `router_config` and `worker_registry`: in-memory
     /// storage, a generous rate limiter, no gateway, worker monitor or WASM
-    /// manager, the policy registry the configuration's policy and routing-key
-    /// override select, the given tool parsers (a parser override is validated
+    /// manager, the policy registry the configuration's policy, routing-key
+    /// override and pairing mode select, the given tool parsers (a parser override is validated
     /// against them when they are given), and an uninitialized worker job
     /// queue: submitted jobs are accepted and queued but never processed, so a
     /// test observes what a step or a pass submits without spawning workflow
@@ -1578,16 +1581,19 @@ pub(crate) mod testing {
 
         Arc::new(AppContext {
             gateway_auth: AuthConfig::new(None),
-            client: crate::server::http_client(),
+            client: http_client(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
             worker_registry: Arc::clone(&worker_registry),
             prefill_admission: None,
-            policy_registry: Arc::new(crate::policies::PolicyRegistry::with_override(
-                router_config.policy.clone(),
-                router_config.routing_key_override.clone(),
-            )),
+            policy_registry: Arc::new(
+                PolicyRegistry::with_override(
+                    router_config.policy.clone(),
+                    router_config.routing_key_override.clone(),
+                )
+                .with_pd_pairing_mode(router_config.pd_pairing_mode),
+            ),
             reasoning_parser_factory: None,
             tool_parser_factory,
             gateway: None,
@@ -1608,9 +1614,7 @@ pub(crate) mod testing {
             tokenizer_load_failures: Arc::default(),
             worker_loaded_tokenizers: Arc::default(),
             wasm_manager: None,
-            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
-                &router_config,
-            )),
+            worker_client_cache: Arc::new(WorkerHttpClientCache::new(&router_config)),
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,
                 job_queue,

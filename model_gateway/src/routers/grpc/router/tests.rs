@@ -29,7 +29,10 @@ use crate::{
     routers::grpc::{
         common::stages::RateLimitOutcome,
         test_engine::serve_on_loopback,
-        testing::{grpc_config, grpc_ctx, grpc_ctx_from, grpc_ctx_with_parsers, mcp_orchestrator},
+        testing::{
+            grpc_config, grpc_ctx, grpc_ctx_from, grpc_ctx_over_stores, grpc_ctx_with_parsers,
+            mcp_orchestrator,
+        },
     },
     tenant::TenantKey,
     worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType},
@@ -268,6 +271,75 @@ async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
         assert_eq!(body["error"]["code"], code, "{runtime}: {body}");
         if let Some(message) = message {
             assert_eq!(body["error"]["message"], message, "{runtime}: {body}");
+        }
+    }
+}
+
+/// count_tokens judges media of a model without a media spec by the template
+/// the count renders through, as `/v1/messages` does: the one for requests
+/// with tools when the request declares tools, the default one otherwise.
+#[tokio::test]
+async fn count_tokens_media_without_a_spec_is_judged_by_the_template_the_count_renders_through() {
+    use llm_tokenizer::{chat_template::ChatTemplateContentFormat, mock::MockTokenizer};
+
+    use crate::routers::grpc::regular::stages::testing::components_forwarding_media_of;
+
+    let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+    for (default, with_tools) in [
+        (
+            ChatTemplateContentFormat::String,
+            ChatTemplateContentFormat::OpenAI,
+        ),
+        (
+            ChatTemplateContentFormat::OpenAI,
+            ChatTemplateContentFormat::String,
+        ),
+    ] {
+        let tokenizer = MockTokenizer::new()
+            .with_deferred_chat_ids(vec![11, 12, 13])
+            .with_content_format(default)
+            .with_tool_content_format(with_tools);
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        ctx.worker_registry
+            .register(grpc_worker_for_m_on(None))
+            .expect("register worker");
+        let mut router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let (_dir, components) = components_forwarding_media_of("m", Arc::new(tokenizer)).await;
+        router.shared_components = components;
+        for (declares_tools, format) in [(true, with_tools), (false, default)] {
+            let mut body = json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "What colour is this pixel?"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                    }}
+                ]}]
+            });
+            if declares_tools {
+                body["tools"] = json!([{
+                    "name": "lookup", "description": "Look a thing up",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]);
+            }
+            let request: CountMessageTokensRequest =
+                serde_json::from_value(body).expect("count request");
+            let response = router
+                .route_messages_count_tokens(None, &tenant_meta, request, "m")
+                .await;
+            if format == ChatTemplateContentFormat::String {
+                assert_eq!(
+                    error::extract_error_code_from_response(&response),
+                    "multimodal_not_supported",
+                    "declares tools: {declares_tools}"
+                );
+            } else {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "declares tools: {declares_tools}"
+                );
+            }
         }
     }
 }
@@ -1836,4 +1908,152 @@ fn max_tokens_zero_records_the_requests_media_and_count_tokens_does_not() {
             );
         });
     });
+}
+
+/// A streamed regular Responses request persists from a task of its own (the
+/// stream's transform), where the middleware's storage-context task-local is
+/// gone: the route hands this request's context on in the `ResponsesContext`,
+/// as the Harmony and the background routes do, and every write of the
+/// persist reaches the store under it. A hook on the stores reads the context
+/// each operation ran under.
+#[tokio::test]
+async fn a_streamed_regular_response_persists_under_the_request_s_storage_context() {
+    use smg_data_connector::{
+        create_storage, with_request_context, BeforeHookResult, ExtraColumns, HistoryBackend,
+        HookError, RequestContext as StorageRequestContext, StorageFactoryConfig, StorageHook,
+        StorageOperation,
+    };
+
+    /// Records the `tenant_id` of the storage context every operation ran
+    /// under.
+    struct ContextRecordingHook {
+        seen: std::sync::Mutex<Vec<(StorageOperation, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl StorageHook for ContextRecordingHook {
+        async fn before(
+            &self,
+            operation: StorageOperation,
+            context: Option<&StorageRequestContext>,
+            _payload: &serde_json::Value,
+        ) -> Result<BeforeHookResult, HookError> {
+            let tenant = context
+                .and_then(|ctx| ctx.get("tenant_id"))
+                .map(str::to_owned);
+            self.seen
+                .lock()
+                .expect("the recorded operations")
+                .push((operation, tenant));
+            Ok(BeforeHookResult::Continue(ExtraColumns::new()))
+        }
+
+        async fn after(
+            &self,
+            _operation: StorageOperation,
+            _context: Option<&StorageRequestContext>,
+            _payload: &serde_json::Value,
+            _result: &serde_json::Value,
+            extra: &ExtraColumns,
+        ) -> Result<ExtraColumns, HookError> {
+            Ok(extra.clone())
+        }
+    }
+
+    let hook = Arc::new(ContextRecordingHook {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let stores = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Memory,
+        oracle: None,
+        postgres: None,
+        redis: None,
+        memory: None,
+        hook: Some(hook.clone()),
+    })
+    .await
+    .expect("the hooked in-memory stores");
+    let ctx = grpc_ctx_over_stores(
+        &grpc_config(regular_routing_mode()).build_unchecked(),
+        mcp_orchestrator().await,
+        stores.response_storage,
+        stores.conversation_storage,
+        stores.conversation_item_storage,
+    );
+    register_tokenizer_for(&ctx, "m", CHAT_TEMPLATE, ("Hello", 100)).await;
+    let port = spawn_engine(vec![100]).await;
+    register_worker(
+        &ctx,
+        &format!("grpc://127.0.0.1:{port}"),
+        WorkerType::Regular,
+        ModelCard::new("m"),
+    );
+    // Built at start-up, outside any request, as the gateway builds it.
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+
+    let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+    let body: ResponsesRequest =
+        serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
+            .expect("responses request");
+    let mut request_context = StorageRequestContext::new();
+    request_context.set("tenant_id", "tenant-1");
+    // The middleware's scope: the request task carries the context; the
+    // stream's transform, spawned from it, does not.
+    let response = with_request_context(
+        request_context,
+        router.route_responses(None, &tenant_meta, body, "m"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the stream");
+    let frames = String::from_utf8_lossy(&bytes);
+    assert!(
+        frames.contains("response.completed"),
+        "the stream did not complete: {frames}"
+    );
+
+    let seen = hook.seen.lock().expect("the recorded operations").clone();
+    assert!(
+        seen.iter().any(|(operation, _)| matches!(
+            operation,
+            StorageOperation::StoreResponse | StorageOperation::CreateItem
+        )),
+        "the stream persisted nothing: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .all(|(_, tenant)| tenant.as_deref() == Some("tenant-1")),
+        "a store operation ran without the request's storage context: {seen:?}"
+    );
+}
+
+/// The router is built at start-up, outside any request: the storage context
+/// its Responses contexts store is `None` by construction, not a read of
+/// whatever task-local happens to cover the constructor. Every Responses
+/// branch derives this request's context in the request task, and the inline
+/// paths run under the middleware's live task-local; a router built inside a
+/// storage-context scope stores none all the same.
+#[tokio::test]
+async fn a_router_built_inside_a_storage_context_scope_stores_no_request_context() {
+    use smg_data_connector::{with_request_context, RequestContext as StorageRequestContext};
+
+    let ctx = grpc_ctx_from(
+        &grpc_config(regular_routing_mode()).build_unchecked(),
+        mcp_orchestrator().await,
+    );
+    let mut scope = StorageRequestContext::new();
+    scope.set("tenant_id", "tenant-1");
+    let router = with_request_context(scope, async { GrpcRouter::new(&ctx, Mode::Regular) })
+        .await
+        .expect("regular router");
+    for context in [&router.responses_context, &router.harmony_responses_context] {
+        let context = context.as_ref().expect("a responses context");
+        assert!(
+            context.request_context.is_none(),
+            "the router stored a construction-time storage context: {:?}",
+            context.request_context
+        );
+    }
 }

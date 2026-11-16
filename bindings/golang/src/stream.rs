@@ -94,17 +94,19 @@ pub unsafe extern "C" fn sgl_stream_read_next(
 
     match chunk_result {
         Some(Ok(proto_response)) => {
+            // Whether this is the complete response (stream done): read before the
+            // message moves out of its box into the converter.
+            let is_complete = matches!(
+                proto_response.response,
+                Some(proto::generate_response::Response::Complete(_))
+            );
             // Convert proto response to OpenAI format
             // We need to get the converter lock first
             let conversion_result = RUNTIME.block_on(async {
                 let mut converter_guard = converter.lock().await;
 
                 let tokenizer = Arc::clone(&converter_guard.tokenizer);
-                convert_proto_chunk_to_openai(
-                    proto_response.clone(),
-                    &mut converter_guard,
-                    &tokenizer,
-                )
+                convert_proto_chunk_to_openai(*proto_response, &mut converter_guard, &tokenizer)
             });
 
             match conversion_result {
@@ -131,12 +133,6 @@ pub unsafe extern "C" fn sgl_stream_read_next(
                             return SglErrorCode::MemoryError;
                         }
                     };
-
-                    // Check if this is a complete response (stream done)
-                    let is_complete = matches!(
-                        proto_response.response,
-                        Some(proto::generate_response::Response::Complete(_))
-                    );
 
                     *response_json_out = result_cstr.into_raw();
                     *is_done_out = if is_complete { 1 } else { 0 };

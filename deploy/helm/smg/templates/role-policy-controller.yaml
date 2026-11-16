@@ -1,0 +1,18 @@
+{{- if and (.Values.policyController).enabled (include "smg.policyControllerElection" .) }}
+{{- /* What the election calls and no more: a read and a replace of the one
+     Lease this chart renders. No create (a create cannot be held to a
+     name: the Lease is the release's object), no list and no watch (the
+     controller polls). */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "smg.policyControllerName" . }}
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: policy-controller
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: [{{ include "smg.policyControllerLeaseName" . | quote }}]
+    verbs: ["get", "update"]
+{{- end }}

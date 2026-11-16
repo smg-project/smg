@@ -43,6 +43,8 @@ def test_explicit_abort_wakes_waiting_consumer(manager, stream, send_fails):  # 
 
 
 def test_repeated_abort_and_late_outputs_queue_one_terminal(manager):  # noqa: F811
+    """Repeated aborts and late generation or embedding outputs cannot double-finish."""
+
     async def scenario():
         task, got = await _handle(manager, "r")
         state = manager.rid_to_state["r"]
@@ -51,10 +53,16 @@ def test_repeated_abort_and_late_outputs_queue_one_terminal(manager):  # noqa: F
         assert [span.ended for span in manager.exporter.spans] == [1]
         await manager.abort_request("r")
         await manager._handle_abort_req(SimpleNamespace(rid="r", finished_reason=None))
-        await manager._handle_batch_output(SimpleNamespace(rids=["r"]))
+        await manager._handle_batch_output(
+            SimpleNamespace(rids=["r"], output_ids=[[1]], prompt_tokens=[1], cached_tokens=[0])
+        )
         await manager._handle_embedding_output(
             SimpleNamespace(
-                rids=["r"], embeddings=[[0.0]], prompt_tokens=[1], finished_reasons=[None]
+                rids=["r"],
+                embeddings=[[0.0]],
+                prompt_tokens=[1],
+                cached_tokens=[0],
+                finished_reasons=[None],
             )
         )
         assert state.out_queue.qsize() == 1

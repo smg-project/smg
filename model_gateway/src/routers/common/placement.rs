@@ -28,8 +28,9 @@ use crate::{
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        as_consistent_hashing, policy_filters_unavailable_workers, CacheNamespace,
-        LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
+        as_consistent_hashing, policy_filters_unavailable_workers, policy_reads_hash_ring,
+        CacheNamespace, LoadBalancingPolicy, NamedList, PolicyRegistry, SelectWorkerInfo,
+        WorkerRole,
     },
     routers::{
         common::{
@@ -128,7 +129,9 @@ pub(crate) struct PlacementInputs<'a> {
     pub cache_namespace: Option<CacheNamespace>,
     /// Extra per-request candidate predicate; a worker it rejects is never
     /// selected (e.g. only workers that process media references themselves,
-    /// or none that already answered this request definitively).
+    /// or none that already answered this request definitively). It is asked
+    /// once a candidate, and while it refuses nobody the selection runs over
+    /// the pool as drawn.
     pub candidate_filter: Option<CandidateFilter<'a>>,
     /// Engines (by base URL) a failed attempt of this request already
     /// dispatched to. A retry skips them while another available candidate
@@ -150,10 +153,122 @@ pub(crate) enum Candidates {
 }
 
 impl Candidates {
+    /// `pool` whole, or its part on `wire` when a retry pins the retained
+    /// plan's runtime and transport.
+    fn of(pool: Arc<[Arc<dyn Worker>]>, wire: Option<WireConstraint>) -> Self {
+        match wire {
+            None => Self::Shared(pool),
+            Some(_) => Self::Pinned(
+                pool.iter()
+                    .filter(|w| WireConstraint::admits(wire, w.as_ref()))
+                    .cloned()
+                    .collect(),
+            ),
+        }
+    }
+
     pub(crate) fn as_slice(&self) -> &[Arc<dyn Worker>] {
         match self {
             Self::Shared(shared) => shared,
             Self::Pinned(pinned) => pinned,
+        }
+    }
+
+    /// The snapshot's own list, when the candidates are that list whole.
+    fn shared(&self) -> Option<&Arc<[Arc<dyn Worker>]>> {
+        match self {
+            Self::Shared(shared) => Some(shared),
+            Self::Pinned(_) => None,
+        }
+    }
+}
+
+/// The candidates of one selection as a part of a list the routing snapshot
+/// owns: each kept worker beside its position in that list. Every narrowing
+/// goes through here, so a position never names another worker than the
+/// handle beside it, and the policy is told which list its candidates are
+/// cut from ([`NamedList`]).
+pub(crate) struct Narrowed<'a> {
+    list: &'a Arc<[Arc<dyn Worker>]>,
+    positions: Vec<usize>,
+    workers: Vec<Arc<dyn Worker>>,
+}
+
+impl<'a> Narrowed<'a> {
+    /// The workers of `list` at `positions`, which ascend: a policy finds a
+    /// candidate by its position, and nothing downstream sorts them.
+    fn at(list: &'a Arc<[Arc<dyn Worker>]>, positions: Vec<usize>) -> Self {
+        debug_assert!(
+            positions.is_sorted_by(|a, b| a < b),
+            "a list's part is named in the list's order"
+        );
+        let workers = positions.iter().map(|&at| Arc::clone(&list[at])).collect();
+        Self {
+            list,
+            positions,
+            workers,
+        }
+    }
+
+    /// The workers of `list` that `keep` accepts, in the list's order.
+    pub(crate) fn of(
+        list: &'a Arc<[Arc<dyn Worker>]>,
+        mut keep: impl FnMut(&Arc<dyn Worker>) -> bool,
+    ) -> Self {
+        // Sized once for the whole list: two allocations a narrowing, however
+        // many workers it keeps.
+        let mut positions = Vec::with_capacity(list.len());
+        let mut workers = Vec::with_capacity(list.len());
+        for (at, worker) in list.iter().enumerate() {
+            if keep(worker) {
+                positions.push(at);
+                workers.push(Arc::clone(worker));
+            }
+        }
+        Self {
+            list,
+            positions,
+            workers,
+        }
+    }
+
+    /// The candidates, in the list's order.
+    pub(crate) fn workers(&self) -> &[Arc<dyn Worker>] {
+        &self.workers
+    }
+
+    /// The position in the list of candidate `candidate`.
+    fn position(&self, candidate: usize) -> usize {
+        self.positions[candidate]
+    }
+
+    /// The candidates as a policy is told of them.
+    fn named(&self) -> NamedList<'_> {
+        NamedList {
+            list: self.list,
+            positions: Some(&self.positions),
+        }
+    }
+
+    /// Keep the candidates `keep` accepts, when it accepts some and refuses
+    /// some; otherwise the candidates stay as they are. `keep` is asked
+    /// once a candidate, the kept ones stay in their order, and nothing is
+    /// allocated.
+    fn narrow_to(&mut self, mut keep: impl FnMut(&dyn Worker) -> bool) {
+        // The kept candidates move to the front, in their order; the others
+        // end up behind them and are cut off only when there is someone to
+        // keep and someone to cut.
+        let mut kept = 0;
+        for at in 0..self.workers.len() {
+            if keep(self.workers[at].as_ref()) {
+                self.workers.swap(kept, at);
+                self.positions.swap(kept, at);
+                kept += 1;
+            }
+        }
+        if kept > 0 && kept < self.workers.len() {
+            self.workers.truncate(kept);
+            self.positions.truncate(kept);
         }
     }
 }
@@ -222,16 +337,7 @@ pub(crate) fn candidates(
     pool: RoutingPool,
     wire: Option<WireConstraint>,
 ) -> Candidates {
-    let pool = registry.get_routing_pool(model_id, pool);
-    match wire {
-        None => Candidates::Shared(pool),
-        Some(_) => Candidates::Pinned(
-            pool.iter()
-                .filter(|w| WireConstraint::admits(wire, w.as_ref()))
-                .cloned()
-                .collect(),
-        ),
-    }
+    Candidates::of(registry.get_routing_pool(model_id, pool), wire)
 }
 
 /// Pick one worker for `model_id` from `pool`, or `None` when nothing is
@@ -245,13 +351,36 @@ pub(crate) fn select_single(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
-    let candidates = candidates(registry, model_id, pool, wire);
-    select_from(registry, policies, model_id, candidates.as_slice(), inputs)
+    let pool = registry.get_routing_pool(model_id, pool);
+    select_single_of(registry, policies, model_id, pool, wire, inputs)
+}
+
+/// [`select_single`] over a pool the caller drew from a snapshot it read
+/// something else from too (the pool's window floor), so that both come from
+/// one membership generation. The pool keeps its name on the way to the
+/// policy, as in [`select_single`].
+pub(crate) fn select_single_of(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    pool: Arc<[Arc<dyn Worker>]>,
+    wire: Option<WireConstraint>,
+    inputs: PlacementInputs<'_>,
+) -> Option<Arc<dyn Worker>> {
+    let candidates = Candidates::of(pool, wire);
+    select_among(
+        registry,
+        policies,
+        model_id,
+        candidates.as_slice(),
+        candidates.shared(),
+        inputs,
+    )
 }
 
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
 /// with a candidate rule the pools cannot express, such as dropping DP-aware
-/// workers from a path that cannot pin a rank.
+/// workers from a path that cannot pin a rank. Nobody names such a list.
 pub(crate) fn select_from(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -259,16 +388,41 @@ pub(crate) fn select_from(
     candidates: &[Arc<dyn Worker>],
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
+    select_among(registry, policies, model_id, candidates, None, inputs)
+}
+
+/// The selection behind both single-worker entries. `whole` is the
+/// snapshot's own list when `candidates` is that list as the registry holds
+/// it: the policy is told the list's name when the candidates reach it as
+/// that list, and reads which workers it was handed once something narrowed
+/// them (a candidate filter that refuses a worker, a policy that needs its
+/// candidates filtered for it, the engines a retry already tried).
+fn select_among(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    candidates: &[Arc<dyn Worker>],
+    whole: Option<&Arc<[Arc<dyn Worker>]>>,
+    inputs: PlacementInputs<'_>,
+) -> Option<Arc<dyn Worker>> {
     let policy = policies.get_policy_or_default(model_id);
 
     // The per-request predicate applies to every entry point, so a caller
-    // that sets it can never dispatch to a worker it rejects.
+    // that sets it can never dispatch to a worker it rejects. Each candidate
+    // is asked once. A predicate that refuses nobody (a media or context
+    // demand every worker meets) leaves the candidates as they were drawn:
+    // nothing is collected, and the pool keeps its name.
+    let refused = inputs.candidate_filter.and_then(|accepts| {
+        let first = candidates.iter().position(|w| !accepts(w.as_ref()))?;
+        Some((accepts, first))
+    });
     let accepted;
-    let candidates: &[Arc<dyn Worker>] = match inputs.candidate_filter {
-        Some(accepts) => {
-            accepted = candidates
+    let candidates: &[Arc<dyn Worker>] = match refused {
+        Some((accepts, first)) => {
+            let (passed, rest) = candidates.split_at(first);
+            accepted = passed
                 .iter()
-                .filter(|w| accepts(w.as_ref()))
+                .chain(rest[1..].iter().filter(|w| accepts(w.as_ref())))
                 .cloned()
                 .collect::<Vec<_>>();
             &accepted
@@ -283,10 +437,15 @@ pub(crate) fn select_from(
         routing_key: policies.sticky_header_key(inputs.headers),
         rid_key: inputs.rid_key,
         cache_namespace: inputs.cache_namespace,
-        // Cached hash ring for consistent hashing (O(log n) lookup).
-        hash_ring: registry.get_hash_ring(model_id),
+        // The cached hash ring (O(log n) lookup), for a policy that reads
+        // it: no other placement pays the registry's keyed read and the
+        // ring's shared count.
+        hash_ring: policy_reads_hash_ring(policy.as_ref())
+            .then(|| registry.get_hash_ring(model_id))
+            .flatten(),
         role: WorkerRole::Single,
         overload_lifted: false,
+        named: None,
     };
     // A request its policy places by session key keeps a regular owner over
     // the overload thresholds (`LoadBalancingPolicy::routes_by_session_key`);
@@ -346,6 +505,15 @@ pub(crate) fn select_from(
     if available.is_empty() {
         return overload_fallback(registry, policy.name(), model_id, candidates);
     }
+    // The name goes with the list itself, read here and nowhere above:
+    // whatever narrowed the candidates handed on a list of its own, at
+    // another address, and nobody names that one.
+    info.named = whole
+        .filter(|list| std::ptr::eq(&list[..], available))
+        .map(|list| NamedList {
+            list,
+            positions: None,
+        });
 
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
@@ -916,28 +1084,27 @@ fn relaxed_pair(
 /// last changed, so this path compares no descriptors. Every pool is judged
 /// live for availability, and a prefill counts only while one of its
 /// partners is available, so the policy's pick can always be paired; `wire`
-/// pins both pools to the retained plan's runtime and transport on a retry;
-/// `homogeneous_runtime` narrows both pools to the runtime of the first
-/// prefill worker open under its own runtime, which the gRPC wire needs
-/// because its rendezvous is runtime-specific. A miss names the role and carries the verdict judged
+/// pins both pools to the retained plan's runtime and transport on a retry.
+/// Where the index's wire is runtime-specific (`PdWire::runtime_specific`),
+/// every prefill open with a partner of its own known runtime is a
+/// candidate, and its decode is drawn from its partners of that runtime; a
+/// pair with a worker whose runtime is unknown is placed only while no such
+/// prefill is open. A miss names the role and carries the verdict judged
 /// from that role's candidates the request may use. A prefill pool whose
 /// policy balances load against cache affinity itself is never steered by
 /// the overload veto, and is placed by that policy even when every worker
 /// in it is over the thresholds. Any other pool whose every worker the
 /// request may use is over them is steered by load as before: a prefill
 /// pool by the least-loaded default ([`relaxed_pair`]), a decode pool to
-/// the least-loaded partner of the prefill its own policy picked.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "pair placement threads every routing input plus the admission view"
-)]
+/// the least-loaded partner of the prefill its own policy picked. Only the
+/// placement by policy puts a pair on one known runtime before a pair with
+/// an unknown one: the default pairs by load over the index's lists, as before.
 pub(crate) fn select_pair(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
     model_id: &str,
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
-    homogeneous_runtime: bool,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
 ) -> Result<Pair, Box<PairFailure>> {
@@ -1019,12 +1186,12 @@ pub(crate) fn select_pair(
     }
 
     // Live state: a prefill is open when it is available and so is one of
-    // its partners, so the policy's pick can always be paired. Where the
-    // wire's rendezvous is runtime-specific, both pools must also share a
-    // runtime: that of the first prefill worker open under its own runtime,
-    // so a prefill whose partners are all down never shuts out a healthy
-    // pair on another runtime. The index keeps runtimes apart already
-    // unless pairing is off or a runtime is unknown.
+    // its partners, so the policy's pick can always be paired. The index
+    // keeps known runtimes apart on a runtime-specific wire in every
+    // pairing mode (`PdWire::mismatch`), so a pair its lists hold on one
+    // known runtime is a pair the wire carries, and the pairs of every
+    // runtime serve. One order is still decided here: a pair on one known
+    // runtime goes before a pair with a worker whose runtime is unknown.
     let partner_open = |d: &Arc<dyn Worker>, runtime: Option<RuntimeType>| {
         eligible(d, lift_decode) && runtime.is_none_or(|r| d.metadata().spec.runtime_type == r)
     };
@@ -1050,40 +1217,29 @@ pub(crate) fn select_pair(
             failure_from(&admitted, model_id, registry.overload_shed_enabled()),
         ));
     }
-    let pair_runtime = homogeneous_runtime
-        .then(|| {
-            pairs.prefill.iter().enumerate().find_map(|(i, p)| {
-                let runtime = p.metadata().spec.runtime_type;
-                (prefill_eligible(p) && can_pair_on(i, Some(runtime))).then_some(runtime)
-            })
-        })
-        .flatten();
-    // One pass: the open prefills on the pair's runtime, counting the
-    // pairable ones the narrowing excluded so the exclusion leaves a trace.
-    let mut excluded = 0usize;
-    let mut open: Vec<usize> = (0..pairs.prefill.len())
-        .filter(|&i| {
-            let p = &pairs.prefill[i];
-            if !prefill_eligible(p) {
-                return false;
+    // The candidates, in one pass. On a runtime-specific wire a prefill
+    // pairs on its own runtime when that runtime is known and one of its
+    // partners on it is open: such prefills are the candidates, whatever
+    // their runtimes. Until the pass meets the first of them every open
+    // prefill stands, with any open partner, and those are the candidates
+    // when it meets none.
+    let runtime_specific = pairs.wire.runtime_specific();
+    let mut on_own_runtime = false;
+    let mut open: Vec<usize> = Vec::new();
+    for (i, p) in pairs.prefill.iter().enumerate() {
+        if !prefill_eligible(p) {
+            continue;
+        }
+        let runtime = p.metadata().spec.runtime_type;
+        if runtime_specific && runtime.is_specified() && can_pair_on(i, Some(runtime)) {
+            if !on_own_runtime {
+                on_own_runtime = true;
+                open.clear();
             }
-            let own = p.metadata().spec.runtime_type;
-            if pair_runtime.is_some_and(|runtime| own != runtime) {
-                if can_pair_on(i, Some(own)) {
-                    excluded += 1;
-                }
-                return false;
-            }
-            can_pair_on(i, pair_runtime)
-        })
-        .collect();
-    if excluded > 0 {
-        warn!(
-            model_id,
-            ?pair_runtime,
-            excluded,
-            "Mixed runtime types in PD workers; pairable prefill workers on another runtime were excluded"
-        );
+            open.push(i);
+        } else if !on_own_runtime && can_pair_on(i, None) {
+            open.push(i);
+        }
     }
     if open.is_empty() {
         // A lifted prefill pool with every worker vetoed had no prefill free
@@ -1128,10 +1284,10 @@ pub(crate) fn select_pair(
             ));
         }
     }
-    let prefill: Vec<Arc<dyn Worker>> = open
-        .iter()
-        .map(|&i| Arc::clone(&pairs.prefill[i]))
-        .collect();
+    // The open prefills as a part of the index's own list: the policy is
+    // told the list, so what it keeps for the pool does not move with the
+    // workers that are open for this request.
+    let prefill = Narrowed::at(&pairs.prefill, open);
     let hash_ring = registry.get_hash_ring(model_id);
     let mut info = SelectWorkerInfo {
         request_text: inputs.text,
@@ -1143,6 +1299,7 @@ pub(crate) fn select_pair(
         hash_ring,
         role: WorkerRole::Prefill,
         overload_lifted: lift_prefill,
+        named: Some(prefill.named()),
     };
     // Both pools were filtered for availability above (a pool the overload
     // veto cannot steer counting as available), so a miss here is the
@@ -1154,7 +1311,7 @@ pub(crate) fn select_pair(
         })
     };
     let Some(prefill_idx) =
-        policies.select_worker_for_model(&prefill_policy, model_id, &prefill, &info)
+        policies.select_worker_for_model(&prefill_policy, model_id, prefill.workers(), &info)
     else {
         // A policy that declines a lifted pool all over the thresholds: the
         // least-loaded default steers it, as it steers any other such pool.
@@ -1174,23 +1331,22 @@ pub(crate) fn select_pair(
         }
         return Err(declined(WorkerRole::Prefill, prefill_policy.name()));
     };
-    let selected_prefill = prefill[prefill_idx].clone();
+    let selected_prefill = prefill.workers()[prefill_idx].clone();
     if prefill_capacity.is_some_and(|capacity| !capacity.has_capacity(&selected_prefill)) {
         return Err(fail(
             WorkerRole::Prefill,
             PlacementFailure::PrefillAtCapacity,
         ));
     }
-    // The pick's open partners: non-empty by construction, short of an
-    // availability flip between the two reads.
-    let mut decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
-        .iter()
-        .filter(|d| partner_open(d, pair_runtime))
-        .cloned()
-        .collect();
-    if decode.is_empty() {
+    // The pick's open partners, as a part of its partner list: non-empty by
+    // construction, short of an availability flip between the two reads.
+    let decode_runtime = on_own_runtime.then(|| selected_prefill.metadata().spec.runtime_type);
+    let mut decode = Narrowed::of(&pairs.partners[prefill.position(prefill_idx)], |d| {
+        partner_open(d, decode_runtime)
+    });
+    if decode.workers().is_empty() {
         debug!(
-            ?pair_runtime,
+            ?decode_runtime,
             "The selected prefill's partners went unavailable"
         );
         return Err(fail(WorkerRole::Decode, PlacementFailure::Unavailable));
@@ -1201,14 +1357,15 @@ pub(crate) fn select_pair(
     // fallback and not as a selection of the decode policy. Any other keeps
     // the veto for its policy.
     let selected_decode = if lift_decode {
-        overload::least_loaded_uniform(decode.iter(), &mut rand::rng())
+        overload::least_loaded_uniform(decode.workers().iter(), &mut rand::rng())
             .cloned()
             .ok_or_else(|| fail(WorkerRole::Decode, PlacementFailure::Unavailable))?
     } else {
         info.role = WorkerRole::Decode;
         info.overload_lifted = false;
-        match policies.select_worker_for_model(&decode_policy, model_id, &decode, &info) {
-            Some(decode_idx) => decode[decode_idx].clone(),
+        info.named = Some(decode.named());
+        match policies.select_worker_for_model(&decode_policy, model_id, decode.workers(), &info) {
+            Some(decode_idx) => decode.workers()[decode_idx].clone(),
             None => return Err(declined(WorkerRole::Decode, decode_policy.name())),
         }
     };
@@ -1271,24 +1428,12 @@ pub(crate) fn select_pair(
 pub(crate) fn retain_decodes_with_a_room(
     decode_policy: &dyn LoadBalancingPolicy,
     headers: Option<&HeaderMap>,
-    decode: &mut Vec<Arc<dyn Worker>>,
+    decode: &mut Narrowed<'_>,
 ) {
     if !admission_prefilters(decode_policy, headers) {
         return;
     }
-    // The candidates with a room move to the front, in their order; the
-    // ones without end up behind them and are cut off only when there is
-    // someone to keep and someone to cut.
-    let mut kept = 0;
-    for at in 0..decode.len() {
-        if pd_admission::has_free_room(decode[at].as_ref()) {
-            decode.swap(kept, at);
-            kept += 1;
-        }
-    }
-    if kept > 0 && kept < decode.len() {
-        decode.truncate(kept);
-    }
+    decode.narrow_to(pd_admission::has_free_room);
 }
 
 #[cfg(test)]
@@ -1310,8 +1455,8 @@ mod tests {
         },
         observability::logging::test_support::test_subscriber,
         policies::{
-            CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy,
-            PowerOfTwoPolicy, RoundRobinPolicy,
+            hash_ring::HashRing, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
+            LeastLoadPolicy, PowerOfTwoPolicy, RoundRobinPolicy,
         },
         worker::{
             load::state::{one_rank_load, TestFeed},
@@ -1362,7 +1507,6 @@ mod tests {
             MODEL,
             &pairs_of(registry, policies),
             None,
-            true,
             None,
             PlacementInputs::default(),
         )
@@ -1392,7 +1536,6 @@ mod tests {
                 MODEL,
                 &pairs,
                 None,
-                true,
                 None,
                 PlacementInputs::default(),
             )
@@ -1496,24 +1639,250 @@ mod tests {
             )
         };
         let policy = RoundRobinPolicy::new();
-        let mut candidates: Vec<Arc<dyn Worker>> =
-            ["grpc://d:1", "grpc://d:2", "grpc://d:3", "grpc://d:4"]
-                .map(decode)
-                .into();
-        assert!(candidates[0].try_admit_pd(1, 1) && candidates[2].try_admit_pd(1, 1));
+        let list: Arc<[Arc<dyn Worker>]> = ["grpc://d:1", "grpc://d:2", "grpc://d:3", "grpc://d:4"]
+            .map(decode)
+            .into();
+        let urls = |candidates: &Narrowed<'_>| -> Vec<String> {
+            candidates
+                .workers()
+                .iter()
+                .map(|d| d.url().to_string())
+                .collect()
+        };
+        let mut candidates = Narrowed::of(&list, |_| true);
+        assert!(list[0].try_admit_pd(1, 1) && list[2].try_admit_pd(1, 1));
         retain_decodes_with_a_room(&policy, None, &mut candidates);
-        let urls: Vec<&str> = candidates.iter().map(|d| d.url()).collect();
-        assert_eq!(urls, ["grpc://d:2", "grpc://d:4"]);
+        assert_eq!(urls(&candidates), ["grpc://d:2", "grpc://d:4"]);
+        // Each kept candidate keeps its own position in the list beside it.
+        assert_eq!(candidates.named().positions, Some(&[1, 3][..]));
 
         // Every candidate full, then every one with a room: the list as it was.
-        assert!(candidates[0].try_admit_pd(1, 1) && candidates[1].try_admit_pd(1, 1));
+        assert!(list[1].try_admit_pd(1, 1) && list[3].try_admit_pd(1, 1));
         retain_decodes_with_a_room(&policy, None, &mut candidates);
-        assert_eq!(candidates.len(), 2, "nothing to keep: the policy's list");
-        candidates[0].release_pd(1);
-        candidates[1].release_pd(1);
+        assert_eq!(
+            candidates.workers().len(),
+            2,
+            "nothing to keep: the policy's list"
+        );
+        list[1].release_pd(1);
+        list[3].release_pd(1);
         retain_decodes_with_a_room(&policy, None, &mut candidates);
-        let urls: Vec<&str> = candidates.iter().map(|d| d.url()).collect();
-        assert_eq!(urls, ["grpc://d:2", "grpc://d:4"], "nothing to cut");
+        assert_eq!(
+            urls(&candidates),
+            ["grpc://d:2", "grpc://d:4"],
+            "nothing to cut"
+        );
+        assert_eq!(candidates.named().positions, Some(&[1, 3][..]));
+    }
+
+    /// What a policy was told of the list its candidates are cut from: the
+    /// role, the positions, and whether each candidate is the list's own
+    /// worker at its position.
+    type Told = (WorkerRole, Option<Vec<usize>>, bool);
+
+    /// A policy that records what it is told, per selection, and takes its
+    /// first candidate.
+    #[derive(Debug, Default)]
+    struct NameRecorder {
+        seen: Mutex<Vec<Told>>,
+    }
+
+    impl LoadBalancingPolicy for NameRecorder {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            let told = info.named.map(|named| {
+                let positions: Vec<usize> = match named.positions {
+                    Some(positions) => positions.to_vec(),
+                    None => (0..named.list.len()).collect(),
+                };
+                let agrees = positions.len() == workers.len()
+                    && positions
+                        .iter()
+                        .zip(workers)
+                        .all(|(&at, worker)| Arc::ptr_eq(&named.list[at], worker));
+                (positions, agrees)
+            });
+            let (positions, agrees) = match told {
+                Some((positions, agrees)) => (Some(positions), agrees),
+                None => (None, false),
+            };
+            self.seen
+                .lock()
+                .unwrap()
+                .push((info.role, positions, agrees));
+            (!workers.is_empty()).then_some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            "name_recorder"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A pair placement tells each role's policy the list its candidates are
+    /// cut from and each candidate's position in it: the index's prefill
+    /// list with the open prefills, the pick's partner list with its open
+    /// partners. A worker that closes leaves the candidates and the
+    /// positions together.
+    #[test]
+    fn a_pair_placement_names_both_sides_with_their_positions() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:3", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let prefill = Arc::new(NameRecorder::default());
+        let decode = Arc::new(NameRecorder::default());
+        policies.set_prefill_policy(prefill.clone());
+        policies.set_decode_policy(decode.clone());
+        let pairs = pairs_of(&registry, &policies);
+        let place = || {
+            select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                None,
+                PlacementInputs::default(),
+            )
+            .map(|_| ())
+        };
+        place().expect("a pair");
+        // The list's first prefill and its first decode close: both open
+        // sets start at position 1.
+        pairs.prefill[0].set_status(WorkerStatus::NotReady);
+        pairs.partners[1][0].set_status(WorkerStatus::NotReady);
+        place().expect("a pair");
+        assert_eq!(
+            *prefill.seen.lock().unwrap(),
+            [
+                (WorkerRole::Prefill, Some(vec![0, 1, 2]), true),
+                (WorkerRole::Prefill, Some(vec![1, 2]), true),
+            ]
+        );
+        assert_eq!(
+            *decode.seen.lock().unwrap(),
+            [
+                (WorkerRole::Decode, Some(vec![0, 1]), true),
+                (WorkerRole::Decode, Some(vec![1]), true),
+            ]
+        );
+    }
+
+    /// The regular entry names the registry's own pool to its policy, so
+    /// the cache-aware policy keeps the pool's one table by the list's
+    /// name, under a candidate filter too while it refuses nobody. A filter
+    /// that refuses a worker and a retry's tried engines hand the policy
+    /// lists of their own, which nobody names: each has a table by its
+    /// workers. The filter is asked once a candidate either way.
+    #[test]
+    fn the_regular_entry_names_its_pool_until_something_narrows_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::policies::{as_cache_aware, test_support::hold_prompt};
+
+        let registry = registry_with(&[
+            ("http://w1:8000", ConnectionMode::Http, RuntimeType::Vllm),
+            ("http://w2:8000", ConnectionMode::Http, RuntimeType::Vllm),
+            ("http://w3:8000", ConnectionMode::Http, RuntimeType::Vllm),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        let pool = registry.get_routing_pool(MODEL, RoutingPool::HttpRegular);
+        assert_eq!(pool.len(), 3);
+        // The pool's first worker holds the prompt in the model's index.
+        let tokens = hold_prompt(&policies, pool[0].as_ref());
+        let default_policy = policies.get_default_policy();
+        let cache_aware = as_cache_aware(default_policy.as_ref()).expect("cache-aware by default");
+        let place = |inputs: PlacementInputs<'_>| {
+            select_single(
+                &registry,
+                &policies,
+                MODEL,
+                RoutingPool::HttpRegular,
+                None,
+                inputs,
+            )
+            .expect("a worker")
+        };
+        let inputs = PlacementInputs {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        assert_eq!(place(inputs).url(), pool[0].url(), "the holder");
+        place(inputs);
+        assert_eq!(
+            cache_aware.kept_tables(),
+            (1, 0),
+            "the pool's one table, by the list's name"
+        );
+        // A filter that refuses nobody (the HTTP router's ledger on a first
+        // attempt) leaves the pool as it was drawn, with its name.
+        let asked = AtomicUsize::new(0);
+        let everyone = |_: &dyn Worker| {
+            asked.fetch_add(1, Ordering::Relaxed);
+            true
+        };
+        let picked = place(PlacementInputs {
+            candidate_filter: Some(&everyone),
+            ..inputs
+        });
+        assert_eq!(picked.url(), pool[0].url(), "the holder, under the filter");
+        assert_eq!(
+            cache_aware.kept_tables(),
+            (1, 0),
+            "a filter that refuses nobody leaves the pool its name"
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), 3, "each candidate once");
+        // A filter that refuses a worker hands the policy a list of its own:
+        // the workers before the refused one and those after it that pass,
+        // each asked once.
+        let (second_url, holder_url) = (pool[1].url().to_string(), pool[0].url().to_string());
+        let not_the_second = |worker: &dyn Worker| {
+            asked.fetch_add(1, Ordering::Relaxed);
+            worker.url() != second_url
+        };
+        let picked = place(PlacementInputs {
+            candidate_filter: Some(&not_the_second),
+            ..inputs
+        });
+        assert_eq!(
+            picked.url(),
+            pool[0].url(),
+            "the holder stands before the refused worker and stays a candidate"
+        );
+        assert_eq!(
+            cache_aware.kept_tables(),
+            (1, 1),
+            "a list a filter narrowed is nobody's"
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), 6, "each candidate once");
+        let not_the_holder = |worker: &dyn Worker| {
+            asked.fetch_add(1, Ordering::Relaxed);
+            worker.url() != holder_url
+        };
+        let picked = place(PlacementInputs {
+            candidate_filter: Some(&not_the_holder),
+            ..inputs
+        });
+        assert_ne!(picked.url(), pool[0].url(), "never the refused worker");
+        assert_eq!(cache_aware.kept_tables(), (1, 2), "nor is the next one");
+        assert_eq!(asked.load(Ordering::Relaxed), 9, "each candidate once");
+        let tried = [pool[2].base_url().to_string()];
+        place(PlacementInputs {
+            tried: &tried,
+            ..inputs
+        });
+        assert_eq!(cache_aware.kept_tables(), (1, 3), "nor is a retry's");
     }
 
     /// An explicit target under consistent hashing indexes the partners the
@@ -1538,7 +1907,6 @@ mod tests {
                 MODEL,
                 &pairs,
                 None,
-                true,
                 None,
                 PlacementInputs {
                     headers: Some(&headers),
@@ -1587,7 +1955,6 @@ mod tests {
                     MODEL,
                     &pairs,
                     None,
-                    true,
                     None,
                     PlacementInputs {
                         tokens: Some(&tokens),
@@ -1687,11 +2054,11 @@ mod tests {
     }
 
     #[test]
-    fn a_homogeneous_pair_skips_a_prefill_whose_only_partner_runs_another_runtime() {
+    fn a_pair_on_one_known_runtime_goes_before_a_pair_with_an_unknown_one() {
         // P1 (NIXL) pairs only with D1, whose runtime probe failed; P2
-        // (Mooncake) pairs with D1 and D2. On the gRPC wire both pools must
-        // share a runtime, so P1 is never open and every placement lands on
-        // P2/D2 instead of failing every other request.
+        // (Mooncake) pairs with D1 and D2. On the gRPC wire a pair on one
+        // known runtime goes first: while P2/D2 is open P1 is no candidate
+        // and D1 no partner, and every placement lands on P2/D2.
         let registry = pd_registry(&[
             ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
             ("grpc://p:2", WorkerType::Prefill, Some("MooncakeConnector")),
@@ -1718,6 +2085,133 @@ mod tests {
             assert_eq!(pair.prefill.url(), "grpc://p:2");
             assert_eq!(pair.decode.url(), "grpc://d:2");
             assert_eq!(pair.runtime, RuntimeType::Vllm);
+        }
+
+        // With D2 down no pair on a known runtime is open, and the pairs
+        // with D1 serve: both prefills take a turn.
+        registry
+            .get_by_url("grpc://d:2")
+            .expect("registered")
+            .set_status(WorkerStatus::NotReady);
+        let mut prefills: Vec<String> = (0..4)
+            .map(|_| {
+                let pair = pair_from(&registry, &policies).expect("D1 pairs with either prefill");
+                assert_eq!(pair.decode.url(), "grpc://d:1");
+                pair.prefill.url().to_string()
+            })
+            .collect();
+        prefills.sort();
+        prefills.dedup();
+        assert_eq!(
+            prefills,
+            ["grpc://p:1", "grpc://p:2"],
+            "P1 and P2 both pair with D1"
+        );
+    }
+
+    /// A fleet with a complete pair on each of two runtimes: both pairs
+    /// serve, under the lenient pairing mode and under off, and no pair
+    /// crosses the runtimes. The selection used to hand every request to
+    /// the runtime of the first open prefill.
+    #[test]
+    fn pairs_on_two_runtimes_both_take_requests() {
+        let registry = registry_of(&[
+            (
+                "grpc://p:vllm",
+                WorkerType::Prefill,
+                ConnectionMode::Grpc,
+                RuntimeType::Vllm,
+            ),
+            (
+                "grpc://p:sglang",
+                WorkerType::Prefill,
+                ConnectionMode::Grpc,
+                RuntimeType::Sglang,
+            ),
+            (
+                "grpc://d:vllm",
+                WorkerType::Decode,
+                ConnectionMode::Grpc,
+                RuntimeType::Vllm,
+            ),
+            (
+                "grpc://d:sglang",
+                WorkerType::Decode,
+                ConnectionMode::Grpc,
+                RuntimeType::Sglang,
+            ),
+        ]);
+        for mode in [PdPairingMode::Lenient, PdPairingMode::Off] {
+            let policies = cohort_policies().with_pd_pairing_mode(mode);
+            let pairs = pairs_of(&registry, &policies);
+            let mut served = BTreeMap::new();
+            for _ in 0..8 {
+                let pair = select_pair(
+                    &registry,
+                    &policies,
+                    MODEL,
+                    &pairs,
+                    None,
+                    None,
+                    PlacementInputs::default(),
+                )
+                .expect("a pair is open");
+                assert_eq!(
+                    pair.decode.metadata().spec.runtime_type,
+                    pair.runtime,
+                    "{mode:?}: a pair is on one runtime"
+                );
+                *served.entry(pair.runtime.as_str()).or_insert(0) += 1;
+            }
+            assert_eq!(
+                served,
+                BTreeMap::from([("sglang", 4), ("vllm", 4)]),
+                "{mode:?}: both pairs serve"
+            );
+        }
+    }
+
+    /// A pair of two workers whose runtimes are unknown waits behind a pair
+    /// on a known runtime, wherever the pool lists it.
+    #[test]
+    fn a_pair_of_unknown_runtimes_waits_behind_a_pair_on_a_known_one() {
+        let unknown = [
+            (
+                "grpc://p:unknown",
+                WorkerType::Prefill,
+                ConnectionMode::Grpc,
+                RuntimeType::Unspecified,
+            ),
+            (
+                "grpc://d:unknown",
+                WorkerType::Decode,
+                ConnectionMode::Grpc,
+                RuntimeType::Unspecified,
+            ),
+        ];
+        let known = [
+            (
+                "grpc://p:vllm",
+                WorkerType::Prefill,
+                ConnectionMode::Grpc,
+                RuntimeType::Vllm,
+            ),
+            (
+                "grpc://d:vllm",
+                WorkerType::Decode,
+                ConnectionMode::Grpc,
+                RuntimeType::Vllm,
+            ),
+        ];
+        // Listed before the known pair, then after it.
+        for listed in [[unknown, known].concat(), [known, unknown].concat()] {
+            let registry = registry_of(&listed);
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            for _ in 0..4 {
+                let pair = pair_from(&registry, &policies).expect("the vLLM pair is open");
+                assert_eq!(pair.prefill.url(), "grpc://p:vllm");
+                assert_eq!(pair.decode.url(), "grpc://d:vllm");
+            }
         }
     }
 
@@ -1797,6 +2291,183 @@ mod tests {
         let off =
             PolicyRegistry::new(PolicyConfig::RoundRobin).with_pd_pairing_mode(PdPairingMode::Off);
         assert!(pair_from(&registry, &off).is_ok());
+    }
+
+    /// A fleet with no pair on one runtime is refused by name under pairing
+    /// off, in the words the lenient mode refuses it with, and the
+    /// least-loaded default has no pair to steer to either once the prefill
+    /// is over the thresholds.
+    #[test]
+    fn pairing_off_refuses_a_fleet_with_no_shared_runtime_by_name() {
+        let registry = registry_of(&[
+            (
+                "grpc://p:1",
+                WorkerType::Prefill,
+                ConnectionMode::Grpc,
+                RuntimeType::Vllm,
+            ),
+            (
+                "grpc://d:1",
+                WorkerType::Decode,
+                ConnectionMode::Grpc,
+                RuntimeType::Sglang,
+            ),
+        ]);
+        let off =
+            PolicyRegistry::new(PolicyConfig::RoundRobin).with_pd_pairing_mode(PdPairingMode::Off);
+        let lenient = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let refused = |policies: &PolicyRegistry, path: &str| {
+            let failure = pair_from(&registry, policies)
+                .err()
+                .unwrap_or_else(|| panic!("{path}: no pair shares a runtime"));
+            assert_eq!(failure.role, WorkerRole::Decode, "{path}");
+            match failure.verdict {
+                PlacementFailure::NoCompatiblePair {
+                    prefill,
+                    decode,
+                    mismatches,
+                } => {
+                    assert_eq!(prefill, ["vllm/?/?"], "{path}");
+                    assert_eq!(decode, ["sglang/?/?"], "{path}");
+                    assert_eq!(mismatches, ["runtime"], "{path}");
+                }
+                _ => panic!("{path}: expected NoCompatiblePair"),
+            }
+        };
+        refused(&lenient, "lenient");
+        refused(&off, "off, the open path");
+
+        let prefill = registry.get_by_url("grpc://p:1").expect("registered");
+        registry.set_worker_overloaded(&prefill, true);
+        refused(&off, "off, the prefill over the thresholds");
+    }
+
+    /// The HTTP wire forwards one body to both sides, so no pair on it has
+    /// to share a runtime: with pairing off a prefill pairs with a decode of
+    /// another runtime, and keeps its turn. The selection reads the wire's
+    /// fact from the index.
+    #[test]
+    fn the_http_wire_does_not_narrow_its_pairs_to_one_runtime() {
+        let registry = registry_of(&[
+            (
+                "http://p:vllm",
+                WorkerType::Prefill,
+                ConnectionMode::Http,
+                RuntimeType::Vllm,
+            ),
+            (
+                "http://p:sglang",
+                WorkerType::Prefill,
+                ConnectionMode::Http,
+                RuntimeType::Sglang,
+            ),
+            (
+                "http://d:vllm",
+                WorkerType::Decode,
+                ConnectionMode::Http,
+                RuntimeType::Vllm,
+            ),
+        ]);
+        let policies = cohort_policies().with_pd_pairing_mode(PdPairingMode::Off);
+        let pairs = registry
+            .get_routing_snapshot(MODEL)
+            .pd_pairs(PdWire::Http, policies.pd_pairing_mode());
+        let mut prefills: Vec<String> = (0..4)
+            .map(|_| {
+                select_pair(
+                    &registry,
+                    &policies,
+                    MODEL,
+                    &pairs,
+                    None,
+                    None,
+                    PlacementInputs::default(),
+                )
+                .map(|pair| pair.prefill.url().to_string())
+                .unwrap_or_default()
+            })
+            .collect();
+        prefills.sort();
+        prefills.dedup();
+        assert_eq!(
+            prefills,
+            ["http://p:sglang", "http://p:vllm"],
+            "both prefills take a turn"
+        );
+    }
+
+    /// With pairing off a prefill of a runtime-specific wire is still listed
+    /// only the decodes of its runtime, and every placement reads that list:
+    /// the open path, and the least-loaded default once the prefill is over
+    /// the thresholds, though the decode on the other runtime is the idle
+    /// one. With its one partner not ready the request has no pair on
+    /// either path; the other runtime's decode is never handed out. Every
+    /// ordered pair of the wire's runtimes is a row.
+    #[test]
+    fn pairing_off_never_pairs_two_known_runtimes_on_either_path() {
+        let runtimes = [
+            RuntimeType::Vllm,
+            RuntimeType::Sglang,
+            RuntimeType::TokenSpeed,
+            RuntimeType::Trtllm,
+            RuntimeType::Mlx,
+        ];
+        for own in runtimes {
+            for other in runtimes.into_iter().filter(|other| *other != own) {
+                let registry = registry_of(&[
+                    (
+                        "grpc://p:own",
+                        WorkerType::Prefill,
+                        ConnectionMode::Grpc,
+                        own,
+                    ),
+                    (
+                        "grpc://d:own",
+                        WorkerType::Decode,
+                        ConnectionMode::Grpc,
+                        own,
+                    ),
+                    (
+                        "grpc://d:other",
+                        WorkerType::Decode,
+                        ConnectionMode::Grpc,
+                        other,
+                    ),
+                ]);
+                let off = PolicyRegistry::new(PolicyConfig::RoundRobin)
+                    .with_pd_pairing_mode(PdPairingMode::Off);
+                let decode_of = |path: &str| {
+                    let pair = pair_from(&registry, &off)
+                        .unwrap_or_else(|_| panic!("{path} pairs ({own:?}, {other:?})"));
+                    assert_eq!(pair.runtime, own, "{path} ({own:?}, {other:?})");
+                    pair.decode.url().to_string()
+                };
+                for _ in 0..4 {
+                    assert_eq!(decode_of("the open path"), "grpc://d:own");
+                }
+
+                let prefill = registry.get_by_url("grpc://p:own").expect("registered");
+                registry.set_worker_overloaded(&prefill, true);
+                let partner = registry.get_by_url("grpc://d:own").expect("registered");
+                for _ in 0..10 {
+                    partner.increment_load();
+                }
+                for _ in 0..4 {
+                    assert_eq!(decode_of("the default"), "grpc://d:own");
+                }
+
+                partner.set_status(WorkerStatus::NotReady);
+                assert!(
+                    pair_from(&registry, &off).is_err(),
+                    "the default has no pair ({own:?}, {other:?})"
+                );
+                registry.set_worker_overloaded(&prefill, false);
+                assert!(
+                    pair_from(&registry, &off).is_err(),
+                    "the open path has no pair ({own:?}, {other:?})"
+                );
+            }
+        }
     }
 
     /// A pair over a pool whose only decode is not ready is the decode
@@ -2007,6 +2678,7 @@ mod tests {
         let pairs = PdPairIndex::build(
             by_type(WorkerType::Prefill).into(),
             by_type(WorkerType::Decode).into(),
+            PdWire::Http,
             policies.pd_pairing_mode(),
         );
 
@@ -2017,7 +2689,6 @@ mod tests {
             MODEL,
             &pairs,
             None,
-            false,
             None,
             PlacementInputs::default(),
         )
@@ -2035,7 +2706,6 @@ mod tests {
                 requires_media_refs: false,
                 pipeline: PipelinePin::Any,
             }),
-            false,
             None,
             PlacementInputs::default(),
         )
@@ -2100,7 +2770,6 @@ mod tests {
                 MODEL,
                 &pairs_of(&registry, &policies),
                 None,
-                true,
                 None,
                 inputs,
             )
@@ -2153,7 +2822,6 @@ mod tests {
                 MODEL,
                 &pairs_of(&registry, &policies),
                 None,
-                true,
                 None,
                 inputs,
             )
@@ -2207,7 +2875,6 @@ mod tests {
             MODEL,
             &pairs_of(&registry, &policies),
             other_wire,
-            true,
             None,
             PlacementInputs {
                 candidate_filter: Some(&only_p1),
@@ -2379,6 +3046,72 @@ mod tests {
             owner.url(),
             "with every worker tried the pool is used whole again"
         );
+    }
+
+    /// A policy that places by the model's hash ring is handed it. Under
+    /// each of the two a keyed request lands where the policy itself puts it
+    /// with the registry's ring in hand, and some key lands elsewhere
+    /// without the ring (consistent hashing then counts the key over the
+    /// list, prefix hash takes the least loaded worker): a placement that
+    /// withheld the ring would move that key.
+    #[test]
+    fn a_policy_that_reads_the_hash_ring_is_handed_it() {
+        let urls: Vec<String> = (1..=8).map(|n| format!("http://h:{n}")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let registry = http_registry(&urls);
+        let ring = registry.get_hash_ring(MODEL).expect("the model's ring");
+        let pool = candidates(&registry, MODEL, RoutingPool::HttpRegular, None);
+        let pool = pool.as_slice();
+        let prefix_hash = PolicyConfig::PrefixHash {
+            prefix_token_count: 256,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries: Vec::new(),
+        };
+        for config in [PolicyConfig::ConsistentHashing, prefix_hash] {
+            let policies = PolicyRegistry::new(config);
+            let policy = policies.get_policy_or_default(MODEL);
+            let mut moved_without_the_ring = 0;
+            for session in 0..32 {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "x-smg-routing-key",
+                    format!("session-{session}").parse().unwrap(),
+                );
+                let own_pick = |hash_ring: Option<Arc<HashRing>>| {
+                    let info = SelectWorkerInfo {
+                        headers: Some(&headers),
+                        routing_key: policies.sticky_header_key(Some(&headers)),
+                        hash_ring,
+                        ..Default::default()
+                    };
+                    policy
+                        .select_worker(pool, &info)
+                        .map(|idx| pool[idx].url().to_string())
+                };
+                let with_the_ring = own_pick(Some(Arc::clone(&ring)));
+                let placed = pick(
+                    &registry,
+                    &policies,
+                    PlacementInputs {
+                        headers: Some(&headers),
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(
+                    Some(placed.url().to_string()),
+                    with_the_ring,
+                    "{} places session {session} by the ring",
+                    policy.name()
+                );
+                moved_without_the_ring += usize::from(own_pick(None) != with_the_ring);
+            }
+            assert!(
+                moved_without_the_ring > 0,
+                "{}: no key of the 32 tells a withheld ring",
+                policy.name()
+            );
+        }
     }
 
     /// Cache-aware routing pins a prompt to the worker holding its prefix;
@@ -2956,7 +3689,6 @@ mod tests {
             MODEL,
             &pairs_of(registry, policies),
             None,
-            true,
             None,
             PlacementInputs {
                 tokens: Some(tokens),

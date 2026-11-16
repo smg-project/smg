@@ -15,7 +15,6 @@ use async_trait::async_trait;
 pub use openai_protocol::worker::{ConnectionMode, ProfileOptions, RuntimeType, WorkerType};
 use openai_protocol::{
     model_card::ModelCard,
-    model_type::Endpoint,
     worker::{ProviderType, WorkerInfo, WorkerModels, WorkerStatus},
 };
 use smg_grpc_client::common_proto;
@@ -37,8 +36,8 @@ use crate::{
     worker::{
         connection::{
             engine_admin::{
-                admin_backend_client, admin_grpc_result, admin_http_post, FLUSH_HTTP_TIMEOUT,
-                PROFILE_HTTP_TIMEOUT,
+                admin_backend_client, admin_grpc_result, admin_http_post, failed,
+                FLUSH_HTTP_TIMEOUT, PROFILE_HTTP_TIMEOUT,
             },
             http_client::LazyHttpClient,
         },
@@ -233,17 +232,28 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         false
     }
 
-    /// The runtime a stream of this worker notes its progress on, captured
-    /// once at the stream's start (see `TrackedStream`): the shared
-    /// [`WorkerRuntime`] every handle of the worker reaches, so the runtime's
-    /// own millisecond rule decides every note. `None` for a worker without
-    /// one, whose streams note through [`Self::note_token_progress_at`].
+    /// The worker's own state, for the code that owns a concern: the health
+    /// probes, the liveness watch, the load collectors and the pair path read
+    /// and write it here, each taking it once at the top of a pass, and a
+    /// stream captures it once at its start (see `TrackedStream`) to note its
+    /// progress on. It is the shared [`WorkerRuntime`] every handle of the
+    /// worker reaches. `None` for a worker that keeps none: it has no probe
+    /// counts, no contact or progress age and no tracked load, and the code
+    /// that asks reads zero for each.
     ///
-    /// A stream keeps noting the runtime it captured, so a worker's runtime
-    /// is not swapped once the worker can take a stream: the one swap,
-    /// [`Self::inherit_shared_state_from`], runs on a replacement before the
-    /// registry publishes it.
-    fn liveness_runtime(&self) -> Option<Arc<WorkerRuntime>> {
+    /// A dispatch takes it here too, once at its booking. The request's place
+    /// in the pile and its prompt's prefill are noted on the state the
+    /// booking took (see `DispatchBooking`), and its output on the state its
+    /// stream captured, each at its start and at its end, so an end lands
+    /// where its start did. A worker that returns its state has its
+    /// dispatches counted on it, and one that keeps none has none counted.
+    ///
+    /// A handle taken at a pass's top is the worker's state for the whole
+    /// pass, and a stream keeps noting the state it captured, because a
+    /// worker's state is not swapped once the worker can take a stream: the
+    /// one swap, [`Self::inherit_shared_state_from`], runs on a replacement
+    /// before the registry publishes it.
+    fn runtime_state(&self) -> Option<Arc<WorkerRuntime>> {
         None
     }
 
@@ -257,34 +267,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Perform an async health check on the worker.
     ///
-    /// Pure probe — does not mutate worker status, does not increment
-    /// counters beyond `consecutive_*` totals exposed via the accessors
-    /// below. The state machine lives in `WorkerManager`, which reads the
-    /// counters and applies transitions via `WorkerRegistry::transition_status()`.
+    /// Pure probe — does not mutate worker status and keeps no count of its
+    /// outcomes. The state machine lives in `WorkerManager`, which counts
+    /// them on the worker's state (see [`Self::runtime_state`]) and applies
+    /// transitions via `WorkerRegistry::transition_status()`.
     async fn check_health_async(&self) -> WorkerResult<()>;
-
-    // ── Health check counter accessors (used by WorkerManager state machine) ──
-
-    /// Increment `consecutive_failures` and return the new value.
-    fn consecutive_failures_increment(&self) -> usize;
-
-    /// Reset `consecutive_failures` to 0.
-    fn consecutive_failures_reset(&self);
-
-    /// Increment `consecutive_successes` and return the new value.
-    fn consecutive_successes_increment(&self) -> usize;
-
-    /// Reset `consecutive_successes` to 0.
-    fn consecutive_successes_reset(&self);
-
-    /// Read `total_pending_probes` (lifetime probe attempts in Pending state).
-    fn total_pending_probes(&self) -> usize;
-
-    /// Increment `total_pending_probes` and return the new value.
-    fn total_pending_probes_increment(&self) -> usize;
-
-    /// Reset `total_pending_probes` to 0 (called when promoting Pending → Ready).
-    fn total_pending_probes_reset(&self);
 
     /// Get the current load (number of active requests)
     fn load(&self) -> usize;
@@ -478,16 +465,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.is_healthy() && !self.is_overloaded() && self.stall_reason().is_none()
     }
 
-    /// Publish the worker's routing state as the `smg_worker_state` series:
-    /// 1 on the state and reason the routing decision reads now, 0 on the
-    /// pair it left; nothing when the pair did not move. Called where a fact
-    /// of the decision moves (the status, the overload veto, the liveness
-    /// veto, the circuit breaker). A no-op for a worker without the series.
-    fn publish_state(&self) {}
-
-    /// [`Self::publish_state`] for an address whose series were dropped and
-    /// come back (a registration): the current pair is set whether or not it
-    /// was the one published before.
+    /// Publish the worker's routing state for an address whose series were
+    /// dropped and come back (a registration): the current pair of state and
+    /// reason is set whether or not it was the one published before.
     fn republish_state(&self) {}
 
     /// Whether the absolute overload guard currently vetoes this worker.
@@ -519,87 +499,6 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         false
     }
 
-    /// Record a successful interaction with the worker (a poll answered, a
-    /// probe passed, an event batch, a response).
-    fn note_contact(&self) {}
-
-    /// Record a token or a completion from the worker.
-    fn note_token_progress(&self) {}
-
-    /// [`Self::note_token_progress`] at `now_ms` on the gateway clock
-    /// (`liveness::now_ms`): a stamp the caller read once for every note of
-    /// the same message.
-    fn note_token_progress_at(&self, _now_ms: u64) {
-        self.note_token_progress();
-    }
-
-    /// Record a transport failure (a poll, probe or stream that failed on the
-    /// connection); cleared by the next contact.
-    fn note_transport_failure(&self) {}
-
-    /// Whether a transport failure happened since the last contact.
-    fn transport_failure_pending(&self) -> bool {
-        false
-    }
-
-    /// Time since the last successful contact.
-    fn contact_age(&self) -> Duration {
-        Duration::ZERO
-    }
-
-    /// Time since the last token or completion.
-    fn token_progress_age(&self) -> Duration {
-        Duration::ZERO
-    }
-
-    /// Record a load record pushed on the worker's own KV-event stream: from
-    /// here on the worker is expected to be heard from at the stream's
-    /// cadence (see the `liveness` module).
-    fn note_load_record(&self) {}
-
-    /// Whether the worker's stream has ever pushed a load record.
-    fn pushes_load_records(&self) -> bool {
-        false
-    }
-
-    /// Record whether the worker's latest load record reports its engine
-    /// silent on its in-flight requests for the wedge bound (see the
-    /// `liveness` module).
-    fn note_engine_stall(&self, _stalled: bool) {}
-
-    /// Whether the latest load record reported the engine stalled.
-    fn engine_stalled(&self) -> bool {
-        false
-    }
-
-    /// The prefill rate observed on this worker, tokens per second; zero
-    /// until a window of first tokens has been seen.
-    fn prefill_rate_tps(&self) -> u64 {
-        0
-    }
-    /// Record the start of a request whose responses the gateway sees one by
-    /// one (a streaming generation to this worker over gRPC): the pile the
-    /// wedged rule counts, and the start of its clock when a run begins.
-    /// Requests without that signal (HTTP, a PD side, a non-streaming
-    /// generation) never form a pile.
-    fn note_tracked_started(&self) {}
-    /// [`Self::note_tracked_started`] at `now_ms` on the gateway clock (the
-    /// liveness module's `now_ms`): a dispatch that read its instant once
-    /// stamps the run's start with it instead of reading again.
-    fn note_tracked_started_at(&self, _now_ms: u64) {
-        self.note_tracked_started();
-    }
-    /// Record the end of a tracked request.
-    fn note_tracked_ended(&self) {}
-    /// Requests in flight whose responses the gateway sees one by one.
-    fn tracked_load(&self) -> usize {
-        0
-    }
-    /// Record the first token or completion of a stream from this worker:
-    /// from here until its end the stream is one the worker is producing for.
-    fn note_output_started(&self) {}
-    /// Record the end of a stream that had produced output.
-    fn note_output_ended(&self) {}
     /// How long the worker has produced nothing while it still holds streams
     /// it had been producing for: `Some(age)` when at least one stream past
     /// its first token or completion is open and the last token or
@@ -617,24 +516,6 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// can read as silent while a frozen prefill is the cause; the two
     /// conditions together are the limit of this signal.
     fn output_silence(&self) -> Option<Duration> {
-        None
-    }
-
-    /// Store the engine's reported waiting-queue depth, returning the previous
-    /// value.
-    fn swap_waiting_reqs(&self, _waiting: i64) -> i64 {
-        0
-    }
-
-    /// Store the in-flight count seen by the liveness sweep, returning the
-    /// previous sample.
-    fn swap_load_sample(&self, _load: usize) -> usize {
-        0
-    }
-
-    /// A notifier fired on every contact with the worker, for loops that back
-    /// off from it and should retry as soon as it is heard from again.
-    fn contact_wake(&self) -> Option<Arc<Notify>> {
         None
     }
 
@@ -656,10 +537,6 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn readmit_circuit_breaker(&self) -> bool {
         false
     }
-
-    /// Record that the worker just became routable (promotion to Ready, or a
-    /// liveness veto cleared); the warm-up slice counts from here.
-    fn note_admitted(&self) {}
 
     /// Time since the worker last became routable; `Duration::MAX` for a
     /// worker that does not track it (never warming).
@@ -686,50 +563,6 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// `until_ms` while it has anything in flight.
     fn note_diverted(&self, _until_ms: u64) {}
 
-    /// A request of `tokens` prompt tokens was dispatched: work the engine
-    /// still has to prefill before its first token (see
-    /// [`Self::prefill_backlog`]). `timed` says the gateway will see that
-    /// first token on its own (a streaming generation), so the prompt's
-    /// prefill can be timed for the worker's rate; a non-streaming
-    /// generation answers once, at its end, and its prompt counts in the
-    /// backlog only.
-    fn note_prefill_started(&self, _tokens: u64, _timed: bool) {}
-
-    /// [`Self::note_prefill_started`] at `now_ms` on the gateway clock: the
-    /// dispatch's one stamp.
-    fn note_prefill_started_at(&self, tokens: u64, timed: bool, _now_ms: u64) {
-        self.note_prefill_started(tokens, timed);
-    }
-
-    /// The request's first token came back, with `cached` of its prompt
-    /// tokens reported served from the engine's prefix cache (`Some`; zero
-    /// when the engine reports no count), or its stream ended or was dropped
-    /// before one (`None`): its prompt is no longer pending prefill. `timed`
-    /// as at its start.
-    fn note_prefill_ended(&self, _tokens: u64, _timed: bool, _cached: Option<u64>) {}
-
-    /// [`Self::note_prefill_ended`] at `now_ms` on the gateway clock: the
-    /// first response's one stamp.
-    fn note_prefill_ended_at(&self, tokens: u64, timed: bool, cached: Option<u64>, _now_ms: u64) {
-        self.note_prefill_ended(tokens, timed, cached);
-    }
-
-    /// How long the engine may still need before the first token of its
-    /// in-flight work is due: the prompt tokens dispatched and not yet
-    /// answered, over the prefill rate observed on this worker (a cold prior
-    /// until one is). Zero for a worker that does not track it.
-    fn prefill_backlog(&self) -> Duration {
-        Duration::ZERO
-    }
-
-    /// [`Self::prefill_backlog`] with `tokens` more prompt tokens about to
-    /// be dispatched: how long the engine may need before the first token of
-    /// a prompt of that length is due, behind what is already pending. Zero
-    /// for a worker that does not track it.
-    fn prefill_eta(&self, _tokens: u64) -> Duration {
-        Duration::ZERO
-    }
-
     /// How long ago a prompt dispatched to the worker was last answered with
     /// its first token (or, for a non-streaming generation, its one answer):
     /// the worker's latest first response, the evidence that it answers at
@@ -752,38 +585,6 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// none since the gateway started, or does not track it.
     fn prefill_handed_off_ago(&self) -> Option<Duration> {
         None
-    }
-
-    /// How long the worker's current run of pending prompts (since its
-    /// pending backlog last left zero) has waited for its first answer,
-    /// plus the time earlier runs since its latest first response held
-    /// prompts and ended unanswered (given up on, or dropped): its silence,
-    /// the spells it held nothing left out. `None` while nothing is pending,
-    /// once the run has had an answer, or for a worker that does not track
-    /// its runs.
-    fn prefill_unanswered_run(&self) -> Option<Duration> {
-        None
-    }
-
-    /// How long the worker's prompts have gone unanswered since its latest
-    /// first response: [`Self::prefill_unanswered_run`] with the idle spells
-    /// still left out but read whether or not a prompt is pending, so a
-    /// worker that was given up on and holds nothing still reports the
-    /// silence it owes. Zero after an answer, for a worker never dispatched
-    /// to, or for one that does not track its runs.
-    fn prefill_unanswered_total(&self) -> Duration {
-        Duration::ZERO
-    }
-
-    /// Whether the engine behind the worker is on a prompt shape it has not
-    /// shown it runs: a prompt pending on the worker, or one of `tokens`
-    /// about to be dispatched, longer than any the worker has answered since
-    /// the gateway started, on a worker that has answered at least one. A
-    /// worker that has answered nothing has shown no shape to go by, and is
-    /// judged like any other; so is a worker that does not track it
-    /// (`false`).
-    fn prefill_cold_shape(&self, _tokens: u64) -> bool {
-        false
     }
 
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
@@ -990,12 +791,6 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().provider_for_model(model_id)
     }
 
-    /// Check if this worker supports an endpoint for a given model.
-    /// Falls back to LLM capabilities if the model is not registered.
-    fn supports_endpoint(&self, model_id: &str, endpoint: Endpoint) -> bool {
-        self.metadata().supports_endpoint(model_id, endpoint)
-    }
-
     /// Check if this worker supports a specific model.
     ///
     /// `BasicWorker` overrides this to consult its lazy-discovered
@@ -1031,25 +826,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Set models for this worker (for lazy discovery).
     /// Default implementation does nothing - only BasicWorker supports this.
+    ///
+    /// A worker in a registry takes new cards through the registry's
+    /// `refresh_models`: a snapshot keeps figures read from the cards, and
+    /// the refresh publishes the snapshots again.
     fn set_models(&self, _models: Vec<ModelCard>) {
         // Default: no-op. BasicWorker overrides this.
-    }
-
-    /// Check if models have been discovered for this worker.
-    /// Returns true if models were set via set_models() or if metadata has models.
-    fn has_models_discovered(&self) -> bool {
-        !self.metadata().spec.models.is_wildcard()
     }
 
     /// Get or create a gRPC client for this worker
     /// Returns None for HTTP workers, Some(client) for gRPC workers
     async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>>;
-
-    /// Reset the gRPC client connection (for reconnection scenarios)
-    /// No-op for HTTP workers
-    async fn reset_grpc_client(&self) -> WorkerResult<()> {
-        Ok(())
-    }
 
     /// Release background work owned by this worker instance.
     ///
@@ -1061,12 +848,6 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// stops asserting the shared state code, which a replacement reads: a
     /// fact the retired instance still writes marks the code stale instead.
     fn abort_background_tasks(&self) {}
-    async fn grpc_health_check(&self) -> WorkerResult<bool>;
-    /// Liveness check for a ZMQ worker. Unlike gRPC there is no health RPC on
-    /// the raw wire: liveness is local (handshake completed and the engine has
-    /// not signalled `ENGINE_CORE_DEAD`).
-    async fn zmq_health_check(&self) -> WorkerResult<bool>;
-    async fn http_health_check(&self) -> WorkerResult<bool>;
 
     // ── Admin operations ────────────────────────────────────────────
     //
@@ -1110,12 +891,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     async fn start_profile(&self, options: &ProfileOptions) -> WorkerResult<()> {
         match self.connection_mode() {
             ConnectionMode::Http => {
-                let body =
-                    serde_json::to_value(options).map_err(|e| WorkerError::OperationFailed {
-                        url: self.url().to_string(),
-                        operation: "start_profile".to_string(),
-                        reason: format!("failed to serialize profile options: {e}"),
-                    })?;
+                let body = serde_json::to_value(options).map_err(|e| {
+                    failed(
+                        self.url(),
+                        "start_profile",
+                        format!("failed to serialize profile options: {e}"),
+                    )
+                })?;
                 admin_http_post(
                     self.http_client(),
                     self.endpoint_url("/start_profile"),
@@ -1422,7 +1204,7 @@ impl BasicWorker {
         allows
     }
 
-    /// [`Worker::publish_state`] under the runtime guard the caller holds:
+    /// [`Self::publish_state`] under the runtime guard the caller holds:
     /// the pair the facts give now is set to 1 and the pair published before
     /// it to 0, when they differ; with `forget_previous` (a registration,
     /// whose address's series were dropped) the pair is set whether or not
@@ -1520,6 +1302,125 @@ impl BasicWorker {
             read(self.metadata.spec.models.all())
         } else {
             read(overridden.all())
+        }
+    }
+
+    /// Publish the worker's routing state as the `smg_worker_state` series:
+    /// 1 on the state and reason the routing decision reads now, 0 on the
+    /// pair it left; nothing when the pair did not move. Called where a fact
+    /// of the decision moves (the status, the overload veto, the liveness
+    /// veto, the circuit breaker).
+    fn publish_state(&self) {
+        self.publish_state_under(&self.runtime.load(), false);
+    }
+
+    async fn grpc_health_check(&self) -> WorkerResult<bool> {
+        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+        let maybe = self.get_backend_client().await?;
+        let Some(backend_client) = maybe else {
+            tracing::error!(
+                "Worker {} is not a gRPC worker but connection mode is gRPC",
+                self.metadata.redacted_url
+            );
+            return Ok(false);
+        };
+
+        match time::timeout(timeout, backend_client.health_check()).await {
+            Ok(Ok(resp)) => {
+                tracing::debug!(
+                    "gRPC health OK for {}: healthy={}",
+                    self.metadata.redacted_url,
+                    resp.healthy
+                );
+                Ok(resp.healthy)
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    "gRPC health RPC error for {}: {err:?}",
+                    self.metadata.redacted_url
+                );
+                Ok(false)
+            }
+            Err(_) => {
+                tracing::warn!("gRPC health timed out for {}", self.metadata.redacted_url);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Liveness check for a ZMQ worker. Unlike gRPC there is no health RPC on
+    /// the raw wire: liveness is local (handshake completed and the engine has
+    /// not signalled `ENGINE_CORE_DEAD`).
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, where it starts the connect driver.
+    pub(crate) fn zmq_health_check(&self) -> bool {
+        // Never drive (or cancel) the handshake from the probe: model load can
+        // take far longer than the health timeout, and cancelling it mid-flight
+        // would rebind the sockets on every probe and never connect. Peek the
+        // cached client instead — if it isn't there yet, kick the handshake off
+        // once in the background and report not-ready until it lands. Thereafter
+        // liveness is local (the connector marks the client closed on
+        // ENGINE_CORE_DEAD or a transport failure); there is no health RPC on
+        // the raw ZMQ wire.
+        let cell = self.backend_client.load_full();
+        if let Some(backend_client) = cell.get() {
+            if backend_client.is_alive() {
+                return true;
+            }
+            // The engine behind this client died, and a ZMQ client cannot
+            // reconnect in place (liveness is latched). Evict the dead client
+            // and reset the handshake guard so the next probe re-runs
+            // connect_zmq_backend, rebinding the sockets for a replacement
+            // engine to dial into. Eviction cannot race an in-flight connect:
+            // a cell only becomes non-empty once its connect finished, and
+            // compare_and_swap keeps a lagging probe from clobbering a fresh
+            // cell another probe already swapped in.
+            tracing::warn!(
+                "ZMQ engine for {} is no longer alive; evicting the dead client and rebinding on a later probe",
+                self.metadata.redacted_url
+            );
+            self.backend_client
+                .compare_and_swap(&cell, Arc::new(OnceCell::new()));
+            self.zmq_connect_started.store(false, Ordering::SeqCst);
+            return false;
+        }
+        self.spawn_zmq_connect_driver(&cell);
+        false
+    }
+
+    async fn http_health_check(&self) -> WorkerResult<bool> {
+        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+
+        let health_url = format!("{}{}", self.base_url(), self.metadata.health_endpoint);
+
+        let mut req = self.http_client.client().get(&health_url).timeout(timeout);
+        if let Some(api_key) = &self.metadata.spec.api_key {
+            req = req.bearer_auth(api_key);
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    Ok(true)
+                } else {
+                    tracing::warn!(
+                        "HTTP health check returned non-success status for {}: {}",
+                        super::endpoint::Endpoint::redacted_str(&health_url),
+                        status
+                    );
+                    Ok(false)
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "HTTP health check failed for {}: {err:?}",
+                    super::endpoint::Endpoint::redacted_str(&health_url)
+                );
+                Ok(false)
+            }
         }
     }
 }
@@ -1625,7 +1526,7 @@ impl Worker for BasicWorker {
         let probe_ok = match &self.metadata.spec.connection_mode {
             ConnectionMode::Http => self.http_health_check().await?,
             ConnectionMode::Grpc => self.grpc_health_check().await?,
-            ConnectionMode::Zmq => self.zmq_health_check().await?,
+            ConnectionMode::Zmq => self.zmq_health_check(),
         };
 
         if probe_ok {
@@ -1636,34 +1537,6 @@ impl Worker for BasicWorker {
                 reason: "health probe returned non-success".to_string(),
             })
         }
-    }
-
-    fn consecutive_failures_increment(&self) -> usize {
-        self.runtime.load().consecutive_failures_increment()
-    }
-
-    fn consecutive_failures_reset(&self) {
-        self.runtime.load().consecutive_failures_reset();
-    }
-
-    fn consecutive_successes_increment(&self) -> usize {
-        self.runtime.load().consecutive_successes_increment()
-    }
-
-    fn consecutive_successes_reset(&self) {
-        self.runtime.load().consecutive_successes_reset();
-    }
-
-    fn total_pending_probes(&self) -> usize {
-        self.runtime.load().total_pending_probes()
-    }
-
-    fn total_pending_probes_increment(&self) -> usize {
-        self.runtime.load().total_pending_probes_increment()
-    }
-
-    fn total_pending_probes_reset(&self) {
-        self.runtime.load().total_pending_probes_reset();
     }
 
     fn load(&self) -> usize {
@@ -1785,68 +1658,8 @@ impl Worker for BasicWorker {
         changed
     }
 
-    fn liveness_runtime(&self) -> Option<Arc<WorkerRuntime>> {
+    fn runtime_state(&self) -> Option<Arc<WorkerRuntime>> {
         Some(self.runtime.load_full())
-    }
-
-    fn note_contact(&self) {
-        self.runtime.load().note_contact();
-    }
-
-    fn note_token_progress(&self) {
-        self.runtime.load().note_token_progress();
-    }
-
-    fn note_token_progress_at(&self, now_ms: u64) {
-        self.runtime.load().note_token_progress_at(now_ms);
-    }
-
-    fn note_transport_failure(&self) {
-        self.runtime.load().note_transport_failure();
-    }
-
-    fn transport_failure_pending(&self) -> bool {
-        self.runtime.load().transport_failure_pending()
-    }
-
-    fn contact_age(&self) -> Duration {
-        self.runtime.load().contact_age()
-    }
-
-    fn token_progress_age(&self) -> Duration {
-        self.runtime.load().token_progress_age()
-    }
-
-    fn note_load_record(&self) {
-        self.runtime.load().note_load_record();
-    }
-
-    fn pushes_load_records(&self) -> bool {
-        self.runtime.load().pushes_load_records()
-    }
-
-    fn note_engine_stall(&self, stalled: bool) {
-        self.runtime.load().note_engine_stall(stalled);
-    }
-
-    fn engine_stalled(&self) -> bool {
-        self.runtime.load().engine_stalled()
-    }
-
-    fn prefill_rate_tps(&self) -> u64 {
-        self.runtime.load().prefill_rate_tps()
-    }
-
-    fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
-        self.runtime.load().swap_waiting_reqs(waiting)
-    }
-
-    fn swap_load_sample(&self, load: usize) -> usize {
-        self.runtime.load().swap_load_sample(load)
-    }
-
-    fn contact_wake(&self) -> Option<Arc<Notify>> {
-        Some(self.runtime.load().contact_wake())
     }
 
     fn signal_connected(&self) {
@@ -1871,10 +1684,6 @@ impl Worker for BasicWorker {
         false
     }
 
-    fn note_admitted(&self) {
-        self.runtime.load().note_admitted();
-    }
-
     fn admitted_age(&self) -> Duration {
         self.runtime.load().admitted_age()
     }
@@ -1891,37 +1700,6 @@ impl Worker for BasicWorker {
         self.runtime.load().note_diverted(until_ms);
     }
 
-    fn note_prefill_started(&self, tokens: u64, timed: bool) {
-        self.runtime.load().note_prefill_started(tokens, timed);
-    }
-
-    fn note_prefill_started_at(&self, tokens: u64, timed: bool, now_ms: u64) {
-        // 0 is the runtime's unset stamp, as the plain note guards too.
-        self.runtime
-            .load()
-            .note_prefill_started_at(tokens, timed, now_ms.max(1));
-    }
-
-    fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
-        self.runtime
-            .load()
-            .note_prefill_ended(tokens, timed, cached);
-    }
-
-    fn note_prefill_ended_at(&self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
-        self.runtime
-            .load()
-            .note_prefill_ended_at(tokens, timed, cached, now_ms.max(1));
-    }
-
-    fn prefill_backlog(&self) -> Duration {
-        self.runtime.load().prefill_backlog()
-    }
-
-    fn prefill_eta(&self, tokens: u64) -> Duration {
-        self.runtime.load().prefill_eta(tokens)
-    }
-
     fn prefill_answered_ago(&self) -> Option<Duration> {
         self.runtime.load().prefill_answered_ago()
     }
@@ -1932,42 +1710,6 @@ impl Worker for BasicWorker {
 
     fn prefill_handed_off_ago(&self) -> Option<Duration> {
         self.runtime.load().prefill_handed_off_ago()
-    }
-
-    fn prefill_unanswered_run(&self) -> Option<Duration> {
-        self.runtime.load().prefill_unanswered_run()
-    }
-
-    fn prefill_unanswered_total(&self) -> Duration {
-        self.runtime.load().prefill_unanswered_total()
-    }
-
-    fn prefill_cold_shape(&self, tokens: u64) -> bool {
-        self.runtime.load().prefill_cold_shape(tokens)
-    }
-
-    fn note_tracked_started(&self) {
-        self.runtime.load().note_tracked_started();
-    }
-
-    fn note_tracked_started_at(&self, now_ms: u64) {
-        self.runtime.load().note_tracked_started_at(now_ms);
-    }
-
-    fn note_tracked_ended(&self) {
-        self.runtime.load().note_tracked_ended();
-    }
-
-    fn tracked_load(&self) -> usize {
-        self.runtime.load().tracked_load()
-    }
-
-    fn note_output_started(&self) {
-        self.runtime.load().note_output_started();
-    }
-
-    fn note_output_ended(&self) {
-        self.runtime.load().note_output_ended();
     }
 
     fn output_silence(&self) -> Option<Duration> {
@@ -2070,10 +1812,6 @@ impl Worker for BasicWorker {
         }
     }
 
-    fn publish_state(&self) {
-        self.publish_state_under(&self.runtime.load(), false);
-    }
-
     fn republish_state(&self) {
         self.publish_state_under(&self.runtime.load(), true);
     }
@@ -2127,10 +1865,6 @@ impl Worker for BasicWorker {
         );
         self.models_override
             .store(Arc::new(WorkerModels::from(models)));
-    }
-
-    fn has_models_discovered(&self) -> bool {
-        !self.models_override.load().is_wildcard() || !self.metadata.spec.models.is_wildcard()
     }
 
     async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
@@ -2204,86 +1938,6 @@ impl Worker for BasicWorker {
         }
     }
 
-    async fn reset_grpc_client(&self) -> WorkerResult<()> {
-        // Intentional no-op: a failed gRPC worker is removed and re-added rather
-        // than reconnected in place. (The ZMQ path differs: its health probe
-        // evicts a dead client and reconnects — see zmq_health_check.)
-        tracing::debug!(
-            "reset_grpc_client called for {} (no-op for gRPC workers)",
-            self.metadata.redacted_url
-        );
-        Ok(())
-    }
-
-    async fn grpc_health_check(&self) -> WorkerResult<bool> {
-        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-        let maybe = self.get_backend_client().await?;
-        let Some(backend_client) = maybe else {
-            tracing::error!(
-                "Worker {} is not a gRPC worker but connection mode is gRPC",
-                self.metadata.redacted_url
-            );
-            return Ok(false);
-        };
-
-        match time::timeout(timeout, backend_client.health_check()).await {
-            Ok(Ok(resp)) => {
-                tracing::debug!(
-                    "gRPC health OK for {}: healthy={}",
-                    self.metadata.redacted_url,
-                    resp.healthy
-                );
-                Ok(resp.healthy)
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    "gRPC health RPC error for {}: {err:?}",
-                    self.metadata.redacted_url
-                );
-                Ok(false)
-            }
-            Err(_) => {
-                tracing::warn!("gRPC health timed out for {}", self.metadata.redacted_url);
-                Ok(false)
-            }
-        }
-    }
-
-    async fn zmq_health_check(&self) -> WorkerResult<bool> {
-        // Never drive (or cancel) the handshake from the probe: model load can
-        // take far longer than the health timeout, and cancelling it mid-flight
-        // would rebind the sockets on every probe and never connect. Peek the
-        // cached client instead — if it isn't there yet, kick the handshake off
-        // once in the background and report not-ready until it lands. Thereafter
-        // liveness is local (the connector marks the client closed on
-        // ENGINE_CORE_DEAD or a transport failure); there is no health RPC on
-        // the raw ZMQ wire.
-        let cell = self.backend_client.load_full();
-        if let Some(backend_client) = cell.get() {
-            if backend_client.is_alive() {
-                return Ok(true);
-            }
-            // The engine behind this client died, and a ZMQ client cannot
-            // reconnect in place (liveness is latched). Evict the dead client
-            // and reset the handshake guard so the next probe re-runs
-            // connect_zmq_backend, rebinding the sockets for a replacement
-            // engine to dial into. Eviction cannot race an in-flight connect:
-            // a cell only becomes non-empty once its connect finished, and
-            // compare_and_swap keeps a lagging probe from clobbering a fresh
-            // cell another probe already swapped in.
-            tracing::warn!(
-                "ZMQ engine for {} is no longer alive; evicting the dead client and rebinding on a later probe",
-                self.metadata.redacted_url
-            );
-            self.backend_client
-                .compare_and_swap(&cell, Arc::new(OnceCell::new()));
-            self.zmq_connect_started.store(false, Ordering::SeqCst);
-            return Ok(false);
-        }
-        self.spawn_zmq_connect_driver(&cell);
-        Ok(false)
-    }
-
     fn abort_background_tasks(&self) {
         self.superseded.store(true, Ordering::Release);
         if let Some(handle) = self.zmq_connect_abort.swap(None) {
@@ -2291,40 +1945,6 @@ impl Worker for BasicWorker {
             // The bound sockets are released with the cancelled future; reset
             // the guard so any instance still sharing this state can retry.
             self.zmq_connect_started.store(false, Ordering::SeqCst);
-        }
-    }
-
-    async fn http_health_check(&self) -> WorkerResult<bool> {
-        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-
-        let health_url = format!("{}{}", self.base_url(), self.metadata.health_endpoint);
-
-        let mut req = self.http_client.client().get(&health_url).timeout(timeout);
-        if let Some(api_key) = &self.metadata.spec.api_key {
-            req = req.bearer_auth(api_key);
-        }
-
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    Ok(true)
-                } else {
-                    tracing::warn!(
-                        "HTTP health check returned non-success status for {}: {}",
-                        super::endpoint::Endpoint::redacted_str(&health_url),
-                        status
-                    );
-                    Ok(false)
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "HTTP health check failed for {}: {err:?}",
-                    super::endpoint::Endpoint::redacted_str(&health_url)
-                );
-                Ok(false)
-            }
         }
     }
 }

@@ -340,66 +340,34 @@ fn build_planar_tensor_by_table(
 /// the canvas is cropped at its right and bottom edges.
 pub fn paint_rgb_onto_planes(
     rgb: &[u8],
-    image: (usize, usize),
-    canvas: (usize, usize),
+    (image_w, image_h): (usize, usize),
+    (canvas_w, canvas_h): (usize, usize),
     scale: [f32; 3],
     bias: [f32; 3],
     planes: &mut [f32],
 ) {
-    paint_rows(rgb, image, canvas, bias, planes, |row, r, g, b| {
-        deinterleave_rgb_to_planes(row, r, g, b, scale, bias);
-    });
-}
-
-/// [`paint_rgb_onto_planes`] through a per-channel table: every painted byte
-/// maps through `table[c][byte]` and the canvas outside the image holds
-/// `table[c][0]`, what a zero byte of padding maps to under the same
-/// arithmetic.
-pub(crate) fn paint_rgb_onto_planes_by_table(
-    rgb: &[u8],
-    image: (usize, usize),
-    canvas: (usize, usize),
-    table: &[[f32; 256]; 3],
-    planes: &mut [f32],
-) {
-    let black = [table[0][0], table[1][0], table[2][0]];
-    paint_rows(rgb, image, canvas, black, planes, |row, r, g, b| {
-        deinterleave_rgb_to_planes_by_table(row, r, g, b, table);
-    });
-}
-
-/// The canvas fill and the row walk of the paints: `black` fills the canvas,
-/// then `paint_row` maps each image row's bytes onto its three plane slices.
-fn paint_rows<K>(
-    rgb: &[u8],
-    (image_w, image_h): (usize, usize),
-    (canvas_w, canvas_h): (usize, usize),
-    black: [f32; 3],
-    planes: &mut [f32],
-    paint_row: K,
-) where
-    K: Fn(&[u8], &mut [f32], &mut [f32], &mut [f32]),
-{
     let canvas_pixels = canvas_w * canvas_h;
     debug_assert_eq!(planes.len(), 3 * canvas_pixels);
     debug_assert!(rgb.len() >= image_w * image_h * 3);
     let (r_plane, rest) = planes.split_at_mut(canvas_pixels);
     let (g_plane, b_plane) = rest.split_at_mut(canvas_pixels);
 
-    r_plane.fill(black[0]);
-    g_plane.fill(black[1]);
-    b_plane.fill(black[2]);
+    r_plane.fill(bias[0]);
+    g_plane.fill(bias[1]);
+    b_plane.fill(bias[2]);
 
     let painted_w = image_w.min(canvas_w);
     let painted_h = image_h.min(canvas_h);
     for y in 0..painted_h {
         let src_row = &rgb[y * image_w * 3..(y * image_w + painted_w) * 3];
         let dst = y * canvas_w;
-        paint_row(
+        deinterleave_rgb_to_planes(
             src_row,
             &mut r_plane[dst..dst + painted_w],
             &mut g_plane[dst..dst + painted_w],
             &mut b_plane[dst..dst + painted_w],
+            scale,
+            bias,
         );
     }
 }
@@ -553,7 +521,7 @@ fn to_fir_algorithm(filter: FilterType) -> ResizeAlg {
     clippy::slow_vector_initialization,
     reason = "the zero-filled `vec!` is the calloc this helper exists to avoid; see its doc comment"
 )]
-fn plain_buffer(len: usize) -> Vec<u8> {
+pub(crate) fn plain_buffer(len: usize) -> Vec<u8> {
     let mut buffer = Vec::with_capacity(len);
     buffer.resize(len, 0);
     buffer
@@ -2679,12 +2647,11 @@ pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
 /// interpolation, and so what an image processor that resizes the decoded
 /// image before converting it to a tensor runs.
 pub fn resize_bilinear_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
+    let (in_w, in_h, rgb) = rgb_bytes(image);
     let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
+        &rgb,
+        in_w as u32,
+        in_h as u32,
         out_w,
         out_h,
         PilResizeFilter::Bilinear,
@@ -5565,34 +5532,6 @@ mod tests {
                     assert_eq!(
                         planes[c * 6 + y * 3 + x].to_bits(),
                         expected.to_bits(),
-                        "channel {c} at ({x}, {y})"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn paint_rgb_onto_planes_by_table_maps_through_the_table_and_fills_the_margin_with_its_zero() {
-        // A 2x2 image on a 3x2 canvas: the right column is margin. The table
-        // tells the channels and the levels apart, and no multiply-add
-        // produces it.
-        let rgb: [u8; 12] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
-        let table: [[f32; 256]; 3] = std::array::from_fn(|c| {
-            std::array::from_fn(|level| {
-                let sign = if level % 2 == 0 { 1.0 } else { -1.0 };
-                (level as f32 * 0.5 + 1.0) * sign + (c as f32 + 1.0) * 1000.0
-            })
-        });
-        let mut planes = vec![f32::NAN; 3 * 3 * 2];
-        paint_rgb_onto_planes_by_table(&rgb, (2, 2), (3, 2), &table, &mut planes);
-        for c in 0..3 {
-            for y in 0..2 {
-                for x in 0..3 {
-                    let level = if x < 2 { rgb[(y * 2 + x) * 3 + c] } else { 0 };
-                    assert_eq!(
-                        planes[c * 6 + y * 3 + x].to_bits(),
-                        table[c][usize::from(level)].to_bits(),
                         "channel {c} at ({x}, {y})"
                     );
                 }

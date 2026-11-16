@@ -1,14 +1,17 @@
-//! Error types for the SGLang router core
-//!
-//! This module defines error types used throughout the router for worker operations.
+//! The worker errors: what a worker operation reports when it fails, the
+//! worker's address redacted where the message names it (its credentials
+//! masked, a query or fragment dropped, an unparsable one replaced by a
+//! marker; a plain address passes through).
 
 use super::endpoint::Endpoint;
 
 /// Worker-related errors. An arm that names a worker writes its address
-/// masked ([`Endpoint::redacted_url`]): the message follows a masked field
-/// into log lines, step failures and response bodies, and must not repeat
-/// the address raw. The `url` field keeps the registered address for the
-/// code that matches on it.
+/// redacted ([`Endpoint::redacted_url`]: the credentials masked, a query
+/// or fragment dropped, a plain address byte for byte, an unparsable one
+/// replaced by a marker): the message follows a redacted field into log
+/// lines, step failures and response bodies, and must not repeat the
+/// address raw. The `url` field keeps the registered address for the code
+/// that matches on it.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
     #[error("Health check failed for worker {}: {reason}", shown(.url))]
@@ -35,8 +38,9 @@ pub enum WorkerError {
 }
 
 /// The address as an error message writes it: masked when it carries
-/// userinfo, cut at a query; an error without one (a network error whose
-/// request had no URL) writes nothing where the address goes.
+/// userinfo, cut at a query or fragment, a marker when the parser refuses
+/// it; an error without one (a network error whose request had no URL)
+/// writes nothing where the address goes.
 fn shown(url: &str) -> String {
     if url.is_empty() {
         String::new()
@@ -48,12 +52,15 @@ fn shown(url: &str) -> String {
 /// Result type for worker operations
 pub type WorkerResult<T> = Result<T, WorkerError>;
 
-/// Convert from reqwest errors to worker errors
+/// A client error as a worker error. The client's text would repeat the
+/// request URL as the client holds it, so the URL moves to `url` (kept
+/// raw; the message writes it redacted) and the text goes without it.
 impl From<reqwest::Error> for WorkerError {
     fn from(err: reqwest::Error) -> Self {
+        let url = err.url().map(|u| u.to_string()).unwrap_or_default();
         WorkerError::NetworkError {
-            url: err.url().map(|u| u.to_string()).unwrap_or_default(),
-            error: err.to_string(),
+            url,
+            error: err.without_url().to_string(),
         }
     }
 }
@@ -63,6 +70,27 @@ mod tests {
     use std::error::Error;
 
     use super::*;
+    use crate::worker::{connection::http_client::LazyHttpClient, test_support::RefusedAddress};
+
+    #[tokio::test]
+    async fn a_client_error_converts_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}/health?token=s3cret", refused.http_url());
+        let error: WorkerError = LazyHttpClient::deferred()
+            .client()
+            .get(&url)
+            .send()
+            .await
+            .expect_err("nothing listens at the address")
+            .into();
+        let text = error.to_string();
+        assert!(!text.contains("s3cret"), "{text}");
+        assert_eq!(
+            text.matches(&refused.addr().to_string()).count(),
+            1,
+            "{text}"
+        );
+    }
 
     #[test]
     fn test_health_check_failed_display() {
