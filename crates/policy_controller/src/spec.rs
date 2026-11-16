@@ -1417,7 +1417,12 @@ pub struct BindingSpec {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub profiles: BTreeMap<String, String>,
-    /// The overload veto's defaults for the binding's workers.
+    /// The overload veto's defaults for the workers of the pools decided
+    /// under the binding: the pools whose model and phase it is the first
+    /// to match. A decode pool of a model with a pair binding (`pd-pair`
+    /// or `epd`) is decided under that binding, so its block judges the
+    /// pool: a decode-phase binding's block is not read for it, and a pair
+    /// binding with its block switched off leaves the pool unjudged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overload: Option<OverloadSpec>,
     /// Sticky sessions.
