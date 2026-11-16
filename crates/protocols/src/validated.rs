@@ -1739,6 +1739,44 @@ mod tests {
         }
     }
 
+    /// A key repeated inside a chat content part is refused with serde's
+    /// words: the param is the message serde's path stops at and the part's
+    /// place is in the words, as for any part refusal that is no missing
+    /// field; the legacy `function_call` object answers at its own path. The
+    /// code is `json_parse_error`: the reason table names no duplicate field.
+    #[tokio::test]
+    async fn a_repeated_key_inside_a_chat_content_part_is_refused() {
+        use crate::chat::ChatCompletionRequest;
+
+        for (body, param, message) in [
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a","text":"b"}]}]}"#,
+                "messages[0]",
+                "messages[0]: duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"a"},{"type":"text","text":"a","text":"b"}]}]}"#,
+                "messages[1]",
+                "messages[1]: duplicate field `text`, in `content[1]`",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"function_call":{"name":"f","name":"g"}}"#,
+                "function_call",
+                "function_call: duplicate field `name`",
+            ),
+        ] {
+            let (status, json) = rejected::<ChatCompletionRequest>(body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], "json_parse_error", "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+    }
+
     /// A repeated key below an input item's own keys is refused at its
     /// place: serde's words, the path the extractor's tracker recorded
     /// through the nested read; the item's own keys answer `input[0]`. The
