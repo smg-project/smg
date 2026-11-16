@@ -406,14 +406,24 @@ impl ToolInventory {
                 .remove_if(ALIAS_SERVER_KEY, |_, names| names.is_empty());
         }
         // The entry under the alias key is a copy of the target's tool, taken
-        // when the alias was registered: a kept alias takes the tool again.
+        // when the alias was registered: a kept alias takes the tool again,
+        // unless another server took the alias's name over since the read
+        // above.
         for (alias, target) in kept {
             let tool = self
                 .tools_by_qualified
                 .get(&target)
                 .map(|entry| entry.tool.clone());
             if let Some(tool) = tool {
-                self.update_entry(ALIAS_SERVER_KEY, &alias, |entry| entry.tool = tool);
+                self.update_entry(ALIAS_SERVER_KEY, &alias, |entry| {
+                    if entry
+                        .alias_target
+                        .as_ref()
+                        .is_some_and(|held| held.target == target)
+                    {
+                        entry.tool = tool;
+                    }
+                });
             }
         }
     }
@@ -1182,6 +1192,37 @@ mod tests {
         // still an alias of the same target, under its own name
         assert_eq!(alias.tool_name(), "web_search");
         assert_eq!(inventory.resolve_alias("web_search"), Some(target));
+    }
+
+    #[test]
+    fn a_kept_alias_another_server_took_over_keeps_the_takers_tool() {
+        let inventory = ToolInventory::new();
+        let mine = QualifiedToolName::new("s", "search");
+        let theirs = QualifiedToolName::new("other", "lookup");
+        inventory.insert_entry(ToolEntry::new(mine.clone(), create_test_tool("search")));
+        inventory.insert_entry(ToolEntry::new(theirs.clone(), create_test_tool("lookup")));
+        // The alias index still names this server's tool, as the retain read
+        // it; the entry under the alias key is already the other server's.
+        inventory.register_alias("find".to_string(), mine);
+        inventory.insert_entry(
+            ToolEntry::new(
+                QualifiedToolName::new(ALIAS_SERVER_KEY, "find"),
+                create_test_tool("lookup"),
+            )
+            .with_alias(AliasTarget::new(theirs.clone())),
+        );
+
+        inventory.retain_server_tool_entries("s", &HashSet::from(["search".to_string()]));
+
+        let alias = inventory
+            .get_entry(ALIAS_SERVER_KEY, "find")
+            .expect("the alias stays");
+        assert_eq!(
+            alias.tool.description.as_deref(),
+            Some("Test tool: lookup"),
+            "the definition under an alias that targets another server's tool"
+        );
+        assert_eq!(alias.alias_target.map(|held| held.target), Some(theirs));
     }
 
     #[test]
