@@ -2464,8 +2464,9 @@ mod tests {
 
     /// The borrowed view reads every data event of a chat body as the owned
     /// chunk reads it: the same events are chunks, each chunk hands
-    /// `process_chunk` the same parts and the loop the same usage; a text
-    /// with no escape is borrowed from the event, one with an escape copied.
+    /// `process_chunk` the same parts and the loop the same usage, a chunk
+    /// with two choices the parts of its first; a text with no escape is
+    /// borrowed from the event, one with an escape copied.
     #[test]
     fn the_borrowed_chunk_view_reads_what_the_owned_chunk_reads() {
         let body = [
@@ -2474,6 +2475,12 @@ mod tests {
             chat_event(json!({"reasoning_content": "th\u{e9} \"why\"\n"}), None),
             chat_event(json!({"content": "Hello"}), None),
             chat_event(json!({"content": " \"quoted\"\n\ttab \u{1F600}"}), None),
+            "data: {\"id\":\"chat_test\",\"object\":\"chat.completion.chunk\",\"created\":0,\
+             \"model\":\"test-model\",\"choices\":[\
+             {\"index\":0,\"delta\":{\"content\":\"first\"},\"finish_reason\":null},\
+             {\"index\":1,\"delta\":{\"content\":\"second\"},\"logprobs\":null,\
+             \"finish_reason\":null}]}\n\n"
+                .to_string(),
             chat_event(
                 json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
                     "function": {"name": "get_weather", "arguments": "{\"city\":"}}]}),
@@ -2500,16 +2507,17 @@ mod tests {
             chunk_reads::<ChatCompletionStreamResponse>(&body, |chunk| chunk.usage.as_ref());
         let view = chunk_reads::<ChatChunkView<'_>>(&body, |chunk| chunk.usage.as_ref());
         assert_eq!(view, owned);
-        assert_eq!(owned.len(), 12);
+        assert_eq!(owned.len(), 13);
         let chunks = owned.iter().filter(|read| read.starts_with("chunk: "));
-        assert_eq!(chunks.count(), 8);
-        assert_eq!(owned[6], "other: data: {\"unexpected\":true}");
+        assert_eq!(chunks.count(), 9);
+        assert!(owned[4].contains("first") && !owned[4].contains("second"));
+        assert_eq!(owned[7], "other: data: {\"unexpected\":true}");
         assert_eq!(
-            owned[9],
+            owned[10],
             "error: {\"code\":\"internal_error\",\"message\":\"engine unavailable\"}"
         );
-        assert_eq!(owned[10], "done");
-        assert_eq!(owned[11], "other: data: {\"after\":\"done\"}");
+        assert_eq!(owned[11], "done");
+        assert_eq!(owned[12], "other: data: {\"after\":\"done\"}");
 
         let read = |event: &str| -> bool {
             let data = event.trim().strip_prefix("data: ").unwrap();
