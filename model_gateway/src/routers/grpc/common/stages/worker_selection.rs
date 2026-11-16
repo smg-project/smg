@@ -7612,7 +7612,7 @@ mod tests {
     /// both boxed at their call. A dispatch that grows the future past the
     /// bound is boxed at its call or needs its own read.
     #[test]
-    fn the_dispatch_future_fits_its_class() {
+    fn the_dispatch_future_fits_its_bound() {
         let mut ctx = dispatch_ctx("test-model", grpc_wire(RuntimeType::Vllm));
         let future = size_of_val(&execute_plan(
             &mut ctx,
