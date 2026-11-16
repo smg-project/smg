@@ -544,9 +544,14 @@ async fn two_binaries_elect_over_the_lease_object_and_hand_over_at_a_stop() {
     let taken = format!("{second}@{}", term + 1);
     let changes = shared.lock().changes.clone();
     if changes.ends_with(&[format!("{first}@{term}"), format!("@{term}"), taken.clone()]) {
+        // The release is in the record. The leader's log holds its line,
+        // or the failure of a release whose answer came back after the
+        // client's deadline, where a host held the leader or the stand-in
+        // meanwhile: this case plans no refusal, and the leader's next try
+        // finds the object taken and logs no release.
         assert!(
-            stopped.logged("the lease is released"),
-            "a stored release the leader never logged:\n{}",
+            stopped.logged("the lease is released") || stopped.logged("the release failed"),
+            "a stored release the leader's log does not tell:\n{}",
             stopped.log()
         );
     } else {
