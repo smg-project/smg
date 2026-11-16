@@ -1785,6 +1785,40 @@ async fn a_publisher_the_launcher_left_off_is_refused_in_the_launchers_words() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// Only a line the launcher wrote replaces the standing text: an entry that
+/// is absent, empty, blank or not a string leaves it, and so do server args
+/// that do not parse.
+#[test]
+fn the_kv_events_refusal_falls_back_to_the_standing_text() {
+    let refusal = |server_args_json: &str| {
+        kv_events_refusal(&TokenSpeedModelInfo {
+            server_args_json: server_args_json.to_string(),
+            ..model_info()
+        })
+    };
+    assert_eq!(
+        refusal(r#"{"kv_events_left_off":" left off: a reason "}"#),
+        "left off: a reason"
+    );
+    assert_eq!(
+        refusal(r#"{"model":"org/model"}"#),
+        TOKENSPEED_DISABLED_MESSAGE
+    );
+    assert_eq!(
+        refusal(r#"{"kv_events_left_off":""}"#),
+        TOKENSPEED_DISABLED_MESSAGE
+    );
+    assert_eq!(
+        refusal(r#"{"kv_events_left_off":"  "}"#),
+        TOKENSPEED_DISABLED_MESSAGE
+    );
+    assert_eq!(
+        refusal(r#"{"kv_events_left_off":7}"#),
+        TOKENSPEED_DISABLED_MESSAGE
+    );
+    assert_eq!(refusal(""), TOKENSPEED_DISABLED_MESSAGE);
+}
+
 /// The relay follows the publisher from the servicer's start, before any
 /// gateway subscribes: batches published with nobody listening are in its
 /// history, and the first subscription gets them as the engine's whole state.

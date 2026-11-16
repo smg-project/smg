@@ -233,6 +233,19 @@ fn is_unspecified_address(host: &str) -> bool {
         .is_ok_and(|address| address.is_unspecified())
 }
 
+/// What `SubscribeKvEvents` is refused with when no publisher is relayed:
+/// the launcher's line for a publisher it left off for the model's sake
+/// (`kv_events_left_off` in the server args), else the wire's standing text.
+pub(super) fn kv_events_refusal(model: &TokenSpeedModelInfo) -> String {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    args.get("kv_events_left_off")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|left_off| !left_off.is_empty())
+        .unwrap_or(TOKENSPEED_DISABLED_MESSAGE)
+        .to_string()
+}
+
 /// The role this servicer was launched for against what the engines'
 /// handshakes list: the encode role needs every engine to list the encode
 /// request (an engine before the wire carried it lists none and cannot take
@@ -322,10 +335,8 @@ pub(super) struct State {
     /// How long `HealthCheck`'s probe waits for the scheduler
     /// ([`HEALTH_CHECK_TIMEOUT_ENV`]).
     pub(super) health_probe_timeout: Duration,
-    /// What `SubscribeKvEvents` is refused with when no publisher is
-    /// relayed: the launcher's line for a publisher it left off for the
-    /// model's sake (`kv_events_left_off` in the server args), else the
-    /// wire's standing text.
+    /// What `SubscribeKvEvents` is refused with when no publisher is relayed
+    /// ([`kv_events_refusal`]).
     pub(super) kv_events_disabled: String,
 }
 
@@ -395,15 +406,7 @@ impl TokenSpeedServicerServer {
             config.servicer.metrics_bind_address.is_some(),
         )?;
         let encode_role = encode_role(&config.model)?;
-        let server_args: serde_json::Value =
-            serde_json::from_str(&config.model.server_args_json).unwrap_or_default();
-        let kv_events_disabled = server_args
-            .get("kv_events_left_off")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|left_off| !left_off.is_empty())
-            .unwrap_or(TOKENSPEED_DISABLED_MESSAGE)
-            .to_string();
+        let kv_events_disabled = kv_events_refusal(&config.model);
         let state = Arc::new(State {
             model: config.model,
             shared: Shared::new(
