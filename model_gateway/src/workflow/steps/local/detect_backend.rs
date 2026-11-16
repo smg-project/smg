@@ -17,7 +17,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use super::discover_metadata::ModelsResponse;
 use crate::{
-    worker::{endpoint::Endpoint, ConnectionMode},
+    worker::{identity::endpoint::Endpoint, ConnectionMode},
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::util::{grpc_base_url, grpc_health_answer, http_base_url},
@@ -104,7 +104,9 @@ async fn probe_models_endpoint(
 
     let response = match req.send().await {
         Ok(response) => response,
-        Err(e) => return ModelsProbe::Failed(format!("failed to reach {shown}: {e}")),
+        Err(e) => {
+            return ModelsProbe::Failed(format!("failed to reach {shown}: {}", e.without_url()))
+        }
     };
 
     if !response.status().is_success() {
@@ -145,8 +147,9 @@ async fn try_vllm_version(
 
     let response = req.send().await.map_err(|e| {
         format!(
-            "Failed to reach {}: {e}",
-            Endpoint::redacted_str(&version_url)
+            "Failed to reach {}: {}",
+            Endpoint::redacted_str(&version_url),
+            e.without_url()
         )
     })?;
 
@@ -173,10 +176,13 @@ async fn try_sglang_server_info(
         req = req.bearer_auth(key);
     }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach {}: {e}", Endpoint::redacted_str(&info_url)))?;
+    let response = req.send().await.map_err(|e| {
+        format!(
+            "Failed to reach {}: {}",
+            Endpoint::redacted_str(&info_url),
+            e.without_url()
+        )
+    })?;
 
     if !response.status().is_success() {
         return Err(format!("/server_info returned {}", response.status()));
@@ -515,9 +521,8 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn http_detection_failures_name_the_worker_masked() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
 
         let err = detect_http_backend(
             &format!("http://user:secret@127.0.0.1:{port}"),
@@ -538,6 +543,21 @@ mod tests {
         assert!(logs_contain(&format!(
             "http://***@127.0.0.1:{port}/v1/models"
         )));
+    }
+
+    /// An address registered with a query, at a port nobody listens on: the
+    /// failure does not repeat the query. The HTTP client's own error text
+    /// ends with the request URL, the query kept.
+    #[tokio::test]
+    async fn http_detection_failures_go_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}?token=s3cret", refused.http_url());
+
+        let err = detect_http_backend(&url, 1, &http_client(), None)
+            .await
+            .unwrap_err();
+
+        assert!(!err.contains("s3cret"), "{err}");
     }
 
     #[tokio::test]

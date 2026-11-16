@@ -83,7 +83,7 @@ use smg::{
     routers::RouterTrait,
     tenant::TenantKey,
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         RuntimeType, Worker, WorkerType,
     },
 };
@@ -1353,7 +1353,7 @@ fn a_sequential_prefill_whose_calls_queue_is_not_given_up_on() {
             async move {
                 let mut largest = Duration::ZERO;
                 while !done.load(Ordering::Acquire) {
-                    largest = largest.max(prefill.prefill_backlog());
+                    largest = largest.max(prefill.runtime_state().unwrap().prefill_backlog());
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 largest

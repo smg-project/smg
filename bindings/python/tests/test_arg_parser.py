@@ -2748,6 +2748,28 @@ class TestPowerOfTwoLoadMetric:
             parse_router_args(["--power-of-two-load-metric", "resident_tokens"])
 
 
+class TestGroupedDpSticky:
+    """--grouped-dp-sticky takes the Rust CLI's choices with its default (off: no
+    request is pinned to an engine of a grouped worker) and reaches the Rust router."""
+
+    def test_default_is_the_rust_cli_default(self):
+        assert RouterArgs().grouped_dp_sticky == "off"
+        assert parse_router_args([]).grouped_dp_sticky == "off"
+
+    @pytest.mark.parametrize("mode", ["off", "hash"])
+    def test_each_choice_parses(self, mode):
+        assert parse_router_args(["--grouped-dp-sticky", mode]).grouped_dp_sticky == mode
+        assert _prefixed(["--router-grouped-dp-sticky", mode]).grouped_dp_sticky == mode
+
+    def test_an_unknown_mode_is_refused_at_parse_time(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--grouped-dp-sticky", "round_robin"])
+
+    def test_reaches_the_rust_router(self):
+        assert _rust_router_kwargs(grouped_dp_sticky="hash")["grouped_dp_sticky"] == "hash"
+        assert _rust_router_kwargs()["grouped_dp_sticky"] == "off"
+
+
 class TestRuntimeWorkerThreads:
     """--runtime-worker-threads is a launcher option, unset by default as on the Rust
     CLI (the runtime's own size), and reaches the Rust router; a negative count is

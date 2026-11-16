@@ -753,6 +753,39 @@ def test_the_launcher_builds_the_model_config_once_for_the_default_and_the_facts
     )
 
 
+def test_the_facts_say_why_the_default_left_the_publisher_off(monkeypatch, caplog):
+    """A launcher whose engine cannot serve the publisher for the model writes
+    the line it logged into the server args (``kv_events_left_off``), where
+    the Rust servicer reads what it refuses ``SubscribeKvEvents`` with. A
+    publisher that is on, or off by an explicit configuration or the opt-out,
+    writes none."""
+    _install_cache_vocabulary(monkeypatch)
+    _stub_servicer_module(monkeypatch)
+    hybrid = _model_config_of("linear_attention", "full_attention")
+    monkeypatch.setattr(rust, "_model_config", lambda args: hybrid)
+
+    def server_args_of(args):
+        launcher = rust.TokenSpeedLauncher()
+        launcher.kv_events_default(args)
+        return json.loads(launcher.facts(args)["server_args_json"])
+
+    with caplog.at_level(logging.INFO, logger=rust_lifecycle.logger.name):
+        left_off = server_args_of(FakeServerArgs())["kv_events_left_off"]
+    assert left_off.startswith(
+        "KV event publishing left off: org/m keeps recurrent state in 1 of its 2 layers "
+    )
+    assert left_off.endswith("; pass --kv-events-config to turn the publisher on anyway")
+    assert left_off in caplog.text
+
+    given = '{"enable_kv_cache_events": true, "publisher": "zmq", "endpoint": "tcp://*:5600"}'
+    assert "kv_events_left_off" not in server_args_of(FakeServerArgs(kv_events_config=given))
+    monkeypatch.setenv(rust.KV_EVENTS_ENV, "0")
+    assert "kv_events_left_off" not in server_args_of(FakeServerArgs())
+    monkeypatch.delenv(rust.KV_EVENTS_ENV)
+    monkeypatch.setattr(rust, "_model_config", lambda args: _model_config_of("full_attention"))
+    assert "kv_events_left_off" not in server_args_of(FakeServerArgs())
+
+
 @pytest.fixture
 def restore_fault_signals():
     """The rank launch installs SIGUSR1/SIGQUIT handlers in this process; put

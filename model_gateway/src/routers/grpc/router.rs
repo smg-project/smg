@@ -23,9 +23,11 @@ use uuid::Uuid;
 use super::{
     common::{
         responses::{
-            background, handlers::cancel_response_impl, streaming::build_sse_response_from_stream,
-            utils::validate_worker_availability, BackgroundResponses, BackgroundStream,
-            ResponsesContext,
+            background,
+            handlers::cancel_response_impl,
+            streaming::build_sse_response_from_stream,
+            utils::{refuse_tools_without_a_direct_caller, validate_worker_availability},
+            BackgroundResponses, BackgroundStream, ResponsesContext,
         },
         stages::{
             context_length_exceeded, helpers::resolve_request_id_stamp, smallest_context_length,
@@ -218,8 +220,6 @@ impl GrpcRouter {
                 .ok_or_else(|| "gRPC router requires MCP manager".to_string())?
                 .clone();
 
-            // Capture storage request context from middleware task-local (before any spawn)
-            let storage_request_context = smg_data_connector::current_request_context();
             // One registry of background responses for both contexts: one cap,
             // one place a cancel looks a running id up.
             let background_responses = Arc::new(BackgroundResponses::new(
@@ -236,7 +236,11 @@ impl GrpcRouter {
                     ctx.conversation_item_storage.clone(),
                     mcp_orchestrator.clone(),
                     ctx.mcp_format_registry.clone(),
-                    storage_request_context.clone(),
+                    // No storage context at start-up (outside any request):
+                    // each Responses branch of `route_responses_impl` derives
+                    // this request's context in the request task, and a cancel
+                    // runs under the middleware's live task-local.
+                    None,
                     background_responses.clone(),
                 )
             };
@@ -486,16 +490,15 @@ impl GrpcRouter {
                 "Responses endpoint not implemented",
             );
         };
-        let Some(harmony_pipeline) = self.harmony_pipeline.as_ref() else {
-            return error::not_implemented(
-                "responses_not_implemented",
-                "Responses endpoint not implemented",
-            );
-        };
 
         // 0. Fast worker validation (fail-fast before expensive operations)
         if let Some(error_response) = validate_worker_availability(&self.worker_registry, model_id)
         {
+            return error_response;
+        }
+        // A tool only code may call has no caller on this router, which runs
+        // no programmatic tool calls.
+        if let Some(error_response) = refuse_tools_without_a_direct_caller(body.tools.as_deref()) {
             return error_response;
         }
 
@@ -510,20 +513,18 @@ impl GrpcRouter {
         // `background: true` answers the queued object at once and runs the
         // work behind the response id; with the mode switched off such a
         // request runs in the foreground, and its object says so.
+        clear_unapplied_reasoning_keys(&mut body);
         if body.background == Some(true) {
             if responses_context.background.enabled() {
                 let request_context = smg_data_connector::current_request_context();
-                let ctx = if is_harmony {
-                    self.harmony_responses_context(
-                        harmony_pipeline,
-                        harmony_responses_context,
-                        request_context,
-                    )
+                let base = if is_harmony {
+                    harmony_responses_context
                 } else {
-                    ResponsesContext {
-                        request_context,
-                        ..responses_context.clone()
-                    }
+                    responses_context
+                };
+                let ctx = ResponsesContext {
+                    request_context,
+                    ..base.clone()
                 };
                 return self
                     .route_background_responses(
@@ -545,11 +546,10 @@ impl GrpcRouter {
                 model_id,
                 body.stream.unwrap_or(false)
             );
-            let harmony_ctx = self.harmony_responses_context(
-                harmony_pipeline,
-                harmony_responses_context,
-                smg_data_connector::current_request_context(),
-            );
+            let harmony_ctx = ResponsesContext {
+                request_context: smg_data_connector::current_request_context(),
+                ..harmony_responses_context.clone()
+            };
 
             if body.stream.unwrap_or(false) {
                 serve_harmony_responses_stream(&harmony_ctx, body, tenant_meta.clone(), None).await
@@ -560,8 +560,15 @@ impl GrpcRouter {
                 }
             }
         } else {
+            // This request's storage context, read in the request task: the
+            // stream persists from a task of its own, where the middleware's
+            // task-local is gone.
+            let ctx = ResponsesContext {
+                request_context: smg_data_connector::current_request_context(),
+                ..responses_context.clone()
+            };
             responses::route_responses(
-                responses_context,
+                &ctx,
                 Arc::new(body),
                 headers.cloned(),
                 tenant_meta.clone(),
@@ -569,28 +576,6 @@ impl GrpcRouter {
             )
             .await
         }
-    }
-
-    /// The per-request context of the Harmony Responses path: the Harmony
-    /// pipeline with the shared storage and MCP handles and this request's
-    /// storage context.
-    fn harmony_responses_context(
-        &self,
-        harmony_pipeline: &RequestPipeline,
-        harmony_responses_context: &ResponsesContext,
-        request_context: Option<smg_data_connector::RequestContext>,
-    ) -> ResponsesContext {
-        ResponsesContext::new(
-            Arc::new(harmony_pipeline.clone()),
-            self.shared_components.clone(),
-            harmony_responses_context.response_storage.clone(),
-            harmony_responses_context.conversation_storage.clone(),
-            harmony_responses_context.conversation_item_storage.clone(),
-            harmony_responses_context.mcp_orchestrator.clone(),
-            harmony_responses_context.mcp_format_registry.clone(),
-            request_context,
-            harmony_responses_context.background.clone(),
-        )
     }
 
     /// `background: true`: the `queued` Response object is stored under a new
@@ -1368,6 +1353,24 @@ fn canonicalize_responses_request<'a>(
     body.model.clear();
     body.model.push_str(&canonical_model);
     Cow::Owned(canonical_model.to_string())
+}
+
+/// Clears the reasoning config's `mode`, `context` and `generate_summary`,
+/// which no engine behind this router applies.
+///
+/// The router reads only `effort` from the config (the chat request's
+/// `reasoning_effort`, or the Harmony prompt's). Every Response object it
+/// writes for the request echoes the config: the streamed terminal event,
+/// the non-streamed body and the stored object that
+/// `GET /v1/responses/{id}` reads back. Left in, a `mode: "pro"` request
+/// would read back as run in `pro` mode on an engine that ran in its
+/// default. `effort` and `summary` are echoed as before.
+fn clear_unapplied_reasoning_keys(body: &mut ResponsesRequest) {
+    if let Some(reasoning) = body.reasoning.as_mut() {
+        reasoning.mode = None;
+        reasoning.context = None;
+        reasoning.generate_summary = None;
+    }
 }
 
 #[cfg(test)]

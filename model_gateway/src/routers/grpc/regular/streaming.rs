@@ -65,7 +65,7 @@ use crate::{
             context,
             proto_wrapper::{
                 ProtoGenerateComplete, ProtoGenerateResponse, ProtoGenerateStreamChunk,
-                ProtoInputLogProbs, ProtoResponseVariant, ProtoStream,
+                ProtoInputLogProbs, ProtoOutputLogProbs, ProtoResponseVariant, ProtoStream,
             },
             spec::{
                 ChatResponseSpec, CompletionResponseSpec, GenerateResponseSpec,
@@ -84,8 +84,8 @@ mod frames;
 use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
     frames::{
-        assistant_choice, forces_tool_call, opening_choice, text_delta, ChatChunkFrame,
-        CompletionChunkFrame, EscapedText, FrameSink, CHUNK_FLUSH_BYTES, FRAME_ROOM,
+        assistant_choice, forces_tool_call, opening_choice, push_json, text_delta, ChatChunkFrame,
+        CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHUNK_FLUSH_BYTES, FRAME_ROOM,
     },
 };
 #[cfg(test)]
@@ -287,7 +287,8 @@ struct GenerateEvent<'a> {
 impl GenerateEvent<'_> {
     /// Append the event's JSON to `buffer`: the bytes serde writes for the
     /// struct (its keys as literals, the text's literal from the choice, the
-    /// ids, the `meta_info` and the index through serde), pinned by
+    /// ids and the index through serde, the `meta_info` in one pass by
+    /// [`GenerateMetaInfo::write_into`]), pinned by
     /// `tests::generate_event_frames_write_the_bytes_of_the_serialized_event`.
     fn write_into(&self, buffer: &mut BytesMut) -> serde_json::Result<()> {
         // Matched field by field with no rest pattern, so a field added to the
@@ -303,7 +304,7 @@ impl GenerateEvent<'_> {
         buffer.extend_from_slice(b",\"output_ids\":");
         serde_json::to_writer(FrameSink(buffer), output_ids)?;
         buffer.extend_from_slice(b",\"meta_info\":");
-        serde_json::to_writer(FrameSink(buffer), meta_info)?;
+        meta_info.write_into(buffer)?;
         buffer.extend_from_slice(b",\"index\":");
         serde_json::to_writer(FrameSink(buffer), index)?;
         buffer.extend_from_slice(b"}");
@@ -313,7 +314,9 @@ impl GenerateEvent<'_> {
 
 /// The `meta_info` of a generate event: the logprob fields on the stream that
 /// carries logprobs only (`null` there when it has none), `e2e_latency` on the
-/// finish event only, as the events always had them.
+/// finish event only, as the events always had them. The `Serialize` derive
+/// is the shape serde writes, the oracle of the frame test; an event writes
+/// it through [`Self::write_into`].
 #[derive(Serialize)]
 struct GenerateMetaInfo<'a> {
     id: &'a str,
@@ -327,6 +330,66 @@ struct GenerateMetaInfo<'a> {
     reasoning_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     e2e_latency: Option<f64>,
+}
+
+impl GenerateMetaInfo<'_> {
+    /// Append the object's JSON to `buffer`: the bytes serde writes for the
+    /// struct, its keys and brackets as literals and its values through the
+    /// calls serde makes for them (the two strings escaped, the counters in
+    /// decimal, the finish reason, the logprob lists and the latency as it
+    /// writes those values), the logprob pair and the latency present where
+    /// the derive writes them. Walked as a struct, the object cost an escape
+    /// scan and three writes per key on every event (seven keys a token, nine
+    /// with the logprob pair) and the flattened field's map dispatch: about a
+    /// quarter of a generate stream request's user instructions. Pinned by
+    /// `tests::generate_event_frames_write_the_bytes_of_the_serialized_event`.
+    fn write_into(&self, buffer: &mut BytesMut) -> serde_json::Result<()> {
+        // Matched field by field with no rest pattern, so a field added to the
+        // object is a compile error here until this write says where it goes.
+        let Self {
+            id,
+            finish_reason,
+            prompt_tokens,
+            weight_version,
+            logprobs,
+            completion_tokens,
+            cached_tokens,
+            reasoning_tokens,
+            e2e_latency,
+        } = self;
+        buffer.extend_from_slice(b"{\"id\":");
+        push_json(FrameSink(buffer), id);
+        buffer.extend_from_slice(b",\"finish_reason\":");
+        // The finish reason's `Serialize` lives in another crate, so its write
+        // keeps the fallible path rather than the infallible one.
+        serde_json::to_writer(FrameSink(buffer), finish_reason)?;
+        buffer.extend_from_slice(b",\"prompt_tokens\":");
+        push_json(FrameSink(buffer), prompt_tokens);
+        buffer.extend_from_slice(b",\"weight_version\":");
+        push_json(FrameSink(buffer), weight_version);
+        if let Some(GenerateLogprobs {
+            input_token_logprobs,
+            output_token_logprobs,
+        }) = logprobs
+        {
+            buffer.extend_from_slice(b",\"input_token_logprobs\":");
+            push_json(FrameSink(buffer), input_token_logprobs);
+            buffer.extend_from_slice(b",\"output_token_logprobs\":");
+            push_json(FrameSink(buffer), output_token_logprobs);
+        }
+        buffer.extend_from_slice(b",\"completion_tokens\":");
+        push_json(FrameSink(buffer), completion_tokens);
+        buffer.extend_from_slice(b",\"cached_tokens\":");
+        push_json(FrameSink(buffer), cached_tokens);
+        buffer.extend_from_slice(b",\"reasoning_tokens\":");
+        push_json(FrameSink(buffer), reasoning_tokens);
+        if let Some(e2e_latency) = e2e_latency {
+            buffer.extend_from_slice(b",\"e2e_latency\":");
+            push_json(FrameSink(buffer), e2e_latency);
+        }
+        buffer.extend_from_slice(b"}");
+        Ok(())
+    }
 }
 
 /// The logprob fields of a generate event on the stream that carries them.
@@ -1762,8 +1825,9 @@ impl StreamingProcessor {
     /// owns moves into its chunk, and a text the event borrows from the delta
     /// is written from there, with no copy of its own. A bare text delta, the
     /// per-token case, is written in one pass ([`ChatChunkFrame::write_text_delta`];
-    /// with the token's logprobs, [`ChatChunkFrame::write_text_delta_logprobs`]);
-    /// every other chunk goes through serde.
+    /// with the token's logprobs, [`ChatChunkFrame::write_text_delta_logprobs_view`],
+    /// straight from the engine message's view, the chunk's logprobs riding on
+    /// the step's first delta); every other chunk goes through serde.
     ///
     /// Returns whether the buffer reached its flush size, checked after every
     /// event: the caller then awaits the flush and calls again until the
@@ -1771,12 +1835,15 @@ impl StreamingProcessor {
     /// one dropped early would discard the rest) are exhausted, so one frame
     /// stays a bounded burst; a step whose frames fit makes one call and
     /// builds and moves no future.
+    #[expect(clippy::too_many_arguments)]
     fn write_events(
         buffer: &mut BytesMut,
         frame: &ChatChunkFrame,
         index: u32,
         events: &mut std::vec::Drain<'_, Event<'_>>,
-        logprobs: &mut Option<ChatLogProbs>,
+        logprobs: &mut Option<ProtoOutputLogProbs<'_>>,
+        tokenizer: &Arc<dyn Tokenizer>,
+        top_logprobs: Option<u32>,
         usage: Option<&Usage>,
         emit_usage_null: bool,
     ) -> bool {
@@ -1787,29 +1854,42 @@ impl StreamingProcessor {
             if choice.finish_reason.is_some() {
                 continue;
             }
-            choice.logprobs = logprobs.take();
-            match text_delta(&choice) {
-                Some((field, text, None)) => {
-                    frame.write_text_delta(buffer, index, field, text, usage, emit_usage_null);
+            // The chunk's logprobs ride on the step's first delta: a bare text
+            // delta writes them straight from the view; another shape carries
+            // them converted, inside its serialized choice.
+            if let Some((field, text)) = text_delta(&choice) {
+                match logprobs.take() {
+                    Some(view) => frame.write_text_delta_logprobs_view(
+                        buffer,
+                        index,
+                        field,
+                        text,
+                        view,
+                        utils::requested_alternatives(top_logprobs),
+                        utils::token_decoder(tokenizer),
+                        usage,
+                        emit_usage_null,
+                    ),
+                    None => {
+                        frame.write_text_delta(buffer, index, field, text, usage, emit_usage_null);
+                    }
                 }
-                Some((field, text, Some(logprobs))) => frame.write_text_delta_logprobs(
-                    buffer,
-                    index,
-                    field,
-                    text,
-                    logprobs,
-                    usage,
-                    emit_usage_null,
-                ),
-                None => frame.write_chunk(buffer, &choice, usage, emit_usage_null),
+            } else {
+                choice.logprobs = logprobs.take().map(|view| {
+                    utils::convert_proto_to_openai_logprobs(view, tokenizer, top_logprobs)
+                });
+                frame.write_chunk(buffer, &choice, usage, emit_usage_null);
             }
             if buffer.len() >= CHUNK_FLUSH_BYTES {
                 return true;
             }
         }
-        if utils::has_entries(logprobs.as_ref()) {
+        let leftover = logprobs
+            .take()
+            .map(|view| utils::convert_proto_to_openai_logprobs(view, tokenizer, top_logprobs));
+        if utils::has_entries(leftover.as_ref()) {
             let mut choice = assistant_choice(index, None, None, None);
-            choice.logprobs = logprobs.take();
+            choice.logprobs = leftover;
             frame.write_chunk(buffer, &choice, usage, emit_usage_null);
         }
         buffer.len() >= CHUNK_FLUSH_BYTES
@@ -2050,16 +2130,18 @@ impl StreamingProcessor {
     /// `thinking_text` as there) and the reasoning tokens they cost are added to `thinking_tokens`,
     /// under `who` for the telemetry of the output's end. The stream's `delta` and `spare` buffer
     /// are read as a step's are, so events that wait in `spare` (the prompt's, when the message
-    /// ends before any chunk) go out in their order; the machine writes into `blocks` as a step's does.
+    /// ends before any chunk) go out in their order; the machine writes into `blocks` as a step's
+    /// does, under the stream's object rule (`input`).
     #[expect(clippy::too_many_arguments)]
     async fn end_symphony_message(
         tx: &SseSender,
         buffer: &mut BytesMut,
         (reader, machine): (&mut Reader, &mut adapt::messages::Stream),
-        (delta, spare, blocks): (
+        (delta, spare, blocks, input): (
             &mut Delta,
             &mut Events<'static>,
             &mut Vec<MessageStreamEvent>,
+            &mut ToolInput,
         ),
         flushed: Option<String>,
         finish: EngineFinish,
@@ -2073,7 +2155,8 @@ impl StreamingProcessor {
         reader.end(finish, who, &mut events)?;
         *thinking_tokens += reasoning_text_tokens(events.as_slice());
         let stop =
-            Self::send_symphony_blocks(tx, buffer, (machine, blocks), events.as_slice()).await;
+            Self::send_symphony_blocks(tx, buffer, (machine, blocks, input), events.as_slice())
+                .await;
         *spare = events.recycle();
         stop
     }
@@ -2087,10 +2170,18 @@ impl StreamingProcessor {
     /// answer, goes straight from the borrowed text into the buffer ([`Self::write_text_delta`])
     /// when the machine says it would send exactly that
     /// ([`adapt::messages::Stream::direct_text_index`]): no owned event and no `String` per delta.
+    /// A `tool_use` block's `input_json_delta`s leave under the stream's object rule (`input`,
+    /// [`ToolInput`]): the machine hands a call's fragments over as written, as the fold hands the
+    /// buffered answer the whole value, and the gateway keeps the block an object on both,
+    /// as `processor::object_inputs` does for the buffered answer.
     async fn send_symphony_blocks(
         tx: &SseSender,
         buffer: &mut BytesMut,
-        (machine, blocks): (&mut adapt::messages::Stream, &mut Vec<MessageStreamEvent>),
+        (machine, blocks, input): (
+            &mut adapt::messages::Stream,
+            &mut Vec<MessageStreamEvent>,
+            &mut ToolInput,
+        ),
         events: &[Event<'_>],
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
         if let [Event::Content(text)] = events {
@@ -2105,6 +2196,19 @@ impl StreamingProcessor {
             stop = machine.feed(event, blocks).or(stop);
         }
         for block in blocks.iter() {
+            match block {
+                MessageStreamEvent::ContentBlockStart {
+                    content_block: ContentBlock::ToolUse { id, .. },
+                    ..
+                } => input.opened(id),
+                MessageStreamEvent::ContentBlockDelta {
+                    delta: ContentBlockDelta::InputJsonDelta { partial_json },
+                    ..
+                } if !input.takes("StreamingProcessor::send_symphony_blocks", partial_json) => {
+                    continue;
+                }
+                _ => {}
+            }
             Self::write_messages_event(tx, buffer, block).await?;
         }
         Ok(stop)
@@ -3134,8 +3238,10 @@ impl<'a> ChatChunkWithUsage<'a> {
 
 /// Text a choice's decoder released for one engine message, on its way to
 /// the parsers and the client: the choice index, the text, the logprobs that
-/// ride with it, and the tokens it stands for (held ones included).
-type PendingText = (u32, String, Option<ChatLogProbs>, u32);
+/// ride with it (the engine message's view, read in place: the plain text
+/// delta writes them straight from it, every other chunk shape converts them
+/// where it takes them), and the tokens it stands for (held ones included).
+type PendingText<'a> = (u32, String, Option<ProtoOutputLogProbs<'a>>, u32);
 
 /// What one pass of the loop over the engine's end yields.
 enum StreamEnd {
@@ -3144,7 +3250,7 @@ enum StreamEnd {
     /// This pass released nothing to emit.
     Nothing,
     /// Text to emit, and whether it is the parsers' EOF turn for its choice.
-    Text(PendingText, bool),
+    Text(PendingText<'static>, bool),
 }
 
 /// The failure of a choice's decoder: where Symphony reads the choice and its output is not over,
@@ -3513,7 +3619,15 @@ impl<'a> ChatStream<'a> {
 
     /// The logprobs of an engine chunk, in the public API's shape.
     fn logprobs_of(&self, chunk: &ProtoGenerateStreamChunk) -> Option<ChatLogProbs> {
-        chunk.output_logprobs().map(|proto_logprobs| {
+        self.logprobs_from(chunk.output_logprobs())
+    }
+
+    /// A chunk's logprobs view converted to the public API's shape, for the
+    /// chunk shapes that carry them inside a serialized choice (a reasoning
+    /// delta, a tool-call delta, a chunk with an empty delta); the plain text
+    /// delta writes them straight from the view instead.
+    fn logprobs_from(&self, view: Option<ProtoOutputLogProbs<'_>>) -> Option<ChatLogProbs> {
+        view.map(|proto_logprobs| {
             utils::convert_proto_to_openai_logprobs(
                 proto_logprobs,
                 &self.tokenizer,
@@ -3673,10 +3787,10 @@ impl<'a> ChatStream<'a> {
     /// Symphony's reader, which emits its events here) into the text the
     /// emission parses, with the tokens of chunks that decoded to nothing
     /// yet counted with it.
-    async fn read_chunk(
+    async fn read_chunk<'c>(
         &mut self,
-        chunk: &ProtoGenerateStreamChunk,
-    ) -> Result<Option<PendingText>, utils::StreamFailure> {
+        chunk: &'c ProtoGenerateStreamChunk,
+    ) -> Result<Option<PendingText<'c>>, utils::StreamFailure> {
         // Track TTFT immediately on first chunk received from backend
         self.note_first_token();
 
@@ -3792,7 +3906,7 @@ impl<'a> ChatStream<'a> {
                 }
             }
             let usage = self.usage_snapshot();
-            let mut choice_logprobs = self.logprobs_of(chunk);
+            let mut choice_logprobs = chunk.output_logprobs();
             let mut pending = events.consume();
             while StreamingProcessor::write_events(
                 &mut self.sse_buffer,
@@ -3800,6 +3914,8 @@ impl<'a> ChatStream<'a> {
                 index,
                 &mut pending,
                 &mut choice_logprobs,
+                &self.tokenizer,
+                self.spec.top_logprobs,
                 usage.as_ref(),
                 self.emit_usage_null,
             ) {
@@ -3834,8 +3950,7 @@ impl<'a> ChatStream<'a> {
             return Ok(None);
         }
 
-        // Process logprobs if present
-        let choice_logprobs = self.logprobs_of(chunk);
+        let choice_logprobs = chunk.output_logprobs();
 
         let chunk_tokens = chunk.token_ids().len() as u32
             + std::mem::take(&mut self.choices[index as usize].held_tokens);
@@ -3850,7 +3965,7 @@ impl<'a> ChatStream<'a> {
     async fn read_complete(
         &mut self,
         complete: &ProtoGenerateComplete,
-    ) -> Result<Option<PendingText>, utils::StreamFailure> {
+    ) -> Result<Option<PendingText<'static>>, utils::StreamFailure> {
         let index = complete.index();
         let request_id = &self.dispatch.request_id;
 
@@ -4014,7 +4129,7 @@ impl<'a> ChatStream<'a> {
             *parsed_reasoning_tokens = finished.reasoning_tokens;
         }
         let usage = self.usage_snapshot();
-        let mut no_logprobs: Option<ChatLogProbs> = None;
+        let mut no_logprobs: Option<ProtoOutputLogProbs<'_>> = None;
         let mut pending = events.consume();
         while StreamingProcessor::write_events(
             &mut self.sse_buffer,
@@ -4022,6 +4137,8 @@ impl<'a> ChatStream<'a> {
             index,
             &mut pending,
             &mut no_logprobs,
+            &self.tokenizer,
+            self.spec.top_logprobs,
             usage.as_ref(),
             self.emit_usage_null,
         ) {
@@ -4144,7 +4261,7 @@ impl<'a> ChatStream<'a> {
                 *parsed_reasoning_tokens = finished.reasoning_tokens;
             }
             let usage = self.usage_snapshot();
-            let mut no_logprobs: Option<ChatLogProbs> = None;
+            let mut no_logprobs: Option<ProtoOutputLogProbs<'_>> = None;
             let mut pending = events.consume();
             while StreamingProcessor::write_events(
                 &mut self.sse_buffer,
@@ -4152,6 +4269,8 @@ impl<'a> ChatStream<'a> {
                 index,
                 &mut pending,
                 &mut no_logprobs,
+                &self.tokenizer,
+                self.spec.top_logprobs,
                 usage.as_ref(),
                 self.emit_usage_null,
             ) {
@@ -4228,7 +4347,7 @@ impl<'a> ChatStream<'a> {
     /// the public API streams; `final_chunk` is the parsers' EOF turn.
     async fn emit(
         &mut self,
-        pending: PendingText,
+        pending: PendingText<'_>,
         final_chunk: bool,
     ) -> Result<(), utils::StreamFailure> {
         let (index, text, mut choice_logprobs, chunk_tokens) = pending;
@@ -4275,7 +4394,7 @@ impl<'a> ChatStream<'a> {
                 // The chunk's token logprobs ride on its reasoning delta when
                 // none of its text is content, as on a content delta.
                 if normal_text.is_empty() {
-                    choice.logprobs = choice_logprobs.take();
+                    choice.logprobs = self.logprobs_from(choice_logprobs.take());
                 }
                 StreamingProcessor::push_chunk(
                     self.tx,
@@ -4347,7 +4466,7 @@ impl<'a> ChatStream<'a> {
                 // deltas, as on a content delta; a chunk the parser holds
                 // whole goes out as an empty delta with them.
                 if let Some(first) = tool_choices.first_mut() {
-                    first.logprobs = choice_logprobs.take();
+                    first.logprobs = self.logprobs_from(choice_logprobs.take());
                 }
                 for choice in &tool_choices {
                     StreamingProcessor::push_chunk(
@@ -4361,7 +4480,8 @@ impl<'a> ChatStream<'a> {
                     .await
                     .map_err(|()| "Failed to send tool call chunk".to_string())?;
                 }
-                self.push_bare_logprobs(index, choice_logprobs, usage.as_ref())
+                let leftover = self.logprobs_from(choice_logprobs);
+                self.push_bare_logprobs(index, leftover, usage.as_ref())
                     .await?;
 
                 // Always skip regular content when tool parsing is active
@@ -4370,24 +4490,43 @@ impl<'a> ChatStream<'a> {
             }
         }
 
-        // Regular content emission
+        // Regular content emission: a delta carrying the token's logprobs (the
+        // common chunk of a logprobs stream) is written in one pass from the
+        // engine message's view.
         if !delta.is_empty() {
-            let mut choice = assistant_choice(index, Some(delta), None, None);
-            choice.logprobs = choice_logprobs.take();
-            StreamingProcessor::push_chunk(
-                self.tx,
-                &mut self.sse_buffer,
-                &self.chunk_frame,
-                &choice,
-                usage.as_ref(),
-                self.emit_usage_null,
-            )
-            .await
-            .map_err(|()| "Failed to send content chunk".to_string())?;
+            if let Some(view) = choice_logprobs.take() {
+                self.chunk_frame.write_text_delta_logprobs_view(
+                    &mut self.sse_buffer,
+                    index,
+                    TextDelta::Content,
+                    &delta,
+                    view,
+                    utils::requested_alternatives(self.spec.top_logprobs),
+                    utils::token_decoder(&self.tokenizer),
+                    usage.as_ref(),
+                    self.emit_usage_null,
+                );
+                StreamingProcessor::flush_when_full(self.tx, &mut self.sse_buffer)
+                    .await
+                    .map_err(|()| "Failed to send content chunk".to_string())?;
+            } else {
+                let choice = assistant_choice(index, Some(delta), None, None);
+                StreamingProcessor::push_chunk(
+                    self.tx,
+                    &mut self.sse_buffer,
+                    &self.chunk_frame,
+                    &choice,
+                    usage.as_ref(),
+                    self.emit_usage_null,
+                )
+                .await
+                .map_err(|()| "Failed to send content chunk".to_string())?;
+            }
         }
         // A chunk whose text made no delta (a marker the reasoning parser
         // consumed) still carries its logprobs, on a chunk with an empty delta.
-        self.push_bare_logprobs(index, choice_logprobs, usage.as_ref())
+        let leftover = self.logprobs_from(choice_logprobs);
+        self.push_bare_logprobs(index, leftover, usage.as_ref())
             .await?;
         Ok(())
     }
@@ -4674,10 +4813,94 @@ struct ContentBlocks {
     thinking_open: bool,
     text_open: bool,
     tool_open: bool,
+    /// The open `tool_use` block's object rule: whether its arguments were
+    /// seen to open an object, and its id for the log line when not.
+    tool_input: ToolInput,
     /// The request's `thinking.display` withholds the thinking text
     /// (`omitted`): a thinking block closes with one empty `thinking_delta`
     /// before its signature.
     thinking_text_withheld: bool,
+}
+
+/// The object rule of a streamed `tool_use` block's `input`, kept per open
+/// block by both machines of the Messages stream (the parsers'
+/// [`ContentBlocks`], and Symphony's, whose events
+/// [`StreamingProcessor::send_symphony_blocks`] writes): the block's
+/// `input_json_delta`s go out once the arguments' first non-blank byte has
+/// opened an object; arguments that open with anything else are not
+/// written, so the block keeps the empty object it started with, as the
+/// buffered answer's does (`processor::object_input`), and the fallback is
+/// named once in the log. A `tool_use` block's `input` is an object in the
+/// Messages contract; a stream whose pieces spelled an array or a string
+/// would assemble at the client into a block that no request side, this
+/// gateway's included, takes back.
+#[derive(Default, Debug)]
+struct ToolInput {
+    /// The open block's id, for the log line.
+    id: String,
+    /// What the open block's arguments have shown so far.
+    arguments: ToolArguments,
+}
+
+impl ToolInput {
+    /// A `tool_use` block opened for the call `id`: its arguments' first
+    /// non-blank byte decides.
+    fn opened(&mut self, id: &str) {
+        self.id.clear();
+        self.id.push_str(id);
+        self.arguments = ToolArguments::Undecided;
+    }
+
+    /// Whether `partial_json` goes out as the open block's `input_json_delta`:
+    /// the first non-blank byte decides for the block, and the log line of a
+    /// block whose arguments open no object names `function`; blank pieces
+    /// before that byte go nowhere either.
+    fn takes(&mut self, function: &'static str, partial_json: &str) -> bool {
+        if self.arguments == ToolArguments::Undecided {
+            let Some(first) = partial_json.trim_start().chars().next() else {
+                return false;
+            };
+            if first == '{' {
+                self.arguments = ToolArguments::Object;
+            } else {
+                self.arguments = ToolArguments::Dropped;
+                warn!(
+                    function = function,
+                    tool_call_id = %self.id,
+                    error = %format!(
+                        "the arguments do not open an object (they open like {})",
+                        argument_kind(first)
+                    ),
+                    "Failed to parse tool call arguments, defaulting to empty object"
+                );
+            }
+        }
+        self.arguments == ToolArguments::Object
+    }
+}
+
+/// What the open `tool_use` block's arguments have shown so far: nothing
+/// yet, an opening brace, or a first byte that is no object's.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum ToolArguments {
+    #[default]
+    Undecided,
+    Object,
+    Dropped,
+}
+
+/// What the first non-blank byte of a call's arguments opens like, for the
+/// log line of a call whose arguments do not open an object: the byte is
+/// all the stream has read, so the words claim no more than it shows (the
+/// buffered answer's log names the parsed kind, having parsed).
+fn argument_kind(first: char) -> &'static str {
+    match first {
+        '[' => "an array",
+        '"' => "a string",
+        '-' | '0'..='9' => "a number",
+        't' | 'f' | 'n' => "a literal",
+        _ => "something that is not JSON",
+    }
 }
 
 impl ContentBlocks {
@@ -4758,11 +4981,13 @@ impl ContentBlocks {
         tool_call_id: &str,
         name: String,
     ) -> Result<(), String> {
+        let id = message_utils::anthropic_tool_use_id(tool_call_id);
+        self.tool_input.opened(&id);
         self.start(
             tx,
             buffer,
             ContentBlock::ToolUse {
-                id: message_utils::anthropic_tool_use_id(tool_call_id),
+                id,
                 name,
                 input: Value::Object(serde_json::Map::new()),
                 caller: messages::ToolUseCaller::Direct,
@@ -4805,13 +5030,21 @@ impl ContentBlocks {
     }
 
     /// Tool call arguments go to the open `tool_use` block (see
-    /// [`StreamingProcessor::send_tool_arguments`]).
+    /// [`StreamingProcessor::send_tool_arguments`]) under the stream's
+    /// object rule ([`ToolInput::takes`]): once their first non-blank byte
+    /// has opened an object, and not at all when it opened anything else.
     async fn tool_arguments(
         &mut self,
         tx: &SseSender,
         buffer: &mut BytesMut,
         partial_json: String,
     ) -> Result<(), String> {
+        if !self
+            .tool_input
+            .takes("ContentBlocks::tool_arguments", &partial_json)
+        {
+            return Ok(());
+        }
         StreamingProcessor::send_tool_arguments(
             tx,
             buffer,
@@ -4877,6 +5110,9 @@ struct MessagesStream<'a> {
     /// The machine's step buffer: the stream events a step's Symphony events
     /// become, kept across steps like `sse_buffer` and `spare`.
     machine_blocks: Vec<MessageStreamEvent>,
+    /// The object rule of the machine's open `tool_use` block
+    /// ([`ToolInput`]), kept across steps as the block is.
+    machine_input: ToolInput,
 
     // Token tracking
     completion_tokens: CompletionTokenTracker,
@@ -5080,6 +5316,7 @@ impl<'a> MessagesStream<'a> {
             symphony,
             symphony_stop: None,
             machine_blocks: Vec::new(),
+            machine_input: ToolInput::default(),
             delta: Delta::default(),
             spare,
             completion_tokens: CompletionTokenTracker::new(),
@@ -5318,7 +5555,7 @@ impl<'a> MessagesStream<'a> {
             self.symphony_stop = StreamingProcessor::send_symphony_blocks(
                 self.tx,
                 &mut self.sse_buffer,
-                (machine, &mut self.machine_blocks),
+                (machine, &mut self.machine_blocks, &mut self.machine_input),
                 events.as_slice(),
             )
             .await?
@@ -5397,7 +5634,12 @@ impl<'a> MessagesStream<'a> {
                 self.tx,
                 &mut self.sse_buffer,
                 (reader, machine),
-                (&mut self.delta, &mut self.spare, &mut self.machine_blocks),
+                (
+                    &mut self.delta,
+                    &mut self.spare,
+                    &mut self.machine_blocks,
+                    &mut self.machine_input,
+                ),
                 flushed,
                 engine_finish(&self.finish_reason_str),
                 Who {
@@ -5452,7 +5694,12 @@ impl<'a> MessagesStream<'a> {
                 self.tx,
                 &mut self.sse_buffer,
                 (reader, machine),
-                (&mut self.delta, &mut self.spare, &mut self.machine_blocks),
+                (
+                    &mut self.delta,
+                    &mut self.spare,
+                    &mut self.machine_blocks,
+                    &mut self.machine_input,
+                ),
                 flushed,
                 finish,
                 Who {
