@@ -361,6 +361,49 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     Ok(())
 }
 
+/// Why the worker URL door refuses `url`, `None` when it takes it: the
+/// reason of [`validate_worker_url`] alone, without the door's naming of the
+/// address. A reason names no part of the address behind its scheme: the
+/// door refuses what its two readers read apart, and there one reader's
+/// host or port is the other's credential. A scheme the door does not know
+/// is named as written, and no reader takes a scheme for a credential.
+fn worker_url_refusal(url: &str) -> Option<String> {
+    validate_worker_url(url).err().map(|error| match error {
+        ConfigError::InvalidValue { reason, .. } => reason,
+        other => other.to_string(),
+    })
+}
+
+/// Why the worker URL door refuses an address a discovery manifest lists,
+/// `None` when the door takes it: the door's reason alone, so a manifest's
+/// refusal names no part of the address behind its scheme.
+///
+/// A scheme is a known one at the start of the address, as the address type
+/// reads it ([`Scheme::split_from`]) and the registration keeps it, and it
+/// is stored lowercase however the manifest spells it. An address with none
+/// may hold a `://` further in, in a path or a query, and the registration
+/// writes `http://` or `grpc://` before it, by what the engine answers.
+/// Such an address is asked under `http://`: what the door refuses under
+/// `grpc://` it refuses under `http://`, where a client reads a host in
+/// more forms and ends an authority at one character more. One the URL
+/// library cannot read under `http://` is asked under `grpc://`: no HTTP
+/// client builds it, so the registration stores it there or not at all.
+/// What stands behind the scheme is asked as given: the manifest's reader
+/// asks of the address as written, and again as it is kept.
+pub(crate) fn listed_worker_url_refusal(url: &str) -> Option<String> {
+    match Scheme::split_from(url) {
+        Some((scheme, rest)) => worker_url_refusal(&format!("{}{rest}", scheme.as_prefix())),
+        None => {
+            let http = format!("http://{url}");
+            if ::url::Url::parse(&http).is_ok() {
+                worker_url_refusal(&http)
+            } else {
+                worker_url_refusal(&format!("grpc://{url}"))
+            }
+        }
+    }
+}
+
 /// How a refusal of the worker URL door names the address: by the gateway's
 /// masked rendering, and by its scheme alone when that rendering reads a
 /// rank. No caller's address carries a rank, and what stands before the `@`
@@ -3915,6 +3958,56 @@ mod tests {
             text.starts_with("Invalid value for field 'worker_url': tcp://***@10.0.0.5:31000 - "),
             "{text}"
         );
+    }
+
+    /// The door as a discovery manifest's reader asks it: an address with no
+    /// scheme is asked under `http://`, or under `grpc://` where the URL
+    /// library cannot read it under `http://`, a known scheme in any case
+    /// under its lowercase form, and the answer is the door's reason alone,
+    /// which names no part of the address behind its scheme.
+    #[test]
+    fn a_listed_worker_url_is_asked_of_the_door_in_the_forms_it_is_stored_in() {
+        for url in [
+            "10.0.0.11:8000",
+            "user:pass@10.0.0.11:8000",
+            "[2001:db8::1]:8000",
+            "HTTP://10.0.0.11:8000",
+            "grpc://decode.internal:9000",
+            "ipc:///tmp/engine.sock",
+            // The URL library cannot read it under `http://`: asked under
+            // `grpc://`, the one scheme it can be stored with, and taken.
+            "256.1.1.1:8000",
+        ] {
+            assert_eq!(listed_worker_url_refusal(url), None, "{url}");
+        }
+        for (url, reason) in [
+            (
+                "http://adm1n:s3cret@2130706433/",
+                "the gateway cannot read this address as a host and a port",
+            ),
+            (
+                "adm1n:s3cret@2130706433",
+                "the gateway cannot read this address as a host and a port",
+            ),
+            ("Http://s3cret@2130706433", "reads them as a rank suffix"),
+            ("http://adm1n:s3cret@99999999999", "Invalid URL format"),
+            (
+                "grpcs://adm1n:s3cret@w:9000",
+                "grpcs:// workers are not supported",
+            ),
+            // The library reads it under `http://` and the door refuses it
+            // there alone: under `grpc://` the door takes it.
+            ("user\\@worker:50051", "the address reads two ways"),
+        ] {
+            let refusal = listed_worker_url_refusal(url).unwrap_or_default();
+            assert!(refusal.contains(reason), "{url}: {refusal}");
+            for part in ["adm1n", "s3cret", "2130706433", "99999999999"] {
+                assert!(
+                    !refusal.contains(part),
+                    "{url}: the refusal names '{part}': {refusal}"
+                );
+            }
+        }
     }
 
     /// What the two readings agree on stays accepted, however it is
