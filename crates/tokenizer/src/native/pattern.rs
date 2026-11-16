@@ -1771,7 +1771,7 @@ impl Scanner {
     /// text beyond ASCII, a blank run the pass declines, the text's last
     /// block. Where the pass cut nothing the walk goes twice as far before
     /// the pass is tried again, up to [`block::MAX_WALK`], so a text with
-    /// no ASCII stretch pays one test of a block per walk.
+    /// no ASCII stretch pays one test of two blocks per walk.
     #[inline(always)]
     fn for_each_match_by_blocks<const WORDS: bool, F: FnMut(usize, usize)>(
         &self,
