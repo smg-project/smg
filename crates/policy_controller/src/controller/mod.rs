@@ -706,6 +706,7 @@ impl Controller {
             metrics: Arc::clone(&metrics),
             loads,
             decides: Arc::clone(shared.deciders.counts()),
+            store: Arc::clone(&store),
         });
         let mut admin_stop = stop.subscribe();
         tasks.spawn(async move {
