@@ -929,16 +929,18 @@ fn a_sheet_of_a_policy_no_module_replays_is_a_defect() {
     );
 }
 
-/// The store's part of an encode-pair row reads red on a list that is not
-/// the store's. An offered list that leaves the class's ready encoders out,
-/// an offered encoder that is not ready and a permanent gap's refusal
-/// beside a class that serves the request are one defect each. A copied
-/// row is its sheet's row under one renaming of its runtimes: other names
-/// in the same order are no defect, two names made one are.
+/// An encode-pair row reads red on a list that is not the store's and on
+/// an answer that is not the decision's. An offered list that leaves the
+/// class's ready encoders out is a defect of the store's part, and so is an
+/// encoder offered to a request that carries no item. An offered encoder
+/// that is not ready, and a permanent gap's refusal beside a class that
+/// serves the request, are a defect of each part. A copied row is its
+/// sheet's row under one renaming of its runtimes: other names in the same
+/// order are no defect, two names made one are.
 #[test]
-fn an_encode_pair_row_is_held_to_the_stores_lists() {
+fn an_encode_pair_row_is_held_to_the_stores_lists_and_the_decision() {
     let inline = classic::encode_pair::INLINE;
-    let defect_of = |name: &str, change: &dyn Fn(&mut Value)| {
+    let defects_of = |name: &str, change: &dyn Fn(&mut Value)| {
         let mut sheet: Value = serde_json::from_str(inline).expect("the inline sheet");
         let rows = sheet.get_mut("rows").and_then(Value::as_array_mut);
         let row = rows
@@ -946,28 +948,49 @@ fn an_encode_pair_row_is_held_to_the_stores_lists() {
             .iter_mut()
             .find(|row| row.get("name").and_then(Value::as_str) == Some(name));
         change(row.expect("the row of that name"));
-        let (_, mut defects) = replay_sheet(&sheet.to_string(), "sheet");
-        assert_eq!(defects.len(), 1, "{defects:#?}");
-        defects.remove(0)
+        let (_, defects) = replay_sheet(&sheet.to_string(), "sheet");
+        defects
     };
     let placed = "two-runtimes-the-items-go-to-the-encoders-of-the-pushing-pair";
-    assert!(defect_of(placed, &|row| {
+    let unoffered = defects_of(placed, &|row| {
         let offered = row.pointer_mut("/outcome/sequence/0/placed/offered");
         *offered.expect("the offered encoders") = Value::Array(Vec::new());
-    })
-    .contains("was offered the encoders []"));
-    assert!(defect_of(placed, &|row| {
+    });
+    assert!(
+        matches!(unoffered.as_slice(), [one] if one.contains("was offered the encoders []")),
+        "{unoffered:#?}"
+    );
+    let unready = defects_of(placed, &|row| {
         let open = row.pointer_mut("/encoders/1/open");
         *open.expect("the second encoder") = Value::from(false);
-    })
-    .contains("of which [0] are ready"));
+    });
+    assert!(
+        matches!(unready.as_slice(), [store, decision]
+            if store.contains("of which [0] are ready")
+                && decision.contains("replayed [0, 0, 0]")),
+        "{unready:#?}"
+    );
     let refused = "push-a-producer-and-a-consumer-on-two-connectors-are-refused";
-    assert!(defect_of(refused, &|row| {
+    let served = defects_of(refused, &|row| {
         let connector = row.pointer("/encoders/0/connector").cloned();
         let of_prefill = row.pointer_mut("/prefills/0/connector");
         *of_prefill.expect("the prefill's connector") = connector.expect("the encoder's");
-    })
-    .contains("yet the class of prefill 0 holds encoder 0"));
+    });
+    assert!(
+        matches!(served.as_slice(), [store, decision]
+            if store.contains("yet the class of prefill 0 holds encoder 0")
+                && decision.contains("refused as ec_incompatible, replayed")),
+        "{served:#?}"
+    );
+    let bare = "an-encoder-whose-runtime-states-no-handoff-serves-no-item";
+    let read = defects_of(bare, &|row| {
+        let offered = row.pointer_mut("/outcome/sequence/2/placed/offered");
+        *offered.expect("the offered encoders") = Value::from(vec![0]);
+    });
+    assert!(
+        matches!(read.as_slice(), [one] if one.contains("carries no item")),
+        "{read:#?}"
+    );
 
     let held = classic::pair_index::copied_row_defects;
     assert_eq!(held(inline, inline, "sheet"), Vec::<String>::new());

@@ -4,23 +4,33 @@
 //! encoders it offered the request's items and each item's encoder, or a
 //! refusal by its name. Nothing is drawn.
 //!
-//! This module replays the store's part of a row: which encoders hand to
+//! A row replays in two parts. The store's part is which encoders hand to
 //! which prefill ([`EncodeClasses`]). A placed request with items was
 //! offered the encoders of its prefill's class, those that were ready and
 //! take the request's media, and no other. A refusal that names a permanent
 //! gap of the encode side says no class serves the request: no prefill with
 //! a partner names a class that holds an encoder taking its media. A
-//! request without items reads no encoder. The pair, each item's encoder
-//! and the other refusals are the decision's: the rule that places the
-//! items replays them.
+//! request without items reads no encoder.
+//!
+//! The decision's part is every answer whole, through
+//! [`Engine::decide_encode_pair`] over the row's fleet: the pair pick for
+//! pick, whether the items were placed as one key, each key's encoder, and
+//! a refusal by its name. A ring's owner is not one identity in the
+//! gateway's ring and this crate's, so under consistent hashing a key is
+//! held to the encoders it was offered and equal keys to one encoder. The
+//! pair's own refusal is replayed by its name alone.
 //!
 //! A row records the handoff's form on its encoders. The gateway reads a
 //! prefill's form as it reads an encoder's, from the runtime, so a prefill
 //! here states the form its runtime's encoders state in the row.
 
 use serde::Deserialize;
-use smg_policy_controller::store::encoding::{
-    EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer,
+use smg_policy_controller::{
+    fingerprint,
+    store::encoding::{EncodeClasses, EncodeHandoff, EncodeMember, EncodeOffer},
+    Candidate, Constraints, Decision, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine,
+    Health, Identity, MediaCounts, PairPools, PairTable, PolicySpec, PoolFacts, RequestFacts, Role,
+    Scratch, WorkerId,
 };
 
 /// The classic policy these rows record, as a sheet's head names it.
@@ -54,6 +64,7 @@ struct Encoder {
     images: bool,
     references: bool,
     open: bool,
+    in_flight: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,8 +72,20 @@ struct Prefill {
     runtime: String,
     ec_consumer: bool,
     connector: Option<String>,
+    open: bool,
+    in_flight: u32,
     /// The decodes the gateway pairs it with, by index.
     partners: Vec<u32>,
+}
+
+/// A decode as the gateway reads it: whether its registration says it
+/// takes images, and whether it is ready.
+#[derive(Debug, Deserialize)]
+struct Decode {
+    runtime: String,
+    images: bool,
+    open: bool,
+    in_flight: u32,
 }
 
 /// What a request asks of an encoder.
@@ -72,6 +95,11 @@ struct Request {
     items: Vec<String>,
     references: bool,
     images: bool,
+    /// The decode of the pair must take images.
+    decode_images: bool,
+    /// Each item is encoded on its own; without it a pushing runtime
+    /// places the items as one key.
+    fanout: bool,
 }
 
 impl Request {
@@ -82,14 +110,19 @@ impl Request {
     }
 }
 
-/// The part of an answer the store's lists answer for.
+/// The gateway's answer to one request.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Answer {
     Placed {
         prefill: usize,
+        decode: usize,
         /// The encoders the request's items were offered, by index.
         offered: Vec<u32>,
+        /// The keys the items were placed by: each item's, or the one key.
+        keys: Vec<String>,
+        /// Each key's encoder, by index.
+        encoders: Vec<u32>,
     },
     Refused {
         name: String,
@@ -104,8 +137,12 @@ struct Outcome {
 #[derive(Debug, Deserialize)]
 struct Row {
     name: String,
+    prefill_policy: String,
+    decode_policy: String,
+    encode_policy: String,
     encoders: Vec<Encoder>,
     prefills: Vec<Prefill>,
+    decodes: Vec<Decode>,
     requests: Vec<Request>,
     outcome: Outcome,
 }
@@ -195,12 +232,25 @@ fn replay(row: &Row) -> Vec<String> {
     let answered = row.requests.iter().zip(&row.outcome.sequence);
     for (at, (request, answer)) in answered.enumerate() {
         if request.items.is_empty() {
+            // A request without items reads no encoder: an answer that
+            // offers it one is a defect, whatever the classes hold.
+            let offered: &[u32] = match answer {
+                Answer::Placed { offered, .. } => offered,
+                Answer::Refused { .. } => &[],
+            };
+            if !offered.is_empty() {
+                found.push(format!(
+                    "request {at}: it carries no item, yet it was offered the encoders {offered:?}"
+                ));
+            }
             continue;
         }
         let encoder = |place: u32| row.encoders.get(place as usize);
         let takes = |place: u32| encoder(place).is_some_and(|encoder| request.taken_by(encoder));
         match answer {
-            Answer::Placed { prefill, offered } => {
+            Answer::Placed {
+                prefill, offered, ..
+            } => {
                 let class = classes.list(classes.prefill_class(*prefill));
                 let here: Vec<u32> = class
                     .iter()
@@ -231,6 +281,276 @@ fn replay(row: &Row) -> Vec<String> {
                 }
             }
             Answer::Refused { .. } => {}
+        }
+    }
+    found.extend(decided(row, &classes));
+    found
+}
+
+/// The pair policy every row records, and the one an item's encoder is
+/// picked by where no ring places it.
+const FEWEST: &str = "power_of_two:least_requests";
+
+/// The engine of a row's three policies under the `epd` plan: each side of
+/// the pair takes the worker that holds fewer requests, and so does an
+/// item's encoder unless the row places items on the ring. `None` for a
+/// policy this replay does not build.
+fn engine(row: &Row) -> Option<Engine> {
+    if row.prefill_policy != FEWEST || row.decode_policy != FEWEST {
+        return None;
+    }
+    let encode = match row.encode_policy.as_str() {
+        FEWEST => "power_of_two",
+        "consistent_hashing" => "consistent_hashing",
+        _ => return None,
+    };
+    let mut spec = PolicySpec::epd_presets(encode, "power_of_two", "power_of_two").ok()?;
+    for (name, profile) in &mut spec.profiles {
+        if name != "encode" || encode == "power_of_two" {
+            profile.pick = "count-first".into();
+        }
+    }
+    spec.validate().ok()
+}
+
+/// One worker's row in a pool of the replay: ready or not, with the
+/// requests the router holds on it and every admission bit set.
+fn worker(at: usize, first: u64, role: Role, open: bool, in_flight: u32) -> Candidate {
+    let id = first + at as u64;
+    Candidate {
+        position: at as u32,
+        id: WorkerId(id),
+        role,
+        health: Health {
+            healthy: open,
+            ..Health::default()
+        },
+        in_flight,
+        has_capacity: true,
+        has_room: true,
+        key: id as u32,
+        ..Candidate::default()
+    }
+}
+
+/// The pair classes of a row's partner lists: each prefill is a class of
+/// its own, the decodes are numbered as the lists first name them (`0` for
+/// a decode no prefill partners), and the table's two slices follow.
+struct Pairing {
+    decode_classes: Vec<u32>,
+    ends: Vec<u32>,
+    listed: Vec<u32>,
+}
+
+fn pairing(row: &Row) -> Pairing {
+    let mut decode_classes = vec![0u32; row.decodes.len()];
+    let mut named = 0u32;
+    let (mut ends, mut listed) = (Vec::new(), Vec::new());
+    for prefill in &row.prefills {
+        let mut list: Vec<u32> = prefill
+            .partners
+            .iter()
+            .filter_map(|&decode| {
+                let class = decode_classes.get_mut(decode as usize)?;
+                if *class == 0 {
+                    named += 1;
+                    *class = named;
+                }
+                Some(*class)
+            })
+            .collect();
+        list.sort_unstable();
+        listed.extend(list);
+        ends.push(listed.len() as u32);
+    }
+    Pairing {
+        decode_classes,
+        ends,
+        listed,
+    }
+}
+
+/// The recorded name of a refusal, read from the stage a shed names: the
+/// encode side's stages by their names, the pair's own refusal for every
+/// other.
+fn refusal(stage: &str) -> &'static str {
+    match stage {
+        "encoders" => "unavailable",
+        "encode-vision" => "encode_vision_unsupported",
+        "ec-compatible" => "ec_incompatible",
+        "encode-media" => "encode_not_supported",
+        "decode-vision" => "decode_vision_unsupported",
+        _ => "placement",
+    }
+}
+
+/// What of one row's answers the decision does not replay, request by
+/// request.
+fn decided(row: &Row, classes: &EncodeClasses) -> Vec<String> {
+    let Some(engine) = engine(row) else {
+        return vec!["a policy this replay does not build".to_string()];
+    };
+    let ring = row.encode_policy != FEWEST;
+    let pushes = |runtime: &str| {
+        let mut of_runtime = row.encoders.iter().filter(|w| w.runtime == runtime);
+        of_runtime.any(|w| w.handoff == Some(Form::Push))
+    };
+    let paired = pairing(row);
+    let prefills: Vec<Candidate> = (row.prefills.iter().enumerate())
+        .map(|(at, w)| Candidate {
+            pair_class: at as u32 + 1,
+            ..worker(at, 1_000, Role::Prefill, w.open, w.in_flight)
+        })
+        .collect();
+    // The gateway holds the decodes of a pushing runtime to what their
+    // registration says of images, and no other runtime's.
+    let decodes: Vec<Candidate> = (row.decodes.iter().enumerate())
+        .map(|(at, w)| Candidate {
+            pair_class: paired.decode_classes.get(at).copied().unwrap_or(0),
+            vision: w.images || !pushes(&w.runtime),
+            ..worker(at, 2_000, Role::Decode, w.open, w.in_flight)
+        })
+        .collect();
+    let encoders: Vec<Candidate> = (row.encoders.iter().enumerate())
+        .map(|(at, w)| Candidate {
+            vision: w.images,
+            ..worker(at, 3_000, Role::Encode, w.open, w.in_flight)
+        })
+        .collect();
+    let stated = classes.encoders().iter().copied();
+    let of_encoders: Vec<EncoderFacts> = (row.encoders.iter())
+        .zip(stated.chain(std::iter::repeat(0)))
+        .map(|(w, class)| EncoderFacts {
+            class,
+            pushes: w.handoff == Some(Form::Push),
+            references: w.references,
+        })
+        .collect();
+    let prefill_classes: Vec<u32> = (0..row.prefills.len())
+        .map(|at| classes.prefill_class(at))
+        .collect();
+    let table = PairTable::new(&paired.ends, &paired.listed);
+    if let Err(clause) = table.validate() {
+        return vec![format!("the row's pair table: {clause}")];
+    }
+    let pools = PairPools {
+        prefills: &prefills,
+        decodes: &decodes,
+        table,
+        ..PairPools::default()
+    };
+    let encode = EncodePool {
+        encoders: &encoders,
+        facts: &of_encoders,
+        prefill_classes: &prefill_classes,
+        affinity: &[],
+    };
+    let pool_facts = PoolFacts {
+        pool_size: prefills.len() as u32,
+        generation: 1,
+        ..PoolFacts::default()
+    };
+    let cx = Constraints::default();
+    let mut scratch = Scratch::new();
+    let mut placed = EncodePlaced::new();
+    let mut found = Vec::new();
+    let answered = row.requests.iter().zip(&row.outcome.sequence);
+    for (at, (request, answer)) in answered.enumerate() {
+        let keys: Vec<Identity<'_>> = (request.items.iter())
+            .map(|item| Identity::plain(item))
+            .collect();
+        // The items taken as one: the caller's digest, any value its
+        // callers agree on.
+        let digest = Identity::hashed(fingerprint(request.items.concat().as_bytes()));
+        let items = EncodeItems {
+            keys: &keys,
+            one: (!request.fanout && !keys.is_empty()).then_some(digest),
+            references: request.references,
+            decode_images: request.decode_images,
+        };
+        let facts = RequestFacts {
+            model: "m",
+            media: MediaCounts {
+                images: u16::from(request.images),
+                ..MediaCounts::default()
+            },
+            seed: at as u64 + 1,
+            ..RequestFacts::default()
+        };
+        let decision = engine.decide_encode_pair(
+            &facts,
+            &pool_facts,
+            pools,
+            encode,
+            items,
+            &cx,
+            &cx,
+            &cx,
+            &mut scratch,
+            &mut placed,
+        );
+        match (answer, &decision) {
+            (
+                Answer::Placed {
+                    prefill,
+                    decode,
+                    offered,
+                    keys: placed_by,
+                    encoders: recorded,
+                },
+                Decision::Pick(pick),
+            ) => {
+                let target = pick.targets.first();
+                let pair = target.map(|t| {
+                    let decode = t.pair.map(|pair| pair.decode_position as usize);
+                    (t.position as usize, decode)
+                });
+                if pair != Some((*prefill, Some(*decode))) {
+                    found.push(format!(
+                        "request {at}: the pair of prefill {prefill} and decode {decode}, replayed {pair:?}"
+                    ));
+                }
+                let one = *placed_by != request.items;
+                if placed.one() != one {
+                    found.push(format!(
+                        "request {at}: the items placed as one key: {one}, replayed {}",
+                        placed.one()
+                    ));
+                }
+                let here: Vec<u32> = placed.encoders().iter().map(|t| t.position).collect();
+                let same = if ring {
+                    let of_keys = || placed_by.iter().zip(&here);
+                    here.len() == recorded.len()
+                        && here.iter().all(|encoder| offered.contains(encoder))
+                        && of_keys().all(|(key, encoder)| {
+                            of_keys().all(|(other, of_other)| key != other || encoder == of_other)
+                        })
+                } else {
+                    here == *recorded
+                };
+                if !same {
+                    found.push(format!(
+                        "request {at}: the encoders {recorded:?} of the offered {offered:?}, replayed {here:?}"
+                    ));
+                }
+            }
+            (Answer::Refused { name }, Decision::Shed(shed)) => {
+                let here = refusal(shed.emptied_by);
+                if here != name {
+                    found.push(format!(
+                        "request {at}: refused as {name}, replayed {here} (the stage {})",
+                        shed.emptied_by
+                    ));
+                }
+            }
+            (Answer::Placed { .. }, other) => {
+                found.push(format!("request {at}: placed, replayed {other:?}"));
+            }
+            (Answer::Refused { name }, other) => {
+                found.push(format!(
+                    "request {at}: refused as {name}, replayed {other:?}"
+                ));
+            }
         }
     }
     found
