@@ -4,7 +4,9 @@
 //! contexts of the regular and the disaggregated modes read), and the
 //! labelled worker selection the stages' tests read a decode worker's
 //! labels from, and the forced call a thinking prompt takes under a parser,
-//! which the restamp and the parser-utility tests shape a constraint from.
+//! which the restamp and the parser-utility tests shape a constraint from,
+//! and the model directory a media test registers its tokenizer from, so
+//! that the model's config is not looked up on the model hub.
 
 use std::{
     sync::{Arc, Mutex, OnceLock},
@@ -266,4 +268,16 @@ pub(crate) fn bytes_allocated_during(f: impl FnOnce()) -> u64 {
     let before = allocated.get();
     f();
     allocated.get() - before
+}
+
+/// A model directory whose `config.json` is no JSON. A tokenizer registered
+/// from it keeps the media path's lookup of the model's config on this
+/// disk, where it fails as an unreadable checkpoint does; a source with no
+/// `config.json` in it is looked up on the model hub instead, and the test's
+/// answer follows the hub's. The directory is gone once dropped: a test
+/// holds it while its requests run.
+pub(crate) fn unreadable_model_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("config.json"), "no model configuration").expect("config.json");
+    dir
 }

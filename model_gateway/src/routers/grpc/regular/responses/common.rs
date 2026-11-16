@@ -13,8 +13,8 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{Tool, ToolChoice, ToolChoiceValue, ToolReference, Usage},
     responses::{
-        self, InputTokensDetails, OutputTokensDetails, ResponseInput, ResponseInputOutputItem,
-        ResponseOutputItem, ResponseUsage, ResponsesRequest,
+        self, ResponseInput, ResponseInputOutputItem, ResponseOutputItem, ResponseUsage,
+        ResponsesRequest,
     },
 };
 use serde_json::{json, Value};
@@ -33,7 +33,7 @@ use crate::{
         grpc::common::responses::{
             history::current_input_items,
             tool_call_limit,
-            utils::{resolve_function_identity, tool_call_overflow},
+            utils::{add_model_call_usage, resolve_function_identity, tool_call_overflow},
         },
     },
 };
@@ -79,35 +79,7 @@ pub(super) struct ResponsesCallContext {
 impl ToolLoopState {
     /// Usage is per model request; missing reports must not erase prior totals.
     pub fn record_usage(&mut self, usage: Option<&Usage>) {
-        let Some(usage) = usage else {
-            return;
-        };
-        let total = self.usage.get_or_insert_with(|| ResponseUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-            input_tokens_details: InputTokensDetails::default(),
-            output_tokens_details: OutputTokensDetails::default(),
-        });
-        total.input_tokens = total.input_tokens.saturating_add(usage.prompt_tokens);
-        total.output_tokens = total.output_tokens.saturating_add(usage.completion_tokens);
-        total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
-        if let Some(details) = &usage.prompt_tokens_details {
-            total.input_tokens_details.cached_tokens = total
-                .input_tokens_details
-                .cached_tokens
-                .saturating_add(details.cached_tokens);
-        }
-        if let Some(tokens) = usage
-            .completion_tokens_details
-            .as_ref()
-            .and_then(|details| details.reasoning_tokens)
-        {
-            total.output_tokens_details.reasoning_tokens = total
-                .output_tokens_details
-                .reasoning_tokens
-                .saturating_add(tokens);
-        }
+        add_model_call_usage(&mut self.usage, usage);
     }
 
     /// `tools` are the request's own tool definitions, read for the call's

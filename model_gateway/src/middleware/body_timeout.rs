@@ -249,9 +249,10 @@ struct TimedBody {
 }
 
 /// `now + total`, saturated to a far future when the sum does not fit an
-/// instant: a `request_timeout_secs` too large to hold (the "no timeout"
-/// idiom) is a deadline that never comes, as `tokio::time::sleep` treats it.
-fn deadline_from_now(total: Duration) -> tokio::time::Instant {
+/// instant: seconds too large to hold (the "no timeout" idiom of
+/// `request_timeout_secs`, a shutdown grace written as the largest number)
+/// are a deadline that never comes, as `tokio::time::sleep` treats them.
+pub(crate) fn deadline_from_now(total: Duration) -> tokio::time::Instant {
     let now = tokio::time::Instant::now();
     now.checked_add(total)
         .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))

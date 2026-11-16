@@ -291,7 +291,11 @@ async fn refresh_worker_models(
                     false
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to parse models response: {}", e);
+                    tracing::warn!(
+                        "Failed to parse models response from {}: {}",
+                        Endpoint::redacted_str(&url),
+                        e.without_url()
+                    );
                     false
                 }
             }
@@ -534,5 +538,38 @@ mod tests {
             ["/v1/models", "/v1/models"]
         );
         assert_eq!(slashed.url(), format!("http://{addr}/"));
+    }
+
+    /// A worker registered with a query whose model list is no JSON: the
+    /// refresh's line names the worker masked and does not repeat the query.
+    /// The HTTP client's text of a failed body read ends with the request
+    /// URL too.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn an_unparsed_model_refresh_goes_without_the_clients_url_in_its_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only server answering no JSON; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|| async { "not json" }),
+            )
+            .await
+            .unwrap();
+        });
+        let queried = worker(&format!("http://127.0.0.1:{port}?token=s3cret"), false);
+
+        let refreshed = refresh_worker_models(&WorkerRegistry::new(), &queried, None).await;
+        server.abort();
+
+        assert!(!refreshed);
+        assert!(logs_contain(&format!(
+            "Failed to parse models response from http://127.0.0.1:{port}: "
+        )));
+        assert!(!logs_contain("s3cret"));
     }
 }
