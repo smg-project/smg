@@ -206,7 +206,8 @@ const WORD_SCAN_MIN_BYTES: usize = PARALLEL_CHUNK_BYTES;
 /// for) and drops their entries, so a thread that filled its packed table
 /// on one kind of text and then meets such pieces holds both, about 51 MiB
 /// with typical map entries and 140 MiB at the worst case the count bound
-/// allows.
+/// allows; a thread that filled its wide table between the two keeps those
+/// slots as well, 32.5 MiB more (about 84 MiB and 172 MiB).
 /// Measured on one thread after a corpus of 7,015 prompts: the peak RSS
 /// grew by 8 MB on a 128k-token vocabulary and did not move on three
 /// larger ones, whose peak is the file load.
@@ -231,7 +232,10 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// the packed table cut back, for a smaller share), so the count-bounded tiers
 /// of one tokenizer hold at most the sum of the two: about 820 MiB at sixteen
 /// threads with typical map entries (about 2.2 GiB, sixteen times the 140 MiB
-/// of a thread, were every map entry the worst case), toward 352 + 560 MiB with
+/// of a thread, were every map entry the worst case), and the slots of wide
+/// tables that grew to the bound as well, kept through a clear like the packed
+/// slots (65 bytes a slot: 520 MiB more at sixteen threads, 693 MiB at the most
+/// however many threads share the total), toward 352 + 560 MiB with
 /// the rounding of more threads (the packed part toward twice its 352 MiB past
 /// some 680 threads, as above); the long pieces add `LONG_PIECE_BYTES_TOTAL` at
 /// most (a thread's long tier keeps its map's slots through an eviction's
@@ -242,7 +246,7 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// it for that call's misses (a call that was running when threads joined keeps
 /// its earlier share until it ends; the long tier reads the live share at every
 /// miss), so after threads join it is within the smaller share from its next
-/// call on, entries, packed slots and map buckets alike (the packed table's
+/// call on, entries, packed slots, wide slots and map buckets alike (the packed table's
 /// pages already touched inside its reservation stay resident,
 /// `THREAD_BACKING_SLOTS` slots at most, 33 bytes each, about 528 KiB per
 /// thread: more than the share's slots only once those fall under the
@@ -465,7 +469,6 @@ impl PieceCache {
         self.packed.len() + self.wide.len() + self.short.len()
     }
 
-    /// Slots of the wide tier.
     fn wide_slots(&self) -> usize {
         self.wide.slots()
     }
@@ -3359,7 +3362,8 @@ impl NativeEncoder {
             if cache.short_entries() >= share {
                 cache.clear_short(share);
             }
-            let kept = WideKey::of(piece).is_some_and(|key| cache.wide.insert(key, &ids[start..]));
+            let kept =
+                WideKey::of(piece).is_some_and(|key| cache.wide.insert(key, &ids[start..], share));
             if !kept {
                 cache.short.insert(piece.into(), ids[start..].into());
             }
@@ -3539,7 +3543,7 @@ impl NativeEncoder {
         let slots = ShortPieceTable::slots_for(share);
         if cache.short_entries() > share
             || cache.packed_slots() > slots
-            || cache.wide_slots() > slots
+            || cache.wide_slots() > WidePieceTable::slots_for(share)
             || cache.map_capacity() > 2 * share
         {
             cache.clear_short(share);

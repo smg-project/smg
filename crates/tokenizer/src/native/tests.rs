@@ -4236,25 +4236,39 @@ fn long_entry_bytes(piece: &[u8], ids: &[u32]) -> usize {
 /// in one of the two, and a second encode reads the same ids.
 #[test]
 fn pieces_of_sixteen_to_thirty_two_bytes_are_kept_by_their_id_count() {
-    let mut state = 0x51DE_7AB1_E5EE_D001u64;
-    let shape = &shapes()[0];
-    let tokenizer = tokenizer_of(shape, &mut state);
+    // A model whose merges build `abcdefgh` whole: a piece of that word
+    // repeated has an id for every eight bytes.
+    let tokenizer = split_tokenizer(QWEN35, cluster_model("abcd", "efgh"));
     let native = seeded(&tokenizer);
     let model = tokenizer.get_model();
     let (mut fit, mut over) = (0, 0);
     let mut text = String::new();
-    for i in 0..200u32 {
-        let piece = letters(16 + i as usize % 17, i);
+    // Pieces that fit an entry: the word two to four times over, and up to
+    // four letters no merge holds after it. Pieces that do not: letters
+    // with a padding no merge holds, an id a byte.
+    let mut pieces: Vec<String> = Vec::new();
+    for words in 2..=3 {
+        for extra in 0..=4 {
+            pieces.push("abcdefgh".repeat(words) + &"vwxy"[..extra]);
+        }
+    }
+    pieces.push("abcdefgh".repeat(4));
+    pieces.extend((0..100u32).map(|i| letters(16 + i as usize % 17, i)));
+    for piece in &pieces {
         let alone = tokenizer.encode(piece.as_str(), false).expect("encode");
         if alone.get_ids().len() <= 7 {
             fit += 1;
         } else {
             over += 1;
         }
-        // Newlines split the words without joining a space to them.
-        text.push_str(&piece);
+        // Newlines split the pieces.
+        text.push_str(piece);
         text.push('\n');
     }
+    assert!(
+        fit > 0 && over > 0,
+        "both tiers are exercised: {fit} fit, {over} over"
+    );
     let reference = tokenizer.encode(text.as_str(), false).expect("encode");
     let first = native.encode(Some(model), &text, false).expect("ids");
     assert_eq!(first, reference.get_ids());
@@ -4292,7 +4306,7 @@ fn a_thread_whose_wide_table_outgrew_its_share_gives_it_back_at_its_next_encode(
         let cache = cache.get_mut();
         for i in 0..16_000u32 {
             let key = WideKey::of(letters(20, i).as_bytes()).expect("a key");
-            assert!(cache.wide.insert(key, &[i, i + 1]));
+            assert!(cache.wide.insert(key, &[i, i + 1], cache.share));
         }
     }
     let slots = |native: &mut NativeEncoder| -> usize {
@@ -4340,6 +4354,47 @@ fn a_thread_whose_wide_table_outgrew_its_share_gives_it_back_at_its_next_encode(
         before
     );
     assert_eq!(slots(&mut native), 0);
+}
+
+/// A thread at a steady share keeps its pieces from one encode to the next
+/// while its wide table grows: the table stops at the share's slots, so the
+/// next call finds nothing to cut back (a table grown by four past them had
+/// every count-bounded tier cleared at each call).
+#[test]
+fn a_wide_table_grows_within_the_share_and_keeps_the_threads_pieces() {
+    let mut state = 0x5EED_0F5E_A7ED_CAFEu64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let mut native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    // 4,096 threads counted: a share of 1,024 pieces, whose slots are 2,048.
+    native.threads.store(4_096, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert_eq!((share, WidePieceTable::slots_for(share)), (1_024, 2_048));
+    let text = " a b c";
+    let before = native
+        .encode_with(Some(model), text, false, false)
+        .expect("ids");
+    // Nine hundred pieces, stored as first sights store them: past the 768
+    // at which a table of 1,024 slots grows.
+    for cache in &mut native.piece_cache {
+        let cache = cache.get_mut();
+        for i in 0..900u32 {
+            let key = WideKey::of(letters(20, i).as_bytes()).expect("a key");
+            assert!(cache.wide.insert(key, &[i, i + 1], share));
+        }
+        assert_eq!((cache.wide.len(), cache.wide_slots()), (900, 2_048));
+    }
+    assert_eq!(
+        native
+            .encode_with(Some(model), text, false, false)
+            .expect("ids"),
+        before
+    );
+    for cache in &mut native.piece_cache {
+        let cache = cache.get_mut();
+        assert_eq!((cache.wide.len(), cache.wide_slots()), (900, 2_048));
+    }
 }
 
 #[test]

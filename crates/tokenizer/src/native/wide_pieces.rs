@@ -16,9 +16,6 @@ const MIN_SLOTS: usize = 64;
 /// packed table of the shorter pieces does.
 const GROW_BY_FOUR_UP_TO: usize = 4_096;
 const EMPTY_TAG: u8 = 0;
-/// The tag of a stored entry that waits for its place while the table grows;
-/// no stored piece has it (a piece's tag has the top bit set).
-const WAITING_TAG: u8 = 1;
 const LOW_SALT: u64 = 0x2545_F491_4F6C_DD1D;
 const HIGH_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -123,19 +120,17 @@ impl WidePieceTable {
         }
     }
 
-    /// Entries stored.
     pub(super) fn len(&self) -> usize {
         self.len
     }
 
-    /// Slots allocated.
     pub(super) fn slots(&self) -> usize {
         self.tags.len()
     }
 
     /// The slots a table of `entries` pieces grows to at the most: a power
     /// of two that holds them under the fill bound, as the packed table's.
-    fn slots_for(entries: usize) -> usize {
+    pub(super) fn slots_for(entries: usize) -> usize {
         (entries * 4 / 3 + 1).next_power_of_two().max(MIN_SLOTS)
     }
 
@@ -171,14 +166,20 @@ impl WidePieceTable {
     /// Stores `ids` for `key` and answers whether the table holds the piece
     /// now. It refuses no ids and more ids than an entry holds; a piece
     /// already stored keeps its ids. A table at its fill bound, three
-    /// quarters of its slots, grows first, so a probe always ends on an
-    /// empty slot.
-    pub(super) fn insert(&mut self, key: WideKey, ids: &[u32]) -> bool {
+    /// quarters of its slots, grows first, up to the slots `bound` entries
+    /// take ([`Self::slots_for`]), so a probe always ends on an empty slot
+    /// and the table never has more slots than its thread's share allows;
+    /// at those slots it refuses the piece, which is the map's then.
+    pub(super) fn insert(&mut self, key: WideKey, ids: &[u32], bound: usize) -> bool {
         if ids.is_empty() || ids.len() > WIDE_IDS {
             return false;
         }
         if self.len >= self.slots() / 4 * 3 {
-            self.grow();
+            let most = Self::slots_for(bound);
+            if self.slots() >= most {
+                return false;
+            }
+            self.grow(most);
         }
         let (mut slot, tag) = self.first_slot(key.hash());
         while self.tags[slot] != EMPTY_TAG {
@@ -202,43 +203,29 @@ impl WidePieceTable {
     }
 
     /// Grows the slots (the first ones, then by four up to
-    /// `GROW_BY_FOUR_UP_TO`, by two above) in place: the arrays are
-    /// lengthened and every entry is placed again by its key, so the old
-    /// slots never stand beside new ones.
-    fn grow(&mut self) {
+    /// `GROW_BY_FOUR_UP_TO`, by two above, to `most` at the most) into new
+    /// arrays, every entry placed again by its key. A tag does not depend
+    /// on the slot count.
+    fn grow(&mut self, most: usize) {
         let slots = match self.slots() {
             0 => MIN_SLOTS,
             old if old < GROW_BY_FOUR_UP_TO => old * 4,
             old => old * 2,
-        };
-        self.tags.resize(slots, EMPTY_TAG);
-        self.entries.resize(slots, Entry::EMPTY);
-        self.mask = slots - 1;
-        for tag in &mut self.tags {
-            if *tag != EMPTY_TAG {
-                *tag = WAITING_TAG;
-            }
         }
-        // An entry settles on the first slot from its own that holds no
-        // settled entry: an empty one, or one whose entry still waits, which
-        // then takes the slot this one leaves and is placed in its turn. A
-        // settled entry never moves again and none settles past an empty or
-        // a waiting slot, so a probe still ends on its piece or on an empty
-        // slot.
-        for at in 0..slots {
-            while self.tags[at] == WAITING_TAG {
-                let (mut slot, tag) = self.first_slot(self.entries[at].key().hash());
-                while self.tags[slot] != EMPTY_TAG && self.tags[slot] != WAITING_TAG {
-                    slot = (slot + 1) & self.mask;
-                }
-                if self.tags[slot] == EMPTY_TAG {
-                    self.entries[slot] = self.entries[at];
-                    self.tags[at] = EMPTY_TAG;
-                } else {
-                    self.entries.swap(at, slot);
-                }
-                self.tags[slot] = tag;
+        .min(most);
+        let tags = std::mem::replace(&mut self.tags, vec![EMPTY_TAG; slots]);
+        let entries = std::mem::replace(&mut self.entries, vec![Entry::EMPTY; slots]);
+        self.mask = slots - 1;
+        for (tag, entry) in tags.into_iter().zip(entries) {
+            if tag == EMPTY_TAG {
+                continue;
             }
+            let (mut slot, _) = self.first_slot(entry.key().hash());
+            while self.tags[slot] != EMPTY_TAG {
+                slot = (slot + 1) & self.mask;
+            }
+            self.tags[slot] = tag;
+            self.entries[slot] = entry;
         }
     }
 
@@ -259,6 +246,9 @@ impl WidePieceTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bound no table of these tests reaches.
+    const ROOMY: usize = 1 << 20;
 
     /// A piece of `len` bytes, distinct for distinct `i`.
     fn piece(len: usize, i: usize) -> Vec<u8> {
@@ -310,7 +300,7 @@ mod tests {
             let ids: Vec<u32> = (0..count as u32)
                 .map(|id| 100 * count as u32 + id)
                 .collect();
-            assert!(table.insert(key(&piece(15 + count, count)), &ids));
+            assert!(table.insert(key(&piece(15 + count, count)), &ids, ROOMY));
             assert_eq!(ids_of(&table, &piece(15 + count, count)), Some(ids));
         }
         assert_eq!((table.len(), table.slots()), (WIDE_IDS, MIN_SLOTS));
@@ -320,7 +310,7 @@ mod tests {
     #[test]
     fn ids_are_appended_after_what_the_buffer_held() {
         let mut table = WidePieceTable::new();
-        assert!(table.insert(key(&piece(24, 1)), &[7, 8, 9]));
+        assert!(table.insert(key(&piece(24, 1)), &[7, 8, 9], ROOMY));
         let mut ids = vec![1, 2];
         assert!(table.ids_into(key(&piece(24, 1)), &mut ids));
         assert_eq!(ids, [1, 2, 7, 8, 9]);
@@ -329,8 +319,8 @@ mod tests {
     #[test]
     fn no_ids_and_more_than_an_entry_holds_are_refused() {
         let mut table = WidePieceTable::new();
-        assert!(!table.insert(key(&piece(20, 1)), &[]));
-        assert!(!table.insert(key(&piece(20, 1)), &[1; WIDE_IDS + 1]));
+        assert!(!table.insert(key(&piece(20, 1)), &[], ROOMY));
+        assert!(!table.insert(key(&piece(20, 1)), &[1; WIDE_IDS + 1], ROOMY));
         assert_eq!((table.len(), table.slots()), (0, 0));
         assert_eq!(ids_of(&table, &piece(20, 1)), None);
     }
@@ -338,8 +328,8 @@ mod tests {
     #[test]
     fn a_stored_piece_keeps_its_ids_on_a_second_insert() {
         let mut table = WidePieceTable::new();
-        assert!(table.insert(key(&piece(20, 1)), &[1, 2]));
-        assert!(table.insert(key(&piece(20, 1)), &[3]));
+        assert!(table.insert(key(&piece(20, 1)), &[1, 2], ROOMY));
+        assert!(table.insert(key(&piece(20, 1)), &[3], ROOMY));
         assert_eq!(table.len(), 1);
         assert_eq!(ids_of(&table, &piece(20, 1)), Some(vec![1, 2]));
     }
@@ -350,7 +340,7 @@ mod tests {
         let mut steps = vec![];
         for i in 0..10_000 {
             let slots = table.slots();
-            assert!(table.insert(key(&piece(16 + i % 17, i)), &[i as u32, 1]));
+            assert!(table.insert(key(&piece(16 + i % 17, i)), &[i as u32, 1], ROOMY));
             if table.slots() != slots {
                 steps.push(table.slots());
             }
@@ -368,10 +358,33 @@ mod tests {
     }
 
     #[test]
+    fn a_table_grows_to_the_slots_of_its_bound_and_refuses_past_them() {
+        let mut table = WidePieceTable::new();
+        let bound = 1_000;
+        let most = WidePieceTable::slots_for(bound);
+        assert_eq!(most, 2_048);
+        let (mut steps, mut kept) = (vec![], 0);
+        for i in 0..2_000 {
+            let slots = table.slots();
+            kept += usize::from(table.insert(key(&piece(20, i)), &[i as u32], bound));
+            if table.slots() != slots {
+                steps.push(table.slots());
+            }
+        }
+        // By four while small, then to the bound's slots and no further:
+        // the step by four from 1,024 slots would pass them.
+        assert_eq!(steps, [64, 256, 1_024, most]);
+        assert_eq!((kept, table.len()), (most / 4 * 3, most / 4 * 3));
+        // The bound's own clear finds nothing to give back.
+        table.clear(bound);
+        assert_eq!((table.len(), table.slots()), (0, most));
+    }
+
+    #[test]
     fn a_clear_forgets_and_keeps_the_slots_until_the_bound_falls_under_them() {
         let mut table = WidePieceTable::new();
         for i in 0..1_000 {
-            assert!(table.insert(key(&piece(20, i)), &[i as u32]));
+            assert!(table.insert(key(&piece(20, i)), &[i as u32], ROOMY));
         }
         let slots = table.slots();
         assert_eq!(slots, 4_096);
@@ -379,13 +392,13 @@ mod tests {
         table.clear(3_000);
         assert_eq!((table.len(), table.slots()), (0, slots));
         assert_eq!(ids_of(&table, &piece(20, 1)), None);
-        assert!(table.insert(key(&piece(20, 1)), &[5]));
+        assert!(table.insert(key(&piece(20, 1)), &[5], ROOMY));
         assert_eq!(ids_of(&table, &piece(20, 1)), Some(vec![5]));
         // A bound that takes fewer slots: they are given back.
         table.clear(1_000);
         assert_eq!((table.len(), table.slots()), (0, 0));
         assert_eq!(ids_of(&table, &piece(20, 1)), None);
-        assert!(table.insert(key(&piece(20, 2)), &[6]));
+        assert!(table.insert(key(&piece(20, 2)), &[6], ROOMY));
         assert_eq!((table.len(), table.slots()), (1, MIN_SLOTS));
     }
 }
