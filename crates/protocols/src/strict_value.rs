@@ -39,19 +39,20 @@ pub(crate) fn strict_entries<'de, A: MapAccess<'de>>(
 /// map is built. A repeated key is refused when it is met, as
 /// [`strict_entries`] refuses it. A walk over the keys met so far tells a
 /// repeat while they are few; past [`WALKED_KEYS`] a hashed set does, so no
-/// object makes the check quadratic.
+/// object makes the check quadratic. The entries start with room for eight,
+/// which holds most such objects in one allocation; the set is built only
+/// for an object that needs it.
 pub(crate) fn strict_fields<'de, A: MapAccess<'de>>(
     entries: &mut A,
 ) -> Result<Vec<(String, Value)>, A::Error> {
-    let mut fields: Vec<(String, Value)> = Vec::new();
-    let mut hashed = HashSet::new();
+    let mut fields: Vec<(String, Value)> = Vec::with_capacity(8);
+    let mut hashed: Option<HashSet<String>> = None;
     while let Some(key) = entries.next_key::<String>()? {
         let repeated = if fields.len() < WALKED_KEYS {
             fields.iter().any(|(known, _)| *known == key)
         } else {
-            if hashed.is_empty() {
-                hashed.extend(fields.iter().map(|(known, _)| known.clone()));
-            }
+            let hashed = hashed
+                .get_or_insert_with(|| fields.iter().map(|(known, _)| known.clone()).collect());
             !hashed.insert(key.clone())
         };
         if repeated {
