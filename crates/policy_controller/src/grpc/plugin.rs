@@ -20,8 +20,8 @@ use tokio::sync::mpsc;
 use super::{
     config::{GrpcPluginSpec, Transport},
     runtime::{
-        Command, Fault, Lane, LaneEvents, ObserveLane, Peer, Readiness, Runtime, SendError, Wait,
-        Witness,
+        answer_bytes, Command, Fault, Lane, LaneEvents, ObserveLane, Peer, Readiness, Runtime,
+        SendError, Wait, Witness,
     },
     unit::Unit,
     view::{self, Answer, FILTER, PICK, SCORE},
@@ -186,7 +186,9 @@ struct Inner {
     /// The `Observe` stream's queue until the first `Decide` stream
     /// settles, which opens it.
     observe_rx: Mutex<Option<mpsc::Receiver<proto::ObserveRequest>>>,
-    observe_seq: AtomicU64,
+    /// How many counters the row declares: an answer holds no more
+    /// increments.
+    declared: usize,
 }
 
 impl Inner {
@@ -210,11 +212,13 @@ impl Inner {
     }
 
     fn observe(&self, event: proto::lifecycle_event::Event) {
-        let seq = self.observe_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        // The number is the stream's: the I/O thread writes it where the
+        // event enters the stream, so threads that raise events at once
+        // cannot send a later number first.
         let request = proto::ObserveRequest {
             request: Some(proto::observe_request::Request::Event(
                 proto::LifecycleEvent {
-                    seq,
+                    seq: 0,
                     event: Some(event),
                 },
             )),
@@ -299,7 +303,8 @@ fn check(spec: &GrpcPluginSpec) -> Result<(), LoadError> {
 impl Plugin {
     /// Checks `spec`, opens this thread's stream and waits for the hello's
     /// ack within the connect frame: a plugin that cannot be reached, or
-    /// whose `init` failed, fails the apply.
+    /// whose `init` failed, fails the apply. The loading thread's stream
+    /// lives as long as the plugin, whether or not that thread decides.
     pub fn load(runtime: &Arc<Runtime>, spec: GrpcPluginSpec) -> Result<Arc<Self>, LoadError> {
         check(&spec)?;
         let frame = spec.frame();
@@ -311,6 +316,7 @@ impl Plugin {
             exposure: view::exposure(&spec.view),
             counters: spec.metrics.clone(),
             connect: Duration::from_micros(u64::from(spec.connect_micros)),
+            answer_bytes: answer_bytes(spec.max_candidates, spec.metrics.len()),
         });
         let (observe_tx, observe_rx) = mpsc::channel(OBSERVE_QUEUE);
         let inner = Arc::new_cyclic(|me| Inner {
@@ -322,13 +328,13 @@ impl Plugin {
             needs: spec.needs,
             failure: spec.failure,
             max_candidates: spec.max_candidates,
+            declared: spec.metrics.len(),
             counters: Counters::new(spec.metrics),
             unit: Unit::new(name, spec.breaker),
             tally: Tally::default(),
             peer,
             observe_tx,
             observe_rx: Mutex::new(Some(observe_rx)),
-            observe_seq: AtomicU64::new(0),
         });
         let plugin = Arc::new(Self {
             inner,
@@ -350,10 +356,14 @@ impl Plugin {
 
     /// Opens this thread's stream and waits for the hello's ack within the
     /// connect frame; the apply calls it on every deciding thread, so no
-    /// decision meets a stream that was never opened.
+    /// decision meets a stream that was never opened. The I/O thread gives
+    /// the connect, the stream's open and the ack a connect frame each, and
+    /// this wait is one frame for the three: a slower open is refused here
+    /// and settles behind. A failed stream is asked for at once: the pause
+    /// between two asks is the decisions' alone.
     pub fn warm(&self) -> Result<(), LoadError> {
         let lane = self.lane();
-        lane.ensure_connecting(&self.inner.runtime);
+        lane.connect(&self.inner.runtime);
         match lane.wait_ready(Instant::now() + self.inner.peer.connect) {
             Readiness::Ready => Ok(()),
             Readiness::NotYet => Err(LoadError::Connect(
@@ -557,6 +567,7 @@ impl Binder {
             opens: ThreadLocal::new(),
             stages: AtomicU32::new(0),
             observer_taken: Arc::clone(&self.observer_taken),
+            unimplemented_said: AtomicBool::new(false),
         })
     }
 }
@@ -570,6 +581,8 @@ pub struct Bound {
     stages: AtomicU32,
     /// The build's observer, shared with the build's other bound sets.
     observer_taken: Arc<AtomicBool>,
+    /// The line of a stage bound and not implemented was written.
+    unimplemented_said: AtomicBool,
 }
 
 impl fmt::Debug for Bound {
@@ -605,6 +618,21 @@ impl Bound {
     /// the plugin once per build, whichever of its profiles bind the plugin.
     pub(crate) fn take_observer(&self) -> bool {
         !self.observer_taken.swap(true, Ordering::Relaxed)
+    }
+
+    /// A stage the profile binds and the plugin's ack leaves out takes its
+    /// fallback on every decision, and no counter moves for it: one line a
+    /// bound set names the mismatch, in the protocol's stage bits.
+    #[cold]
+    fn say_unimplemented(&self, bound_stages: u32, implemented_stages: u32) {
+        if !self.unimplemented_said.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                plugin = self.plugin.inner.name,
+                bound_stages,
+                implemented_stages,
+                "a plugin does not implement a stage its profile binds: the stage takes its fallback"
+            );
+        }
     }
 
     /// Sends the decision's frame for `asked` under what the decision has
@@ -696,7 +724,9 @@ impl Bound {
     /// blocked is drawn from the decision's remainder (a missed frame
     /// draws its whole grant), and the round trip is the plugin's charge
     /// in the decision's latency sample. What a missed frame says of its
-    /// plugin is one table, [`Miss::of`].
+    /// plugin is one table, [`Miss::of`]. A late answer the thread finds
+    /// without waiting is used and sampled at its whole flight: a miss is a
+    /// frame the thread stopped waiting for.
     fn take(
         &self,
         open: &mut Open,
@@ -723,14 +753,14 @@ impl Bound {
                         micros(arrived.saturating_duration_since(ticket.at)).max(1),
                     );
                 }
-                let read = view::read(decision, open.asked, open.count).and_then(|answer| {
-                    match (shown, answer.pick) {
+                let read = view::read(decision, open.asked, open.count, inner.declared).and_then(
+                    |answer| match (shown, answer.pick) {
                         (Some(shown), Some(pick)) if !shown.contains(&pick) => {
                             Err(view::Invalid::Pick)
                         }
                         _ => Ok(answer),
-                    }
-                });
+                    },
+                );
                 match read {
                     Ok(answer) => {
                         for delta in &answer.counters {
@@ -808,7 +838,13 @@ impl Bound {
             }
             Wait::Broken => {
                 // Counted by the stream's own failure; this decision falls
-                // back and the next finds the lane reconnecting or open.
+                // back, and a later one asks for the stream again. The time
+                // this thread blocked is drawn like an answered wait's: a
+                // plugin asked later in the decision is asked under the
+                // rest.
+                budget.remaining_micros = budget
+                    .remaining_micros
+                    .saturating_sub(micros(started.elapsed()));
                 open.bypass = true;
             }
         }
@@ -876,7 +912,11 @@ impl Bound {
             open.bypass = true;
             return;
         };
-        let bound = self.stages.load(Ordering::Relaxed) & implemented;
+        let asked = self.stages.load(Ordering::Relaxed);
+        let bound = asked & implemented;
+        if bound != asked && !self.unimplemented_said.load(Ordering::Relaxed) {
+            self.say_unimplemented(asked, implemented);
+        }
         if bound == 0 {
             // The plugin implements none of the stages this profile binds.
             open.bypass = true;
@@ -996,16 +1036,23 @@ impl Bound {
     ) -> Result<u32, Fallback> {
         let mut open = self.state(facts.phase);
         if let Some(mut frame) = open.pending.take() {
-            frame.scores_in.resize(open.count as usize, -1.0);
-            for (&i, &s) in kept.iter().zip(scores) {
-                if let Some(slot) = frame.scores_in.get_mut(i as usize) {
-                    // A surviving row never reads below zero.
-                    *slot = s.max(0.0);
+            if self.plugin.inner.unit.failed_in(open.stamp) {
+                // The plugin failed this decision since the open (the other
+                // side of a pair answered outside the contract): its part
+                // in the decision is over, and this side sends no frame.
+                open.bypass = true;
+            } else {
+                frame.scores_in.resize(open.count as usize, -1.0);
+                for (&i, &s) in kept.iter().zip(scores) {
+                    if let Some(slot) = frame.scores_in.get_mut(i as usize) {
+                        // A surviving row never reads below zero.
+                        *slot = s.max(0.0);
+                    }
                 }
+                open.named_survivors = true;
+                let budget = self.plugin.inner.runtime.decisions().on_this_thread();
+                self.send(&mut open, &budget, frame, PICK);
             }
-            open.named_survivors = true;
-            let budget = self.plugin.inner.runtime.decisions().on_this_thread();
-            self.send(&mut open, &budget, frame, PICK);
         }
         if open.asked & PICK == 0 {
             return Err(Fallback);

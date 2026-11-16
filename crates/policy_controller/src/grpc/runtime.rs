@@ -51,6 +51,45 @@ const WITNESS_TICK: Duration = Duration::from_millis(1);
 /// runs at least this often. A longer gap is a stall, the host's.
 pub(crate) const PROMISE_MICROS: u64 = 4_000;
 
+/// How long a lane that failed leaves its plugin alone before a decision
+/// asks for the next stream, whatever the breaker is set to: a socket that
+/// refuses at once is dialled once a pause, never once a decision.
+pub(crate) const RECONNECT_PAUSE: Duration = Duration::from_millis(100);
+
+/// The most bytes of the plugin's own words an error or a log line carries:
+/// an ack's reason and a status's message are the peer's, of any length
+/// the transport lets through.
+const PEER_TEXT: usize = 256;
+
+/// `text` cut to [`PEER_TEXT`] bytes at a character's start; a cut text
+/// ends in an ellipsis.
+fn bounded(mut text: String) -> String {
+    if text.len() > PEER_TEXT {
+        let mut end = PEER_TEXT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("...");
+    }
+    text
+}
+
+/// The most bytes one message of the plugin's may hold, judged before it
+/// is decoded: a fixed part (the ids, the pick, a decline with its detail,
+/// an ack with its reason) and what the row lets an answer carry, a
+/// surviving position and a score a candidate and an increment a declared
+/// counter. A longer message ends the stream.
+pub(crate) fn answer_bytes(max_candidates: u32, counters: usize) -> usize {
+    const FIXED: usize = 64 * 1024;
+    const A_CANDIDATE: usize = 16;
+    const A_COUNTER: usize = 32;
+    let candidates = usize::try_from(max_candidates).unwrap_or(usize::MAX);
+    FIXED
+        .saturating_add(A_CANDIDATE.saturating_mul(candidates))
+        .saturating_add(A_COUNTER.saturating_mul(counters))
+}
+
 /// The I/O thread's witness: when it last ran, and the last gap between two
 /// of its runs that was longer than its promise. A remote plugin is judged
 /// by what reached the host, and the I/O thread is the host's part of that
@@ -124,8 +163,9 @@ impl Witness {
     /// Whether the I/O thread stalled while an answer was owed from `from`
     /// to `until`: it has not run for longer than its promise at `until`,
     /// or the last gap it closed crosses the two. A frame whose own budget
-    /// is no longer than the promise is never excused: it misses before
-    /// the thread can be seen late, and its miss is nobody's to say
+    /// is no longer than the promise is excused only where another frame's
+    /// flight already shows the thread stalled: alone it misses before the
+    /// thread can be seen late, and its miss is nobody's to say
     /// ([`Self::vouches_for`]).
     pub(crate) fn stalled_between(&self, from: Instant, until: Instant) -> bool {
         let (from, until) = (self.micros(from), self.micros(until));
@@ -170,6 +210,8 @@ pub(crate) struct Peer {
     pub(crate) counters: Vec<String>,
     /// The connect and the hello run under this.
     pub(crate) connect: Duration,
+    /// The most bytes one message of the plugin's holds ([`answer_bytes`]).
+    pub(crate) answer_bytes: usize,
 }
 
 impl Peer {
@@ -230,7 +272,7 @@ impl From<&str> for Fault {
 
 impl From<String> for Fault {
     fn from(why: String) -> Self {
-        Self::Stream(why)
+        Self::Stream(bounded(why))
     }
 }
 
@@ -246,8 +288,9 @@ enum LaneState {
         /// The stage bits the plugin implements.
         stages: u32,
     },
-    /// The stream failed; the next decision asks for a new one.
-    Failed(Fault),
+    /// The stream failed, at this instant; a decision at least
+    /// [`RECONNECT_PAUSE`] later asks for a new one.
+    Failed(Fault, Instant),
 }
 
 /// One frame in flight: what the I/O thread fills in.
@@ -373,10 +416,26 @@ impl Lane {
         self.ids.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Asks the I/O thread for a stream when the lane is cold or failed.
+    /// A decision's ask: the I/O thread is asked for a stream when the lane
+    /// is cold, or failed at least [`RECONNECT_PAUSE`] ago.
     pub(crate) fn ensure_connecting(self: &Arc<Self>, runtime: &Runtime) {
+        self.ask(runtime, RECONNECT_PAUSE);
+    }
+
+    /// The apply's ask, which waits for the stream: asked for when the lane
+    /// is cold or failed, however lately.
+    pub(crate) fn connect(self: &Arc<Self>, runtime: &Runtime) {
+        self.ask(runtime, Duration::ZERO);
+    }
+
+    fn ask(self: &Arc<Self>, runtime: &Runtime, pause: Duration) {
         let mut state = self.state.lock();
-        if matches!(*state, LaneState::Cold | LaneState::Failed(_)) {
+        let due = match &*state {
+            LaneState::Cold => true,
+            LaneState::Failed(_, at) => at.elapsed() >= pause,
+            LaneState::Connecting | LaneState::Ready { .. } => false,
+        };
+        if due {
             *state = LaneState::Connecting;
             drop(state);
             if !runtime.send(Command::Connect(Arc::clone(self))) {
@@ -399,13 +458,13 @@ impl Lane {
         loop {
             match &*state {
                 LaneState::Ready { .. } => return Readiness::Ready,
-                LaneState::Failed(_) | LaneState::Cold => return Readiness::Failed,
+                LaneState::Failed(..) | LaneState::Cold => return Readiness::Failed,
                 LaneState::Connecting => {
                     if self.ready.wait_until(&mut state, deadline).timed_out() {
                         return match &*state {
                             LaneState::Ready { .. } => Readiness::Ready,
                             LaneState::Connecting => Readiness::NotYet,
-                            LaneState::Failed(_) | LaneState::Cold => Readiness::Failed,
+                            LaneState::Failed(..) | LaneState::Cold => Readiness::Failed,
                         };
                     }
                 }
@@ -416,7 +475,7 @@ impl Lane {
     /// Why the lane failed, when it did.
     pub(crate) fn failure(&self) -> Option<Fault> {
         match &*self.state.lock() {
-            LaneState::Failed(why) => Some(why.clone()),
+            LaneState::Failed(why, _) => Some(why.clone()),
             _ => None,
         }
     }
@@ -454,7 +513,10 @@ impl Lane {
     }
 
     /// Waits for the answer of `decision_id` until `deadline`; its place is
-    /// free again when this returns, so an answer after a miss is late.
+    /// free again when this returns, so an answer after a miss is late. An
+    /// answer already in its place is returned whenever it arrived: a
+    /// thread never throws away an answer it need not wait for, and its
+    /// lateness is read from the arrival it comes back with.
     pub(crate) fn wait_answer(&self, decision_id: u64, deadline: Instant) -> Wait {
         let mut table = self.pending.lock();
         loop {
@@ -513,7 +575,7 @@ impl Lane {
     }
 
     fn fail(&self, why: Fault) {
-        *self.state.lock() = LaneState::Failed(why);
+        *self.state.lock() = LaneState::Failed(why, Instant::now());
         self.ready.notify_all();
         // Every frame in flight went with the stream.
         for pending in &mut self.pending.lock().0 {
@@ -631,11 +693,18 @@ impl Runtime {
     ) -> Result<Arc<Self>, io::Error> {
         let (commands, rx) = mpsc::unbounded_channel();
         let witness = Arc::new(Witness::new());
+        // The event loop is built here, on the calling thread: a host that
+        // cannot build one reads the error where it asked.
+        let io_loop = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
         let io = thread::Builder::new()
             .name("smg-policy-grpc".to_owned())
             .spawn({
                 let witness = Arc::clone(&witness);
-                move || serve(rx, witness)
+                // Every stream's task is owned by the loop's set and goes
+                // with it.
+                move || io_loop.block_on(async move { drop(run_commands(rx, witness).await) })
             })?;
         Ok(Arc::new(Self {
             decisions: Arc::clone(decisions),
@@ -692,21 +761,6 @@ impl Drop for Runtime {
     }
 }
 
-fn serve(commands: mpsc::UnboundedReceiver<Command>, witness: Arc<Witness>) {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            tracing::error!(%error, "the plugin I/O thread has no runtime");
-            return;
-        }
-    };
-    // Every stream's task is owned by the loop's set and goes with it.
-    runtime.block_on(async move { drop(run_commands(commands, witness).await) });
-}
-
 /// The I/O thread's loop: a task for each stream it is asked for, and each
 /// ended task taken out of the set, so a stream that ends and reopens for
 /// the life of a process leaves no task behind. It ends when the runtime
@@ -733,7 +787,15 @@ async fn run_commands(
                 }
                 None => break,
             },
-            Some(_) = streams.join_next() => {}
+            Some(ended) = streams.join_next() => {
+                // A stream's task ends by returning. One that panicked did
+                // so in the host's own code (the clock a build handed the
+                // runtime); its lane's state had moved, so the stream is
+                // asked for again, and this line says what happened.
+                if let Some(error) = ended.err().filter(tokio::task::JoinError::is_panic) {
+                    tracing::error!(%error, "a plugin stream's task panicked");
+                }
+            }
         }
     }
     streams
@@ -815,7 +877,7 @@ async fn open_decide(
     let channel = tokio::time::timeout(connect, channel(&peer.transport, connect))
         .await
         .map_err(|_| "the connect did not settle within its frame")??;
-    let mut client = PolicyPluginClient::new(channel);
+    let mut client = PolicyPluginClient::new(channel).max_decoding_message_size(peer.answer_bytes);
     // The hello and a window of frames.
     let (tx, rx) = mpsc::channel(WINDOW + 1);
     tx.try_send(proto::PluginRequest {
@@ -839,7 +901,7 @@ async fn open_decide(
             response: Some(proto::plugin_response::Response::Hello(ack)),
         }) => {
             if !ack.ok {
-                Err(Fault::Init(ack.error))
+                Err(Fault::Init(bounded(ack.error)))
             } else if ack.protocol != PROTOCOL {
                 Err(format!(
                     "the plugin chose protocol {}, outside the offered {PROTOCOL}",
@@ -859,10 +921,14 @@ async fn run_lane(lane: Arc<Lane>) {
     let (tx, mut inbound, stages) = match open_decide(&lane.peer).await {
         Ok(opened) => opened,
         Err(why) => {
-            if let Some(events) = lane.events() {
-                events.stream_failed(&why.to_string());
-            }
+            // The lane's state moves before the plugin is told: the telling
+            // reads the host's clock, and whatever that does, the lane
+            // reads as failed and is asked for again.
+            let said = why.to_string();
             lane.fail(why);
+            if let Some(events) = lane.events() {
+                events.stream_failed(&said);
+            }
             return;
         }
     };
@@ -883,10 +949,12 @@ async fn run_lane(lane: Arc<Lane>) {
             },
         }
     };
+    // A status's text is the plugin's: cut. The state first, as above.
+    let why = bounded(why);
+    lane.fail(Fault::Stream(why.clone()));
     if let Some(events) = lane.events() {
         events.stream_failed(&why);
     }
-    lane.fail(why.into());
 }
 
 async fn run_observe(lane: Arc<ObserveLane>) {
@@ -897,6 +965,9 @@ async fn run_observe(lane: Arc<ObserveLane>) {
     // One line per outage: the first failure after a call that carried an
     // event.
     let mut reported = false;
+    // The events' numbers, one count for the plugin's life: a number never
+    // goes down, on one stream or across two.
+    let mut seq = 0_u64;
     loop {
         if lane.events.strong_count() == 0 {
             return;
@@ -920,7 +991,8 @@ async fn run_observe(lane: Arc<ObserveLane>) {
                 continue;
             }
         };
-        let mut client = PolicyPluginClient::new(channel);
+        let mut client =
+            PolicyPluginClient::new(channel).max_decoding_message_size(peer.answer_bytes);
         let (tx, rx) = mpsc::channel::<proto::ObserveRequest>(OBSERVE_WINDOW);
         let hello = proto::ObserveRequest {
             request: Some(proto::observe_request::Request::Hello(peer.hello())),
@@ -936,7 +1008,15 @@ async fn run_observe(lane: Arc<ObserveLane>) {
         let forward = async {
             loop {
                 match queue.recv().await {
-                    Some(event) => {
+                    Some(mut event) => {
+                        // Numbered here, where it enters the stream: one
+                        // task numbers every event, in the order it sends.
+                        if let Some(proto::observe_request::Request::Event(numbered)) =
+                            event.request.as_mut()
+                        {
+                            seq += 1;
+                            numbered.seq = seq;
+                        }
                         if tx.send(event).await.is_err() {
                             return true;
                         }
@@ -955,7 +1035,7 @@ async fn run_observe(lane: Arc<ObserveLane>) {
                     reported = true;
                     match outcome {
                         Ok(_) => lane.failed("the plugin ended the observe stream"),
-                        Err(status) => lane.failed(&status.to_string()),
+                        Err(status) => lane.failed(&bounded(status.to_string())),
                     }
                 }
                 true
@@ -1019,6 +1099,7 @@ mod tests {
             exposure: proto::Exposure::default(),
             counters: Vec::new(),
             connect: Duration::from_secs(1),
+            answer_bytes: super::answer_bytes(128, 0),
         });
         let events: Arc<dyn LaneEvents> = Arc::clone(events) as _;
         let weak: Weak<dyn LaneEvents> = Arc::downgrade(&events);

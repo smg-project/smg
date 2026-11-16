@@ -50,7 +50,7 @@ use smg_policy_controller::{
 };
 use support::{
     grpc_plugin::{eventually, Behaviour, ServerTls, TestPlugin, ALL, FILTER, PICK, SCORE},
-    said::{openings, said},
+    said::{lines, openings, said},
 };
 
 /// The decision budget of the answered cases, and the connect frame of
@@ -424,6 +424,25 @@ fn a_plugin_that_cannot_be_reached_or_whose_init_fails_does_not_load() {
     }
 }
 
+/// The ack's reason is the plugin's own words, of any length: the error
+/// that fails the apply carries their start.
+#[test]
+fn an_init_failure_carries_the_start_of_the_plugins_words() {
+    let served = TestPlugin::serve();
+    served.script(|s| {
+        s.ack_ok = false;
+        s.ack_error = "\u{e9}".repeat(20_000);
+    });
+    let runtime = runtime();
+    match Plugin::load(&runtime, spec(&served, "wordy")) {
+        Err(LoadError::Init(why)) => {
+            assert!(why.starts_with("\u{e9}\u{e9}"), "{why}");
+            assert!(why.len() <= 300, "{} bytes of the plugin's", why.len());
+        }
+        other => panic!("an init failure, not {other:?}"),
+    }
+}
+
 /// One plugin speaks one version: the host offers the one it speaks on every
 /// stream, and a stream whose ack names another is cancelled with an error
 /// that names both, however many deciding threads open theirs at once. The
@@ -726,6 +745,40 @@ fn a_plugin_is_asked_for_the_stages_it_implements_alone() {
     assert_eq!(idle.frames(), 0, "nothing to ask: no frame");
 }
 
+/// A stage the profile binds and the plugin's ack leaves out takes its
+/// fallback on every decision, and no counter moves for it: the host says
+/// so once a bound set, which is what names the mismatch.
+#[test]
+fn a_stage_bound_and_not_implemented_says_so_once() {
+    said();
+    let served = TestPlugin::serve();
+    served.script(|s| s.implements = SCORE);
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "partly-implemented");
+    let engine = single_engine(profile(&plugin, ALL));
+    for seed in 1..=3 {
+        assert_eq!(lead(&decide(&engine, &pool(4), seed)), Some(103));
+    }
+    let said_once = lines("partly-implemented", "does not implement");
+    assert_eq!(said_once.len(), 1, "one line a bound set: {said_once:?}");
+    assert!(
+        said_once[0].contains(&format!("bound_stages={ALL}"))
+            && said_once[0].contains(&format!("implemented_stages={SCORE}")),
+        "{}",
+        said_once[0]
+    );
+
+    // An ack that implements no stage loads (the plugin may observe alone)
+    // and is named the same way.
+    let idle = TestPlugin::serve();
+    idle.script(|s| s.implements = 0);
+    let plugin = load(&runtime, &idle, "observes-alone");
+    let engine = single_engine(profile(&plugin, ALL));
+    decide(&engine, &pool(4), 1);
+    decide(&engine, &pool(4), 2);
+    assert_eq!(lines("observes-alone", "does not implement").len(), 1);
+}
+
 #[test]
 fn a_pair_asks_both_sides_at_once_on_one_stream() {
     let served = TestPlugin::serve();
@@ -865,6 +918,61 @@ fn an_invalid_answer_fails_its_decision_once_on_a_pair() {
     decide_pair(&plugin, &facts(10));
     let stats = plugin.stats();
     assert_eq!((stats.invalid, stats.breaker_opens), (2, 1));
+}
+
+/// A plugin asked for the pick alone on both sides of a pair, whose first
+/// pick is a row its frame showed as dropped: the decision is failed once
+/// and the other side's pick sends no frame, as an open after the failure
+/// sends none.
+#[test]
+fn a_pick_only_frame_is_not_sent_once_the_plugin_failed_its_decision() {
+    let served = TestPlugin::serve();
+    served.behave(Behaviour::PickDroppedRow);
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "pair-blind-picker");
+    let engine = Engine::new(
+        vec![profile(&plugin, PICK)],
+        vec![binding(Plan::PdPair, Some(0))],
+        1,
+        Needs::default(),
+    );
+    let mut prefills = pool(3);
+    let mut decodes = pool(4);
+    for c in prefills.iter_mut().chain(decodes.iter_mut()) {
+        c.pair_class = 7;
+    }
+    for (i, c) in decodes.iter_mut().enumerate() {
+        c.id = WorkerId(200 + i as u64);
+    }
+    // A row the built-in filter drops on each side: each frame names it.
+    prefills[0].health.healthy = false;
+    decodes[0].health.healthy = false;
+    let decision = engine.decide_pair(
+        &facts(9),
+        &PoolFacts {
+            pool_size: 7,
+            generation: 1,
+            ..PoolFacts::default()
+        },
+        PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        },
+        &Constraints::default(),
+        &Constraints::default(),
+        &mut Scratch::new(),
+    );
+    assert!(decision.pick().is_some(), "the fallbacks placed the pair");
+    let stats = plugin.stats();
+    assert_eq!((stats.invalid, stats.answered), (1, 0), "{stats:?}");
+    // A second frame, were it sent, is answered into nothing.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        (served.frames(), plugin.stats().late_answers),
+        (1, 0),
+        "the failed decision's other side asked nothing"
+    );
 }
 
 /// One decision over both kinds: a WebAssembly plugin filters and a remote
@@ -1142,11 +1250,12 @@ fn each_invalid_answer_is_one_fault_and_the_frame_falls_back_whole() {
 #[test]
 fn the_counters_an_answer_carries_are_added_by_declared_id() {
     let served = TestPlugin::serve();
-    // Id 7 is not declared: the host ignores it.
+    // Id 7 is not declared: the host ignores it. An answer holds one
+    // increment a declared counter at most, so three are declared.
     served.script(|s| s.counters = vec![(0, 2), (1, 5), (7, 1)]);
     let runtime = runtime();
     let mut spec = spec(&served, "counting");
-    spec.metrics = vec!["hits".to_owned(), "skips".to_owned()];
+    spec.metrics = vec!["hits".to_owned(), "skips".to_owned(), "spare".to_owned()];
     let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
     decide(&engine, &pool(4), 1);
@@ -1158,9 +1267,54 @@ fn the_counters_an_answer_carries_are_added_by_declared_id() {
         .collect();
     assert_eq!(
         read,
-        [("hits".to_owned(), 4), ("skips".to_owned(), 10)],
+        [
+            ("hits".to_owned(), 4),
+            ("skips".to_owned(), 10),
+            ("spare".to_owned(), 0)
+        ],
         "two answers"
     );
+}
+
+/// An answer holds no more increments than the plugin declared counters:
+/// a longer list is outside the contract, one fault, and none of it is
+/// added.
+#[test]
+fn more_increments_than_declared_counters_is_one_fault() {
+    let served = TestPlugin::serve();
+    served.script(|s| s.counters = vec![(0, 2), (1, 5), (0, 1)]);
+    let runtime = runtime();
+    let mut spec = spec(&served, "over-counting");
+    spec.metrics = vec!["first".to_owned(), "second".to_owned()];
+    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    assert_eq!(lead(&decide(&engine, &pool(4), 1)), Some(103));
+    let stats = plugin.stats();
+    assert_eq!((stats.invalid, stats.answered), (1, 0), "{stats:?}");
+    assert!(
+        plugin.counters().read().all(|(_, value)| value == 0),
+        "nothing of the list is added"
+    );
+}
+
+/// An answer is bounded in bytes by what its row lets it hold: a message
+/// past that ends the stream before it is decoded.
+#[test]
+fn an_answer_past_the_message_bound_ends_its_stream() {
+    let served = TestPlugin::serve();
+    // Hundreds of kilobytes of increments under a row of 128 candidates.
+    served.script(|s| s.counters = vec![(1, 1); 50_000]);
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "flooding");
+    let engine = single_engine(profile(&plugin, ALL));
+    assert_eq!(lead(&decide(&engine, &pool(4), 1)), Some(103));
+    assert!(
+        eventually(|| plugin.stats().failed_streams == 1),
+        "the stream ends at the message: {:?}",
+        plugin.stats()
+    );
+    let stats = plugin.stats();
+    assert_eq!((stats.invalid, stats.answered), (0, 0), "{stats:?}");
 }
 
 // --- the budget and the breaker ----------------------------------------------
@@ -1475,6 +1629,97 @@ fn two_missed_frames_in_a_window_of_fast_answers_do_not_open_by_the_tail() {
     );
 }
 
+/// A filter of the host's own that holds its decision's thread once, for
+/// the milliseconds it is told: a plugin's frame sent at the open is in
+/// flight meanwhile.
+#[derive(Debug)]
+struct HoldsTheThread(Arc<AtomicU64>);
+
+impl Filter for HoldsTheThread {
+    fn name(&self) -> &'static str {
+        "holds-the-thread"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        let hold = self.0.swap(0, Ordering::Relaxed);
+        if hold != 0 {
+            std::thread::sleep(Duration::from_millis(hold));
+        }
+        true
+    }
+}
+
+/// An answer that arrives after its frame's deadline, while the decision's
+/// thread is elsewhere, is used when the thread comes to read it, and it is
+/// sampled at its whole flight. A miss is a frame the thread stopped
+/// waiting for; the lateness is the plugin's and the latency rule reads it.
+/// So two such answers in a window of fast ones open the breaker by the
+/// tail, where two missed frames, sampled at their grant, do not.
+#[test]
+fn late_answers_the_thread_finds_without_waiting_are_used_and_sampled_at_their_flight() {
+    said();
+    let served = TestPlugin::serve();
+    // Row 0, which no built-in stage would leave: the answer is seen used.
+    served.behave(Behaviour::KeepFirst);
+    let runtime = runtime();
+    let mut spec = spec(&served, "late-answers");
+    // The latency rule alone opens here.
+    spec.breaker = BreakerSpec {
+        failures: u32::MAX,
+        ..BreakerSpec::default()
+    };
+    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+    let hold = Arc::new(AtomicU64::new(0));
+    // The host's filter runs ahead of the plugin's: the frame left at the
+    // open, and the thread reads its answer after the hold.
+    let mut held = profile(&plugin, ALL);
+    held.filters
+        .insert(0, Box::new(HoldsTheThread(Arc::clone(&hold))));
+    let engine = single_engine(held);
+    let candidates = pool(4);
+    let short = RequestFacts {
+        budget_micros: SHORT_MICROS,
+        ..facts(1)
+    };
+    // The answer leaves three budgets after its frame, and the thread is
+    // held ten.
+    served.script(|s| s.delay = Duration::from_millis(60));
+    let mut late = 0;
+    for _ in 0..16 {
+        if late == 2 {
+            break;
+        }
+        let before = plugin.stats();
+        hold.store(200, Ordering::Relaxed);
+        let decision = decide_with(&engine, &short, &candidates);
+        let after = plugin.stats();
+        if after.stalls != before.stalls || after.missed != before.missed {
+            made_again(
+                "late answers",
+                "the host held the answer past the thread's hold, or held its I/O thread",
+            );
+            continue;
+        }
+        assert_eq!(lead(&decision), Some(100), "the late answer is used");
+        assert_eq!(after.answered - before.answered, 1, "{after:?}");
+        late += 1;
+    }
+    assert_eq!(late, 2, "two late answers were read: {:?}", plugin.stats());
+    served.script(|s| s.delay = Duration::ZERO);
+    // The window's first read is at its 64th sample.
+    decide_until_judged(&engine, &plugin, &short, &candidates, 64);
+    let stats = plugin.stats();
+    assert_eq!(
+        stats.breaker_opens, 1,
+        "two flights past the budget are the window's tail: {stats:?}"
+    );
+    let opened = openings("late-answers");
+    assert!(
+        opened.len() == 1 && opened[0].contains("rule=\"latency\""),
+        "{opened:?}"
+    );
+}
+
 /// A frame the decision's remainder clamped at its send is not under the
 /// plugin's own bound: its miss is the decision's budget spent, whoever
 /// spent it, and no failure.
@@ -1764,6 +2009,39 @@ fn an_answered_wait_draws_the_time_the_thread_blocked() {
     );
 }
 
+/// A stream that goes while its decision waits ends the wait, and the time
+/// the thread blocked is drawn like an answered wait's: a plugin asked
+/// later in the decision is asked under the rest.
+#[test]
+fn a_wait_its_stream_broke_draws_the_time_the_thread_blocked() {
+    let leaving = TestPlugin::serve();
+    // The stream ends 200 ms after the frame, far inside the budget.
+    leaving.script(|s| {
+        s.behaviour = Behaviour::EndStream;
+        s.delay = Duration::from_millis(200);
+    });
+    let quick = TestPlugin::serve();
+    let runtime = runtime();
+    let filter = load(&runtime, &leaving, "leaving-filter");
+    let picker = load(&runtime, &quick, "picker");
+    let engine = single_engine(filter_then_picker(&filter, &picker));
+    // The filter falls back; the scripted picker, asked alone, takes the
+    // most loaded row.
+    assert_eq!(lead(&decide(&engine, &pool(4), 1)), Some(100));
+    assert!(
+        eventually(|| filter.stats().failed_streams == 1),
+        "the stream went under the wait"
+    );
+    assert_eq!((filter.stats().missed, picker.stats().answered), (0, 1));
+    // As for an answered wait: half the 200 ms must be gone from what the
+    // picker's frame names.
+    let named = quick.seen().frames[0].budget_micros;
+    assert!(
+        named <= BUDGET_MICROS - 100_000,
+        "the broken wait drew nothing like its 200 ms: {named} of {BUDGET_MICROS} left"
+    );
+}
+
 #[test]
 fn a_missed_frame_draws_its_grant_and_the_next_plugin_is_asked_under_the_rest() {
     let silent = TestPlugin::serve();
@@ -1792,6 +2070,16 @@ fn a_missed_frame_draws_its_grant_and_the_next_plugin_is_asked_under_the_rest() 
     assert_eq!(
         quick.seen().frames[0].budget_micros,
         SHORT_MICROS - SHORT_MICROS / 4
+    );
+    // The silent filter's frame named two budgets: its own quarter as the
+    // frame's deadline, the decision's remainder as the request's.
+    let sent = silent.seen();
+    assert_eq!(
+        (
+            sent.frames[0].budget_micros,
+            sent.frames[0].request.as_ref().map(|r| r.budget_micros)
+        ),
+        (SHORT_MICROS / 4, Some(SHORT_MICROS))
     );
 }
 
@@ -2208,7 +2496,7 @@ fn without_a_fallback_the_failure_policy_decides() {
 // --- the stream ---------------------------------------------------------------
 
 #[test]
-fn a_stream_that_ends_is_counted_once_and_reopens_behind_the_next_decision() {
+fn a_stream_that_ends_is_counted_once_and_reopens_behind_a_decision_a_pause_later() {
     let served = TestPlugin::serve();
     served.behave(Behaviour::EndStream);
     let runtime = runtime();
@@ -2220,27 +2508,188 @@ fn a_stream_that_ends_is_counted_once_and_reopens_behind_the_next_decision() {
         Some(103),
         "the decision in flight falls back when its stream goes"
     );
+    assert!(!plugin.is_warm());
+    // The lane's state moved before the plugin was told: the count follows.
+    assert!(eventually(|| plugin.stats().failed_streams == 1));
     let stats = plugin.stats();
     assert_eq!(
         (stats.failed_streams, stats.missed, stats.cold),
         (1, 0, 0),
         "the stream's end, not a missed deadline"
     );
-    assert!(!plugin.is_warm());
 
-    // The next decision does not wait for a connect: it falls back at once
-    // and the stream opens behind it.
+    // The next decision does not wait for a connect: it falls back at once.
+    // The stream is asked for behind a decision a pause after the failure.
     served.behave(Behaviour::Honest);
     assert_eq!(lead(&decide(&engine, &candidates, 2)), Some(103));
     assert_eq!(plugin.stats().cold, 1);
     assert!(
-        eventually(|| plugin.stats().connects == 2),
-        "reconnected behind the decision"
+        eventually(|| {
+            decide(&engine, &candidates, 2);
+            plugin.is_warm()
+        }),
+        "reopened behind a decision"
     );
+    let before = plugin.stats();
     assert_eq!(lead(&decide(&engine, &candidates, 3)), Some(103));
     let stats = plugin.stats();
-    assert_eq!((stats.answered, stats.failed_streams), (1, 1));
+    assert_eq!(
+        (
+            stats.answered - before.answered,
+            stats.connects,
+            stats.failed_streams
+        ),
+        (1, 2, 1)
+    );
     assert_eq!(served.seen().hellos.len(), 2);
+}
+
+/// A stream's failure is told to the plugin through the host's clock, on
+/// the I/O thread, and the lane's state moves first: here that read of the
+/// clock panics, and the thread's next decisions still find the stream gone
+/// and reopen it. Told first, the lane would read as open over a dead
+/// stream, and no decision would ever reopen it.
+#[test]
+fn a_stream_that_ends_under_a_clock_that_panics_still_reopens() {
+    let served = TestPlugin::serve();
+    let armed = Arc::new(AtomicBool::new(false));
+    let told = Arc::clone(&armed);
+    let deciding = std::thread::current().id();
+    let runtime = Runtime::with_clock(&OpenDecisions::new(), move || {
+        // Off the deciding thread the clock is read where a stream's
+        // failure is told: that read panics, once.
+        assert!(
+            std::thread::current().id() == deciding || !told.swap(false, Ordering::Relaxed),
+            "the runtime's clock panics on the I/O thread"
+        );
+        1_000_000
+    })
+    .expect("a runtime");
+    let plugin = load(&runtime, &served, "ends-under-a-panic");
+    let engine = single_engine(profile(&plugin, ALL));
+    let candidates = pool(4);
+    assert_eq!(lead(&decide(&engine, &candidates, 1)), Some(103));
+    assert_eq!(plugin.stats().answered, 1);
+    served.behave(Behaviour::EndStream);
+    armed.store(true, Ordering::Relaxed);
+    // The decision in flight falls back when its stream goes.
+    assert_eq!(lead(&decide_short(&engine, &candidates, 2)), Some(103));
+    served.behave(Behaviour::Honest);
+    assert!(
+        eventually(|| {
+            decide(&engine, &candidates, 3);
+            plugin.stats().connects == 2
+        }),
+        "the lane was left open over a dead stream: {:?}",
+        plugin.stats()
+    );
+    let before = plugin.stats().answered;
+    assert_eq!(lead(&decide(&engine, &candidates, 4)), Some(103));
+    assert_eq!(
+        plugin.stats().answered - before,
+        1,
+        "the reopened stream answers"
+    );
+}
+
+/// A lane that failed asks for its next stream no sooner than a pause
+/// later, whatever the breaker is set to. Against a socket that refuses at
+/// once, under a cool-down of zero, the decisions of a third of a second
+/// ask for a handful of streams, not one each.
+#[test]
+fn a_refused_socket_under_a_cool_down_of_zero_is_asked_once_a_pause() {
+    let mut served = TestPlugin::serve();
+    let runtime = runtime();
+    let mut spec = spec(&served, "refused");
+    spec.breaker = BreakerSpec {
+        cooldown_micros: 0,
+        ..BreakerSpec::default()
+    };
+    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    let candidates = pool(4);
+    assert_eq!(lead(&decide(&engine, &candidates, 1)), Some(103));
+    served.stop();
+    assert!(
+        eventually(|| plugin.stats().failed_streams == 1),
+        "the stream went with the server"
+    );
+    let started = Instant::now();
+    let mut decisions = 0_u64;
+    while started.elapsed() < Duration::from_millis(300) {
+        assert_eq!(lead(&decide(&engine, &candidates, 2)), Some(103));
+        decisions += 1;
+    }
+    let asked = plugin.stats().failed_streams - 1;
+    assert!(
+        decisions > 100,
+        "a failed lane's decisions fall back at once"
+    );
+    assert!(
+        asked <= 6,
+        "{asked} streams asked for by {decisions} decisions in 300 ms"
+    );
+}
+
+/// A stream that ends is one failure on the breaker, with no decision to
+/// mark: under a threshold of one it opens, and the next decision is
+/// bypassed.
+#[test]
+fn a_stream_that_ends_counts_on_the_breaker() {
+    let served = TestPlugin::serve();
+    served.behave(Behaviour::EndStream);
+    let runtime = runtime();
+    let mut spec = spec(&served, "leaving-once");
+    spec.breaker = BreakerSpec {
+        failures: 1,
+        window_micros: 60_000_000,
+        cooldown_micros: 60_000_000,
+    };
+    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    let candidates = pool(4);
+    assert_eq!(lead(&decide(&engine, &candidates, 1)), Some(103));
+    assert!(
+        eventually(|| plugin.stats().breaker_opens == 1),
+        "the stream's end reached the breaker: {:?}",
+        plugin.stats()
+    );
+    assert_eq!(lead(&decide(&engine, &candidates, 2)), Some(103));
+    assert_eq!(plugin.stats().bypassed, 1);
+}
+
+/// The hello's ack is awaited under the connect frame on the I/O thread
+/// too. A plugin that takes a cold thread's stream and never acks leaves
+/// it failed at the frame's end, and the thread's later decisions ask for
+/// it again.
+#[test]
+fn a_hello_never_acked_fails_a_cold_threads_stream_at_the_connect_frame() {
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let mut spec = spec(&served, "mute-hello");
+    spec.connect_micros = 100_000;
+    let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+    served.script(|s| s.hello_delay = Duration::from_secs(30));
+    let engine = single_engine(profile(&plugin, ALL));
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            // This thread's stream was never opened: it opens behind the
+            // thread's first decision, which falls back.
+            assert_eq!(lead(&decide(&engine, &pool(4), 1)), Some(103));
+            assert!(
+                eventually(|| plugin.stats().failed_streams == 1),
+                "the wait for the ack ended: {:?}",
+                plugin.stats()
+            );
+            assert!(
+                eventually(|| {
+                    decide(&engine, &pool(4), 2);
+                    served.seen().hellos.len() >= 3
+                }),
+                "the failed stream is asked for again"
+            );
+        });
+    });
 }
 
 /// A stream that goes takes its frames in flight with it and no more: the
@@ -2257,19 +2706,25 @@ fn a_place_free_when_its_stream_went_serves_the_reopened_stream() {
     let engine = single_engine(profile(&plugin, ALL));
     let candidates = pool(4);
     assert_eq!(lead(&decide(&engine, &candidates, 1)), Some(103));
-    assert_eq!(plugin.stats().failed_streams, 1, "the stream went");
-    // The stream opens behind the next decision.
-    served.behave(Behaviour::Honest);
-    assert_eq!(lead(&decide(&engine, &candidates, 2)), Some(103));
     assert!(
-        eventually(|| plugin.stats().connects == 2),
-        "reconnected behind the decision"
+        eventually(|| plugin.stats().failed_streams == 1),
+        "the stream went"
+    );
+    // The stream opens behind a decision, a pause after the failure.
+    served.behave(Behaviour::Honest);
+    assert!(
+        eventually(|| {
+            decide(&engine, &candidates, 2);
+            plugin.is_warm()
+        }),
+        "reopened behind a decision"
     );
     drop(engine);
+    let before = plugin.stats();
     assert!(decide_pair(&plugin, &facts(9)).pick().is_some());
     let stats = plugin.stats();
     assert_eq!(
-        (stats.answered, stats.failed_streams),
+        (stats.answered - before.answered, stats.failed_streams),
         (2, 1),
         "both frames of the pair were answered on the reopened stream: {stats:?}"
     );
@@ -2375,6 +2830,58 @@ fn the_lifecycle_reaches_the_plugin_once_in_order() {
     }
 }
 
+/// The events' numbers are the stream's: an event is numbered where it
+/// enters the stream, on the I/O thread, so threads that raise events at
+/// once cannot put a later number ahead of an earlier one.
+#[test]
+fn events_raised_on_many_threads_are_numbered_in_the_order_they_are_sent() {
+    const THREADS: usize = 16;
+    const EACH: usize = 60;
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "many-observers");
+    let engine = single_engine(profile(&plugin, ALL));
+    let start = std::sync::Barrier::new(THREADS);
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                start.wait();
+                for _ in 0..EACH {
+                    engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+                }
+            });
+        }
+    });
+    // Fewer than the queue holds: none is dropped.
+    assert_eq!(plugin.stats().observed, (THREADS * EACH) as u64);
+    assert!(eventually(|| served.seen().events.len() == THREADS * EACH));
+    let seen = served.seen();
+    let seqs: Vec<u64> = seen.events.iter().map(|e| e.seq).collect();
+    let in_order: Vec<u64> = (1..=(THREADS * EACH) as u64).collect();
+    assert_eq!(seqs, in_order, "the numbers follow the order on the stream");
+}
+
+/// An event the queue cannot take is dropped and counted, never a wait on
+/// the thread that raised it. The I/O thread is held off the queue here,
+/// so nothing leaves it while 2,000 events are raised.
+#[test]
+fn events_past_the_queue_are_dropped_and_counted() {
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "flooded-observer");
+    let engine = single_engine(profile(&plugin, ALL));
+    runtime.hold_io(Duration::from_millis(300));
+    for _ in 0..2_000 {
+        engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    }
+    let stats = plugin.stats();
+    assert_eq!(stats.observed + stats.observe_dropped, 2_000, "{stats:?}");
+    assert!(
+        stats.observed >= 1_024 && stats.observe_dropped > 0,
+        "the queue holds 1,024 and the rest is dropped: {stats:?}"
+    );
+}
+
 /// A build that binds the plugin to two profiles takes both bound sets from
 /// one binder: the engine hands an event to every profile and the plugin
 /// hears it once. An engine built later over the same plugin has an observer
@@ -2463,6 +2970,87 @@ fn the_exposure_withholds_what_the_row_does_not_reveal() {
         }],
         "the allow-listed header alone"
     );
+}
+
+/// A lease on the lifecycle carries the session's value, and a request
+/// shows the same value in the hash form, so a plugin matches the two: a
+/// row that withholds the session key withholds both.
+#[test]
+fn a_lease_and_its_request_show_one_session_value_or_none() {
+    let keyed = RequestFacts {
+        session_key: Identity::plain("s-1"),
+        ..facts(1)
+    };
+    let lease = Lease {
+        session: keyed.session(),
+        ..Lease::default()
+    };
+    let value = lease.session.get();
+    assert_ne!(value, 0, "a keyed request has a session");
+    let runtime = runtime();
+    // The session as the request's frame and as the lease's event show it.
+    let shown_under = |name: &str, session_key: Reveal| {
+        let served = TestPlugin::serve();
+        let mut spec = spec(&served, name);
+        spec.view = Exposure {
+            session_key,
+            ..Exposure::default()
+        };
+        let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+        let engine = single_engine(profile(&plugin, ALL));
+        let decision = decide_with(&engine, &keyed, &pool(4));
+        engine.on_decision_issued(&lease, &decision);
+        assert!(eventually(|| served.seen().events.len() == 1));
+        let seen = served.seen();
+        let request = seen.frames[0].request.as_ref().expect("the request");
+        let in_the_frame = request.session_key.as_ref().and_then(|id| id.form.clone());
+        let on_the_lease = match &seen.events[0].event {
+            Some(proto::lifecycle_event::Event::Issued(issued)) => {
+                issued.decision.as_ref().expect("the decision").leases[0].session_key
+            }
+            other => panic!("issued, not {other:?}"),
+        };
+        (in_the_frame, on_the_lease)
+    };
+    assert_eq!(
+        shown_under("session-withheld", Reveal::None),
+        (None, 0),
+        "withheld from both"
+    );
+    assert_eq!(
+        shown_under("session-hashed", Reveal::Hash),
+        (Some(proto::identity::Form::Hash(value)), value),
+        "one value in both, under a row that reveals the key's hash"
+    );
+}
+
+/// A row printed in its debug form writes none of its PEMs: one of them
+/// is the private key.
+#[test]
+fn a_printed_row_withholds_its_pems() {
+    let pems: [&[u8]; 3] = [b"AUTHORITY", b"CERTIFICATE", b"PRIVATE"];
+    let row = GrpcPluginSpec::new(
+        "printed",
+        Transport::Tls {
+            address: "plugin.example:9000".to_owned(),
+            tls: Tls {
+                server_name: "plugin.example".to_owned(),
+                ca_pem: pems[0].to_vec(),
+                cert_pem: pems[1].to_vec(),
+                key_pem: pems[2].to_vec(),
+            },
+        },
+    );
+    let printed = format!("{row:?}");
+    assert!(printed.contains("plugin.example"), "{printed}");
+    for pem in pems {
+        // A byte vector prints as its numbers between brackets.
+        let numbers = format!("{pem:?}");
+        assert!(
+            !printed.contains(&numbers[1..numbers.len() - 1]),
+            "a PEM's bytes are printed: {printed}"
+        );
+    }
 }
 
 // --- mutual TLS ---------------------------------------------------------------

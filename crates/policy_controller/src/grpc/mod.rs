@@ -11,6 +11,8 @@
 //! counters, the stage bits the engine will ask for and how many frames it
 //! keeps in flight; the plugin's ack fixes the protocol version and the
 //! stages it implements, and an ack that says `init` failed fails the apply.
+//! A stage a profile binds and the ack leaves out takes its fallback on
+//! every decision, and one warning a bound set says so.
 //!
 //! How a decision runs: one `Decide` stream per deciding thread, opened at
 //! the apply ([`Plugin::warm`] on every shard thread) and kept. No decision
@@ -48,13 +50,17 @@
 //! breaks a validity rule (a repeated or out-of-range survivor, a non-finite
 //! score or the wrong count, a pick outside the plugin's own survivors or
 //! outside the rows a pick-only frame named, a declined stage with its field
-//! filled) is the plugin's fault: the frame falls back whole and the breaker
-//! counts it. The decision is the breaker's unit, as for every kind: a plugin
+//! filled, more counter increments than the row declares counters) is the
+//! plugin's fault: the frame falls back whole and the breaker counts it. A
+//! message longer than the row lets an answer be ends its stream undecoded.
+//! The decision is the breaker's unit, as for every kind: a plugin
 //! fails a decision once, its later opens of that decision send no frame, and
 //! the answer of a frame already in flight for the other side of a pair is
 //! not read. A pick over the whole view that the profile's own filters
 //! dropped meanwhile is no fault: the picker falls back. A stream that ends
-//! or errs counts once and is reopened behind the thread's next decision; a
+//! or errs counts once and is reopened behind a decision of its thread, no
+//! sooner than a pause (100 ms) after the failure, whatever the breaker is
+//! set to; a wait its stream broke draws the time its thread blocked; a
 //! frame past the stream's window is not sent; a pool larger than the
 //! plugin's `max_candidates` sends no frame (whole view or none: a truncated
 //! view would make the answer depend on the host's candidate order), takes
@@ -67,7 +73,9 @@
 //! The lifecycle: one `Observe` stream per plugin, opened once a `Decide`
 //! stream has settled, carries the events the engine forwards (issued,
 //! dispatched, completed, released, membership, signals) in order, each
-//! numbered; an event the stream cannot take at once is dropped and counted,
+//! numbered by the I/O thread where it enters the stream, so the numbers
+//! never go down whichever threads raise the events; an event the queue
+//! cannot take at once is dropped and counted,
 //! never a wait on a deciding thread. Each profile that binds the plugin
 //! holds one [`Bound`] set, taken from its engine build's [`Binder`]: one
 //! adapter of a build forwards, so an event reaches the plugin once per
@@ -83,8 +91,12 @@
 //! promise (four milliseconds) is the host's: counted as a stall and left
 //! out of the plugin's latency sample; a missed one falls back all the
 //! same. With no frame in flight nothing ticks. A frame whose own budget
-//! is no longer than the promise is never excused, and its miss is never
-//! the plugin's failure: it ends before the thread can be seen late.
+//! is no longer than the promise is excused only where another frame's
+//! flight already shows the thread stalled, and its miss is never the
+//! plugin's failure: alone it ends before the thread can be seen late. An
+//! answer in its place when the thread comes to read it is used whenever
+//! it arrived and sampled at its whole flight: a miss is a frame the thread
+//! stopped waiting for, and a late answer's lateness is the latency rule's.
 //!
 //! What is not here yet: the spec's `plugins` row that names a gRPC plugin
 //! by address (it lands with the configuration schema; until then a host

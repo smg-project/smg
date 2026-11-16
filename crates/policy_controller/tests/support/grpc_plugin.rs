@@ -333,7 +333,9 @@ impl PolicyPlugin for Shared {
                             lock(&shared.seen).frames.push(frame);
                         }
                         if script.behaviour == Behaviour::EndStream {
-                            // The response stream ends with its sender.
+                            // The response stream ends with its sender, after
+                            // the delay an answer would wait.
+                            pause(script.delay).await;
                             return;
                         }
                         let Some(decision) = answered else {

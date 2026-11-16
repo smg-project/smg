@@ -52,14 +52,19 @@ pub fn said() -> Arc<std::sync::Mutex<Vec<String>>> {
     }))
 }
 
-/// The lines of an opening that name `plugin`.
-pub fn openings(plugin: &str) -> Vec<String> {
+/// The kept lines that name `plugin` and hold `text`.
+pub fn lines(plugin: &str, text: &str) -> Vec<String> {
     let named = format!("plugin=\"{plugin}\"");
     said()
         .lock()
         .expect("the kept lines")
         .iter()
-        .filter(|line| line.contains("breaker opened") && line.contains(&named))
+        .filter(|line| line.contains(text) && line.contains(&named))
         .cloned()
         .collect()
+}
+
+/// The lines of an opening that name `plugin`.
+pub fn openings(plugin: &str) -> Vec<String> {
+    lines(plugin, "breaker opened")
 }

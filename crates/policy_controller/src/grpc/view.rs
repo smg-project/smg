@@ -531,6 +531,8 @@ pub(crate) enum Invalid {
     Scores,
     /// A pick outside the surviving set.
     Pick,
+    /// More counter increments than the plugin declared counters.
+    Counters,
 }
 
 impl std::fmt::Display for Invalid {
@@ -540,6 +542,7 @@ impl std::fmt::Display for Invalid {
             Self::Survivor => "a surviving position is out of range or repeated",
             Self::Scores => "the scores are not one finite value per candidate",
             Self::Pick => "the pick is outside the surviving set",
+            Self::Counters => "more counter increments than declared counters",
         })
     }
 }
@@ -576,8 +579,19 @@ pub(crate) fn bit(mask: &[u64], position: u32) -> bool {
 /// with its field filled is invalid. The pick is judged here against the
 /// plugin's own survivors when its filter answered in the frame, and against
 /// the candidate count otherwise; the picker judges it against the rows the
-/// profile's filters left.
-pub(crate) fn read(d: proto::PluginDecision, asked: u32, count: u32) -> Result<Answer, Invalid> {
+/// profile's filters left. The counter list is judged first: an answer
+/// holds no more increments than the plugin declared counters (`declared`),
+/// so what the deciding thread walks after its wait is the row's size and
+/// never the plugin's.
+pub(crate) fn read(
+    d: proto::PluginDecision,
+    asked: u32,
+    count: u32,
+    declared: usize,
+) -> Result<Answer, Invalid> {
+    if d.counters.len() > declared {
+        return Err(Invalid::Counters);
+    }
     let mut answer = Answer {
         counters: d.counters,
         ..Answer::default()
@@ -653,7 +667,12 @@ pub(crate) fn read(d: proto::PluginDecision, asked: u32, count: u32) -> Result<A
 
 #[cfg(test)]
 mod tests {
-    use super::{proto, read, Invalid, FILTER, PICK, SCORE};
+    use super::{proto, Answer, Invalid, FILTER, PICK, SCORE};
+
+    /// The stages' rules, under a plugin that declared no counter.
+    fn read(d: proto::PluginDecision, asked: u32, count: u32) -> Result<Answer, Invalid> {
+        super::read(d, asked, count, 0)
+    }
 
     fn decision(
         survivors: Option<Vec<u32>>,
@@ -810,6 +829,25 @@ mod tests {
             )
             .unwrap_err(),
             Invalid::DeclinedAndAnswered
+        );
+    }
+
+    #[test]
+    fn more_increments_than_declared_counters_break_the_contract() {
+        let counted = |increments: usize| proto::PluginDecision {
+            counters: vec![proto::CounterDelta { id: 0, by: 1 }; increments],
+            ..decision(None, Vec::new(), Some(2), None)
+        };
+        let within = super::read(counted(2), PICK, 3, 2).unwrap();
+        assert_eq!(within.counters.len(), 2, "an id named twice is no fault");
+        assert_eq!(
+            super::read(counted(3), PICK, 3, 2).unwrap_err(),
+            Invalid::Counters
+        );
+        assert_eq!(
+            super::read(counted(1), PICK, 3, 0).unwrap_err(),
+            Invalid::Counters,
+            "a plugin that declared none sends none"
         );
     }
 

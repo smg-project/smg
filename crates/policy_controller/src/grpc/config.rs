@@ -4,7 +4,7 @@
 //! directly. The parts a row has whatever its kind are the shared ones of
 //! [`crate::plugins::config`], re-exported here.
 
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 pub use crate::plugins::config::{BreakerSpec, Exposure, Failure, FrameBudget, HeaderSet, Reveal};
 use crate::spec::Needs;
@@ -12,7 +12,7 @@ use crate::spec::Needs;
 /// The client side of mutual TLS: the authority that signed the plugin's
 /// certificate, the identity the plugin verifies, and the name pinned on the
 /// plugin's certificate.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Tls {
     /// The server name the plugin's certificate must carry.
     pub server_name: String,
@@ -21,6 +21,16 @@ pub struct Tls {
     /// This host's certificate chain and private key, PEM.
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
+}
+
+/// The PEMs are withheld: the private key is one of them, and a host that
+/// prints its row writes none of it.
+impl fmt::Debug for Tls {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tls")
+            .field("server_name", &self.server_name)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Where the plugin answers. The design names two transports and no plain
@@ -72,7 +82,8 @@ pub struct GrpcPluginSpec {
 }
 
 impl GrpcPluginSpec {
-    /// The default candidate bound: the record view is 40 KB at 512.
+    /// The default candidate bound: a frame is 1.5 KB on the wire at 64
+    /// candidates and 12.6 KB at 512.
     pub const DEFAULT_MAX_CANDIDATES: u32 = 128;
 
     /// The default connect frame: the WebAssembly host's `init` frame.

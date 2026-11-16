@@ -113,7 +113,9 @@ ingest = [
 # The standalone controller: the ingestion drivers, the listeners with their
 # scopes, the protocol's generated service and client, the election, the gRPC
 # health service, the admin endpoints and the binary of the package's name.
-# Off by default: the engine alone has no server dependency.
+# Off by default: the engine alone has no server dependency. It builds on
+# Linux and macOS: the gRPC plugin kind dials a Unix socket and reads its
+# peer's user through `rustix`, which is declared for those two.
 controller = [
     "ingest",
     "dep:axum",
@@ -208,6 +210,11 @@ required-features = ["controller"]
 
 [[test]]
 name = "grpc_plugin"
+required-features = ["controller"]
+
+# One case in a process of its own: it lowers the process's descriptor limit.
+[[test]]
+name = "grpc_runtime"
 required-features = ["controller"]
 
 [[test]]
