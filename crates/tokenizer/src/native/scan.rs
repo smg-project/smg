@@ -6,8 +6,11 @@
 //! role's test for one character in one read: a table of role bits per
 //! ASCII byte (a byte beyond ASCII reads as no role there), one per code
 //! point of the Basic Multilingual Plane built from the classes when the
-//! scanner is recognized, and the classes themselves above the plane. The
-//! plane table is kept by 256-code-point blocks, blocks with the same bits
+//! scanner is recognized, and above the plane the runs of code points the
+//! classes read alike: one binary search per character, where asking the
+//! classes is a search per category table per class (measured: two thirds
+//! of an encode's cycles on a text with one emoji per 134 bytes). The plane
+//! table is kept by 256-code-point blocks, blocks with the same bits
 //! sharing one row: the ideographs, the kana, a Cyrillic or Thai block each
 //! read from one 512-byte row, so the table a text touches stays in the
 //! first-level cache (a flat table of the plane is 128 KiB and missed the
@@ -167,15 +170,16 @@ pub(super) struct Roles {
     block_rows: [u16; 256],
     /// The distinct rows of the plane table, `BLOCK` bits each.
     rows: Box<[Bits]>,
-    /// The class of each role, read above the plane.
-    classes: Vec<Class>,
+    /// The role bits above the plane as runs in code point order: the first
+    /// code point of each run and its bits; a run ends where the next starts.
+    above: Box<[(u32, Bits)]>,
 }
 
 impl std::fmt::Debug for Roles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Roles")
-            .field("roles", &self.classes.len())
             .field("rows", &(self.rows.len() / BLOCK))
+            .field("runs_above", &self.above.len())
             .finish()
     }
 }
@@ -220,12 +224,28 @@ impl Roles {
                 (rows.len() / BLOCK - 1) as u16
             });
         }
+        // Above the plane the bits change only where a class's membership
+        // does: one run from each such point to the next, equal neighbours
+        // as one.
+        let mut changes = vec![PLANE, u32::from(char::MAX) + 1];
+        for class in classes {
+            class.changes_from(PLANE, &mut changes);
+        }
+        changes.sort_unstable();
+        changes.dedup();
+        let mut above: Vec<(u32, Bits)> = Vec::new();
+        for code in changes {
+            let bits = char::from_u32(code).map_or(0, bits_of);
+            if above.last().is_none_or(|&(_, last)| last != bits) {
+                above.push((code, bits));
+            }
+        }
         Self {
             bytes,
             scans,
             block_rows,
             rows: rows.into_boxed_slice(),
-            classes: classes.iter().map(|class| (*class).clone()).collect(),
+            above: above.into_boxed_slice(),
         }
     }
 
@@ -266,18 +286,12 @@ impl Roles {
         (bits, len)
     }
 
-    /// The role bits of a code point above the plane, from the classes.
+    /// The role bits of a code point above the plane: those of its run.
     #[cold]
     #[inline(never)]
     fn above(&self, code: u32) -> Bits {
-        let Some(c) = char::from_u32(code) else {
-            return 0;
-        };
-        self.classes
-            .iter()
-            .enumerate()
-            .filter(|(_, class)| class.contains(c))
-            .fold(0, |bits, (slot, _)| bits | (1 << slot))
+        let next = self.above.partition_point(|&(start, _)| start <= code);
+        next.checked_sub(1).map_or(0, |run| self.above[run].1)
     }
 
     /// [`Self::run_end`] for a role whose run the caller expects to be the
@@ -468,7 +482,15 @@ mod tests {
         let classes: Vec<&Class> = pattern.classes().iter().collect();
         let roles = Roles::build(&classes);
         let mut text = String::new();
-        for code in (0..0x11_0000u32).filter(|code| code % 7 == 0 || *code < 0x3000) {
+        // Above the plane the table is runs: both ends of every run are read
+        // beside the sample.
+        let mut changes = vec![PLANE];
+        for class in &classes {
+            class.changes_from(PLANE, &mut changes);
+        }
+        let ends = changes.iter().flat_map(|&code| code - 1..=code);
+        let sample = (0..0x11_0000u32).filter(|code| code % 7 == 0 || *code < 0x3000);
+        for code in sample.chain(ends) {
             let Some(c) = char::from_u32(code) else {
                 continue;
             };

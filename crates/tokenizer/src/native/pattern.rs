@@ -351,6 +351,23 @@ impl Class {
         }
     }
 
+    /// Every code point above `from` at which membership of the class can
+    /// change: the bounds of its own ranges and of the tables of its
+    /// categories and exclusions.
+    pub(super) fn changes_from(&self, from: u32, changes: &mut Vec<u32>) {
+        let mut bounds = |ranges: &[(u32, u32)]| {
+            for &(start, end) in ranges {
+                changes.extend([start, end + 1].into_iter().filter(|&code| code > from));
+            }
+        };
+        bounds(&self.ranges);
+        for &(bit, table) in &CATEGORY_TABLES {
+            if (self.categories | self.without) & bit != 0 {
+                bounds(table);
+            }
+        }
+    }
+
     /// Whether the class may hold a character beyond ASCII.
     pub(super) fn may_hold_beyond_ascii(&self) -> bool {
         self.first().non_ascii
