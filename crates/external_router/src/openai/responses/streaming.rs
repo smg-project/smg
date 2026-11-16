@@ -666,7 +666,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
             worker.record_outcome(502);
             return (
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to forward request to OpenAI: {err}"),
+                format!("Failed to forward request to OpenAI: {}", err.without_url()),
             )
                 .into_response();
         }
@@ -1608,6 +1608,58 @@ mod tests {
             .expect("the routed-worker header");
         assert!(!header.contains("secret"), "{header}");
         assert_eq!(header, format!("http://***@127.0.0.1:{port}"));
+    }
+
+    /// A streamed forward nothing answers: the caller's 502 says why without
+    /// the worker's address. The HTTP client's own error text ends with the
+    /// request URL.
+    #[tokio::test]
+    async fn a_failed_streamed_forward_answers_without_the_workers_address() {
+        use std::sync::Arc;
+
+        use axum::http::StatusCode;
+        use openai_protocol::responses::ResponsesRequest;
+        use serde_json::json;
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        };
+
+        use crate::{
+            openai::context::StorageHandles,
+            test_support::{http_client, text_of, RefusedAddress, StubWorker},
+        };
+
+        let refused = RefusedAddress::reserve();
+        let worker_url = format!("http://{}", refused.addr());
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
+                .expect("a request");
+        let req = StreamingRequest {
+            url: format!("{worker_url}/v1/responses"),
+            payload: json!({}),
+            original_body: request,
+            previous_response_id: None,
+            existing_mcp_list_tools_labels: Vec::new(),
+            storage: StorageHandles {
+                response: Arc::new(MemoryResponseStorage::new()),
+                conversation: Arc::new(MemoryConversationStorage::new()),
+                conversation_item: Arc::new(MemoryConversationItemStorage::new()),
+                request_context: None,
+                tenant: None,
+            },
+        };
+
+        let response = handle_simple_streaming_passthrough(
+            &http_client(),
+            &StubWorker::at(&worker_url),
+            None,
+            req,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = text_of(response).await;
+        assert!(!body.contains(&refused.addr().to_string()), "{body}");
     }
 
     /// A header the upstream sent more than once reaches the client of a
