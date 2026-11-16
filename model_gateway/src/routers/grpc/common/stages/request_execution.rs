@@ -1316,7 +1316,7 @@ async fn execute_embed(
     // The file's own `join_all` import goes with the last other call that
     // uses it; this one names the function here, so the call stands whether
     // or not that import remains.
-    use futures::future::join_all;
+    use futures::{future::join_all, FutureExt};
 
     let client = &*clients.single_or_mismatch("execute_embed")?;
 
@@ -1332,10 +1332,27 @@ async fn execute_embed(
     let answers = if calls.len() <= MAX_IN_FLIGHT_EMBED_CALLS {
         join_all(calls).await
     } else {
-        futures::stream::iter(calls)
-            .buffered(MAX_IN_FLIGHT_EMBED_CALLS)
-            .collect()
-            .await
+        // Unordered, so a slow call does not hold the window's other slots:
+        // each answer is put back at its input's place. The index rides the
+        // call's own future: an async block around the call would hold that
+        // future twice and double every call's task.
+        let mut calls = calls.enumerate();
+        let mut in_flight = FuturesUnordered::new();
+        let mut answers = Vec::with_capacity(calls.len());
+        loop {
+            while in_flight.len() < MAX_IN_FLIGHT_EMBED_CALLS {
+                let Some((index, call)) = calls.next() else {
+                    break;
+                };
+                in_flight.push(call.map(move |answer| (index, answer)));
+            }
+            let Some(answer) = in_flight.next().await else {
+                break;
+            };
+            answers.push(answer);
+        }
+        answers.sort_unstable_by_key(|(index, _)| *index);
+        answers.into_iter().map(|(_, answer)| answer).collect()
     };
     // One breaker sample for the request, read from every answer: a worker
     // failure on any input counts whatever its place in the batch.

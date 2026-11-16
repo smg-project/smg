@@ -393,22 +393,35 @@ async fn a_batch_of_texts_is_one_call_per_text_answered_in_order() {
 }
 
 /// A batch past the window keeps the window's count of calls in flight and
-/// never one more. The stub holds every call where it arrived, so its count
-/// is every call the gateway has open.
+/// never one more, and is answered in the inputs' order. The stub holds every
+/// call where it arrived, so its count is every call the gateway has open.
 #[tokio::test]
 async fn a_batch_past_the_window_keeps_the_window_of_calls_in_flight() {
     let (open, gate) = watch::channel(false);
     let stub = EmbedStub {
         gate: Some(gate),
+        // The first input's call answers last, so the answers reach the
+        // gateway out of the inputs' order.
+        slow_ids: Some(vec![1]),
         ..EmbedStub::default()
     };
     let bed = Bed::over(Endpoint::Embeddings, stub).await;
-    let inputs = vec![vec![1]; MAX_IN_FLIGHT_EMBED_CALLS + 44];
+    // Each input's vector (`[len, first id]`) is its own, so the answers' order
+    // is read back past the window too.
+    let inputs: Vec<Vec<u32>> = (0..MAX_IN_FLIGHT_EMBED_CALLS + 44)
+        .map(|i| vec![(i % 9) as u32 + 1; i / 9 + 1])
+        .collect();
 
     let window_read = async {
-        while bed.stub.in_flight.load(Ordering::SeqCst) < MAX_IN_FLIGHT_EMBED_CALLS {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        let full = async {
+            while bed.stub.in_flight.load(Ordering::SeqCst) < MAX_IN_FLIGHT_EMBED_CALLS {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        // A window narrower than its constant is a failure here, not a hang.
+        tokio::time::timeout(Duration::from_secs(10), full)
+            .await
+            .expect("the window fills");
         // The window is full and no call ends: one past it arrives now.
         tokio::time::sleep(Duration::from_millis(50)).await;
         open.send(true).expect("the stub holds the gate");
@@ -419,7 +432,15 @@ async fn a_batch_past_the_window_keeps_the_window_of_calls_in_flight() {
     );
 
     assert_eq!(status, http::StatusCode::OK, "{body}");
-    assert_eq!(items(&body).len(), inputs.len(), "one vector per input");
+    assert_eq!(
+        items(&body),
+        inputs
+            .iter()
+            .enumerate()
+            .map(|(i, ids)| (i as u64, vector_of(ids)))
+            .collect::<Vec<_>>(),
+        "each input's vector at its index past the window: {body}"
+    );
     assert_eq!(
         bed.stub.most_in_flight.load(Ordering::SeqCst),
         MAX_IN_FLIGHT_EMBED_CALLS,
