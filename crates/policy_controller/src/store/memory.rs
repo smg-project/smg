@@ -21,6 +21,7 @@ use crate::{
     store::{
         health::HealthSink,
         index::{indexed_under, KvEvent, KvTables, LaneCounts},
+        journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore},
         loads::{LoadSample, LoadSink, LoadSource, PollMode},
@@ -68,6 +69,28 @@ pub struct MemoryStore {
     world: ArcSwap<World>,
     /// Where the rows' clock starts.
     origin: Instant,
+    /// Where the term is told; `None` for a store nobody follows. The
+    /// membership writes tell through their table's own handle.
+    journal: Option<Arc<dyn Journal>>,
+    /// The same journal where it carries load rows: where the load writes
+    /// are told.
+    load_journal: Option<Arc<dyn Journal>>,
+}
+
+/// The store's replicated tables at one place of its history
+/// ([`MemoryStore::cut`]).
+#[derive(Clone, Debug)]
+pub struct Cut {
+    /// The last journaled write of the kinds asked that the tables hold,
+    /// with its term; the default for a store with no journal.
+    pub at: Position,
+    /// The membership epoch.
+    pub epoch: u64,
+    /// Every row, by registration key.
+    pub rows: Vec<WorkerRow>,
+    /// Every load row on file, by worker and rank; none in a cut of the
+    /// watched kinds.
+    pub loads: Vec<(WorkerId, u16, LoadSample)>,
 }
 
 impl Default for MemoryStore {
@@ -125,6 +148,63 @@ impl MemoryStore {
             leases: Mutex::default(),
             world,
             origin,
+            journal: None,
+            load_journal: None,
+        }
+    }
+
+    /// A store that tells `journal` its replicated writes (membership and
+    /// status, the term, and the load rows where the journal carries
+    /// them), each inside the write's own critical section: a store a
+    /// standby or a watcher of its rows can follow.
+    pub fn journaled(journal: Arc<dyn Journal>) -> Self {
+        let mut store = Self::default();
+        store.workers.get_mut().journal = Some(Arc::clone(&journal));
+        store.load_journal = journal.carries_loads().then(|| Arc::clone(&journal));
+        store.journal = Some(journal);
+        store
+    }
+
+    /// The tables of `kinds` as one journaled write of those kinds left
+    /// them, with that write's position: the rows, and with [`Kinds::All`]
+    /// the load rows. What a watcher of the rows starts from, and what a
+    /// standby is restored from. Taken under the locks of the kinds asked,
+    /// in the store's order (the membership lock; the load lock for the
+    /// load rows alone): every journaled write holds its table's lock from
+    /// its apply to its telling, so none stands half told here. A writer
+    /// of those tables waits for the copy; a decision reads the published
+    /// world and does not, and a cut of the rows leaves the load writers
+    /// be.
+    pub fn cut(&self, kinds: Kinds) -> Cut {
+        // Copied under the locks, sorted after them: a writer waits for the
+        // copy alone.
+        let (at, epoch, mut rows, mut samples) = {
+            let workers = self.workers.lock();
+            let loads = (kinds == Kinds::All).then(|| self.loads.lock());
+            let at = self
+                .journal
+                .as_ref()
+                .map_or_else(Position::default, |journal| journal.head(kinds));
+            let rows: Vec<WorkerRow> = workers.rows.values().map(|row| row.row.clone()).collect();
+            let samples: Vec<(WorkerId, u16, LoadSample)> = loads
+                .iter()
+                .flat_map(|loads| loads.ranks.iter())
+                .flat_map(|(id, ranks)| {
+                    ranks
+                        .samples
+                        .iter()
+                        .map(|(rank, sample)| (*id, *rank, *sample))
+                })
+                .collect();
+            (at, workers.epoch, rows, samples)
+        };
+        rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
+        samples.sort_by_key(|(id, rank, _)| (*id, *rank));
+        Cut {
+            at,
+            epoch,
+            rows,
+            loads: samples,
         }
     }
 
@@ -408,6 +488,9 @@ struct Workers {
     by_key: HashMap<String, WorkerId>,
     epoch: u64,
     log: VecDeque<(u64, MembershipChange)>,
+    /// The store's journal: every membership and status write passes
+    /// [`Workers::record`], which tells it.
+    journal: Option<Arc<dyn Journal>>,
 }
 
 struct Row {
@@ -425,11 +508,25 @@ struct Probes {
 
 impl Workers {
     fn record(&mut self, change: MembershipChange) -> MembershipChange {
+        self.record_over(change, None)
+    }
+
+    /// [`Workers::record`] for a write that took a row out of the table (a
+    /// removal, a replacement): `left` is that row, for the journal.
+    fn record_over(
+        &mut self,
+        change: MembershipChange,
+        left: Option<&WorkerRow>,
+    ) -> MembershipChange {
         self.epoch += 1;
         if self.log.len() == CHANGE_LOG {
             self.log.pop_front();
         }
         self.log.push_back((self.epoch, change));
+        if let Some(journal) = &self.journal {
+            let row = self.rows.get(&change.id()).map(|row| &row.row);
+            journal.member(self.epoch, change, row, left);
+        }
         change
     }
 
@@ -488,6 +585,7 @@ impl WorkersStore for MemoryStore {
             let old = workers.rows.remove(&old_id);
             let new_id = identity(&facts.key, facts.incarnation);
             let status = old
+                .as_ref()
                 .filter(|old| {
                     old.row.facts.role == facts.role
                         && old.row.facts.models == facts.models
@@ -508,16 +606,22 @@ impl WorkersStore for MemoryStore {
                     probes: Probes::default(),
                 },
             );
-            let change = workers.record(MembershipChange::Replaced {
-                old: old_id,
-                new: new_id,
-            });
             // The old incarnation's tables leave with its row, as on a
-            // removal and under the same lock: a veto, a completed dispatch
-            // or a load row keyed by the old id would outlive it for good.
-            // The new incarnation starts with an empty load entry: nothing
-            // the old one reported is the new one's.
+            // removal, under the same lock and before the replacement is
+            // told: a veto, a completed dispatch or a load row keyed by the
+            // old id would outlive it for good, and no load of the old
+            // incarnation stands after the replacement in the journal.
             self.forget_worker(old_id);
+            let change = workers.record_over(
+                MembershipChange::Replaced {
+                    old: old_id,
+                    new: new_id,
+                },
+                old.as_ref().map(|old| &old.row),
+            );
+            // The new incarnation starts with an empty load entry, made
+            // after the telling: nothing the old one reported is the new
+            // one's, and no load of it stands before the replacement.
             self.loads.lock().ranks.insert(new_id, Ranks::default());
             self.index_member(&workers, new_id);
             self.rebuild_world(&workers);
@@ -538,10 +642,12 @@ impl WorkersStore for MemoryStore {
                 probes: Probes::default(),
             },
         );
+        // Recorded before the row's load entry exists: no load of a worker
+        // stands before its registration in the journal.
+        let change = workers.record(MembershipChange::Registered { id });
         // The row's load entry, created with it: what a member's load
         // writes go into.
         self.loads.lock().ranks.insert(id, Ranks::default());
-        let change = workers.record(MembershipChange::Registered { id });
         self.index_member(&workers, id);
         self.rebuild_world(&workers);
         change
@@ -570,13 +676,14 @@ impl WorkersStore for MemoryStore {
         workers.guarded(id, revision)?;
         let row = workers.rows.remove(&id)?;
         workers.by_key.remove(&row.row.facts.key);
-        let change = workers.record(MembershipChange::Removed { id });
-        // The worker's tables leave with its row, under the workers lock: a
-        // veto, a completed dispatch or a load row keyed by an id that is
-        // gone would stay for good, the next incarnation having a new id. A
-        // poll or a record that lands later finds no load entry and writes
-        // nothing.
+        // The worker's tables leave with its row, under the workers lock
+        // and before the removal is told: a veto, a completed dispatch or a
+        // load row keyed by an id that is gone would stay for good, the next
+        // incarnation having a new id, and no load of the worker stands
+        // after its removal in the journal. A poll or a record that lands
+        // later finds no load entry and writes nothing.
         self.forget_worker(id);
+        let change = workers.record_over(MembershipChange::Removed { id }, Some(&row.row));
         self.rebuild_world(&workers);
         Some(change)
     }
@@ -866,6 +973,9 @@ impl LoadSink for MemoryStore {
             ranks.pushed_at.insert(rank, received_at);
         }
         ranks.samples.insert(rank, sample);
+        if let Some(journal) = &self.load_journal {
+            journal.load(id, rank, &sample);
+        }
         if let Some(place) = writer.fold_load(id, rank, Some(&sample)) {
             writer.recorded(place);
             let world = writer.folded_at(received_at);
@@ -911,6 +1021,9 @@ impl LoadSink for MemoryStore {
                         source,
                     };
                     ranks.samples.insert(rank, sample);
+                    if let Some(journal) = &self.load_journal {
+                        journal.load(id, rank, &sample);
+                    }
                     let place = writer.fold_load(id, rank, Some(&sample));
                     (place.and_then(|place| writer.engine_at(place)), true)
                 }
@@ -1227,7 +1340,12 @@ impl LeasesStore for MemoryStore {
 
     fn set_term(&self, term: u64) {
         let mut leases = self.leases.lock();
-        leases.term = leases.term.max(term);
+        if term > leases.term {
+            leases.term = term;
+            if let Some(journal) = &self.journal {
+                journal.term_rose(term);
+            }
+        }
     }
 
     fn issue(&self, record: LeaseRecord) -> Result<(), LeaseRefused> {
