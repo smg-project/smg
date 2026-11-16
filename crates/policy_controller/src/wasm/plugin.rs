@@ -1919,15 +1919,50 @@ impl Bound {
 
     /// Closes every open phase of this thread: the resources are dropped
     /// under their frame's fuel (a destructor is the guest's code too), the
-    /// answers forgotten.
+    /// answers forgotten. The scope is closed first: every phase stops
+    /// reading as open, and its place in the thread's decision is given
+    /// back, before the first destructor runs. A destructor is called under
+    /// the host's own code (the clock a build handed the runtime, an
+    /// import's body): whatever such a call does, the thread's next decision
+    /// opens as its own.
     pub(crate) fn close(&self) {
+        /// The destructors' walk. If it does not return, the slot it marked
+        /// for the close's rebuild is forgotten: the thread's next decision
+        /// finds a cold slot, not one its own calls emptied.
+        struct Walk<'a> {
+            plugin: &'a Plugin,
+            returned: bool,
+        }
+        impl Drop for Walk<'_> {
+            fn drop(&mut self) {
+                if !self.returned {
+                    self.plugin.emptied.get_or_default().set(false);
+                }
+            }
+        }
         let plugin = &self.plugin;
         let mut opens = self.opens.get_or_default().borrow_mut();
         let mut budget = plugin.runtime.decisions.on_this_thread();
+        // One bit a phase that was open.
+        let mut closing = 0u8;
+        for (phase, open) in opens.0.iter_mut().enumerate() {
+            if open.is_open {
+                open.is_open = false;
+                budget.close();
+                closing |= 1 << phase;
+            }
+        }
+        let mut walk = Walk {
+            plugin: self.plugin.as_ref(),
+            returned: false,
+        };
         // The decision these opens are of: each open of it returned the one
         // number.
         let mut decision = 0;
-        for open in opens.0.iter_mut().filter(|o| o.is_open) {
+        // The phases that were open, the lowest first.
+        while closing != 0 {
+            let open = &mut opens.0[closing.trailing_zeros() as usize];
+            closing &= closing - 1;
             if let Some(resource) = open.resource.take() {
                 let mut guard = plugin.slot().borrow_mut();
                 // A resource whose store went with a fault (another binding's
@@ -1964,9 +1999,9 @@ impl Bound {
             }
             decision = open.decision;
             open.reset();
-            budget.close();
             plugin.note_close(decision, budget.seed_micros);
         }
+        walk.returned = true;
         drop(budget);
         // A slot this decision emptied (a call interrupted or trapped, an
         // answer outside the contract, a destructor that ran out) is rebuilt

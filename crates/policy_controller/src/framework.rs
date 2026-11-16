@@ -207,10 +207,12 @@ pub trait Picker: Lifecycle + Debug {
 /// is one of them: when a scope panics at its open, the engine closes the
 /// scopes whose open returned, and neither that scope nor any after it.
 /// So a `close` always follows an `open` that returned, and an `open`
-/// that stops half-way undoes what it did itself. A `close` that panics
-/// keeps no other scope open: the engine runs every close it owes, each
-/// under a catch, and the first panic of the decision is the one the host
-/// sees. A built-in stage holds none; the profile's flag
+/// that stops half-way undoes what it did itself. Its twin is the
+/// implementer's: a `close` that stops half-way leaves its scope closed,
+/// so it forgets what it holds open before a step that may not return. A
+/// `close` that panics keeps no other scope open: the engine runs every
+/// close it owes, each under a catch, and the first panic of the decision
+/// is the one the host sees. A built-in stage holds none; the profile's flag
 /// ([`Profile::scoped`]) is read once in the engine, so a profile without
 /// one pays nothing per decision.
 pub trait DecisionScope: Send + Sync + Debug {
@@ -301,10 +303,13 @@ impl Drop for Opened<'_> {
 
 /// Closes every scope of the profile, each under a catch, so a close that
 /// panics keeps no scope after it open. The first panic of the decision is
-/// the one the host sees. Where one is already unwinding (a stage's, or the
-/// open of a pair's other side), a close's panic stops here: let out, it
-/// would end the process. Where none is, the first close's panic goes on
-/// once every scope is closed. A payload that stops here is released.
+/// the one the host sees. Where one is already unwinding (a stage's, the
+/// open of a pair's other side, or a close of that side's), a close's panic
+/// stops here: let out, it would end the process. Where none is, the first
+/// close's panic goes on once every scope is closed. A pair's decode side
+/// closes first: where a close of each side panics, the decode side's goes
+/// on and the prefill side's stops inside it. A payload that stops here is
+/// released.
 #[cold]
 #[inline(never)]
 fn close_scopes(profile: &Profile) {
