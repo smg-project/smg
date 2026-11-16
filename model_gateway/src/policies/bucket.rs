@@ -13,7 +13,7 @@ use super::{
     get_healthy_worker_indices, normalize_model_key, utils::PeriodicTask, BucketConfig,
     LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::worker::{endpoint::Endpoint, Worker};
+use crate::worker::{identity::endpoint::Endpoint, Worker};
 
 #[derive(Debug)]
 pub struct BucketPolicy {

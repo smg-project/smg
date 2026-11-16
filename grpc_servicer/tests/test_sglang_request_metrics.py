@@ -21,8 +21,10 @@ pytest.importorskip("zmq")
 
 @pytest.fixture
 def manager_mod(monkeypatch):
+    """Load the real manager against isolated engine symbols for CPU regression tests."""
+    monkeypatch.setitem(sys.modules, "sglang.srt.disaggregation.mode", None)
     symbols = {
-        "sglang.srt.disaggregation.utils": "DisaggregationMode",
+        "sglang.srt.disaggregation.utils": "DisaggregationMode FAKE_BOOTSTRAP_HOST",
         "sglang.srt.managers.io_struct": (
             "AbortReq BatchEmbeddingOutput BatchTokenIDOutput FlushCacheReqOutput "
             "GetInternalStateReqOutput HealthCheckOutput ProfileReqOutput "
@@ -174,7 +176,11 @@ def _construct_manager(module, monkeypatch, server_args, collector_cls=None):
 
 
 def _manager_and_state(module, collector=None):
+    """Build a live request and its output adapter without starting scheduler sockets."""
     manager = module.GrpcRequestManager.__new__(module.GrpcRequestManager)
+    from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
+
+    manager.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
     manager.enable_trace = False  # target tracing field, fixture-only adaptation
     manager.metrics_collector = collector if collector is not None else Collector()
     manager.disaggregation_mode = "null"
@@ -499,3 +505,114 @@ def test_scheduler_abort_metric_failure_still_delivers_terminal_response(manager
         assert not state.abort_observed
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_sparse_stream_usage_and_terminal_cache_details(manager_mod, flat):
+    """Interleaved sparse updates survive streaming and reach final metrics."""
+
+    async def scenario():
+        manager, state = _manager_and_state(manager_mod)
+        state.obj.return_logprob = False
+        stats = SimpleNamespace(
+            prompt_tokens=10, cached_tokens=2, cached_tokens_details={"device": 2}
+        )
+        batch = SimpleNamespace(
+            rids=["test"], request_stats=[stats], completion_tokens=[1], finished_reasons=[None]
+        )
+        if flat:
+            batch.output_ids_flat, batch.output_ids_offsets = [7], [0, 1]
+        else:
+            batch.output_ids = [[7]]
+        await manager._handle_batch_output(batch)
+        assert state.out_queue.get_nowait()["meta_info"]["prompt_tokens"] == 10
+        batch.request_stats = None
+        batch.completion_tokens = [2]
+        await manager._handle_batch_output(batch)
+        output = state.out_queue.get_nowait()
+        assert output["token_ids"] == [7]
+        assert output["meta_info"]["cached_tokens"] == 2
+        stats.cached_tokens = 1  # first update after retraction / final snapshot
+        stats.cached_tokens_details = {"device": 1}
+        batch.request_stats = [stats]
+        batch.finished_reasons = [{"type": "stop"}]
+        await manager._handle_batch_output(batch)
+        assert state.out_queue.get_nowait()["meta_info"]["cached_tokens"] == 1
+        assert manager.metrics_collector.finished[-1]["cached_tokens_details"] == {"device": 1}
+        assert not manager.output_adapter._counts
+
+    asyncio.run(scenario())
+
+
+def test_sparse_embedding_usage_reaches_python_client(manager_mod):
+    """An embedding response reads prompt counts from the modern stats object."""
+
+    async def scenario():
+        manager, state = _manager_and_state(manager_mod)
+        await manager._handle_embedding_output(
+            SimpleNamespace(
+                rids=["test"],
+                embeddings=[[0.5]],
+                finished_reasons=[{"type": "stop"}],
+                request_stats=[SimpleNamespace(prompt_tokens=12, cached_tokens=4)],
+            )
+        )
+        result = state.out_queue.get_nowait()
+        assert result["prompt_tokens"] == 12
+        assert result["embedding"] == [0.5]
+        assert state.finished
+
+    asyncio.run(scenario())
+
+
+def test_sparse_usage_is_removed_on_abort_and_late_output(manager_mod):
+    """Cancellation and unknown late rows cannot retain per-request counts."""
+
+    async def scenario():
+        manager, state = _manager_and_state(manager_mod)
+        state.obj.return_logprob = False
+        batch = SimpleNamespace(
+            rids=["test"],
+            output_ids_flat=[7],
+            output_ids_offsets=[0, 1],
+            request_stats=[SimpleNamespace(prompt_tokens=10, cached_tokens=2)],
+            completion_tokens=[1],
+            finished_reasons=[None],
+        )
+        await manager._handle_batch_output(batch)
+        assert manager.output_adapter._counts
+        await manager._handle_abort_req(SimpleNamespace(rid="test", finished_reason=None))
+        assert not manager.output_adapter._counts
+        await manager._handle_batch_output(batch)  # state already finished
+        assert not manager.output_adapter._counts
+        manager.rid_to_state.clear()
+        await manager._handle_batch_output(batch)  # state already removed
+        assert not manager.output_adapter._counts
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("rows", [None, []])
+@pytest.mark.parametrize("counts", [None, [], [10]])
+def test_python_legacy_empty_rows_and_counts_preserve_defaults(manager_mod, rows, counts):
+    """Legacy optional columns still yield an empty token row and zero counts."""
+
+    async def scenario():
+        manager, state = _manager_and_state(manager_mod)
+        state.obj.return_logprob = False
+        batch = SimpleNamespace(
+            rids=["test"],
+            output_ids=rows,
+            prompt_tokens=counts,
+            cached_tokens=counts,
+            completion_tokens=None,
+            finished_reasons=[None],
+        )
+        await manager._handle_batch_output(batch)
+        result = state.out_queue.get_nowait()
+        assert result["token_ids"] == []
+        assert result["meta_info"]["prompt_tokens"] == (counts[0] if counts else 0)
+        assert result["meta_info"]["cached_tokens"] == (counts[0] if counts else 0)
+        assert result["meta_info"]["completion_tokens"] == 0
+
+    asyncio.run(scenario())

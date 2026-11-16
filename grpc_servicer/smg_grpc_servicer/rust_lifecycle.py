@@ -651,6 +651,16 @@ def free_kv_events_endpoint(ranks: int = 1) -> str:
     )
 
 
+def kv_events_left_off(reason: str) -> str:
+    """The line for a publisher the engine's own word keeps off: logged once
+    by :func:`apply_kv_events_default`, and what a servicer whose launcher
+    hands it over refuses ``SubscribeKvEvents`` with."""
+    return (
+        f"KV event publishing left off: {reason}; pass --kv-events-config to turn the publisher "
+        "on anyway"
+    )
+
+
 def apply_kv_events_default(
     target: Any,
     default: Callable[[str], Any],
@@ -694,11 +704,7 @@ def apply_kv_events_default(
         return None
     reason = unless() if unless is not None else None
     if reason:
-        logger.info(
-            "KV event publishing left off: %s; pass --kv-events-config to turn the publisher "
-            "on anyway",
-            reason,
-        )
+        logger.info("%s", kv_events_left_off(reason))
         return None
     config = default(free_kv_events_endpoint(ranks))
     try:

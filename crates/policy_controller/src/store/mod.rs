@@ -54,6 +54,13 @@
 //! contract tests run over. A gateway in the embedded mode implements the
 //! same traits over the structures it already holds.
 //!
+//! A decision reads none of the tables behind those traits. The store
+//! derives a [`World`] from them (every pool as whole candidate rows) and
+//! publishes it by pointer swap: [`world`] holds the read side and the
+//! build of one decision's view. Every world is published under the
+//! generation the store holds, which [`MemoryStore::apply`] alone replaces:
+//! a decision reads its rows and its engine in one load.
+//!
 //! [`LoadRow`]: crate::view::LoadRow
 
 pub mod health;
@@ -64,6 +71,7 @@ pub mod memory;
 pub mod reservations;
 pub mod sessions;
 pub mod workers;
+pub mod world;
 
 #[cfg(test)]
 mod tests;
@@ -82,6 +90,7 @@ pub use workers::{
     identity, identity_of, HealthPolicy, MembershipChange, MembershipTail, Overload, Reachability,
     Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
+pub use world::{Ask, Built, StaleGeneration, ViewBuffers, World, PUBLISH_WINDOW};
 
 /// The verified identity of a gateway: the fingerprint of the subject its
 /// session was authenticated as, never a message field. Leases, vetoes and

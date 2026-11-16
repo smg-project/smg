@@ -110,11 +110,15 @@ stages of a profile:
 ```rust
 use std::sync::Arc;
 
-use smg_policy_controller::wasm::{
-    Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer,
+use smg_policy_controller::{
+    plugins::OpenDecisions,
+    wasm::{Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
 };
 
-let runtime = Arc::new(Runtime::new()?);
+// One for the process: every plugin runtime is built over it, so a
+// decision draws one budget whichever plugins it opens.
+let decisions = OpenDecisions::new();
+let runtime = Arc::new(Runtime::new(&decisions)?);
 let mut spec = PluginSpec::new("least-loaded", std::fs::read(component_path)?);
 spec.config = vec![20]; // the session bonus, in percent
 spec.budget_micros = 10_000; // per call
