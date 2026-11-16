@@ -39,6 +39,7 @@ use crate::{
             PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor,
             VisionPreprocessingContext,
         },
+        scratch,
         transforms::{resize_bicubic_torch_aa_f32, rgb_bytes, TransformError},
     },
 };
@@ -66,6 +67,13 @@ pub(crate) fn grid_tokens(rows: usize, cols: usize) -> usize {
 }
 const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+
+/// A request's patch buffer comes from the thread's float scratch pool when
+/// it is larger than this: glibc's allocator and the gateway's unmap a freed
+/// buffer above 32 MiB at once, so a new one pays for fresh pages on every
+/// request. A smaller one they hand out again by themselves, and taking it
+/// from the pool measured slower.
+const POOLED_PATCH_BYTES: usize = 32 << 20;
 
 /// Whether a checkpoint config value equals the one this port implements,
 /// comparing numbers by value (`16` and `16.0` are the same).
@@ -400,12 +408,15 @@ impl VisionPreProcessor for NemotronOmniProcessor {
             .collect();
         let planned = Self::plan_grids(&sizes, context.token_budget)?;
         let patch_len = 3 * PATCH_SIZE * PATCH_SIZE;
-        let mut encoder_input = Vec::with_capacity(
-            planned
-                .iter()
-                .map(|(rows, cols)| rows * cols * patch_len)
-                .sum(),
-        );
+        let capacity: usize = planned
+            .iter()
+            .map(|(rows, cols)| rows * cols * patch_len)
+            .sum();
+        let mut encoder_input = if capacity * size_of::<f32>() > POOLED_PATCH_BYTES {
+            scratch::take_f32_cap(capacity)
+        } else {
+            Vec::with_capacity(capacity)
+        };
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len() * 2);
