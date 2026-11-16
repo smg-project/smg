@@ -259,8 +259,9 @@ impl Scanner {
     /// Calls `f` with each piece of `text` as its byte range, in order; the
     /// pieces tile the text, as three `Split` stages that keep their gaps
     /// leave no character out. `words` says the run loops take their word
-    /// scans (a long input; see the encoder's `WORD_SCAN_MIN_BYTES`): the
-    /// walk is compiled both ways and the choice is made once per call.
+    /// scans (a long input, or a unit that opens as ASCII text; see the
+    /// encoder's `WORD_SCAN_MIN_BYTES`): the walk is compiled both ways and
+    /// the choice is made once per unit.
     pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &str, words: bool, f: &mut F) {
         if words {
             self.pieces_as::<true, F>(text, f);
@@ -395,8 +396,8 @@ impl Scanner {
 
     /// [`Self::run_end_in`] through the word scan `SCAN` of the role's ASCII
     /// members, eight bytes at a time, when no stop class has a character
-    /// among them (read at recognition) and the unit is long (`WORDS`); byte
-    /// by byte otherwise.
+    /// among them (read at recognition) and the encoder passes the scans on
+    /// (`WORDS`); byte by byte otherwise.
     #[inline(always)]
     fn run<const SCAN: u8, const WORDS: bool>(
         &self,

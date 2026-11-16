@@ -4,9 +4,10 @@
 //! of the case asks each engine its health and writes what it heard; and
 //! the pool is read back as a decision's view reads it: every rank a row,
 //! healthy by its probe, its load from a poll, an engine that holds
-//! requests reading them. Then one engine is killed: the first probe turn
-//! after its death writes it, and the pool reads its rows unhealthy and
-//! every other row healthy.
+//! requests reading them. Then one engine is killed: the first dial that
+//! hears it dead writes it, and the pool reads its rows unhealthy and every
+//! other row healthy. Last, an engine stops answering with its sockets
+//! open: a probe turn waits out its dial bound, writes it and goes on.
 //!
 //! No decision is asked yet: the service answers `Leader` alone, and the
 //! case asserts that call end to end. The decisions take the views' place
@@ -34,7 +35,7 @@ use std::{
 };
 
 use engines::cpu_seconds;
-use fleet::{within, Harness, Shape, DIAL_TIMEOUT, POLL_INTERVAL, PROBE_INTERVAL, ROOM};
+use fleet::{within, DialEnd, Harness, Shape, DIAL_TIMEOUT, POLL_INTERVAL, PROBE_INTERVAL, ROOM};
 use net::vm_rss_kib;
 use smg_policy_controller::{
     store::WorkerStatus,
@@ -208,10 +209,10 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "a dead engine's rows stay rows: {pool:?}"
         );
         // The death's verdicts are the ones written from the kill on, one a
-        // rank: they came from a turn that began before the death was whole
-        // or from the first one after it, never a later one. The liveness
-        // rule moves a not-ready row on to failed three failures later: that
-        // step follows the death, it is not its verdict.
+        // rank, by the first dial that heard the engine dead: a turn in
+        // flight at the kill, or the first one begun after the death. The
+        // liveness rule moves a not-ready row on to failed three failures
+        // later: that step follows the death, it is not its verdict.
         let moved: Vec<_> = harness
             .verdicts()
             .into_iter()
@@ -226,15 +227,22 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             2,
             "one verdict a rank from the kill on: {moved:?}"
         );
+        let first = harness
+            .first_unhealthy(dead, death.asked)
+            .expect("a dial heard the engine dead");
+        assert!(
+            first <= death.turn + 1,
+            "the first turn after the death dialed it: turn {first} after {death:?}"
+        );
         for verdict in &moved {
             assert_eq!(
                 (verdict.from, verdict.to),
                 (WorkerStatus::Ready, WorkerStatus::NotReady),
                 "{verdict:?}"
             );
-            assert!(
-                verdict.turn <= death.turn + 1,
-                "the first turn after the death wrote it: {verdict:?} after {death:?}"
+            assert_eq!(
+                verdict.turn, first,
+                "the first dial that heard the engine dead wrote it: {verdict:?} after {death:?}"
             );
         }
         let written = moved
@@ -242,6 +250,91 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .map(|verdict| verdict.at.duration_since(death.at))
             .max()
             .unwrap_or_default();
+
+        // The hang. An engine that stops answering with its sockets open
+        // costs a probe turn its dial bound and no more: that turn writes
+        // the engine's row not ready, and no live row moves.
+        let hung = engines[2];
+        let hang = Instant::now();
+        harness.hang(hung).expect("the hang");
+        within(
+            "a hung engine's rows read unhealthy and every live row healthy",
+            PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
+            || {
+                harness.view(MODEL, Role::Single).is_ok_and(|pool| {
+                    pool.iter()
+                        .all(|row| row.healthy == (row.engine != dead && row.engine != hung))
+                })
+            },
+        )
+        .await
+        .expect("the hang is seen");
+        let hung_seen = hang.elapsed();
+        let moved: Vec<_> = harness
+            .verdicts()
+            .into_iter()
+            .filter(|verdict| {
+                verdict.engine == hung && verdict.at >= hang && verdict.to != WorkerStatus::Failed
+            })
+            .collect();
+        assert_eq!(
+            moved
+                .iter()
+                .map(|verdict| (verdict.from, verdict.to))
+                .collect::<Vec<_>>(),
+            [(WorkerStatus::Ready, WorkerStatus::NotReady)],
+            "one verdict for the hung engine's one rank: {moved:?}"
+        );
+        // That turn went on to every engine after the hung one, and from
+        // the hang on no live row moved.
+        let turn = moved[0].turn;
+        within("the turn that waited out the bound ends", ROOM, || {
+            harness.dialed(turn).len() == FLEET.len()
+        })
+        .await
+        .expect("the turn goes on");
+        assert_eq!(
+            harness.dialed(turn),
+            [
+                (engines[0], DialEnd::Answered(true)),
+                (busy, DialEnd::Answered(true)),
+                (hung, DialEnd::TimedOut),
+                (engines[3], DialEnd::Answered(true)),
+                (dead, DialEnd::Failed),
+            ],
+            "the turn that waited out the bound went on to every engine"
+        );
+        let others: Vec<_> = harness
+            .verdicts()
+            .into_iter()
+            .filter(|verdict| {
+                verdict.at >= hang && verdict.engine != hung && verdict.engine != dead
+            })
+            .collect();
+        assert!(
+            others.is_empty(),
+            "no live row moves at the hang: {others:?}"
+        );
+        // A hung engine is not a dead one: its listener still takes a
+        // connection.
+        harness
+            .connect(hung)
+            .await
+            .expect("a hung engine takes a connection");
+        // So the bound is spent on a fresh dial too: the next turn dials the
+        // hung engine anew and waits it out again.
+        within(
+            "a hung engine is dialed again",
+            2 * (PROBE_INTERVAL + DIAL_TIMEOUT) + ROOM,
+            || harness.ends(hung, turn).len() >= 2,
+        )
+        .await
+        .expect("the next turn dials the hung engine");
+        assert_eq!(
+            harness.ends(hung, turn)[..2],
+            [DialEnd::TimedOut, DialEnd::TimedOut],
+            "each dial of a hung engine waits out its bound"
+        );
 
         // The Numbers: one process holds the controller, the engines and
         // the feeds, so its CPU and resident memory are a ceiling over the
@@ -260,6 +353,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         writeln!(out, "FLEET_LOADS_FOLLOW_MS {}", followed.as_millis()).expect("stdout");
         writeln!(out, "FLEET_DEATH_WRITTEN_MS {}", written.as_millis()).expect("stdout");
         writeln!(out, "FLEET_DEATH_SEEN_MS {}", seen.as_millis()).expect("stdout");
+        writeln!(out, "FLEET_HANG_SEEN_MS {}", hung_seen.as_millis()).expect("stdout");
         writeln!(out, "FLEET_WALL_MS {}", wall.as_millis()).expect("stdout");
         writeln!(out, "FLEET_CPU_MS {:.0}", (cpu_seconds() - cpu) * 1_000.0).expect("stdout");
         writeln!(out, "FLEET_RSS_KIB {}", vm_rss_kib()).expect("stdout");

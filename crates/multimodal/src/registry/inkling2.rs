@@ -68,8 +68,9 @@ impl ModelProcessorSpec for Inkling2Spec {
         Ok(HashMap::from([(Modality::Image, 10)]))
     }
 
-    /// Images only, from the checkpoint's exact native policy file; any
-    /// other config is refused when the processor is built.
+    /// Images only, from the checkpoint's fixed policy (its native policy
+    /// file or the released processor_config.json section); any other
+    /// config is refused when the processor is built.
     fn vision_processor(
         &self,
         _model_config: &Value,

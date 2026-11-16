@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use openai_protocol::worker::WorkerLoadResponse;
 
-use crate::view::{LoadRow, Role, SignalSource};
+use crate::view::{permille, LoadRow, Role, SignalSource};
 
 /// One worker's load row from its report, in one pass over the ranks: the
 /// request and token counts summed, the KV ratios averaged, the drain rate
@@ -85,11 +85,6 @@ pub fn load_row(
 /// A summed engine count as the row's field: negative reads as none.
 fn narrow(count: i64) -> u32 {
     u32::try_from(count.max(0)).unwrap_or(u32::MAX)
-}
-
-/// A ratio as the row's permille field.
-fn permille(ratio: f64) -> u16 {
-    (ratio * 1000.0).round().clamp(0.0, 1000.0) as u16
 }
 
 #[cfg(test)]

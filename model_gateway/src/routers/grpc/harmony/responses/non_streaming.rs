@@ -7,7 +7,7 @@ use std::{
 
 use axum::response::Response;
 use openai_protocol::{
-    common::{ToolCall, Usage},
+    common::ToolCall,
     responses::{
         ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
         ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
@@ -37,9 +37,9 @@ use crate::{
                 streaming::OutputItemKind,
                 tool_call_limit,
                 utils::{
-                    function_call_status, generation_failure_error, iteration_exceeds_safety_limit,
-                    resolve_function_identity, response_status, tool_call_overflow,
-                    McpToolCallLimit,
+                    add_model_call_usage, function_call_status, generation_failure_error,
+                    iteration_exceeds_safety_limit, resolve_function_identity, response_status,
+                    tool_call_overflow, McpToolCallLimit,
                 },
                 NotStored, ReplayInto, ResponsesContext,
             },
@@ -162,6 +162,9 @@ async fn execute_with_mcp_loop(
     // loop takes it back (`owned_request`) when it appends the tool outputs.
     let mut current_request = Arc::new(current_request);
 
+    // Every model call of the loop adds to it; every answering exit reports it.
+    let mut usage_total: Option<ResponseUsage> = None;
+
     loop {
         iteration_count += 1;
 
@@ -208,6 +211,8 @@ async fn execute_with_mcp_loop(
                     partial_text_len = partial_text.len(),
                     "Tool calls found - separating MCP and function tools"
                 );
+
+                add_model_call_usage(&mut usage_total, Some(&usage));
 
                 // Separate MCP and function tool calls based on session exposure.
                 // MCP tools are exposed to the model as function tools, so the only reliable
@@ -272,7 +277,7 @@ async fn execute_with_mcp_loop(
                         finish_reason.as_deref(),
                         analysis,
                         partial_text,
-                        usage,
+                        usage_total.take(),
                         request_id,
                         Arc::new(response_request),
                     );
@@ -348,7 +353,7 @@ async fn execute_with_mcp_loop(
                         finish_reason.as_deref(),
                         analysis,
                         partial_text,
-                        usage,
+                        usage_total.take(),
                         request_id,
                         Arc::new(response_request),
                     );
@@ -395,6 +400,10 @@ async fn execute_with_mcp_loop(
                     output_tokens = usage.completion_tokens,
                     "MCP loop completed - no more tool calls"
                 );
+
+                // The pipeline's response carries this generation's usage alone.
+                add_model_call_usage(&mut usage_total, Some(&usage));
+                response.usage = usage_total.take().map(ResponsesUsage::Modern);
 
                 // Inject MCP metadata into final response
                 inject_mcp_metadata(&mut response, &mcp_tracking, &session, &user_function_names);
@@ -455,7 +464,7 @@ async fn execute_without_mcp_loop(
                 finish_reason.as_deref(),
                 analysis,
                 partial_text,
-                usage,
+                Some(ResponseUsage::from(&usage)),
                 request_id,
                 current_request,
             ))
@@ -479,7 +488,7 @@ fn build_tool_response(
     finish_reason: Option<&str>,
     analysis: Option<String>, // Analysis channel content (reasoning)
     partial_text: String,     // Final channel content (message)
-    usage: Usage,
+    usage: Option<ResponseUsage>,
     request_id: String,
     responses_request: Arc<ResponsesRequest>,
 ) -> ResponsesResponse {
@@ -571,7 +580,7 @@ fn build_tool_response(
         .created_at(created_at)
         .status(status)
         .output(output)
-        .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)));
+        .maybe_usage(usage.map(ResponsesUsage::Modern));
     if let Some(details) = incomplete_details {
         builder = builder.incomplete_details(details);
     }
@@ -601,7 +610,7 @@ mod namespace_tests {
             Some("tool_calls"),
             None,
             String::new(),
-            Usage::from_counts(1, 1),
+            None,
             "resp_test".into(),
             Arc::new(request),
         );
@@ -638,7 +647,7 @@ mod status_tests {
             finish_reason,
             None,
             String::new(),
-            Usage::from_counts(1, 1),
+            None,
             "resp_test".into(),
             Arc::new(ResponsesRequest::default()),
         );

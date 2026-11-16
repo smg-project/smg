@@ -8,9 +8,9 @@
 //! `leaseDurationSeconds`, so the object reads to `kubectl` and to any other
 //! leader election as a lease. The term has no spec field: it lives in the
 //! [`TERM_ANNOTATION`], and `leaseTransitions` carries the count of holder
-//! changes the term is one ahead of. The spec stores whole seconds, so an
-//! election duration with a fraction of a second is refused at the first
-//! write.
+//! changes the term is one ahead of, a restart under the same identity
+//! counted as one. The spec stores whole seconds, so an election duration
+//! with a fraction of a second is refused at the first write.
 //!
 //! A write replaces the object under the resource version of the object
 //! read last; the server refuses a replace over a version that moved. An

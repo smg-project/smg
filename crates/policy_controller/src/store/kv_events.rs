@@ -11,20 +11,26 @@ pub struct BatchFacts {
     /// The publisher's sequence number: monotonic per rank, each rank its
     /// own counter.
     pub sequence: u64,
-    /// The batch carries the engine's own cache clear.
+    /// The batch carries the engine's own cache clear, wherever it stands
+    /// among the events: the cursor's fact (a batch below the cursor that
+    /// clears is a restarted publisher, since what such a batch leaves
+    /// owes nothing to what came before it). The clear itself is the
+    /// batch's: a collector sets this when a clear stands among what it
+    /// decoded, and a sink empties the rank there.
     pub clears: bool,
     /// The batch is one chunk of a relay's state snapshot, not a batch the
     /// publisher sent.
     pub snapshot: Option<SnapshotChunk>,
 }
 
-/// Where a relay's in-band snapshot stands: chunk `index` of `count`, each
-/// stamped with a sequence the relay chose so live batches continue after
-/// the last one.
+/// One chunk of a relay's in-band snapshot, stamped with a sequence the
+/// relay chose so live batches continue after the last one. A chunk only
+/// adds to its rank: the snapshot's start is a resync
+/// ([`ResyncReason::Snapshot`]) the collector says before the first block.
+/// Where a chunk stands in the relay's count over the engine is the
+/// collector's to read: no sink reads it, so none is handed it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SnapshotChunk {
-    pub index: u32,
-    pub count: u32,
     /// The snapshot could not cover the engine's whole life: the rank's
     /// blocks are a partial set until the next resync.
     pub unknown_before: bool,
@@ -35,8 +41,9 @@ pub struct SnapshotChunk {
 pub enum BatchOutcome {
     /// Applied to the index; the cursor advanced to it.
     Applied,
-    /// A duplicate below the cursor, a chunk of a snapshot still arriving, or
-    /// another rank's batch: counted, not applied.
+    /// A duplicate below the cursor, a chunk of a snapshot still arriving,
+    /// another rank's batch, or a batch for a worker the store holds no row
+    /// for: not applied.
     Skipped,
     /// A gap with no replay asked yet: the caller reconnects asking for a
     /// replay from `expected`; the batch is not applied (the replay resends
@@ -47,8 +54,9 @@ pub enum BatchOutcome {
 
 /// Why a rank's cursor was reset or its blocks replaced. The first six are
 /// the servicer's own stream status codes, forwarded by a relay as frames so
-/// the store tells a relay restart from an engine restart; the last three
-/// the cursor's own findings.
+/// the store tells a relay restart from an engine restart; the next two the
+/// cursor's own findings; the last the collector's word at a snapshot's
+/// start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResyncReason {
     /// The server's history no longer reaches the cursor.
@@ -66,7 +74,8 @@ pub enum ResyncReason {
     /// A gap the server could not replay, too large to keep the state.
     GapCleared,
     /// A relay served a state snapshot in place of history: the live set it
-    /// carries replaces the rank's blocks.
+    /// carries replaces the blocks of every rank of the engine. The
+    /// collector says it to each row before the snapshot's first block.
     Snapshot,
 }
 
@@ -114,6 +123,13 @@ pub struct KvCursor {
 /// past). A snapshot chunk is applied outside these rules and moves the
 /// cursor to its stamp. Never-drop flow control is the subscriber's: past the
 /// index lanes' depth it stops reading the rank's stream.
+///
+/// The sink's unit is a row, one rank of an engine: `id` names the row, and
+/// `rank` repeats its rank as a check. The collector's unit is an engine.
+/// What is an engine's (a snapshot's start, a new connection) the collector
+/// says to each row of the engine, the rows a snapshot holds nothing for
+/// included. A snapshot's start is a resync for [`ResyncReason::Snapshot`]
+/// before its first block, and a chunk only adds.
 pub trait KvEventSink: Send + Sync {
     /// The batch message as the host's wire crate defines it; the store
     /// applies its events to the index and reads nothing else of it.
@@ -135,9 +151,9 @@ pub trait KvEventSink: Send + Sync {
     /// it shows where the publisher stands.
     fn reconnected(&self, id: WorkerId);
 
-    /// Reset one rank's cursor, or every rank's (`None`), for `reason`; the
-    /// worker's blocks go with it, and the next stream is taken from
-    /// wherever it starts.
+    /// Reset the row's cursor for `reason`: its blocks go with it, and the
+    /// next stream is taken from wherever it starts. A `rank` that is not
+    /// the row's resets nothing; `None` asks no check.
     fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason);
 
     /// The cursor of one rank, when the rank has been heard from.

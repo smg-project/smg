@@ -9,21 +9,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::error;
 
 use crate::{
     observability::metrics::metrics_labels,
-    routers::{
-        error,
-        grpc::{
-            common::stages::{ProcessStage, RateLimitCell},
-            context::{DispatchContext, FinalResponse},
-            regular::{processor, streaming},
-            spec::ResponseSpec,
-            utils::StreamSource,
-        },
+    routers::grpc::{
+        common::stages::{ProcessStage, RateLimitCell},
+        context::{stage_output, wrong_response_spec, DispatchContext, FinalResponse},
+        regular::{processor, streaming},
+        spec::ResponseSpec,
+        utils::StreamSource,
     },
 };
+
+const FUNCTION: &str = "MessageResponseProcessingStage::process";
 
 /// Message response processing stage
 pub(crate) struct MessageResponseProcessingStage {
@@ -51,52 +49,17 @@ impl ProcessStage for MessageResponseProcessingStage {
         spec: ResponseSpec,
     ) -> Result<Option<Response>, Response> {
         let ResponseSpec::Messages(messages_request) = spec else {
-            error!(
-                function = "MessageResponseProcessingStage::process",
-                "Wrong response spec"
-            );
-            return Err(error::internal_error(
-                "wrong_response_spec",
-                "Wrong response spec",
-            ));
+            return Err(wrong_response_spec(FUNCTION));
         };
         let messages_request = *messages_request;
 
         let is_streaming = ctx.streaming;
 
-        // Extract execution result
-        let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
-            error!(
-                function = "MessageResponseProcessingStage::process",
-                "No execution result"
-            );
-            error::internal_error("no_execution_result", "No execution result")
-        })?;
+        let execution_result = stage_output(ctx.response.execution_result.take(), FUNCTION)?;
 
-        // Get dispatch metadata
-        let dispatch = ctx
-            .dispatch
-            .as_ref()
-            .ok_or_else(|| {
-                error!(
-                    function = "MessageResponseProcessingStage::process",
-                    "Dispatch metadata not set"
-                );
-                error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
-            })?
-            .clone();
+        let dispatch = stage_output(ctx.dispatch.as_ref(), FUNCTION)?.clone();
 
-        // Get cached tokenizer
-        let tokenizer = ctx.tokenizer_arc().ok_or_else(|| {
-            error!(
-                function = "MessageResponseProcessingStage::process",
-                "Tokenizer not cached in context"
-            );
-            error::internal_error(
-                "tokenizer_not_cached",
-                "Tokenizer not cached in context - preparation stage may have been skipped",
-            )
-        })?;
+        let tokenizer = stage_output(ctx.tokenizer_arc(), FUNCTION)?;
 
         if is_streaming {
             // Read derived skip_special_tokens (set in preparation, survives request_building .take())
@@ -136,16 +99,7 @@ impl ProcessStage for MessageResponseProcessingStage {
         }
 
         // Non-streaming: delegate to ResponseProcessor
-        let stop_decoder = ctx.response.stop_decoder.as_mut().ok_or_else(|| {
-            error!(
-                function = "MessageResponseProcessingStage::process",
-                "Stop decoder not initialized"
-            );
-            error::internal_error(
-                "stop_decoder_not_initialized",
-                "Stop decoder not initialized",
-            )
-        })?;
+        let stop_decoder = stage_output(ctx.response.stop_decoder.as_mut(), FUNCTION)?;
 
         let (response, counts) = self
             .processor
