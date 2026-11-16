@@ -42,6 +42,13 @@ pub fn data_url_payload_bytes(url: &str) -> Option<usize> {
 /// for the router-side fetch and the reference placement's door, so a data
 /// URL no engine serves is refused in the same words wherever the request's
 /// media is processed.
+///
+/// A header may carry parameters before the marker
+/// (`data:image/png;charset=x;base64,`, a form RFC 2397 writes): the rule
+/// reads the header's tail alone, so the fetch decodes such a payload and the
+/// door forwards such a URL as written. Past the door the answer is the
+/// worker's: an engine whose own fetcher reads the encoding after the
+/// header's first `;` refuses the form, one that reads the last takes it.
 pub fn data_url_payload(data_url: &str) -> Result<&str, MediaConnectorError> {
     let (metadata, data) = data_url
         .split_once(',')
@@ -70,8 +77,8 @@ mod tests {
     use super::{base64_payload, data_url_payload, data_url_payload_bytes};
 
     /// The payload rules every reader shares: the header must end in
-    /// `;base64`, the payload must carry something; the text comes back
-    /// without its surrounding whitespace.
+    /// `;base64`, whatever parameters come before it, the payload must carry
+    /// something; the text comes back without its surrounding whitespace.
     #[test]
     fn the_payload_rules_are_the_readers() {
         assert_eq!(
@@ -82,10 +89,20 @@ mod tests {
             data_url_payload("data:image/png;base64, AAAA ").unwrap(),
             "AAAA"
         );
+        for url in [
+            "data:image/png;charset=x;base64,AAAA",
+            "data:image/png;charset=x;name=a.png;base64,AAAA",
+        ] {
+            assert_eq!(data_url_payload(url).unwrap(), "AAAA", "{url}");
+        }
         for (url, why) in [
             ("data:image/png;base64", "missing comma in data url"),
             (
                 "data:image/png,%89PNG%0D%0A",
+                "only base64 encoded data URLs are supported",
+            ),
+            (
+                "data:image/png;base64;charset=x,AAAA",
                 "only base64 encoded data URLs are supported",
             ),
             ("data:image/png;base64,", "empty payload"),
