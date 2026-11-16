@@ -3702,7 +3702,23 @@ impl<'a> ChatStream<'a> {
                         })
                         .await?;
                         match polled {
-                            Some(item) => item,
+                            Some(item) => {
+                                // A message ready with this much unsent is a
+                                // burst's, and its frame is on the way to the
+                                // flush bound: the buffer takes two frames'
+                                // room in one step, the room the generate
+                                // loops take after a full frame. Doubled up
+                                // from the stream's first room, it was copied
+                                // at every step. An eighth of a frame is half
+                                // that first room: a paced engine's frames,
+                                // one event each, stay under it and keep the
+                                // room they have.
+                                let unsent = self.sse_buffer.len();
+                                if unsent >= CHUNK_FLUSH_BYTES / 8 {
+                                    self.sse_buffer.reserve(FRAME_ROOM.saturating_sub(unsent));
+                                }
+                                item
+                            }
                             None => {
                                 if let Some(frame) = waiting {
                                     self.tx
