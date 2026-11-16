@@ -246,13 +246,20 @@ type PoolVetoes = Arc<[GatewayRun]>;
 /// met the search when the two were timed alone.
 const WALKED_RUNS: usize = 160;
 
+/// The runs a walk passes in one step while every one of them is short of
+/// the gateway it seeks. A walk run by run is a loop of a few instructions
+/// whose time follows where the build's text puts it; by strides the walk
+/// is the shorter wherever it sits.
+const STRIDE: usize = 4;
+
 /// `gateway`'s run among a pool's runs, sorted by gateway. While the runs
 /// are at most [`WALKED_RUNS`] the two ends are asked first, which is the
 /// whole answer where one gateway alone holds a veto, and a gateway
 /// between them is walked to from the nearer end, over the runs between
 /// the two ends alone: from the front to the first gateway not under it,
-/// or from the back to the first not above it. Above that count the run
-/// is found by one search.
+/// or from the back to the first not above it, [`STRIDE`] runs a step
+/// while a whole stride is short of it. Above that count the run is found
+/// by one search.
 fn run_of(runs: &[GatewayRun], gateway: GatewayId) -> Option<&GatewayRun> {
     if runs.len() > WALKED_RUNS {
         let at = runs
@@ -268,12 +275,36 @@ fn run_of(runs: &[GatewayRun], gateway: GatewayId) -> Option<&GatewayRun> {
     if gateway >= last.gateway {
         return (gateway == last.gateway).then_some(last);
     }
-    // The middle run says which half holds the gateway's.
+    // The middle run says which half holds the gateway's. From either end
+    // the walk passes a stride while the stride's far run is short of the
+    // gateway, then goes run by run.
     let middle = between.get(between.len() / 2)?;
     let run = if gateway < middle.gateway {
-        between.iter().find(|run| run.gateway >= gateway)
+        let mut from = 0;
+        while between
+            .get(from + STRIDE - 1)
+            .is_some_and(|run| run.gateway < gateway)
+        {
+            from += STRIDE;
+        }
+        between
+            .get(from..)?
+            .iter()
+            .find(|run| run.gateway >= gateway)
     } else {
-        between.iter().rev().find(|run| run.gateway <= gateway)
+        let mut to = between.len();
+        while to >= STRIDE
+            && between
+                .get(to - STRIDE)
+                .is_some_and(|run| run.gateway > gateway)
+        {
+            to -= STRIDE;
+        }
+        between
+            .get(..to)?
+            .iter()
+            .rev()
+            .find(|run| run.gateway <= gateway)
     };
     run.filter(|run| run.gateway == gateway)
 }
