@@ -610,9 +610,10 @@ fn report(
 }
 
 /// The planned stop: the elector closes the fence, then rewrites the record
-/// released, so the next candidate to look takes the lease at once. The
-/// first release follows the loop's last step at once: a stop does not wait
-/// for the period. A release that fails is tried again, a bounded number of
+/// released, so the next candidate to look takes the lease at once, or one
+/// renew deadline later when the take still waited to lead. The first
+/// release follows the loop's last step at once: a stop does not wait for
+/// the period. A release that fails is tried again, a bounded number of
 /// times, and no sooner than one renew period after the attempt before it
 /// began, as the loop spaces its steps; an attempt that took the period is
 /// followed at once. The fence is closed either way and the lease then

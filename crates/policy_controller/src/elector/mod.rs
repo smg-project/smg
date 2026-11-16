@@ -30,9 +30,9 @@
 //!   follows nobody meanwhile ([`Tick::Gone`]). A record with no holder that
 //!   still says a duration is no leader's release either, which writes none:
 //!   a hand cleared the holder in place, or a taker gave the lease up while
-//!   its own take still waited to lead and says the renew deadline, the wait
-//!   it still owed. Every candidate waits the duration the record says, from
-//!   its first sight of it. A take
+//!   its own take still waited to lead and says the renew deadline, the whole
+//!   wait of that take. Every candidate waits the duration the record says,
+//!   from its first sight of it. A take
 //!   writes the next term (terms only grow, one per change of holder, and a
 //!   candidate counts from the highest term it saw, so a record that vanished
 //!   under it is taken at the term after the one it held). A term is taken
@@ -173,7 +173,8 @@ pub struct LeaseRecord {
     /// every renewal as a change.
     pub renewed_at_micros: u64,
     /// The holder's duration in milliseconds: how long the record may stand
-    /// unchanged before another candidate takes it; `0` once released.
+    /// unchanged before another candidate takes it. A leader's release says
+    /// `0`; a release inside its take's wait says the renew deadline.
     pub duration_ms: u64,
 }
 
@@ -268,7 +269,8 @@ pub enum Tick {
     /// holder may still lead, so nobody is followed, and the lease is taken
     /// once that record's duration has passed since this candidate first saw
     /// the change. Also the answer at a record under `term` with no holder
-    /// and a duration, which a hand's clearing leaves and no release does.
+    /// and a duration: a hand's clearing leaves one, and so does a release
+    /// inside its take's wait.
     Gone { term: u64 },
     /// The lease looked free, but another candidate wrote first; the next
     /// tick reads what it wrote.
@@ -441,7 +443,9 @@ impl Elector {
     }
 
     /// This run's take still waits to lead: it took a record with no holder
-    /// to wait for, and its fence has not opened yet.
+    /// to wait for, and its fence has not opened yet. A loss, a release and
+    /// a take a rival won end the wait. An attempt still in doubt keeps it:
+    /// it may have landed.
     pub fn waits_to_lead(&self) -> bool {
         self.waits_from.is_some()
     }
@@ -538,6 +542,11 @@ impl Elector {
                 self.attempted = None;
                 self.waits_from = None;
                 if let Some(observation) = &mut self.observed {
+                    // This run's own sight of its release is dated at the
+                    // write's return, never before its take's read returned:
+                    // its own next take waits out what it handed on, as
+                    // every candidate does.
+                    observation.since = observation.since.max(Instant::now());
                     observation.record = released;
                 }
                 Ok(true)
@@ -750,8 +759,8 @@ impl Elector {
             // A record with no holder is waited out for the duration it
             // says, from this run's first sight of it. A holder's release
             // says none and is taken at once, unless its own take still
-            // waited to lead: then it says the renew deadline, the wait it
-            // owed. A record whose holder another hand cleared in place
+            // waited to lead: then it says the renew deadline, that take's
+            // whole wait. A record whose holder another hand cleared in place
             // keeps its duration, and that holder may lead until its own
             // next step reads the lease.
             Some(record) if record.is_released() => {
@@ -847,7 +856,15 @@ impl Elector {
                 self.held = Some(record);
                 Ok(Tick::Acquired { term })
             }
-            Written::Moved => Ok(Tick::Raced),
+            // Another write landed first and nothing is taken. This take's
+            // wait goes with it, unless an earlier attempt of this run is
+            // still in doubt: the write that landed may be that attempt.
+            Written::Moved => {
+                if self.attempted.is_none() {
+                    self.waits_from = None;
+                }
+                Ok(Tick::Raced)
+            }
         }
     }
 }
@@ -1315,6 +1332,32 @@ mod tests {
     }
 
     #[test]
+    fn a_releaser_waits_out_its_own_release_from_the_writes_return() {
+        // b's take is handed an instant from before its read, so its own
+        // sight of the record is dated there and its wait at the read's
+        // return. Its release inside that wait is dated at the write's
+        // return: b's own next take waits out what it handed on, as every
+        // candidate does, and never the read's length short of it.
+        let lease = MemoryLease::new();
+        let mut b = candidate(&lease, "b@host:2");
+        let before = Instant::now();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(b.tick(before).expect("take"), Tick::Acquired { term: 1 });
+        assert!(b.release().expect("release"));
+        let released = Instant::now();
+        assert_eq!(
+            b.tick(before + 2 * S).expect("look"),
+            Tick::Gone { term: 1 }
+        );
+        assert_eq!(b.fence().leader_term(before + 2 * S), None);
+        assert_eq!(
+            b.tick(released + 2 * S).expect("take"),
+            Tick::Acquired { term: 2 }
+        );
+        assert_eq!(b.fence().leader_term(released + 2 * S), Some(2));
+    }
+
+    #[test]
     fn a_taker_whose_lease_went_waits_for_nothing() {
         // The wait belongs to the take. A loss ends it, and so does a
         // release: the reader says no from then on.
@@ -1606,6 +1649,7 @@ mod tests {
         let t0 = Instant::now() + S;
         assert_eq!(a.tick(t0).expect("tick"), Tick::Raced);
         assert!(!a.is_holder());
+        assert!(!a.waits_to_lead(), "a take a rival won waits for no lead");
         assert_eq!(a.fence().leader_term(t0), None);
         assert_eq!(
             a.tick(t0 + S).expect("tick"),
