@@ -17,11 +17,12 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fmt,
+    sync::LazyLock,
 };
 
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{
-    de::{self, MapAccess, Visitor},
+    de::{self, value::SeqAccessDeserializer, MapAccess, SeqAccess, Visitor},
     ser::SerializeMap,
     Deserialize, Deserializer, Serialize, Serializer,
 };
@@ -29,11 +30,11 @@ use serde::{
 use crate::{
     affinity::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
     builtins::{
-        Best, CountFirst, FewestSessions, HasCapacity, HasRoom, Healthy, LeastLoad, LeastRequests,
-        NotOverloaded, NotTried, Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
-        SessionAffinity,
+        FewestSessions, LeastLoad, LeastRequests, ResidentWork, SessionAffinity,
+        DEFAULT_MEAN_PREFILL_TOKENS,
     },
-    framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, Weighted},
+    catalog::{Catalog, Found},
+    framework::{Binding, Engine, Picker, Plan, Profile, Scorer, Weighted},
     ring::ConsistentHash,
     sessions::SessionRule,
     view::Phase,
@@ -82,8 +83,9 @@ pub const SCORERS: [&str; 10] = [
 ];
 
 /// The pickers of v1; `count-first` and `power-of-two-count-first` compare
-/// the requests in flight before the score; `best-with-temperature` takes
-/// its temperature and is written in the parameter form.
+/// the requests in flight before the score; `manual` leaves the placement
+/// to the binding's sessions rule, by its assignment; `best-with-temperature`
+/// takes its temperature and is written in the parameter form.
 pub const PICKERS: [&str; 9] = [
     "best",
     "round-robin",
@@ -95,6 +97,10 @@ pub const PICKERS: [&str; 9] = [
     "manual",
     "best-with-temperature",
 ];
+
+/// The stock build's catalog: what [`PolicySpec::validate`] resolves a
+/// stage name in.
+static STOCK: LazyLock<Catalog> = LazyLock::new(Catalog::builtin);
 
 /// A sampling picker compares its draws by the profile's scorers, so it
 /// needs at least one.
@@ -127,6 +133,17 @@ pub struct Needs {
     /// The request's own key's in-flight count per worker (a sessions rule
     /// with an in-flight cap).
     pub session_in_flight: bool,
+    /// The affinity column
+    /// ([`RequestFacts::affinity`](crate::RequestFacts::affinity)): one
+    /// [`AffinityFacts`](crate::AffinityFacts) a candidate. A stage that
+    /// reads any of the five declares this, whatever feeds them: `events`
+    /// asks for the index and the hash fields for the request's hashes, and
+    /// neither stands for the column. A host fills the column where this is
+    /// declared and may hand an empty one elsewhere. The engine checks the
+    /// column's shape, never its presence: an unfilled column reads as
+    /// nothing held for every candidate and nothing is refused. What holds
+    /// a host to the need is the builder of its view, by a case of its own.
+    pub affinity: bool,
 }
 
 impl Needs {
@@ -144,6 +161,7 @@ impl Needs {
             media: self.media || other.media,
             active_sessions: self.active_sessions || other.active_sessions,
             session_in_flight: self.session_in_flight || other.session_in_flight,
+            affinity: self.affinity || other.affinity,
         }
     }
 }
@@ -561,8 +579,8 @@ impl Default for ConsistentHashParams {
     }
 }
 
-/// The resident-work scorer: the tokens resident on a candidate, with the
-/// request's own token count added for the comparison.
+/// The resident-work scorer: the context tokens resident on a candidate,
+/// and a price in tokens for every request it holds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResidentWorkParams {
@@ -570,9 +588,8 @@ pub struct ResidentWorkParams {
     #[serde(default = "one")]
     #[schemars(extend("exclusiveMinimum" = 0))]
     pub weight: f32,
-    /// The request's token count added to each candidate's resident
-    /// tokens; above zero.
-    #[schemars(range(min = 1))]
+    /// What one request a candidate holds adds to its resident tokens, in
+    /// context tokens; zero compares the tokens alone.
     pub request_tokens: u32,
 }
 
@@ -654,19 +671,29 @@ impl ScoreStage {
     }
 }
 
-/// A scorer reference: a bare name, or the name mapped to its weight and
+/// A scorer reference: a bare name (a built-in at its defaults, or a scorer
+/// the catalog adds at weight one), or the name mapped to its weight and
 /// parameters ([`ScoreStage`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScoreSpec {
     Name(String),
     Params(ScoreStage),
+    /// A name that is no built-in's, mapped to what the document wrote under
+    /// it: a scorer the catalog adds, with its weight (`{ name: { weight }
+    /// }`). Kept as read: the validator asks the catalog for the name first
+    /// and reads the keys of a name it holds. A key written twice is the
+    /// parser's refusal, as under a built-in.
+    Added {
+        name: String,
+        written: serde_json::Value,
+    },
 }
 
 impl ScoreSpec {
     /// The scorer's name as written.
     pub fn name(&self) -> &str {
         match self {
-            Self::Name(name) => name,
+            Self::Name(name) | Self::Added { name, .. } => name,
             Self::Params(stage) => stage.name(),
         }
     }
@@ -686,8 +713,14 @@ impl From<ScoreStage> for ScoreSpec {
 
 impl Serialize for ScoreSpec {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let Self::Params(stage) = self else {
-            return serializer.serialize_str(self.name());
+        let stage = match self {
+            Self::Name(name) => return serializer.serialize_str(name),
+            Self::Added { name, written } => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(name, written)?;
+                return map.end();
+            }
+            Self::Params(stage) => stage,
         };
         // One key, the stage's name, to its parameters: the document form in
         // JSON and in YAML alike (a derived enum would render as a YAML tag).
@@ -710,10 +743,12 @@ impl Serialize for ScoreSpec {
     }
 }
 
-/// The one scorer of a score entry's map, read by its key; the key chooses
-/// the parameter struct, so the struct's own message names an unknown or
-/// mistyped parameter.
-fn scorer_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<ScoreStage, A::Error> {
+/// The one scorer of a score entry's map, read by its key; a built-in's key
+/// chooses the parameter struct, so the struct's own message names an
+/// unknown or mistyped parameter. Any other key is kept with what is
+/// written under it ([`ScoreSpec::Added`]): only the validator knows the
+/// names a catalog adds.
+fn scorer_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<ScoreSpec, A::Error> {
     let Some(key) = map.next_key::<String>()? else {
         return Err(de::Error::custom("a score entry names one scorer"));
     };
@@ -728,14 +763,84 @@ fn scorer_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<ScoreStage, A::Err
         "bucket" => ScoreStage::Bucket(map.next_value()?),
         "consistent-hash" => ScoreStage::ConsistentHash(map.next_value()?),
         "resident-work" => ScoreStage::ResidentWork(map.next_value()?),
-        other => return Err(de::Error::unknown_variant(other, &SCORERS)),
+        _ => {
+            let Written(written) = map.next_value()?;
+            return single_key(map, ScoreSpec::Added { name: key, written });
+        }
     };
+    single_key(map, ScoreSpec::Params(stage))
+}
+
+/// `entry`, once its map holds no second key.
+fn single_key<'de, A: MapAccess<'de>>(mut map: A, entry: ScoreSpec) -> Result<ScoreSpec, A::Error> {
     if map.next_key::<de::IgnoredAny>()?.is_some() {
         return Err(de::Error::custom(
             "a score entry maps a single key to its parameters; write one entry per scorer",
         ));
     }
-    Ok(stage)
+    Ok(entry)
+}
+
+/// What a document wrote under a scorer's name that is no built-in's, kept
+/// as read for the validator. A key written twice is refused here, in the
+/// words a built-in's parameters refuse it: the map of `serde_json` keeps
+/// the last value and says nothing. Only the entry's own keys are asked:
+/// the validator takes the weight alone, a number.
+struct Written(serde_json::Value);
+
+impl<'de> Deserialize<'de> for Written {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct WrittenVisitor;
+
+        impl<'de> Visitor<'de> for WrittenVisitor {
+            type Value = Written;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a scorer's parameters")
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Written, E> {
+                Ok(Written(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Written, A::Error> {
+                Deserialize::deserialize(SeqAccessDeserializer::new(seq)).map(Written)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Written, A::Error> {
+                let mut keys = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if keys.contains_key(&key) {
+                        return Err(de::Error::custom(format_args!("duplicate field `{key}`")));
+                    }
+                    keys.insert(key, map.next_value()?);
+                }
+                Ok(Written(keys.into()))
+            }
+        }
+
+        deserializer.deserialize_any(WrittenVisitor)
+    }
 }
 
 impl<'de> Deserialize<'de> for ScoreSpec {
@@ -753,10 +858,10 @@ impl<'de> Deserialize<'de> for ScoreSpec {
                 Ok(ScoreSpec::Name(name.to_string()))
             }
 
-            // The map is read by its one key, so the message names an
-            // unknown scorer or a wrong parameter, never "no variant matched".
+            // The map is read by its one key, so the message names a
+            // built-in's wrong parameter, never "no variant matched".
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<ScoreSpec, A::Error> {
-                scorer_entry(map).map(ScoreSpec::Params)
+                scorer_entry(map)
             }
         }
 
@@ -906,7 +1011,7 @@ impl JsonSchema for PickSpec {
             .filter(|name| *name != "best-with-temperature")
             .collect();
         json_schema!({
-            "description": "A picker: its bare name, or the name mapped to its parameters.",
+            "description": "A picker: its bare name, or the name mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
             "anyOf": [
                 { "type": "string", "enum": names },
                 generator.subschema_for::<PickStage>()
@@ -1029,7 +1134,10 @@ impl Default for OverloadSpec {
     }
 }
 
-/// How a session key seen for the first time picks its worker.
+/// How a session key seen for the first time picks its worker. Under the
+/// `manual` picker the same assignment places a request with no key, which
+/// is not pinned, and a `manual` profile bound with no sessions rule places
+/// every request by `min_load`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Assignment {
@@ -1078,7 +1186,8 @@ pub struct SessionsSpec {
     #[serde(default = "default_sweep_s")]
     #[schemars(range(min = 1))]
     pub sweep_s: u32,
-    /// How a first-seen key picks its worker (default `delegate`).
+    /// How a first-seen key picks its worker (default `delegate`); under
+    /// the `manual` picker, a request with no key as well.
     #[serde(default)]
     pub assignment: Assignment,
     /// How many requests of one key a worker carries before the next steps
@@ -1287,6 +1396,8 @@ pub enum SpecError {
     UnknownPicker { profile: String, name: String },
     #[error("profile {profile:?}: picker {picker:?} needs a scorer to compare by")]
     PickerNeedsScorer { profile: String, picker: String },
+    #[error("profile {profile:?}: picker {picker:?} leaves the placement to the binding's sessions rule and runs no scorer; remove `score`")]
+    PickerRunsNoScorer { profile: String, picker: String },
     #[error("binding {index}: unknown profile {name:?}")]
     UnknownProfile { index: usize, name: String },
     #[error("binding {index} names no profile")]
@@ -1600,9 +1711,12 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
                 "a finite number above zero",
             )
         }
+        // The resident-work price has no bound: zero compares the tokens
+        // alone.
         ScoreStage::LeastRequests(_)
         | ScoreStage::FewestSessions(_)
-        | ScoreStage::SessionAffinity(_) => Ok(()),
+        | ScoreStage::SessionAffinity(_)
+        | ScoreStage::ResidentWork(_) => Ok(()),
         ScoreStage::PrefixAffinity(p) => {
             at.number("threshold", p.threshold, unit_interval, "between 0 and 1")?;
             at.number(
@@ -1656,7 +1770,6 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
                 None => Ok(()),
             }
         }
-        ScoreStage::ResidentWork(p) => at.nonzero("request_tokens", Some(p.request_tokens)),
     }
 }
 
@@ -1704,7 +1817,7 @@ fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
     match stage {
         ScoreStage::LeastLoad(p) => built_scorer(LeastLoad::new(
             p.kv_pressure_weight.unwrap_or(0.15),
-            p.mean_prefill_tokens.unwrap_or(1024),
+            p.mean_prefill_tokens.unwrap_or(DEFAULT_MEAN_PREFILL_TOKENS),
             p.default_throughput.unwrap_or(2000.0),
         )),
         ScoreStage::LeastRequests(_) => built_scorer(LeastRequests),
@@ -1731,37 +1844,28 @@ fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
             Resolved::NotInBuild("the consistent-hash prefix key")
         }
         ScoreStage::ConsistentHash(p) => built_scorer(ConsistentHash::new(p.bounded_load.as_ref())),
-        ScoreStage::ResidentWork(_) => Resolved::NotInBuild("the resident-work scorer"),
+        ScoreStage::ResidentWork(p) => built_scorer(ResidentWork::new(p.request_tokens)),
     }
-}
-
-fn built_picker(picker: impl Picker + 'static) -> Resolved<Box<dyn Picker>> {
-    Resolved::Built(Box::new(picker))
 }
 
 fn picker_of(
     pick: &PickSpec,
     profile: &str,
     at: &At,
+    catalog: &Catalog,
 ) -> Result<Resolved<Box<dyn Picker>>, SpecError> {
     Ok(match pick {
-        PickSpec::Name(name) => match name.as_str() {
-            "best" => built_picker(Best),
-            "round-robin" => built_picker(RoundRobin::new()),
-            "random" => built_picker(Random),
-            "power-of-two" => built_picker(PowerOfTwo),
-            "count-first" => built_picker(CountFirst),
-            "power-of-two-count-first" => built_picker(PowerOfTwoCountFirst),
-            "passthrough" => built_picker(Passthrough),
-            "manual" => Resolved::NotInBuild("the manual picker"),
-            "best-with-temperature" => {
+        PickSpec::Name(name) => match catalog.find_picker(name) {
+            Some(Found::Built(picker)) => Resolved::Built(picker),
+            // The one picker with parameters, named without them.
+            Some(Found::Typed) => {
                 return Err(at.bad(
                     "pick",
                     name,
                     "a picker with its temperature: { best-with-temperature: { temperature } }",
                 ))
             }
-            _ => {
+            None => {
                 return Err(SpecError::UnknownPicker {
                     profile: profile.to_string(),
                     name: name.clone(),
@@ -1781,34 +1885,86 @@ fn picker_of(
     })
 }
 
-fn filter_by_name(name: &str) -> Option<Box<dyn Filter>> {
-    Some(match name {
-        "healthy" => Box::new(Healthy),
-        "not-overloaded" => Box::new(NotOverloaded),
-        "has-capacity" => Box::new(HasCapacity),
-        "has-room" => Box::new(HasRoom),
-        "not-tried" => Box::new(NotTried),
-        _ => return None,
-    })
+/// What a score entry stands for.
+enum Scored {
+    /// A built-in, by its parameters: the written ones, or a bare name's
+    /// defaults.
+    Typed(ScoreStage),
+    /// A scorer the catalog built, with its weight.
+    Built(Weighted),
 }
 
-/// The stage a score entry stands for: a bare catalog name at its defaults,
-/// or the written parameters.
-fn stage_of(entry: &ScoreSpec, profile: &str, at: &At) -> Result<ScoreStage, SpecError> {
-    match entry {
-        ScoreSpec::Params(stage) => Ok(stage.clone()),
-        ScoreSpec::Name(name) if name == "resident-work" => Err(SpecError::BadField {
+/// The stage a score entry stands for. The catalog is asked for the name
+/// first: a name it does not hold is refused as unknown whatever is written
+/// under it, so a misspelt built-in reads its name and not a key it carries.
+fn scored(
+    entry: &ScoreSpec,
+    profile: &str,
+    at: &At,
+    catalog: &Catalog,
+) -> Result<Scored, SpecError> {
+    let name = entry.name();
+    let Some(found) = catalog.find_scorer(name) else {
+        return Err(SpecError::UnknownScorer {
+            profile: profile.to_string(),
+            name: name.to_string(),
+        });
+    };
+    match (entry, found) {
+        (ScoreSpec::Params(stage), _) => Ok(Scored::Typed(stage.clone())),
+        (ScoreSpec::Name(_), Found::Typed) => match ScoreStage::by_name(name) {
+            Some(stage) => Ok(Scored::Typed(stage)),
+            // The one scorer whose parameters have no default.
+            None => Err(SpecError::BadField {
+                path: at.0.clone(),
+                value: name.to_string(),
+                reason: "a scorer with its request_tokens: { resident-work: { request_tokens } }",
+            }),
+        },
+        (ScoreSpec::Name(_), Found::Built(scorer)) => Ok(Scored::Built(Weighted {
+            scorer,
+            weight: 1.0,
+        })),
+        (ScoreSpec::Added { written, .. }, Found::Built(scorer)) => Ok(Scored::Built(Weighted {
+            scorer,
+            weight: added_weight(written, &at.sub(name))?,
+        })),
+        // Only a document built in code: the parser reads a built-in's key
+        // into its parameter struct.
+        (ScoreSpec::Added { .. }, Found::Typed) => Err(SpecError::BadField {
             path: at.0.clone(),
-            value: name.clone(),
-            reason: "a scorer with its request_tokens: { resident-work: { request_tokens } }",
+            value: name.to_string(),
+            reason: "a scorer added in code: a built-in's parameters are typed",
         }),
-        ScoreSpec::Name(name) => {
-            ScoreStage::by_name(name).ok_or_else(|| SpecError::UnknownScorer {
-                profile: profile.to_string(),
-                name: name.clone(),
-            })
+    }
+}
+
+/// The weight a document gives a scorer added in code: `{ weight }` and no
+/// other key, each refused by name; one when the map is empty.
+fn added_weight(written: &serde_json::Value, at: &At) -> Result<f32, SpecError> {
+    let Some(keys) = written.as_object() else {
+        return Err(SpecError::BadField {
+            path: at.0.clone(),
+            value: written.to_string(),
+            reason: "a map of the scorer's weight: { weight }",
+        });
+    };
+    let mut weight = 1.0;
+    for (key, value) in keys {
+        if key != "weight" {
+            return Err(at.bad(
+                key,
+                value,
+                "a parameter of a scorer added in code, which takes its weight alone",
+            ));
+        }
+        // A number past an `f32` narrows to infinity and is refused below.
+        weight = value.as_f64().map_or(f32::NAN, |number| number as f32);
+        if !above_zero(weight) {
+            return Err(at.bad("weight", value, "a finite number above zero"));
         }
     }
+    Ok(weight)
 }
 
 /// One profile's stages, built when this build carries every one of them.
@@ -1816,40 +1972,47 @@ fn check_profile(
     name: &str,
     p: &ProfileSpec,
     view: &ViewSpec,
-    needs: &mut Needs,
+    catalog: &Catalog,
     deferred: &mut Deferred,
 ) -> Result<Option<Profile>, SpecError> {
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
     let mut filters = Vec::with_capacity(p.filter.len());
     for f in &p.filter {
-        filters.push(filter_by_name(f).ok_or_else(|| SpecError::UnknownFilter {
-            profile: name.to_string(),
-            name: f.clone(),
-        })?);
+        filters.push(
+            catalog
+                .find_filter(f)
+                .ok_or_else(|| SpecError::UnknownFilter {
+                    profile: name.to_string(),
+                    name: f.clone(),
+                })?,
+        );
     }
     let mut scorers = Vec::with_capacity(p.score.len());
     let mut complete = true;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
-        let stage = stage_of(entry, name, &entry_at)?;
+        let stage = match scored(entry, name, &entry_at, catalog)? {
+            Scored::Typed(stage) => stage,
+            Scored::Built(weighted) => {
+                scorers.push(weighted);
+                continue;
+            }
+        };
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
         match scorer_of(&stage, gates) {
-            Resolved::Built(scorer) => {
-                *needs = needs.or(scorer.needs());
-                scorers.push(Weighted {
-                    scorer,
-                    weight: stage.weight(),
-                });
-            }
+            Resolved::Built(scorer) => scorers.push(Weighted {
+                scorer,
+                weight: stage.weight(),
+            }),
             Resolved::NotInBuild(what) => {
                 complete = false;
                 deferred.note(stage_at.0, what);
             }
         }
     }
-    let picker = match picker_of(&p.pick, name, &at)? {
+    let picker = match picker_of(&p.pick, name, &at, catalog)? {
         Resolved::Built(picker) => Some(picker),
         Resolved::NotInBuild(what) => {
             deferred.note(at.field("pick"), what);
@@ -1858,6 +2021,15 @@ fn check_profile(
     };
     if p.score.is_empty() && SAMPLING_PICKERS.contains(&p.pick.name()) {
         return Err(SpecError::PickerNeedsScorer {
+            profile: name.to_string(),
+            picker: p.pick.name().to_string(),
+        });
+    }
+    // A picker that leaves the placement to the binding's rule: the engine
+    // never runs such a profile's scorers, so a document that names one
+    // names a stage that never runs.
+    if !p.score.is_empty() && picker.as_ref().is_some_and(|picker| picker.by_assignment()) {
+        return Err(SpecError::PickerRunsNoScorer {
             profile: name.to_string(),
             picker: p.pick.name().to_string(),
         });
@@ -1880,6 +2052,9 @@ struct BindingContext<'a> {
     denied: &'a [&'a str],
     /// Profile name to its position in the document's map.
     profiles: &'a BTreeMap<&'a str, u16>,
+    /// The profiles whose built picker leaves the placement to a sessions
+    /// rule ([`Picker::by_assignment`]), by name.
+    by_assignment: &'a [&'a str],
 }
 
 fn check_bounds<T>(bounds: &Bounds<T>, at: &At) -> Result<(), SpecError>
@@ -2174,6 +2349,20 @@ fn check_binding(
     check_matcher(&b.matcher, cx, &at, deferred)?;
     check_binding_rules(b, cx, &at, deferred)?;
     let mut built = resolve_plan(b, cx)?;
+    // A picker that leaves the placement to a sessions rule, and a rule runs
+    // under the single plan alone: on a side of a pair or of `epd` nothing
+    // would place its requests. The built picker answers, as it answers the
+    // engine.
+    if b.plan.unwrap_or_default() != PlanName::Single {
+        for (side, name) in &b.profiles {
+            if cx.by_assignment.contains(&name.as_str()) {
+                deferred.note(
+                    at.sub("profiles").field(side),
+                    "a picker that places by the sessions rule outside the single plan",
+                );
+            }
+        }
+    }
     if let (Some(binding), Some(sessions)) = (built.as_mut(), &b.sessions) {
         let rule = session_rule(sessions, cx.index, binding.plan)?;
         needs.active_sessions |= rule.assignment == Assignment::MinGroup;
@@ -2250,7 +2439,48 @@ fn standard_filters() -> Vec<String> {
     ]
 }
 
+/// The load metric the `power_of_two` preset compares its candidates by:
+/// one form of the preset each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerOfTwoMetric {
+    /// Two draws, the lower expected wait: the preset under its bare name.
+    ExpectedWait,
+    /// Two draws, the fewer requests in flight, the expected wait between
+    /// equal counts.
+    Requests,
+    /// The fewest requests in flight over every candidate, the expected wait
+    /// between equal counts.
+    LeastRequests,
+    /// The least resident work over every candidate, each request priced at
+    /// `request_tokens` context tokens.
+    ResidentTokens { request_tokens: u32 },
+}
+
 impl PolicySpec {
+    /// The `power_of_two` preset in the form its load metric names, bound to
+    /// every model and phase: the count forms compare the requests in flight
+    /// before the score through the count-first pickers, and the resident
+    /// form scores every candidate and takes the best, with no draw of two.
+    pub fn power_of_two(metric: PowerOfTwoMetric) -> Result<Self, SpecError> {
+        const NAME: &str = "power_of_two";
+        let mut spec = Self::preset(NAME)?;
+        let profile = spec.profiles.get_mut(NAME).ok_or(SpecError::Empty)?;
+        match metric {
+            PowerOfTwoMetric::ExpectedWait => {}
+            PowerOfTwoMetric::Requests => profile.pick = "power-of-two-count-first".into(),
+            PowerOfTwoMetric::LeastRequests => profile.pick = "count-first".into(),
+            PowerOfTwoMetric::ResidentTokens { request_tokens } => {
+                profile.score = vec![ScoreStage::ResidentWork(ResidentWorkParams {
+                    weight: 1.0,
+                    request_tokens,
+                })
+                .into()];
+                profile.pick = "best".into();
+            }
+        }
+        Ok(spec)
+    }
+
     /// A spec of one preset profile bound to every model and phase.
     pub fn preset(name: &str) -> Result<Self, SpecError> {
         let profile = match name {
@@ -2291,11 +2521,13 @@ impl PolicySpec {
             // Sticky sessions over a random assignment: a key stays with the
             // first worker it was placed on, no in-flight cap, the first
             // worker back in the lead when it recovers; the idle TTL of four
-            // hours swept each minute, as the keyed policy of today.
+            // hours swept each minute, as the keyed policy of today. The
+            // picker leaves the placement to the rule, so another assignment
+            // is the rule's one field and no other profile.
             "manual" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec![],
-                pick: "random".into(),
+                pick: "manual".into(),
             },
             // Affinity first, the expected wait within the group: the slice
             // and the diversion over everything when due, the holder tiers
@@ -2328,7 +2560,7 @@ impl PolicySpec {
             headers: vec![],
             ttl_s: 14_400,
             sweep_s: 60,
-            assignment: Assignment::Delegate,
+            assignment: Assignment::Random,
             inflight_cap: u16::MAX,
             issue_session_id: false,
             recovery: Recovery::Original,
@@ -2413,11 +2645,23 @@ impl PolicySpec {
 
     /// [`PolicySpec::validate`] with the host's own denied header names
     /// (the configured tenant header) added to the built-in deny-list.
+    pub fn validate_with(&self, denied_headers: &[&str]) -> Result<Engine, SpecError> {
+        self.validate_in(&STOCK, denied_headers)
+    }
+
+    /// [`PolicySpec::validate_with`] over the stages `catalog` holds: the
+    /// stock build's and the ones a host added in code, each named in the
+    /// document as a built-in is. Every stage name is resolved here, once;
+    /// a factory builds its stage for this engine alone.
     ///
     /// Every field is checked in shape first; a field this build cannot
     /// honour (a stage, a plan, a matcher or a binding rule of a later step)
     /// is then refused by name as [`SpecError::NotInBuild`].
-    pub fn validate_with(&self, denied_headers: &[&str]) -> Result<Engine, SpecError> {
+    pub fn validate_in(
+        &self,
+        catalog: &Catalog,
+        denied_headers: &[&str],
+    ) -> Result<Engine, SpecError> {
         if let Some(kind) = &self.kind {
             return Err(SpecError::Kind(kind.clone()));
         }
@@ -2441,12 +2685,18 @@ impl PolicySpec {
         check_view(&self.view, denied_headers)?;
         check_index(&self.index, &self.view)?;
         let mut deferred = Deferred::default();
+        // What no stage declares: the sessions rules' counts and the view's
+        // headers. The engine folds every profile's stages in.
         let mut needs = Needs::default();
         let mut profiles = Vec::with_capacity(self.profiles.len());
+        // Noted by name: the built vector lines up with the document's
+        // positions only once nothing is deferred.
+        let mut by_assignment = Vec::new();
         for (name, profile) in &self.profiles {
-            if let Some(built) =
-                check_profile(name, profile, &self.view, &mut needs, &mut deferred)?
-            {
+            if let Some(built) = check_profile(name, profile, &self.view, catalog, &mut deferred)? {
+                if built.picker.by_assignment() {
+                    by_assignment.push(name.as_str());
+                }
                 profiles.push(built);
             }
         }
@@ -2468,6 +2718,7 @@ impl PolicySpec {
                 view: &self.view,
                 denied: denied_headers,
                 profiles: &positions,
+                by_assignment: &by_assignment,
             };
             if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
                 bindings.push(built);
@@ -2538,6 +2789,74 @@ impl PolicySpec {
     }
 }
 
+/// One generation as a store applies it: the engine validated from a
+/// document, with the generation's number and its needs.
+///
+/// One invariant: **a decision reads its rows, its engine and its number
+/// in one load.** A store publishes every world under one of these
+/// ([`World::spec`](crate::store::World::spec)), so no reader pairs one
+/// generation's engine with rows published under another. The number is the
+/// engine's own, the document's `generation` line: there is no second
+/// holder.
+///
+/// A document becomes one by validation alone ([`AppliedSpec::validate`]):
+/// one that fails validation never does. The other constructor validates
+/// nothing: [`AppliedSpec::unbound`] is what a store holds before any
+/// document is applied, and the only generation 0 a store ever holds. A
+/// document that names no generation validates to number 0 too, and the
+/// store's apply refuses it as not above the standing one.
+#[derive(Debug)]
+pub struct AppliedSpec {
+    engine: Engine,
+}
+
+impl AppliedSpec {
+    /// The generation `document` validates into ([`PolicySpec::validate`]).
+    pub fn validate(document: &PolicySpec) -> Result<Self, SpecError> {
+        Self::validate_with(document, &[])
+    }
+
+    /// [`AppliedSpec::validate`] with the host's own denied header names,
+    /// as [`PolicySpec::validate_with`] takes them.
+    pub fn validate_with(
+        document: &PolicySpec,
+        denied_headers: &[&str],
+    ) -> Result<Self, SpecError> {
+        document
+            .validate_with(denied_headers)
+            .map(|engine| Self { engine })
+    }
+
+    /// The generation a store holds before any document is applied: number
+    /// 0, an engine with no profile and no binding, which declines every
+    /// decision by name as an engine declines a model no binding covers.
+    #[must_use]
+    pub fn unbound() -> Self {
+        Self {
+            engine: Engine::new(Vec::new(), Vec::new(), 0, Needs::default()),
+        }
+    }
+
+    /// The generation's number: the engine's own.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.engine.generation()
+    }
+
+    /// The engine a decision under this generation runs.
+    #[must_use]
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// What the host must feed under this generation
+    /// ([`Engine::needs`]).
+    #[must_use]
+    pub fn needs(&self) -> Needs {
+        self.engine.needs()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2600,6 +2919,9 @@ mod tests {
             assert_eq!(engine.needs().loads, load_aware, "{name}");
             assert_eq!(engine.needs().ring, name == "consistent_hashing", "{name}");
             assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
+            // The affinity column is fed where an affinity stage reads it
+            // and nowhere else: a preset without one declares no column.
+            assert_eq!(engine.needs().affinity, name == "cache_aware", "{name}");
             assert_eq!(engine.needs().headers, name == "manual", "{name}");
             assert!(!engine.needs().active_sessions, "{name}");
             assert!(!engine.needs().session_in_flight, "{name}");
@@ -2682,18 +3004,21 @@ mod tests {
         // A decode-phase binding before the pair binding decides the decode
         // requests that come alone; a pair's decode side is decided by the
         // binding its prefill lookup resolves to, with that pair's decode
-        // profile. The decode needs carry both.
+        // profile. The decode needs carry both. The pair's decode profile
+        // is not the first profile in name order, the order the engine
+        // holds them in: a decode slot that read the first profile would
+        // find the decode-only one and lose the pair's needs.
         let text = r#"{
           "apiVersion": "smg.policy/v1",
           "profiles": {
             "decode-only": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" },
             "prefill": { "filter": ["healthy"], "pick": "round-robin" },
-            "decode": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
+            "pair-decode": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
             "default": { "filter": ["healthy"], "pick": "round-robin" }
           },
           "bindings": [
             { "match": { "model": "*", "phase": ["decode"] }, "profile": "decode-only" },
-            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" } },
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "pair-decode" } },
             { "match": { "model": "*" }, "profile": "default" }
           ]
         }"#;
@@ -3114,12 +3439,16 @@ mod tests {
 
     #[test]
     fn a_misspelt_or_unknown_scorer_is_refused_by_name() {
-        // With parameters, the one-key map goes to the stage enum whole, so
-        // the message names the key instead of "no variant matched".
-        let err = parse_error(
-            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":[{"least_load":{"kv_pressure_weight":5}}],"pick":"best"}}}"#,
-        );
-        assert!(err.contains("unknown variant `least_load`"), "{err}");
+        // A key that is no built-in's parses, since a catalog may add the
+        // name; the validator refuses it by name, whatever is written under
+        // it.
+        match spec_with_score(r#"{"least_load":{"kv_pressure_weight":5}}"#).validate() {
+            Err(SpecError::UnknownScorer { name, .. }) => assert_eq!(name, "least_load"),
+            other => panic!("validated as {other:?}"),
+        }
+        // With parameters, a built-in's one-key map goes to its parameter
+        // struct whole, so the message names the key instead of "no variant
+        // matched".
         let err = parse_error(
             r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":[{"least-requests":{"kv_pressure_weight":5}}],"pick":"best"}}}"#,
         );
@@ -3215,6 +3544,33 @@ mod tests {
     }
 
     #[test]
+    fn a_generation_is_refused_for_a_header_the_host_denies() {
+        let tenant = spec_with_view(r#"{"headers":["x-smg-tenant-id"]}"#);
+        assert!(AppliedSpec::validate(&tenant).is_ok());
+        assert_eq!(
+            AppliedSpec::validate_with(&tenant, &["X-SMG-Tenant-Id"]).err(),
+            Some(SpecError::DeniedHeader {
+                path: "view.headers[0]".into(),
+                name: "x-smg-tenant-id".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_generation_declares_the_needs_of_its_engine() {
+        for name in PRESETS {
+            let document = PolicySpec::preset(name).expect(name);
+            let applied = AppliedSpec::validate(&document).expect(name);
+            assert_eq!(applied.needs(), applied.engine().needs(), "{name}");
+        }
+        let cache_aware = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        let needs = AppliedSpec::validate(&cache_aware)
+            .expect("a preset validates")
+            .needs();
+        assert!(needs.loads && needs.events && needs.affinity);
+    }
+
+    #[test]
     fn the_view_lists_at_most_256_headers() {
         let with_headers = |count: usize| {
             let names: Vec<String> = (0..count).map(|i| format!("\"x-h{i}\"")).collect();
@@ -3288,6 +3644,46 @@ mod tests {
     }
 
     #[test]
+    fn the_power_of_two_preset_has_four_forms_by_its_load_metric() {
+        let form = |metric| {
+            let spec = PolicySpec::power_of_two(metric).expect("a preset");
+            let engine = spec.validate().expect("validates");
+            assert!(engine.needs().loads, "{metric:?}");
+            let profile = spec.profiles["power_of_two"].clone();
+            (profile.score, profile.pick.name().to_string())
+        };
+        let least_load: Vec<ScoreSpec> = vec!["least-load".into()];
+        assert_eq!(
+            form(PowerOfTwoMetric::ExpectedWait),
+            (least_load.clone(), "power-of-two".to_string())
+        );
+        assert_eq!(
+            form(PowerOfTwoMetric::Requests),
+            (least_load.clone(), "power-of-two-count-first".to_string())
+        );
+        assert_eq!(
+            form(PowerOfTwoMetric::LeastRequests),
+            (least_load, "count-first".to_string())
+        );
+        let resident: Vec<ScoreSpec> = vec![ScoreStage::ResidentWork(ResidentWorkParams {
+            weight: 1.0,
+            request_tokens: 2048,
+        })
+        .into()];
+        assert_eq!(
+            form(PowerOfTwoMetric::ResidentTokens {
+                request_tokens: 2048
+            }),
+            (resident, "best".to_string())
+        );
+        // A request priced at nothing is a form too: the tokens alone.
+        PolicySpec::power_of_two(PowerOfTwoMetric::ResidentTokens { request_tokens: 0 })
+            .expect("a preset")
+            .validate()
+            .expect("the tokens alone");
+    }
+
+    #[test]
     fn every_catalog_scorer_parses_and_the_ones_this_build_lacks_are_refused_by_name() {
         let in_build = [
             "least-load",
@@ -3337,16 +3733,16 @@ mod tests {
                 r#"{"consistent-hash":{"prefix_tokens":512,"bounded_load":{"factor":1.5,"abs_margin":4}}}"#,
                 "consistent-hash",
             ),
-            (
-                r#"{"resident-work":{"request_tokens":512}}"#,
-                "resident-work",
-            ),
         ];
         for (score, name) in with_params {
             let (path, what) = not_in_build(&spec_with_score(score));
             assert_eq!(path, format!("profiles.p.score[0].{name}"), "{score}");
             assert!(what.contains(name), "{what}");
         }
+        // The resident-work scorer is in the build with its parameter, and
+        // reads the load reports.
+        let resident = spec_with_score(r#"{"resident-work":{"request_tokens":512}}"#);
+        assert!(resident.validate().expect("validates").needs().loads);
         // The consistent-hash scorer is in the build with its bounded-load
         // rule; the prefix key form waits for the block hashes in the view.
         let bounded = spec_with_score(r#"{"consistent-hash":{"bounded_load":{"factor":1.5}}}"#);
@@ -3378,10 +3774,6 @@ mod tests {
                 "consistent-hash.bounded_load.factor",
             ),
             (
-                r#"{"resident-work":{"request_tokens":0}}"#,
-                "resident-work.request_tokens",
-            ),
-            (
                 r#"{"prefix-affinity":{"threshold":1.5}}"#,
                 "prefix-affinity.threshold",
             ),
@@ -3399,12 +3791,116 @@ mod tests {
         }
     }
 
+    /// One profile for every assignment: the `manual` preset's picker
+    /// leaves the placement to the binding's rule, the rule names the
+    /// classic default, and each other assignment is that one field and
+    /// validates. The recorded rows hold where each one places. The built
+    /// engine answers each rule with the assignment the document names:
+    /// under this picker it places a `delegate` by the fewest in flight,
+    /// and a reader of the binding still reads `delegate`.
+    #[test]
+    fn the_manual_preset_is_one_profile_for_every_assignment() {
+        let mut spec = PolicySpec::preset("manual").expect("the preset");
+        let pick = spec.profiles.get("manual").map(|p| p.pick.name());
+        assert_eq!(pick, Some("manual"));
+        let default = spec
+            .bindings
+            .first()
+            .and_then(|b| b.sessions.as_ref())
+            .map(|rule| rule.assignment);
+        assert_eq!(default, Some(Assignment::Random), "the classic default");
+        for assignment in [
+            Assignment::Random,
+            Assignment::MinLoad,
+            Assignment::MinGroup,
+            Assignment::Delegate,
+        ] {
+            let rule = spec
+                .bindings
+                .first_mut()
+                .and_then(|b| b.sessions.as_mut())
+                .expect("the preset's sessions rule");
+            rule.assignment = assignment;
+            let engine = spec.validate().expect("every assignment validates");
+            assert_eq!(
+                engine.needs().active_sessions,
+                assignment == Assignment::MinGroup,
+                "{assignment:?}"
+            );
+            let read_back = engine
+                .binding("m", Phase::Single)
+                .and_then(|binding| binding.sessions)
+                .map(|rule| rule.assignment);
+            assert_eq!(read_back, Some(assignment), "read back as declared");
+        }
+    }
+
+    /// The `manual` preset's whole rule, as the gateway's keyed policy runs
+    /// today: the routing-key header as the session key and the view's one
+    /// header, no header list of the rule's own, four hours of idle time
+    /// swept each minute, a random assignment, no in-flight cap, no session
+    /// id issued, the first worker back in the lead.
+    #[test]
+    fn the_manual_preset_states_its_whole_rule() {
+        let spec = PolicySpec::preset("manual").expect("the preset");
+        let rule = spec
+            .bindings
+            .first()
+            .and_then(|b| b.sessions.as_ref())
+            .expect("the preset's sessions rule");
+        assert_eq!(
+            *rule,
+            SessionsSpec {
+                sticky_header: "x-smg-routing-key".into(),
+                headers: vec![],
+                ttl_s: 14_400,
+                sweep_s: 60,
+                assignment: Assignment::Random,
+                inflight_cap: u16::MAX,
+                issue_session_id: false,
+                recovery: Recovery::Original,
+            }
+        );
+        assert_eq!(spec.view.headers, ["x-smg-routing-key"]);
+    }
+
+    /// The manual picker places by a sessions rule, and a rule runs under
+    /// the single plan alone: on a side of a pair or of `epd` the profile is
+    /// refused, with the side that names it. The built picker answers, so
+    /// any picker that leaves the placement to the rule is refused the same
+    /// way.
+    #[test]
+    fn the_manual_picker_outside_the_single_plan_is_not_in_this_build() {
+        let spec = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"pd-pair","profiles":{"prefill":"q","decode":"sticky"}}]}"#,
+        );
+        assert_eq!(
+            not_in_build(&spec),
+            (
+                "bindings[0].profiles.decode".to_string(),
+                "a picker that places by the sessions rule outside the single plan"
+            )
+        );
+        let epd = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"q":{"pick":"random"},"sticky":{"pick":"manual"}},"bindings":[{"plan":"epd","profiles":{"encode":"sticky","prefill":"q","decode":"q"}}]}"#,
+        );
+        assert_eq!(
+            not_in_build(&epd),
+            (
+                "bindings[0].profiles.encode".to_string(),
+                "a picker that places by the sessions rule outside the single plan"
+            )
+        );
+        // Under the single plan the same profile validates, here with no
+        // rule; the preset is the profile with one.
+        let single = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"sticky":{"pick":"manual"}},"bindings":[{"profile":"sticky"}]}"#,
+        );
+        assert!(single.validate().is_ok());
+    }
+
     #[test]
     fn the_pickers_of_v1_resolve_or_are_refused_by_name() {
-        assert_eq!(
-            not_in_build(&spec_with_pick(r#""manual""#)),
-            ("profiles.p.pick".to_string(), "the manual picker")
-        );
         assert_eq!(
             bad_field(&spec_with_pick(r#""best-with-temperature""#)),
             "profiles.p.pick"
@@ -3442,6 +3938,16 @@ mod tests {
                 "{name}"
             );
         }
+        // The manual picker leaves the placement to the binding's rule: no
+        // scorer of its profile would ever run, so one is refused by name.
+        match spec_with_pick(r#""manual""#).validate() {
+            Err(SpecError::PickerRunsNoScorer { profile, picker }) => {
+                assert_eq!((profile.as_str(), picker.as_str()), ("p", "manual"));
+            }
+            other => panic!("a scorer beside the manual picker validated as {other:?}"),
+        }
+        let alone = doc(r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"manual"}}}"#);
+        assert!(alone.validate().is_ok());
     }
 
     #[test]
@@ -3855,16 +4361,29 @@ mod tests {
     /// default (1.5, plus the margin) it spills.
     #[test]
     fn the_spill_parameters_of_the_spec_reach_the_profiles_gates() {
-        use crate::{Candidate, Constraints, Health, PoolFacts, RequestFacts, Scratch, WorkerId};
+        use crate::{
+            AffinityFacts, Candidate, Constraints, Health, PoolFacts, RequestFacts, Scratch,
+            WorkerId,
+        };
         let hashes = [0u64; 16];
+        // The first worker holds the whole request; the column says so.
+        let held = [
+            AffinityFacts {
+                overlap_blocks: 16,
+                ..AffinityFacts::default()
+            },
+            AffinityFacts::default(),
+            AffinityFacts::default(),
+        ];
         let facts = RequestFacts {
             model: "m",
             block_hashes: &hashes,
             prompt_tokens: 256,
             seed: 7,
+            affinity: &held,
             ..RequestFacts::default()
         };
-        let row = |position: u32, in_flight: u32, overlap_blocks: u32| Candidate {
+        let row = |position: u32, in_flight: u32| Candidate {
             position,
             id: WorkerId(100 + u64::from(position)),
             health: Health {
@@ -3872,10 +4391,9 @@ mod tests {
                 ..Health::default()
             },
             in_flight,
-            overlap_blocks,
             ..Candidate::default()
         };
-        let pool = [row(0, 20, 16), row(1, 0, 0), row(2, 0, 0)];
+        let pool = [row(0, 20), row(1, 0), row(2, 0)];
         let leader = |score: &str| {
             let engine = spec_with_score(score).validate().expect("a valid profile");
             let decision = engine.decide(

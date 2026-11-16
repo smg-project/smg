@@ -44,11 +44,11 @@ pub struct McpConfig {
 /// 1. Explicit tool policies (server:tool → decision)
 /// 2. Server policies with trust levels
 /// 3. Default policy (fallback)
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PolicyConfig {
     /// Default policy when no other rules match.
     /// Default: "allow"
-    #[serde(default = "default_allow")]
+    #[serde(default)]
     pub default: PolicyDecisionConfig,
 
     /// Per-server policies with trust levels.
@@ -61,7 +61,7 @@ pub struct PolicyConfig {
 }
 
 /// Server-level policy configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ServerPolicyConfig {
     /// Trust level for this server.
     /// - trusted: Allow all tools unconditionally
@@ -72,7 +72,7 @@ pub struct ServerPolicyConfig {
     pub trust_level: TrustLevelConfig,
 
     /// Default policy for tools on this server.
-    #[serde(default = "default_allow")]
+    #[serde(default)]
     pub default: PolicyDecisionConfig,
 }
 
@@ -145,29 +145,6 @@ impl<'de> Deserialize<'de> for PolicyDecisionConfig {
         }
 
         deserializer.deserialize_any(PolicyDecisionVisitor)
-    }
-}
-
-fn default_allow() -> PolicyDecisionConfig {
-    PolicyDecisionConfig::Allow
-}
-
-impl Default for PolicyConfig {
-    fn default() -> Self {
-        Self {
-            default: PolicyDecisionConfig::Allow,
-            servers: HashMap::new(),
-            tools: HashMap::new(),
-        }
-    }
-}
-
-impl Default for ServerPolicyConfig {
-    fn default() -> Self {
-        Self {
-            trust_level: TrustLevelConfig::Standard,
-            default: PolicyDecisionConfig::Allow,
-        }
     }
 }
 

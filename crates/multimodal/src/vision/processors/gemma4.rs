@@ -942,14 +942,14 @@ mod tests {
             for patch_x in 0..grid_w {
                 for dy in 0..patch {
                     for dx in 0..patch {
-                        for channel in 0..CHANNELS {
+                        for (channel, lut) in pipeline.lut.iter().enumerate() {
                             let source = ((patch_y * patch + dy) * width + patch_x * patch + dx)
                                 * CHANNELS
                                 + channel;
                             let index = (patch_y * grid_w + patch_x) * patch_pixels
                                 + (dy * patch + dx) * CHANNELS
                                 + channel;
-                            expected[index] = pipeline.lut[channel][pixels[source] as usize];
+                            expected[index] = lut[pixels[source] as usize];
                         }
                     }
                 }

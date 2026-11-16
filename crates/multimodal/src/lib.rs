@@ -34,7 +34,7 @@ pub use error::{
 };
 pub use media::{
     init_log_video_decode_timing, missing_video_decoder, FrameSampling, ImageFetchConfig,
-    MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
+    MediaConnector, MediaConnectorConfig, MediaSource, RawMedia, VideoFetchConfig,
 };
 pub use registry::{
     EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec,
