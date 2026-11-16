@@ -142,20 +142,29 @@ pub(crate) mod tests {
         elector::{ElectionSettings, Elector, MemoryLease, Tick},
     };
 
-    /// A candidate over a lease of its own and a readiness that reads its
-    /// fence: the run loop's writer, the election's writer, the reader.
+    /// A candidate alone over a lease of its own and a readiness that reads
+    /// its fence: the run loop's writer, the election's writer, the reader.
     pub(crate) fn fenced() -> (
         Elector,
         watch::Sender<Phase>,
         watch::Sender<Standing>,
         Readiness,
     ) {
-        let elector = Elector::new(
-            Box::new(MemoryLease::new()),
-            "controller-0@127.0.0.1:1",
-            ElectionSettings::default(),
+        over(
+            Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+                .expect("the default settings are in order"),
         )
-        .expect("the default settings are in order");
+    }
+
+    /// The same over the candidate that is handed in.
+    fn over(
+        elector: Elector,
+    ) -> (
+        Elector,
+        watch::Sender<Phase>,
+        watch::Sender<Standing>,
+        Readiness,
+    ) {
         let (steps, stepped) = watch::channel(Standing::default());
         let (phase, readiness) = channel(elector.fence(), stepped);
         (elector, phase, steps, readiness)
@@ -175,7 +184,16 @@ pub(crate) mod tests {
 
     #[test]
     fn the_role_is_the_fences_at_the_instant_of_the_read() {
-        let (mut elector, phase, _steps, readiness) = fenced();
+        // A lease that is handed in may have a holder this candidate never
+        // saw, so its take waits to lead.
+        let (mut elector, phase, _steps, readiness) = over(
+            Elector::new(
+                Box::new(MemoryLease::new()),
+                "controller-0@127.0.0.1:1",
+                ElectionSettings::default(),
+            )
+            .expect("the default settings are in order"),
+        );
         assert_eq!(readiness.state(), State::Starting);
 
         // Serving with no lease held: a follower.
@@ -184,8 +202,9 @@ pub(crate) mod tests {
 
         // The take of a lease that held no record opens no fence: still a
         // follower. The first renewal a renew deadline later opens it: the
-        // leader, with no message sent.
-        let taken = Instant::now();
+        // leader, with no message sent. The instants are ahead of the clock:
+        // the wait is dated by the later of the two.
+        let taken = Instant::now() + elector.settings().renew_period;
         assert_eq!(
             elector.tick(taken).expect("the take"),
             Tick::Acquired { term: 1 }

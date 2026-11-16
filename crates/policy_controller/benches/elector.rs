@@ -31,18 +31,25 @@ use smg_policy_controller::{
 };
 
 /// A holder whose fence is open, as a leader's is. Its lease, which no
-/// record held, is taken one renew deadline back and renewed now: that
-/// renewal opens the fence.
+/// record held, is taken at an instant ahead of the clock, where the take's
+/// wait is dated from, and renewed one renew deadline later: that renewal
+/// opens the fence. One more at the clock stamps the fence behind the reads,
+/// where a leader's stamp is.
 fn holder(backend: Box<dyn LeaseBackend>, identity: &str) -> Elector {
     let settings = ElectionSettings::default();
     let mut elector = Elector::new(backend, identity, settings).expect("valid settings");
-    let now = Instant::now();
+    let taken = Instant::now() + settings.renew_period;
     assert_eq!(
-        elector
-            .tick(now - settings.renew_deadline)
-            .expect("the take"),
+        elector.tick(taken).expect("the take"),
         Tick::Acquired { term: 1 }
     );
+    assert_eq!(
+        elector
+            .tick(taken + settings.renew_deadline)
+            .expect("the renewal"),
+        Tick::Renewed { term: 1 }
+    );
+    let now = Instant::now();
     assert_eq!(
         elector.tick(now).expect("the renewal"),
         Tick::Renewed { term: 1 }

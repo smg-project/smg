@@ -507,7 +507,7 @@ mod tests {
             service::{Service, Shared},
             PROTOCOL_VERSION,
         },
-        elector::{ElectionSettings, Elector, MemoryLease, Tick},
+        elector::{ElectionSettings, Elector, Tick},
         lease::LeaseId,
         proto::{
             self, controller_frame, gateway_frame::Frame,
@@ -543,8 +543,7 @@ mod tests {
         ceiling: Option<usize>,
         hello_deadline: Option<Duration>,
     ) -> Bed {
-        let elector = Elector::new(Box::new(MemoryLease::new()), IDENTITY, settings)
-            .expect("the settings are in order");
+        let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
         let mut shared = Shared::new(
             ID.to_owned(),
@@ -587,8 +586,8 @@ mod tests {
 
     impl Bed {
         /// The candidate leads now under `term`, by a take or a renewal, and
-        /// the election publishes the look. A take of a lease no record held
-        /// leads one renew deadline later, so that one is made in the past.
+        /// the election publishes the look. The bed's candidate is alone
+        /// over its own lease: its first take leads at once.
         fn leads(&mut self, term: u64) {
             let now = Instant::now();
             if self.elector.is_holder() || self.elector.observed().is_some() {

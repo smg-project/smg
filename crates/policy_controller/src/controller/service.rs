@@ -988,8 +988,9 @@ mod tests {
 
         // The lease held no record: the take opens no fence, and the answer
         // names nobody under the take's term until the first renewal a renew
-        // deadline later.
-        let took = Instant::now();
+        // deadline later. The instants are ahead of the clock: the wait is
+        // dated by the later of the two.
+        let took = Instant::now() + ElectionSettings::default().renew_period;
         assert_eq!(
             elector.tick(took).expect("the take"),
             Tick::Acquired { term: 1 }

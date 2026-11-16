@@ -33,7 +33,7 @@ use super::config::ConfigError;
 #[cfg(feature = "kubernetes")]
 use crate::elector::KubernetesLease;
 use crate::{
-    elector::{ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, MemoryLease, Tick},
+    elector::{ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, Tick},
     store::{LeasesStore, MemoryStore},
 };
 
@@ -291,7 +291,9 @@ pub enum LeaseError {
 /// is not there refuses the start before a listener serves.
 pub(crate) async fn elector(election: &Election, identity: String) -> Result<Elector, LeaseError> {
     let backend: Box<dyn LeaseBackend> = match &election.lease {
-        LeasePlace::Process => Box::new(MemoryLease::new()),
+        // The elector makes this place's store itself and hands it to
+        // nobody: no other holder can be, and its take leads at once.
+        LeasePlace::Process => return Ok(Elector::alone(identity, election.settings)?),
         LeasePlace::File(path) => {
             let directory = match path.parent() {
                 Some(directory) if !directory.as_os_str().is_empty() => directory,
@@ -584,14 +586,16 @@ fn report(
         }
     }
     // One line when the fence opens: at the take, or one renew deadline
-    // after a take of a record with no holder to wait for.
+    // after a take of a record with no holder to wait for. The elector
+    // says which take it made: after a slow step the fence reads closed
+    // here as well, with no wait to name, and the next renewal leads.
     match tick {
         Tick::Acquired { term } | Tick::Renewed { term } => {
             if !*leading {
                 *leading = elector.fence().leader_term(Instant::now()).is_some();
                 if *leading {
                     info!(identity = elector.identity(), term, "leading");
-                } else if matches!(tick, Tick::Acquired { .. }) {
+                } else if matches!(tick, Tick::Acquired { .. }) && elector.waits_to_lead() {
                     info!(
                         identity = elector.identity(),
                         term,
@@ -874,6 +878,16 @@ mod tests {
             assert_eq!(object(None).to_string(), "Lease smg-policy");
             assert!(object(None).is_shared());
         }
+    }
+
+    #[tokio::test]
+    async fn the_process_place_makes_an_elector_alone_that_leads_at_its_take() {
+        let mut alone = elector(&Election::default(), "controller-0@127.0.0.1:1".to_owned())
+            .await
+            .expect("the process place needs nothing");
+        let now = Instant::now();
+        alone.tick(now).expect("the take");
+        assert_eq!(alone.fence().leader_term(now), Some(1));
     }
 
     #[tokio::test]
@@ -1732,6 +1746,57 @@ mod tests {
         assert!(!text.contains("the lease's term fell"), "{text}");
         // The holder followed again after the first streak is named anew.
         assert_eq!(text.matches(": following").count(), 2, "{text}");
+    }
+
+    #[test]
+    fn a_take_whose_slow_step_closed_its_fence_logs_no_wait() {
+        const TOOK: &str = "took a lease with no holder to wait for";
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(20),
+            renew_deadline: Duration::from_millis(400),
+        };
+        // A holder's release is taken at once and waits for nobody. This
+        // take's step began a second before its report, as over a store that
+        // answers slowly: the fence reads closed at the report, past its
+        // renew deadline, and no line names a wait that was not made.
+        let mut lease = MemoryLease::new();
+        let released = LeaseRecord {
+            term: 1,
+            ..LeaseRecord::default()
+        };
+        assert_eq!(
+            lease.write(None, &released).expect("a write"),
+            Written::Done
+        );
+        let mut taker = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", settings)
+            .expect("the settings are in order");
+        let began = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the clock is past its first second");
+        let tick = taker.tick(began).expect("the take");
+        assert_eq!(tick, crate::elector::Tick::Acquired { term: 2 });
+        assert_eq!(taker.fence().leader_term(Instant::now()), None);
+        let lines = Logged(Arc::new(Mutex::new(Vec::new())));
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let mut leading = false;
+        tracing::subscriber::with_default(subscriber, || {
+            super::report(
+                &taker,
+                &tick,
+                &MemoryStore::new(),
+                &mut String::new(),
+                &mut false,
+                &mut leading,
+            );
+        });
+        let text = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+        assert_eq!(text.matches(TOOK).count(), 0, "{text}");
+        assert!(!leading, "{text}");
     }
 
     #[test]

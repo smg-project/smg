@@ -460,7 +460,7 @@ pub(crate) mod tests {
             self,
             tests::{a_completed, worker},
         },
-        elector::{ElectionSettings, Elector, MemoryLease, Tick},
+        elector::{ElectionSettings, Elector, Tick},
         lease::{Lease, LeaseId},
         store::{GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore},
         view::WorkerId,
@@ -495,12 +495,8 @@ pub(crate) mod tests {
         grace: Duration,
         ceiling: usize,
     ) -> (Elector, Arc<MemoryStore>, Arc<Gateways>, Instant) {
-        let mut elector = Elector::new(
-            Box::new(MemoryLease::new()),
-            "controller-0@10.0.0.7:30100",
-            PATIENT,
-        )
-        .expect("the settings are in order");
+        let mut elector = Elector::alone("controller-0@10.0.0.7:30100", PATIENT)
+            .expect("the settings are in order");
         let taken = Instant::now();
         elector.lead_at(taken);
         assert_eq!(elector.fence().leader_term(taken), Some(1));

@@ -165,10 +165,10 @@ mod tests {
         assert!(scrape.contains("smg_policy_controller_state{state=\"follower\"} 1"));
         assert!(scrape.contains("smg_policy_controller_state{state=\"leader\"} 0"));
 
-        // The fence opens one renew deadline after the take of a lease that
-        // held no record: the probe and the gauge say leader with no message
-        // between the election and the admin listener.
-        elector.lead_at(Instant::now() + elector.settings().renew_deadline);
+        // The candidate, alone over its own lease, takes it and leads: the
+        // probe and the gauge say leader with no message between the
+        // election and the admin listener.
+        elector.lead_at(Instant::now());
         let (status, _, body) = get(app.clone(), "/readiness").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, r#"{"status":"ready","role":"leader"}"#);
