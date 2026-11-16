@@ -926,6 +926,87 @@ mod tests {
     /// The prompt's tail with the thought open, as the table whose name the card carries reads it.
     const THINKING: &str = "<|message_model|><|content_thinking|>";
 
+    /// A forced call from a thought the prompt left open: workers that name where they start a
+    /// grammar get the table's tag; where they name no start the table's tag would open with
+    /// free text, which owes the call nothing, so the older registry's schema goes out, as on a
+    /// table with no tag.
+    #[test]
+    fn a_forced_call_from_an_open_thought_takes_the_schema_where_the_workers_name_no_start() {
+        let tokenizer = hiding(&["<think>", "</think>"]);
+        for (start, schema) in [
+            (Some("first_token"), false),
+            (Some("after_reasoning"), false),
+            (None, true),
+        ] {
+            let chat = forced(true);
+            let mut ctx = RequestContext::for_chat(
+                Arc::clone(&chat),
+                None,
+                SERVED.into(),
+                pool("qwen3", start),
+            );
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            let tools = chat.tools.clone().unwrap_or_default();
+            let prepared = prepare(
+                &ctx,
+                Asks::Chat(&chat),
+                &tools,
+                PROMPT,
+                true,
+                &tokenizer,
+                "test",
+            )
+            .map_err(|response| response.status())
+            .expect("nothing refused");
+            assert_eq!(
+                prepared.json_schema, schema,
+                "workers that start at {start:?}: {:?}",
+                prepared.constraint
+            );
+        }
+    }
+
+    /// The reader of a forced call under the schema starts the same on a table that has a tag
+    /// of its own: in the call on workers that start at the first token, with the prompt's
+    /// replay on workers that start once the thought is over, and on workers that do not say
+    /// with the replay kept and the JSON's opener named.
+    #[test]
+    fn a_forced_calls_reader_starts_the_same_on_a_table_that_has_a_tag() {
+        const OBJECT: &str = r#"{"type":"object","properties":{}}"#;
+        // The replay the reader keeps is the turn the model answers in.
+        const TURN: &str = "<|im_start|>assistant\n<think>\n";
+        for (start, replayed, opener) in [
+            (Some("first_token"), "", None),
+            (Some("after_reasoning"), TURN, None),
+            (None, TURN, Some(b'{')),
+        ] {
+            let chat = forced(true);
+            let mut ctx = RequestContext::for_chat(
+                Arc::clone(&chat),
+                None,
+                SERVED.into(),
+                pool("qwen3", start),
+            );
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            let schema = ToolConstraint::JsonSchema(OBJECT.to_string());
+            let decided = decide(
+                &mut ctx,
+                Asks::Chat(&chat),
+                &[],
+                PROMPT,
+                Ok(symphony::Prepared::from(Some(schema))),
+                |_| panic!("the policy is requested: no auto tag"),
+            )
+            .map_err(|response| response.status())
+            .expect("nothing refused");
+            let assignment = decided.assignment.expect("the table reads the forced call");
+            assert_eq!(assignment.table(), "qwen3", "{start:?}");
+            assert_eq!(assignment.forcing.as_deref(), Some("lookup"), "{start:?}");
+            assert_eq!(assignment.prompt, replayed, "{start:?}");
+            assert_eq!(assignment.opener, opener, "{start:?}");
+        }
+    }
+
     /// A forced call the table has no tag for takes the older registry's JSON schema, and the
     /// table still reads the response. Where the table's markers are special tokens of the
     /// vocabulary, the decoder keeps them under the schema too, whether the request separates the
