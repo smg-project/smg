@@ -376,6 +376,27 @@ pub(super) fn push_json<W: io::Write, T: Serialize + ?Sized>(writer: W, value: &
     let _ = serde_json::to_writer(writer, value);
 }
 
+/// `text` as its JSON string literal onto the end of `buffer`: the bytes
+/// serde_json writes for it. A text with no byte JSON escapes (a quote, a
+/// backslash, a control character under 0x20), which nearly every delta of a
+/// stream is, is itself between two quotes and is written so, without serde's
+/// walk of it (its escape scan, a write per fragment and one per quote); a
+/// text with such a byte is serde's to write, so every escape is its own.
+/// `tests::a_json_string_written_plain_is_the_string_serde_writes` pins both
+/// against serde, for every byte under 0x80 and for text past it.
+pub(super) fn push_json_str(buffer: &mut BytesMut, text: &str) {
+    if text
+        .bytes()
+        .any(|byte| byte < 0x20 || byte == b'"' || byte == b'\\')
+    {
+        push_json(FrameSink(buffer), text);
+        return;
+    }
+    buffer.extend_from_slice(b"\"");
+    buffer.extend_from_slice(text.as_bytes());
+    buffer.extend_from_slice(b"\"");
+}
+
 /// A generate choice's text so far as the contents of its JSON string: the
 /// bytes serde writes between the quotes, escaped once as each chunk arrives.
 /// Every event of a generate stream carries the choice's whole text, and the

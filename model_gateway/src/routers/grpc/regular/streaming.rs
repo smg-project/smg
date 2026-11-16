@@ -84,9 +84,9 @@ mod frames;
 use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
     frames::{
-        assistant_choice, forces_tool_call, opening_choice, push_json, text_delta, ChatChunkFrame,
-        CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHAT_BURST_MARK, CHAT_BURST_ROOM,
-        CHUNK_FLUSH_BYTES, FRAME_ROOM,
+        assistant_choice, forces_tool_call, opening_choice, push_json, push_json_str, text_delta,
+        ChatChunkFrame, CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHAT_BURST_MARK,
+        CHAT_BURST_ROOM, CHUNK_FLUSH_BYTES, FRAME_ROOM,
     },
 };
 #[cfg(test)]
@@ -1751,6 +1751,24 @@ impl StreamingProcessor {
         Ok(())
     }
 
+    /// Whether a write of `room` bytes would grow the buffer's block under the
+    /// Messages events it holds, which copies them: the events leave first
+    /// ([`Self::hand_over`]) and the write takes a block of its own (the
+    /// stream's, in place, once the connection dropped those frames; a new
+    /// one of its size while it holds them). A flush once the buffer holds
+    /// [`CHUNK_FLUSH_BYTES`], the block's own size, came one frame too late
+    /// for a burst, whose every block was copied whole on its way out.
+    fn grows_under_frames(buffer: &BytesMut, room: usize) -> bool {
+        buffer.capacity() - buffer.len() < room && !buffer.is_empty()
+    }
+
+    /// The buffered Messages events, handed to the channel as one frame.
+    async fn hand_over(tx: &SseSender, buffer: &mut BytesMut) -> Result<(), String> {
+        tx.send(Ok(buffer.split().freeze()))
+            .await
+            .map_err(|_| "Client disconnected".to_string())
+    }
+
     /// The generate loops' [`Self::flush_when_full`]: a full frame that
     /// leaves here holds the buffer's allocation until the connection has
     /// written it, so the room for the next frame is not taken now but owed
@@ -2032,6 +2050,47 @@ impl StreamingProcessor {
         }
     }
 
+    /// `event` as the string delta it is, if it is one of the four that are
+    /// written in one pass: its block's index, the constant text between the
+    /// index and the string (the delta's tag and its one key), and the string.
+    #[inline]
+    fn string_delta_of(event: &MessageStreamEvent) -> Option<(u32, &'static [u8], &str)> {
+        match event {
+            MessageStreamEvent::ContentBlockDelta { index, delta } => match delta {
+                ContentBlockDelta::TextDelta { text } => {
+                    Some((*index, Self::TEXT_DELTA_HEAD, text.as_str()))
+                }
+                ContentBlockDelta::InputJsonDelta { partial_json } => Some((
+                    *index,
+                    b",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":".as_slice(),
+                    partial_json.as_str(),
+                )),
+                ContentBlockDelta::ThinkingDelta { thinking } => Some((
+                    *index,
+                    b",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":".as_slice(),
+                    thinking.as_str(),
+                )),
+                ContentBlockDelta::SignatureDelta { signature } => Some((
+                    *index,
+                    b",\"delta\":{\"type\":\"signature_delta\",\"signature\":".as_slice(),
+                    signature.as_str(),
+                )),
+                ContentBlockDelta::CitationsDelta { .. } => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The room [`Self::format_messages_sse_into`] reserves for `event` ahead
+    /// of its writes: a string delta's own ([`MESSAGES_DELTA_ROOM`] and its
+    /// string), a whole event's [`MESSAGES_EVENT_ROOM`].
+    #[inline]
+    fn messages_event_room(event: &MessageStreamEvent) -> usize {
+        Self::string_delta_of(event).map_or(MESSAGES_EVENT_ROOM, |(_, _, text)| {
+            MESSAGES_DELTA_ROOM + text.len()
+        })
+    }
+
     /// Format a `MessageStreamEvent` as Anthropic SSE onto the end of `buffer`.
     ///
     /// Appends `event: {type}\ndata: {json}\n\n` to `buffer`, which a sender
@@ -2043,9 +2102,10 @@ impl StreamingProcessor {
     /// stream sends per token, are written in one pass by
     /// [`Self::format_string_delta_frame_into`]: their constant text (the
     /// event's tag, the `index` and `delta` keys, the delta's tag and its one
-    /// key) goes in as literals and serde writes only the index and the delta's
-    /// string, so a frame costs the escape of its text, not the walk of two
-    /// tagged enums. The bytes are those of the serialized event, which
+    /// key) goes in as literals and serde writes only an index of two digits or
+    /// more and a string with a byte JSON escapes, so a frame costs its own
+    /// bytes, not the walk of two tagged enums. The bytes are those of the
+    /// serialized event, which
     /// `tests::messages_delta_frames_write_the_bytes_of_the_serialized_event`
     /// pins; every other event, `citations_delta` included, is serialized whole.
     #[inline]
@@ -2053,32 +2113,8 @@ impl StreamingProcessor {
         buffer: &mut BytesMut,
         event: &MessageStreamEvent,
     ) -> Result<(), String> {
-        let string_delta: Option<(&u32, &'static [u8], &str)> = match event {
-            MessageStreamEvent::ContentBlockDelta { index, delta } => match delta {
-                ContentBlockDelta::TextDelta { text } => {
-                    Some((index, Self::TEXT_DELTA_HEAD, text.as_str()))
-                }
-                ContentBlockDelta::InputJsonDelta { partial_json } => Some((
-                    index,
-                    b",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":".as_slice(),
-                    partial_json.as_str(),
-                )),
-                ContentBlockDelta::ThinkingDelta { thinking } => Some((
-                    index,
-                    b",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":".as_slice(),
-                    thinking.as_str(),
-                )),
-                ContentBlockDelta::SignatureDelta { signature } => Some((
-                    index,
-                    b",\"delta\":{\"type\":\"signature_delta\",\"signature\":".as_slice(),
-                    signature.as_str(),
-                )),
-                ContentBlockDelta::CitationsDelta { .. } => None,
-            },
-            _ => None,
-        };
-        if let Some((index, delta_head, text)) = string_delta {
-            return Self::format_string_delta_frame_into(buffer, *index, delta_head, text);
+        if let Some((index, delta_head, text)) = Self::string_delta_of(event) {
+            return Self::format_string_delta_frame_into(buffer, index, delta_head, text);
         }
         // One reserve per whole-event frame, ahead of its writes (a string
         // delta's reserve is its writer's own).
@@ -2101,8 +2137,10 @@ impl StreamingProcessor {
 
     /// The `content_block_delta` frame of one string delta, written in one pass onto the end of
     /// `buffer`: the constant text as literals (`delta_head` is the delta's type and key, the
-    /// `text_delta` one [`Self::TEXT_DELTA_HEAD`]) and serde for the index and the text, so the
-    /// frame costs the escape of its text. The bytes are those of the serialized event, which
+    /// `text_delta` one [`Self::TEXT_DELTA_HEAD`]), a block index of one digit as that digit and
+    /// a text with no byte JSON escapes as itself between its quotes ([`push_json_str`]); serde
+    /// writes a wider index and a text with such a byte, so the frame costs its own bytes and,
+    /// where its text has one, the escape. The bytes are those of the serialized event, which
     /// `tests::messages_delta_frames_write_the_bytes_of_the_serialized_event` pins; the lane's
     /// end-to-end bytes are the `messages_symphony_text` scenario of `tests::messages_bytes`.
     #[inline]
@@ -2118,9 +2156,16 @@ impl StreamingProcessor {
         buffer.extend_from_slice(
             b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":",
         );
-        serde_json::to_writer(FrameSink(buffer), &index).map_err(Self::serialize_failed)?;
+        // A block index of one digit, which nearly every block has, is that
+        // digit; serde writes a wider one.
+        match u8::try_from(index) {
+            Ok(digit @ 0..=9) => buffer.extend_from_slice(&[b'0' + digit]),
+            _ => {
+                serde_json::to_writer(FrameSink(buffer), &index).map_err(Self::serialize_failed)?;
+            }
+        }
         buffer.extend_from_slice(delta_head);
-        serde_json::to_writer(FrameSink(buffer), text).map_err(Self::serialize_failed)?;
+        push_json_str(buffer, text);
         buffer.extend_from_slice(b"}}\n\n");
         Ok(())
     }
@@ -2239,12 +2284,18 @@ impl StreamingProcessor {
     /// as one frame, without a copy, by [`Self::flush_chunks`] once the
     /// engine has nothing more ready (the Messages loop's `read_engine`: the
     /// events ready at one poll share a frame, after the first token's), at
-    /// the stream's end, or here once it holds [`CHUNK_FLUSH_BYTES`].
+    /// the stream's end, or here: once it holds [`CHUNK_FLUSH_BYTES`], and
+    /// ahead of an event its block has no room for
+    /// ([`Self::grows_under_frames`], by the room the event's own writer
+    /// reserves: [`Self::messages_event_room`]).
     async fn write_messages_event(
         tx: &SseSender,
         buffer: &mut BytesMut,
         event: &MessageStreamEvent,
     ) -> Result<(), String> {
+        if Self::grows_under_frames(buffer, Self::messages_event_room(event)) {
+            Self::hand_over(tx, buffer).await?;
+        }
         let start = buffer.len();
         if let Err(error) = Self::format_messages_sse_into(buffer, event) {
             // A frame whose serialization failed is not left half-written: the
@@ -2253,9 +2304,10 @@ impl StreamingProcessor {
             buffer.truncate(start);
             return Err(error);
         }
-        Self::flush_when_full(tx, buffer)
-            .await
-            .map_err(|()| "Client disconnected".to_string())
+        if buffer.len() >= CHUNK_FLUSH_BYTES {
+            Self::hand_over(tx, buffer).await?;
+        }
+        Ok(())
     }
 
     /// Write the `text_delta` event of `text` for the open block `index` into
@@ -2268,6 +2320,13 @@ impl StreamingProcessor {
         index: u32,
         text: &str,
     ) -> Result<(), String> {
+        // The room the frame's writer reserves: the block leaves first when
+        // it does not have it. Both tests of this write are read here, and a
+        // future is polled only for the frame that leaves: nearly every delta
+        // neither ends the block nor fills the frame.
+        if Self::grows_under_frames(buffer, MESSAGES_DELTA_ROOM + text.len()) {
+            Self::hand_over(tx, buffer).await?;
+        }
         let start = buffer.len();
         if let Err(error) =
             Self::format_string_delta_frame_into(buffer, index, Self::TEXT_DELTA_HEAD, text)
@@ -2275,9 +2334,10 @@ impl StreamingProcessor {
             buffer.truncate(start);
             return Err(error);
         }
-        Self::flush_when_full(tx, buffer)
-            .await
-            .map_err(|()| "Client disconnected".to_string())
+        if buffer.len() >= CHUNK_FLUSH_BYTES {
+            Self::hand_over(tx, buffer).await?;
+        }
+        Ok(())
     }
 
     /// Stop the open text or `tool_use` block, if any, so the next block gets
