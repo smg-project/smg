@@ -60,9 +60,20 @@ pub(super) const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 /// buffer takes the allocation they shared back in place, while a burst's next
 /// write comes with the frame still in flight and allocates a fresh room (a
 /// buffer grown against a frame in flight grows by exact-size allocations,
-/// not by doubling). The chat loop takes the same room once a burst's unsent
-/// bytes reach an eighth of a frame (`ChatStream::read_engine`).
+/// not by doubling).
 pub(super) const FRAME_ROOM: usize = 2 * CHUNK_FLUSH_BYTES;
+
+/// The room the chat loop's frame buffer takes once a burst's unsent bytes
+/// reach an eighth of a frame (`ChatStream::read_engine`): one frame and two
+/// such marks. The frame leaves at the flush bound plus the event that
+/// crossed it, and what it leaves behind still holds the next burst up to
+/// its own mark, so each frame of a burst costs one reservation: taken back
+/// in place when the connection has dropped the sent frame, a fresh
+/// allocation while it is in flight. One frame's room and not [`FRAME_ROOM`]:
+/// the chat loop reserves at every frame's mark, before it knows the frame
+/// will fill, so a second frame's room would never be written, and a frame
+/// in flight pins its whole allocation.
+pub(super) const CHAT_BURST_ROOM: usize = CHUNK_FLUSH_BYTES + CHUNK_FLUSH_BYTES / 4;
 
 /// The SSE frame of the per-token chat chunks of one stream.
 ///

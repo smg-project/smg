@@ -85,7 +85,8 @@ use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
     frames::{
         assistant_choice, forces_tool_call, opening_choice, push_json, text_delta, ChatChunkFrame,
-        CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHUNK_FLUSH_BYTES, FRAME_ROOM,
+        CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHAT_BURST_ROOM,
+        CHUNK_FLUSH_BYTES, FRAME_ROOM,
     },
 };
 #[cfg(test)]
@@ -3705,17 +3706,17 @@ impl<'a> ChatStream<'a> {
                             Some(item) => {
                                 // A message ready with this much unsent is a
                                 // burst's, and its frame is on the way to the
-                                // flush bound: the buffer takes two frames'
-                                // room in one step, the room the generate
-                                // loops take after a full frame. Doubled up
-                                // from the stream's first room, it was copied
-                                // at every step. An eighth of a frame is half
-                                // that first room: a paced engine's frames,
-                                // one event each, stay under it and keep the
-                                // room they have.
+                                // flush bound: the buffer takes that frame's
+                                // room in one step (`CHAT_BURST_ROOM`). Doubled
+                                // up from the stream's first room, it was
+                                // copied at every step. An eighth of a frame is
+                                // half that first room: a paced engine's
+                                // frames, one event each, stay under it and
+                                // keep the room they have.
                                 let unsent = self.sse_buffer.len();
                                 if unsent >= CHUNK_FLUSH_BYTES / 8 {
-                                    self.sse_buffer.reserve(FRAME_ROOM.saturating_sub(unsent));
+                                    self.sse_buffer
+                                        .reserve(CHAT_BURST_ROOM.saturating_sub(unsent));
                                 }
                                 item
                             }
