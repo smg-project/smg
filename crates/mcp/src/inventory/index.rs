@@ -132,6 +132,18 @@ impl ToolInventory {
         self.tools_by_qualified.get(&qualified).map(|e| e.clone())
     }
 
+    /// The entries `key` keeps, each with its key and cloned once: one walk
+    /// of the inventory and no copy of the entries left out.
+    pub fn entries_keyed<K>(
+        &self,
+        mut key: impl FnMut(&ToolEntry) -> Option<K>,
+    ) -> Vec<(K, ToolEntry)> {
+        self.tools_by_qualified
+            .iter()
+            .filter_map(|entry| key(entry.value()).map(|k| (k, entry.value().clone())))
+            .collect()
+    }
+
     /// Atomically update a tool entry if it exists.
     ///
     /// Returns true if the entry was found and updated, false otherwise.

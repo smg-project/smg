@@ -1,10 +1,11 @@
 //! The bounded view: the per-decision, handle-free picture of one request and
 //! its candidates (design 4.1). Built once per decision by the host into a
 //! reused buffer; every row is `Copy`, and nothing here reaches back into the
-//! host. The names are the wire's: a candidate on the wire is this row without
-//! its position and sample instant, a request this request without its host
-//! clock, and positions into the spec's declared lists (zones, engine kinds,
-//! connectors, labels, headers) are the same positions here.
+//! host. The names are the wire's: a candidate on the wire is this row with
+//! its affinity facts and without its position and sample instant, a request
+//! this request without its host clock and its affinity column, and positions
+//! into the spec's declared lists (zones, engine kinds, connectors, labels,
+//! headers) are the same positions here.
 
 /// The stable identity of a candidate: a hash of the registration key and the
 /// incarnation, never a URL. A same-URL replacement is a new id.
@@ -165,8 +166,13 @@ pub struct LoadRow {
     pub active_kv_permille: u16,
     /// Tokens per second the worker drains; `0` when unknown.
     pub live_rate: u32,
-    /// Context tokens resident for the running requests.
+    /// Context tokens resident for the running requests; `0` too when the
+    /// engine does not count them.
     pub resident_tokens: u32,
+    /// Whether the report counts resident tokens: an engine that does not
+    /// count them sends none, which is not a count of zero. The host's own
+    /// reading of the report, in no plugin's view.
+    pub resident_counted: bool,
     /// Age of the report's sample at the decision, in milliseconds.
     pub report_age_ms: u32,
     /// Where the row came from.
@@ -222,20 +228,6 @@ impl<'a> Identity<'a> {
         Self { hash, plain: None }
     }
 
-    /// A key within a scope (a model and a phase, fingerprinted by the host):
-    /// the fingerprint mixes the scope in, so one key names one session per
-    /// scope, and the plain form is kept. Never `0` for a present key.
-    pub fn scoped(key: &'a str, scope: u64) -> Self {
-        let mut h = fingerprint(key.as_bytes()) ^ scope.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        h ^= h >> 31;
-        Self {
-            hash: if h == 0 { 1 } else { h },
-            plain: Some(key),
-        }
-    }
-
     pub const fn is_none(&self) -> bool {
         self.hash == 0
     }
@@ -257,13 +249,103 @@ pub fn fingerprint(key: &[u8]) -> u64 {
     }
 }
 
-/// One candidate row: a worker, or one DP rank of a data-parallel worker.
-/// About 120 bytes in memory; the wire form drops the position and the
-/// sample instant and encodes to about 76 bytes with its load row.
+/// The fingerprint of a model's name, the model's part of a session's value.
+/// A host that keeps its models makes it once a model and carries it in the
+/// request's facts, so a keyed decision does not read the name's bytes
+/// again. Only [`ModelFingerprint::of`] makes one: a number of the host's
+/// own is no model's fingerprint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModelFingerprint(u64);
+
+impl ModelFingerprint {
+    /// Not carried: a read of the request's session fingerprints the name.
+    pub const NONE: Self = Self(0);
+
+    /// The fingerprint of `model`, the name as a request carries it.
+    pub fn of(model: &str) -> Self {
+        Self(fingerprint(model.as_bytes()))
+    }
+}
+
+/// A session: a key within its model and phase, as the one value a lease
+/// carries and the session table is keyed by. Only
+/// [`RequestFacts::session`] makes one, so a lease or a pin cannot carry a
+/// key's own fingerprint in its place.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Session(u64);
+
+impl Session {
+    /// No session: the request carried no key. `0` is no session's and no
+    /// key's: a present key never makes it ([`RequestFacts::session`]).
+    pub const NONE: Self = Self(0);
+
+    pub const fn is_none(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The value as the wire carries it; `0` for no session.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// A session from its value, for the session table's own cases.
+    #[cfg(test)]
+    pub(crate) const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// What the affinity stages read of one candidate: a column beside the rows,
+/// by the candidate's index ([`RequestFacts::affinity`]). A host fills it for
+/// a profile whose stages declare it
+/// ([`Needs::affinity`](crate::Needs::affinity)) and for no other, so a
+/// decision that reads none of it copies none of it. `Default` is nothing
+/// held by a worker just admitted, which is what every candidate reads as
+/// when the column is empty. On a wire the five are fields of the
+/// candidate's own record, at the numbers they were given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AffinityFacts {
+    /// Prefix blocks of the request this worker holds, by the event index.
+    pub overlap_blocks: u32,
+    /// The same by the sent-prefix predictor.
+    pub predicted_blocks: u32,
+    /// Milliseconds since the worker was admitted to the pool, saturating at
+    /// `u32::MAX` as `report_age_ms` does; never wrapping.
+    pub admitted_age_ms: u32,
+    /// Blocks the index learned about the worker since admission.
+    pub indexed_growth: u32,
+    /// Blocks the index holds for the worker: what a warm-up stage reads
+    /// thinness from, against the fleet's level.
+    pub indexed_blocks: u32,
+}
+
+/// One candidate row: a worker, or one DP rank of a data-parallel worker:
+/// what every decision reads. Its fields take 103 bytes, and the row is
+/// aligned to a 64-byte cache line: 128 bytes in memory, every row on a
+/// line's start.
+///
+/// The alignment is measured. The filters walk the rows once a filter, and
+/// where the pull-request bench gate runs, such a pass over 512 rows read 5
+/// to 11 percent slower at a stride of 96, 104 or 112 bytes than at 128,
+/// wherever the flags sat in the row. A build host read the narrower
+/// strides faster, so a change of the row's size or alignment carries the
+/// decision bench (`benches/decision.rs`) on both.
+///
+/// The wire form drops the position and the sample instant, carries the
+/// candidate's [`AffinityFacts`] in the same record and encodes to about 76
+/// bytes with its load row.
 #[derive(Clone, Copy, Debug, Default)]
+#[repr(align(64))]
 pub struct Candidate {
     /// The row's position in the host's candidate slice; targets name it.
-    /// In-process only: the wire names rows by their order.
+    /// In-process only: the wire names rows by their order. It is also the
+    /// row's index in the slice the decision is made over (its own side's
+    /// pool on a pair): the plugin's filter adapter asks for its row by it
+    /// and the pair plan looks a chosen prefill up by it. A filter's `keep`
+    /// takes one row and no index, so a filter that read the affinity
+    /// column there would have to read it at the position; no filter of
+    /// this crate does. A debug build asserts that the two agree where a
+    /// decision takes its inputs; a release build does not check.
     pub position: u32,
     pub id: WorkerId,
     pub role: Role,
@@ -287,28 +369,21 @@ pub struct Candidate {
     /// now and leave a load scorer's credit. In-process only; the wire carries
     /// the row's age.
     pub load_sampled_at_micros: u64,
-    /// Prefix blocks of the request this worker holds, by the event index.
-    pub overlap_blocks: u32,
-    /// The same by the sent-prefix predictor.
-    pub predicted_blocks: u32,
     /// The session key of the request is pinned to this worker.
     pub session_hit: bool,
     /// Requests of the request's session key in flight on this worker.
     pub session_in_flight: u16,
-    /// The pairing class: a decode may pair with a prefill of the same class;
-    /// `0` for a worker outside any pairing. Until a store derives classes, a
-    /// host keys it by the open prefill a decode partners with.
+    /// The pairing class: `0` for a worker outside any pairing. Which decode
+    /// classes a prefill class pairs with is the pair table's to say
+    /// ([`PairTable`](crate::PairTable)); with no table a decode pairs with a
+    /// prefill of the same class. Until a store derives classes, a host keys
+    /// it by the open prefill a decode partners with.
     pub pair_class: u32,
     /// Host-supplied admission bit: the prefill capacity window has a slot.
     pub has_capacity: bool,
     /// Host-supplied admission bit: the decode's running window has a room
     /// nobody waiting at its gate is in line for.
     pub has_room: bool,
-    /// Milliseconds since the worker was admitted to the pool, saturating at
-    /// `u32::MAX` as `report_age_ms` does; never wrapping.
-    pub admitted_age_ms: u32,
-    /// Blocks the index learned about the worker since admission.
-    pub indexed_growth: u32,
     /// The zone, as a position into the spec's declared list; `0` when
     /// unzoned.
     pub zone: u16,
@@ -337,10 +412,6 @@ pub struct Candidate {
     /// Zero when the host carries none. After the contract's first cut (the
     /// wire numbers its fields in the record's order).
     pub key: u32,
-    /// Blocks the index holds for the worker: what a warm-up stage reads
-    /// thinness from, against the fleet's level. Last in the record, after
-    /// `key`, for the same reason.
-    pub indexed_blocks: u32,
 }
 
 /// Media on the request: counts and bytes, for workers that take media.
@@ -380,7 +451,9 @@ pub struct RequestFacts<'a> {
     /// Prefix block hashes, capped by the host.
     pub block_hashes: &'a [u64],
     pub hash_kind: HashKind,
-    /// The routing key as the host derives it, lineage-stripped.
+    /// The routing key as the host derives it, lineage-stripped: the key
+    /// alone, in the form the host holds. The session it names within the
+    /// request's model and phase is [`RequestFacts::session`].
     pub session_key: Identity<'a>,
     pub phase: Phase,
     /// The retry number, `0` for the first attempt.
@@ -404,6 +477,100 @@ pub struct RequestFacts<'a> {
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,
+    /// The candidates' affinity facts, by index in the candidate slice the
+    /// decision is made over: the one column the affinity stages read, in
+    /// the candidates' own order. It is EMPTY or holds exactly one entry a
+    /// candidate; the engine refuses any other before a stage runs. An
+    /// empty column is the host's word that it holds nothing: it reads as
+    /// nothing held for every candidate, under a profile that declared
+    /// [`Needs::affinity`](crate::Needs::affinity) as under one that did
+    /// not, and the engine neither refuses it nor counts it. A host that
+    /// owes the column and hands none is routed by its other stages alone,
+    /// with no signal. A pair decision takes each side's column from
+    /// its pool ([`PairPools`](crate::PairPools)) and none from here: a
+    /// non-empty column on the request of a pair decision is refused, as a
+    /// column of another length is. The host keeps it readable, as it keeps
+    /// the candidates, until the decision is committed. In-process only: a
+    /// wire carries each candidate's facts in its record.
+    pub affinity: &'a [AffinityFacts],
+    /// The fingerprint of `model` when the host holds it, as a host that
+    /// keeps its models makes it once a model; [`ModelFingerprint::NONE`]
+    /// when it does not, and each read of [`RequestFacts::session`] then
+    /// fingerprints the name. A debug build holds a carried fingerprint to
+    /// the name. A release build trusts it: a request that carries another
+    /// name's fingerprint is that model's session for its key, and reads
+    /// and moves that model's pins. The trust ends when the facts carry
+    /// the model as one value, its name with its fingerprint: the change
+    /// that hands a decision its facts from the host's own store makes
+    /// them so. In-process only: the wire carries the name.
+    pub model_fingerprint: ModelFingerprint,
+}
+
+/// The multiplier that spreads a session's model and phase over its key.
+const SESSION_MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// A phase's number in a session's value: pinned here, never the enum's
+/// order, which a later phase may change.
+const fn session_phase(phase: Phase) -> u64 {
+    match phase {
+        Phase::Single => 1,
+        Phase::Prefill => 2,
+        Phase::Decode => 3,
+        Phase::Encode => 4,
+    }
+}
+
+impl RequestFacts<'_> {
+    /// The affinity facts of the candidate at `index` of the slice the
+    /// decision is made over. An empty column reads as nothing held for
+    /// every candidate. Any other column holds the candidate's own entry,
+    /// and the read is that entry: an index past its end is a host's
+    /// mistake and fails as an index past the candidates does, never as a
+    /// default in the entry's place. Each read tests the column's emptiness
+    /// and its bound: a pass over a pool takes the column once
+    /// ([`RequestFacts::affinity`]) and walks it beside the rows, as this
+    /// crate's stages and its packed plugin fill do.
+    pub fn affinity_at(&self, index: u32) -> AffinityFacts {
+        if self.affinity.is_empty() {
+            AffinityFacts::default()
+        } else {
+            self.affinity[index as usize]
+        }
+    }
+
+    /// The session the request belongs to: its key within its model and
+    /// phase, as one value; [`Session::NONE`] when it carries no key. One key names one
+    /// session per model, and each side of a pair keeps its own. The value
+    /// is a wire fact: a lease carries it and a session table is keyed by
+    /// it on every replica, so this formula alone makes it, from the key's
+    /// fingerprint, the fingerprint of the model's name as the request
+    /// carries it and the phase's pinned number. Two hosts that hold one
+    /// key in different forms (the plain key, its fingerprint) get one
+    /// value, and so do a host that carries the model's fingerprint and
+    /// one that leaves it to this read. The value is never `0` for a
+    /// present key: a result of `0` is carried as `1`, a term of the
+    /// formula as the plugin protocol states it.
+    pub fn session(&self) -> Session {
+        if self.session_key.is_none() {
+            return Session::NONE;
+        }
+        let model = if self.model_fingerprint == ModelFingerprint::NONE {
+            fingerprint(self.model.as_bytes())
+        } else {
+            debug_assert_eq!(
+                self.model_fingerprint,
+                ModelFingerprint::of(self.model),
+                "the carried fingerprint is not the model name's"
+            );
+            self.model_fingerprint.0
+        };
+        let scope = model ^ session_phase(self.phase).wrapping_mul(SESSION_MIX);
+        let mut h = self.session_key.hash ^ scope.wrapping_mul(SESSION_MIX);
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^= h >> 31;
+        Session(if h == 0 { 1 } else { h })
+    }
 }
 
 /// What only the deciding host knows now: its standing vetoes, the wires it
@@ -470,14 +637,109 @@ mod tests {
     }
 
     #[test]
-    fn a_candidate_row_stays_within_two_cache_lines() {
-        // The row is copied once per candidate per decision; a change that
-        // grows it past two cache lines is a design change, not a field.
-        assert!(
-            size_of::<Candidate>() <= 128,
-            "a candidate row is {} bytes",
-            size_of::<Candidate>()
+    fn a_candidate_row_is_two_lines_and_its_affinity_facts_20_bytes() {
+        // The filters walk the rows once a filter, so the rows' stride is a
+        // cost every policy pays: the pin is exact, 128 bytes at a 64-byte
+        // alignment, and a change of any number here carries the crate's
+        // decision bench (`benches/decision.rs`) where the pull-request gate
+        // runs as well as on a build host: the two read a narrower stride in
+        // opposite directions.
+        assert_eq!(size_of::<Candidate>(), 128);
+        assert_eq!(align_of::<Candidate>(), 64);
+        assert_eq!(size_of::<AffinityFacts>(), 20);
+    }
+
+    #[test]
+    fn a_candidate_rows_fields_take_103_bytes() {
+        // The row is written once per candidate per decision, so what its
+        // fields take is a cost every policy pays. The alignment leaves
+        // spare bytes, so the row's size no longer says it, and a field
+        // added to the row would move no size. This case names every field
+        // (a new one does not compile until it is named here) and pins
+        // where the last one ends. A fact one stage family reads belongs in
+        // a column beside the rows, as the affinity facts are. The plugin
+        // view's packed row is 104 bytes WITH the five facts in it: nothing
+        // ties that number to this one, and each is pinned in its own file.
+        fn end<T>(at: usize, _field: &T) -> usize {
+            at + size_of::<T>()
+        }
+        macro_rules! ends {
+            ($($field:ident),* $(,)?) => {{
+                let Candidate { $($field),* } = Candidate::default();
+                [$(end(std::mem::offset_of!(Candidate, $field), &$field)),*]
+            }};
+        }
+        let ends = ends!(
+            position,
+            id,
+            role,
+            dp_rank,
+            dp_size,
+            health,
+            wire_modes,
+            engine_kind,
+            connector,
+            in_flight,
+            load,
+            load_sampled_at_micros,
+            session_hit,
+            session_in_flight,
+            pair_class,
+            has_capacity,
+            has_room,
+            zone,
+            labels,
+            ec_compatible,
+            vision,
+            host_local,
+            active_sessions,
+            key,
         );
+        assert_eq!(ends.into_iter().max(), Some(103));
+    }
+
+    #[test]
+    fn an_empty_affinity_column_reads_as_nothing_held_for_every_candidate() {
+        let empty = RequestFacts::default();
+        for index in [0, 1, 511] {
+            assert_eq!(empty.affinity_at(index), AffinityFacts::default());
+        }
+    }
+
+    #[test]
+    fn a_filled_affinity_column_reads_the_entry_at_the_candidates_index() {
+        let column = [3, 5, 8].map(|overlap_blocks| AffinityFacts {
+            overlap_blocks,
+            ..AffinityFacts::default()
+        });
+        let facts = RequestFacts {
+            affinity: &column,
+            ..RequestFacts::default()
+        };
+        let read = [0, 1, 2].map(|index| facts.affinity_at(index).overlap_blocks);
+        assert_eq!(read, [3, 5, 8]);
+    }
+
+    /// A column that holds an entry is never read as a default past its
+    /// end: zero is a real answer (a cold worker), so a forgiving read would
+    /// turn a column filled for another pool into a routing change.
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn a_read_past_a_filled_affinity_column_is_not_a_default() {
+        let column = [AffinityFacts::default()];
+        let facts = RequestFacts {
+            affinity: &column,
+            ..RequestFacts::default()
+        };
+        let _ = facts.affinity_at(1);
+    }
+
+    #[test]
+    fn the_load_row_holds_its_resident_count_flag_in_its_padding() {
+        // 34 bytes of fields in a row aligned to four: the flag adds no
+        // byte, and an optional row needs no tag beside it.
+        assert_eq!(size_of::<LoadRow>(), 36);
+        assert_eq!(size_of::<Option<LoadRow>>(), 36);
     }
 
     #[test]
@@ -492,6 +754,110 @@ mod tests {
         // The empty key is present too: a fingerprint is never the absent
         // marker.
         assert_ne!(fingerprint(b""), 0);
+    }
+
+    /// The session's value is a wire fact: these literals stop an edit of
+    /// the formula that keeps every relative case green.
+    #[test]
+    fn a_sessions_value_is_pinned_for_a_fixed_key_model_and_each_phase() {
+        let of = |phase| {
+            RequestFacts {
+                model: "model-a",
+                session_key: Identity::plain("conversation-7"),
+                phase,
+                ..RequestFacts::default()
+            }
+            .session()
+            .get()
+        };
+        assert_eq!(fingerprint(b"conversation-7"), 0xd449_9ecc_c740_2a12);
+        assert_eq!(of(Phase::Single), 0x6e88_ff71_cc98_2a42);
+        assert_eq!(of(Phase::Prefill), 0x619f_dbb0_c262_9a55);
+        assert_eq!(of(Phase::Decode), 0x3e92_fbbd_183d_f4b6);
+        assert_eq!(of(Phase::Encode), 0x3780_ba54_336a_57d0);
+        // The lift of a zero result is a term of the formula. The mix sends
+        // 0 to 0 and no other value there, so one key of a model and phase
+        // would read as no session: it reads 1, and is a session.
+        let lifted = RequestFacts {
+            model: "model-a",
+            session_key: Identity::hashed(0x2bb0_c344_f139_5abd),
+            phase: Phase::Single,
+            ..RequestFacts::default()
+        }
+        .session();
+        assert_eq!(lifted.get(), 1);
+        assert!(!lifted.is_none());
+    }
+
+    #[test]
+    fn a_session_is_one_key_in_one_model_and_phase_whatever_form_the_key_takes() {
+        let plain = RequestFacts {
+            model: "model-a",
+            session_key: Identity::plain("conversation-7"),
+            ..RequestFacts::default()
+        };
+        // A host that holds the key's fingerprint alone names the same
+        // session.
+        let hashed = RequestFacts {
+            session_key: Identity::hashed(fingerprint(b"conversation-7")),
+            ..plain
+        };
+        assert_eq!(plain.session(), hashed.session());
+        // So does a host that carries the model's fingerprint, made once a
+        // model, where this one fingerprints the name at the read.
+        let carried = RequestFacts {
+            model_fingerprint: ModelFingerprint::of("model-a"),
+            ..plain
+        };
+        assert_eq!(plain.session(), carried.session());
+        let other_model = RequestFacts {
+            model: "model-b",
+            ..plain
+        };
+        let other_phase = RequestFacts {
+            phase: Phase::Decode,
+            ..plain
+        };
+        let other_key = RequestFacts {
+            session_key: Identity::plain("conversation-8"),
+            ..plain
+        };
+        for other in [other_model, other_phase, other_key] {
+            assert_ne!(plain.session(), other.session());
+        }
+        // The model's part is its name as the request carries it: no name
+        // is a name too.
+        let unnamed = RequestFacts { model: "", ..plain };
+        assert!(!unnamed.session().is_none());
+        assert_ne!(unnamed.session(), plain.session());
+        // No key, no session.
+        let keyless = RequestFacts {
+            session_key: Identity::NONE,
+            ..plain
+        };
+        assert!(keyless.session().is_none());
+    }
+
+    /// A carried fingerprint is the host's word that it is the name's. A
+    /// debug build stops the read of one that is another name's; a release
+    /// build trusts it, and the request is then that other model's session.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "the carried fingerprint is not the model name's")
+    )]
+    fn a_carried_fingerprint_of_another_name_stops_a_debug_build_and_is_trusted_by_a_release_one() {
+        let other = RequestFacts {
+            model: "model-b",
+            session_key: Identity::plain("conversation-7"),
+            ..RequestFacts::default()
+        };
+        let carried = RequestFacts {
+            model: "model-a",
+            model_fingerprint: ModelFingerprint::of("model-b"),
+            ..other
+        };
+        assert_eq!(carried.session(), other.session());
     }
 
     #[test]

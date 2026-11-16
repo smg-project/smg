@@ -132,7 +132,7 @@ mod dp_removal_tests {
     }
 
     /// Snapshot `(worker id, revision)` for each worker, as discovery does.
-    fn guards(context: &AppContext, workers: &[&Arc<dyn Worker>]) -> HashMap<String, u64> {
+    fn guards(context: &AppContext, workers: &[&Arc<dyn Worker>]) -> HashMap<String, Option<u64>> {
         workers
             .iter()
             .map(|worker| {
@@ -140,7 +140,7 @@ mod dp_removal_tests {
                     .worker_registry
                     .get_id_by_url(worker.url())
                     .expect("worker is registered");
-                (id.as_str().to_string(), worker.revision())
+                (id.as_str().to_string(), Some(worker.revision()))
             })
             .collect()
     }
@@ -148,7 +148,7 @@ mod dp_removal_tests {
     async fn run_removal(
         context: &Arc<AppContext>,
         url: &str,
-        expected_revisions: Option<HashMap<String, u64>>,
+        expected_revisions: Option<HashMap<String, Option<u64>>>,
     ) -> Result<String, String> {
         let engine = &context.workflow_engines.get().unwrap().worker_removal;
         let data = create_worker_removal_workflow_data(
@@ -191,7 +191,7 @@ mod dp_removal_tests {
             .worker_registry
             .get_id_by_url(rank1.url())
             .expect("rank1 is registered");
-        expected.insert(rank1_id.as_str().to_string(), rank1.revision() + 1);
+        expected.insert(rank1_id.as_str().to_string(), Some(rank1.revision() + 1));
 
         run_removal(&context, "worker:30000", Some(expected))
             .await
@@ -297,10 +297,11 @@ mod dp_removal_tests {
                 );
 
                 // A mismatched revision must preserve every current registration.
-                let stale: HashMap<String, u64> = guards(&context, &[&plain, &rank0, &rank1])
-                    .into_iter()
-                    .map(|(id, revision)| (id, revision + 1))
-                    .collect();
+                let stale: HashMap<String, Option<u64>> =
+                    guards(&context, &[&plain, &rank0, &rank1])
+                        .into_iter()
+                        .map(|(id, revision)| (id, revision.map(|revision| revision + 1)))
+                        .collect();
                 run_removal(&context, "worker:30000", Some(stale))
                     .await
                     .unwrap();

@@ -1342,9 +1342,10 @@ impl PostgresResponseStorage {
                 s.col("created_at")
             )
         };
+        let terminal = sql_string_list(&TERMINAL_RESPONSE_STATUSES);
         Some(format!(
             "DELETE FROM {table} WHERE {store} = 'false' \
-             AND {status} IN ('completed', 'incomplete', 'failed', 'cancelled') \
+             AND {status} IN ({terminal}) \
              AND {ended} < $1"
         ))
     }

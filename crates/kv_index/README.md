@@ -160,7 +160,7 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
 
 ## Routing and recovery in the gateway
 
-- **One index, one type.** `KvIndex` (`model_gateway/src/worker/kv_index_backend.rs`) holds the
+- **One index, one type.** `KvIndex` (`model_gateway/src/worker/kv/index_backend.rs`) holds the
   chain index; the monitor and the policy see the operations they used before. An in-gateway
   exactness test replays generated engine streams and a synthetic hole corpus through the
   monitor's own apply path into the index and the reference indexer.
@@ -241,7 +241,8 @@ capture on, and they are independent of each other. A request header asks for it
   the gates and the policy's prediction, several KB per request on a large fleet.
   `SMG_CACHE_TRACE_SAMPLE=N` keeps one line in N, `SMG_CACHE_TRACE_MAX_BYTES=B` drops the
   per-candidate lists from a line longer than B bytes and keeps the decision record, and a failed
-  request logs a `Cache routing failure` line the same way.
+  request logs a `Cache routing failure` line the same way. Every row names a worker by its
+  address with the userinfo masked and the query cut.
 - `SMG_CACHE_TRACE_HEADER=1` returns the decision record of the dispatch that produced the
   response in the `x-smg-cache-trace` header, on every response and without any log line, so a
   client can compare the predicted overlap with the engine's

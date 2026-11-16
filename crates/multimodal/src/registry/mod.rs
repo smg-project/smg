@@ -238,7 +238,7 @@ mod tests {
             processors::llava::{CLIP_MEAN, CLIP_STD},
             transforms::mean_to_rgb,
         },
-        Modality, ModelSpecificValue, PreProcessorConfig, VideoClipOptions,
+        EncoderFieldLayouts, Modality, ModelSpecificValue, PreProcessorConfig, VideoClipOptions,
     };
 
     /// A checkpoint of this family resolves to a spec by its `model_type`
@@ -279,6 +279,36 @@ mod tests {
             .map(|spec| spec.name())
             .collect();
         assert_eq!(resizing, ["minimax_m3"]);
+    }
+
+    /// The trait's default hands an entry's legacy field map to the request
+    /// path. An entry that declares such a map and lays out every modality
+    /// another way keeps a table no request reads; the registry holds no
+    /// such entry.
+    #[test]
+    fn no_entry_declares_a_legacy_field_map_that_no_modality_reads() {
+        let registry = ModelRegistry::new();
+        let unread: Vec<&str> = registry
+            .specs
+            .iter()
+            .map(|spec| spec.get())
+            .filter(|spec| {
+                let converted = EncoderFieldLayouts::from_legacy_fields(spec.field_layouts());
+                // The trait's own map converts to the default layouts: the
+                // entry declares none.
+                converted != EncoderFieldLayouts::default()
+                    && ![
+                        Modality::Image,
+                        Modality::ImageEmbeds,
+                        Modality::Audio,
+                        Modality::Video,
+                    ]
+                    .into_iter()
+                    .any(|modality| spec.encoder_field_layouts_for(modality) == converted)
+            })
+            .map(|spec| spec.name())
+            .collect();
+        assert_eq!(unread, Vec::<&str>::new());
     }
 
     /// The vision processors come from the spec a model resolves to, so they

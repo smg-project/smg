@@ -36,6 +36,11 @@ const KNOWN_GAPS: &[(Table, Gap, &str)] = &[
         Gap::OpenThoughtAtFirstToken,
         "the thought is a message of its own, and the tag finds no close of it to write before the call",
     ),
+    (
+        Table::Inkling2,
+        Gap::OpenThoughtAtFirstToken,
+        "Inkling's rows: the thought is a message of its own, and the tag finds no close of it to write before the call",
+    ),
 ];
 
 fn tool(name: &str, parameters: serde_json::Value) -> Tool {
@@ -122,7 +127,7 @@ fn every_table_that_reads_calls_writes_a_forced_tag_in_every_configuration() {
             continue;
         };
         assert!(
-            !matches!(syntax, CallSyntax::ForcedArguments),
+            !matches!(syntax, CallSyntax::ForcedArguments | CallSyntax::ForcedList),
             "{}: the forced table is not a registry table",
             table.name()
         );
