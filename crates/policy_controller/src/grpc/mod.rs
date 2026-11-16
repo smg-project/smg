@@ -81,10 +81,12 @@
 //! never a wait on a deciding thread. A number counts the events sent and
 //! the events refused, for the plugin's life and across its streams, so a
 //! gap tells the plugin what it lost: events refused at a full queue, or in
-//! flight on a stream that ended. A gap's size is exact and its place is
-//! not: events raised before the loss can arrive behind it, and a loss after
-//! the last event sent shows at the next. The stream's task is started again a
-//! pause after one that panicked, the queue and the numbers kept. Each profile
+//! flight on a stream that ended. A gap sits where the loss fell: an event
+//! carries the refusals its thread had seen as it entered the queue, so
+//! every event raised before a loss arrives ahead of its gap, and a loss
+//! after the last event raised shows at the next. The stream's task is
+//! started again a pause after one that panicked, the queue and the numbers
+//! kept. Each profile
 //! that binds the plugin holds one [`Bound`] set, taken from its engine
 //! build's [`Binder`]: one adapter of a build forwards, so an event reaches
 //! the plugin once per engine.
