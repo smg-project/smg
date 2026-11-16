@@ -5492,6 +5492,40 @@ fn a_mixed_pool_whose_first_worker_has_no_event_index_is_the_scans() {
     }
 }
 
+/// The lookup after the draw still decides one pool: its first worker names
+/// a model with an event index and is never drawn, and every worker a sample
+/// can draw names a model without one. The sample's first worker names the
+/// index the decision reads, there is none, and the scan decides.
+#[test]
+fn a_mixed_pool_whose_sampled_workers_have_no_event_index_is_the_scans() {
+    use openai_protocol::model_card::ModelCard;
+
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
+
+    let (policy, mut workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], test_config());
+    workers[0].set_status(WorkerStatus::NotReady);
+    for (i, worker) in workers.iter_mut().enumerate().skip(1) {
+        *worker = Arc::new(
+            BasicWorkerBuilder::new(format!("http://plain{i}:8000").as_str())
+                .model(ModelCard::new("plain"))
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        );
+    }
+    policy.init_workers(&workers);
+    let prompt: Vec<u32> = (1..=8).collect();
+    let info = tokens_info(&prompt);
+    assert!(!info.admits(workers[0].routing_state()));
+    assert!(info.admits(workers[1].routing_state()));
+    for _ in 0..8 {
+        assert!(matches!(
+            policy.select_worker_sampled(&workers, &info),
+            Sampled::Scan
+        ));
+    }
+}
+
 #[test]
 fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
     let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
