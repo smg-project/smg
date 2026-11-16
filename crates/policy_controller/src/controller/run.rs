@@ -12,10 +12,9 @@ use std::{
 };
 
 use clap::Parser;
-use tokio::{
-    runtime::{Builder, Runtime},
-    signal::unix::{signal, SignalKind},
-};
+use tokio::runtime::{Builder, Runtime};
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -388,8 +387,10 @@ fn truthy(value: Option<&OsStr>) -> bool {
 /// Resolves on SIGTERM (the orchestrator's stop) or SIGINT (a terminal's).
 /// A handler that cannot be installed is logged and its signal waits
 /// forever, so the other one still stops the process; a failure of both
-/// leaves the controller serving until it is killed.
+/// leaves the controller serving until it is killed. A host that is not
+/// Unix has no SIGTERM: the terminal's interrupt alone stops it there.
 async fn signals() {
+    #[cfg(unix)]
     let mut term = match signal(SignalKind::terminate()) {
         Ok(term) => Some(term),
         Err(error) => {
@@ -397,6 +398,7 @@ async fn signals() {
             None
         }
     };
+    #[cfg(unix)]
     let term = async {
         match term.as_mut() {
             Some(term) => {
@@ -405,6 +407,8 @@ async fn signals() {
             None => pending::<()>().await,
         }
     };
+    #[cfg(not(unix))]
+    let term = pending::<()>();
     let interrupt = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             warn!(%error, "no SIGINT handler; SIGTERM alone stops the controller");
