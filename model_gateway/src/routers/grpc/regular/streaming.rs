@@ -514,7 +514,6 @@ impl StreamingProcessor {
                 dispatch_start,
             } => {
                 let processor = self.clone();
-                let dispatch_clone = dispatch.clone();
                 let tokenizer_clone = tokenizer.clone();
                 let table = chat_request.symphony.as_ref().map(Assignment::table);
                 // The request's span, for the line a failure writes: the
@@ -527,7 +526,7 @@ impl StreamingProcessor {
                     let result = isolated(processor.process_streaming_chunks_inner(
                         dispatch_start,
                         stream,
-                        dispatch_clone,
+                        dispatch,
                         tokenizer_clone,
                         stop_params,
                         chat_request,
@@ -2431,7 +2430,6 @@ impl StreamingProcessor {
                 dispatch_start,
             } => {
                 let processor = self.clone();
-                let dispatch_clone = dispatch.clone();
                 let tokenizer_clone = tokenizer.clone();
                 let table = messages_request.symphony.as_ref().map(Assignment::table);
                 // The request's span, for the line a failure writes: the
@@ -2444,7 +2442,7 @@ impl StreamingProcessor {
                     let result = isolated(processor.process_messages_streaming_chunks_inner(
                         dispatch_start,
                         stream,
-                        dispatch_clone,
+                        dispatch,
                         tokenizer_clone,
                         stop_params,
                         messages_request,

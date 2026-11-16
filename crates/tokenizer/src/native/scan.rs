@@ -10,16 +10,20 @@
 //! classes read alike: one binary search per character, where asking the
 //! classes is a search per category table per class (measured: two thirds
 //! of an encode's cycles on a text with one emoji per 134 bytes). The plane
-//! table is kept by 256-code-point blocks, blocks with the same bits
-//! sharing one row: the ideographs, the kana, a Cyrillic or Thai block each
-//! read from one 512-byte row, so the table a text touches stays in the
-//! first-level cache (a flat table of the plane is 128 KiB and missed the
-//! cache on every character of such a run: measured, a seventh of the
-//! encode's instructions on a corpus with such scripts in it). A run of one
-//! class is then a loop over bytes with one load per ASCII byte; a character
-//! beyond ASCII is decoded from its bytes in place (the text is valid UTF-8
-//! and the scanners stand on character boundaries, so the lead byte gives
-//! the length and no validation is repeated).
+//! table is kept by 64-code-point blocks, blocks with the same bits
+//! sharing one row: the ideographs read from one 128-byte row, the kana, a
+//! Cyrillic or Thai block from a few, so the table a text touches stays in
+//! the first-level cache (a flat table of the plane is 128 KiB and missed
+//! the cache on every character of such a run: measured, a seventh of the
+//! encode's instructions on a corpus with such scripts in it). Such a block
+//! is the characters whose bytes differ in the last one alone: the bytes
+//! before it name the block and its six bits the place in the row, so a
+//! character of the plane is read from its bytes as they stand and no code
+//! point is put together. A run of one class is then a loop over bytes with
+//! one load per ASCII byte; a character beyond ASCII is read from its bytes
+//! in place (the text is valid UTF-8 and the scanners stand on character
+//! boundaries, so the lead byte gives the length and no validation is
+//! repeated).
 
 use std::collections::HashMap;
 
@@ -32,8 +36,14 @@ pub(super) type Bits = u16;
 /// Code points of the plane table.
 const PLANE: u32 = 0x1_0000;
 
-/// Code points per block of the plane table.
-const BLOCK: usize = 256;
+/// Code points per block of the plane table: the characters whose UTF-8
+/// bytes differ in the last one alone.
+const BLOCK: usize = 64;
+
+/// Blocks of the plane table. There are at most as many rows as blocks, so
+/// the start of a row fits sixteen bits whatever the classes are.
+const BLOCKS: usize = PLANE as usize / BLOCK;
+const _: () = assert!(BLOCKS * BLOCK - BLOCK <= u16::MAX as usize);
 
 /// The code point of the character beyond ASCII whose lead byte `lead`
 /// stands at `pos` of `bytes`, and its length. The text is valid UTF-8 and
@@ -166,8 +176,9 @@ pub(super) struct Roles {
     /// Per role, the word scan its ASCII members are the set of
     /// ([`WordScan`]), `WordScan::NONE` for most.
     scans: [u8; Bits::BITS as usize],
-    /// Per block of the plane, the row of `rows` that holds its bits.
-    block_rows: [u16; 256],
+    /// Per block of the plane, where the row that holds its bits starts in
+    /// `rows`.
+    block_rows: [u16; BLOCKS],
     /// The distinct rows of the plane table, `BLOCK` bits each.
     rows: Box<[Bits]>,
     /// The role bits above the plane as runs in code point order: the first
@@ -210,7 +221,7 @@ impl Roles {
                 .fold(0u128, |members, (code, _)| members | (1 << code));
             *scan = WordScan::of(members);
         }
-        let mut block_rows = [0u16; 256];
+        let mut block_rows = [0u16; BLOCKS];
         let mut rows: Vec<Bits> = Vec::new();
         let mut seen: HashMap<[Bits; BLOCK], u16> = HashMap::new();
         for (block, row) in block_rows.iter_mut().enumerate() {
@@ -221,7 +232,7 @@ impl Roles {
             }
             *row = *seen.entry(block_bits).or_insert_with(|| {
                 rows.extend_from_slice(&block_bits);
-                (rows.len() / BLOCK - 1) as u16
+                (rows.len() - BLOCK) as u16
             });
         }
         // Above the plane the bits change only where a class's membership
@@ -273,25 +284,40 @@ impl Roles {
     }
 
     /// The role bits of the character beyond ASCII whose lead byte `lead`
-    /// stands at `pos`, and its length.
+    /// stands at `pos`, and its length. A character of two or three bytes
+    /// is one of the plane, and the bytes before its last name its block;
+    /// one of four bytes stands above the plane. The text is valid UTF-8
+    /// and `pos` a character boundary, so the bytes the lead announces
+    /// follow; the reads stay checked all the same.
     #[inline(always)]
     fn beyond(&self, bytes: &[u8], pos: usize, lead: u8) -> (Bits, usize) {
-        let (code, len) = char_beyond_ascii(bytes, pos, lead);
-        let bits = if code < PLANE {
-            let row = usize::from(self.block_rows[(code >> 8) as usize]);
-            self.rows[(row << 8) | (code & 0xFF) as usize]
+        let tail = |i: usize| bytes.get(pos + i).copied().unwrap_or(0);
+        if lead < 0xE0 {
+            (self.in_block(usize::from(lead & 0x1F), tail(1)), 2)
+        } else if lead < 0xF0 {
+            let block = (usize::from(lead & 0x0F) << 6) | usize::from(tail(1) & 0x3F);
+            (self.in_block(block, tail(2)), 3)
         } else {
-            self.above(code)
-        };
-        (bits, len)
+            self.above(bytes, pos, lead)
+        }
     }
 
-    /// The role bits of a code point above the plane: those of its run.
+    /// The role bits of the character of `block` whose last byte is `last`.
+    #[inline(always)]
+    fn in_block(&self, block: usize, last: u8) -> Bits {
+        let row = usize::from(self.block_rows[block]);
+        self.rows[row | usize::from(last & 0x3F)]
+    }
+
+    /// The role bits of the character of four bytes whose lead byte `lead`
+    /// stands at `pos`, and its length: one above the plane, which reads
+    /// the bits of its run.
     #[cold]
     #[inline(never)]
-    fn above(&self, code: u32) -> Bits {
+    fn above(&self, bytes: &[u8], pos: usize, lead: u8) -> (Bits, usize) {
+        let (code, len) = char_beyond_ascii(bytes, pos, lead);
         let next = self.above.partition_point(|&(start, _)| start <= code);
-        next.checked_sub(1).map_or(0, |run| self.above[run].1)
+        (next.checked_sub(1).map_or(0, |run| self.above[run].1), len)
     }
 
     /// [`Self::run_end`] for a role whose run the caller expects to be the
@@ -496,7 +522,9 @@ mod tests {
         }
         let ends = changes.iter().flat_map(|&code| code - 1..=code);
         let cuts = 0x1_0400..=0x1_044F;
-        let sample = (0..0x11_0000u32).filter(|code| code % 7 == 0 || *code < 0x3000);
+        // The plane whole, where a character's bytes name its block, and a
+        // sample above it.
+        let sample = (0..0x11_0000u32).filter(|code| *code < PLANE || code % 7 == 0);
         for code in sample.chain(ends).chain(cuts) {
             let Some(c) = char::from_u32(code) else {
                 continue;

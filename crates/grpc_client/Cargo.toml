@@ -25,7 +25,6 @@ tracing.workspace = true
 
 # gRPC dependencies
 tonic.workspace = true
-tonic-prost.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 
@@ -54,6 +53,8 @@ tonic-prost-build = "0.14.6"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 # Mock-server harness for the abort-on-drop behavioral tests.
 tokio-stream = { version = "0.1", features = ["net"] }
+# The stock prost codec: the codec's tests write and read each frame through both.
+tonic-prost.workspace = true
 
 [lints]
 workspace = true
