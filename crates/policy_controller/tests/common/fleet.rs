@@ -43,12 +43,12 @@ use smg_policy_controller::{
     controller::{
         Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
     },
-    proto::{LeaderInfo, Welcome},
+    proto::{completed::Class, Completed, Dispatched, LeaderInfo, Side, Welcome},
     store::{
         Ask, GatewayId, HealthPolicy, HealthSink, MemoryStore, ViewBuffers, WorkerFacts,
         WorkerStatus, WorkersStore,
     },
-    view::{LoadRow, Role, WireModes, WorkerId},
+    view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
 };
 use tokio::{
     io::{copy, sink},
@@ -57,6 +57,7 @@ use tokio::{
     task::JoinSet,
     time::MissedTickBehavior,
 };
+use tonic::codegen::tokio_stream::StreamExt;
 
 use crate::{
     engines::{engine_config, eventually},
@@ -80,6 +81,12 @@ pub const ROOM: Duration = Duration::from_secs(30);
 /// The tokens a held request asks for: at the engines' decode step it
 /// outlasts any case.
 const HELD_TOKENS: u32 = 1 << 20;
+
+/// The tokens a sent request asks for: a few, read to the stream's end.
+const SENT_TOKENS: u32 = 4;
+
+/// The name the harness's client states as its gateway id.
+pub const GATEWAY: &str = "fleet-gateway";
 
 /// One kind of engine in a fleet's table: a model, a role and its
 /// data-parallel ranks.
@@ -213,6 +220,8 @@ pub struct Harness {
     probed: Arc<Mutex<Vec<Probed>>>,
     turns: Arc<Turns>,
     held: Vec<AbortOnDropStream>,
+    /// The requests sent so far: the next one's lease id.
+    sent: u64,
     buffers: ViewBuffers,
     stop_feeds: watch::Sender<bool>,
     feeds: JoinSet<()>,
@@ -560,7 +569,7 @@ impl Harness {
         let client = bounded(
             "the client connects to the gateway listener",
             ROOM,
-            Client::connect(&format!("http://{gateway}"), "fleet-gateway"),
+            Client::connect(&format!("http://{gateway}"), GATEWAY),
         )
         .await?
         .map_err(|error| error.to_string())?;
@@ -574,6 +583,7 @@ impl Harness {
             probed: Arc::default(),
             turns: Arc::default(),
             held: Vec::new(),
+            sent: 0,
             buffers: ViewBuffers::default(),
             stop_feeds,
             feeds: JoinSet::new(),
@@ -749,6 +759,123 @@ impl Harness {
             self.held.push(stream);
         }
         Ok(())
+    }
+
+    /// Sends one short request to the engine at `engine` on the engine's own
+    /// wire and reads it to its end, as a gateway that decided by itself
+    /// sends one, the whole under [`DIAL_TIMEOUT`]. Then it reports the
+    /// request on the client's session: a `Dispatched`, and a `Completed`
+    /// for the engine's first rank under the class the transport read: a
+    /// stream read to its end, a connection refused, or the bound run out.
+    /// The lease is the harness's own number: no leader issued it. Returns
+    /// the class.
+    pub async fn send(&mut self, engine: usize) -> Result<Class, String> {
+        let endpoint = self
+            .engines
+            .get(engine)
+            .map(|engine| engine.endpoint.clone())
+            .ok_or_else(|| format!("no engine {engine}"))?;
+        let served = self.worker(engine)?;
+        self.sent += 1;
+        let lease_id = self.sent;
+        let started = Instant::now();
+        let request = vllm_proto::GenerateRequest {
+            request_id: format!("sent-{engine}-{lease_id}"),
+            input: Some(vllm_proto::generate_request::Input::Tokenized(
+                vllm_proto::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: vec![1; 8],
+                },
+            )),
+            sampling_params: Some(vllm_proto::SamplingParams {
+                max_tokens: Some(SENT_TOKENS),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        let asked = tokio::time::timeout(DIAL_TIMEOUT, async {
+            let Ok(client) = VllmEngineClient::connect(&endpoint).await else {
+                return (Class::ConnectFailed, 0);
+            };
+            let Ok(mut stream) = client.generate(request).await else {
+                return (Class::ServerError, 0);
+            };
+            let mut frames = 0;
+            loop {
+                match stream.next().await {
+                    Some(Ok(_)) => frames += 1,
+                    Some(Err(_)) => return (Class::ServerError, frames),
+                    None => return (Class::Ok, frames),
+                }
+            }
+        })
+        .await;
+        let (class, frames) = asked.unwrap_or((Class::Timeout, 0));
+        let side = Side::Single.into();
+        let dispatched = Dispatched {
+            lease_id,
+            target_index: 0,
+            side,
+            since_decision_micros: 0,
+        };
+        bounded(
+            "the client reports a dispatch",
+            ROOM,
+            self.client.dispatched(dispatched),
+        )
+        .await?
+        .map_err(|error| error.to_string())?;
+        let completed = Completed {
+            lease_id,
+            side,
+            served: served.0,
+            // The gRPC code the request ended with.
+            status: match class {
+                Class::Ok => 0,
+                Class::Timeout => 4,
+                Class::ConnectFailed => 14,
+                _ => 2,
+            },
+            class: class.into(),
+            ttft_micros: 0,
+            tokens_in: 8,
+            tokens_out: frames,
+            duration_micros: u32::try_from(started.elapsed().as_micros()).unwrap_or(u32::MAX),
+        };
+        bounded(
+            "the client reports a completion",
+            ROOM,
+            self.client.completed(completed),
+        )
+        .await?
+        .map_err(|error| error.to_string())?;
+        Ok(class)
+    }
+
+    /// The client: a case reports what the harness has no form for.
+    pub fn client(&mut self) -> &mut Client {
+        &mut self.client
+    }
+
+    /// Whether the store holds a completion of class ok by the gateway named
+    /// `gateway` on the first rank of the engine at `engine`, at or after
+    /// `since`: the read a decision's precedence rule makes of one
+    /// gateway's own dispatches.
+    pub fn completed_ok(&self, gateway: &str, engine: usize, since: Instant) -> bool {
+        self.worker(engine).is_ok_and(|served| {
+            let gateway = GatewayId(fingerprint(gateway.as_bytes()));
+            self.store.completed_ok_since(gateway, served, since)
+        })
+    }
+
+    /// The row id of the first rank of the engine at `engine`.
+    pub fn worker(&self, engine: usize) -> Result<WorkerId, String> {
+        self.members
+            .iter()
+            .find(|(_, member)| **member == (engine, 0))
+            .map(|(id, _)| *id)
+            .ok_or_else(|| format!("engine {engine} has no registered first rank"))
     }
 
     /// Kills the engine at `engine`: its runtime is dropped and the call

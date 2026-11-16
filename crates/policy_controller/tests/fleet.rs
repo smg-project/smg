@@ -6,12 +6,16 @@
 //! healthy by its probe, its load from a poll, an engine that holds
 //! requests reading them. Then one engine is killed: the first dial that
 //! hears it dead writes it, and the pool reads its rows unhealthy and every
-//! other row healthy. Last, an engine stops answering with its sockets
-//! open: a probe turn waits out its dial bound, writes it and goes on.
+//! other row healthy. Next, an engine stops answering with its sockets
+//! open: a probe turn waits out its dial bound, writes it and goes on. Last,
+//! the gateway sends requests of its own and reports each on its session:
+//! the store holds the completion of the engine that answered, none of class
+//! ok for the dead and the hung one, and nothing of it for another gateway;
+//! a frame that reads wrong ends the session of the gateway that sent it.
 //!
-//! No decision is asked yet: the service answers `Leader` alone, and the
-//! case asserts that call end to end. The decisions take the views' place
-//! when the service answers them.
+//! No decision is asked yet: the service answers `Leader` and takes the
+//! session's reports, and the case asserts both end to end. The decisions
+//! take the views' place when the service answers them.
 //!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
@@ -31,22 +35,25 @@ mod net;
 
 use std::{
     io::Write,
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
 use engines::cpu_seconds;
 use fleet::{
-    within, DialEnd, Harness, Replica, Shape, DIAL_TIMEOUT, POLL_INTERVAL, PROBE_INTERVAL, ROOM,
+    within, DialEnd, Harness, Replica, Shape, DIAL_TIMEOUT, GATEWAY, POLL_INTERVAL, PROBE_INTERVAL,
+    ROOM,
 };
 use net::vm_rss_kib;
 use smg_policy_controller::{
     client::{self, blocking, Client},
     controller::{State, PROTOCOL_VERSION},
-    proto::principal,
+    proto::{completed::Class, principal, released, Completed, Released, Side},
     store::WorkerStatus,
     view::{Role, SignalSource},
 };
 use tokio::sync::oneshot;
+use tonic::Code;
 
 const MODEL: &str = "fleet-model";
 
@@ -373,6 +380,142 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             [DialEnd::TimedOut, DialEnd::TimedOut],
             "each dial of a hung engine waits out its bound"
         );
+
+        // The reports. A gateway that decides by itself tells the controller
+        // each request's life on its session, and the store holds what a
+        // decision's precedence rule reads of it: one gateway's own
+        // completions of class ok, a worker at a time.
+        let live = engines[0];
+        let asked = Instant::now();
+        let class = harness.send(live).await.expect("a live engine is sent");
+        assert_eq!(class, Class::Ok, "a live engine answers to the end");
+        within(
+            "the live engine's row holds this gateway's completion",
+            PROBE_INTERVAL + ROOM,
+            || harness.completed_ok(GATEWAY, live, asked),
+        )
+        .await
+        .expect("the completion is read");
+        let class = harness.send(dead).await.expect("a dead engine is sent");
+        assert_eq!(class, Class::ConnectFailed, "a dead engine connects none");
+        let class = tokio::time::timeout(ROOM, harness.send(hung))
+            .await
+            .expect("a hung engine's send ends at the dial bound")
+            .expect("a hung engine is sent");
+        assert_eq!(class, Class::Timeout, "a hung engine answers nothing");
+        // A lease no leader issued is given up: not on file, no error, and
+        // the session outlives it: the next request's reports are applied.
+        harness
+            .client()
+            .released(Released {
+                what: Some(released::What::LeaseId(u64::MAX)),
+                reason: released::Reason::ClientGone.into(),
+                ..Released::default()
+            })
+            .await
+            .expect("a release is reported");
+        let again = Instant::now();
+        let class = harness.send(live).await.expect("a live engine is sent");
+        assert_eq!(class, Class::Ok, "a live engine answers a second time");
+        within(
+            "the session outlives a release of a lease not on file",
+            PROBE_INTERVAL + ROOM,
+            || harness.completed_ok(GATEWAY, live, again),
+        )
+        .await
+        .expect("the second completion is read");
+        // One session's frames are applied in their order: the dead and the
+        // hung engine's completions are on file by now, and neither is one
+        // of class ok.
+        assert!(
+            !harness.completed_ok(GATEWAY, dead, asked),
+            "a dead engine's row holds no completion of class ok"
+        );
+        assert!(
+            !harness.completed_ok(GATEWAY, hung, asked),
+            "a hung engine's row holds no completion of class ok"
+        );
+        // One gateway's completions are its own.
+        assert!(
+            !harness.completed_ok("another-gateway", live, asked),
+            "another gateway reads none of this gateway's completions"
+        );
+        // A frame that reads wrong ends the session of the gateway that sent
+        // it, by its field's name: a second gateway gives up neither a
+        // lease nor a ticket.
+        let mut other =
+            Client::connect(&format!("http://{}", harness.gateway()), "another-gateway")
+                .await
+                .expect("a second gateway connects");
+        other
+            .released(Released::default())
+            .await
+            .expect("the frame is queued");
+        let ended = other
+            .session_end()
+            .await
+            .expect("the controller ends the session inside the client's bound");
+        assert_eq!(ended.code(), Code::InvalidArgument, "{ended:?}");
+        assert!(
+            ended.message().contains("Released.what"),
+            "the refusal names the field: {ended:?}"
+        );
+        // The first gateway's session stands: its next reports are applied.
+        let last = Instant::now();
+        let class = harness.send(live).await.expect("a live engine is sent");
+        assert_eq!(class, Class::Ok, "a live engine answers a third time");
+        within(
+            "the first gateway's session stands",
+            PROBE_INTERVAL + ROOM,
+            || harness.completed_ok(GATEWAY, live, last),
+        )
+        .await
+        .expect("the third completion is read");
+
+        // The blocking form's report leaves when it is made: its runtime
+        // drives the connection between calls. The client is held, and
+        // asked nothing more, until the store has read its completion.
+        let served = harness.worker(live).expect("the live engine's row").0;
+        let address = format!("http://{}", harness.gateway());
+        let reported = Instant::now();
+        let (hold, held) = mpsc::channel::<()>();
+        let (told, reporting) = oneshot::channel();
+        std::thread::spawn(move || {
+            let report =
+                blocking::Client::connect(&address, "blocking-gateway").and_then(|mut client| {
+                    client.completed(Completed {
+                        lease_id: 1,
+                        side: Side::Single.into(),
+                        served,
+                        class: Class::Ok.into(),
+                        ..Completed::default()
+                    })?;
+                    Ok(client)
+                });
+            match report {
+                Ok(client) => {
+                    let _ = told.send(Ok(()));
+                    let _ = held.recv();
+                    drop(client);
+                }
+                Err(error) => {
+                    let _ = told.send(Err(error.to_string()));
+                }
+            }
+        });
+        tokio::time::timeout(ROOM, reporting)
+            .await
+            .expect("the blocking client reports inside its bound")
+            .expect("the client's thread sends its answer")
+            .expect("the blocking client's report");
+        within(
+            "the blocking form's report leaves when it is made",
+            PROBE_INTERVAL + ROOM,
+            || harness.completed_ok("blocking-gateway", live, reported),
+        )
+        .await
+        .expect("the blocking gateway's completion is read");
+        drop(hold);
 
         // The Numbers: one process holds the controller, the engines and
         // the feeds, so its CPU and resident memory are a ceiling over the
