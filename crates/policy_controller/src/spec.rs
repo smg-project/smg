@@ -1655,28 +1655,55 @@ fn check_index(index: &BTreeMap<String, IndexSpec>, view: &ViewSpec) -> Result<(
             });
         }
     }
-    let keys: Vec<&str> = index.keys().map(String::as_str).collect();
-    for (i, first) in keys.iter().enumerate() {
-        if let Some(second) = keys[i + 1..].iter().find(|second| ambiguous(first, second)) {
-            return Err(SpecError::IndexOverlap {
-                first: (*first).to_string(),
-                second: (*second).to_string(),
-            });
-        }
+    match overlap(index.keys()) {
+        Some((first, second)) => Err(SpecError::IndexOverlap {
+            first: first.clone(),
+            second: second.clone(),
+        }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
-/// A `prefix*` and a `*suffix` of one literal length: they match a common
-/// model and neither is the more specific, so the pair is refused.
-fn ambiguous(a: &str, b: &str) -> bool {
-    let shape = |g: &str| match (g.strip_suffix('*'), g.strip_prefix('*')) {
-        _ if g == "*" => None,
-        (Some(prefix), _) => Some((true, prefix.len())),
-        (_, Some(suffix)) => Some((false, suffix.len())),
+/// The first two keys that overlap, in the keys' order: the first key with
+/// a partner after it, and the first such partner. A `prefix*` and a
+/// `*suffix` of one literal length overlap: they match a common model and
+/// neither is the more specific, so the pair is refused.
+///
+/// Each key is read once, whatever their number. Only the first `prefix*`
+/// and the first `*suffix` of a literal length can be that pair, so those
+/// are what the pass keeps.
+fn overlap<K: AsRef<str>>(keys: impl IntoIterator<Item = K>) -> Option<(K, K)> {
+    // By literal length: the first key of each side, with its place.
+    let mut firsts: BTreeMap<usize, [Option<(usize, K)>; 2]> = BTreeMap::new();
+    for (place, key) in keys.into_iter().enumerate() {
+        let Some((which, literal)) = side(key.as_ref()) else {
+            continue;
+        };
+        let first = &mut firsts.entry(literal).or_insert([None, None])[which];
+        if first.is_none() {
+            *first = Some((place, key));
+        }
+    }
+    firsts
+        .into_values()
+        .filter_map(|sides| match sides {
+            [Some(prefix), Some(suffix)] if prefix.0 < suffix.0 => Some((prefix, suffix)),
+            [Some(prefix), Some(suffix)] => Some((suffix, prefix)),
+            _ => None,
+        })
+        .min_by_key(|(first, _)| first.0)
+        .map(|((_, first), (_, second))| (first, second))
+}
+
+/// The side of a model a glob holds, 0 for `prefix*` and 1 for `*suffix`,
+/// with its literal length. An id and `*` hold none.
+fn side(glob: &str) -> Option<(usize, usize)> {
+    match (glob.strip_suffix('*'), glob.strip_prefix('*')) {
+        _ if glob == "*" => None,
+        (Some(prefix), _) => Some((0, prefix.len())),
+        (_, Some(suffix)) => Some((1, suffix.len())),
         _ => None,
-    };
-    matches!((shape(a), shape(b)), (Some((pa, la)), Some((pb, lb))) if pa != pb && la == lb)
+    }
 }
 
 /// Whether a model glob (`*`, `prefix*`, `*suffix` or an id) matches a model.
@@ -4432,6 +4459,95 @@ mod tests {
                 first: "*cd".into(),
                 second: "ab*".into()
             })
+        );
+    }
+
+    /// An index key, with a count of the times it is read.
+    struct Read<'a>(&'a str, &'a std::cell::Cell<usize>);
+
+    impl AsRef<str> for Read<'_> {
+        fn as_ref(&self) -> &str {
+            self.1.set(self.1.get() + 1);
+            self.0
+        }
+    }
+
+    /// The overlap pass reads each index key once, whatever their number: a
+    /// thousand keys are a thousand reads and eight thousand are eight
+    /// thousand. A pass over every pair reads them by the square.
+    #[test]
+    fn the_overlap_pass_reads_each_index_key_once() {
+        for entries in [1_000, 8_000] {
+            // A prefix and a suffix by turns, of two literal lengths: no two
+            // overlap, so no pass ends early.
+            let keys: Vec<String> = (0..entries)
+                .map(|n| {
+                    if n % 2 == 0 {
+                        format!("p{n:05}*")
+                    } else {
+                        format!("*{n:05}ss")
+                    }
+                })
+                .collect();
+            let reads = std::cell::Cell::new(0);
+            let found = overlap(keys.iter().map(|key| Read(key, &reads)));
+            assert!(found.is_none(), "{entries} keys of no overlap");
+            assert_eq!(reads.get(), entries, "{entries} keys");
+        }
+    }
+
+    /// The pass over every pair, as the check ran before: the measure of
+    /// the pair the overlap pass names.
+    fn pairwise<'a>(keys: &[&'a str]) -> Option<(&'a str, &'a str)> {
+        let ambiguous = |a: &str, b: &str| matches!((side(a), side(b)), (Some((sa, la)), Some((sb, lb))) if sa != sb && la == lb);
+        keys.iter().enumerate().find_map(|(place, first)| {
+            let second = keys[place + 1..]
+                .iter()
+                .find(|second| ambiguous(first, second))?;
+            Some((*first, *second))
+        })
+    }
+
+    /// The next of a draw's numbers, under `bound`.
+    fn below(state: &mut u64, bound: u64) -> usize {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        usize::try_from((*state >> 33) % bound).expect("under the bound")
+    }
+
+    /// The pair refused is the pair a pass over every pair names: the first
+    /// key with a later partner, and its first partner. Four thousand key
+    /// sets by draw, of ids, prefixes, suffixes and `*`, in the map's order.
+    #[test]
+    fn the_overlap_named_is_the_pair_a_pass_over_every_pair_names() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let (mut overlapping, mut distinct) = (0, 0);
+        for _ in 0..4_000 {
+            let mut keys = BTreeSet::new();
+            for _ in 0..below(&mut state, 12) {
+                let literal: String = (0..below(&mut state, 4))
+                    .map(|_| ["a", "b"][below(&mut state, 2)])
+                    .collect();
+                keys.insert(match below(&mut state, 4) {
+                    0 => format!("{literal}*"),
+                    1 => format!("*{literal}"),
+                    2 => "*".to_owned(),
+                    _ => format!("{literal}x"),
+                });
+            }
+            let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+            let named = overlap(keys.iter().copied());
+            assert_eq!(named, pairwise(&keys), "{keys:?}");
+            if named.is_some() {
+                overlapping += 1;
+            } else {
+                distinct += 1;
+            }
+        }
+        assert!(
+            overlapping > 500 && distinct > 500,
+            "{overlapping} sets overlap, {distinct} do not"
         );
     }
 
