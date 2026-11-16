@@ -1,9 +1,10 @@
 //! What the crate's capture tests drive a request through: a worker at an
 //! address of the test's choosing, a worker source over such workers, the
 //! HTTP client they share, an address nothing answers at, a provider's
-//! answer of the test's making, how a test reads an answer's body back as
-//! text, and the counting allocator every unit test of the crate runs
-//! under (the allocation pins read it).
+//! answer of the test's making, a provider stub that sends one whole or cut
+//! short, how a test reads an answer's body back as text, and the counting
+//! allocator every unit test of the crate runs under (the allocation pins
+//! read it).
 
 use std::{
     fmt,
@@ -15,12 +16,15 @@ use std::{
 use async_trait::async_trait;
 use axum::{
     body::to_bytes,
-    http::{header::CONTENT_TYPE, HeaderMap},
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
     response::Response,
 };
 use openai_protocol::worker::ProviderType;
 use rustls::crypto::ring::default_provider;
-use tokio::net::TcpSocket;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpSocket},
+};
 
 use crate::{
     error,
@@ -69,6 +73,41 @@ pub(crate) async fn text_of(response: Response) -> String {
         .await
         .expect("a body");
     String::from_utf8(bytes.to_vec()).expect("utf-8")
+}
+
+/// A provider stub at an address of its own. Every request is answered
+/// under `status` with `body`; with `cut_short`, the head declares one byte
+/// more than the stub sends, and the client's read of the body fails.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test stub server lives for the duration of the test process"
+)]
+pub(crate) async fn answering(status: u16, body: &'static str, cut_short: bool) -> SocketAddr {
+    let status = StatusCode::from_u16(status).expect("a status code");
+    let declared = body.len() + usize::from(cut_short);
+    let answer = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+         content-length: {declared}\r\nconnection: close\r\n\r\n{body}"
+    );
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("a loopback port");
+    let addr = listener.local_addr().expect("the bound address");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0_u8; 4096];
+            // The answer follows the request and the close follows the
+            // client's: closed over unread bytes, the connection is reset
+            // and the answer may be lost with it.
+            if stream.read(&mut request).await.is_ok()
+                && stream.write_all(answer.as_bytes()).await.is_ok()
+                && stream.shutdown().await.is_ok()
+            {
+                while stream.read(&mut request).await.is_ok_and(|read| read > 0) {}
+            }
+        }
+    });
+    addr
 }
 
 /// A worker at one address, serving model `m`, with no API key of its own.

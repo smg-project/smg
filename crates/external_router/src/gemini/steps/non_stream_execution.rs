@@ -97,7 +97,7 @@ pub(crate) async fn non_stream_request_execution(
     if !status.is_success() {
         let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
         let body = response.text().await.unwrap_or_else(|e| {
-            tracing::warn!("Failed to read upstream error body: {e}");
+            tracing::warn!(url = %redacted_url(upstream_url), error = %e.without_url(), "Failed to read upstream error body");
             String::new()
         });
         let body = error::sanitize_error_body(&body);
@@ -110,7 +110,7 @@ pub(crate) async fn non_stream_request_execution(
     }
 
     // Parse response body
-    let response_json: Value = match response.json().await {
+    let response_json: Value = match response.json().await.map_err(reqwest::Error::without_url) {
         Ok(r) => r,
         Err(e) if is_request_timeout(&e) => {
             tracing::warn!(url = %redacted_url(upstream_url), error = %e, "Upstream response timed out");
@@ -148,8 +148,8 @@ mod tests {
         gemini::context::{RequestContext, SharedComponents},
         tenant::{TenantKey, TenantRequestMeta},
         test_support::{
-            http_client, RefusedAddress, StubWorker, StubWorkers, CREDENTIALED_WORKER_URL,
-            MASKED_WORKER_URL,
+            answering, http_client, RefusedAddress, StubWorker, StubWorkers,
+            CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
         },
     };
 
@@ -214,6 +214,42 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert!(logs_contain("Request to worker failed"));
+        assert!(!logs_contain("s3cret"));
+    }
+
+    /// An answer that is no JSON, from an address registered with a query:
+    /// the failure line says why without the query. The HTTP client's text of
+    /// a failed body read ends with the request URL, its query kept.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn an_invalid_json_answer_goes_without_the_clients_url_in_its_line() {
+        let addr = answering(200, "not json", false).await;
+        let mut ctx = context_for(&format!("http://{addr}?key=s3cret"));
+
+        let Err(response) = non_stream_request_execution(&mut ctx).await else {
+            panic!("an answer that is no JSON");
+        };
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(logs_contain("Upstream returned invalid JSON"));
+        assert!(!logs_contain("s3cret"));
+    }
+
+    /// A refusal whose body is lost mid-answer: the line about the unread
+    /// body names the worker masked and says why without the query.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn an_unread_refusal_goes_without_the_clients_url_in_its_line() {
+        let addr = answering(500, "short", true).await;
+        let mut ctx = context_for(&format!("http://{addr}?key=s3cret"));
+
+        let Err(response) = non_stream_request_execution(&mut ctx).await else {
+            panic!("a refusal");
+        };
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(logs_contain("Failed to read upstream error body"));
+        assert!(logs_contain(&format!("url=http://{addr}")));
         assert!(!logs_contain("s3cret"));
     }
 }

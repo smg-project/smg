@@ -109,7 +109,9 @@ fn relayed_body(resp: reqwest::Response, status: StatusCode) -> Response {
 /// here: [`upstream_body::answer_error`] answers it.
 async fn buffered_body(resp: reqwest::Response, status: StatusCode) -> Response {
     let content_type = resp.headers().get(CONTENT_TYPE).cloned();
-    match resp.bytes().await {
+    // The client's text ends with the request URL; both failure answers
+    // carry the text to the caller.
+    match resp.bytes().await.map_err(reqwest::Error::without_url) {
         Ok(body) => {
             let mut response = Response::new(Body::from(body));
             *response.status_mut() = status;
@@ -358,7 +360,7 @@ mod tests {
         retry::REQUEST_TIMEOUT_CODE,
         tenant::TenantKey,
         test_support::{
-            counting_alloc, http_client, text_of, upstream, RefusedAddress, StubWorker,
+            answering, counting_alloc, http_client, text_of, upstream, RefusedAddress, StubWorker,
         },
         worker::{ExternalWorker, WorkerStats},
     };
@@ -479,6 +481,25 @@ mod tests {
             REQUEST_TIMEOUT_CODE
         );
         assert!(!is_retryable_response(&response));
+    }
+
+    /// A body lost mid-answer is the 500 of a read failure, and it says why
+    /// without the worker's address. The HTTP client's text of a failed body
+    /// read ends with the request URL.
+    #[tokio::test]
+    async fn a_buffered_body_cut_short_is_answered_without_the_workers_address() {
+        let addr = answering(200, "short", true).await;
+        let answer = http_client()
+            .post(format!("http://{addr}"))
+            .send()
+            .await
+            .expect("the answer's head");
+
+        let response = buffered_body(answer, StatusCode::OK).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = text_of(response).await;
+        assert!(!body.contains(&addr.to_string()), "{body}");
     }
 
     #[tokio::test]
