@@ -3402,6 +3402,40 @@ pub(crate) fn crop_rgb(image: &RgbImage, x: u32, y: u32, width: u32, height: u32
     RgbImage::from_raw(width, height, data).expect("crop buffer size")
 }
 
+/// The columns of the image that one pass of [`transpose_rgb`] moves: their
+/// pixels of an image row and the output rows they go to stay in the cache.
+const TRANSPOSE_BLOCK: usize = 32;
+
+/// `image` flipped over its main diagonal (PIL's `Image.TRANSPOSE`): the
+/// pixel at (`x`, `y`) goes to (`y`, `x`), so the result is `height` wide and
+/// `width` high. The generic way, a horizontal flip and then a quarter turn,
+/// copies the image twice, pixel by pixel. Here a block of columns at a time
+/// is gathered in a scratch block that stays in the cache, each image row
+/// giving one pixel to each of its output rows, and joins the output whole.
+pub(crate) fn transpose_rgb(image: &RgbImage) -> RgbImage {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    // A zero-sized image has no rows; a chunk size of 0 would panic.
+    let (stride, out_stride) = ((width * 3).max(1), (height * 3).max(1));
+    let mut data = Vec::with_capacity(width * height * 3);
+    let mut block = vec![0_u8; TRANSPOSE_BLOCK.min(width) * height * 3];
+    for first in (0..width).step_by(TRANSPOSE_BLOCK) {
+        let columns = TRANSPOSE_BLOCK.min(width - first);
+        let block = &mut block[..columns * height * 3];
+        for (y, row) in rgb_pixels(image).chunks_exact(stride).enumerate() {
+            let (pixels, _) = row[first * 3..(first + columns) * 3].as_chunks::<3>();
+            for (out_row, pixel) in block.chunks_exact_mut(out_stride).zip(pixels) {
+                out_row[y * 3..y * 3 + 3].copy_from_slice(pixel);
+            }
+        }
+        data.extend_from_slice(block);
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "data holds exactly height * width * 3 bytes by construction"
+    )]
+    RgbImage::from_raw(image.height(), image.width(), data).expect("transpose buffer size")
+}
+
 /// `image` pasted at (`x`, `y`) on a `width` x `height` canvas of
 /// `background`, built row by row: background rows above and below the
 /// paste, and every pasted row the left margin, the image's row and the
@@ -5316,6 +5350,48 @@ mod tests {
             paste_rgb(&empty, 24, 24, 3, 2, [127, 10, 250]).as_raw(),
             expected.as_raw()
         );
+    }
+
+    /// The one-pass transpose makes the image that the flip and the quarter
+    /// turn make, on sizes around its block of columns and over a container
+    /// longer than the pixels.
+    #[test]
+    fn transpose_rgb_is_the_flip_and_the_quarter_turn() {
+        let sizes = [
+            (1, 1),
+            (1, 7),
+            (7, 1),
+            (31, 5),
+            (32, 33),
+            (33, 32),
+            (65, 97),
+            (200, 130),
+        ];
+        for (width, height) in sizes {
+            let image = lcg_rgb_image(width, height, 11);
+            let rgb = image.to_rgb8();
+            let generic = image.fliph().rotate270().to_rgb8();
+            let fast = transpose_rgb(&rgb);
+            assert_eq!(fast.dimensions(), (height, width), "{width}x{height}");
+            assert_eq!(fast.as_raw(), generic.as_raw(), "{width}x{height}");
+
+            let mut container = rgb.into_raw();
+            container.extend_from_slice(&[0xAB; 7]);
+            let longer = RgbImage::from_raw(width, height, container).expect("longer container");
+            let fast_of_longer = transpose_rgb(&longer);
+            assert_eq!(fast_of_longer.as_raw(), fast.as_raw(), "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn transpose_rgb_stays_total_on_an_empty_image() {
+        // No row to chunk and no block to fill: the result is the empty
+        // image with its two sides swapped.
+        for (width, height) in [(0, 7), (7, 0), (0, 0)] {
+            let transposed = transpose_rgb(&RgbImage::new(width, height));
+            assert_eq!(transposed.dimensions(), (height, width), "{width}x{height}");
+            assert!(transposed.as_raw().is_empty(), "{width}x{height}");
+        }
     }
 
     #[test]
