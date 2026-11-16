@@ -7,7 +7,7 @@ use openai_protocol::{
     messages::CreateMessageRequest,
     profile::ProviderProfile,
 };
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     routers::{
@@ -121,8 +121,21 @@ impl MessagePreparationStage {
         ) {
             Ok(msgs) => msgs,
             Err(e) => {
-                error!(function = "MessagePreparationStage::execute", error = %e, "Failed to process messages");
-                return Err(error::bad_request("process_messages_failed", e));
+                // As in the chat preparation: one WARN and the mark only for
+                // a refusal typed as the request's own; every other failure
+                // keeps ERROR and stays unmarked.
+                let refused = e.is_refusal();
+                if refused {
+                    warn!(function = "MessagePreparationStage::execute", error = %e, "Failed to process messages");
+                } else {
+                    error!(function = "MessagePreparationStage::execute", error = %e, "Failed to process messages");
+                }
+                let answer = error::bad_request("process_messages_failed", String::from(e));
+                return Err(if refused {
+                    utils::reported(answer)
+                } else {
+                    answer
+                });
             }
         };
 

@@ -1646,6 +1646,43 @@ fn test_raise_exception_surfaces_template_validation_message() {
     assert!(error.contains("reasoning_effort is invalid"), "{error}");
 }
 
+/// A template's own `raise_exception` is typed as the template's refusal, from
+/// inside a macro too, under the text every render failure reads; an operation
+/// the template could not run is a render failure and no refusal.
+#[test]
+fn a_templates_own_refusal_is_typed_and_another_render_failure_is_not() {
+    let failure = |template: &str| {
+        ChatTemplateState::new(Some(template.to_string()))
+            .unwrap()
+            .apply(
+                &[serde_json::json!({"role": "user", "content": []})],
+                ChatTemplateParams::default(),
+            )
+            .unwrap_err()
+    };
+
+    let refused = failure("{{ raise_exception('the roles must alternate') }}");
+    assert!(TemplateRefusal::is(&refused), "{refused:#}");
+    assert!(
+        refused
+            .to_string()
+            .starts_with("Failed to render template: invalid operation: the roles must alternate"),
+        "{refused}"
+    );
+    let in_a_macro =
+        failure("{% macro check() %}{{ raise_exception('no') }}{% endmacro %}{{ check() }}");
+    assert!(TemplateRefusal::is(&in_a_macro), "{in_a_macro:#}");
+
+    let failed = failure("{{ 'user: ' + messages[0]['content'] }}");
+    assert!(!TemplateRefusal::is(&failed), "{failed:#}");
+    assert!(
+        failed
+            .to_string()
+            .starts_with("Failed to render template: invalid operation: "),
+        "{failed}"
+    );
+}
+
 #[test]
 fn test_special_tokens_injected_into_context() {
     let template = "{{ bos_token }}{% for message in messages %}{{ message.content }}{% endfor %}{{ eos_token }}";
