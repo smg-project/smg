@@ -574,7 +574,9 @@ impl Controller {
             Leave::Task(Some(Err(join))) => Some(Error::Task(join.to_string())),
             Leave::Election => Some(Error::ElectionEnded),
         };
-        let deadline = tokio::time::Instant::now() + config.shutdown_grace;
+        // A grace period the clock cannot add to the present bounds nothing:
+        // the wait for the election thread below then has no deadline.
+        let deadline = tokio::time::Instant::now().checked_add(config.shutdown_grace);
         let result = if let Some(error) = error {
             error!(controller_id = %config.controller_id, %error, "the serve ended before the shutdown");
             tasks.abort_all();
@@ -619,14 +621,19 @@ impl Controller {
         // write, tried again a renew period later while it fails. Neither
         // leave ends the process before the release landed or was given
         // up, within the grace period: this one wait serves both.
-        if tokio::time::timeout_at(deadline, election.ended())
-            .await
-            .is_err()
-        {
-            warn!(
-                controller_id = %config.controller_id,
-                "the election thread outlived the grace period; a lease it holds expires by its duration"
-            );
+        match deadline {
+            Some(deadline) => {
+                if tokio::time::timeout_at(deadline, election.ended())
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        controller_id = %config.controller_id,
+                        "the election thread outlived the grace period; a lease it holds expires by its duration"
+                    );
+                }
+            }
+            None => election.ended().await,
         }
         if result.is_ok() {
             info!(controller_id = %config.controller_id, "stopped");
@@ -785,5 +792,71 @@ mod tests {
             record.holder.is_empty(),
             "the lease is released when the serve has returned: {record:?}"
         );
+    }
+
+    /// The largest grace period a caller can set is one the clock cannot
+    /// add to the present. A serve under it leaves as under any other, by a
+    /// signal and by a listener's error: it waits for the release, and the
+    /// lease is free when the serve has returned.
+    #[tokio::test]
+    async fn a_serve_under_a_grace_period_the_clock_cannot_hold_leaves_with_its_lease_released() {
+        for by_error in [false, true] {
+            let mut lease = MemoryLease::new();
+            let mut config = valid();
+            config.shutdown_grace = Duration::MAX;
+            let mut controller = Controller::bind(config).await.expect("the listeners bind");
+            controller.elector = Elector::new(
+                Box::new(ReleasesSlowly {
+                    lease: lease.clone(),
+                    slow: Duration::from_millis(500),
+                }),
+                "controller-0@127.0.0.1:1",
+                ElectionSettings {
+                    duration: Duration::from_millis(300),
+                    renew_period: Duration::from_millis(20),
+                    renew_deadline: Duration::from_millis(200),
+                },
+            )
+            .expect("the settings are in order");
+            let fence = controller.elector.fence();
+            let (leave, left) = oneshot::channel::<()>();
+            let serve = async {
+                if by_error {
+                    controller
+                        .serve_until(pending(), async move {
+                            let _ = left.await;
+                            Error::Task("a listener failed".to_owned())
+                        })
+                        .await
+                } else {
+                    controller
+                        .serve(async move {
+                            let _ = left.await;
+                        })
+                        .await
+                }
+            };
+            let told = async {
+                // The take lands, then the serve is told to leave.
+                while fence.term() == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                leave.send(()).expect("the serve waits for its leave");
+            };
+            let (served, ()) =
+                timeout(Duration::from_secs(60), async { tokio::join!(serve, told) })
+                    .await
+                    .expect("the serve ends");
+            if by_error {
+                assert!(matches!(served, Err(Error::Task(_))), "{served:?}");
+            } else {
+                assert!(served.is_ok(), "{served:?}");
+            }
+            let record = lease.read().expect("a read").expect("a record");
+            assert!(
+                record.holder.is_empty(),
+                "the lease is released when the serve has returned (by an error: {by_error}): {record:?}"
+            );
+        }
     }
 }
