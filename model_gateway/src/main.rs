@@ -2263,6 +2263,21 @@ mod tests {
         );
         let regular = cli_args_from(&["--worker-urls", "http://user:s3cret@10.0.0.7:9"]);
         assert!(regular.node_lines(&prefill, &[]).is_empty());
+
+        // An address on the command line carries no rank: a token before a
+        // host of digits is a userinfo there, never a host with a rank.
+        let digits = cli_args_from(&[
+            "--pd-disaggregation",
+            "--decode",
+            "http://s3cret-token@8080",
+        ]);
+        assert_eq!(
+            digits.node_lines(&[node("http://s3cret-token@2130706433", None)], &[]),
+            [
+                r#"Prefill nodes: [("http://***@2130706433", None)]"#,
+                r#"Decode nodes: ["http://***@8080"]"#,
+            ]
+        );
     }
 
     /// A flag whose value has a required shape is refused by name when the

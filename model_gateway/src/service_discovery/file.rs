@@ -155,12 +155,15 @@ pub(crate) fn export_manifest(workers: &[WorkerInfo]) -> Manifest {
             }
         }
         let address = spec.dp_base_url.as_deref().unwrap_or(&spec.url);
-        // No registered address fails to parse; one that did is not written
+        // A base, or the address of a worker the registration did not
+        // expand: no rank is read out of it, so digits behind its last `@`
+        // are a host behind a userinfo and the worker is exported. No
+        // registered address fails to parse; one that did is not written
         // raw, as it may carry a credential.
-        let Ok(endpoint) = Endpoint::parse(address) else {
+        let Ok(endpoint) = Endpoint::parse_unranked(address.trim()) else {
             warnings.push(format!(
                 "{}: not exported, the address does not parse",
-                Endpoint::redacted_str(address)
+                Endpoint::redacted_base_url(address)
             ));
             continue;
         };
@@ -1255,6 +1258,48 @@ mod tests {
         assert!(exported.workers[0].id.is_none(), "{text}");
         assert!(exported.warnings.is_empty(), "{text}");
         assert_eq!(parse(&text, Roles::Regular).unwrap().len(), 1);
+    }
+
+    /// Digits behind the last `@` of an address the registration did not
+    /// expand are its own text: a host of digits behind a token. The export
+    /// reads no rank out of it, so the worker is exported at its host and
+    /// neither its record nor a warning carries the token.
+    #[test]
+    fn a_token_before_a_host_of_digits_is_exported_without_the_token() {
+        use crate::worker::{identity::basic::worker_to_info, BasicWorkerBuilder, Worker};
+
+        let fleet: Vec<WorkerInfo> = [
+            "http://s3cret-token@2130706433",
+            "http://s3cret-user:8080@2130706434",
+        ]
+        .into_iter()
+        .map(|url| {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            );
+            worker_to_info(&worker)
+        })
+        .collect();
+
+        let exported = export_manifest(&fleet);
+        let text = serde_json::to_string(&exported).unwrap();
+
+        assert!(
+            !text.contains("s3cret"),
+            "a token reached the export: {text}"
+        );
+        let urls: Vec<_> = exported.workers.iter().map(|w| w.url.as_str()).collect();
+        assert_eq!(urls, ["http://2130706433", "http://2130706434"], "{text}");
+        assert_eq!(
+            exported.warnings,
+            [
+                "http://2130706433: url credentials not exported",
+                "http://2130706434: url credentials not exported"
+            ]
+        );
+        assert_eq!(parse(&text, Roles::Regular).unwrap().len(), 2);
     }
 
     /// An export with warnings is still a manifest: the field is known and

@@ -128,6 +128,99 @@ async fn a_constrained_decoding_label_update_must_name_a_policy() {
     step_succeeds(UpdateWorkerPropertiesStep.execute(&mut always).await);
 }
 
+/// A label an update refuses names the worker by its own masked address,
+/// not by its address read as a bare string: a token before a host of
+/// digits is masked (the string reads a host and a rank there), and a rank
+/// of a data-parallel worker keeps its host and its rank. So does a label
+/// the engine's own report carries, which the refresh refuses.
+#[tokio::test]
+async fn a_refused_label_update_names_the_worker_by_its_own_masked_address() {
+    // (the address, its rank, how the refusal names the worker)
+    for (url, rank, named) in [
+        (
+            "http://s3cret-token@2130706433",
+            None,
+            "Worker http://***@2130706433:",
+        ),
+        ("http://rank:8000", Some(1), "Worker http://rank:8000@1:"),
+        (
+            "http://user:s3cret@rank:8000",
+            Some(1),
+            "Worker http://***@rank:8000@1:",
+        ),
+    ] {
+        let mut builder = BasicWorkerBuilder::new(url).status(WorkerStatus::Ready);
+        if let Some(rank) = rank {
+            builder = builder.dp_config(rank, 2);
+        }
+        let worker: Arc<dyn Worker> = Arc::new(builder.build());
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let mut typo = make_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            HashMap::from([("constrained_decoding".to_string(), "sometimes".to_string())]),
+        );
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut typo)
+            .await
+            .expect_err("a label that names no policy")
+            .to_string();
+        assert!(err.contains(named), "{url}: {err}");
+        assert!(!err.contains("s3cret"), "{url}: {err}");
+
+        let mut report = make_refresh_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            labels_of(&[("constrained_decoding", "sometimes")]),
+        );
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut report)
+            .await
+            .expect_err("a report that names no policy")
+            .to_string();
+        assert!(err.contains(named), "{url}, a report: {err}");
+        assert!(!err.contains("s3cret"), "{url}, a report: {err}");
+    }
+}
+
+/// So does a parser override an update refuses: a token before a host of
+/// digits is a userinfo there, and a rank keeps its host and its rank.
+#[tokio::test]
+async fn a_refused_parser_override_names_the_worker_by_its_own_masked_address() {
+    let rank = {
+        let mut spec = WorkerSpec::new("http://rank:8000@1");
+        spec.dp_base_url = Some("http://rank:8000".to_string());
+        spec.dp_rank = Some(1);
+        spec.dp_size = Some(2);
+        spec
+    };
+    for (spec, named) in [
+        (
+            WorkerSpec::new("http://s3cret-token@2130706433"),
+            "worker http://***@2130706433 declares",
+        ),
+        (rank, "worker http://rank:8000@1 declares"),
+    ] {
+        let worker = registered(spec, labels_of(&[("served_model_name", "m")]));
+        let app_ctx = make_app_context_with(
+            std::slice::from_ref(&worker),
+            Some(tool_parser::ParserFactory::default()),
+        );
+        let mut unknown = make_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            labels_of(&[("tool_parser", "definitely-not-a-parser")]),
+        );
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut unknown)
+            .await
+            .expect_err("an unknown parser override")
+            .to_string();
+        assert!(err.contains(named), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+}
+
 fn make_refresh_context(
     app_context: Arc<AppContext>,
     worker: Arc<dyn Worker>,
@@ -1341,12 +1434,15 @@ async fn a_worker_over_the_cap_takes_updates_that_add_no_key() {
 #[tokio::test]
 async fn a_refused_rank_leaves_no_partial_update_behind() {
     let first: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new("http://rank:8000@0")
+        BasicWorkerBuilder::new("http://rank:8000")
+            .dp_config(0, 2)
             .status(WorkerStatus::Ready)
             .label("k0", "v")
             .build(),
     );
-    let mut builder = BasicWorkerBuilder::new("http://rank:8000@1").status(WorkerStatus::Ready);
+    let mut builder = BasicWorkerBuilder::new("http://rank:8000")
+        .dp_config(1, 2)
+        .status(WorkerStatus::Ready);
     for i in 0..MAX_WORKER_LABELS {
         builder = builder.label(format!("k{i}"), "v");
     }

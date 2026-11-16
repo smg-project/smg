@@ -50,10 +50,7 @@ use crate::{
         error::error_type_for_status,
         grpc::context::{DispatchMetadata, WorkerSelection},
     },
-    worker::{
-        identity::{basic::WorkerTypeExt, endpoint::Endpoint},
-        ConnectionModeExt, Worker,
-    },
+    worker::{identity::basic::WorkerTypeExt, ConnectionModeExt, Worker},
 };
 
 /// The SSE error `type` of a stream the worker failed: the engine's
@@ -462,11 +459,11 @@ impl StreamSource {
             UpstreamStream::Prefill => (self.prefill.as_ref(), metrics_labels::WORKER_PREFILL),
         };
         let class = UpstreamClass::of(status);
-        let worker_url = worker.map_or("none", |worker| worker.url());
+        let worker_shown = worker.map_or("none", |worker| worker.redacted_url());
         match rendezvous {
             Some(DeadRendezvous(port)) => warn!(
                 request_id = %self.request_id,
-                worker = %Endpoint::redacted_str(worker_url),
+                worker = %worker_shown,
                 worker_type,
                 completion_tokens,
                 grpc_code = ?status.code(),
@@ -484,7 +481,7 @@ impl StreamSource {
             ),
             None => warn!(
                 request_id = %self.request_id,
-                worker = %Endpoint::redacted_str(worker_url),
+                worker = %worker_shown,
                 worker_type,
                 completion_tokens,
                 grpc_code = ?status.code(),

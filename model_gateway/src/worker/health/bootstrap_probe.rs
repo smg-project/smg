@@ -13,7 +13,7 @@
 //! either way, and a port that does not accept the connection is named in one
 //! WARN and counted.
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use openai_protocol::worker::{RuntimeType, WorkerType};
 use tokio::net::TcpStream;
@@ -22,9 +22,8 @@ use tracing::{debug, info, warn};
 use crate::{
     observability::metrics::Metrics,
     worker::{
-        identity::{basic::WorkerTypeExt, endpoint::Endpoint},
-        pd::pairing::KvTransferProfile,
-        Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
+        identity::basic::WorkerTypeExt, pd::pairing::KvTransferProfile, Worker,
+        DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
     },
 };
 
@@ -201,18 +200,25 @@ pub(crate) fn spawn_bootstrap_port_probe(worker: &dyn Worker) {
         }
         return;
     }
-    let Some((host, port, source)) = partners_bootstrap_address(worker) else {
+    let Some(probe) = registration_probe(worker) else {
         return;
     };
-    let url = worker.url().to_string();
-    let worker_type = worker.worker_type().as_metric_label();
     #[expect(
         clippy::disallowed_methods,
         reason = "an advisory probe that ends within its own timeout; nothing waits on it at shutdown"
     )]
-    tokio::spawn(async move {
-        report_bootstrap_port_probe(&url, worker_type, &host, port, source).await;
-    });
+    tokio::spawn(probe);
+}
+
+/// The registration probe of `worker`, ready to run off the registration
+/// path; `None` when no partner is handed a bootstrap port for it. Its lines
+/// name the worker by the worker's own masked address, taken here where the
+/// worker is in hand.
+fn registration_probe(worker: &dyn Worker) -> Option<impl Future<Output = bool> + Send + 'static> {
+    let (host, port, source) = partners_bootstrap_address(worker)?;
+    let shown = worker.redacted_url().to_string();
+    let worker_type = worker.worker_type().as_metric_label();
+    Some(async move { report_bootstrap_port_probe(&shown, worker_type, &host, port, source).await })
 }
 
 /// Run the probe and report its verdict: a port that did not accept the
@@ -220,9 +226,10 @@ pub(crate) fn spawn_bootstrap_port_probe(worker: &dyn Worker) {
 /// from (`bootstrap_port_source`: `registered`, or `default` for a worker
 /// registered without one) and the error, and one count under
 /// `smg_pd_rendezvous_failures_total{leg, phase="probe"}`; a port that did is
-/// a DEBUG line. Returns whether the port accepted.
+/// a DEBUG line. `worker` is the worker's masked address, as its caller
+/// made it. Returns whether the port accepted.
 async fn report_bootstrap_port_probe(
-    url: &str,
+    worker: &str,
     worker_type: &'static str,
     host: &str,
     port: u16,
@@ -231,7 +238,7 @@ async fn report_bootstrap_port_probe(
     match probe_bootstrap_port(host, port, PROBE_TIMEOUT).await {
         Ok(()) => {
             debug!(
-                worker = %Endpoint::redacted_str(url),
+                worker = %worker,
                 worker_type = worker_type,
                 bootstrap_host = host,
                 bootstrap_port = port,
@@ -242,7 +249,7 @@ async fn report_bootstrap_port_probe(
         }
         Err(error) => {
             warn!(
-                worker = %Endpoint::redacted_str(url),
+                worker = %worker,
                 worker_type = worker_type,
                 bootstrap_host = host,
                 bootstrap_port = port,
@@ -595,16 +602,37 @@ mod tests {
             .bootstrap_port(Some(refused.port()))
             .build();
 
-        let (host, port, source) = partners_bootstrap_address(&worker)
-            .expect("a prefill side registered with a port is probed");
-        assert_eq!(host, "127.0.0.1");
-        let worker_type = worker.worker_type().as_metric_label();
-        let accepted =
-            report_bootstrap_port_probe(worker.url(), worker_type, &host, port, source).await;
+        let accepted = registration_probe(&worker)
+            .expect("a prefill side registered with a port is probed")
+            .await;
 
         assert!(!accepted);
         assert!(logs_contain("bootstrap_host=\"127.0.0.1\""));
-        assert!(!logs_contain("bootstrap_host=\"s3cret-token\""));
+        assert!(!logs_contain("s3cret"));
+    }
+
+    /// The registration probe's line names the worker by its own masked
+    /// address: a rank of a data-parallel worker keeps its rank there, where
+    /// its address string alone shows none behind the query of its base.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_registration_probe_names_the_worker_by_its_own_masked_address() {
+        let refused = RefusedAddress::reserve();
+        let worker = BasicWorkerBuilder::new("http://127.0.0.1:8000?token=abc")
+            .worker_type(WorkerType::Prefill)
+            .runtime_type(RuntimeType::Sglang)
+            .bootstrap_port(Some(refused.port()))
+            .dp_config(1, 2)
+            .build();
+        assert_eq!(worker.url(), "http://127.0.0.1:8000?token=abc@1");
+
+        let accepted = registration_probe(&worker)
+            .expect("a prefill side registered with a port is probed")
+            .await;
+
+        assert!(!accepted);
+        assert!(logs_contain("worker=http://127.0.0.1:8000@1 worker_type="));
+        assert!(!logs_contain("abc"));
     }
 
     #[tokio::test]

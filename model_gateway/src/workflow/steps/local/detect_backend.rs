@@ -64,7 +64,7 @@ async fn detect_grpc_backend(
 
     Err(format!(
         "gRPC backend detection failed for {} (tried sglang, vllm, trtllm, tokenspeed, mlx): {}",
-        Endpoint::redacted_str(url),
+        Endpoint::redacted_base_url(url),
         errors.join("; ")
     ))
 }
@@ -93,7 +93,7 @@ async fn probe_models_endpoint(
     let models_url = format!("{}/v1/models", http_base_url(url));
     // The address as the probe's failures name it: a userinfo in it masked
     // (they end in the step's failure message and its lines).
-    let shown = Endpoint::redacted_str(&models_url);
+    let shown = Endpoint::redacted_base_url(&models_url);
 
     let mut req = client
         .get(&models_url)
@@ -153,7 +153,7 @@ async fn try_vllm_version(
     let response = req.send().await.map_err(|e| {
         format!(
             "Failed to reach {}: {}",
-            Endpoint::redacted_str(&version_url),
+            Endpoint::redacted_base_url(&version_url),
             e.without_url()
         )
     })?;
@@ -184,7 +184,7 @@ async fn try_sglang_server_info(
     let response = req.send().await.map_err(|e| {
         format!(
             "Failed to reach {}: {}",
-            Endpoint::redacted_str(&info_url),
+            Endpoint::redacted_base_url(&info_url),
             e.without_url()
         )
     })?;
@@ -245,7 +245,7 @@ async fn detect_http_backend(
             if sglang_result.is_ok() {
                 debug!(
                     "Both /version and /server_info succeeded for {}; /version is vLLM-specific, detecting as vllm",
-                    Endpoint::redacted_str(url)
+                    Endpoint::redacted_base_url(url)
                 );
             }
             return Ok("vllm".to_string());
@@ -269,7 +269,7 @@ async fn detect_http_backend(
         // instead of rejecting a healthy worker.
         ModelsProbe::UnrecognizedOwnedBy(owned_by) => {
             warn!(
-                worker = %Endpoint::redacted_str(url),
+                worker = %Endpoint::redacted_base_url(url),
                 owned_by = ?owned_by,
                 "Could not identify backend engine: /v1/models responded but its \
                  owned_by is not a known engine, and neither /version (vllm) nor \
@@ -281,7 +281,7 @@ async fn detect_http_backend(
         ModelsProbe::Failed(models_failure) => Err(format!(
             "Could not detect HTTP backend for {}: /v1/models: {models_failure}; \
              /version: {vllm_failure}; /server_info: {sglang_failure}",
-            Endpoint::redacted_str(url)
+            Endpoint::redacted_base_url(url)
         )),
         // Detected returned early above.
         ModelsProbe::Detected(runtime) => Ok(runtime),
@@ -329,7 +329,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
             debug!(
                 "Using explicitly configured runtime type: {} for {}",
                 config_runtime,
-                Endpoint::redacted_str(&config.url)
+                Endpoint::redacted_base_url(&config.url)
             );
             context.data.detected_runtime_type = Some(config_runtime.to_string());
             return Ok(StepResult::Success);
@@ -337,7 +337,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
 
         debug!(
             "Detecting backend for {} ({:?})",
-            Endpoint::redacted_str(&config.url),
+            Endpoint::redacted_base_url(&config.url),
             connection_mode
         );
 
@@ -350,7 +350,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
                         step_id: wfaas::StepId::new("detect_backend"),
                         message: format!(
                             "HTTP backend detection failed for {}: {}",
-                            Endpoint::redacted_str(&config.url),
+                            Endpoint::redacted_base_url(&config.url),
                             e
                         ),
                     })?
@@ -361,7 +361,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
                     step_id: wfaas::StepId::new("detect_backend"),
                     message: format!(
                         "gRPC backend detection failed for {}: {}",
-                        Endpoint::redacted_str(&config.url),
+                        Endpoint::redacted_base_url(&config.url),
                         e
                     ),
                 })?,
@@ -371,7 +371,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
             // worker that left it unspecified reaches this default of vLLM.
             ConnectionMode::Zmq => {
                 warn!(
-                    worker = %Endpoint::redacted_str(&config.url),
+                    worker = %Endpoint::redacted_base_url(&config.url),
                     "runtime_type unspecified for ZMQ worker; defaulting to vLLM \
                      EngineCore. A TokenSpeed or SGLang engine must declare its \
                      runtime to speak the correct wire protocol: `--backend \
@@ -386,7 +386,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
         debug!(
             "Detected backend: {} for {} ({:?})",
             detected,
-            Endpoint::redacted_str(&config.url),
+            Endpoint::redacted_base_url(&config.url),
             connection_mode
         );
         context.data.detected_runtime_type = Some(detected);

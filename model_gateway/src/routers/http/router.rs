@@ -108,8 +108,8 @@ use crate::{
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        identity::endpoint::Endpoint, ConnectionMode, RoutingPool, RuntimeType, Worker,
-        WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        ConnectionMode, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
+        WorkerType, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -303,7 +303,7 @@ impl Router {
                     }
                     Err(e) => {
                         error!(
-                            worker = Endpoint::redacted_str(worker.url()),
+                            worker = worker.redacted_url(),
                             endpoint,
                             "Failed to proxy GET request: {}",
                             cause(&e)
@@ -1062,7 +1062,7 @@ impl Router {
                         .await
                         .map_err(|e| {
                             error!(
-                                worker = Endpoint::redacted_str(worker.url()),
+                                worker = worker.redacted_url(),
                                 endpoint,
                                 "Failed to send request: {}",
                                 cause(&e)
@@ -1347,7 +1347,7 @@ impl Router {
             Err(e) => {
                 error!(
                     "Failed to send multipart transcription request worker_url={} route={} error={}",
-                    Endpoint::redacted_str(worker.url()),
+                    worker.redacted_url(),
                     route,
                     cause(&e)
                 );
@@ -1434,7 +1434,7 @@ impl Router {
             Err(e) => {
                 error!(
                     "Failed to send typed request worker_url={} route={} error={}",
-                    Endpoint::redacted_str(worker.url()),
+                    worker.redacted_url(),
                     route,
                     cause(&e)
                 );
@@ -1613,7 +1613,7 @@ impl Router {
             Err(e) => {
                 error!(
                     "Failed to send streamed request worker_url={} route={} error={}",
-                    Endpoint::redacted_str(worker.url()),
+                    worker.redacted_url(),
                     route,
                     cause(&e)
                 );
@@ -4783,6 +4783,52 @@ mod tests {
         assert!(!header.contains("secret"), "{header}");
         assert!(!logs_contain("secret"));
         assert!(logs_contain(&url.replacen("http://", "http://***@", 1)));
+    }
+
+    /// Loopback engine stub that answers at any path and keeps the URI it
+    /// was asked with.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_any_path_stub() -> (String, Arc<tokio::sync::Mutex<Option<String>>>) {
+        let asked = Arc::new(tokio::sync::Mutex::new(None));
+        let sink = Arc::clone(&asked);
+        let app = axum::Router::new().fallback(move |uri: http::Uri| {
+            let sink = Arc::clone(&sink);
+            async move {
+                *sink.lock().await = Some(uri.to_string());
+                ([(CONTENT_TYPE, "application/json")], "{}")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), asked)
+    }
+
+    /// A worker registered with a token in its query whose tail is an at-sign
+    /// and digits is asked with that query whole: the digits are text on the
+    /// wire and no rank. The routed-worker header and the request-sent event
+    /// show the address cut at the query, and no digit of the token.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn the_routed_worker_header_reads_no_rank_out_of_a_query() {
+        let (url, asked) = spawn_any_path_stub().await;
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&format!("{url}?token=abc@8642097531"))],
+        );
+
+        let header = routed_worker_id(&router, streamed_request(&[b"{\"text\":\"hello\"}"])).await;
+
+        assert_eq!(header, url);
+        assert!(!logs_contain("8642097531"));
+        let asked = asked.lock().await.clone().unwrap();
+        assert!(asked.contains("token=abc@8642097531"), "{asked}");
     }
 
     #[tokio::test]

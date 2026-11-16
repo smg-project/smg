@@ -664,6 +664,30 @@ fn test_create_decode_worker() {
     assert_eq!(worker.worker_type(), &WorkerType::Decode);
 }
 
+/// A worker's own health error names the worker by its own masked address:
+/// a token before a host of digits is a userinfo there, where the address
+/// string alone reads as a host and its rank.
+#[tokio::test]
+async fn a_failed_health_check_names_the_worker_by_its_own_masked_address() {
+    // The host `1` is the address 0.0.0.1, where nothing answers.
+    let worker = BasicWorkerBuilder::new("http://s3cret-token@1")
+        .health_config(HealthCheckConfig {
+            timeout_secs: 1,
+            ..Default::default()
+        })
+        .build();
+
+    let error = worker
+        .check_health_async()
+        .await
+        .expect_err("nothing answers the probe");
+
+    assert_eq!(
+        error.to_string(),
+        "Health check failed for worker http://***@1: health probe returned non-success"
+    );
+}
+
 #[tokio::test]
 async fn test_check_health_async() {
     use crate::worker::BasicWorkerBuilder;

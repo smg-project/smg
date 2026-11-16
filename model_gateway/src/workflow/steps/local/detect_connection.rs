@@ -86,7 +86,7 @@ async fn probe_http(
                 }),
                 (Err(h2_err), Ok(())) => {
                     debug!(
-                        worker = %Endpoint::redacted_str(&config.url),
+                        worker = %Endpoint::redacted_base_url(&config.url),
                         error = %h2_err,
                         "HTTP/2 prior-knowledge probe failed; staying on HTTP/1.1"
                     );
@@ -127,7 +127,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
         let url = config.url.clone();
         // The address as the step's lines and messages write it: a secret in
         // its userinfo masked.
-        let shown = Endpoint::redacted_str(&url);
+        let shown = Endpoint::redacted_base_url(&url);
         debug!(
             "Detecting connection mode for {shown} (timeout: {:?}s, max_attempts: {})",
             config.health.timeout_secs, config.max_connection_attempts

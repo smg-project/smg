@@ -3651,6 +3651,36 @@ async fn no_row_of_the_cache_trace_carries_a_registered_address_whole() {
     );
 }
 
+/// The tree decision's line names the selected worker by its own masked
+/// address: a token before a host of digits is a userinfo there, where the
+/// address string alone reads as a host and its rank.
+#[test]
+#[traced_test]
+fn the_tree_decision_names_the_worker_by_its_own_masked_address() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers = vec![
+        make_worker("http://s3cret-token@2130706433"),
+        make_worker("http://w2:8000"),
+    ];
+    let text = "a prefix the tree holds for one worker";
+    seed_string_tenants(&policy, &workers, text, &[workers[0].url()]);
+    route_text(&policy, &workers, text);
+
+    logs_assert(|lines: &[&str]| {
+        let line = lines
+            .iter()
+            .find(|line| line.contains("tree_match"))
+            .ok_or("the tree decision wrote no line")?;
+        if !line.contains("http://***@2130706433") {
+            return Err(format!("the line names the worker otherwise: {line}"));
+        }
+        match lines.iter().find(|line| line.contains("s3cret")) {
+            Some(line) => Err(format!("a line carries the token: {line}")),
+            None => Ok(()),
+        }
+    });
+}
+
 /// No debug line of a cache-aware decision carries a worker's registered
 /// address whole. The workers are registered with a password and a query
 /// token, and every line that names a worker is written by a decision of its

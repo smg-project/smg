@@ -395,7 +395,11 @@ impl BasicWorkerBuilder {
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
             pd_pairing: PdPairing::derive(&self.spec),
-            redacted_url: Endpoint::redacted_url(&self.spec.url),
+            redacted_url: Endpoint::redacted_worker_url(
+                &self.spec.url,
+                self.spec.dp_base_url.as_deref(),
+                self.spec.dp_rank,
+            ),
             decoding: DecodingLabels::of(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
@@ -447,9 +451,10 @@ impl BasicWorkerBuilder {
             )),
             kv_engine_id_unconfirmed: Arc::new(AtomicBool::new(false)),
             runtime: ArcSwap::from_pointee(WorkerRuntime::new(&metadata.spec.url, initial_status)),
-            circuit_breaker: ArcSwap::from_pointee(CircuitBreaker::with_config_and_label(
+            circuit_breaker: ArcSwap::from_pointee(CircuitBreaker::for_worker(
                 self.circuit_breaker_config,
                 metadata.spec.url.clone(),
+                metadata.redacted_url.clone(),
             )),
             metadata,
             backend_client,
@@ -494,14 +499,12 @@ fn bootstrap_host(spec: &WorkerSpec) -> String {
             .flatten()
     });
     host.unwrap_or_else(|| {
-        // Named as it was read, with no rank read out of it. The mask a log
-        // line names a worker by reads digits behind the last `@` as a rank
-        // and writes what stands before them as the host: a token, where
-        // the digits are a host no client reads.
-        let shown = Endpoint::parse(dialled).map_or_else(
-            |_| "<unparsable address>".to_string(),
-            |address| address.redacted(),
-        );
+        // The worker named by its own masked address, made from the spec's
+        // fields: no rank is read out of an address whose spec holds none,
+        // so a token before digits no client reads as a host is a userinfo
+        // there, and masked.
+        let shown =
+            Endpoint::redacted_worker_url(&spec.url, spec.dp_base_url.as_deref(), spec.dp_rank);
         tracing::warn!("Failed to parse URL '{shown}', defaulting to localhost");
         "localhost".to_string()
     })
@@ -537,6 +540,28 @@ mod tests {
         assert_eq!(from_url.is_healthy(), from_spec.is_healthy());
     }
 
+    /// A built worker's breaker names the worker by the worker's own masked
+    /// address in its lines: a token before a host of digits is a userinfo
+    /// there, where the address string alone reads as a host and its rank.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_built_workers_breaker_names_it_by_its_own_masked_address() {
+        let worker = BasicWorkerBuilder::new("http://s3cret-token@2130706433")
+            .circuit_breaker_config(CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..Default::default()
+            })
+            .build();
+
+        worker.record_outcome(500);
+
+        assert!(logs_contain(
+            "Circuit breaker state transition: closed -> open"
+        ));
+        assert!(logs_contain("worker_url=http://***@2130706433"));
+        assert!(!logs_contain("s3cret"));
+    }
+
     /// The rendered URL is computed once at build: a URL without userinfo is
     /// the URL byte for byte (its spelling kept), one with userinfo masks it
     /// whole and keeps the DP rank.
@@ -549,6 +574,31 @@ mod tests {
             .build();
         assert_eq!(with_secret.url(), "http://user:secret@worker:8080@2");
         assert_eq!(with_secret.redacted_url(), "http://***@worker:8080@2");
+    }
+
+    /// The rendered URL takes its rank from the worker and never from the
+    /// string's tail: a rank-expanded worker whose base carries a query keeps
+    /// its rank and loses the query, and a worker that was not expanded shows
+    /// no rank, whatever its address ends in.
+    #[test]
+    fn the_rendered_url_takes_its_rank_from_the_worker_and_never_from_the_string() {
+        for rank in [0, 1] {
+            let ranked = BasicWorkerBuilder::new("http://worker:8080?token=abc")
+                .dp_config(rank, 2)
+                .build();
+            assert_eq!(ranked.url(), format!("http://worker:8080?token=abc@{rank}"));
+            assert_eq!(ranked.redacted_url(), format!("http://worker:8080@{rank}"));
+        }
+        for (url, rendered) in [
+            ("http://worker:8080?token=abc@42", "http://worker:8080"),
+            ("http://worker:8080?token=@123456", "http://worker:8080"),
+            ("http://worker:8080/v1#frag@7", "http://worker:8080/v1"),
+            ("http://token@8080", "http://***@8080"),
+        ] {
+            let plain = BasicWorkerBuilder::new(url).build();
+            assert_eq!(plain.url(), url);
+            assert_eq!(plain.redacted_url(), rendered, "{url}");
+        }
     }
 
     #[test]
@@ -888,11 +938,11 @@ mod tests {
     }
 
     /// An address no client reads falls back to "localhost", and the
-    /// fallback's warning names it with no rank read out of it. The digits
-    /// are a host here: read as a rank, they left the token before them to
-    /// be written whole, as the host. An address the address type reads
-    /// with no rank is named as before, its userinfo masked: the third
-    /// spelling, whose digits fit no rank, and a socket path.
+    /// fallback's warning names the worker by its own masked address, made
+    /// from the spec's fields: no rank is read out of an address whose spec
+    /// holds none. The digits are a host here: read as a rank, they left the
+    /// token before them to be written whole, as the host. A socket path is
+    /// named as it is.
     #[test]
     #[tracing_test::traced_test]
     fn the_bootstrap_host_of_an_address_no_client_reads_is_localhost() {
@@ -905,7 +955,10 @@ mod tests {
         }
         assert!(!logs_contain("s3cret-token"));
         assert!(logs_contain(
-            "Failed to parse URL '<unparsable address>', defaulting to localhost"
+            "Failed to parse URL 'http://***@99999999999', defaulting to localhost"
+        ));
+        assert!(logs_contain(
+            "Failed to parse URL '***@99999999999', defaulting to localhost"
         ));
         assert!(logs_contain(
             "Failed to parse URL 'http://***@18446744073709551616', defaulting to localhost"

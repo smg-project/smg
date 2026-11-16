@@ -1116,6 +1116,33 @@ fn apply_connect_signal_reports_the_promoted_worker() {
     );
 }
 
+/// A connect signal's lines name the worker it found by the worker's own
+/// masked address: a token before a host of digits is a userinfo there,
+/// where the signal's address string alone reads as a host and its rank.
+#[test]
+#[tracing_test::traced_test]
+fn a_connect_signal_names_the_worker_by_its_own_masked_address() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = unprobed_worker("http://s3cret-token@2130706433");
+    worker.set_status(WorkerStatus::NotReady);
+    let revision = worker.revision();
+    registry.register(worker.clone()).unwrap();
+    let mut next_check = HashMap::new();
+    let signal = || WorkerConnected {
+        url: "http://s3cret-token@2130706433".to_string(),
+        revision,
+    };
+
+    // The first signal promotes the worker; the second moves nothing.
+    assert!(apply_connect_signal(&registry, signal(), &mut next_check, &test_config()).is_some());
+    assert!(apply_connect_signal(&registry, signal(), &mut next_check, &test_config()).is_none());
+
+    assert!(logs_contain("Promoted worker on connect signal"));
+    assert!(logs_contain("Connect signal applied no transition"));
+    assert!(logs_contain("worker_url=http://***@2130706433"));
+    assert!(!logs_contain("s3cret"));
+}
+
 /// A promotion by contact is a transition into service like one by probe:
 /// the label refresh is submitted for a locally registered worker.
 #[tokio::test]
@@ -1428,6 +1455,76 @@ async fn engine_metrics_scrapes_the_http_workers_and_names_the_others() {
         "{text}"
     );
     assert!(!text.contains("secret"), "{text}");
+}
+
+/// The answer names a worker by its base, masked with no rank read: a base
+/// carries none. An address that ends in an at-sign and digits once its
+/// trailing slash is dropped shows neither the token before them nor the
+/// digits as a rank: in the label of a scraped worker, in the comment
+/// line of one that is named, and in the line of a scrape that failed.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn engine_metrics_reads_no_rank_out_of_a_workers_base() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let stub_hits = hits.clone();
+    // An engine that answers its metrics at any path: the route is joined
+    // after the query of the address it is registered under.
+    let app = axum::Router::new().fallback(move || {
+        let hits = stub_hits.clone();
+        async move {
+            hits.fetch_add(1, Ordering::SeqCst);
+            STUB_METRICS
+        }
+    });
+    let base = serve_stub(app).await;
+
+    let registry = WorkerRegistry::new();
+    registry
+        .register(make_worker(
+            &format!("{base}/?token=s3cret@8642097531/"),
+            1,
+            1,
+        ))
+        .unwrap();
+    registry
+        .register(grpc_worker("http://s3cret-token@2130706433/"))
+        .unwrap();
+    // No client reads an address in this base (its digits are no IPv4
+    // address), so its scrape fails before a request leaves.
+    registry
+        .register(make_worker("http://s3cret-token@99999999999/", 1, 1))
+        .unwrap();
+
+    let text = match WorkerManager::get_engine_metrics(&registry).await {
+        EngineMetricsResult::Ok(text) => text,
+        EngineMetricsResult::Err(err) => panic!("the HTTP worker is scraped: {err}"),
+    };
+
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "the HTTP worker, once");
+    assert!(
+        text.contains(&format!("worker_addr=\"{base}\"")),
+        "the label carries the base cut at its path:\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("# not scraped: http://***@2130706433 (grpc worker)")),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line == "# not scraped: http://***@99999999999: GET /metrics failed"),
+        "{text}"
+    );
+    for shown in ["s3cret", "8642097531"] {
+        assert!(!text.contains(shown), "{shown} reached the answer:\n{text}");
+    }
+    logs_assert(
+        |lines: &[&str]| match lines.iter().find(|line| line.contains("s3cret")) {
+            Some(line) => Err(format!("a line carries the token: {line}")),
+            None => Ok(()),
+        },
+    );
+    assert!(logs_contain("worker_url=http://***@99999999999"));
 }
 
 /// Two registrations of one address under other credentials are one scrape
@@ -2084,6 +2181,40 @@ async fn test_removal_candidate_strips_dp_rank_suffix() {
 
     assert_eq!(removals.len(), 1);
     assert_eq!(removals[0].url, "http://10.130.99.80:30000");
+}
+
+/// A failed worker's removal names the worker by its base, masked with no
+/// rank read, in its own line and in the line of a submission the queue
+/// refuses: a base that ends in an at-sign and digits shows no token.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_failed_workers_removal_reads_no_rank_out_of_its_base() {
+    use crate::workflow::JobQueueConfig;
+    let registry = Arc::new(WorkerRegistry::new());
+    // A queue with no context refuses every submission, so the removal
+    // writes its two lines and no job writes one.
+    let job_queue = JobQueue::new(JobQueueConfig::default(), std::sync::Weak::new());
+
+    let worker = make_worker("http://s3cret-token@2130706433/", 2, 3);
+    worker.set_status(WorkerStatus::Failed);
+    let revision = worker.revision();
+    let worker_id = registry.register(Arc::clone(&worker)).unwrap();
+    assert_eq!(worker.base_url(), "http://s3cret-token@2130706433");
+
+    submit_removal_job(
+        &registry,
+        &worker_id,
+        worker.base_url(),
+        revision,
+        &job_queue,
+        UnhealthyRemovalScope::AllLocal,
+    )
+    .await;
+
+    assert!(logs_contain("Removing failed worker from registry"));
+    assert!(logs_contain("Failed to submit worker removal job"));
+    assert!(logs_contain("worker_url=http://***@2130706433"));
+    assert!(!logs_contain("s3cret"));
 }
 
 /// Under the discovery default, a failed static or API-added worker is

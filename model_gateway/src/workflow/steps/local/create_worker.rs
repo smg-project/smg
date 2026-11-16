@@ -71,7 +71,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 step_id: StepId::new("create_worker"),
                 message: format!(
                     "Worker {} already exists",
-                    Endpoint::redacted_str(&config.url)
+                    Endpoint::redacted_base_url(&config.url)
                 ),
             });
         }
@@ -80,7 +80,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // a window set by hand is the worker's only window, see `merge_labels`).
         let mut labels = merge_labels(&context.data.discovered_labels, &config.labels);
 
-        validate_constrained_decoding_label(&labels, &config.url, "create_worker")?;
+        validate_constrained_decoding_label(&labels, Named::AsGiven(&config.url), "create_worker")?;
         let (kv_connector, kv_role, kv_engine_id) = take_kv_transfer_metadata(config, &mut labels);
 
         let model_id = resolve_model_id(config, &labels);
@@ -98,7 +98,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     message: format!(
                         "ZMQ worker {} has no model identity: EngineCore does not report a \
                          served model name, so --model-path (or a model_id label) is required",
-                        Endpoint::redacted_str(&config.url)
+                        Endpoint::redacted_base_url(&config.url)
                     ),
                 })?
         } else {
@@ -117,7 +117,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // (mirrors the fail-fast AppContext applies to the global CLI names).
         validate_parser_overrides(
             &model_card,
-            &config.url,
+            Named::AsGiven(&config.url),
             app_context.router_config.parser,
             app_context.tool_parser_factory.as_ref(),
             app_context.reasoning_parser_factory.as_ref(),
@@ -152,7 +152,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             &flags,
             &app_context.worker_registry,
         ) {
-            warn!(model = %model_card.id, worker = %Endpoint::redacted_str(&config.url), "{message}");
+            warn!(model = %model_card.id, worker = %Endpoint::redacted_base_url(&config.url), "{message}");
         }
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
@@ -167,7 +167,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         } else {
             debug!(
                 "Runtime type unresolved for {} after detection; defaulting to sglang",
-                Endpoint::redacted_str(&config.url)
+                Endpoint::redacted_base_url(&config.url)
             );
             RuntimeType::Sglang
         };
@@ -198,7 +198,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 message: format!(
                     "ZMQ worker {} has unsupported runtime {}: only vllm, tokenspeed and \
                      sglang are supported over the ZMQ direct backend",
-                    Endpoint::redacted_str(&config.url),
+                    Endpoint::redacted_base_url(&config.url),
                     runtime_type
                 ),
             });
@@ -411,7 +411,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         debug!(
             "Created {} worker(s) for {} ({:?}, {} labels)",
             workers.len(),
-            Endpoint::redacted_str(&url),
+            Endpoint::redacted_base_url(&url),
             connection_mode,
             labels.len()
         );
@@ -426,13 +426,36 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
     }
 }
 
+/// The worker a registration check names in its refusal. The check masks
+/// it, so no caller can forget to, and the caller says which address it
+/// holds: no one reading of a string is right for both.
+pub(super) enum Named<'a> {
+    /// A registration's address as given. It carries no rank, so none is
+    /// read out of it: digits behind its last `@` are its own text.
+    AsGiven(&'a str),
+    /// A registered worker, by its own masked address, which names the
+    /// rank of a data-parallel worker.
+    Registered(&'a dyn Worker),
+}
+
+impl std::fmt::Display for Named<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AsGiven(url) => f.write_str(&Endpoint::redacted_base_url(url)),
+            Self::Registered(worker) => f.write_str(worker.redacted_url()),
+        }
+    }
+}
+
 /// A `constrained_decoding` label, configured, discovered or sent in a label
 /// update, must name a policy; a worker that would silently fall back to
 /// `requested` on a typo fails the `step` instead. The typed spec field needs
 /// no such check.
+///
+/// The refusal names the worker as [`Named`] masks it.
 pub(super) fn validate_constrained_decoding_label(
     labels: &HashMap<String, String>,
-    url: &str,
+    named: Named<'_>,
     step: &str,
 ) -> WorkflowResult<()> {
     match labels.get(ConstrainedDecoding::LABEL) {
@@ -441,7 +464,7 @@ pub(super) fn validate_constrained_decoding_label(
                 .map(drop)
                 .map_err(|why| WorkflowError::StepFailed {
                     step_id: StepId::new(step),
-                    message: format!("Worker {}: {why}", Endpoint::redacted_str(url)),
+                    message: format!("Worker {named}: {why}"),
                 })
         }
         None => Ok(()),
@@ -496,6 +519,9 @@ pub(super) fn resolve_model_id<'a>(
 /// registered worker serving the same model. Resolution stays deterministic
 /// (lexicographically smallest name wins), but only one format parses
 /// correctly — operators should see the conflict at deploy time.
+///
+/// `worker_url` is the new worker's address as given, or the base an update
+/// hands on: neither carries a rank, so the line reads none out of it.
 pub(super) fn warn_on_conflicting_parser_overrides(
     card: &ModelCard,
     worker_url: &str,
@@ -523,7 +549,7 @@ pub(super) fn warn_on_conflicting_parser_overrides(
                 if new_name != existing_name {
                     warn!(
                         model = %card.id,
-                        new_worker = %Endpoint::redacted_str(worker_url),
+                        new_worker = %Endpoint::redacted_base_url(worker_url),
                         existing_worker = existing.redacted_url(),
                         %kind,
                         new = %new_name,
@@ -541,9 +567,11 @@ pub(super) fn warn_on_conflicting_parser_overrides(
 /// Reject parser-override names the registries don't know: the legacy parsers', and, under
 /// `--parser symphony`, Symphony's tables (`regular::symphony::check_names`). A name whose
 /// factory is absent is not checked (parsers unused in that configuration).
+///
+/// The refusal names the worker as [`Named`] masks it.
 pub(super) fn validate_parser_overrides(
     card: &ModelCard,
-    worker_url: &str,
+    named: Named<'_>,
     parser: ParserChoice,
     tool_parser_factory: Option<&tool_parser::ParserFactory>,
     reasoning_parser_factory: Option<&reasoning_parser::ParserFactory>,
@@ -556,9 +584,8 @@ pub(super) fn validate_parser_overrides(
     )
     .map_err(|why| {
         format!(
-            "worker {} declares a parser override for model '{}' the gateway cannot \
+            "worker {named} declares a parser override for model '{}' the gateway cannot \
              read with: {why}",
-            Endpoint::redacted_str(worker_url),
             card.id
         )
     })
@@ -628,7 +655,7 @@ fn registry_reads_over_the_flags(
          reads only the models the registry does not know",
         table.name(),
         card.id,
-        Endpoint::redacted_str(worker_url),
+        Endpoint::redacted_base_url(worker_url),
         spell(flags.tool.as_deref()),
         spell(flags.reasoning.as_deref()),
     ))
@@ -818,7 +845,7 @@ fn validate_overload_overrides(config: &WorkerSpec) -> Result<(), String> {
         return Err(format!(
             "worker {} sets overload.waiting_requests to 0: Must be >= 1 \
              (0 would mark every worker overloaded)",
-            Endpoint::redacted_str(&config.url)
+            Endpoint::redacted_base_url(&config.url)
         ));
     }
     if let Some(threshold) = config.overload.token_usage {
@@ -826,7 +853,7 @@ fn validate_overload_overrides(config: &WorkerSpec) -> Result<(), String> {
             return Err(format!(
                 "worker {} sets overload.token_usage to {threshold}: Must be a \
                  fraction in (0.0, 1.0]",
-                Endpoint::redacted_str(&config.url)
+                Endpoint::redacted_base_url(&config.url)
             ));
         }
     }
@@ -857,7 +884,7 @@ fn validate_zmq_handshake_override(
         return Err(format!(
             "worker {} sets zmq_handshake_address but its connection mode is \
              {connection_mode:?}: the field is only meaningful for ZMQ workers",
-            Endpoint::redacted_str(&config.url)
+            Endpoint::redacted_base_url(&config.url)
         ));
     }
     Ok(())
@@ -906,8 +933,8 @@ fn validate_zmq_handshake_address(
                 "ZMQ worker {} would bind handshake address {handshake}, already claimed by \
                  worker {}: the derived port is a hash of the ipc path, so rename \
                  this worker's ipc path or set zmq_handshake_address to a free tcp:// address",
-                Endpoint::redacted_str(url),
-                Endpoint::redacted_str(existing_url)
+                Endpoint::redacted_base_url(url),
+                Endpoint::redacted_base_url(existing_url)
             ));
         }
     }
@@ -934,7 +961,7 @@ fn resolve_zmq_health_config(
     warn!(
         "Ignoring disabled health checks for ZMQ worker {}: the ZMQ probe is a local liveness \
          check and the only path that reconnects a restarted engine, so it stays enabled",
-        Endpoint::redacted_str(url)
+        Endpoint::redacted_base_url(url)
     );
     HealthCheckConfig {
         disable_health_check: false,
@@ -994,7 +1021,7 @@ fn validate_zmq_worker_type(
         step_id: StepId::new("create_worker"),
         message: format!(
             "ZMQ worker {} cannot serve worker type {worker_type}: {reason}",
-            Endpoint::redacted_str(url)
+            Endpoint::redacted_base_url(url)
         ),
     })
 }
@@ -1143,7 +1170,7 @@ fn validate_zmq_dp(
             message: format!(
                 "ZMQ worker {} cannot be dp-aware expanded (dp_size={dp_size}); \
                  configure a grouped ZMQ worker (`dp_size` on the worker spec) instead",
-                Endpoint::redacted_str(url)
+                Endpoint::redacted_base_url(url)
             ),
         });
     }
@@ -1187,6 +1214,35 @@ mod tests {
 
         warn_on_conflicting_parser_overrides(&replacement, "http://other:8000", &registry);
         assert!(logs_contain("conflicting parser"));
+    }
+
+    /// The warning names the new worker by an address that carries no rank,
+    /// so none is read out of it: a token before a host of digits is masked.
+    #[traced_test]
+    #[test]
+    fn the_parser_override_warning_reads_no_rank_out_of_the_new_workers_address() {
+        let mut registered = ModelCard::new("m");
+        registered.tool_parser = Some("one".into());
+        let registry = WorkerRegistry::new();
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://h:8000")
+                    .model(registered)
+                    .build(),
+            ))
+            .unwrap();
+        let mut replacement = ModelCard::new("m");
+        replacement.tool_parser = Some("two".into());
+
+        warn_on_conflicting_parser_overrides(
+            &replacement,
+            "http://s3cret-token@2130706433",
+            &registry,
+        );
+
+        assert!(logs_contain("conflicting parser"));
+        assert!(logs_contain("new_worker=http://***@2130706433"));
+        assert!(!logs_contain("s3cret"));
     }
 
     /// Under `--parser symphony`, a gRPC worker's registration resolves the table whose failure
@@ -2496,7 +2552,7 @@ mod tests {
             assert_eq!(card.tool_parser, None);
             validate_parser_overrides(
                 &card,
-                "grpc://engine:50051",
+                Named::AsGiven("grpc://engine:50051"),
                 ParserChoice::Legacy,
                 Some(&tool_factory),
                 Some(&reasoning_factory),
@@ -2520,7 +2576,7 @@ mod tests {
         let check = |card: &ModelCard, parser| {
             validate_parser_overrides(
                 card,
-                "http://w:1",
+                Named::AsGiven("http://w:1"),
                 parser,
                 Some(&tool_factory),
                 Some(&reasoning_factory),
@@ -2552,7 +2608,7 @@ mod tests {
         let card = ModelCard::new("m");
         assert!(validate_parser_overrides(
             &card,
-            "http://w:1",
+            Named::AsGiven("http://w:1"),
             ParserChoice::Legacy,
             Some(&tool_factory),
             Some(&reasoning_factory)
@@ -2563,7 +2619,7 @@ mod tests {
         let card = ModelCard::new("m").with_tool_parser("json");
         assert!(validate_parser_overrides(
             &card,
-            "http://w:1",
+            Named::AsGiven("http://w:1"),
             ParserChoice::Legacy,
             Some(&tool_factory),
             None
@@ -2575,7 +2631,7 @@ mod tests {
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
         let err = validate_parser_overrides(
             &card,
-            "http://user:secret@w:1",
+            Named::AsGiven("http://user:secret@w:1"),
             ParserChoice::Legacy,
             Some(&tool_factory),
             None,
@@ -2590,7 +2646,7 @@ mod tests {
         let card = ModelCard::new("m").with_reasoning_parser("definitely-not-a-parser");
         let err = validate_parser_overrides(
             &card,
-            "http://user:secret@w:1",
+            Named::AsGiven("http://user:secret@w:1"),
             ParserChoice::Legacy,
             None,
             Some(&reasoning_factory),
@@ -2602,12 +2658,31 @@ mod tests {
             "{err}"
         );
 
+        // A token before a host of digits is masked too: the address as
+        // given carries no rank, so the digits are its host.
+        let err = validate_parser_overrides(
+            &card,
+            Named::AsGiven("http://s3cret-token@2130706433"),
+            ParserChoice::Legacy,
+            None,
+            Some(&reasoning_factory),
+        )
+        .expect_err("unknown reasoning parser must fail registration");
+        assert!(
+            err.contains("worker http://***@2130706433 declares") && !err.contains("s3cret"),
+            "{err}"
+        );
+
         // Absent factories skip validation (parsers unused in that config).
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
-        assert!(
-            validate_parser_overrides(&card, "http://w:1", ParserChoice::Legacy, None, None)
-                .is_ok()
-        );
+        assert!(validate_parser_overrides(
+            &card,
+            Named::AsGiven("http://w:1"),
+            ParserChoice::Legacy,
+            None,
+            None
+        )
+        .is_ok());
     }
 }
 
@@ -2801,7 +2876,7 @@ mod rank_window_tests {
 mod constrained_decoding_label_tests {
     use std::collections::HashMap;
 
-    use super::validate_constrained_decoding_label;
+    use super::{validate_constrained_decoding_label, Named};
 
     /// A configured or discovered `constrained_decoding` label must name a
     /// policy; anything else fails the registration with the reason.
@@ -2809,7 +2884,7 @@ mod constrained_decoding_label_tests {
     fn a_constrained_decoding_label_must_name_a_policy() {
         let mut labels = HashMap::new();
         let check = |labels: &HashMap<String, String>, step: &str| {
-            validate_constrained_decoding_label(labels, "http://w:8000", step)
+            validate_constrained_decoding_label(labels, Named::AsGiven("http://w:8000"), step)
         };
         assert!(check(&labels, "create_worker").is_ok());
         labels.insert("constrained_decoding".to_string(), "always".to_string());
@@ -2823,5 +2898,28 @@ mod constrained_decoding_label_tests {
             format!("{update:?}").contains("update_worker_properties"),
             "{update}"
         );
+    }
+
+    /// The refusal masks the address it names, the check itself: an
+    /// address as given carries no rank, so a token before a host of digits
+    /// is a userinfo and never a host with a rank.
+    #[test]
+    fn a_refused_label_names_the_address_as_given_masked() {
+        let labels = HashMap::from([("constrained_decoding".to_string(), "sometimes".to_string())]);
+        for (url, named) in [
+            ("http://user:secret@w:8000", "Worker http://***@w:8000:"),
+            (
+                "http://s3cret-token@2130706433",
+                "Worker http://***@2130706433:",
+            ),
+        ] {
+            let message =
+                validate_constrained_decoding_label(&labels, Named::AsGiven(url), "create_worker")
+                    .unwrap_err()
+                    .to_string();
+            assert!(message.contains(named), "{url}: {message}");
+            assert!(!message.contains("secret"), "{url}: {message}");
+            assert!(!message.contains("s3cret"), "{url}: {message}");
+        }
     }
 }

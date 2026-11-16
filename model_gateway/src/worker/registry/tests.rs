@@ -883,6 +883,136 @@ fn a_mesh_imports_lines_name_the_address_masked() {
     });
 }
 
+/// The lines of a worker built from a mesh state name it by its own masked
+/// address: a token before a host of digits is a userinfo there, where the
+/// state's address string alone reads as a host and its rank.
+#[test]
+#[tracing_test::traced_test]
+fn a_mesh_import_is_named_by_its_own_masked_address() {
+    let url = "http://s3cret-token@2130706433";
+    let spec = |model: &str| spec_bytes(url, model, WorkerType::Regular);
+    let state = |version: u64, spec: Vec<u8>| smg_mesh::WorkerState {
+        version,
+        ..remote_state("peer-w1", url, true, spec)
+    };
+
+    // A first import from a spec and its owner's replacement; then, on a
+    // registry of its own, a first import with no spec and its replacement.
+    // Each replacement is followed by the state's health hint.
+    let registry = WorkerRegistry::new();
+    registry.on_remote_worker_state(&state(1, spec("llama-3")));
+    registry.on_remote_worker_state(&state(2, spec("llama-4")));
+    let registry = WorkerRegistry::new();
+    registry.on_remote_worker_state(&state(1, Vec::new()));
+    registry.on_remote_worker_state(&state(2, Vec::new()));
+
+    logs_assert(|lines: &[&str]| {
+        for message in [
+            "Registered mesh-synced worker into local registry",
+            "Rebuilt mesh-synced worker from its owner's replacement",
+            "Rebuilt the minimal mesh-synced worker from its owner's replacement",
+            "Updated health for existing mesh-synced worker",
+        ] {
+            let line = lines
+                .iter()
+                .find(|line| line.contains(message))
+                .ok_or_else(|| format!("no line says: {message}"))?;
+            if !line.contains("url=http://***@2130706433") {
+                return Err(format!("the line names the import otherwise: {line}"));
+            }
+        }
+        match lines.iter().find(|line| line.contains("s3cret")) {
+            Some(line) => Err(format!("a line carries the token: {line}")),
+            None => Ok(()),
+        }
+    });
+}
+
+/// A peer's state that no worker is built from is named by the masked
+/// address its import carries, and a state for a worker held under its id by
+/// that worker's own: a token before a host of digits is a userinfo there,
+/// where the state's address string alone reads as a host and its rank. The
+/// host-local states by address and by spec, a peer's echo of a local
+/// worker, and the two lines of a spec that does not decode. A rank this
+/// registry owns keeps its host and its rank in the line of its echo.
+#[test]
+#[tracing_test::traced_test]
+fn a_peers_state_is_named_by_the_masked_address_its_import_carries() {
+    let url = "http://s3cret-token@2130706433";
+    let state = |version: u64, url: &str, spec: Vec<u8>| smg_mesh::WorkerState {
+        version,
+        ..remote_state("peer-w1", url, true, spec)
+    };
+    let host_local = {
+        let mut spec = openai_protocol::worker::WorkerSpec::new(url);
+        spec.connection_mode = ConnectionMode::Zmq;
+        serde_json::to_vec(&spec).unwrap()
+    };
+
+    // Host-local by its address, then by its spec: neither is imported.
+    let registry = WorkerRegistry::new();
+    registry.on_remote_worker_state(&state(1, "tcp://s3cret-token@2130706433", Vec::new()));
+    registry.on_remote_worker_state(&state(1, url, host_local));
+    assert!(registry.is_empty());
+    // A spec that does not decode: the minimal import, then its owner's
+    // replacement, which does not decode either.
+    registry.on_remote_worker_state(&state(1, url, b"not a spec".to_vec()));
+    registry.on_remote_worker_state(&state(2, url, b"not a spec".to_vec()));
+    assert!(registry.get_by_url(url).is_some());
+    // A peer's echo of a worker this registry owns.
+    let registry = WorkerRegistry::new();
+    registry
+        .register(Arc::new(BasicWorkerBuilder::new(url).build()))
+        .unwrap();
+    registry.on_remote_worker_state(&state(1, url, Vec::new()));
+    // And of a rank it owns, in a state that carries no spec.
+    let rank = BasicWorkerBuilder::new("http://worker:8000")
+        .dp_config(1, 2)
+        .build();
+    registry.register(Arc::new(rank)).unwrap();
+    registry.on_remote_worker_state(&state(1, "http://worker:8000@1", Vec::new()));
+
+    logs_assert(|lines: &[&str]| {
+        for (message, named) in [
+            (
+                "Ignoring mesh state for host-local ZMQ worker",
+                "url=tcp://***@2130706433",
+            ),
+            (
+                "Ignoring mesh state for host-local ZMQ worker",
+                "url=http://***@2130706433",
+            ),
+            (
+                "undecodable WorkerSpec in mesh state; importing minimal worker",
+                "url=http://***@2130706433",
+            ),
+            (
+                "carries a spec this node cannot decode",
+                "url=http://***@2130706433",
+            ),
+            (
+                "Ignoring mesh state for locally-owned worker",
+                "url=http://***@2130706433",
+            ),
+            (
+                "Ignoring mesh state for locally-owned worker",
+                "url=http://worker:8000@1",
+            ),
+        ] {
+            if !lines
+                .iter()
+                .any(|line| line.contains(message) && line.contains(named))
+            {
+                return Err(format!("no line says '{message}' with {named}"));
+            }
+        }
+        match lines.iter().find(|line| line.contains("s3cret")) {
+            Some(line) => Err(format!("a line carries the token: {line}")),
+            None => Ok(()),
+        }
+    });
+}
+
 /// The lines of a refused replacement and of divergent sampling defaults
 /// name the address masked.
 #[test]

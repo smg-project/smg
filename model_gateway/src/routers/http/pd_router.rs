@@ -89,8 +89,8 @@ use crate::{
         PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        identity::endpoint::Endpoint, PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker,
-        WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
+        UNKNOWN_MODEL_ID,
     },
 };
 
@@ -1273,7 +1273,7 @@ impl PDRouter {
         e: &reqwest::Error,
     ) -> Response {
         error!(
-            worker = Endpoint::redacted_str(worker.url()),
+            worker = worker.redacted_url(),
             "PD {what} timed out: {}",
             cause(e)
         );
@@ -1299,7 +1299,7 @@ impl PDRouter {
             return Self::side_timed_out(worker, side.name(), what, e);
         }
         error!(
-            worker = Endpoint::redacted_str(worker.url()),
+            worker = worker.redacted_url(),
             worker_type = side.name(),
             "PD {what} failed below HTTP: {}",
             cause(e)
@@ -1454,7 +1454,7 @@ impl PDRouter {
                 ));
             }
             let result = self
-                .process_prefill_response(resp, prefill.url(), context.return_logprob)
+                .process_prefill_response(resp, prefill.as_ref(), context.return_logprob)
                 .await;
             drop(prefill_guard);
             let (_, body) = result.map_err(DispatchError::Prefill)?;
@@ -2368,7 +2368,7 @@ impl PDRouter {
     async fn process_prefill_response(
         &self,
         prefill_response: reqwest::Response,
-        prefill_url: &str,
+        prefill: &dyn Worker,
         return_logprob: bool,
     ) -> Result<(StatusCode, Option<Bytes>), Response> {
         let prefill_status = prefill_response.status();
@@ -2376,7 +2376,7 @@ impl PDRouter {
         if !prefill_status.is_success() {
             error!(
                 "Prefill server returned error status prefill_url={} status={}",
-                Endpoint::redacted_str(prefill_url),
+                prefill.redacted_url(),
                 prefill_status
             );
             return Err(Self::side_refused(PdSide::Prefill, prefill_response).await);
@@ -2928,7 +2928,7 @@ impl RouterTrait for PDRouter {
                 // The request's own timeout is a 504, as on every other
                 // path, and the worker records it as such.
                 error!(
-                    worker = Endpoint::redacted_str(worker.url()),
+                    worker = worker.redacted_url(),
                     endpoint = "/v1/messages/count_tokens",
                     "PD count-tokens request timed out: {}",
                     cause(&e)
@@ -2940,7 +2940,7 @@ impl RouterTrait for PDRouter {
                 // The worker's address belongs in the log, not in the
                 // client's answer: it names the endpoint an operator reads.
                 error!(
-                    worker = Endpoint::redacted_str(worker.url()),
+                    worker = worker.redacted_url(),
                     endpoint = "/v1/messages/count_tokens",
                     "PD count-tokens request failed below HTTP: {}",
                     cause(&e)
@@ -2965,7 +2965,7 @@ impl RouterTrait for PDRouter {
             }
             Err(e) if is_request_timeout(&e) => {
                 error!(
-                    worker = Endpoint::redacted_str(worker.url()),
+                    worker = worker.redacted_url(),
                     endpoint = "/v1/messages/count_tokens",
                     "PD count-tokens response timed out: {}",
                     cause(&e)
@@ -2975,7 +2975,7 @@ impl RouterTrait for PDRouter {
             }
             Err(e) => {
                 error!(
-                    worker = Endpoint::redacted_str(worker.url()),
+                    worker = worker.redacted_url(),
                     endpoint = "/v1/messages/count_tokens",
                     "PD count-tokens response body could not be read: {}",
                     cause(&e)
@@ -5955,6 +5955,30 @@ mod tests {
         assert_eq!(error_code(&response), Some("moriio_pair_misconfigured"));
         assert!(taken(&prefill_seen).is_empty());
         assert!(taken(&decode_seen).is_empty());
+    }
+
+    /// A prefill side's error answer is logged under the worker's own masked
+    /// address: a token before a host of digits is a userinfo there, where
+    /// the address string alone reads as a host and its rank.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_prefill_error_line_names_the_worker_by_its_own_masked_address() {
+        let router = create_test_pd_router();
+        let prefill = BasicWorkerBuilder::new("http://s3cret-token@2130706433")
+            .worker_type(WorkerType::Prefill)
+            .build();
+        let upstream = http::Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body("the engine failed")
+            .unwrap();
+
+        let refused = router
+            .process_prefill_response(reqwest::Response::from(upstream), &prefill, false)
+            .await;
+
+        assert!(refused.is_err());
+        assert!(logs_contain("prefill_url=http://***@2130706433 status=500"));
+        assert!(!logs_contain("s3cret"));
     }
 
     /// A pair refused for running two transfer modes is named in the warning

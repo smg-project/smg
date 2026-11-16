@@ -172,8 +172,8 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// The URL as a request's success path shows it (the routed-worker
     /// response header, the cache-trace header, the request-sent event): the
     /// registered URL byte for byte when it has no userinfo, query or
-    /// fragment, otherwise `Endpoint::redacted_str`'s form (see
-    /// `Endpoint::redacted_url`). Computed once at construction
+    /// fragment, otherwise its masked form, with the worker's own rank (see
+    /// `Endpoint::redacted_worker_url`). Computed once at construction
     /// (`WorkerMetadata::redacted_url`).
     fn redacted_url(&self) -> &str {
         &self.metadata().redacted_url
@@ -873,13 +873,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
             }
             ConnectionMode::Grpc | ConnectionMode::Zmq => {
                 let client = admin_backend_client(
-                    self.url(),
+                    self.redacted_url(),
                     "flush_cache",
                     self.get_backend_client().await?,
                 )?;
                 let result = client.flush_cache(0.0).await;
                 admin_grpc_result(
-                    self.url(),
+                    self.redacted_url(),
                     "flush_cache",
                     result.map(|r| (r.success, r.message)),
                 )
@@ -893,7 +893,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
             ConnectionMode::Http => {
                 let body = serde_json::to_value(options).map_err(|e| {
                     failed(
-                        self.url(),
+                        self.redacted_url(),
                         "start_profile",
                         format!("failed to serialize profile options: {e}"),
                     )
@@ -910,7 +910,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
             }
             ConnectionMode::Grpc | ConnectionMode::Zmq => {
                 let client = admin_backend_client(
-                    self.url(),
+                    self.redacted_url(),
                     "start_profile",
                     self.get_backend_client().await?,
                 )?;
@@ -925,7 +925,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                 };
                 let result = client.start_profile(req).await;
                 admin_grpc_result(
-                    self.url(),
+                    self.redacted_url(),
                     "start_profile",
                     result.map(|r| (r.success, r.message)),
                 )
@@ -950,13 +950,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
             }
             ConnectionMode::Grpc | ConnectionMode::Zmq => {
                 let client = admin_backend_client(
-                    self.url(),
+                    self.redacted_url(),
                     "stop_profile",
                     self.get_backend_client().await?,
                 )?;
                 let result = client.stop_profile().await;
                 admin_grpc_result(
-                    self.url(),
+                    self.redacted_url(),
                     "stop_profile",
                     result.map(|r| (r.success, r.message)),
                 )
@@ -1134,6 +1134,7 @@ impl BasicWorker {
         let base_url = self.metadata.base_url().to_string();
         let model_id = self.metadata.model_id().to_string();
         let url = self.metadata.spec.url.clone();
+        let shown = self.metadata.redacted_url.clone();
         let runtime = self.metadata.spec.runtime_type;
         let worker_type = self.metadata.spec.worker_type;
         let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
@@ -1181,8 +1182,7 @@ impl BasicWorker {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "ZMQ backend handshake failed for {}: {e}; will retry on the next health probe",
-                        super::endpoint::Endpoint::redacted_str(&url)
+                        "ZMQ backend handshake failed for {shown}: {e}; will retry on the next health probe"
                     );
                     started.store(false, Ordering::SeqCst);
                 }
@@ -1533,7 +1533,7 @@ impl Worker for BasicWorker {
             Ok(())
         } else {
             Err(WorkerError::HealthCheckFailed {
-                url: self.metadata.spec.url.clone(),
+                url: self.metadata.redacted_url.clone(),
                 reason: "health probe returned non-success".to_string(),
             })
         }
@@ -1907,7 +1907,7 @@ impl Worker for BasicWorker {
                                         e
                                     );
                                     Err(WorkerError::ConnectionFailed {
-                                        url: self.metadata.spec.url.clone(),
+                                        url: self.metadata.redacted_url.clone(),
                                         reason: format!("Failed to connect to gRPC server: {e}"),
                                     })
                                 }
@@ -1931,7 +1931,7 @@ impl Worker for BasicWorker {
                 }
                 self.spawn_zmq_connect_driver(&cell);
                 Err(WorkerError::ConnectionFailed {
-                    url: self.metadata.spec.url.clone(),
+                    url: self.metadata.redacted_url.clone(),
                     reason: "ZMQ backend handshake has not completed yet".to_string(),
                 })
             }

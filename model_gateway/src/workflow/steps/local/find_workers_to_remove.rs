@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::find_workers_by_url;
+use super::{find_workers_by_url, shown_found};
 use crate::{worker::identity::endpoint::Endpoint, workflow::data::WorkerRemovalWorkflowData};
 
 /// Request structure for worker removal.
@@ -86,7 +86,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
         debug!(
             "Found {} worker(s) to remove for {}",
             workers_to_remove.len(),
-            Endpoint::redacted_str(&request.url)
+            shown_found(&request.url, &workers_to_remove)
         );
 
         // The workers, their URLs and their models for the steps after this one.

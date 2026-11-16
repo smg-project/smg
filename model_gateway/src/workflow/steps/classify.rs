@@ -96,7 +96,7 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
                 message: format!(
                     "worker {} targets the {} provider, but this build carries no {} router; \
                      rebuild with the `{}` Cargo feature to admit it",
-                    Endpoint::redacted_str(&config.url),
+                    Endpoint::redacted_base_url(&config.url),
                     missing.label,
                     missing.label,
                     missing.feature
@@ -113,7 +113,7 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
             };
             debug!(
                 "Worker {} explicitly configured as {} → {:?}",
-                Endpoint::redacted_str(&config.url),
+                Endpoint::redacted_base_url(&config.url),
                 config.runtime_type,
                 kind
             );
@@ -125,7 +125,7 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         if let Some(provider) = ProviderType::from_url(&config.url) {
             debug!(
                 "Worker {} URL matches known provider ({}) → External",
-                Endpoint::redacted_str(&config.url),
+                Endpoint::redacted_base_url(&config.url),
                 provider
             );
             context.data.worker_kind = Some(WorkerKind::External);
@@ -148,7 +148,7 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         {
             debug!(
                 "Worker {} responded to /health → Local",
-                Endpoint::redacted_str(&config.url)
+                Endpoint::redacted_base_url(&config.url)
             );
             context.data.worker_kind = Some(WorkerKind::Local);
             return Ok(StepResult::Success);
@@ -158,7 +158,7 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         if try_grpc_reachable(&config.url, timeout).await.is_ok() {
             debug!(
                 "Worker {} responded to gRPC health → Local",
-                Endpoint::redacted_str(&config.url)
+                Endpoint::redacted_base_url(&config.url)
             );
             context.data.worker_kind = Some(WorkerKind::Local);
             return Ok(StepResult::Success);
@@ -170,7 +170,7 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         {
             debug!(
                 "Worker {} /v1/models owned_by={} → Local",
-                Endpoint::redacted_str(&config.url),
+                Endpoint::redacted_base_url(&config.url),
                 owned_by
             );
             context.data.worker_kind = Some(WorkerKind::Local);
@@ -181,7 +181,7 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         // detect_connection_mode will retry with the full startup timeout).
         debug!(
             "Worker {} not reachable on any probe → defaulting to Local",
-            Endpoint::redacted_str(&config.url)
+            Endpoint::redacted_base_url(&config.url)
         );
         context.data.worker_kind = Some(WorkerKind::Local);
         Ok(StepResult::Success)

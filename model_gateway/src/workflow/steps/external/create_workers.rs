@@ -157,13 +157,13 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
         if model_cards.is_empty() {
             debug!(
                 "Creating wildcard worker (no models) for {}",
-                Endpoint::redacted_str(&config.url)
+                Endpoint::redacted_base_url(&config.url)
             );
         } else {
             debug!(
                 "Creating one external worker with {} discovered models for {}",
                 model_cards.len(),
-                Endpoint::redacted_str(&config.url)
+                Endpoint::redacted_base_url(&config.url)
             );
         }
 
@@ -185,12 +185,12 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
         if model_cards.is_empty() {
             info!(
                 "Created wildcard worker at {} (accepts any model, user auth forwarded)",
-                Endpoint::redacted_str(&normalized_url)
+                Endpoint::redacted_base_url(&normalized_url)
             );
         } else {
             info!(
                 "Created external worker at {} with {} discovered models",
-                Endpoint::redacted_str(&normalized_url),
+                Endpoint::redacted_base_url(&normalized_url),
                 model_cards.len()
             );
         }

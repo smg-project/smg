@@ -79,7 +79,6 @@ use crate::{
     service_discovery::DISCOVERY_ID_LABEL,
     worker::{
         endpoint_key,
-        identity::endpoint::Endpoint,
         registry::{event::WorkerEvent, WorkerId},
         ConnectionMode, EndpointKey, Worker, WorkerOrigin, WorkerRegistry,
     },
@@ -499,7 +498,7 @@ impl WorkerSyncAdapter {
         let raised = worker_state_of(&id, &worker, &self.node_name);
         info!(
             worker_id,
-            url = %Endpoint::redacted_str(&state.url),
+            url = %worker.redacted_url(),
             stored = state.version,
             published = raised.version,
             "publishing a claimed worker above a later state of its key: a peer saw the earlier \
@@ -575,10 +574,10 @@ impl WorkerSyncAdapter {
     fn drop_dead_owner_import(&self, state: &WorkerState) {
         match self.import_of_key(state) {
             Some(id) => {
-                if self.worker_registry.remove_remote(&id).is_some() {
+                if let Some(worker) = self.worker_registry.remove_remote(&id) {
                     info!(
                         owner = %state.owner,
-                        url = %Endpoint::redacted_str(&state.url),
+                        url = %worker.redacted_url(),
                         worker_id = %id.as_str(),
                         "removed mesh-imported worker: its owner node is down"
                     );
@@ -586,7 +585,7 @@ impl WorkerSyncAdapter {
             }
             None => debug!(
                 owner = %state.owner,
-                url = %Endpoint::redacted_str(&state.url),
+                url = %WorkerRegistry::shown_state(state),
                 "ignoring worker state published by a node that is down"
             ),
         }
@@ -600,9 +599,9 @@ impl WorkerSyncAdapter {
     /// instance at the address holds a different id and is not held back.
     fn drop_held_back_import(&self, state: &WorkerState) {
         if let Some(id) = self.import_of_key(state) {
-            if self.worker_registry.remove_remote(&id).is_some() {
+            if let Some(worker) = self.worker_registry.remove_remote(&id) {
                 info!(
-                    url = %Endpoint::redacted_str(&state.url),
+                    url = %worker.redacted_url(),
                     worker_id = %id.as_str(),
                     "removed mesh-imported worker: this gateway removed its endpoint"
                 );
@@ -626,7 +625,7 @@ impl WorkerSyncAdapter {
         if self.is_own_orphan(worker_id, state) {
             info!(
                 worker_id,
-                url = %Endpoint::redacted_str(&state.url),
+                url = %WorkerRegistry::shown_state(state),
                 "tombstoning a key of this node's name whose endpoint this process holds under \
                  another id: left by an earlier life of the node"
             );
@@ -644,7 +643,7 @@ impl WorkerSyncAdapter {
             // and has new ones delayed by a pass at most.
             OwnerLiveness::GoneWithinGrace => debug!(
                 owner = %state.owner,
-                url = %Endpoint::redacted_str(&state.url),
+                url = %WorkerRegistry::shown_state(state),
                 "leaving worker state alone: its owner node is gone, inside the grace"
             ),
             OwnerLiveness::Live => {
@@ -723,7 +722,7 @@ impl WorkerSyncAdapter {
         if !entry.logged {
             entry.logged = true;
             info!(
-                url = %Endpoint::redacted_str(&state.url),
+                url = %WorkerRegistry::shown_state(state),
                 removed_instance = ?entry.instance,
                 incoming_instance = ?incoming,
                 "Ignoring a peer's state for an endpoint this gateway removed (logged once per endpoint)"
@@ -2334,6 +2333,144 @@ mod tests {
                 .get_by_url(url)
                 .map(|worker| worker.model_id().to_string())
         );
+    }
+
+    /// A peer's state that no worker stands for is named by the masked
+    /// address its import carries: a token before a host of digits is a
+    /// userinfo there, where the state's address string alone reads as a host
+    /// and its rank. The lines of an endpoint this gateway removed, of a
+    /// gone owner inside the grace and past it, and of this node's own
+    /// leftover key. A rank's state keeps its host and its rank: its spec
+    /// names them.
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_state_no_worker_stands_for_is_named_by_its_imports_masked_address() {
+        let url = "http://s3cret-token@2130706433";
+        let mesh = MeshKV::new("node-a".into());
+        let ns = worker_namespace(&mesh);
+        let registry = Arc::new(WorkerRegistry::new());
+        let cluster = cluster_with(&[
+            ("node-a", NodeStatus::Alive),
+            ("node-b", NodeStatus::Alive),
+            ("node-c", NodeStatus::Down),
+        ]);
+        let adapter = adapter_in(ns, registry.clone(), cluster);
+
+        // An endpoint this gateway removed: a live peer's state is held back.
+        adapter.retire(url, None);
+        adapter.apply_state("b-w1", &owned_state("b-w1", url, "node-b"));
+        // A gone owner's state, inside the grace and past it.
+        adapter.refresh_membership();
+        adapter.apply_state("c-w1", &owned_state("c-w1", url, "node-c"));
+        tokio::time::advance(DEAD_OWNER_GRACE).await;
+        adapter.apply_state("c-w1", &owned_state("c-w1", url, "node-c"));
+        // A rank's state from the same owner.
+        let rank: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker:8000")
+                .dp_config(1, 2)
+                .build(),
+        );
+        let rank_id = WorkerId::from_string("c-rank".to_string());
+        adapter.apply_state("c-rank", &worker_state_of(&rank_id, &rank, "node-c"));
+        assert!(registry.is_empty(), "none of the four is imported");
+        // A key of this node's name whose endpoint this process holds under
+        // another id.
+        registry.register(local_worker(url)).unwrap();
+        adapter.apply_state("a-old", &owned_state("a-old", url, "node-a"));
+
+        logs_assert(|lines: &[&str]| {
+            let token = "url=http://***@2130706433";
+            for (message, named) in [
+                (
+                    "Ignoring a peer's state for an endpoint this gateway removed",
+                    token,
+                ),
+                ("leaving worker state alone: its owner node is gone", token),
+                (
+                    "ignoring worker state published by a node that is down",
+                    token,
+                ),
+                (
+                    "ignoring worker state published by a node that is down",
+                    "url=http://worker:8000@1",
+                ),
+                ("tombstoning a key of this node's name", token),
+            ] {
+                if !lines
+                    .iter()
+                    .any(|line| line.contains(message) && line.contains(named))
+                {
+                    return Err(format!("no line says '{message}' with {named}"));
+                }
+            }
+            match lines.iter().find(|line| line.contains("s3cret")) {
+                Some(line) => Err(format!("a line carries the token: {line}")),
+                None => Ok(()),
+            }
+        });
+    }
+
+    /// The line of a mesh import taken out with its endpoint names the worker
+    /// by its own masked address: a token before a host of digits is a
+    /// userinfo there, where the state's address string alone reads as a host
+    /// and its rank.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_removed_import_is_named_by_its_own_masked_address() {
+        let (_ns, registry, adapter) = setup();
+        let state = sample_state("w1", "http://s3cret-token@2130706433");
+        registry.on_remote_worker_state(&state);
+        assert!(registry.get_by_url(&state.url).is_some());
+
+        adapter.drop_held_back_import(&state);
+
+        assert!(registry.get_by_url(&state.url).is_none());
+        logs_assert(|lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|line| line.contains("removed mesh-imported worker"))
+                .ok_or("the removal wrote no line")?;
+            if !line.contains("url=http://***@2130706433") {
+                return Err(format!("the line names the import otherwise: {line}"));
+            }
+            match lines.iter().find(|line| line.contains("s3cret")) {
+                Some(line) => Err(format!("a line carries the token: {line}")),
+                None => Ok(()),
+            }
+        });
+    }
+
+    /// The line of a claimed worker published above a later state of its key
+    /// names the worker by its own masked address: a token before a host of
+    /// digits is a userinfo there, where the state's address string alone
+    /// reads as a host and its rank.
+    #[tokio::test]
+    #[traced_test]
+    async fn a_claimed_worker_published_above_a_later_state_is_named_by_its_own_masked_address() {
+        let mesh = MeshKV::new("node-p".into());
+        let ns = worker_namespace(&mesh);
+        let registry = Arc::new(WorkerRegistry::new());
+        let adapter = adapter_as(ns, registry.clone(), "node-p");
+        let worker = local_worker_of("http://s3cret-token@2130706433", "model-a");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        // The earlier life's later publication: this node's key, one version up.
+        let late = WorkerState {
+            version: worker.revision() + 1,
+            ..worker_state_of(&id, &worker, "node-p")
+        };
+
+        assert!(adapter.republish_above_own_key(id.as_str(), &late));
+        logs_assert(|lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|line| line.contains("publishing a claimed worker above a later state"))
+                .ok_or("the republish wrote no line")?;
+            if line.contains("url=http://***@2130706433") && !line.contains("s3cret") {
+                Ok(())
+            } else {
+                Err(format!("the line names the worker otherwise: {line}"))
+            }
+        });
     }
 
     #[tokio::test]

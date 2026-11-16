@@ -3167,12 +3167,13 @@ impl CacheAwarePolicy {
     }
 
     /// One decision per tree-routed request: the branch counter and match
-    /// ratio histogram always, the debug line when enabled. `selected_url ==
-    /// None` means the caller fell back to `fallback_url` (first healthy).
+    /// ratio histogram always, the debug line when enabled. `selected ==
+    /// None` means the caller fell back to `fallback` (first healthy). The
+    /// line names the worker by its own masked address.
     fn log_tree_decision(
         &self,
-        selected_url: Option<&str>,
-        fallback_url: Option<&str>,
+        selected: Option<&dyn Worker>,
+        fallback: Option<&dyn Worker>,
         matched_units: usize,
         input_units: usize,
         matched_tenants: &[TenantId],
@@ -3189,11 +3190,14 @@ impl CacheAwarePolicy {
                 matched_units as f64 / input_units as f64,
             )
         };
-        let branch = match selected_url {
+        let branch = match selected {
             None => "first_healthy_fallback",
             Some(_) if matched_ratio <= self.config.cache_threshold => "expected_wait_fallback",
-            Some(url) => {
-                if matched_tenants.iter().any(|tenant| tenant.as_ref() == url) {
+            Some(worker) => {
+                if matched_tenants
+                    .iter()
+                    .any(|tenant| tenant.as_ref() == worker.url())
+                {
                     "tree_match"
                 } else {
                     "spill"
@@ -3220,11 +3224,9 @@ impl CacheAwarePolicy {
         debug!(
             index = "tree",
             branch,
-            worker = selected_url
-                .or(fallback_url)
-                .map(Endpoint::redacted_url)
-                .as_deref()
-                .unwrap_or("none"),
+            worker = selected
+                .or(fallback)
+                .map_or("none", |worker| worker.redacted_url()),
             model_id,
             matched_ratio = f64::from(matched_ratio),
             threshold = f64::from(self.config.cache_threshold),
@@ -3571,8 +3573,8 @@ impl CacheAwarePolicy {
         });
 
         self.log_tree_decision(
-            selected_idx.map(|idx| workers[idx].url()),
-            healthy_indices.first().map(|&idx| workers[idx].url()),
+            selected_idx.map(|idx| workers[idx].as_ref()),
+            healthy_indices.first().map(|&idx| workers[idx].as_ref()),
             result.matched_token_count.saturating_sub(marker_len),
             result.input_token_count.saturating_sub(marker_len),
             &result.matched_tenants,
@@ -3651,8 +3653,8 @@ impl CacheAwarePolicy {
         });
 
         self.log_tree_decision(
-            selected_idx.map(|idx| workers[idx].url()),
-            healthy_indices.first().map(|&idx| workers[idx].url()),
+            selected_idx.map(|idx| workers[idx].as_ref()),
+            healthy_indices.first().map(|&idx| workers[idx].as_ref()),
             result.matched_char_count.saturating_sub(marker_len),
             result.input_char_count.saturating_sub(marker_len),
             &result.matched_tenants,

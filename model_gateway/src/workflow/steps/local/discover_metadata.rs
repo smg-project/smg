@@ -154,7 +154,7 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     url: &str,
     api_key: Option<&str>,
 ) -> Result<T, MetadataError> {
-    let shown = Endpoint::redacted_str(url);
+    let shown = Endpoint::redacted_base_url(url);
     let mut req = client.get(url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
@@ -584,7 +584,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
 
         debug!(
             "Discovering metadata for {} ({:?})",
-            Endpoint::redacted_str(&config.url),
+            Endpoint::redacted_base_url(&config.url),
             connection_mode
         );
 
@@ -597,7 +597,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .unwrap_or_else(|| {
                         warn!(
                             "No detected_runtime_type for {}, defaulting to sglang",
-                            Endpoint::redacted_str(&config.url)
+                            Endpoint::redacted_base_url(&config.url)
                         );
                         "sglang"
                     });
@@ -646,7 +646,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
         .unwrap_or_else(|e| {
             warn!(
                 "Failed to fetch metadata for {}: {}",
-                Endpoint::redacted_str(&config.url),
+                Endpoint::redacted_base_url(&config.url),
                 e
             );
             (HashMap::new(), None)
@@ -655,7 +655,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
         debug!(
             "Discovered {} labels for {}",
             discovered_labels.len(),
-            Endpoint::redacted_str(&config.url)
+            Endpoint::redacted_base_url(&config.url)
         );
         context.data.discovered_labels = discovered_labels;
         if let Some(runtime) = detected_runtime {

@@ -18,10 +18,7 @@ use openai_protocol::worker::WorkerStatus;
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    worker::{identity::endpoint::Endpoint, Worker},
-    workflow::data::WorkerRemovalWorkflowData,
-};
+use crate::{worker::Worker, workflow::data::WorkerRemovalWorkflowData};
 
 /// Step that transitions Ready workers to `Draining` and waits for the
 /// resolved drain settle window before downstream steps remove them.
@@ -66,7 +63,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
             let Some(worker_id) = registry.get_id_by_url(url) else {
                 debug!(
                     "Worker {} not in registry, skipping drain transition",
-                    Endpoint::redacted_str(url)
+                    snapshot.redacted_url()
                 );
                 kept.push(Arc::clone(snapshot));
                 continue;
@@ -79,7 +76,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
                 Some(None) => {
                     debug!(
                         "Worker {} was registered under the URL after the removal's selection, left alone",
-                        Endpoint::redacted_str(url)
+                        snapshot.redacted_url()
                     );
                     continue;
                 }
@@ -92,7 +89,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
                     let Some(current) = registry.get(&worker_id) else {
                         debug!(
                             "Worker {} disappeared from registry, skipping drain transition",
-                            Endpoint::redacted_str(url)
+                            snapshot.redacted_url()
                         );
                         kept.push(Arc::clone(snapshot));
                         continue;
@@ -127,7 +124,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
                 // registry step finds nothing and the policy step prunes it.
                 None => match (pinned_revision, registry.get(&worker_id)) {
                     (Some(pinned), Some(current)) => debug!(
-                        worker_url = %Endpoint::redacted_str(url),
+                        worker_url = %snapshot.redacted_url(),
                         pinned_revision = pinned,
                         current_revision = current.revision(),
                         "Worker was replaced after the removal's selection, left alone"
@@ -135,7 +132,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
                     _ => {
                         debug!(
                             "Worker {} disappeared from registry, skipping drain transition",
-                            Endpoint::redacted_str(url)
+                            snapshot.redacted_url()
                         );
                         kept.push(Arc::clone(snapshot));
                     }
@@ -237,6 +234,23 @@ mod tests {
         let mut ctx = make_context(app_ctx, vec![]);
         let result = DrainWorkersStep.execute(&mut ctx).await.unwrap();
         assert_eq!(result, StepResult::Success);
+    }
+
+    /// A worker that left the registry before its drain is named by its own
+    /// masked address: read as a bare string, a token before a host of
+    /// digits is a host with a rank and is written whole.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn a_worker_gone_before_its_drain_is_named_by_its_own_masked_address() {
+        let worker = build_worker("http://s3cret-token@2130706433", 0, WorkerStatus::Ready);
+        let app_ctx = make_app_context(&[]);
+        let mut ctx = make_context(app_ctx, vec![worker]);
+        let result = DrainWorkersStep.execute(&mut ctx).await.unwrap();
+        assert_eq!(result, StepResult::Success);
+        assert!(logs_contain(
+            "Worker http://***@2130706433 not in registry, skipping drain transition"
+        ));
+        assert!(!logs_contain("s3cret"));
     }
 
     #[tokio::test(start_paused = true)]
