@@ -56,4 +56,4 @@ pub use openai_protocol::{
 pub(crate) use pd::pair_index::{PdPairIndex, PdWire};
 pub use pd::pairing::{PairingMismatch, PdPairing, PdPairingMode};
 pub use registry::{service::WorkerService, WorkerOrigin, WorkerRegistry};
-pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool, WindowFloor};
+pub(crate) use registry::{ModelLabels, ModelWorkerSnapshot, RoutingPool, WindowFloor};

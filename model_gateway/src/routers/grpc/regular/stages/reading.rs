@@ -30,6 +30,7 @@ use crate::{
             utils::{self, Names},
         },
     },
+    worker::{ModelLabels, Worker},
 };
 
 /// What preparation found for the response.
@@ -109,15 +110,16 @@ pub(crate) fn prepare(
     // legacy parsers here and at the two sites below, whatever the enum's
     // default.
     let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
-    // The model's workers, fetched once for the request: the cards' parser
-    // names are read among them here, and a forced call's tag takes the
-    // start they name together; a JSON answer's tag and the `auto` tag take
-    // the selected worker's own start at request building.
-    let workers = ctx
-        .components
-        .worker_registry
-        .get_by_model(&ctx.input.model_id);
-    let names = ctx.components.parser_resolver.names_among(&workers, model);
+    // What the model's workers say together, as the registry's membership
+    // snapshot keeps it (`together`): the cards' parser names, and for a
+    // forced call's tag the start and the vocabulary they name together; a
+    // JSON answer's tag and the `auto` tag take the selected worker's own
+    // start at request building.
+    let labels = together(ctx, model, ModelLabels::clone);
+    let names = ctx.components.parser_resolver.names_of(Names {
+        tool: labels.tool_parser,
+        reasoning: labels.reasoning_parser,
+    });
     // Which table reads the response under the parser, decided once for the
     // request: the replay, the constraint and the decoder's special tokens
     // read it here, the assignment at request building after them. A refusal
@@ -142,8 +144,8 @@ pub(crate) fn prepare(
             tools,
             reasoning,
             thought_closed,
-            symphony::grammar_start_of(&workers),
-            symphony::vocabulary_of(&workers),
+            labels.grammar_start,
+            labels.vocabulary,
         )
     });
     let choice = asks.choice();
@@ -212,6 +214,42 @@ pub(crate) fn prepare(
         prompt_thought,
         reading: reading.ok(),
     })
+}
+
+/// What the model's workers say together to a request, before one of them is
+/// selected: the parser names their cards set
+/// (`utils::ParserResolver::card_names_among`), where their engines start a
+/// grammar (`regular::symphony::grammar_start_of`) and the tag vocabulary
+/// they take (`regular::symphony::vocabulary_of`). A worker's cards and
+/// labels stay as they are while it is a member, so the registry's
+/// membership snapshot keeps the three answers
+/// (`ModelWorkerSnapshot::labels`): the first request after a membership
+/// change walks the workers, and every request after it reads the kept
+/// answers, whatever the size of the fleet. A request that spells the model
+/// otherwise than the kept answers do, or names a model no worker serves,
+/// walks the workers itself. `take` reads what its caller needs of the
+/// answers.
+fn together<T>(ctx: &RequestContext, model: &str, take: impl FnOnce(&ModelLabels) -> T) -> T {
+    let read = |workers: &[Arc<dyn Worker>]| {
+        let Names { tool, reasoning } = utils::ParserResolver::card_names_among(workers, model);
+        ModelLabels {
+            tool_parser: tool,
+            reasoning_parser: reasoning,
+            grammar_start: symphony::grammar_start_of(workers),
+            vocabulary: symphony::vocabulary_of(workers),
+        }
+    };
+    let snapshot = ctx
+        .components
+        .worker_registry
+        .model_routing_snapshot(&ctx.input.model_id);
+    match snapshot.as_deref() {
+        Some(snapshot) => match snapshot.labels(model, read) {
+            Some(kept) => take(kept),
+            None => take(&read(snapshot)),
+        },
+        None => take(&read(&[])),
+    }
 }
 
 /// Whether the rendered prompt leaves the model inside its thought, as the
@@ -397,14 +435,10 @@ pub(crate) fn decide(
             .map_err(|why| error::bad_request("invalid_parser_configuration", why))?,
     };
     // A forced call's reader starts where the model's workers start a grammar together, the
-    // start preparation built the constraint for, read among the same workers; the assignment
-    // asks under a forced call's JSON schema alone, so no other request walks the registry here.
+    // start preparation built the constraint for, kept with it (`together`); the assignment
+    // asks under a forced call's JSON schema alone, so no other request reads it here.
     let assignment = symphony::assign_for(read, asks, registry, processed_text, provider, || {
-        symphony::grammar_start_of(
-            &ctx.components
-                .worker_registry
-                .get_by_model(&ctx.input.model_id),
-        )
+        together(ctx, model, |labels| labels.grammar_start)
     });
     ctx.state.parser = Some(match assignment {
         Some(_) => ParserChoice::Symphony,
@@ -1019,5 +1053,93 @@ mod tests {
             assert_eq!(assignment.prompt, replayed, "{case}");
             assert_eq!(assignment.opener, opener, "{case}");
         }
+    }
+
+    /// Preparation reads what the model's workers say together where the registry's membership
+    /// snapshot keeps it: the first request after a membership change walks the workers and
+    /// leaves its answers on the snapshot, the next request reads them there, and a worker that
+    /// joins the model is read by the request after it, its card and its label beside the
+    /// first worker's.
+    #[test]
+    fn preparation_keeps_what_the_models_workers_say_until_the_membership_changes() {
+        let components = pool("inkling", Some("first_token"));
+        let tokenizer = hiding(&["<|content_thinking|>", "<|end_message|>"]);
+        let chat = forced(true);
+        let tools = chat.tools.clone().unwrap_or_default();
+        let names = || {
+            let mut ctx = RequestContext::for_chat(
+                Arc::clone(&chat),
+                None,
+                SERVED.into(),
+                Arc::clone(&components),
+            );
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            prepare(
+                &ctx,
+                Asks::Chat(&chat),
+                &tools,
+                THINKING,
+                false,
+                &tokenizer,
+                "test",
+            )
+            .map_err(|response| response.status())
+            .expect("nothing refused")
+            .names
+        };
+        // What the snapshot a request draws now holds, read by nobody here: a reader that ran
+        // would mean preparation kept nothing.
+        let kept = || {
+            components
+                .worker_registry
+                .model_routing_snapshot(SERVED)
+                .expect("a served model")
+                .labels(SERVED, |_| {
+                    panic!("preparation kept nothing on the snapshot")
+                })
+                .cloned()
+                .expect("kept under the request's spelling")
+        };
+        let inkling = Names {
+            tool: None,
+            reasoning: Some("inkling".to_string()),
+        };
+        assert_eq!(names(), inkling);
+        assert_eq!(
+            kept(),
+            ModelLabels {
+                tool_parser: None,
+                reasoning_parser: Some("inkling".to_string()),
+                grammar_start: ::symphony::grammar::GrammarStart::FirstToken,
+                vocabulary: utils::TagVocabulary::Current,
+            }
+        );
+        assert_eq!(names(), inkling, "the next request reads the kept answers");
+
+        let joining = BasicWorkerBuilder::new("grpc://engine-2:50051")
+            .model(
+                ModelCard::new(SERVED)
+                    .with_reasoning_parser("inkling")
+                    .with_tool_parser("json"),
+            )
+            .worker_type(WorkerType::Regular)
+            .label(tool_parser::GrammarStart::LABEL, "after_reasoning");
+        components
+            .worker_registry
+            .register(Arc::new(joining.build()));
+        let joined = Names {
+            tool: Some("json".to_string()),
+            ..inkling
+        };
+        assert_eq!(names(), joined);
+        assert_eq!(
+            kept(),
+            ModelLabels {
+                tool_parser: joined.tool,
+                reasoning_parser: joined.reasoning,
+                grammar_start: ::symphony::grammar::GrammarStart::Either,
+                vocabulary: utils::TagVocabulary::Current,
+            }
+        );
     }
 }

@@ -37,7 +37,7 @@ use crate::{
 /// symphony` a flag may name a Symphony table or the response template, which
 /// no legacy parser reads) → `None`, which lets the factory helpers fall back
 /// to their name-based auto-detection, unchanged. Symphony takes the two
-/// sources apart (`names_among`), the flags as set, with its registry
+/// sources apart (`names_of`), the flags as set, with its registry
 /// between them (`regular::symphony::names::reads`).
 ///
 /// Lookups borrow straight from worker metadata (no card clones); only the
@@ -146,9 +146,9 @@ impl ParserResolver {
             .or(self.legacy_flags.tool.as_deref())
     }
 
-    /// [`Self::names_among`] over this resolver's own registry walk, for the
+    /// [`Self::names_of`] over this resolver's own registry walk, for the
     /// tests: a request's readers take the names its preparation resolved
-    /// ([`Self::names_for`]) or read them among the workers the stage holds.
+    /// ([`Self::names_for`]).
     #[cfg(test)]
     pub(crate) fn names(&self, model: &str) -> ModelNames<'_> {
         ModelNames {
@@ -157,18 +157,21 @@ impl ParserResolver {
         }
     }
 
-    /// The parser names set for `model`, apart by who set them: its cards'
-    /// (its workers' labels), read among `workers`, the model's workers a
-    /// stage already holds, with no registry walk of this resolver's own; and
-    /// the gateway's flags as set. Symphony reads them in that order with its
-    /// registry between (`regular::symphony::names::reads`); the legacy
-    /// parsers take each kind's first, from the flags only a name they read
+    /// The parser names set for a model, apart by who set them: its cards'
+    /// (its workers' labels), `cards` as [`Self::card_names_among`] read them
+    /// among the model's workers, which a resolver without a registry does
+    /// not read; and the gateway's flags as set. A request's preparation
+    /// hands in the card names the registry's membership snapshot keeps of
+    /// that walk, so no request walks the workers for them. Symphony reads
+    /// the two in that order with its registry between
+    /// (`regular::symphony::names::reads`); the legacy parsers take each
+    /// kind's first, from the flags only a name they read
     /// ([`Self::tool_parser`], [`Self::reasoning_parser`],
     /// [`Self::legacy_tool`]).
-    pub(crate) fn names_among(&self, workers: &[Arc<dyn Worker>], model: &str) -> ModelNames<'_> {
+    pub(crate) fn names_of(&self, cards: Names) -> ModelNames<'_> {
         ModelNames {
             labels: if self.worker_registry.is_some() {
-                Self::card_names_among(workers, model)
+                cards
             } else {
                 Names::default()
             },
@@ -176,7 +179,7 @@ impl ParserResolver {
         }
     }
 
-    /// [`Self::names_among`] for a request whose preparation resolved the card names once
+    /// [`Self::names_of`] for a request whose preparation resolved the card names once
     /// (`ProcessingState::parser_names`): `resolved` as they were then, with the flags, and no
     /// second walk over the model's workers; `None` resolves them now, over the registry's walk.
     pub(crate) fn names_for(&self, resolved: Option<&Names>, model: &str) -> ModelNames<'_> {
@@ -238,8 +241,8 @@ impl ParserResolver {
     /// they do not (mixed labels, e.g. mid rolling-upgrade) each kind takes
     /// the lexicographically smallest name, so the choice does not depend on
     /// the registry's iteration order. Registration logs the conflict as a
-    /// warning; here it is debug (the per-request hot path).
-    fn card_names_among(workers: &[Arc<dyn Worker>], model: &str) -> Names {
+    /// warning; here it is debug.
+    pub(crate) fn card_names_among(workers: &[Arc<dyn Worker>], model: &str) -> Names {
         let mut tool = CardPick::default();
         let mut reasoning = CardPick::default();
         for worker in workers {
@@ -353,7 +356,7 @@ static NO_NAMES: Names = Names {
     reasoning: None,
 };
 
-/// The parser names set for one model, apart by who set them ([`ParserResolver::names_among`]): the
+/// The parser names set for one model, apart by who set them ([`ParserResolver::names_of`]): the
 /// names of its card, which its workers' labels (or the operator's card) set for the one model,
 /// and the gateway's flags, which every model shares. Symphony reads the two in that order with
 /// its registry between them (`regular::symphony::names::reads`): the card's names when they select
@@ -2425,10 +2428,9 @@ mod parser_resolver_tests {
         assert_eq!(resolver.reasoning_parser("m"), None);
     }
 
-    /// The reading stage holds the model's workers already: the names read among them are the
-    /// names a registry walk resolves, each kind chosen on its own in the one pass (the smallest
-    /// where the cards disagree, a card for another model skipped), and a disabled resolver
-    /// reads none among them either.
+    /// The card names read among a model's workers are the names a registry walk resolves, each
+    /// kind chosen on its own in the one pass (the smallest where the cards disagree, a card for
+    /// another model skipped), and a disabled resolver takes none of them.
     #[test]
     fn the_names_among_a_models_workers_are_the_registry_walks() {
         let registry = Arc::new(WorkerRegistry::new());
@@ -2451,7 +2453,8 @@ mod parser_resolver_tests {
         let resolver =
             ParserResolver::with_flags(Arc::clone(&registry), None, Some("flag".to_string()));
         let workers = registry.get_by_model("m");
-        let among = resolver.names_among(&workers, "m");
+        let read = ParserResolver::card_names_among(&workers, "m");
+        let among = resolver.names_of(read.clone());
         assert_eq!(among, resolver.names("m"));
         assert_eq!(
             among.labels,
@@ -2462,11 +2465,11 @@ mod parser_resolver_tests {
         );
         assert_eq!(among.flags, &resolver.flags);
         assert_eq!(
-            resolver.names_among(&workers, "other").labels,
+            ParserResolver::card_names_among(&workers, "other"),
             Names::default()
         );
         assert_eq!(
-            ParserResolver::disabled().names_among(&workers, "m").labels,
+            ParserResolver::disabled().names_of(read).labels,
             Names::default()
         );
         // The slice is the stage's snapshot: a worker registered after it was
@@ -2477,7 +2480,9 @@ mod parser_resolver_tests {
             .build();
         registry.register(Arc::new(later));
         assert_eq!(
-            resolver.names_among(&workers, "m").labels.tool.as_deref(),
+            ParserResolver::card_names_among(&workers, "m")
+                .tool
+                .as_deref(),
             Some("alpha")
         );
         assert_eq!(resolver.names("m").labels.tool.as_deref(), Some("aardvark"));
