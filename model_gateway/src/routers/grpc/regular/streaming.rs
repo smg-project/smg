@@ -3616,11 +3616,6 @@ impl<'a> ChatStream<'a> {
         .map_err(|()| "Failed to send logprobs chunk".to_string())
     }
 
-    /// The logprobs of an engine chunk, in the public API's shape.
-    fn logprobs_of(&self, chunk: &ProtoGenerateStreamChunk) -> Option<ChatLogProbs> {
-        self.logprobs_from(chunk.output_logprobs())
-    }
-
     /// A chunk's logprobs view converted to the public API's shape, for the
     /// chunk shapes that carry them inside a serialized choice (a reasoning
     /// delta, a tool-call delta, a chunk with an empty delta); the plain text
@@ -3954,7 +3949,7 @@ impl<'a> ChatStream<'a> {
             // The chunk's logprobs still reach the client, on a chunk with
             // an empty delta, as the engine's own server sends a step whose
             // text made no delta: every generated token's entry goes out once.
-            let logprobs = self.logprobs_of(chunk);
+            let logprobs = self.logprobs_from(chunk.output_logprobs());
             if utils::has_entries(logprobs.as_ref()) {
                 let usage = self.usage_snapshot();
                 self.push_bare_logprobs(index, logprobs, usage.as_ref())

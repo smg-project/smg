@@ -960,35 +960,21 @@ impl PrefillTicket {
     /// stream by [`ProtoStream::tracked_prefill_side_booked`]; dropped before
     /// that (the call failed or was retired), it releases the prompt untimed.
     pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Self> {
-        Self::book_as(worker, prompt_tokens, true)
+        Self::book_at(worker, prompt_tokens, liveness::now_ms())
     }
 
-    /// [`Self::book`] with the prompt's prefill `timed` or not: a regular
-    /// dispatch times it when the engine streams the generation (the first
-    /// response is the first token) and books it untimed otherwise (the one
-    /// response of a non-streaming generation is its whole answer).
-    pub(crate) fn book_as(
-        worker: &Arc<dyn Worker>,
-        prompt_tokens: u64,
-        timed: bool,
-    ) -> Option<Self> {
-        Self::book_as_at(worker, prompt_tokens, timed, liveness::now_ms())
-    }
-
-    /// [`Self::book_as`] at `now_ms` on the gateway clock (`liveness::now_ms`):
+    /// [`Self::book`] at `now_ms` on the gateway clock (`liveness::now_ms`):
     /// the dispatch's one stamp, shared with its deadline.
-    pub(crate) fn book_as_at(
+    pub(crate) fn book_at(
         worker: &Arc<dyn Worker>,
         prompt_tokens: u64,
-        timed: bool,
         now_ms: u64,
     ) -> Option<Self> {
-        (prompt_tokens > 0)
-            .then(|| Self::open(worker.runtime_state(), prompt_tokens, timed, now_ms))
+        (prompt_tokens > 0).then(|| Self::open(worker.runtime_state(), prompt_tokens, true, now_ms))
     }
 
-    /// [`Self::book_as_at`] for a prompt that is not empty, on the state its
-    /// dispatch took.
+    /// A booking, `timed` or not, for a prompt that is not empty, on the state
+    /// its dispatch took.
     fn open(
         runtime: Option<Arc<WorkerRuntime>>,
         prompt_tokens: u64,
@@ -1454,7 +1440,7 @@ mod tracked_tests {
     fn a_prefill_ticket_notes_its_start_and_its_answer_no_lower_than_stamp_one() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
         let state = worker.runtime_state().unwrap();
-        let mut ticket = PrefillTicket::book_as_at(&worker, 2_001, true, 0).unwrap();
+        let mut ticket = PrefillTicket::book_at(&worker, 2_001, 0).unwrap();
         ticket.first_response_at(0, 0);
         assert_eq!(
             state.prefill_answered_ago_at(1),
@@ -1463,7 +1449,7 @@ mod tracked_tests {
         );
         // Booked at one too, so the prompt put no time in the rate's window:
         // the next one's 2,000 ms are the whole span its sample is taken over.
-        let mut next = PrefillTicket::book_as_at(&worker, 2_001, true, 1).unwrap();
+        let mut next = PrefillTicket::book_at(&worker, 2_001, 1).unwrap();
         next.first_response_at(0, 2_001);
         assert_eq!(
             state.prefill_rate_tps(),
@@ -3777,8 +3763,8 @@ mod first_response_tests {
     fn a_prefill_ticket_answered_and_dropped_ends_its_prompt_once() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
         let state = worker.runtime_state().unwrap();
-        let mut first = PrefillTicket::book_as_at(&worker, 8_192, true, 1).unwrap();
-        let second = PrefillTicket::book_as_at(&worker, 4_096, true, 1).unwrap();
+        let mut first = PrefillTicket::book_at(&worker, 8_192, 1).unwrap();
+        let second = PrefillTicket::book_at(&worker, 4_096, 1).unwrap();
         assert_eq!(
             state.prefill_backlog(),
             Duration::from_millis(1_228),

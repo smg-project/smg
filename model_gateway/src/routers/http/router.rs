@@ -1113,16 +1113,6 @@ impl Router {
             .unwrap_or_else(|| error::bad_gateway("no_worker_response", "No worker response"))
     }
 
-    // Route a POST request with empty body to a specific endpoint
-    async fn route_post_empty_request(
-        &self,
-        headers: Option<&HeaderMap>,
-        endpoint: &str,
-    ) -> Response {
-        self.route_simple_request(headers, endpoint, Method::POST)
-            .await
-    }
-
     /// Forward an audio transcription request to an audio-capable worker as
     /// `multipart/form-data`, as the sequence of its stages: the prologue it
     /// shares with `route_typed_request` (the routing derivatives, the
@@ -2668,7 +2658,8 @@ impl RouterTrait for Router {
         response_id: &str,
     ) -> Response {
         let endpoint = format!("v1/responses/{response_id}/cancel");
-        self.route_post_empty_request(headers, &endpoint).await
+        self.route_simple_request(headers, &endpoint, Method::POST)
+            .await
     }
 
     async fn route_embeddings(
