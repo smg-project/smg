@@ -1378,8 +1378,26 @@ def test_the_binary_refuses_at_start_what_the_chart_refuses_at_render(binary):
     grace = 2 * DEFAULT_SETTLE_SECONDS - 1
     over = refusal(binary, ["--shutdown-grace-period-secs", str(grace)])
     assert f"settle window of {DEFAULT_SETTLE_SECONDS}s is over half the grace period" in over
-    # A name the schema refuses is no listener of the controller's.
-    unknown = refusal(binary, ["--identity-as-told", "admin"])
+    # A name the schema refuses is no listener of the controller's. The
+    # controller binds its listeners before it reads the name, so they take
+    # ports of the case's own: a host that holds a default port reads the
+    # same refusal.
+    gateway, control, replication, admin = free_ports(4)
+    unknown = refusal(
+        binary,
+        [
+            "--gateway-listen",
+            f"127.0.0.1:{gateway}",
+            "--control-listen",
+            f"127.0.0.1:{control}",
+            "--replication-listen",
+            f"127.0.0.1:{replication}",
+            "--admin-listen",
+            f"127.0.0.1:{admin}",
+            "--identity-as-told",
+            "admin",
+        ],
+    )
     assert 'no listener is named "admin"' in unknown
 
 
