@@ -457,6 +457,11 @@ impl Replica {
     /// listener: the term of the `Welcome` that answers it, or the name of
     /// what answered in its place.
     pub async fn hello(&self, gateway: &str) -> Result<u64, String> {
+        self.hello_under(gateway, 0).await
+    }
+
+    /// The same with the gateway's term floor on the frame.
+    pub async fn hello_under(&self, gateway: &str, term_floor: u64) -> Result<u64, String> {
         let endpoint = Channel::from_shared(format!("http://{}", self.gateway))
             .map_err(|error| error.to_string())?
             .connect_timeout(CALL);
@@ -483,7 +488,7 @@ impl Replica {
         frames
             .send(GatewayFrame {
                 seq: 0,
-                term_floor: 0,
+                term_floor,
                 frame: Some(gateway_frame::Frame::Hello(hello)),
             })
             .await

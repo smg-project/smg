@@ -34,9 +34,14 @@
 // Fencing: design 5.3. Every ControllerFrame and DecideAnswer carries the
 // leader's term, every GatewayFrame the gateway's term floor. A gateway
 // raises its floor from Leader and rejects frames below it; the controller
-// refuses a floor above its own term with FAILED_PRECONDITION; a leader past
-// its renew deadline sends NotLeader with an empty address and releases
-// nothing.
+// refuses a floor above its own term with FAILED_PRECONDITION, and its
+// leader gives the lease up so that the next take is above the floor (a
+// floor more than 65,536 above the term, or one that leaves no term to
+// take, is not believed: INVALID_ARGUMENT by the field's name, and the
+// lease stands; one controller process moves the lease 1,048,576 terms on
+// such floors at most, and past them a floor above the term is refused the
+// same and moves nothing); a leader past its renew deadline sends
+// NotLeader with an empty address and releases nothing.
 // Flow: design 5.2. Budgets are relative to receipt, never absolute; credits
 // ride the Decide stream as deltas (Credit) and are never taken back; with
 // no credit the gateway decides locally, and a DecideRequest sent with none
@@ -71,11 +76,12 @@
 // at the head of a refused registration's or patch's status message), a
 // Dispatched, Completed or Released whose side, class, reason or number
 // reads wrong, a Released that names neither a lease nor a ticket (the
-// field's name in the message), a veto of no kind, a Hello whose veto_count
-// is not its list's length, or a DecideRequest field out of its range in
-// this protocol version (the status message names the field, and the stream
-// closes); RESOURCE_EXHAUSTED a relay over its per-subscriber budget or a
-// standby over its backlog (a resync_required batch precedes it), a complete
+// field's name in the message), a term floor that is not believed (the
+// same), a veto of no kind, a Hello whose veto_count is not its list's
+// length, or a DecideRequest field out of its range in this protocol version
+// (the status message names the field, and the stream closes);
+// RESOURCE_EXHAUSTED a relay over its per-subscriber budget or a standby
+// over its backlog (a resync_required batch precedes it), a complete
 // snapshot above one message, a WatchWorkers past its principal's ceiling of
 // 4 open watches or past the replica's ceiling of watching principals, a
 // Decide stream past its gateway's Welcome.max_decide_streams, a Session

@@ -422,6 +422,60 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
     writeln!(out, "LEADER_ANSWERS_RECORDED {}", record.len()).expect("stdout");
 }
 
+/// A gateway's term floor above the leader's term (design 5.3), over two
+/// replicas and one lease file. The gateway holds a term the lease does not:
+/// its `Hello` under that floor is refused, the leader gives the lease up,
+/// and the take after it is above the floor, where the gateway's next
+/// `Hello` under the same floor is welcomed. A term never goes back while a
+/// gateway that saw it lives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gateways_floor_above_the_leaders_term_moves_the_lease_above_it() {
+    const GATEWAY: &str = "gateway-a";
+    const FLOOR: u64 = 7;
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let lease = dir.path().join("lease");
+    let settings = short();
+    let mut record = Record::default();
+    let mut replicas = vec![
+        start("replica-a", &lease, settings),
+        start("replica-b", &lease, settings),
+    ];
+    let (leader, term) = agreed(&mut record, &mut replicas).await;
+    assert!(term < FLOOR, "the first terms are under the floor: {term}");
+
+    assert_eq!(
+        replicas[leader].hello_under(GATEWAY, FLOOR).await,
+        Err("FailedPrecondition".to_owned()),
+        "a floor above the leader's term is refused"
+    );
+
+    // The leader gave the lease up under the floor it was shown, and the
+    // take after it is above that floor: whichever replica leads there
+    // welcomes the gateway under its floor.
+    let said = Instant::now();
+    let welcomed = loop {
+        let mut answers = Vec::with_capacity(replicas.len());
+        for replica in &replicas {
+            answers.push(replica.hello_under(GATEWAY, FLOOR).await);
+        }
+        if let Some(term) = answers.iter().find_map(|answer| answer.as_ref().ok()) {
+            break *term;
+        }
+        assert!(
+            said.elapsed() < ROOM,
+            "no Welcome under the floor in {ROOM:?}: {answers:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        welcomed > FLOOR,
+        "welcomed under term {welcomed}, not above the floor {FLOOR}"
+    );
+    let (_, after) = agreed(&mut record, &mut replicas).await;
+    assert!(after >= welcomed, "{after} after {welcomed}");
+    record.check().expect("the election's promise holds");
+}
+
 /// The middle of a sorted list and its last entry. A group with no sample
 /// (no round ran, or none passed its filter) has neither and is refused by
 /// its name.
