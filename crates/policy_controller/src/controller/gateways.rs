@@ -355,7 +355,7 @@ impl Gateways {
             .is_some_and(|row| self.over(row, now))
         {
             if let Some(row) = table.rows.remove(&gateway) {
-                self.end(gateway, row);
+                self.end(vec![(gateway, row)]);
             }
         }
         match table.rows.get(&gateway) {
@@ -425,8 +425,8 @@ impl Gateways {
     }
 
     /// One pass of the sweep at `now`: every gateway whose period is over
-    /// is let go. Returns how many were let go. A replica that does not
-    /// lead at `now` lets nothing go.
+    /// is let go, in one write of the store for them all. Returns how many
+    /// were let go. A replica that does not lead at `now` lets nothing go.
     pub(crate) fn sweep(&self, now: Instant) -> usize {
         let mut table = self.table.lock();
         if !Self::observe(&mut table, self.fence.leader_term(now), now) {
@@ -435,18 +435,13 @@ impl Gateways {
         for row in table.rows.values_mut() {
             row.prune(now);
         }
-        let over: Vec<GatewayId> = table
+        let over: Vec<(GatewayId, Row)> = table
             .rows
-            .iter()
-            .filter(|(_, row)| self.over(row, now))
-            .map(|(gateway, _)| *gateway)
+            .extract_if(|_, row| self.over(row, now))
             .collect();
-        for gateway in &over {
-            if let Some(row) = table.rows.remove(gateway) {
-                self.end(*gateway, row);
-            }
-        }
-        over.len()
+        let let_go = over.len();
+        self.end(over);
+        let_go
     }
 
     /// The sweep's task: a pass every tenth of the grace period until
@@ -651,19 +646,23 @@ impl Gateways {
         })
     }
 
-    /// The end of a presence, under the table's lock: what the store holds
-    /// for the gateway (its lease records, its vetoes and its completions)
-    /// is let go through the store's one door for a gone gateway, then the
-    /// row goes and its decide streams are told.
-    fn end(&self, gateway: GatewayId, row: Row) {
-        let leases = self.store.drop_gateway(gateway);
-        info!(
-            gateway = %row.subject,
-            leases,
-            vetoed = row.vetoes.len(),
-            "a gateway's grace period ended with no new Hello: its leases and its vetoes are released"
-        );
-        drop(row);
+    /// The end of presences, under the table's lock: what the store holds
+    /// for each gateway (its lease records, its vetoes and its completions)
+    /// is let go through the store's one door for a gone gateway, in one
+    /// write for them all, then the rows go and their decide streams are
+    /// told.
+    fn end(&self, gone: Vec<(GatewayId, Row)>) {
+        let gateways: Vec<GatewayId> = gone.iter().map(|(gateway, _)| *gateway).collect();
+        let leases = self.store.drop_gateways(&gateways);
+        for ((_, row), leases) in gone.iter().zip(leases) {
+            info!(
+                gateway = %row.subject,
+                leases,
+                vetoed = row.vetoes.len(),
+                "a gateway's grace period ended with no new Hello: its leases and its vetoes are released"
+            );
+        }
+        drop(gone);
     }
 
     /// The session `session` of `gateway` ended at `now`: its grace period
@@ -1454,6 +1453,36 @@ pub(crate) mod tests {
         assert_eq!(gateways.sweep(t0 + GRACE), 1);
         assert!(!store.vetoed(A, w, t0 + GRACE));
         assert!(store.vetoed(B, w, t0 + GRACE), "another gateway's stands");
+        drop(stands);
+    }
+
+    /// One pass lets every gateway whose period is over go in one write of
+    /// the store: their vetoes leave in one publication, and a present
+    /// gateway's stands. A pass that lets none go publishes nothing.
+    #[test]
+    fn a_pass_lets_its_gateways_go_in_one_publication_of_the_store() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let w = worker(&store, "http://a:8000");
+        let until = t0 + 100 * GRACE;
+        let stands = welcomed(&gateways, C, "gateway-c", TERM, t0);
+        assert_eq!(stands.veto(w, BREAKER, Some(until), t0), Vetoed::Shown);
+        for (gateway, subject) in [(A, "gateway-a"), (B, "gateway-b")] {
+            let gone = welcomed(&gateways, gateway, subject, TERM, t0);
+            assert_eq!(gone.veto(w, BREAKER, Some(until), t0), Vetoed::Shown);
+            gone.end(t0);
+        }
+
+        let published = store.publications();
+        assert_eq!(gateways.sweep(t0 + GRACE - MS), 0);
+        assert_eq!(store.publications(), published);
+        assert_eq!(gateways.sweep(t0 + GRACE), 2);
+        assert_eq!(
+            store.publications(),
+            published + 1,
+            "one world for the pass"
+        );
+        assert!(!store.vetoed(A, w, t0 + GRACE) && !store.vetoed(B, w, t0 + GRACE));
+        assert!(store.vetoed(C, w, t0 + GRACE), "a present gateway's stands");
         drop(stands);
     }
 
