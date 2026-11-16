@@ -9,8 +9,10 @@
 //! parallelism. Recycling keeps the pages mapped and hot.
 //!
 //! A lock-free thread-local pool serves same-thread take/give (preprocess
-//! internals run on blocking-pool threads). The pool is capped to bound
-//! residency; buffers beyond the cap are dropped. A thread keeps buffers only
+//! internals run on blocking-pool threads). A take gets the smallest kept
+//! buffer that holds it and never grows one. The pool is capped to bound
+//! residency, and a full pool keeps its largest buffers. A thread keeps
+//! buffers only
 //! once it has taken from the pool: a tensor's consuming write may run on a
 //! thread that never preprocesses (a runtime worker), and a pool there would
 //! hold the storage for the life of the thread without ever handing it out,
@@ -31,28 +33,53 @@ thread_local! {
 
 macro_rules! pool_impl {
     ($take_cap:ident, $give:ident, $held:ident, $ty:ty, $local:ident) => {
-        /// Take an empty `Vec` with at least `cap` capacity, reusing pooled storage.
+        /// Take an empty `Vec` with at least `cap` capacity: the smallest kept
+        /// buffer that holds it, or new storage when none does. A kept buffer
+        /// is never grown: growing one copies its old contents, which nobody
+        /// reads, and takes it from the take it fits.
         pub fn $take_cap(cap: usize) -> Vec<$ty> {
-            let mut v = $local
-                .with(|p| p.borrow_mut().get_or_insert_with(Vec::new).pop())
-                .unwrap_or_default();
-            v.clear();
-            v.reserve(cap);
-            v
+            let kept = $local.with(|p| {
+                let mut p = p.borrow_mut();
+                let kept = p.get_or_insert_with(Vec::new);
+                let fit = kept
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.capacity() >= cap)
+                    .min_by_key(|(_, v)| v.capacity())
+                    .map(|(at, _)| at);
+                fit.map(|at| kept.swap_remove(at))
+            });
+            match kept {
+                Some(mut v) => {
+                    v.clear();
+                    v
+                }
+                None => Vec::with_capacity(cap),
+            }
         }
 
         /// Return a buffer for reuse by a later same-thread take. Kept only on
         /// a thread that has taken from the pool (one of its producers); on
         /// any other thread the buffer is dropped, since nothing there would
-        /// ever take it.
+        /// ever take it. A full pool keeps its largest buffers: a take is
+        /// never grown into, so a small buffer serves small takes only.
         pub fn $give(v: Vec<$ty>) {
             if v.capacity() == 0 {
                 return;
             }
             $local.with(|p| {
                 let mut p = p.borrow_mut();
-                if let Some(kept) = p.as_mut().filter(|kept| kept.len() < MAX_THREAD_POOLED) {
+                let Some(kept) = p.as_mut() else {
+                    return;
+                };
+                if kept.len() < MAX_THREAD_POOLED {
                     kept.push(v);
+                } else if let Some(smallest) =
+                    kept.iter_mut().min_by_key(|buffer| buffer.capacity())
+                {
+                    if smallest.capacity() < v.capacity() {
+                        *smallest = v;
+                    }
                 }
             });
         }
@@ -103,6 +130,61 @@ mod tests {
             let _ = take_f32(16);
             give_f32(vec![0.0; 16]);
             assert_eq!(held_f32(), 1, "after its first take the thread keeps");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_take_gets_the_smallest_kept_buffer_that_holds_it() {
+        std::thread::spawn(|| {
+            drop(take_f32_cap(1));
+            give_f32(Vec::with_capacity(16));
+            give_f32(Vec::with_capacity(1024));
+            assert!(
+                take_f32_cap(8).capacity() < 1024,
+                "the 16 serves the small take"
+            );
+            assert!(
+                take_f32_cap(512).capacity() >= 1024,
+                "the 1024 was left for the large take"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_take_that_no_kept_buffer_holds_gets_new_storage() {
+        std::thread::spawn(|| {
+            drop(take_f32_cap(1));
+            give_f32(Vec::with_capacity(16));
+            assert!(take_f32_cap(1024).capacity() >= 1024);
+            assert_eq!(
+                held_f32(),
+                1,
+                "the 16 was not grown: it waits for a take it holds"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_full_pool_keeps_its_largest_buffers() {
+        std::thread::spawn(|| {
+            drop(take_f32_cap(1));
+            give_f32(Vec::with_capacity(16));
+            give_f32(Vec::with_capacity(32));
+            give_f32(Vec::with_capacity(64));
+            assert_eq!(held_f32(), MAX_THREAD_POOLED);
+            drop(take_f32_cap(40));
+            drop(take_f32_cap(40));
+            assert_eq!(
+                held_f32(),
+                1,
+                "the 64 pushed the 16 out and served one take; the 32 holds neither"
+            );
         })
         .join()
         .unwrap();
