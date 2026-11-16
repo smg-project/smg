@@ -3116,6 +3116,7 @@ impl NativeEncoder {
         let vacancy = match ShortPieceKey::of(piece) {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return Ok(()),
+                Some(vacancy) if self.seeded(vacancy, ids, cache) => return Ok(()),
                 vacancy => vacancy,
             },
             None => None,
@@ -3198,6 +3199,7 @@ impl NativeEncoder {
         let vacancy = match ShortPieceKey::at(text.as_bytes(), piece.start, piece.end) {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return Ok(()),
+                Some(vacancy) if self.seeded(vacancy, ids, cache) => return Ok(()),
                 vacancy => vacancy,
             },
             None => None,
@@ -3223,8 +3225,45 @@ impl NativeEncoder {
         self.tokenize_piece_at(model, text, piece, mapped, ids, cache)
     }
 
-    /// The rest of [`Self::tokenize_piece`], out of line: the longer pieces'
-    /// cache, the seed, the merge or the model, and the cache insert.
+    /// A short piece the thread's table missed (`vacancy`), answered when
+    /// the encoder's seed holds it, as it holds every short vocabulary word:
+    /// the ids appended, and the seed's entry kept in the thread's table at
+    /// the vacancy as a copy ([`ShortPieceTable::keep`]), so a first-sight
+    /// vocabulary word pays neither the slow path's frame nor a second walk
+    /// and an insert from its ids (70 to 75 instructions fewer a word,
+    /// counted on three vocabularies). False when the seed does not hold
+    /// the piece: the slow path merges it. Out of line and cold: inlined at
+    /// the probe's miss it cost every hit up to ten instructions, as a plain
+    /// call up to twenty-three on one vocabulary; cold, a hit costs what it
+    /// did or less (counted).
+    #[cold]
+    #[inline(never)]
+    fn seeded(&self, vacancy: Vacancy, ids: &mut Vec<u32>, cache: &mut PieceCache) -> bool {
+        let Ok(entry) = self.seed.probe(vacancy.key()) else {
+            return false;
+        };
+        let kept = cache.short_entries() < cache.share && cache.packed.keep(vacancy, entry);
+        let start = ids.len();
+        self.seed.append(entry, ids);
+        if !kept {
+            self.remember_seeded(vacancy, start, ids, cache);
+        }
+        true
+    }
+
+    /// [`Self::remember_piece`] for a seeded piece the thread's table did
+    /// not keep as a copy: its ids are in the seed's spill, or the table is
+    /// at its fill bound or the thread at its share. The rare case, out of
+    /// line so that [`Self::seeded`] keeps no frame for it.
+    #[cold]
+    #[inline(never)]
+    fn remember_seeded(&self, vacancy: Vacancy, start: usize, ids: &[u32], cache: &mut PieceCache) {
+        self.remember_piece(&[], Some(vacancy), start, ids, cache);
+    }
+
+    /// The rest of [`Self::tokenize_piece`], out of line, for a piece the
+    /// thread's packed table and the seed do not hold: the longer pieces'
+    /// cache, the merge or the model, and the cache insert.
     #[inline(never)]
     fn tokenize_piece_slow(
         &self,
@@ -3243,51 +3282,49 @@ impl NativeEncoder {
             }
         }
         let start = ids.len();
-        // A piece this thread has not met: the encoder's seed has it when it
-        // is a vocabulary word, else it is merged, by the table or by the
-        // model for a table that declined. A raw piece of the sentencepiece
-        // path never comes here: it has its own slow path.
+        // A piece this thread has not met and the seed does not hold (the
+        // probe's miss asked it, see `Self::seeded`): merged, by the table
+        // or by the model for a table that declined. A raw piece of the
+        // sentencepiece path never comes here: it has its own slow path.
         debug_assert!(
             self.chars.is_none(),
             "a sentencepiece piece takes tokenize_raw_piece_slow"
         );
-        if !vacancy.is_some_and(|vacancy| self.seed.ids_into(vacancy.key(), ids)) {
-            // A piece holding a byte the table has no token for is the
-            // model's (see `MergeTable::lacks_a_token_for`).
-            if let Some(table) = self
-                .merges
-                .as_ref()
-                .filter(|table| !table.lacks_a_token_for(bytes))
+        // A piece holding a byte the table has no token for is the
+        // model's (see `MergeTable::lacks_a_token_for`).
+        if let Some(table) = self
+            .merges
+            .as_ref()
+            .filter(|table| !table.lacks_a_token_for(bytes))
+        {
+            // Under `ignore_merges` a piece that is an entry is that entry:
+            // the model's map is asked when the piece can be one (the
+            // lookup is the piece mapped to the alphabet as a string, its
+            // hash, a probe of the map and a compare: a memory latency and
+            // more on a cold piece, measured).
+            let whole = if table.ignore_merges
+                && self.may_be_entry(vacancy.map(|vacancy| vacancy.key()), bytes)
             {
-                // Under `ignore_merges` a piece that is an entry is that entry:
-                // the model's map is asked when the piece can be one (the
-                // lookup is the piece mapped to the alphabet as a string, its
-                // hash, a probe of the map and a compare: a memory latency and
-                // more on a cold piece, measured).
-                let whole = if table.ignore_merges
-                    && self.may_be_entry(vacancy.map(|vacancy| vacancy.key()), bytes)
-                {
-                    model.and_then(|model| model.token_to_id(self.mapped(bytes, mapped)))
-                } else {
-                    None
-                };
-                match whole {
-                    Some(id) => ids.push(id),
-                    // A cold piece of a unit with a non-ASCII byte merges
-                    // from its pre-formed characters when it has them (the
-                    // pre-formed path reads the piece's bytes itself); a
-                    // piece of an ASCII unit never reads that analysis.
-                    None => {
-                        if cache.unit_ascii || !table.merge_preformed(bytes, ids) {
-                            table.merge(bytes, ids);
-                        }
+                model.and_then(|model| model.token_to_id(self.mapped(bytes, mapped)))
+            } else {
+                None
+            };
+            match whole {
+                Some(id) => ids.push(id),
+                // A cold piece of a unit with a non-ASCII byte merges
+                // from its pre-formed characters when it has them (the
+                // pre-formed path reads the piece's bytes itself); a
+                // piece of an ASCII unit never reads that analysis.
+                None => {
+                    if cache.unit_ascii || !table.merge_preformed(bytes, ids) {
+                        table.merge(bytes, ids);
                     }
                 }
-            } else {
-                match model.map(|model| model.tokenize(self.mapped(bytes, mapped))) {
-                    Some(Ok(tokens)) => ids.extend(tokens.iter().map(|token| token.id)),
-                    Some(Err(_)) | None => return Err(Fallback::PieceDeclined),
-                }
+            }
+        } else {
+            match model.map(|model| model.tokenize(self.mapped(bytes, mapped))) {
+                Some(Ok(tokens)) => ids.extend(tokens.iter().map(|token| token.id)),
+                Some(Err(_)) | None => return Err(Fallback::PieceDeclined),
             }
         }
         self.remember_piece(bytes, vacancy, start, ids, cache);
@@ -3396,6 +3433,7 @@ impl NativeEncoder {
         let vacancy = match ShortPieceKey::at(text.as_bytes(), piece.start, piece.end) {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return,
+                Some(vacancy) if self.seeded(vacancy, ids, cache) => return,
                 vacancy => vacancy,
             },
             None => None,
@@ -3420,6 +3458,7 @@ impl NativeEncoder {
         let vacancy = match ShortPieceKey::of(spaced.as_bytes()) {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return,
+                Some(vacancy) if self.seeded(vacancy, ids, cache) => return,
                 vacancy => vacancy,
             },
             None => None,
@@ -3427,10 +3466,10 @@ impl NativeEncoder {
         self.tokenize_raw_piece_slow(chars, &spaced, vacancy, mapped, ids, cache);
     }
 
-    /// The rest of [`Self::tokenize_raw_piece`], out of line: the longer
-    /// pieces' cache (by the raw bytes), the seed, the merge from the
-    /// piece's character symbols in the vocabulary's form, and the cache
-    /// insert.
+    /// The rest of [`Self::tokenize_raw_piece`], out of line, for a piece
+    /// the thread's packed table and the seed do not hold: the longer
+    /// pieces' cache (by the raw bytes), the merge from the piece's
+    /// character symbols in the vocabulary's form, and the cache insert.
     #[inline(never)]
     fn tokenize_raw_piece_slow(
         &self,
@@ -3449,13 +3488,11 @@ impl NativeEncoder {
             }
         }
         let start = ids.len();
-        if !vacancy.is_some_and(|vacancy| self.seed.ids_into(vacancy.key(), ids)) {
-            chars.merge(
-                CharSymbols::normalized(raw, mapped),
-                &mut cache.symbols,
-                ids,
-            );
-        }
+        chars.merge(
+            CharSymbols::normalized(raw, mapped),
+            &mut cache.symbols,
+            ids,
+        );
         self.remember_piece(bytes, vacancy, start, ids, cache);
     }
 

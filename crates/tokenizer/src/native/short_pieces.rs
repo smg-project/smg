@@ -176,7 +176,7 @@ impl ShortPieceKey {
 /// the length back to the count, whatever they hold.
 #[derive(Clone, Copy)]
 #[repr(C, align(32))]
-struct Entry {
+pub(super) struct Entry {
     key: u128,
     ids: [u32; INLINE_IDS],
 }
@@ -275,35 +275,39 @@ impl ShortPieceTable {
 
     /// Appends the ids of `key` to `out` and answers whether the table had
     /// the piece.
-    #[inline(always)]
+    #[cfg(test)]
     pub(super) fn ids_into(&self, key: ShortPieceKey, out: &mut Vec<u32>) -> bool {
         self.lookup(key, out).is_none()
     }
 
-    /// The probe: a hit appends the piece's ids (all four inline ids, then
-    /// the length set to the count; a spilled entry from the spill) and
-    /// returns `None`; a miss returns where it ended, for the insert that
-    /// follows it ([`Self::ids_into`] is this probe read as a hit test).
+    /// The probe as a lookup: a hit appends the piece's ids
+    /// ([`Self::append`]) and returns `None`; a miss returns where the probe
+    /// ended, for the insert that follows it.
     #[inline(always)]
     pub(super) fn lookup(&self, key: ShortPieceKey, out: &mut Vec<u32>) -> Option<Vacancy> {
+        match self.probe(key) {
+            Ok(entry) => {
+                self.append(entry, out);
+                None
+            }
+            Err(vacancy) => Some(vacancy),
+        }
+    }
+
+    /// The probe: the entry of `key`, or where the walk ended on an empty
+    /// slot when the table does not hold the piece.
+    #[inline(always)]
+    pub(super) fn probe(&self, key: ShortPieceKey) -> Result<&Entry, Vacancy> {
         let (mut slot, tag) = self.first_slot(key);
         loop {
             let found = self.tags[slot];
             if found == tag {
                 let entry = &self.entries[slot];
                 if entry.key & KEY_MASK == key.0 {
-                    let count = (entry.key >> COUNT_SHIFT) as usize;
-                    if count <= INLINE_IDS {
-                        out.extend_from_slice(&entry.ids);
-                        out.truncate(out.len() - (INLINE_IDS - count));
-                    } else {
-                        let start = entry.ids[0] as usize;
-                        out.extend_from_slice(&self.spill[start..start + count]);
-                    }
-                    return None;
+                    return Ok(entry);
                 }
             } else if found == EMPTY_TAG {
-                return Some(Vacancy {
+                return Err(Vacancy {
                     key,
                     slot: slot as u32,
                     mask: self.mask as u32,
@@ -312,6 +316,44 @@ impl ShortPieceTable {
             }
             slot = (slot + 1) & self.mask;
         }
+    }
+
+    /// Appends the ids of `entry`, an entry of this table, to `out`: all
+    /// four inline ids, then the length set to the count; a spilled entry's
+    /// from the spill.
+    #[inline(always)]
+    pub(super) fn append(&self, entry: &Entry, out: &mut Vec<u32>) {
+        let count = (entry.key >> COUNT_SHIFT) as usize;
+        if count <= INLINE_IDS {
+            out.extend_from_slice(&entry.ids);
+            out.truncate(out.len() - (INLINE_IDS - count));
+        } else {
+            let start = entry.ids[0] as usize;
+            out.extend_from_slice(&self.spill[start..start + count]);
+        }
+    }
+
+    /// Stores a copy of `entry`, another table's entry for the key a probe
+    /// of this table has just missed, at the probe's vacancy, and answers
+    /// true: the key, the count and the inline ids of an entry read the same
+    /// in every table, so the copy is the insert. False, with nothing stored,
+    /// for an entry whose ids are in the other table's spill, for a table at
+    /// its fill bound and for a vacancy that is not of the table as it is:
+    /// [`Self::insert_at`] takes those.
+    #[inline(always)]
+    pub(super) fn keep(&mut self, vacancy: Vacancy, entry: &Entry) -> bool {
+        let slot = vacancy.slot as usize;
+        if (entry.key >> COUNT_SHIFT) as usize > INLINE_IDS
+            || vacancy.mask as usize != self.mask
+            || self.len >= self.fill_bound()
+            || self.tags[slot] != EMPTY_TAG
+        {
+            return false;
+        }
+        self.tags[slot] = vacancy.tag;
+        self.entries[slot] = *entry;
+        self.len += 1;
+        true
     }
 
     /// Stores `ids` as the piece's encoding and answers true. A table at its
@@ -684,6 +726,56 @@ mod tests {
         assert!(table.insert_at(stale, &[9], 1000));
         assert_eq!(ids_of(&table, b"other"), Some(vec![9]));
         assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn a_missed_piece_is_kept_as_a_copy_of_another_tables_entry() {
+        let mut seed = ShortPieceTable::for_entries(8);
+        assert!(seed.insert(key(b"word"), &[7, 8], 8));
+        assert!(seed.insert(key(b"spilled"), &[1, 2, 3, 4, 5], 8));
+        let mut table = ShortPieceTable::new();
+        let mut out = vec![9];
+        let vacancy = table.lookup(key(b"word"), &mut out).expect("a miss");
+        let Ok(entry) = seed.probe(key(b"word")) else {
+            panic!("the seed holds the piece");
+        };
+        assert!(table.keep(vacancy, entry));
+        seed.append(entry, &mut out);
+        assert_eq!(out, [9, 7, 8]);
+        assert_eq!(table.len(), 1);
+        assert_eq!(ids_of(&table, b"word"), Some(vec![7, 8]));
+        // Ids in the other table's spill are not a copy to keep.
+        let vacancy = table.lookup(key(b"spilled"), &mut out).expect("a miss");
+        let Ok(spilled) = seed.probe(key(b"spilled")) else {
+            panic!("the seed holds the piece");
+        };
+        assert!(!table.keep(vacancy, spilled));
+        assert_eq!(table.len(), 1);
+        assert_eq!(ids_of(&table, b"spilled"), None);
+    }
+
+    #[test]
+    fn a_table_at_its_fill_bound_keeps_no_copy_and_the_insert_grows_it() {
+        let mut seed = ShortPieceTable::for_entries(8);
+        assert!(seed.insert(key(b"word"), &[7], 8));
+        let mut table = ShortPieceTable::new();
+        let bound = 1000;
+        let mut stored = 0usize;
+        while table.len() < table.fill_bound() {
+            assert!(table.insert(key(&stored.to_le_bytes()), &[stored as u32], bound));
+            stored += 1;
+        }
+        let slots = table.slots();
+        let mut out = Vec::new();
+        let vacancy = table.lookup(key(b"word"), &mut out).expect("a miss");
+        let Ok(entry) = seed.probe(key(b"word")) else {
+            panic!("the seed holds the piece");
+        };
+        assert!(!table.keep(vacancy, entry));
+        assert_eq!(ids_of(&table, b"word"), None);
+        assert!(table.insert_at(vacancy, &[7], bound));
+        assert!(table.slots() > slots);
+        assert_eq!(ids_of(&table, b"word"), Some(vec![7]));
     }
 
     #[test]
