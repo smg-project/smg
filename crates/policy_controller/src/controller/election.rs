@@ -15,7 +15,8 @@
 //! to the store at a take and publishes what it saw. At the shutdown signal
 //! it closes the fence and rewrites the record released, in that order, so
 //! no instant has two open fences and the next candidate to look takes the
-//! lease at once; it then stops and never takes again.
+//! lease at once, or one renew deadline later when this thread's own take
+//! still waited to lead; it then stops and never takes again.
 
 use std::{
     fmt, io,

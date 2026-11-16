@@ -14,8 +14,8 @@
 //! the same over every backend:
 //!
 //! - **Acquire.** A candidate that never saw the lease held takes what the
-//!   store shows at once when it is absent or a holder's release, which says
-//!   no holder and no duration. One that saw it held takes a holder's release
+//!   store shows at once when it is absent or a leader's release, which says
+//!   no holder and no duration. One that saw it held takes a leader's release
 //!   at once as well (a release keeps the term, so the record's term is at or
 //!   above the one last seen held), and a record that stood unchanged for its
 //!   duration *by this candidate's own clock*, its own identity's record
@@ -28,9 +28,11 @@
 //!   candidate waits the duration of the record it saw held last, from its
 //!   own first sight of the change, as for a record that stands still, and
 //!   follows nobody meanwhile ([`Tick::Gone`]). A record with no holder that
-//!   still says a duration is no holder's release either, since a release
-//!   writes none: a hand cleared the holder in place, and every candidate
-//!   waits the duration the record says, from its first sight of it. A take
+//!   still says a duration is no leader's release either, which writes none:
+//!   a hand cleared the holder in place, or a taker gave the lease up while
+//!   its own take still waited to lead and says the renew deadline, the wait
+//!   it still owed. Every candidate waits the duration the record says, from
+//!   its first sight of it. A take
 //!   writes the next term (terms only grow, one per change of holder, and a
 //!   candidate counts from the highest term it saw, so a record that vanished
 //!   under it is taken at the term after the one it held). A term is taken
@@ -57,9 +59,10 @@
 //!   one or more. A holder still alive renewed before its record went, so
 //!   its own fence is closed by then, and a holder stops serving before
 //!   any taker of its lease serves, for replicas that share their
-//!   settings. An elector alone over a store it made itself
-//!   ([`Elector::alone`]) has no other holder to wait for: its take leads
-//!   at once.
+//!   settings. A taker that gives the lease up inside that wait hands the
+//!   wait on: its release says the renew deadline as the record's duration.
+//!   An elector alone over a store it made itself ([`Elector::alone`]) has
+//!   no other holder to wait for: its take leads at once.
 //!
 //! The settings ([`ElectionSettings`]): duration 3 s, renew period 1 s, renew
 //! deadline 2 s by default; a deployment that prefers fewer leadership
@@ -246,7 +249,8 @@ pub enum Tick {
     /// This candidate took the lease under `term`. It leads from now, or
     /// from the first renewal one renew deadline after this take where the
     /// record had no holder to wait for (absent, gone and waited out, or
-    /// released under term zero).
+    /// released under term zero). An elector alone ([`Elector::alone`])
+    /// leads from now whatever the record.
     Acquired { term: u64 },
     /// The lease is renewed under `term`; the fence is open for another
     /// renew deadline, or still closed inside the first one after a take of
@@ -365,7 +369,8 @@ pub struct Elector {
     /// wait from: the return of that take's read. Its fence opens at the
     /// first renewal one renew deadline after it. A holder still alive
     /// renewed before its record went, so its own fence is closed by then.
-    /// `None` once the fence opened, and after every other take.
+    /// `None` once the fence opened or the lease went, and after every
+    /// other take.
     waits_from: Option<Instant>,
     /// This elector made its store itself and handed it to nobody
     /// ([`Elector::alone`]): no other holder can be, so no take of its
@@ -492,16 +497,26 @@ impl Elector {
     /// the lease. On an error the elector keeps the record, so a second call
     /// retries the write; a caller that ticks instead renews, or answers
     /// [`Tick::Lost`] when the release landed after all.
+    ///
+    /// A release while this run's own take still waits to lead hands that
+    /// wait on: the record says the renew deadline as its duration, and the
+    /// next candidate waits it out before it takes.
     pub fn release(&mut self) -> Result<bool, ElectError> {
         let Some(mine) = self.held.clone() else {
             return Ok(false);
         };
         self.fence.set(mine.term, None);
         // No duration: it tells a holder's release, taken at once, from a
-        // holder that another hand cleared in place.
+        // holder that another hand cleared in place. A release while this
+        // run's own take still waits to lead says the renew deadline
+        // instead: a holder this run never saw may still lead that long,
+        // this run's wait was all that covered it, and the next candidate
+        // waits the release out as it waits out a cleared record.
         let released = LeaseRecord {
             holder: String::new(),
-            duration_ms: 0,
+            duration_ms: self
+                .waits_from
+                .map_or(0, |_| whole_millis_up(self.settings.renew_deadline)),
             renewed_at_micros: next_wall_micros(mine.renewed_at_micros),
             ..mine.clone()
         };
@@ -521,6 +536,7 @@ impl Elector {
             Written::Done => {
                 self.held = None;
                 self.attempted = None;
+                self.waits_from = None;
                 if let Some(observation) = &mut self.observed {
                     observation.record = released;
                 }
@@ -543,8 +559,11 @@ impl Elector {
                     // Another candidate's write, or this process's own
                     // release that landed and reported an error: released
                     // under this term.
-                    (stored, _) => Ok(stored
-                        .is_some_and(|stored| stored.is_released() && stored.term == mine.term)),
+                    (stored, _) => {
+                        self.waits_from = None;
+                        Ok(stored
+                            .is_some_and(|stored| stored.is_released() && stored.term == mine.term))
+                    }
                 }
             }
         }
@@ -685,6 +704,7 @@ impl Elector {
 
     fn lose(&mut self, term: u64, current: Option<LeaseRecord>) -> Tick {
         self.held = None;
+        self.waits_from = None;
         self.fence.set(term, None);
         Tick::Lost {
             term,
@@ -729,9 +749,11 @@ impl Elector {
             None => (next_term, 0),
             // A record with no holder is waited out for the duration it
             // says, from this run's first sight of it. A holder's release
-            // says none and is taken at once. A record whose holder another
-            // hand cleared in place keeps its duration, and that holder may
-            // lead until its own next step reads the lease.
+            // says none and is taken at once, unless its own take still
+            // waited to lead: then it says the renew deadline, the wait it
+            // owed. A record whose holder another hand cleared in place
+            // keeps its duration, and that holder may lead until its own
+            // next step reads the lease.
             Some(record) if record.is_released() => {
                 let since = self.observed.as_ref().map_or(now, |o| o.since);
                 if now.saturating_duration_since(since) < record.duration() {
@@ -1259,6 +1281,67 @@ mod tests {
     }
 
     #[test]
+    fn a_release_inside_the_takes_wait_leaves_the_wait_to_the_next_candidate() {
+        // b took a record with no holder to wait for and gives it up before
+        // its fence opened. A holder b never saw may still lead to its renew
+        // deadline, and b's wait was all that covered it: the release says
+        // that deadline as its duration, and the next candidate waits it out
+        // from its first sight of the release.
+        let lease = MemoryLease::new();
+        let mut b = candidate(&lease, "b@host:2");
+        let mut c = candidate(&lease, "c@host:3");
+        let t0 = Instant::now() + S;
+        assert_eq!(b.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        assert!(matches!(
+            c.tick(t0).expect("follow"),
+            Tick::Following { term: 1, .. }
+        ));
+        assert!(b.release().expect("release"));
+        let released = b.observed().expect("the release").clone();
+        assert!(released.is_released());
+        assert_eq!(released.duration_ms, 2_000);
+        let saw = t0 + Duration::from_millis(1);
+        assert_eq!(c.tick(saw).expect("look"), Tick::Gone { term: 1 });
+        assert_eq!(
+            c.tick(saw + 2 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 1 }
+        );
+        assert_eq!(
+            c.tick(saw + 2 * S).expect("take"),
+            Tick::Acquired { term: 2 }
+        );
+        assert_eq!(c.fence().leader_term(saw + 2 * S), Some(2));
+    }
+
+    #[test]
+    fn a_taker_whose_lease_went_waits_for_nothing() {
+        // The wait belongs to the take. A loss ends it, and so does a
+        // release: the reader says no from then on.
+        let mut lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        assert!(a.waits_to_lead());
+        let own = a.observed().expect("the take's record").clone();
+        let other = held_by("x@host:8", 2, 3_000);
+        assert_eq!(
+            lease.write(Some(&own), &other).expect("a write"),
+            Written::Done
+        );
+        assert!(matches!(
+            a.tick(t0 + S).expect("look"),
+            Tick::Lost { term: 1, .. }
+        ));
+        assert!(!a.waits_to_lead());
+        let mut b = candidate(&MemoryLease::new(), "b@host:2");
+        assert_eq!(b.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        assert!(b.waits_to_lead());
+        assert!(b.release().expect("release"));
+        assert!(!b.waits_to_lead());
+    }
+
+    #[test]
     fn a_released_lease_is_taken_at_once_with_the_next_term() {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
@@ -1449,8 +1532,8 @@ mod tests {
         let mut a = candidate(&lease, "a@host:1");
         let mut b = candidate(&lease, "b@host:2");
         let mut c = candidate(&lease, "c@host:3");
-        let t0 = Instant::now() + S;
-        assert_eq!(a.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
+        let t0 = Instant::now() + 3 * S;
+        a.lead_at(t0);
         a.release().expect("release");
         assert_eq!(b.tick(t0 + S).expect("tick"), Tick::Acquired { term: 2 });
         c.tick(t0 + S).expect("c sees b");
@@ -1646,6 +1729,7 @@ mod tests {
         let mut b = candidate(&lease, "b@host:2");
         let t0 = Instant::now() + S;
         a.tick(t0).expect("acquire");
+        assert!(a.waits_to_lead());
         b.tick(t0).expect("follow");
         assert_eq!(
             b.tick(t0 + 3 * S).expect("take"),
@@ -1656,6 +1740,7 @@ mod tests {
             "the lease is b's"
         );
         assert!(!a.is_holder());
+        assert!(!a.waits_to_lead(), "the wait went with the lease");
         assert_eq!(
             lease
                 .clone()
@@ -1962,8 +2047,8 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
-        a.tick(t0).expect("acquire");
+        let t0 = Instant::now() + 3 * S;
+        a.lead_at(t0);
         fails.store(1, Ordering::Relaxed);
         a.release().expect_err("the answer was lost");
         // The caller ticks instead of retrying: the released record is this
@@ -2007,8 +2092,8 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
-        a.tick(t0).expect("acquire");
+        let t0 = Instant::now() + 3 * S;
+        a.lead_at(t0);
         fails.store(1, Ordering::Relaxed);
         a.tick(t0 + S).expect_err("the answer was lost");
         // A planned stop: the release goes over the renewal that landed, not
@@ -2121,8 +2206,8 @@ mod tests {
             write_fails: Arc::clone(&write_fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
-        a.tick(t0).expect("acquire");
+        let t0 = Instant::now() + 3 * S;
+        a.lead_at(t0);
         // A renewal lands and its answer is lost; then the release's own
         // write fails before it lands. The landed renewal stays the record
         // the retry adopts: the lease is free at once, not at its expiry.
@@ -2151,8 +2236,8 @@ mod tests {
             .expect("settings");
         let mut b = Elector::new(Box::new(FileLease::new(&path)), "b@host:2", settings())
             .expect("settings");
-        let t0 = Instant::now() + S;
-        assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
+        let t0 = Instant::now() + 3 * S;
+        a.lead_at(t0);
         assert!(a.release().expect("release"));
         assert_eq!(b.tick(t0 + S).expect("take"), Tick::Acquired { term: 2 });
         assert!(matches!(
@@ -2621,8 +2706,8 @@ mod tests {
             .expect("settings");
         let mut b = Elector::new(Box::new(FileLease::new(&path)), "b@host:2", settings())
             .expect("settings");
-        let t0 = Instant::now() + S;
-        assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
+        let t0 = Instant::now() + 3 * S;
+        a.lead_at(t0);
         assert!(a.release().expect("release"));
         assert_eq!(b.tick(t0 + S).expect("take"), Tick::Acquired { term: 2 });
         assert!(matches!(
