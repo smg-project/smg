@@ -319,6 +319,17 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   copy a chat template renders, and `FunctionTool::allows_direct_calls` and
   `CustomTool::allows_direct_calls` say whether the model may call a tool itself. Breaking:
   `CustomTool` gains `r#async: Option<bool>` and `allowed_callers: Option<Vec<String>>`.
+- An Interactions request keeps the fields the gateway does not model (`continuation_token`,
+  `safety_settings`, `service_tier`, `webhook_config`, `environment`, `labels`, `cached_content`,
+  and any the API adds), forwarded to the upstream as written, as the Messages request's `other`
+  keeps its. The Gemini router rebuilds the upstream body from the typed request, which dropped
+  them: the safety settings were lost, and a `store: false` client's continuation hop reached the
+  upstream without its token, so each hop started the answer over. A modeled field also reads its
+  camelCase spelling (`previousInteractionId`, `systemInstruction`, `generationConfig`, ...) into
+  the typed field, where the gateway's checks see it, and a body with both spellings is refused.
+  So does a key of the generation and agent configs (`maxOutputTokens`, `stopSequences`,
+  `thinkingSummaries`, ...), which goes upstream in snake_case with its value.
+  Breaking: `InteractionsRequest` gains `other: Map<String, Value>`.
 - `GenerateRequest` runs the rules of its `sampling_params`, with the chat route's lower bound on
   `n`, and refuses an empty `input_ids` as the chat route refuses an empty `messages`, so the
   gateway's `/generate` reads its body through the validated extractor and answers a negative
