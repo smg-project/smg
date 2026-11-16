@@ -958,7 +958,8 @@ mod tests {
     /// character of `GROUP_CUTS`, are one piece without the later stages'
     /// read of them; the stages still cut every other run and group: a run
     /// with a punctuation mark or a symbol of its block in it, a run that a
-    /// punctuation lead opens, a group with a letter in it.
+    /// punctuation lead opens, a group with a letter, a punctuation mark or
+    /// a space in it.
     #[test]
     fn a_run_of_letters_and_a_plain_group_are_one_piece_and_the_stages_cut_the_others() {
         // A punctuation lead that is a letter too, with a run class that
@@ -981,6 +982,24 @@ mod tests {
             ([DIGITS, RUNS, TEMPLATE], "١٢٣٤", vec![(0, 6), (6, 8)]),
             ([DIGITS, "[a-zé]+", LEAD_A], "abé", vec![(0, 2), (2, 4)]),
             ([HEX, RUNS, TEMPLATE], "1a2", vec![(0, 2), (2, 3)]),
+            // A group class that holds a punctuation mark and a space: each
+            // is a match of the template inside the group. The full stop is
+            // a punctuation lead too; the ideographic one is not.
+            (
+                [r"[0-9 .]{1,3}", RUNS, TEMPLATE],
+                "1.2",
+                vec![(0, 1), (1, 2), (2, 3)],
+            ),
+            (
+                [r"[0-9 .]{1,3}", RUNS, TEMPLATE],
+                "1 2",
+                vec![(0, 1), (1, 2), (2, 3)],
+            ),
+            (
+                ["[0-9。]{1,3}", RUNS, TEMPLATE],
+                "1。2",
+                vec![(0, 1), (1, 4), (4, 5)],
+            ),
         ] {
             let stages = chain(&patterns);
             let scanner = Scanner::recognize(&stages).expect("the scanner");
