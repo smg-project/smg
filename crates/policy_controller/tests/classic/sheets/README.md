@@ -2,7 +2,8 @@
 
 What the gateway's own routing policy code picks, recorded row by row. The gateway chooses a worker for each request
 with a load-balancing policy, and this crate builds those policies a second time. The test target
-`tests/classic_rows.rs` replays every row here through the new code and fails on a row it decides differently. The
+`tests/classic_rows.rs` replays every row of each sheet that has a module there through the new code, and fails on a
+row it decides differently. A sheet with no module yet is read and owed by name. The
 reference is the gateway's policy code at the commit a sheet names, run, never read.
 
 One sheet records no pick: `pair_index.json` holds which prefill and decode workers the gateway pairs, the lists a
