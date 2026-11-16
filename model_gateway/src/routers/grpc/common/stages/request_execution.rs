@@ -1297,6 +1297,37 @@ pub(crate) fn start_failure_response(
 /// them, and the worker's queue is no longer one request's to fill.
 pub(crate) const MAX_IN_FLIGHT_EMBED_CALLS: usize = 256;
 
+/// The calls of a batch past the window, at most the window of them in
+/// flight, their answers in the inputs' order. Unordered, so a slow call
+/// does not hold the window's other slots: each answer is put back at its
+/// input's place. The index rides the call's own future: an async block
+/// around the call would hold that future twice and double every call's
+/// task.
+async fn embed_in_window<C>(calls: impl ExactSizeIterator<Item = C>) -> Vec<C::Output>
+where
+    C: Future,
+{
+    use futures::FutureExt;
+
+    let mut calls = calls.enumerate();
+    let mut in_flight = FuturesUnordered::new();
+    let mut answers = Vec::with_capacity(calls.len());
+    loop {
+        while in_flight.len() < MAX_IN_FLIGHT_EMBED_CALLS {
+            let Some((index, call)) = calls.next() else {
+                break;
+            };
+            in_flight.push(call.map(move |answer| (index, answer)));
+        }
+        let Some(answer) = in_flight.next().await else {
+            break;
+        };
+        answers.push(answer);
+    }
+    answers.sort_unstable_by_key(|(index, _)| *index);
+    answers.into_iter().map(|(_, answer)| answer).collect()
+}
+
 /// The embed calls of a request, one per input, at most
 /// [`MAX_IN_FLIGHT_EMBED_CALLS`] of them in flight together on the one worker
 /// and answered in the inputs' order (the wire takes one input per call). The
@@ -1316,7 +1347,7 @@ async fn execute_embed(
     // The file's own `join_all` import goes with the last other call that
     // uses it; this one names the function here, so the call stands whether
     // or not that import remains.
-    use futures::{future::join_all, FutureExt};
+    use futures::future::join_all;
 
     let client = &*clients.single_or_mismatch("execute_embed")?;
 
@@ -1327,32 +1358,13 @@ async fn execute_embed(
         }
         client.embed(request)
     });
-    // A batch within the window is one plain join, as a single input is: the
-    // window's queue is paid only by the batch that needs it.
+    // A batch within the window is one plain join, as a single input is. The
+    // window's queue is a future of its own, boxed: only the batch that
+    // needs the window pays for it, in its calls and in this future's size.
     let answers = if calls.len() <= MAX_IN_FLIGHT_EMBED_CALLS {
         join_all(calls).await
     } else {
-        // Unordered, so a slow call does not hold the window's other slots:
-        // each answer is put back at its input's place. The index rides the
-        // call's own future: an async block around the call would hold that
-        // future twice and double every call's task.
-        let mut calls = calls.enumerate();
-        let mut in_flight = FuturesUnordered::new();
-        let mut answers = Vec::with_capacity(calls.len());
-        loop {
-            while in_flight.len() < MAX_IN_FLIGHT_EMBED_CALLS {
-                let Some((index, call)) = calls.next() else {
-                    break;
-                };
-                in_flight.push(call.map(move |answer| (index, answer)));
-            }
-            let Some(answer) = in_flight.next().await else {
-                break;
-            };
-            answers.push(answer);
-        }
-        answers.sort_unstable_by_key(|(index, _)| *index);
-        answers.into_iter().map(|(_, answer)| answer).collect()
+        Box::pin(embed_in_window(calls)).await
     };
     // One breaker sample for the request, read from every answer: a worker
     // failure on any input counts whatever its place in the batch.
