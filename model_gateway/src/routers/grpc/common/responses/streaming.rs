@@ -8,7 +8,7 @@ use futures::Stream;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use openai_protocol::{
     chat::ChatCompletionStreamResponse,
-    common::{ToolCallDelta, Usage},
+    common::Usage,
     event_types::{
         ContentPartEvent, FunctionCallEvent, McpEvent, OutputItemEvent, OutputTextEvent,
         ResponseEvent,
@@ -310,6 +310,51 @@ fn serde_error_kind(error: &serde_json::Error) -> &'static str {
         "duplicate field"
     } else {
         "other"
+    }
+}
+
+/// One tool-call delta of a chat chunk, as the Responses events read it.
+pub struct ToolCallParts<'a> {
+    pub index: u32,
+    pub id: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub arguments: Option<&'a str>,
+}
+
+/// What the Responses events read of one chat chunk: its first choice's
+/// delta texts, its tool-call deltas in order and its finish reason. The
+/// owned chunk answers from its fields; a reader that borrows the chunk from
+/// its frame answers from the frame's text, with no copy of it.
+pub trait ChatChunkParts {
+    fn reasoning(&self) -> Option<&str>;
+    fn content(&self) -> Option<&str>;
+    /// The tool-call delta at position `at` of the delta's list.
+    fn tool_call(&self, at: usize) -> Option<ToolCallParts<'_>>;
+    fn finish_reason(&self) -> Option<&str>;
+}
+
+impl ChatChunkParts for ChatCompletionStreamResponse {
+    fn reasoning(&self) -> Option<&str> {
+        self.choices.first()?.delta.reasoning_content.as_deref()
+    }
+
+    fn content(&self) -> Option<&str> {
+        self.choices.first()?.delta.content.as_deref()
+    }
+
+    fn tool_call(&self, at: usize) -> Option<ToolCallParts<'_>> {
+        let call = self.choices.first()?.delta.tool_calls.as_ref()?.get(at)?;
+        let function = call.function.as_ref();
+        Some(ToolCallParts {
+            index: call.index,
+            id: call.id.as_deref(),
+            name: function.and_then(|f| f.name.as_deref()),
+            arguments: function.and_then(|f| f.arguments.as_deref()),
+        })
+    }
+
+    fn finish_reason(&self) -> Option<&str> {
+        self.choices.first()?.finish_reason.as_deref()
     }
 }
 
@@ -1519,31 +1564,23 @@ impl ResponseStreamEventEmitter {
     /// content delta, the tool-call deltas, then the finish, in that order.
     pub async fn process_chunk(
         &mut self,
-        chunk: &ChatCompletionStreamResponse,
+        chunk: &impl ChatChunkParts,
         tx: &SseSender,
     ) -> Result<(), String> {
-        let Some(choice) = chunk.choices.first() else {
-            return Ok(());
-        };
-        if let Some(reasoning) = choice
-            .delta
-            .reasoning_content
-            .as_deref()
-            .filter(|r| !r.is_empty())
-        {
+        if let Some(reasoning) = chunk.reasoning().filter(|r| !r.is_empty()) {
             self.process_reasoning_delta(reasoning, tx).await?;
         }
-        if let Some(content) = choice.delta.content.as_deref().filter(|c| !c.is_empty()) {
+        if let Some(content) = chunk.content().filter(|c| !c.is_empty()) {
             self.process_content_delta(content, tx).await?;
         }
-        if let Some(tool_calls) = &choice.delta.tool_calls {
-            for tc in tool_calls {
-                self.process_tool_call_delta(tc, tx).await?;
-            }
+        let mut at = 0;
+        while let Some(call) = chunk.tool_call(at) {
+            self.process_tool_call_delta(call, tx).await?;
+            at += 1;
         }
         // Check for finish_reason to emit completion events
-        if let Some(reason) = &choice.finish_reason {
-            self.finish_reason = Some(reason.clone());
+        if let Some(reason) = chunk.finish_reason() {
+            self.finish_reason = Some(reason.to_owned());
             self.close_reasoning_item(tx).await?;
             self.close_message_item(tx).await?;
             self.close_tool_call_items(tx).await?;
@@ -1669,7 +1706,7 @@ impl ResponseStreamEventEmitter {
     /// or arguments, and its arguments streamed unless the tool is custom.
     async fn process_tool_call_delta(
         &mut self,
-        tc: &ToolCallDelta,
+        tc: ToolCallParts<'_>,
         tx: &SseSender,
     ) -> Result<(), String> {
         let pos = match self
@@ -1688,8 +1725,7 @@ impl ResponseStreamEventEmitter {
                     item_id,
                     call_id: tc
                         .id
-                        .clone()
-                        .unwrap_or_else(|| format!("call_{}", Uuid::now_v7())),
+                        .map_or_else(|| format!("call_{}", Uuid::now_v7()), str::to_owned),
                     name: String::new(),
                     custom: false,
                     arguments: String::new(),
@@ -1698,13 +1734,8 @@ impl ResponseStreamEventEmitter {
                 self.tool_call_items.len() - 1
             }
         };
-        let function = tc.function.as_ref();
-        let name_delta = function
-            .and_then(|f| f.name.as_deref())
-            .filter(|n| !n.is_empty());
-        let args_delta = function
-            .and_then(|f| f.arguments.as_deref())
-            .filter(|a| !a.is_empty());
+        let name_delta = tc.name.filter(|n| !n.is_empty());
+        let args_delta = tc.arguments.filter(|a| !a.is_empty());
 
         // The name arrives once; whether it names a custom tool is decided
         // then and kept on the item.
