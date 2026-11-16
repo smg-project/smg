@@ -139,7 +139,9 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   names the thought as the state an unopened turn starts in, with `<｜end▁of▁sentence｜>` as the end of
   a turn the model wrote: a prompt with no opener, or whose last opener's turn ended, starts the
   output in the thought, and nothing of it is replayed (an earlier turn's markers and a `</think>`
-  quoted in a tool result move nothing). A prompt that is the thought's markers with no opener
+  quoted in a tool result move nothing). Where such a prompt ends with `<｜end▁of▁sentence｜>` itself,
+  the engine keeps and reads that marker alone, under every variant of the table a request reads
+  with. A prompt that is the thought's markers with no opener
   before them is such a prompt too: the corpus replay feeds the turn opener before the template's
   tail for this reason (the tail alone read a thinking-off turn's text as reasoning; the gateway
   replays the whole prompt and never meets it). The legacy reasoning parser for this checkpoint starts
@@ -535,8 +537,12 @@ What the table says beyond `inkling`, whose rows it shares:
   after any message's close; a prompt whose last `<|message_model|>` is followed by
   `<|end_message|>` (an assistant message in the history) starts there too, and a prompt that
   continues an assistant message (`<|message_model|><|content_text|>Partial`, the template's
-  continuation) replays from the opener as Inkling's does. Every recorded output of the group
-  starts with the opener, and the corpus replay feeds the close alone before it, no opener.
+  continuation) replays from the opener as Inkling's does: the message's own, the first after the
+  last close, since an opener said again inside the body the prompt left open opens nothing.
+  Every recorded output of the group starts with the opener, and the corpus replay feeds the
+  close alone before it, no opener. The engine keeps and reads that close alone as well: a
+  prompt that ends with it opens no turn wherever its last opener stands, so nothing before it
+  is searched or kept, whatever the prompt's length.
 - **A JSON answer's tag writes the opener first.** The way into the answer from where the turn
   starts is `<|message_model|>` and then `<|content_text|>`: `Format::answer_grammar` leads the
   tag with the rows from the unopened state to the turn's own state, owed outright before the

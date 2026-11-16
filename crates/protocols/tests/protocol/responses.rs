@@ -5200,6 +5200,81 @@ fn a_custom_tool_a_namespace_and_its_members_have_names() {
     assert!(named.validate().is_ok(), "named tools pass");
 }
 
+/// A namespace's function member is handed to the model as a function of its
+/// own, so its `parameters` are held to the rule a top-level function's are: a
+/// JSON Schema object, refused at the member's place inside its namespace. The
+/// name's rule stands ahead, as it does for a top-level function. A member
+/// with an object, with `null` or with no `parameters` passes, and so does a
+/// custom member, which has none.
+#[test]
+fn a_namespace_members_parameters_must_be_an_object() {
+    let namespace = |name: &str, tools: serde_json::Value| json!({"type": "namespace", "name": name, "description": "d", "tools": tools});
+    let member = |name: &str, parameters: serde_json::Value| json!({"type": "function", "name": name, "parameters": parameters});
+    for (parameters, got) in [
+        (json!("not-an-object"), "a string"),
+        (json!([1]), "an array"),
+        (json!(7), "a number"),
+        (json!(true), "a boolean"),
+    ] {
+        let request = plain_request(json!({
+            "model": "m", "input": "hi",
+            "tools": [
+                function_tool("f"),
+                namespace("ns", json!([function_tool("g"), member("h", parameters.clone())]))
+            ]
+        }))
+        .unwrap();
+        let code = validation_code(&request);
+        assert!(
+            code.contains("invalid_type")
+                && code.contains(&format!(
+                    "Invalid type for 'tools[1].tools[1].parameters': expected an object, but got {got} instead."
+                )),
+            "{parameters}: {code}"
+        );
+    }
+
+    // The first member of a second namespace: the namespace's place, then the member's.
+    let request = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [
+            namespace("a", json!([function_tool("g")])),
+            namespace("b", json!([member("h", json!("x")), function_tool("i")]))
+        ]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(code.contains("'tools[1].tools[0].parameters'"), "{code}");
+
+    // An unnamed member with such parameters is refused for its name.
+    let request = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [namespace("ns", json!([member("", json!("x"))]))]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(
+        names_the_unnamed_tool(&code, "tools[0].tools[0].name") && !code.contains("invalid_type"),
+        "{code}"
+    );
+
+    let accepted = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [namespace("ns", json!([
+            member("object", json!({"type": "object"})),
+            member("null", serde_json::Value::Null),
+            {"type": "function", "name": "absent"},
+            {"type": "custom", "name": "custom"}
+        ]))]
+    }))
+    .unwrap();
+    assert!(
+        accepted.validate().is_ok(),
+        "{}",
+        validation_code(&accepted)
+    );
+}
+
 /// One of OpenAI's own models: the public API's structured-output rules apply.
 const OPENAI_MODEL: &str = "gpt-4.1";
 /// A self-hosted model: those rules are the engine's business, not the gateway's.
@@ -5242,6 +5317,67 @@ fn strict_function_schema_passes_through_for_self_hosted_models() {
     let request = plain_request(json!({
         "model": SELF_HOSTED_MODEL, "input": "hi",
         "tools": [{"type": "function", "name": "f", "strict": true, "parameters": loose}]
+    }))
+    .unwrap();
+    assert!(
+        request.validate().is_ok(),
+        "the engine's grammar compiler decides a self-hosted model's strict schema"
+    );
+}
+
+/// A strict function that is a namespace's member is held to the pin a
+/// top-level strict function is held to, for OpenAI's own models: the refusal
+/// names the member whose schema lacks it. A pinned member and a member that
+/// is not strict pass, and a self-hosted model's strict member is passed
+/// through as its top-level function is.
+#[test]
+fn strict_namespace_member_schema_needs_additional_properties_false_for_openai_models() {
+    let loose = json!({"type": "object", "properties": {"x": {"type": "string"}}});
+    let pinned = json!({
+        "type": "object", "properties": {"x": {"type": "string"}}, "additionalProperties": false
+    });
+    let namespace = |tools: serde_json::Value| json!({"type": "namespace", "name": "ns", "description": "d", "tools": tools});
+    let strict = |name: &str, parameters: &serde_json::Value| json!({"type": "function", "name": name, "strict": true, "parameters": parameters});
+
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "hi",
+        "tools": [namespace(json!([
+            strict("f", &pinned),
+            {"type": "custom", "name": "c"},
+            strict("g", &loose)
+        ]))]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(
+        code.contains("invalid_function_parameters")
+            && code.contains(
+                "Invalid schema for function 'g': In context=(), 'additionalProperties' is required to be supplied and to be false."
+            ),
+        "{code}"
+    );
+
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "hi",
+        "tools": [namespace(json!([strict("f", &pinned)]))]
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok(), "a pinned member passes");
+
+    // Not strict: the pin is not required.
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "hi",
+        "tools": [namespace(json!([{"type": "function", "name": "f", "parameters": loose}]))]
+    }))
+    .unwrap();
+    assert!(
+        request.validate().is_ok(),
+        "a member that is not strict passes"
+    );
+
+    let request = plain_request(json!({
+        "model": SELF_HOSTED_MODEL, "input": "hi",
+        "tools": [namespace(json!([strict("g", &loose)]))]
     }))
     .unwrap();
     assert!(

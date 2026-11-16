@@ -9,14 +9,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{Ask, Built, ViewBuffers, World, Writer, PUBLISH_WINDOW};
+use super::{
+    run_of, seek, Ask, Built, GatewayRun, PoolVeto, PoolVetoes, StaleGeneration, ViewBuffers,
+    World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
+};
 use crate::{
+    spec::{BindingSpec, Match, OverloadSpec},
     store::{
-        GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Reachability, WorkerFacts,
-        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Overload, Reachability,
+        WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{fingerprint, AffinityFacts, Candidate, LoadRow, Phase, Role, WireModes, WorkerId},
-    PolicySpec,
+    AppliedSpec, PolicySpec,
 };
 
 const MODEL: &str = "m";
@@ -268,6 +272,13 @@ fn running_in(world: &World, model: &str, now: Instant) -> Option<u32> {
     out.candidates[0].load.map(|load| load.running)
 }
 
+/// The rows of `model`'s single pool as `world` lists them, under a count
+/// of the caller's own.
+fn rows_of(world: &World, model: &str) -> Arc<[Candidate]> {
+    let index = world.derived.by_model[model][super::role_slot(Role::Single)].expect("the pool");
+    Arc::clone(&world.rows[index as usize])
+}
+
 #[test]
 fn two_publications_of_one_membership_are_two_worlds_of_one_epoch_sharing_what_it_derived() {
     let store = MemoryStore::new();
@@ -289,13 +300,14 @@ fn two_publications_of_one_membership_are_two_worlds_of_one_epoch_sharing_what_i
     // Nothing derived was built again: the two worlds share it by pointer,
     assert!(Arc::ptr_eq(&before.derived, &after.derived));
     // and the pool no write was folded into keeps its rows by pointer.
-    let rows = |world: &World, model: &str| {
-        let index =
-            world.derived.by_model[model][super::role_slot(Role::Single)].expect("the pool");
-        Arc::clone(&world.rows[index as usize])
-    };
-    assert!(Arc::ptr_eq(&rows(&before, "two"), &rows(&after, "two")));
-    assert!(!Arc::ptr_eq(&rows(&before, "one"), &rows(&after, "one")));
+    assert!(Arc::ptr_eq(
+        &rows_of(&before, "two"),
+        &rows_of(&after, "two")
+    ));
+    assert!(!Arc::ptr_eq(
+        &rows_of(&before, "one"),
+        &rows_of(&after, "one")
+    ));
     // A world never changes once published: the one a decision took before
     // the record reads none.
     assert_eq!(running_in(&before, "one", t0), None);
@@ -306,6 +318,190 @@ fn two_publications_of_one_membership_are_two_worlds_of_one_epoch_sharing_what_i
     let next = store.world();
     assert!(next.epoch() > after.epoch());
     assert!(!Arc::ptr_eq(&after.derived, &next.derived));
+}
+
+/// What `id`'s row reads as running in the store's world.
+fn running_of(store: &MemoryStore, id: WorkerId, now: Instant) -> Option<u32> {
+    let (rows, _, _) = view(store, &ask(now));
+    let row = rows.iter().find(|row| row.id == id).expect("the row");
+    row.load.map(|load| load.running)
+}
+
+#[test]
+fn a_pool_no_reader_holds_is_published_into_two_buffers_in_turn() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    member(&store, "http://b:8000");
+    // Each record lands a window after the last and publishes by itself.
+    let publish = |turn: u32| {
+        let at = t0 + PUBLISH_WINDOW * turn;
+        store.record(id, 0, load(turn, 0), at, LoadSource::Stream);
+        assert_eq!(running_of(&store, id, at), Some(turn));
+    };
+    // Where the store's world lists the pool's rows, no hold kept on them.
+    let listed = || rows_of(&store.world(), MODEL).as_ptr();
+    let derived = listed();
+    assert_eq!(
+        store.publication_allocations(),
+        0,
+        "a membership write is not counted"
+    );
+
+    // The pool's first publication has no earlier rows to write over.
+    publish(1);
+    let second = listed();
+    assert_ne!(second, derived);
+    assert_eq!(store.publication_allocations(), 1);
+    // Each one after it writes over the rows published before the last:
+    // two buffers in turn, and nothing allocated.
+    for turn in 2..=7 {
+        publish(turn);
+        let written = if turn % 2 == 0 { derived } else { second };
+        assert_eq!(listed(), written, "turn {turn}");
+    }
+    assert_eq!(store.publication_allocations(), 1);
+
+    // A membership write derives its pools anew, uncounted, and each pool
+    // starts again without earlier rows. The rows it retired are the
+    // writer's to free: the spare at once, the published at the next
+    // publication, when the world that listed them has left the store.
+    member(&store, "http://c:8000");
+    assert_eq!((store.publication_allocations(), store.held_rows()), (1, 1));
+    publish(8);
+    assert_eq!((store.publication_allocations(), store.held_rows()), (2, 0));
+    publish(9);
+    publish(10);
+    assert_eq!(store.publication_allocations(), 2);
+}
+
+#[test]
+fn a_pool_written_once_keeps_its_rows_while_another_pool_publishes() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let one = store
+        .upsert(facts("http://a:8000", Role::Single, &["one"]))
+        .id();
+    let two = store
+        .upsert(facts("http://b:8000", Role::Single, &["two"]))
+        .id();
+    // One record into the first pool, published by itself.
+    store.record(one, 0, load(1, 0), t0, LoadSource::Stream);
+    let listed = |model: &str| rows_of(&store.world(), model).as_ptr();
+    let written = listed("one");
+    // The other pool publishes five times, a window apart. The first pool
+    // moved in none of them: it is not published again, and the world
+    // lists the rows it listed.
+    for turn in 1..=5 {
+        let at = t0 + PUBLISH_WINDOW * turn;
+        store.record(two, 0, load(turn, 0), at, LoadSource::Stream);
+        assert_eq!(running_in(&store.world(), "two", at), Some(turn));
+        assert_eq!(listed("one"), written, "turn {turn}");
+    }
+    // The first pool was written over the rows the second registration
+    // retired, and the other allocated at its own first publication alone.
+    assert_eq!(store.publication_allocations(), 1);
+}
+
+#[test]
+fn rows_a_reader_still_holds_are_left_whole_and_that_publication_allocates() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    let publish = |turn: u32| {
+        let at = t0 + PUBLISH_WINDOW * turn;
+        store.record(id, 0, load(turn, 0), at, LoadSource::Stream);
+        assert_eq!(running_of(&store, id, at), Some(turn));
+    };
+    let counts = || (store.publication_allocations(), store.held_rows());
+    publish(1);
+    assert_eq!(counts(), (1, 0));
+
+    // A reader takes the world of the first publication and keeps it
+    // across two publications of its pool.
+    let kept = store.world();
+    let read = format!("{:?}", rows_of(&kept, MODEL));
+    publish(2);
+    assert_eq!(counts(), (1, 0));
+    // The second would write over the rows that world lists: it leaves
+    // them whole, allocates and is counted.
+    publish(3);
+    assert_eq!(counts(), (2, 1));
+    assert_eq!(running_in(&kept, MODEL, t0), Some(1));
+    assert_eq!(format!("{:?}", rows_of(&kept, MODEL)), read);
+
+    // One world held is one buffer more: the two others go on in turn.
+    publish(4);
+    publish(5);
+    assert_eq!(counts(), (2, 1));
+    assert_eq!(format!("{:?}", rows_of(&kept, MODEL)), read);
+
+    // The writer kept its own reference to the rows it left, so the
+    // reader dropping the last world that lists them frees no rows: two
+    // counts stay, the writer's and this case's.
+    let rows = rows_of(&kept, MODEL);
+    drop(kept);
+    assert_eq!(Arc::strong_count(&rows), 2);
+    publish(6);
+    assert_eq!((counts(), Arc::strong_count(&rows)), ((2, 1), 2));
+    // The publication that finds them alone frees them.
+    drop(rows);
+    publish(7);
+    assert_eq!(counts(), (2, 0));
+
+    // A membership write keeps its outgoing rows the same way, uncounted:
+    // the spare for its reader, the published rows for the world the store
+    // showed till then. The pool's next publication frees both and
+    // allocates.
+    let kept = store.world();
+    publish(8);
+    member(&store, "http://b:8000");
+    assert_eq!(counts(), (2, 2));
+    let rows = rows_of(&kept, MODEL);
+    drop(kept);
+    assert_eq!(Arc::strong_count(&rows), 2);
+    drop(rows);
+    publish(9);
+    assert_eq!(counts(), (3, 0));
+}
+
+#[test]
+fn a_pool_with_no_spare_to_write_over_takes_rows_the_writer_holds_alone() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    let publish = |turn: u32| {
+        let at = t0 + PUBLISH_WINDOW * turn;
+        store.record(id, 0, load(turn, 0), at, LoadSource::Stream);
+        assert_eq!(running_of(&store, id, at), Some(turn));
+    };
+    let counts = || (store.publication_allocations(), store.held_rows());
+    publish(1);
+    // A reader that holds the worlds of the last two publications: each
+    // publication finds its pool's spare listed by the older one.
+    let mut kept = [store.world(), store.world()];
+    publish(2);
+    kept[0] = store.world();
+    // The first such publication has no other rows to take.
+    publish(3);
+    assert_eq!(counts(), (2, 1));
+    // From then on the rows the reader let go come back in turn: three
+    // buffers carry every window and nothing is allocated.
+    for turn in 4..=9 {
+        kept[(turn % 2) as usize] = store.world();
+        publish(turn);
+        assert_eq!(counts(), (2, 1), "turn {turn}");
+    }
+    drop(kept);
+    publish(10);
+    assert_eq!(counts(), (2, 0));
+
+    // A membership write that leaves the pool its length: the pool's next
+    // publication takes the rows the write retired.
+    store.upsert(facts("http://z:8000", Role::Single, &["other"]));
+    assert_eq!(counts(), (2, 1));
+    publish(11);
+    assert_eq!(counts(), (2, 0));
 }
 
 #[test]
@@ -558,8 +754,7 @@ fn a_report_is_folded_whole_and_a_poll_asked_before_the_last_window_waits() {
     assert_eq!(store.publish_due(), Some(t0 + PUBLISH_WINDOW));
     // A poll asked before the last publication lands inside its window.
     store.report(
-        id,
-        &[(0, load(4, 0)), (1, load(5, 0))],
+        &[(id, 0, Some(load(4, 0))), (id, 1, Some(load(5, 0)))],
         t0 - Duration::from_millis(3),
         LoadSource::Poll,
     );
@@ -577,8 +772,11 @@ fn a_report_whose_last_rank_is_not_the_members_still_shows_the_members_row() {
     // The member is rank 0 and the report's last row is another rank's: the
     // report is shown for the row it reached, whichever row came last.
     store.report(
-        id,
-        &[(0, load(4, 0)), (1, load(5, 0)), (2, load(6, 0))],
+        &[
+            (id, 0, Some(load(4, 0))),
+            (id, 1, Some(load(5, 0))),
+            (id, 2, Some(load(6, 0))),
+        ],
         t0,
         LoadSource::Poll,
     );
@@ -586,8 +784,7 @@ fn a_report_whose_last_rank_is_not_the_members_still_shows_the_members_row() {
     // Inside the window that opened, the next one waits and the sink names
     // its instant.
     store.report(
-        id,
-        &[(0, load(7, 0)), (1, load(8, 0))],
+        &[(id, 0, Some(load(7, 0))), (id, 1, Some(load(8, 0)))],
         t0 + Duration::from_millis(1),
         LoadSource::Poll,
     );
@@ -1220,11 +1417,18 @@ fn the_pair_door_racing_the_publications_builds_both_sides_from_one_load() {
     // The case ends at an event, the door read across `SEEN` publications,
     // and holds the door's rule at every read: one load of the world feeds
     // both sides, so a publication between the two builds shows in neither.
+    // A store that stopped publishing fails the case at this bound: without
+    // it the door would be read for ever.
+    let bound = Instant::now() + Duration::from_secs(60);
     let (mut seen, mut last) = (0, None);
     while seen < SEEN {
         assert!(
             !writer.is_finished(),
             "the writer ended before the door was read across {SEEN} publications"
+        );
+        assert!(
+            Instant::now() < bound,
+            "the door was read across {seen} publications of {SEEN} in a minute"
         );
         let (prefills, decodes) = sides();
         assert_eq!(
@@ -1395,4 +1599,1157 @@ fn a_veto_past_its_end_leaves_at_the_next_windows_publication() {
     assert_eq!(stalled(&store, ASKER, t0), [standing]);
     // The sink's own answer keeps its compare.
     assert!(store.vetoed(ASKER, ended, t0));
+}
+
+#[test]
+fn each_of_many_gateways_is_masked_by_its_own_vetoes_alone() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(60);
+    let mut workers: Vec<WorkerId> = (0..24)
+        .map(|n| member(&store, &format!("http://w{n}:8000")))
+        .collect();
+    workers.sort_unstable();
+    // Twenty-four gateways whose ids follow no order of their writes, each
+    // with three vetoes; a worker is vetoed by three of them.
+    let gateways: Vec<GatewayId> = (0..24).map(|n| GatewayId(n * 856 % 1_009 + 2)).collect();
+    let own = |n: usize| {
+        let mut own: Vec<WorkerId> = (0..3).map(|step| workers[(n + step * 5) % 24]).collect();
+        own.sort_unstable();
+        own
+    };
+    for (n, &gateway) in gateways.iter().enumerate().rev() {
+        for id in own(n) {
+            store.gateway_veto(gateway, id, Some(until));
+        }
+    }
+    let each_reads_its_own = || {
+        for (n, &gateway) in gateways.iter().enumerate() {
+            assert_eq!(stalled(&store, gateway, t0), own(n), "gateway {n}");
+        }
+        // A gateway that holds no veto reads none among the others'.
+        assert_eq!(stalled(&store, ASKER, t0), []);
+    };
+    // As each veto's write left the runs,
+    each_reads_its_own();
+    // as a membership write builds every run again,
+    member(&store, "http://joined:8000");
+    each_reads_its_own();
+    // and after one gateway cleared its own: the others' stand.
+    for id in own(7) {
+        store.gateway_veto(gateways[7], id, None);
+    }
+    assert_eq!(stalled(&store, gateways[7], t0), []);
+    assert_eq!(stalled(&store, gateways[6], t0), own(6));
+    assert_eq!(stalled(&store, gateways[8], t0), own(8));
+}
+
+#[test]
+fn a_gateways_run_is_found_by_the_walk_and_by_the_search_and_none_where_it_holds_none() {
+    let until = Instant::now() + Duration::from_secs(60);
+    // Runs of gateways three apart, on both sides of the count a build
+    // walks: an asker stands under them, between two and above them. Each
+    // run's one veto names its own place.
+    for count in [
+        0,
+        1,
+        2,
+        WALKED_RUNS - 1,
+        WALKED_RUNS,
+        WALKED_RUNS + 1,
+        3 * WALKED_RUNS,
+    ] {
+        let runs: Vec<GatewayRun> = (0..count)
+            .map(|place| GatewayRun {
+                gateway: GatewayId(3 * place as u64 + 3),
+                vetoes: Arc::from([PoolVeto {
+                    row: place as u32,
+                    id: WorkerId(place as u64),
+                    until,
+                }]),
+            })
+            .collect();
+        for asker in 0..=3 * count as u64 + 4 {
+            let found = run_of(&runs, GatewayId(asker)).map(|run| run.vetoes[0].row);
+            let holds = asker >= 3 && asker % 3 == 0 && asker / 3 <= count as u64;
+            let held = holds.then(|| (asker / 3 - 1) as u32);
+            assert_eq!(found, held, "{count} runs, gateway {asker}");
+        }
+    }
+}
+
+#[test]
+fn one_worker_vetoed_by_every_gateway_is_masked_for_each_whatever_their_count() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(60);
+    let mut workers: Vec<WorkerId> = (0..4)
+        .map(|n| member(&store, &format!("http://w{n}:8000")))
+        .collect();
+    workers.sort_unstable();
+    // Gateways two apart. Each vetoes the one sick worker and, by its own
+    // number, one of the three others: a build that took a neighbour's run
+    // would mask another row.
+    let gateway = |n: u64| GatewayId(2 * n + 2);
+    let own = |n: u64| {
+        let mut own = vec![workers[0], workers[1 + (n % 3) as usize]];
+        own.sort_unstable();
+        own
+    };
+    let walked = WALKED_RUNS as u64;
+    let mut holders = 0;
+    // Few gateways, as many as a build walks, one more, and many.
+    for count in [1, 9, walked, walked + 1, 2 * walked] {
+        for n in holders..count {
+            for id in own(n) {
+                store.gateway_veto(gateway(n), id, Some(until));
+            }
+        }
+        holders = count;
+        for n in 0..count {
+            assert_eq!(
+                stalled(&store, gateway(n), t0),
+                own(n),
+                "{count} gateways, gateway {n}"
+            );
+            // The gateway under each holder holds none.
+            assert_eq!(
+                stalled(&store, GatewayId(2 * n + 1), t0),
+                [],
+                "{count} gateways, under gateway {n}"
+            );
+        }
+        assert_eq!(
+            stalled(&store, GatewayId(2 * count + 3), t0),
+            [],
+            "{count} gateways, above them"
+        );
+    }
+}
+
+/// Every pool's runs as plain values: per gateway its entries.
+fn runs_of(writer: &Writer) -> Vec<Vec<(GatewayId, Vec<PoolVeto>)>> {
+    writer
+        .pool_vetoes
+        .iter()
+        .map(|runs| {
+            runs.iter()
+                .map(|run| (run.gateway, run.vetoes.to_vec()))
+                .collect()
+        })
+        .collect()
+}
+
+/// A member row of the writer's own cases: worker `id`, ready, serving
+/// `models`.
+fn row_serving(id: u64, models: &[&str], admitted_at: Instant) -> WorkerRow {
+    WorkerRow {
+        id: WorkerId(id),
+        facts: facts(&format!("http://w{id}:8000"), Role::Single, models),
+        status: WorkerStatus::Ready,
+        revision: 1,
+        admitted_at,
+    }
+}
+
+#[test]
+fn a_spare_of_another_length_is_left_and_the_publication_allocates() {
+    let origin = Instant::now();
+    let members = [
+        row_serving(1, &[MODEL], origin),
+        row_serving(2, &[MODEL], origin),
+    ];
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    writer.rebuild(1, members.iter(), |_, _| None);
+    // No write leaves a pool a spare of another length: one is planted,
+    // the rows of a pool of one, held by the pool alone.
+    writer.spares[0] = Some(Arc::from(&writer.working[0].rows[..1]));
+    let world = writer
+        .fold_status(WorkerId(1), WorkerStatus::Draining)
+        .expect("a publication");
+    assert_eq!(world.rows[0].len(), 2);
+    assert!(world.rows[0].iter().any(|row| row.health.draining));
+    assert_eq!((writer.allocations, writer.held_rows()), (1, 1));
+    // The next publication finds the planted rows free of every world and
+    // of no pool's length: it frees them and writes over the pool's own.
+    writer
+        .fold_status(WorkerId(1), WorkerStatus::Ready)
+        .expect("a publication");
+    assert_eq!((writer.allocations, writer.held_rows()), (1, 0));
+}
+
+#[test]
+fn a_membership_write_leaves_the_writers_lists_at_one_slot_a_pool() {
+    let origin = Instant::now();
+    let members = [
+        row_serving(1, &[MODEL, "other"], origin),
+        row_serving(2, &[MODEL, "other"], origin),
+    ];
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    for epoch in 1..=4 {
+        writer.rebuild(epoch, members.iter(), |_, _| None);
+        // Two models, a pool each: one slot a pool in each list, however
+        // many membership writes came before.
+        assert_eq!(
+            (
+                writer.spares.len(),
+                writer.published.len(),
+                writer.working.len()
+            ),
+            (2, 2, 2),
+            "epoch {epoch}"
+        );
+        // Both pools publish, so each holds a spare for the next membership
+        // write to retire.
+        writer
+            .fold_status(WorkerId(1), WorkerStatus::Draining)
+            .expect("a publication");
+    }
+}
+
+#[test]
+fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
+    let origin = Instant::now();
+    let until = origin + Duration::from_secs(60);
+    // Eight workers of the model; the first four serve a second model too.
+    let members: Vec<WorkerRow> = (1..=8)
+        .map(|id| {
+            let models: &[&str] = if id <= 4 {
+                &[MODEL, "second"]
+            } else {
+                &[MODEL]
+            };
+            row_serving(id, models, origin)
+        })
+        .collect();
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    writer.rebuild(1, members.iter(), |_, _| None);
+    let (writing, other) = (GatewayId(3), GatewayId(7));
+    for (gateway, id) in [(other, 2), (other, 6), (writing, 3)] {
+        writer
+            .veto(gateway, WorkerId(id), Some(until))
+            .expect("a new veto");
+    }
+    let run = |runs: &PoolVetoes, gateway: GatewayId| {
+        runs.iter()
+            .find(|run| run.gateway == gateway)
+            .map(|run| Arc::clone(&run.vetoes))
+    };
+    // One more veto of the writing gateway, on a worker of the first pool
+    // alone.
+    let before = Arc::clone(&writer.pool_vetoes);
+    writer
+        .veto(writing, WorkerId(7), Some(until))
+        .expect("a new veto");
+    let after = Arc::clone(&writer.pool_vetoes);
+    let mut whole = 0;
+    for (was, is) in before.iter().zip(after.iter()) {
+        if Arc::ptr_eq(was, is) {
+            // The pool the worker has no row in: not built again at all.
+            whole += 1;
+            continue;
+        }
+        // In the worker's pool the writing gateway's run is a new one with
+        // the entry, and the other gateway's is the allocation it was.
+        let (old, new) = (run(was, other), run(is, other));
+        assert!(old
+            .zip(new)
+            .is_some_and(|(old, new)| Arc::ptr_eq(&old, &new)));
+        assert_eq!(run(is, writing).map(|run| run.len()), Some(2));
+    }
+    assert_eq!((before.len(), whole), (2, 1));
+    // The clear takes the entry out the same way; the last clear of a
+    // gateway takes its run out of the pool, and the last of the store
+    // leaves no list at all.
+    let before = Arc::clone(&writer.pool_vetoes);
+    writer.veto(writing, WorkerId(7), None).expect("a clear");
+    let after = Arc::clone(&writer.pool_vetoes);
+    assert_eq!(
+        before
+            .iter()
+            .zip(after.iter())
+            .filter(|(was, is)| Arc::ptr_eq(was, is))
+            .count(),
+        1
+    );
+    writer.veto(writing, WorkerId(3), None).expect("a clear");
+    assert!(writer
+        .pool_vetoes
+        .iter()
+        .all(|runs| run(runs, writing).is_none()));
+    for id in [2, 6] {
+        writer.veto(other, WorkerId(id), None).expect("a clear");
+    }
+    assert!(writer.pool_vetoes.is_empty());
+}
+
+#[test]
+fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
+    let origin = Instant::now();
+    let at = |ms: u64| origin + Duration::from_millis(ms);
+    // Twelve workers of the model; each third one serves a second model.
+    let all: Vec<WorkerRow> = (1..=12)
+        .map(|id| {
+            let models: &[&str] = if id % 3 == 0 {
+                &[MODEL, "second"]
+            } else {
+                &[MODEL]
+            };
+            row_serving(id, models, origin)
+        })
+        .collect();
+    let mut present = [true; 12];
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    writer.rebuild(1, all.iter(), |_, _| None);
+    // A fixed sequence: the case makes the same writes at every run.
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+    let mut clock = 1_000;
+    let mut standing_most = 0;
+    for step in 0..3_000_u64 {
+        let (gateway, worker) = (GatewayId(next(5) * 11 + 2), WorkerId(next(12) + 1));
+        match next(16) {
+            // A membership write: one worker joins or leaves.
+            0 => {
+                let n = next(12) as usize;
+                present[n] = !present[n];
+                let members = all
+                    .iter()
+                    .zip(present)
+                    .filter_map(|(row, here)| here.then_some(row));
+                writer.rebuild(step + 2, members, |_, _| None);
+            }
+            // A window's publication, which drops what its instant ended.
+            1 => {
+                clock += next(40);
+                writer.publish_window(at(clock));
+            }
+            // A clear, of a veto that stands or of none.
+            2..=5 => drop(writer.veto(gateway, worker, None)),
+            // A veto, new or with a new end.
+            _ => drop(writer.veto(gateway, worker, Some(at(clock + 1 + next(60))))),
+        }
+        let left = runs_of(&writer);
+        for runs in &left {
+            assert!(
+                runs.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "step {step}: a pool's runs stand by gateway"
+            );
+            for (_, run) in runs {
+                assert!(!run.is_empty(), "step {step}: no run is empty");
+                assert!(
+                    run.windows(2).all(|pair| pair[0].row < pair[1].row),
+                    "step {step}: a run stands by row"
+                );
+            }
+        }
+        let standing: usize = left.iter().flatten().map(|(_, run)| run.len()).sum();
+        standing_most = standing_most.max(standing);
+        writer.derive_vetoes();
+        assert_eq!(left, runs_of(&writer), "step {step}");
+    }
+    // The sequence held vetoes of several gateways in both pools at once.
+    assert!(standing_most >= 12, "{standing_most}");
+    // Then every standing veto is cleared, one write each: each clear
+    // leaves what a derive builds, the last one no list at all.
+    for gateway in (0..5).map(|n| GatewayId(n * 11 + 2)) {
+        for worker in (1..=12).map(WorkerId) {
+            if writer.veto(gateway, worker, None).is_none() {
+                continue;
+            }
+            let left = runs_of(&writer);
+            writer.derive_vetoes();
+            assert_eq!(left, runs_of(&writer), "{gateway:?} clears {worker:?}");
+        }
+    }
+    assert!(writer.pool_vetoes.is_empty());
+}
+
+#[test]
+fn a_seek_from_any_place_finds_what_a_search_of_the_whole_list_finds() {
+    // Ids with gaps and repeats, in a list longer than the steps on foot.
+    let ids = [
+        1, 1, 3, 4, 4, 4, 7, 9, 10, 12, 15, 15, 18, 21, 22, 25, 30, 31, 31, 40,
+    ]
+    .map(WorkerId);
+    for from in 0..=ids.len() {
+        for id in (0..=41).map(WorkerId) {
+            let whole = ids.partition_point(|&at| at < id).max(from);
+            assert_eq!(seek(&ids, from, id, |&at| at), whole, "from {from}, {id:?}");
+        }
+    }
+}
+
+/// A document that validates, under the generation `number`.
+fn generation(number: u64) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    AppliedSpec::validate(&document).expect("a preset validates")
+}
+
+#[test]
+fn a_store_starts_under_the_unbound_generation_which_binds_nothing() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    member(&store, "http://a:8000");
+    let world = store.world();
+    assert_eq!(world.spec().generation(), 0);
+    for phase in [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode] {
+        assert!(world.spec().engine().binding(MODEL, phase).is_none());
+    }
+    // A build under it reads the same number with its rows.
+    let built = view(&store, &ask(t0)).2;
+    assert_eq!((built.generation, built.pool_facts().generation), (0, 0));
+}
+
+#[test]
+fn a_generation_is_applied_above_the_standing_one_and_no_other() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    member(&store, "http://a:8000");
+    // A document that names no generation is number 0: not above the
+    // unbound start, which stays the only generation 0.
+    assert_eq!(
+        store.apply(generation(0)),
+        Err(StaleGeneration {
+            standing: 0,
+            offered: 0
+        })
+    );
+    store.apply(generation(3)).expect("above the unbound start");
+    let built = view(&store, &ask(t0)).2;
+    assert_eq!(
+        (
+            built.generation,
+            built.pool_facts().generation,
+            built.pool_size
+        ),
+        (3, 3, 1)
+    );
+    let standing = store.world();
+    assert_eq!(standing.spec().generation(), 3);
+    assert!(standing
+        .spec()
+        .engine()
+        .binding(MODEL, Phase::Single)
+        .is_some());
+    // The number only rises: the standing one again and any under it are
+    // refused by naming the standing one, and nothing is published.
+    for offered in [3, 2, 0] {
+        let refused = store.apply(generation(offered)).expect_err("not above");
+        assert_eq!(
+            refused,
+            StaleGeneration {
+                standing: 3,
+                offered
+            }
+        );
+        assert!(refused.to_string().ends_with("the standing generation 3"));
+    }
+    assert!(Arc::ptr_eq(&standing, &store.world()));
+    store.apply(generation(4)).expect("above the standing one");
+    assert_eq!(view(&store, &ask(t0)).2.generation, 4);
+}
+
+#[test]
+fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
+    let mut writer = Writer::new(PUBLISH_WINDOW, Instant::now());
+    let first = Arc::new(generation(1));
+    let held = Arc::downgrade(&first);
+    let (world, before) = writer.apply(first).expect("above the unbound start");
+    assert!(before.is_none(), "nothing was kept before the first apply");
+    // A reader still holds a world of generation 1 when the next is
+    // applied; the unbound start, kept since the first apply, is handed
+    // back.
+    let (_, before) = writer
+        .apply(Arc::new(generation(2)))
+        .expect("above the standing one");
+    assert_eq!(before.map(|spec| spec.generation()), Some(0));
+    // The reader lets its world go: the writer keeps the generation, so
+    // the reader frees no engine.
+    drop(world);
+    assert_eq!(held.strong_count(), 1, "kept by the writer alone");
+    // The next apply hands it back, and the caller's drop is its end.
+    let (_, before) = writer
+        .apply(Arc::new(generation(3)))
+        .expect("above the standing one");
+    let before = before.expect("the generation before the last");
+    assert_eq!((before.generation(), held.strong_count()), (1, 1));
+    drop(before);
+    assert_eq!(held.strong_count(), 0);
+}
+
+#[test]
+fn an_applied_generation_is_published_at_once_with_the_rows_as_they_stand() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    status(&store, id, WorkerStatus::Ready);
+    store.gateway_veto(ASKER, id, Some(t0 + Duration::from_secs(60)));
+    // The first record opens a window; the second waits inside it.
+    store.record(id, 0, load(1, 0), t0, LoadSource::Stream);
+    store.record(
+        id,
+        0,
+        load(2, 0),
+        t0 + Duration::from_millis(1),
+        LoadSource::Stream,
+    );
+    assert_eq!(running(&store, t0), Some(1));
+    let epoch = store.world().epoch();
+    store.apply(generation(1)).expect("above the unbound start");
+    // One publication: the generation, the membership and its veto as they
+    // stood, and the record that waited.
+    let (rows, _, built) = view(&store, &ask(t0));
+    assert_eq!((built.generation, built.membership_epoch), (1, epoch));
+    assert_eq!(rows[0].load.map(|load| load.running), Some(2));
+    assert!(rows[0].health.healthy && rows[0].health.stalled);
+}
+
+#[test]
+fn the_pair_door_builds_no_decode_side_beside_an_empty_prefill_pool() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let _decode = store.upsert(facts("http://d:8000", Role::Decode, &[MODEL]));
+    let (mut prefill, mut decode) = (ViewBuffers::default(), ViewBuffers::default());
+    assert_eq!(
+        store.build_pair(MODEL, &ask(t0), &mut prefill, &mut decode),
+        None
+    );
+    // The decode pool has a member and its buffer never grew: the door
+    // stopped at the prefill pool it did not find.
+    assert_eq!(decode.candidates.capacity(), 0);
+    let _prefill = store.upsert(facts("http://p:8000", Role::Prefill, &[MODEL]));
+    assert!(store
+        .build_pair(MODEL, &ask(t0), &mut prefill, &mut decode)
+        .is_some());
+    assert_eq!((prefill.candidates.len(), decode.candidates.len()), (1, 1));
+}
+
+// ------------------------------------------------------ the overload verdict
+
+/// A generation whose one binding hands every pool the block `overload`.
+fn generation_with(number: u64, overload: OverloadSpec) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    let profile = document
+        .profiles
+        .keys()
+        .next()
+        .expect("the preset's profile")
+        .clone();
+    document.bindings = vec![BindingSpec {
+        profile: Some(profile),
+        overload: Some(overload),
+        ..BindingSpec::default()
+    }];
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
+/// A block with both thresholds named.
+fn block(waiting_requests: u32, token_usage: f32) -> OverloadSpec {
+    OverloadSpec {
+        waiting_requests: Some(waiting_requests),
+        token_usage: Some(token_usage),
+        ..OverloadSpec::default()
+    }
+}
+
+/// A load row with a queue and an active KV usage.
+fn pressure(queued: u32, active_kv_permille: u16) -> LoadRow {
+    LoadRow {
+        queued,
+        active_kv_permille,
+        ..LoadRow::default()
+    }
+}
+
+/// The workers of the pool whose rows carry the overload verdict, by id.
+fn overloaded(store: &MemoryStore, now: Instant) -> Vec<WorkerId> {
+    view(store, &ask(now))
+        .0
+        .iter()
+        .filter(|row| row.health.overloaded)
+        .map(|row| row.id)
+        .collect()
+}
+
+/// One rank of the two-rank engine `engine`.
+fn rank_of(store: &MemoryStore, engine: &str, rank: u16) -> WorkerId {
+    store
+        .upsert(WorkerFacts {
+            engine: engine.to_string(),
+            dp_rank: rank,
+            dp_size: 2,
+            ..facts(&format!("{engine}#{rank}"), Role::Single, &[MODEL])
+        })
+        .id()
+}
+
+#[test]
+fn a_store_with_no_threshold_writes_no_verdict() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = member(&store, "http://a:8000");
+    // Under the unbound generation no pool has a pair.
+    store.record(a, 0, pressure(1_000, 1_000), t0, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0), []);
+    // A block switched off hands none, whatever values it still names.
+    let off = OverloadSpec {
+        enabled: false,
+        ..block(1, 0.1)
+    };
+    store.apply(generation_with(1, off)).expect("applied");
+    store.record(a, 0, pressure(1_000, 1_000), t0, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0), []);
+    assert_eq!(store.overload_flips(), 0, "no write moved a verdict");
+}
+
+#[test]
+fn a_row_is_judged_at_and_above_its_pool_s_thresholds_and_its_own_stand_over_them() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = member(&store, "http://a:8000");
+    let b = member(&store, "http://b:8000");
+    // The third names a count of its own and takes the pool's usage.
+    let c = store
+        .upsert(WorkerFacts {
+            overload: Overload {
+                waiting_requests: Some(2),
+                kv_usage_permille: None,
+            },
+            ..facts("http://c:8000", Role::Single, &[MODEL])
+        })
+        .id();
+    store
+        .apply(generation_with(1, block(4, 0.5)))
+        .expect("applied");
+
+    // The count: at the threshold is over, one under is not.
+    store.record(a, 0, pressure(4, 0), t0, LoadSource::Stream);
+    store.record(b, 0, pressure(3, 0), t0, LoadSource::Stream);
+    store.record(c, 0, pressure(2, 0), t0, LoadSource::Stream);
+    let mut over = [a, c];
+    over.sort_unstable();
+    assert_eq!(overloaded(&store, t0), over);
+    // The usage, in the row's unit: at the threshold is over, one
+    // permille under is not; either signal alone vetoes.
+    store.record(a, 0, pressure(0, 499), t0, LoadSource::Stream);
+    store.record(b, 0, pressure(0, 500), t0, LoadSource::Stream);
+    store.record(c, 0, pressure(1, 500), t0, LoadSource::Stream);
+    let mut over = [b, c];
+    over.sort_unstable();
+    assert_eq!(overloaded(&store, t0), over);
+
+    // A worker's own value still vetoes under a block switched off, and
+    // the value it left to the pool is gone with the block.
+    let off = OverloadSpec {
+        enabled: false,
+        ..OverloadSpec::default()
+    };
+    store.apply(generation_with(2, off)).expect("applied");
+    assert_eq!(
+        overloaded(&store, t0),
+        [],
+        "the pool's usage left with the block"
+    );
+    store.record(c, 0, pressure(2, 0), t0, LoadSource::Stream);
+    store.record(a, 0, pressure(9, 0), t0, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0), [c]);
+    // A membership write under no pool's pair judges again the engine
+    // whose only threshold is its registration's own, and its records
+    // are judged after it.
+    member(&store, "http://d:8000");
+    assert_eq!(overloaded(&store, t0), [c]);
+    store.record(c, 0, pressure(1, 0), t0, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0), []);
+    store.record(c, 0, pressure(2, 0), t0, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0), [c]);
+}
+
+#[test]
+fn an_engine_s_ranks_are_judged_as_one_by_their_sum_and_their_mean() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    let mut both = [zero, one];
+    both.sort_unstable();
+    store
+        .apply(generation_with(1, block(8, 0.8)))
+        .expect("applied");
+    let answer = |first: LoadRow, second: LoadRow| {
+        store.report(
+            &[(zero, 0, Some(first)), (one, 1, Some(second))],
+            t0,
+            LoadSource::Poll,
+        );
+        overloaded(&store, t0)
+    };
+    // The queued requests are summed over the ranks: neither rank is at
+    // the count alone.
+    assert_eq!(answer(pressure(5, 0), pressure(3, 0)), both);
+    assert_eq!(answer(pressure(4, 0), pressure(3, 0)), []);
+    // The usage is the mean over the ranks, compared with no division:
+    // 900 and 700 are at 800, 900 and 699 are under it.
+    assert_eq!(answer(pressure(0, 900), pressure(0, 700)), both);
+    assert_eq!(answer(pressure(0, 900), pressure(0, 699)), []);
+    // The ranks on file are the ranks judged: with one evicted, the other
+    // is the whole engine.
+    assert_eq!(answer(pressure(0, 800), pressure(0, 0)), []);
+    // An eviction has no instant of its own: its judgment is shown with
+    // the window's end, as its fold is.
+    store.evict(one);
+    store.publish(t0);
+    assert_eq!(overloaded(&store, t0), both, "one rank on file, at 800");
+    // An engine with nothing on file reads clear.
+    store.evict(zero);
+    store.publish(t0);
+    assert_eq!(overloaded(&store, t0), []);
+}
+
+#[test]
+fn two_ranks_that_trade_their_queues_in_one_answer_move_no_verdict() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(
+        &[
+            (zero, 0, Some(pressure(6, 0))),
+            (one, 1, Some(pressure(1, 0))),
+        ],
+        t0,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![], 0)
+    );
+    // One answer in which the ranks trade: the sum never left 7.
+    store.report(
+        &[
+            (zero, 0, Some(pressure(1, 0))),
+            (one, 1, Some(pressure(6, 0))),
+        ],
+        t0,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![], 0)
+    );
+    // The same trade as two writes reads one new rank beside one old: 6
+    // and 6 between them, a verdict raised and taken back.
+    store.report(&[(zero, 0, Some(pressure(6, 0)))], t0, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t0).len(), 2);
+    store.report(&[(one, 1, Some(pressure(1, 0)))], t0, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![], 2)
+    );
+}
+
+#[test]
+fn the_word_that_no_report_came_clears_the_verdict_until_the_engine_is_heard_again() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = member(&store, "http://a:8000");
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(&[(a, 0, Some(pressure(9, 0)))], t0, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![a], 1)
+    );
+
+    // A poll that brought no report: the verdict is cleared and the row on
+    // file stays.
+    let t1 = t0 + Duration::from_secs(1);
+    store.report(&[(a, 0, None)], t1, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, t1), store.overload_flips()),
+        (vec![], 2)
+    );
+    assert_eq!(store.load(a, 0).map(|sample| sample.row.queued), Some(9));
+    // The word is on file: a membership write judges again and does not
+    // raise the verdict from the row that is still there.
+    member(&store, "http://b:8000");
+    assert_eq!(overloaded(&store, t1), []);
+    // So does a new generation.
+    store
+        .apply(generation_with(2, block(8, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, t1), []);
+    assert_eq!(
+        store.overload_flips(),
+        2,
+        "neither is a write of the load table"
+    );
+    // The engine's next record is judged as any other.
+    let t2 = t1 + Duration::from_secs(1);
+    store.record(a, 0, pressure(9, 0), t2, LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, t2), store.overload_flips()),
+        (vec![a], 3)
+    );
+
+    // A rank whose stream pushed since the poll began is heard: the poll's
+    // word that none came does not stand over its record.
+    store.report(
+        &[(a, 0, None)],
+        t2 - Duration::from_millis(1),
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t2), store.overload_flips()),
+        (vec![a], 3)
+    );
+}
+
+#[test]
+fn a_registration_s_own_usage_stands_over_its_pool_s() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let own = |key: &str, permille: u16| {
+        store
+            .upsert(WorkerFacts {
+                overload: Overload {
+                    waiting_requests: None,
+                    kv_usage_permille: Some(permille),
+                },
+                ..facts(key, Role::Single, &[MODEL])
+            })
+            .id()
+    };
+    let low = own("http://low:8000", 300);
+    let high = own("http://high:8000", 900);
+    let pool = member(&store, "http://pool:8000");
+    // The count is out of reach: the usage alone judges.
+    store
+        .apply(generation_with(1, block(1_000, 0.5)))
+        .expect("applied");
+    let at = |permille: u16| {
+        for id in [low, high, pool] {
+            store.record(id, 0, pressure(0, permille), t0, LoadSource::Stream);
+        }
+        overloaded(&store, t0)
+    };
+    // Under the pool's half: the row that names a lower usage is over it.
+    assert_eq!(at(400), [low]);
+    // Over the pool's half, and under the usage the third row names.
+    let mut over = [low, pool];
+    over.sort_unstable();
+    assert_eq!(at(700), over);
+    let mut all = [low, high, pool];
+    all.sort_unstable();
+    assert_eq!(at(900), all);
+}
+
+#[test]
+fn a_pool_takes_the_thresholds_of_the_binding_that_covers_its_phase() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let prefill = store
+        .upsert(facts("http://p:8000", Role::Prefill, &[MODEL]))
+        .id();
+    let decode = store
+        .upsert(facts("http://d:8000", Role::Decode, &[MODEL]))
+        .id();
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = 1;
+    let profile = document
+        .profiles
+        .keys()
+        .next()
+        .expect("the preset's profile")
+        .clone();
+    // One model, two bindings: each covers one phase with its own count.
+    let binding = |phase: Phase, waiting: u32| BindingSpec {
+        matcher: Match {
+            phase: vec![phase],
+            ..Match::default()
+        },
+        profile: Some(profile.clone()),
+        overload: Some(block(waiting, 1.0)),
+        ..BindingSpec::default()
+    };
+    document.bindings = vec![binding(Phase::Prefill, 2), binding(Phase::Decode, 9)];
+    store
+        .apply(AppliedSpec::validate(&document).expect("the document validates"))
+        .expect("applied");
+    let over = |role: Role| {
+        let mut out = ViewBuffers::default();
+        store
+            .world()
+            .build(MODEL, role, &ask(t0), &mut out)
+            .expect("the pool");
+        out.candidates
+            .iter()
+            .map(|row| row.health.overloaded)
+            .collect::<Vec<_>>()
+    };
+    // The same queue on both sides: over the prefill pool's count alone.
+    store.record(prefill, 0, pressure(5, 0), t0, LoadSource::Stream);
+    store.record(decode, 0, pressure(5, 0), t0, LoadSource::Stream);
+    assert_eq!(
+        (over(Role::Prefill), over(Role::Decode)),
+        (vec![true], vec![false])
+    );
+}
+
+#[test]
+fn a_failed_poll_does_not_silence_an_engine_whose_rank_pushed_since_it_began() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    let mut both = [zero, one];
+    both.sort_unstable();
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(
+        &[
+            (zero, 0, Some(pressure(1, 0))),
+            (one, 1, Some(pressure(1, 0))),
+        ],
+        t0,
+        LoadSource::Poll,
+    );
+    assert_eq!(overloaded(&store, t0), []);
+
+    // A poll goes out, and rank 0's stream reports a queue while it is
+    // out: the engine is over its count.
+    let asked = t0 + Duration::from_secs(1);
+    let pushed = asked + Duration::from_millis(1);
+    store.record(zero, 0, pressure(9, 0), pushed, LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, pushed), store.overload_flips()),
+        (both.to_vec(), 1)
+    );
+    // The poll fails. Its word that none came stands over no engine a
+    // rank of which was heard since it began, in either order of ranks.
+    let none = [(zero, 0, None), (one, 1, None)];
+    store.report(&none, asked, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, pushed), store.overload_flips()),
+        (both.to_vec(), 1)
+    );
+    store.report(&[none[1], none[0]], asked, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, pushed), store.overload_flips()),
+        (both.to_vec(), 1)
+    );
+    // So for an answer that names the other rank alone: a poll is for
+    // the ranks no stream serves, and a failed one names no other.
+    store.report(&[none[1]], asked, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, pushed), store.overload_flips()),
+        (both.to_vec(), 1)
+    );
+    // Nor when the rank that pushed is the other one: rank 1's record
+    // comes while a poll for rank 0 alone is out.
+    let again = pushed + Duration::from_secs(1);
+    let since = again + Duration::from_millis(1);
+    store.record(one, 1, pressure(1, 0), since, LoadSource::Stream);
+    store.report(&[none[0]], again, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, since), store.overload_flips()),
+        (both.to_vec(), 1)
+    );
+    // A poll asked after both records, and failed, is the engine's word:
+    // whether a stream still serves a rank is its caller's to know.
+    let later = since + Duration::from_secs(1);
+    store.report(&none, later, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, later), store.overload_flips()),
+        (vec![], 2)
+    );
+    // An answer that brings one rank's row and omits the other is no such
+    // word: the engine is heard, and the omitted rank keeps what is on
+    // file.
+    store.report(
+        &[(zero, 0, Some(pressure(7, 0))), (one, 1, None)],
+        later,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, later), store.overload_flips()),
+        (both.to_vec(), 3)
+    );
+}
+
+#[test]
+fn the_word_that_no_report_came_is_kept_and_ended_while_no_threshold_stands() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = member(&store, "http://a:8000");
+    let off = || OverloadSpec {
+        enabled: false,
+        ..OverloadSpec::default()
+    };
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(&[(a, 0, Some(pressure(9, 0)))], t0, LoadSource::Poll);
+    store.report(&[(a, 0, None)], t0, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![], 2)
+    );
+
+    // The block is switched off and the engine is heard under no
+    // threshold: its record ends the word, so the generation that brings
+    // the threshold back judges what is on file.
+    store.apply(generation_with(2, off())).expect("applied");
+    store.record(a, 0, pressure(9, 0), t0, LoadSource::Stream);
+    store
+        .apply(generation_with(3, block(8, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, t0), [a]);
+
+    // The word that comes under no threshold is kept: the generation that
+    // brings one back raises no verdict from the row that is still on
+    // file.
+    store.apply(generation_with(4, off())).expect("applied");
+    let t1 = t0 + Duration::from_secs(1);
+    store.report(&[(a, 0, None)], t1, LoadSource::Poll);
+    store
+        .apply(generation_with(5, block(8, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, t1), []);
+    assert_eq!(
+        store.overload_flips(),
+        2,
+        "no write of the load table moved a verdict under no threshold"
+    );
+}
+
+#[test]
+fn the_word_that_no_report_came_is_read_an_engine_at_a_time_in_a_mixed_answer() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = member(&store, "http://a:8000");
+    let b = member(&store, "http://b:8000");
+    let mut both = [a, b];
+    both.sort_unstable();
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(
+        &[(a, 0, Some(pressure(9, 0))), (b, 0, Some(pressure(9, 0)))],
+        t0,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (both.to_vec(), 2)
+    );
+    // One call for two engines: the first brings a row and the second
+    // none. The second engine's word is its own, whatever the first said.
+    let t1 = t0 + Duration::from_secs(1);
+    store.report(
+        &[(a, 0, Some(pressure(9, 0))), (b, 0, None)],
+        t1,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t1), store.overload_flips()),
+        (vec![a], 3)
+    );
+    // A later engine of the answer is heard by any of its rows: a
+    // two-rank engine named after another, its first rank with a row and
+    // its second with none, is judged and keeps what is on file.
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    let mut over = [a, zero, one];
+    over.sort_unstable();
+    let t2 = t1 + Duration::from_secs(1);
+    store.report(
+        &[
+            (a, 0, Some(pressure(9, 0))),
+            (zero, 0, Some(pressure(9, 0))),
+            (one, 1, None),
+        ],
+        t2,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t2), store.overload_flips()),
+        (over.to_vec(), 4)
+    );
+}
+
+#[test]
+fn a_single_rank_worker_is_an_engine_alone_and_ranks_share_their_engine_s_key() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    // Two single-rank rows that name one engine. The facts' rule is that
+    // a single-rank worker's engine is its own key: each is judged alone.
+    let alone = |key: &str| {
+        store
+            .upsert(WorkerFacts {
+                engine: "http://shared:8000".to_string(),
+                ..facts(key, Role::Single, &[MODEL])
+            })
+            .id()
+    };
+    let (x, y) = (alone("http://x:8000"), alone("http://y:8000"));
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    let mut ranks = [zero, one];
+    ranks.sort_unstable();
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    for (id, rank) in [(x, 0), (y, 0), (zero, 0), (one, 1)] {
+        store.record(id, rank, pressure(5, 0), t0, LoadSource::Stream);
+    }
+    // Five and five: at the count as one engine's ranks, under it alone.
+    assert_eq!(overloaded(&store, t0), ranks);
+}
+
+#[test]
+fn a_membership_write_and_a_new_generation_judge_again_from_what_is_on_file() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = member(&store, "http://a:8000");
+    store.record(a, 0, pressure(5, 0), t0, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0), []);
+    // The record was on file before any threshold: a generation that
+    // hands the pool one judges it.
+    store
+        .apply(generation_with(1, block(5, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, t0), [a]);
+    // A membership write makes every row again and carries no bit over:
+    // the verdict stands because the record on file is judged again. The
+    // pool's rows are cut once, after that judgment: the write counts no
+    // publication's copy.
+    let copies = store.publication_allocations();
+    member(&store, "http://b:8000");
+    assert_eq!(
+        (overloaded(&store, t0), store.publication_allocations()),
+        (vec![a], copies)
+    );
+    // A generation with a higher count takes the verdict back.
+    store
+        .apply(generation_with(2, block(6, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, t0), []);
+    assert_eq!(
+        store.overload_flips(),
+        0,
+        "no write of the load table moved one"
+    );
 }

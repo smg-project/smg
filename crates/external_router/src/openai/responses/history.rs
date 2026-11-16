@@ -13,6 +13,7 @@ use openai_protocol::{
         ResponseInputOutputItem, ResponsesRequest,
     },
 };
+use serde::Deserialize;
 use serde_json::Value;
 use smg_data_connector::{
     is_unstored, visible_chain, ConversationId, ConversationItem, ListParams, ResponseId,
@@ -323,7 +324,7 @@ fn deserialize_items_from_array(array: &Value) -> Vec<ResponseInputOutputItem> {
         .map(|arr| {
             arr.iter()
                 .filter_map(|item| {
-                    serde_json::from_value::<ResponseInputOutputItem>(item.clone())
+                    ResponseInputOutputItem::deserialize(item)
                         .map_err(|e| warn!("Failed to deserialize item: {}. Item: {}", e, item))
                         .ok()
                 })

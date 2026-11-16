@@ -115,6 +115,8 @@ def test_gate_file_rejects_bad_values(mod, tmp_path):
         ("bench_args = 5\n", "bench_args must be a list"),
         ('sources = "benches/a.rs"\n', "sources must be a list"),
         ("sources = [1]\n", "sources must be a list"),
+        ('count = "yes"\n', "count must be true or false"),
+        ("count = 1\n", "count must be true or false"),
         ("[[gate]]\npattern = 1\nthreshold = 0.1\n", "pattern must be a string"),
         ('[[gate]]\npattern = "x"\nthreshold = [0.1]\n', "threshold must be a number"),
         # A single [gate] table where the [[gate]] array belongs.
@@ -831,3 +833,444 @@ def test_a_results_file_that_names_its_unit_prints_plain_values(mod, gates):
     assert "| 300.5 KiB (300 KiB - 301 KiB) |" in text
     timed = results({"encode/t": [1500.0, 1600.0]}, {"encode/t": [1550.0, 1650.0]})
     assert "1.55 µs (1.5 µs - 1.6 µs)" in mod.markdown(timed, mod.compare(timed, gates))
+
+
+# ---------------------------------------------------------------- count
+
+COUNT_TOML = GATE_TOML.replace("repeats = 3\n", "repeats = 3\ncount = true\n")
+# The pull request's four runs of `encode/a` against a base of 100 to 102, on a 10 % threshold:
+# SLOW is +14.9 %, within twice the threshold; OVER is +29.7 %, beyond it.
+SLOW = (115, 116, 117, 118)
+OVER = (130, 131, 132, 133)
+
+# Stands in for valgrind's callgrind: one profile after each batch the listed counts name, the
+# process's own at its end and one of a forked child, laid out as the real tool lays them out.
+FAKE_VALGRIND = r"""#!/usr/bin/env python3
+import json, os, re, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+assert args[:2] == ["--tool=callgrind", "--dump-instr=yes"], args
+assert args[2].startswith("--dump-after=*criterion::bencher::"), args
+out = args[3].split("=", 1)[1]
+binary, rest = Path(args[4]), args[5:]
+assert rest[:2] == ["--bench", "--noplot"] and rest[-3:-1] == ["--profile-time", "1"], rest
+assert os.environ["CRITERION_HOME"] == str(Path(out).parent / "home")
+bench_id = re.sub(r"\\(.)", r"\1", rest[-1][1:-1])
+listed = Path(os.environ["FAKE_COUNTS"])
+with listed.with_suffix(".calls").open("a") as calls:
+    calls.write(f"{binary.parent.name} {bench_id}\n")
+side = json.loads(listed.read_text())[binary.parent.name]
+time.sleep(side.get("sleep", 0))  # a count that hangs
+if "exit" in side:
+    sys.exit(side["exit"])
+PROFILE = '''# callgrind format
+version: 1
+positions: instr line
+events: Ir
+
+fn=(1) decision::decide
+0x1000 0 3
+cfn=(2) <criterion::bencher::Bencher>::iter::<u64, decision::decide::{closure#0}>
+calls=CALLS 0x2000 0
+* 0 COUNT
+fn=(2)
+0x2000 0 9
+cfn=(3) <engine::Engine>::decide
+calls=ITERS ADDRESS 0
++4 0 INSIDE
+'''
+batches = side[bench_id]
+if batches and isinstance(batches[0], list):  # one list a count of this id on this side
+    seen = listed.with_suffix(".calls").read_text().splitlines()
+    batches = batches[min(seen.count(f"{binary.parent.name} {bench_id}"), len(batches)) - 1]
+base = out.replace("%p", str(os.getpid()))
+for n, count in enumerate(batches, start=1):
+    text = PROFILE.replace("COUNT", str(count)).replace("INSIDE", str(count - 1))
+    text = text.replace("CALLS", str(side.get("calls", 1))).replace("ITERS", str(2 ** (n - 1)))
+    Path(f"{base}.{n}").write_text(text.replace("ADDRESS", hex(side.get("address", 0x5000))))
+if side.get("garbage"):
+    Path(f"{base}.1").write_text("fn=(1) main\ncalls=one 0x10 0\n* 0 5\n")
+Path(base).write_text("# callgrind format\nversion: 1\nevents: Ir\n\nfn=(1) main\n16 5\n")
+child = PROFILE.replace("COUNT", "1").replace("INSIDE", "1").replace("CALLS", "1")
+child = child.replace("ITERS", "1").replace("ADDRESS", "0x1")
+Path(out.replace("%p", "1")).write_text(child)
+if side.get("second"):  # a second process that ran a batch of its own
+    Path(out.replace("%p", "1") + ".1").write_text(child)
+print("fake valgrind", bench_id)
+"""
+
+
+def count_run(mod, tmp_path, monkeypatch, counts, gate_text=COUNT_TOML, name="out", slow=SLOW):
+    """One gate run whose `encode/a` fails by time (`slow`: the pull request's four runs), under
+    a valgrind on PATH that writes the listed batch counts per side directory (base, head).
+    Returns the exit code, the output directory and the file that lists the fake tool's calls."""
+    gate_file = tmp_path / "gates.toml"
+    gate_file.write_text(gate_text)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    base = fake_bench(
+        tmp_path / "base.py", {"encode/a": [100, 101, 102, 101], "decode/x": [1, 1, 1]}
+    )
+    pr = fake_bench(tmp_path / "pr.py", {"encode/a": list(slow), "decode/x": [1, 1, 1]})
+    tools = tmp_path / "tools"
+    if not tools.exists():
+        tools.mkdir()
+        tool = tools / "valgrind"
+        tool.write_text(FAKE_VALGRIND)
+        tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
+        monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ['PATH']}")
+    listed = tmp_path / "counts.json"
+    listed.write_text(json.dumps(counts))
+    monkeypatch.setenv("FAKE_COUNTS", str(listed))
+    out = tmp_path / name
+    rc = mod.main(
+        ["run", "--gates", str(gate_file), "--base", str(base), "--pr", str(pr), "--out", str(out)]
+    )
+    return rc, out, listed.with_suffix(".calls")
+
+
+def test_gate_file_names_the_count_switch(mod, tmp_path, gates):
+    assert gates.count is False
+    path = tmp_path / "count.toml"
+    path.write_text(COUNT_TOML)
+    assert mod.load_gates(path).count is True
+
+
+def test_a_profile_is_read_for_the_harness_timed_calls(mod, tmp_path):
+    profile = tmp_path / "profile.1.3"
+    profile.write_text(
+        "# callgrind format\nversion: 1\npositions: instr line\nevents: Ir\nsummary: 900\n\n"
+        "fn=(1) decision::decide\n0x1000 0 3\n"
+        "cfn=(2) <criterion::bencher::Bencher>::iter::<u64, decision::decide::{closure#0}>\n"
+        "calls=1 0x2000 0\n+2 0 700\n"
+        "fn=(2)\n0x2000 0 9\n+3 0 5\n"
+        "cfn=(3) <std::time::Instant>::now\ncalls=2 0x3000 75\n* 0 54\n"
+        "cfn=(4) <engine::Engine>::decide\ncalls=4 0x5240 0\n+8 0 600\n"
+        "fn=(4)\n0x5240 0 600\n"
+        "totals: 900\n"
+    )
+    batch = mod.read_profile(profile)
+    assert (batch.count, batch.calls) == (700, 1)
+    assert (batch.unit, batch.address) == ("<engine::Engine>::decide", 0x5240)
+    # The harness's async timing functions are timed calls too.
+    asynced = profile.read_text().replace("bencher::Bencher>", "bencher::AsyncBencher<Runtime>>")
+    profile.write_text(asynced)
+    batch = mod.read_profile(profile)
+    assert (batch.count, batch.calls, batch.address) == (700, 1, 0x5240)
+    # A callee with less than half of the timed calls' instructions is not the unit: the
+    # routine's own code sits in the harness's function, and the unit is that function.
+    profile.write_text(asynced.replace("+8 0 600\n", "+8 0 300\n"))
+    batch = mod.read_profile(profile)
+    assert (batch.unit, batch.address) == (
+        "<criterion::bencher::AsyncBencher<Runtime>>::iter::<u64, decision::decide::{closure#0}>",
+        0x2000,
+    )
+    # The older mangling, a routine inlined into the harness's function (the unit is that
+    # function) and positions without addresses (no place is read). A timing function that
+    # calls another is one timed call, counted where it is entered from outside.
+    profile.write_text(
+        "version: 1\npositions: line\nevents: Ir\n\n"
+        "fn=(1) bench::run\n12 3\n"
+        "cfn=(2) criterion::bencher::Bencher<M>::iter_with_large_drop\ncalls=1 40\n12 500\n"
+        "fn=(2)\n40 2\n"
+        "cfn=(3) criterion::bencher::Bencher<M>::iter_batched\ncalls=1 60\n41 498\n"
+        "fn=(3)\n60 478\ncfn=(4) std::time::Instant::now\ncalls=2 75\n61 20\n"
+    )
+    batch = mod.read_profile(profile)
+    assert (batch.count, batch.calls) == (500, 1)
+    assert (batch.unit, batch.address) == ("criterion::bencher::Bencher<M>::iter_batched", None)
+
+
+def test_every_batch_both_sides_ran_after_the_first_decides_a_placement(mod, gates):
+    res = results({"encode/a": [100, 101, 102]}, {"encode/a": [115, 116, 117]})
+    # The measured function starts elsewhere in the pull request's executable and +14.9 % is
+    # within twice the threshold: the count alone decides these rows.
+    places = ({"unit": "decide", "address": 0x10C0}, {"unit": "decide", "address": 0x1240})
+
+    def verdict(base, pr):
+        res["count"] = {"encode/a": {"base": places[0] | base, "pr": places[1] | pr}}
+        return verdicts(mod, gates, res)["encode/a"]
+
+    # The first batch is never read: a first iteration pays what the process has not done.
+    assert verdict({"batches": [9, 20, 40]}, {"batches": [7, 20, 40]}) == "placement"
+    assert verdict({"batches": [9, 20, 40]}, {"batches": [9, 20, 41]}) == "regression"
+    # The shorter side names the batches read: the fourth ran on one side alone.
+    assert verdict({"batches": [9, 20, 40, 80]}, {"batches": [9, 20, 40]}) == "placement"
+    # A batch in the middle that differs is a count that moved.
+    assert verdict({"batches": [9, 20, 40, 80]}, {"batches": [9, 20, 41, 80]}) == "regression"
+    # The second batch is read, and alone too: the first is the only one left out.
+    assert verdict({"batches": [9, 20, 40]}, {"batches": [9, 21, 40]}) == "regression"
+    assert verdict({"batches": [9, 20]}, {"batches": [9, 21]}) == "regression"
+    assert verdict({"batches": [9, 20]}, {"batches": [7, 20]}) == "placement"
+    # A side whose own two counts differ is not steady: its count says nothing of the change.
+    unsteady = {"batches": [9, 20, 40], "again": [9, 20, 44]}
+    # (two counts that agree are never taken again: the second reading is of counts that differ)
+    assert verdict(unsteady, {"batches": [9, 20, 40]}) == "placement"
+    assert verdict(unsteady, {"batches": [9, 20, 41]}) == "regression"
+    assert mod.compare(res, gates)[0].counted == mod.Counted("unsteady", 4, 40, 41, "base", 0.1)
+    # Not read on a side, or one batch alone: the time alone decides.
+    assert verdict({"batches": [9, 20]}, {"error": "valgrind is not on this host"}) == "regression"
+    assert verdict({"batches": [9]}, {"batches": [9]}) == "regression"
+    # A count never makes a row that passes by time anything else.
+    res["pr"]["runs"] = [{"encode/a": value} for value in (100, 101, 102)]
+    assert verdict({"batches": [9, 20, 40]}, {"batches": [9, 20, 41]}) == "ok"
+
+
+def test_a_failing_id_on_the_same_count_is_a_placement(mod, tmp_path, monkeypatch):
+    unit = "<engine::Engine>::decide"
+    rc, out, calls = count_run(
+        mod,
+        tmp_path,
+        monkeypatch,
+        {
+            "base": {"encode/a": [5414, 8268, 16270], "address": 0x3BE0C0},
+            "head": {"encode/a": [5680, 8268, 16270, 32274], "address": 0x3BE240},
+        },
+    )
+    assert rc == 0
+    # the id that failed after its re-measurement is counted, once a side, and no other
+    assert calls.read_text().splitlines() == ["base encode/a", "head encode/a"]
+    saved = json.loads((out / "results.json").read_text())
+    assert saved["count"] == {
+        "encode/a": {
+            "base": {"batches": [5414, 8268, 16270], "unit": unit, "address": 0x3BE0C0},
+            "pr": {"batches": [5680, 8268, 16270, 32274], "unit": unit, "address": 0x3BE240},
+        }
+    }
+    text = (out / "gate.md").read_text()
+    assert "### Benchmark gate: PASS" in text
+    assert "| +14.9% | 2.0% | 10.0% | placement |" in text
+    assert "0 failed, 0 suspect" in text and " 1 placement (" in text
+    assert "Counted before the verdict, on both executables under callgrind: `encode/a`." in text
+    assert (
+        "- `encode/a`: placement, +14.9%; base runs [100, 101, 102] ns, pull request runs "
+        "[115, 116, 117] ns; re-measured base 101 ns, pull request 118 ns (+16.8%). The two "
+        "executables run it in the same instruction count in every batch after the first, "
+        "16,270 over the 4 iterations of the last (4,067.5 an iteration): the time is where "
+        f"the code sits in the bench executable, not work the pull request adds. `{unit}` "
+        "starts at 0x0c0 of its 4 KiB page in the base's executable and at 0x240 in the pull "
+        "request's."
+    ) in text
+    # the profiles are read and gone, the child's too; the log stays in the artifact
+    for side in ("base", "head"):
+        assert sorted(p.name for p in (out / side / "count-1-1").iterdir()) == ["count.log"]
+        log = (out / side / "count-1-1" / "count.log").read_text()
+        assert log.startswith("+ ") and f"{out / side / 'bench'} --bench --noplot" in log
+    # the saved results carry the count: re-evaluated, the verdict is the same
+    gate_file = str(tmp_path / "gates.toml")
+    assert mod.main(["compare", "--gates", gate_file, str(out / "results.json")]) == 0
+
+
+def test_a_count_that_moved_keeps_the_failure(mod, tmp_path, monkeypatch):
+    rc, out, calls = count_run(
+        mod,
+        tmp_path,
+        monkeypatch,
+        {"base": {"encode/a": [5414, 8268, 16270]}, "head": {"encode/a": [5414, 8468, 16670]}},
+    )
+    assert rc == 1
+    # two counts that differ are each taken once more
+    assert calls.read_text().splitlines() == ["base encode/a", "head encode/a"] * 2
+    saved = json.loads((out / "results.json").read_text())["count"]["encode/a"]
+    assert saved["base"]["again"] == [5414, 8268, 16270]
+    assert saved["pr"]["again"] == [5414, 8468, 16670]
+    text = (out / "gate.md").read_text()
+    assert "FAIL regression" in text and "1 failed" in text and "1 placement" not in text
+    assert (
+        "The count moved too: 16,270 instructions on the base and 16,670 on the pull request "
+        "over a batch of 4 iterations (+2.459%, 100.0 instructions an iteration more), the same "
+        "in two counts of each."
+    ) in text
+    assert (out / "head" / "count-1-2" / "count.log").exists()
+
+
+def test_a_count_that_is_not_steady_keeps_the_failure(mod, tmp_path, monkeypatch):
+    # The base's own second count differs from its first: the id draws a seed, or allocates
+    # by the heap's state, and no count of it tells the change from the id's own movement.
+    rc, out, _ = count_run(
+        mod,
+        tmp_path,
+        monkeypatch,
+        {
+            "base": {"encode/a": [[5414, 8268, 16270], [5414, 8268, 16275]]},
+            "head": {"encode/a": [5414, 8268, 16274]},
+        },
+    )
+    assert rc == 1
+    text = (out / "gate.md").read_text()
+    assert "FAIL regression" in text and "The count moved too" not in text
+    assert (
+        "The count differs, 16,270 instructions on the base and 16,274 on the pull request over "
+        "a batch of 4 iterations (+0.025%, 1.0 instructions an iteration more), and it is not "
+        "steady on one executable alone: the base's own two counts differ by 0.031%. The time "
+        "alone decides."
+    ) in text
+
+
+def test_a_count_that_was_not_read_keeps_the_failure(mod, tmp_path, monkeypatch):
+    def run(counts, name):
+        rc, out, _ = count_run(mod, tmp_path, monkeypatch, counts, name=name)
+        text = (out / "gate.md").read_text()
+        assert rc == 1 and "FAIL regression" in text
+        return text
+
+    # One batch alone: a first iteration pays what the process has not done yet.
+    text = run({"base": {"encode/a": [5414]}, "head": {"encode/a": [5414]}}, "one")
+    assert (
+        "The count was not read (the first batch alone ran on both sides): the time alone decides."
+    ) in text
+    # The tool fails on one side.
+    text = run({"base": {"encode/a": [1, 2]}, "head": {"exit": 3}}, "exit")
+    assert "The count was not read (pull request: the count exited with 3; see " in text
+    # A profile that holds two timed calls is not one batch.
+    text = run({"base": {"encode/a": [1, 2], "calls": 2}, "head": {"encode/a": [1, 2]}}, "two")
+    assert "The count was not read (base: a profile of the count does not hold one batch" in text
+    # No profile of the harness at all: its timing function is not in the executable's names.
+    text = run({"base": {"encode/a": []}, "head": {"encode/a": [1, 2]}}, "none")
+    assert "The count was not read (base: the count holds no batch of the harness" in text
+    # A profile that does not parse.
+    text = run({"base": {"encode/a": [1, 2], "garbage": True}, "head": {"encode/a": [1, 2]}}, "bad")
+    assert "The count was not read (base: a profile of the count does not parse (" in text
+    # A second process that ran a batch of its own: no one count of the id.
+    second = {"base": {"encode/a": [1, 2], "second": True}, "head": {"encode/a": [1, 2]}}
+    text = run(second, "second")
+    assert "The count was not read (base: two processes of the count ran batches; see " in text
+    # No valgrind on the host.
+    monkeypatch.setattr(mod.shutil, "which", lambda name: None)
+    text = run({"base": {}, "head": {}}, "absent")
+    assert (
+        "The count was not read (base: valgrind is not on this host; pull request: valgrind "
+        "is not on this host): the time alone decides."
+    ) in text
+
+
+def test_the_count_runs_only_when_the_gate_file_asks(mod, tmp_path, monkeypatch):
+    counts = {"base": {"encode/a": [1, 2]}, "head": {"encode/a": [1, 2]}}
+    rc, out, calls = count_run(mod, tmp_path, monkeypatch, counts, gate_text=GATE_TOML)
+    assert rc == 1 and not calls.exists()
+    assert "count" not in json.loads((out / "results.json").read_text())
+    assert "Counted before the verdict" not in (out / "gate.md").read_text()
+
+
+def test_a_placement_needs_a_moved_function_within_twice_the_threshold(mod, gates):
+    def counted(pr_runs, base_at, pr_at, unit="decide"):
+        res = results({"encode/a": [100, 101, 102]}, {"encode/a": pr_runs})
+        res["count"] = {
+            "encode/a": {
+                "base": {"batches": [9, 20, 40], "unit": "decide", "address": base_at},
+                "pr": {"batches": [7, 20, 40], "unit": unit, "address": pr_at},
+            }
+        }
+        return res
+
+    def read(*args, **kwargs):
+        row = mod.compare(counted(*args, **kwargs), gates)[0]
+        return row.verdict, mod.fmt_count(row)
+
+    same = (
+        " The two executables run it in the same instruction count in every batch after the "
+        "first, 40 over the 4 iterations of the last (10.0 an iteration)"
+    )
+    # The three facts: the same count, the function elsewhere, +14.9 % on a 10 % threshold.
+    assert read([115, 116, 117], 0x3BE0C0, 0x3BE240) == (
+        "placement",
+        f"{same}: the time is where the code sits in the bench executable, not work the pull "
+        "request adds. `decide` starts at 0x0c0 of its 4 KiB page in the base's executable and "
+        "at 0x240 in the pull request's.",
+    )
+    # A whole page further on is another address.
+    assert read([115, 116, 117], 0x3BE0C0, 0x3BF0C0) == (
+        "placement",
+        f"{same}: the time is where the code sits in the bench executable, not work the pull "
+        "request adds. `decide` starts at 0x3be0c0 in the base's executable and at 0x3bf0c0 in "
+        "the pull request's, the same place in its 4 KiB page.",
+    )
+    # The same count where nothing moved: where the code sits does not explain the time.
+    assert read([115, 116, 117], 0x3BE0C0, 0x3BE0C0) == (
+        "regression",
+        f"{same}, and `decide` starts at 0x3be0c0 in both: where the code sits does not explain "
+        "the time, and the failure stands.",
+    )
+    # No place read on a side, or another function on it: nothing says the code moved.
+    nowhere = (
+        f"{same}, but the count names no one function with a place on both sides: the failure "
+        "stands."
+    )
+    assert read([115, 116, 117], 0x3BE0C0, None) == ("regression", nowhere)
+    assert read([115, 116, 117], 0x3BE0C0, 0x3BE240, unit="other") == ("regression", nowhere)
+    # Twice the threshold is the most a placement excuses: +19.8 % passes, +20.8 % fails.
+    assert read([120, 121, 122], 0x3BE0C0, 0x3BE240)[0] == "placement"
+    assert read([121, 122, 123], 0x3BE0C0, 0x3BE240) == (
+        "regression",
+        f"{same}. `decide` starts at 0x0c0 of its 4 KiB page in the base's executable and at "
+        "0x240 in the pull request's. A placement excuses a change up to 2 times the threshold, "
+        "20.0%: the failure stands.",
+    )
+    # A placement's line stands in the summary without a re-measurement too.
+    res = counted([115, 116, 117], 0x3BE0C0, 0x3BE240)
+    assert (
+        "- `encode/a`: placement, +14.9%; base runs [100, 101, 102] ns, pull request runs "
+        f"[115, 116, 117] ns.{same}: the time is where the code sits"
+    ) in mod.markdown(res, mod.compare(res, gates))
+
+
+def test_the_same_count_keeps_the_failure_unmoved_or_beyond_twice_the_threshold(
+    mod, tmp_path, monkeypatch
+):
+    unit = "<engine::Engine>::decide"
+    same = (
+        "The two executables run it in the same instruction count in every batch after the "
+        "first, 16,270 over the 4 iterations of the last (4,067.5 an iteration)"
+    )
+    counts = {
+        "base": {"encode/a": [5414, 8268, 16270], "address": 0x3BE0C0},
+        "head": {"encode/a": [5680, 8268, 16270, 32274], "address": 0x3BE240},
+    }
+    # +29.7 % on a 10 % threshold: the function moved, and a placement does not excuse that much.
+    rc, out, calls = count_run(mod, tmp_path, monkeypatch, counts, name="over", slow=OVER)
+    assert rc == 1
+    assert calls.read_text().splitlines() == ["base encode/a", "head encode/a"]
+    text = (out / "gate.md").read_text()
+    assert "### Benchmark gate: FAIL" in text and "1 failed" in text
+    assert "FAIL regression" in text and " 1 placement (" not in text
+    assert (
+        "- `encode/a`: +29.7% against a 10.0% threshold; base runs [100, 101, 102] ns, pull "
+        "request runs [130, 131, 132] ns; re-measured base 101 ns, pull request 133 ns (+31.7%). "
+        f"{same}. `{unit}` starts at 0x0c0 of its 4 KiB page in the base's executable and at "
+        "0x240 in the pull request's. A placement excuses a change up to 2 times the threshold, "
+        "20.0%: the failure stands."
+    ) in text
+    # +14.9 % on the same count, with the function where it was.
+    counts["head"]["address"] = 0x3BE0C0
+    rc, out, _ = count_run(mod, tmp_path, monkeypatch, counts, name="unmoved")
+    assert rc == 1
+    text = (out / "gate.md").read_text()
+    assert "FAIL regression" in text and " 1 placement (" not in text
+    assert (
+        f"{same}, and `{unit}` starts at 0x3be0c0 in both: where the code sits does not explain "
+        "the time, and the failure stands."
+    ) in text
+
+
+def test_the_timed_rounds_are_saved_before_the_count(mod, tmp_path, monkeypatch):
+    saved = {}
+
+    def cancelled(ids, binaries, out, *rest):
+        # What a job cancelled in the count leaves: the file as it stands when the count starts.
+        saved.update(json.loads((out / "results.json").read_text()))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(mod, "count_ids", cancelled)
+    with pytest.raises(KeyboardInterrupt):
+        count_run(mod, tmp_path, monkeypatch, {"base": {}, "head": {}})
+    assert [run["encode/a"] for run in saved["pr"]["runs"]] == [115, 116, 117, 118]
+    assert saved["recheck"] == {"ids": ["encode/a"], "rounds": 1} and "count" not in saved
+    assert json.loads((tmp_path / "out" / "results.json").read_text()) == saved
+
+
+def test_a_count_that_hangs_is_ended_by_its_bound(mod, tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "COUNT_TIMEOUT_S", 0.5)
+    counts = {"base": {"encode/a": [1, 2], "sleep": 30}, "head": {"encode/a": [1, 2]}}
+    rc, out, _ = count_run(mod, tmp_path, monkeypatch, counts)
+    text = (out / "gate.md").read_text()
+    assert rc == 1 and "FAIL regression" in text
+    assert "The count was not read (base: the count ran over 0.5 s; see " in text

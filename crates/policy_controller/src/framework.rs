@@ -203,9 +203,16 @@ pub trait Picker: Lifecycle + Debug {
 /// (a plugin's `decision` resource over the view): the engine opens it once
 /// before the profile's first stage of a decision reads it and closes it
 /// after the last, on every path out, so a stage set used by several stages
-/// of one profile, or asked row by row, reads one state. A built-in stage
-/// holds none; the profile's flag ([`Profile::scoped`]) is read once in the
-/// engine, so a profile without one pays nothing per decision.
+/// of one profile, or asked row by row, reads one state. The unwinding path
+/// is one of them: when a scope panics at its open, the engine closes the
+/// scopes whose open returned, and neither that scope nor any after it.
+/// So a `close` always follows an `open` that returned, and an `open`
+/// that stops half-way undoes what it did itself. A `close` that panics
+/// keeps no other scope open: the engine runs every close it owes, each
+/// under a catch, and the first panic of the decision is the one the host
+/// sees. A built-in stage holds none; the profile's flag
+/// ([`Profile::scoped`]) is read once in the engine, so a profile without
+/// one pays nothing per decision.
 pub trait DecisionScope: Send + Sync + Debug {
     fn open(&self, facts: &RequestFacts<'_>, candidates: &[Candidate], pool: &PoolFacts<'_>);
 
@@ -266,9 +273,19 @@ impl Profile {
         candidates: &[Candidate],
         pool: &PoolFacts<'_>,
     ) -> Opened<'a> {
+        // While the scopes open, a guard of this function's own counts each
+        // scope whose open returned: if an open unwinds, those are closed,
+        // and neither the scope that panicked nor any after it.
+        let mut opening = Opening {
+            profile: self,
+            returned: 0,
+        };
         for scope in self.scopes() {
             scope.open(facts, candidates, pool);
+            opening.returned += 1;
         }
+        // Every open returned: the decision's guard closes them all.
+        opening.returned = 0;
         Opened(self)
     }
 }
@@ -282,11 +299,70 @@ impl Drop for Opened<'_> {
     }
 }
 
+/// Closes every scope of the profile, each under a catch, so a close that
+/// panics keeps no scope after it open. The first panic of the decision is
+/// the one the host sees. Where one is already unwinding (a stage's, or the
+/// open of a pair's other side), a close's panic stops here: let out, it
+/// would end the process. Where none is, the first close's panic goes on
+/// once every scope is closed. A payload that stops here is released.
 #[cold]
 #[inline(never)]
 fn close_scopes(profile: &Profile) {
+    let mut first = None;
     for scope in profile.scopes() {
-        scope.close();
+        let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scope.close()));
+        let Err(payload) = closed else { continue };
+        if first.is_none() && !std::thread::panicking() {
+            first = Some(payload);
+        } else {
+            release(payload);
+        }
+    }
+    if let Some(payload) = first {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// The scopes of one profile whose open returned while a decision opens
+/// them: the first `returned` in the profile's order. Its drop closes those,
+/// which is what the unwinding of a later scope's open runs; once every open
+/// returned the count is cleared and `Opened` holds the scopes.
+struct Opening<'a> {
+    profile: &'a Profile,
+    returned: usize,
+}
+
+impl Drop for Opening<'_> {
+    fn drop(&mut self) {
+        for scope in self.profile.scopes().take(self.returned) {
+            // A close here runs inside the unwinding of a later scope's
+            // open: a close that panics stops there, the rest are still
+            // closed, and the open's panic is the one that reaches the host.
+            contained(|| scope.close());
+        }
+    }
+}
+
+/// Runs `f` on a path that is already unwinding, where a second panic let
+/// out would end the process: a panic of `f` stops here, and its payload is
+/// released.
+pub(crate) fn contained(f: impl FnOnce()) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        release(payload);
+    }
+}
+
+/// Frees a caught payload the engine does not resume. A payload's own
+/// destructor can panic, and a panic let out here would end the process or
+/// take the first panic's place: the drop runs under a catch of its own.
+/// Only the payload of a drop that panicked is forgotten, since its drop
+/// could panic in turn.
+#[cold]
+#[inline(never)]
+fn release(payload: Box<dyn std::any::Any + Send>) {
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)));
+    if let Err(again) = dropped {
+        std::mem::forget(again);
     }
 }
 
@@ -722,6 +798,20 @@ fn profile_index(binding: &Binding, phase: Phase) -> Option<u16> {
     }
 }
 
+/// The overload thresholds a binding hands the pools it matches: its block's
+/// two values, each else the spec's default, resolved once by validation.
+/// The host judges an engine's load reports against them and latches the
+/// verdict on the engine's rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverloadThresholds {
+    /// Queued requests, summed over an engine's ranks, at or above which
+    /// the engine's rows are vetoed.
+    pub waiting_requests: u32,
+    /// KV usage in permille, the mean over an engine's ranks, at or above
+    /// which the engine's rows are vetoed.
+    pub kv_usage_permille: u16,
+}
+
 /// A binding: which profile (or plan of profiles) a request resolves to.
 #[derive(Clone, Debug)]
 pub struct Binding {
@@ -737,6 +827,10 @@ pub struct Binding {
     /// Sticky sessions: a keyed request of the `single` plan stays on the
     /// worker its key was placed on (design 4.6).
     pub sessions: Option<SessionRule>,
+    /// The overload thresholds of the pools the binding matches; `None`
+    /// when its block is switched off, and for a binding built by hand
+    /// that names none.
+    pub overload: Option<OverloadThresholds>,
 }
 
 impl Binding {
@@ -1115,9 +1209,10 @@ enum PairSide {
 impl<'a> PairPools<'a> {
     /// One side of the pair as its stages read it: the side's pool, and the
     /// request's facts with the side's phase, its draw sequence and its own
-    /// pool's affinity column. `None` when that column was not filled for
-    /// that pool ([`column_fits`]). The one place a pair's column meets its
-    /// pool, so no call site hands one side's column with the other side's
+    /// pool's affinity column, and with no rows named: those index neither
+    /// pool. `None` when that column was not filled for that pool
+    /// ([`column_fits`]). The one place a pair's column meets its pool, so
+    /// no call site hands one side's column with the other side's
     /// candidates.
     fn side(
         self,
@@ -1150,6 +1245,7 @@ impl<'a> PairPools<'a> {
                 phase,
                 seed,
                 affinity,
+                named: None,
                 ..*facts
             };
             (pool, facts)
@@ -1174,6 +1270,27 @@ const AFFINITY_COLUMN: &str = "affinity-column";
 /// never its presence.
 fn column_fits(column: &[AffinityFacts], pool: &[Candidate]) -> bool {
     column.is_empty() || column.len() == pool.len()
+}
+
+/// A debug build asserts that the rows a host named in the column's place
+/// ([`NamedAffinity`](crate::NamedAffinity)) stand for `pool`, once where a
+/// decision takes its inputs: both lists ascending and under the pool's
+/// size, beside an empty column. A list out of order hides a holder from
+/// the stages' search, and a column beside the rows is read in their
+/// place. A release build does not check what the host derived: the test
+/// would ride every decision, a keyed one among them.
+fn debug_assert_named(facts: &RequestFacts<'_>, pool: &[Candidate]) {
+    let under = |row: u32| (row as usize) < pool.len();
+    debug_assert!(
+        facts.named.is_none_or(|named| {
+            facts.affinity.is_empty()
+                && named.holders.is_sorted_by(|a, b| a.row < b.row)
+                && named.holders.last().is_none_or(|holder| under(holder.row))
+                && named.warming.is_sorted_by(|a, b| a < b)
+                && named.warming.last().is_none_or(|&row| under(row))
+        }),
+        "rows named in the column's place stand ascending and under the pool's size, beside an empty column"
+    );
 }
 
 /// A debug build asserts that every row's `position` is its index in `pool`,
@@ -1375,7 +1492,10 @@ impl Engine {
     /// pinned worker first, and a profile whose picker leaves the placement
     /// to that rule is placed by its assignment. The request's affinity
     /// column is empty or holds one entry a candidate; any other is
-    /// refused, as a decline under the stage name `affinity-column`.
+    /// refused, as a decline under the stage name `affinity-column`. Rows
+    /// named in the column's place
+    /// ([`NamedAffinity`](crate::NamedAffinity)) are read as the host
+    /// derived them: a debug build asserts that they stand for the pool.
     pub fn decide(
         &self,
         facts: &RequestFacts<'_>,
@@ -1390,6 +1510,7 @@ impl Engine {
             ..Trace::default()
         };
         debug_assert_indexed(candidates);
+        debug_assert_named(facts, candidates);
         if !column_fits(facts.affinity, candidates) {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         }
@@ -1670,8 +1791,8 @@ impl Engine {
     /// such a prefill is dropped at the `partnered` stage, so a host that
     /// leaves the classes unset sheds instead of pairing all with all. Each
     /// side's affinity column rides its pool ([`PairPools`]); the request
-    /// carries none here, and a non-empty one is refused under the stage
-    /// name `affinity-column`.
+    /// carries none here and names no rows, and either is refused under
+    /// the stage name `affinity-column`.
     pub fn decide_pair(
         &self,
         facts: &RequestFacts<'_>,
@@ -1686,10 +1807,10 @@ impl Engine {
             generation: pool.generation,
             ..Trace::default()
         };
-        // A pair's columns ride its two pools. One on the request names
-        // neither pool: refused, where it would be dropped in silence and
-        // both sides scored as if nothing were held.
-        if !facts.affinity.is_empty() {
+        // A pair's columns ride its two pools. One on the request, or rows
+        // named on it, name neither pool: refused, where they would be
+        // dropped in silence and both sides scored as if nothing were held.
+        if !facts.affinity.is_empty() || facts.named.is_some() {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         }
         // Each side's stages read their own pool and its own column.
@@ -2028,6 +2149,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -2159,6 +2281,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -2188,6 +2311,7 @@ mod tests {
             profile: 0,
             decode_profile: Some(0),
             sessions: None,
+            overload: None,
         }
     }
 
@@ -2349,6 +2473,122 @@ mod tests {
         ));
     }
 
+    /// A holder a host named in the column's place leads as the deepest
+    /// overlap of a column does, and a request that names nothing reads its
+    /// column.
+    #[test]
+    fn a_holder_a_host_named_leads_as_the_deepest_overlap_of_a_column_does() {
+        use crate::{NamedAffinity, NamedHolder};
+        let engine = overlap_engine(Binding {
+            model: "m".into(),
+            ..single_binding()
+        });
+        let pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
+        let decide = |column: &[AffinityFacts], named: Option<NamedAffinity<'_>>| {
+            let facts = RequestFacts {
+                model: "m",
+                affinity: column,
+                named,
+                ..RequestFacts::default()
+            };
+            engine.decide(
+                &facts,
+                &PoolFacts::default(),
+                &pool,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            )
+        };
+        let holders = [
+            NamedHolder {
+                row: 0,
+                overlap_blocks: 10,
+                predicted_blocks: 0,
+            },
+            NamedHolder {
+                row: 1,
+                overlap_blocks: 90,
+                predicted_blocks: 0,
+            },
+        ];
+        let named = NamedAffinity {
+            holders: &holders,
+            ..NamedAffinity::default()
+        };
+        assert_eq!(lead(&decide(&[], Some(named))), Some(1));
+        // Nobody named decides too.
+        assert!(decide(&[], Some(NamedAffinity::default())).pick().is_some());
+        // A request that names nothing reads its column.
+        assert_eq!(lead(&decide(&held(&[10, 90, 20]), None)), Some(1));
+    }
+
+    /// The regular entry takes the named rows under an assertion, as it
+    /// takes the rows' positions: a debug build stops at a list out of
+    /// order, at a row named twice, at a row past the pool and at rows
+    /// named beside a column, each by the assertion's own words. A release
+    /// build does not check, so the case is a debug build's alone.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn rows_named_out_of_order_past_the_pool_or_beside_a_column_stop_a_debug_build() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        use crate::{NamedAffinity, NamedHolder};
+        let engine = overlap_engine(Binding {
+            model: "m".into(),
+            ..single_binding()
+        });
+        let pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
+        let column = held(&[10, 90, 20]);
+        let shapes = [
+            ("holders out of order", &[][..], &[2, 1][..], &[][..]),
+            ("a holder named twice", &[][..], &[1, 1][..], &[][..]),
+            ("a holder past the pool", &[][..], &[1, 3][..], &[][..]),
+            ("warming rows out of order", &[][..], &[][..], &[1, 0][..]),
+            ("a warming row named twice", &[][..], &[][..], &[1, 1][..]),
+            ("a warming row past the pool", &[][..], &[][..], &[3][..]),
+            ("rows named beside a column", &column[..], &[1][..], &[][..]),
+        ];
+        for (what, column, holders, warming) in shapes {
+            let holders: Vec<NamedHolder> = holders
+                .iter()
+                .map(|&row| NamedHolder {
+                    row,
+                    overlap_blocks: 90,
+                    predicted_blocks: 0,
+                })
+                .collect();
+            let stopped = catch_unwind(AssertUnwindSafe(|| {
+                let facts = RequestFacts {
+                    model: "m",
+                    affinity: column,
+                    named: Some(NamedAffinity {
+                        holders: &holders,
+                        warming,
+                        thin: false,
+                    }),
+                    ..RequestFacts::default()
+                };
+                engine.decide(
+                    &facts,
+                    &PoolFacts::default(),
+                    &pool,
+                    &Constraints::default(),
+                    &mut Scratch::new(),
+                )
+            }))
+            .expect_err(what);
+            let said = stopped
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| stopped.downcast_ref::<&str>().copied())
+                .unwrap_or_default();
+            assert!(
+                said.contains("rows named in the column's place"),
+                "{what} stopped by another word: {said}"
+            );
+        }
+    }
+
     /// The regular entry takes its rows under the assertion the pair entry
     /// takes each side's under: a debug build stops at a row whose position
     /// is not its index, the second one here. A release build does not
@@ -2451,6 +2691,61 @@ mod tests {
         assert!(decide(&[]).pick().is_some());
         // As long as either pool: its length fits both, and it is refused.
         assert!(refused_for_its_column(&decide(&held(&[10, 90]))));
+    }
+
+    /// Rows named on a pair's request name neither pool, as a column on it
+    /// does: refused.
+    #[test]
+    fn rows_named_on_the_request_are_refused_at_the_pair_entry() {
+        let engine = overlap_engine(pair_binding());
+        let (prefills, decodes) = (paired(2), paired(2));
+        let facts = RequestFacts {
+            model: "m",
+            named: Some(crate::NamedAffinity::default()),
+            ..RequestFacts::default()
+        };
+        let decision = engine.decide_pair(
+            &facts,
+            &PoolFacts::default(),
+            PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            },
+            &Constraints::default(),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert!(refused_for_its_column(&decision), "{decision:?}");
+    }
+
+    /// A pair's side carries no rows named, whatever its request carries:
+    /// named rows index neither pool.
+    #[test]
+    fn a_pair_side_reads_no_rows_named_on_the_request() {
+        let (prefills, decodes) = (paired(2), paired(2));
+        let holders = [crate::NamedHolder {
+            row: 1,
+            overlap_blocks: 8,
+            predicted_blocks: 0,
+        }];
+        let facts = RequestFacts {
+            model: "m",
+            named: Some(crate::NamedAffinity {
+                holders: &holders,
+                ..crate::NamedAffinity::default()
+            }),
+            ..RequestFacts::default()
+        };
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes: &decodes,
+            ..PairPools::default()
+        };
+        for (side, name) in [(PairSide::Prefill, "prefill"), (PairSide::Decode, "decode")] {
+            let (_, read) = pools.side(side, &facts).expect("an empty column fits");
+            assert!(read.named.is_none(), "the {name} side");
+        }
     }
 
     /// Each side of a pair reads its own pool's column: with the two columns
@@ -2871,6 +3166,7 @@ mod tests {
                     profile: 1,
                     decode_profile: None,
                     sessions: None,
+                    overload: None,
                 },
                 pair_binding(),
             ],
@@ -3122,6 +3418,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -3165,6 +3462,7 @@ mod tests {
                 profile: 0,
                 decode_profile: Some(0),
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -3287,6 +3585,7 @@ mod tests {
                 profile: 0,
                 decode_profile: Some(0),
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -3369,6 +3668,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -3672,6 +3972,7 @@ mod tests {
                     profile: 0,
                     decode_profile: Some(1),
                     sessions: None,
+                    overload: None,
                 }],
                 1,
                 Needs::default(),
@@ -3780,6 +4081,7 @@ mod tests {
                 profile: 0,
                 decode_profile: Some(1),
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -4547,6 +4849,7 @@ mod tests {
             profile: 0,
             decode_profile: None,
             sessions: None,
+            overload: None,
         };
         assert!(b.matches("pd/a", Phase::Prefill));
         assert!(!b.matches("pd/a", Phase::Single));
@@ -4558,6 +4861,7 @@ mod tests {
             profile: 0,
             decode_profile: None,
             sessions: None,
+            overload: None,
         };
         assert!(any.matches("anything", Phase::Decode));
         let suffix = Binding {
@@ -4641,6 +4945,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions: Some(rule),
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -4974,6 +5279,7 @@ mod tests {
             profile: 0,
             decode_profile: None,
             sessions: Some(rule),
+            overload: None,
         };
         let engine = Engine::new(
             vec![least_requests_profile()],
@@ -5062,6 +5368,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -5180,6 +5487,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -5492,6 +5800,7 @@ mod tests {
                 profile: 0,
                 decode_profile: Some(0),
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -5532,6 +5841,7 @@ mod tests {
                 profile: 0,
                 decode_profile: Some(0),
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),

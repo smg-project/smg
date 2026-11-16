@@ -122,6 +122,8 @@ fn micros_of_day(stamp: &str) -> Option<u64> {
 pub struct Replica {
     /// Its controller id.
     pub id: String,
+    /// The address it advertises, when it was started under one.
+    advertised: Option<String>,
     child: Child,
     lines: Arc<Mutex<Vec<String>>>,
     /// The thread that reads the process's log into `lines`, until joined.
@@ -150,6 +152,30 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
     ) -> Result<Self, String> {
+        Self::start_as(id, None, lease, settings, settle_secs)
+    }
+
+    /// Starts the binary as [`Replica::start`] does, under an advertised
+    /// `host:port` of its own: the holder identity is `id` at that address
+    /// whatever the listeners bind, so a second process started the same way
+    /// is the first one's restart to the election.
+    pub fn start_at(
+        id: &str,
+        advertise: &str,
+        lease: Lease<'_>,
+        settings: ElectionSettings,
+        settle_secs: u64,
+    ) -> Result<Self, String> {
+        Self::start_as(id, Some(advertise), lease, settings, settle_secs)
+    }
+
+    fn start_as(
+        id: &str,
+        advertise: Option<&str>,
+        lease: Lease<'_>,
+        settings: ElectionSettings,
+        settle_secs: u64,
+    ) -> Result<Self, String> {
         let millis = |duration: Duration| duration.as_millis().to_string();
         let grace_secs = (2 * settle_secs).max(5);
         let mut command = Command::new(BIN);
@@ -165,6 +191,9 @@ impl Replica {
                     .args(["--lease-name", name])
                     .env("KUBECONFIG", kubeconfig);
             }
+        }
+        if let Some(address) = advertise {
+            command.args(["--advertise-address", address]);
         }
         command
             .args(["--controller-id", id])
@@ -206,6 +235,7 @@ impl Replica {
 
         let mut replica = Self {
             id: id.to_owned(),
+            advertised: advertise.map(str::to_owned),
             child,
             lines,
             reader: Some(reader),
@@ -265,7 +295,10 @@ impl Replica {
 
     /// The identity this replica holds the lease under.
     pub fn identity(&self) -> String {
-        format!("{}@{}", self.id, self.gateway)
+        match &self.advertised {
+            Some(address) => format!("{}@{address}", self.id),
+            None => format!("{}@{}", self.id, self.gateway),
+        }
     }
 
     /// The log so far, one line a line.
@@ -338,7 +371,7 @@ impl Replica {
 
     /// One `Leader` call on the gateway listener; `None` when the replica
     /// did not answer within the call's bound (killed, or gone).
-    async fn leader(&mut self) -> Option<LeaderInfo> {
+    pub async fn leader(&mut self) -> Option<LeaderInfo> {
         if self.client.is_none() {
             let endpoint = Channel::from_shared(format!("http://{}", self.gateway))
                 .ok()?
@@ -381,14 +414,39 @@ impl Replica {
         }
     }
 
-    /// The exit status, waited for, with the log read to its end: every
-    /// line the process wrote on its way out is in the log from here.
+    /// The exit status, waited for under the kit's own bound, with the log
+    /// read to its end: every line the process wrote on its way out is in
+    /// the log from here. A replica that has not exited inside [`ROOM`] is
+    /// killed and named, and so is a log that does not end: a process that
+    /// hangs at its exit fails its case instead of holding the job.
     pub fn exited(&mut self) -> Result<ExitStatus, String> {
-        let status = self
-            .child
-            .wait()
-            .map_err(|error| format!("wait {}: {error}", self.id))?;
+        let waited = Instant::now();
+        let status = loop {
+            let exited = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("wait {}: {error}", self.id))?;
+            if let Some(status) = exited {
+                break status;
+            }
+            if waited.elapsed() >= ROOM {
+                // Best effort: the case fails by the name below either way.
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return Err(format!("{} did not exit in {ROOM:?}", self.id));
+            }
+            thread::sleep(PACE);
+        };
         if let Some(reader) = self.reader.take() {
+            while !reader.is_finished() {
+                if waited.elapsed() >= ROOM {
+                    return Err(format!(
+                        "{}: its log did not end in {ROOM:?} of its exit's wait",
+                        self.id
+                    ));
+                }
+                thread::sleep(PACE);
+            }
             reader
                 .join()
                 .map_err(|_| format!("{}: the log reader panicked", self.id))?;

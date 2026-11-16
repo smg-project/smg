@@ -979,6 +979,32 @@ impl McpOrchestrator {
         names
     }
 
+    /// Whether a server of this name is configured as internal: the answer
+    /// [`Self::internal_server_names`] holds for the name, read by key.
+    pub(crate) fn is_internal_server(&self, name: &str) -> bool {
+        self.static_servers
+            .get(name)
+            .is_some_and(|entry| entry.config.internal)
+            || self
+                .config
+                .servers
+                .iter()
+                .any(|server| server.internal && server.name == name)
+    }
+
+    /// Whether a server of this name has `builtin_type` configured: the
+    /// answer [`Self::builtin_server_names`] holds for the name, read by key.
+    pub(crate) fn is_builtin_server(&self, name: &str) -> bool {
+        self.static_servers
+            .get(name)
+            .is_some_and(|entry| entry.config.builtin_type.is_some())
+            || self
+                .config
+                .servers
+                .iter()
+                .any(|server| server.builtin_type.is_some() && server.name == name)
+    }
+
     /// Execute a single tool using an already-resolved qualified binding.
     ///
     /// This path does not perform tool-name reverse lookup. Callers must provide
@@ -1664,8 +1690,7 @@ impl McpOrchestrator {
     /// The key is based on the transport URL, making it suitable for connection pooling.
     pub fn server_key(config: &McpServerConfig) -> String {
         match &config.transport {
-            McpTransport::Streamable { url, .. } => url.clone(),
-            McpTransport::Sse { url, .. } => url.clone(),
+            McpTransport::Streamable { url, .. } | McpTransport::Sse { url, .. } => url.clone(),
             McpTransport::Stdio { command, args, .. } => {
                 format!("{}:{}", command, args.join(" "))
             }
@@ -1814,14 +1839,9 @@ impl McpOrchestrator {
     /// List tools for specific servers: the servers in the order given, each
     /// server's tools in its listing order (the inventory's maps keep neither),
     /// an entry without a position after the listed ones, the name settling
-    /// ties. One walk of the inventory, cloning only these servers' entries.
+    /// ties. Read by server key, cloning only these servers' entries.
     pub fn list_tools_for_servers(&self, server_keys: &[String]) -> Vec<ToolEntry> {
-        // For small server lists (typical case: 1-5), linear scan is faster than HashSet
-        let server_rank = |server_key: &str| server_keys.iter().position(|s| s == server_key);
-
-        let mut ranked = self
-            .tool_inventory
-            .entries_keyed(|entry| server_rank(entry.server_key()));
+        let mut ranked = self.tool_inventory.entries_of_servers(server_keys);
         ranked.sort_by(|(rank_a, a), (rank_b, b)| {
             (rank_a, a.position.is_none(), a.position, a.tool_name()).cmp(&(
                 rank_b,

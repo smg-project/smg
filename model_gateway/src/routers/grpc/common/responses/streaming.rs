@@ -8,7 +8,7 @@ use futures::Stream;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use openai_protocol::{
     chat::ChatCompletionStreamResponse,
-    common::{ToolCallDelta, Usage},
+    common::Usage,
     event_types::{
         ContentPartEvent, FunctionCallEvent, McpEvent, OutputItemEvent, OutputTextEvent,
         ResponseEvent,
@@ -120,12 +120,13 @@ fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
     }
 }
 
-/// The `response.output_text.delta` event of one token, serialized straight
-/// into its frame: the fields in the event's order (the bytes the `json!` map
-/// wrote under `preserve_order`), the item id and the delta borrowed rather
-/// than copied into a map per token.
+/// The text delta of one token, `response.output_text.delta` or
+/// `response.reasoning_text.delta` by `kind`, serialized straight into its
+/// frame: the fields in the event's order (the bytes the `json!` map wrote
+/// under `preserve_order`), the item id and the delta borrowed rather than
+/// copied into a map per token.
 #[derive(Serialize)]
-struct OutputTextDelta<'a> {
+struct TextDelta<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     sequence_number: u64,
@@ -134,6 +135,21 @@ struct OutputTextDelta<'a> {
     content_index: usize,
     delta: &'a str,
 }
+
+/// One fragment of a call's arguments, `response.function_call_arguments.delta`
+/// or `response.mcp_call_arguments.delta` by `kind`, written as [`TextDelta`]
+/// is.
+#[derive(Serialize)]
+struct ArgumentsDelta<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    sequence_number: u64,
+    output_index: usize,
+    item_id: &'a str,
+    delta: &'a str,
+}
+
+const REASONING_TEXT_DELTA: &str = "response.reasoning_text.delta";
 
 /// The `response.output_item.added` and `response.output_item.done` events:
 /// the item an output index opens or closes with, borrowed into the frame
@@ -310,6 +326,51 @@ fn serde_error_kind(error: &serde_json::Error) -> &'static str {
         "duplicate field"
     } else {
         "other"
+    }
+}
+
+/// One tool-call delta of a chat chunk, as the Responses events read it.
+pub struct ToolCallParts<'a> {
+    pub index: u32,
+    pub id: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub arguments: Option<&'a str>,
+}
+
+/// What the Responses events read of one chat chunk: its first choice's
+/// delta texts, its tool-call deltas in order and its finish reason. The
+/// owned chunk answers from its fields; a reader that borrows the chunk from
+/// its frame answers from the frame's text, with no copy of it.
+pub trait ChatChunkParts {
+    fn reasoning(&self) -> Option<&str>;
+    fn content(&self) -> Option<&str>;
+    /// The tool-call delta at position `at` of the delta's list.
+    fn tool_call(&self, at: usize) -> Option<ToolCallParts<'_>>;
+    fn finish_reason(&self) -> Option<&str>;
+}
+
+impl ChatChunkParts for ChatCompletionStreamResponse {
+    fn reasoning(&self) -> Option<&str> {
+        self.choices.first()?.delta.reasoning_content.as_deref()
+    }
+
+    fn content(&self) -> Option<&str> {
+        self.choices.first()?.delta.content.as_deref()
+    }
+
+    fn tool_call(&self, at: usize) -> Option<ToolCallParts<'_>> {
+        let call = self.choices.first()?.delta.tool_calls.as_ref()?.get(at)?;
+        let function = call.function.as_ref();
+        Some(ToolCallParts {
+            index: call.index,
+            id: call.id.as_deref(),
+            name: function.and_then(|f| f.name.as_deref()),
+            arguments: function.and_then(|f| f.arguments.as_deref()),
+        })
+    }
+
+    fn finish_reason(&self) -> Option<&str> {
+        self.choices.first()?.finish_reason.as_deref()
     }
 }
 
@@ -756,14 +817,14 @@ impl ResponseStreamEventEmitter {
     /// it closes no item, so an item left open stays as the processor left it.
     pub async fn finish_stream(
         &mut self,
-        usage: &Usage,
+        usage: Option<&ResponseUsage>,
         not_stored: Option<&serde_json::Value>,
         tx: &SseSender,
     ) {
-        let usage_json = json!(ResponseUsage::from(usage));
+        let usage_json = usage.map(|usage| json!(usage));
         let event = match not_stored {
-            Some(error) => self.emit_failed(Some(&usage_json), error),
-            None => self.emit_completed(Some(&usage_json)),
+            Some(error) => self.emit_failed(usage_json.as_ref(), error),
+            None => self.emit_completed(usage_json.as_ref()),
         };
         let delivered = self.send_event_best_effort(&event, tx).await;
         if delivered && not_stored.is_some() {
@@ -834,21 +895,6 @@ impl ResponseStreamEventEmitter {
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item_id": item_id
-        })
-    }
-
-    pub fn emit_mcp_call_arguments_delta(
-        &mut self,
-        output_index: usize,
-        item_id: &str,
-        delta: &str,
-    ) -> serde_json::Value {
-        json!({
-            "type": McpEvent::CALL_ARGUMENTS_DELTA,
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item_id": item_id,
-            "delta": delta
         })
     }
 
@@ -944,21 +990,6 @@ impl ResponseStreamEventEmitter {
     // ========================================================================
     // Function Call Event Emission Methods
     // ========================================================================
-
-    pub fn emit_function_call_arguments_delta(
-        &mut self,
-        output_index: usize,
-        item_id: &str,
-        delta: &str,
-    ) -> serde_json::Value {
-        json!({
-            "type": FunctionCallEvent::ARGUMENTS_DELTA,
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item_id": item_id,
-            "delta": delta
-        })
-    }
 
     pub fn emit_function_call_arguments_done(
         &mut self,
@@ -1298,22 +1329,6 @@ impl ResponseStreamEventEmitter {
         super::utils::custom_tool_names(tools).contains(name)
     }
 
-    fn emit_reasoning_text_delta(
-        &mut self,
-        output_index: usize,
-        item_id: &str,
-        delta: &str,
-    ) -> serde_json::Value {
-        json!({
-            "type": "response.reasoning_text.delta",
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item_id": item_id,
-            "content_index": 0,
-            "delta": delta
-        })
-    }
-
     fn emit_reasoning_text_done(
         &mut self,
         output_index: usize,
@@ -1519,31 +1534,23 @@ impl ResponseStreamEventEmitter {
     /// content delta, the tool-call deltas, then the finish, in that order.
     pub async fn process_chunk(
         &mut self,
-        chunk: &ChatCompletionStreamResponse,
+        chunk: &impl ChatChunkParts,
         tx: &SseSender,
     ) -> Result<(), String> {
-        let Some(choice) = chunk.choices.first() else {
-            return Ok(());
-        };
-        if let Some(reasoning) = choice
-            .delta
-            .reasoning_content
-            .as_deref()
-            .filter(|r| !r.is_empty())
-        {
+        if let Some(reasoning) = chunk.reasoning().filter(|r| !r.is_empty()) {
             self.process_reasoning_delta(reasoning, tx).await?;
         }
-        if let Some(content) = choice.delta.content.as_deref().filter(|c| !c.is_empty()) {
+        if let Some(content) = chunk.content().filter(|c| !c.is_empty()) {
             self.process_content_delta(content, tx).await?;
         }
-        if let Some(tool_calls) = &choice.delta.tool_calls {
-            for tc in tool_calls {
-                self.process_tool_call_delta(tc, tx).await?;
-            }
+        let mut at = 0;
+        while let Some(call) = chunk.tool_call(at) {
+            self.process_tool_call_delta(call, tx).await?;
+            at += 1;
         }
         // Check for finish_reason to emit completion events
-        if let Some(reason) = &choice.finish_reason {
-            self.finish_reason = Some(reason.clone());
+        if let Some(reason) = chunk.finish_reason() {
+            self.finish_reason = Some(reason.to_owned());
             self.close_reasoning_item(tx).await?;
             self.close_message_item(tx).await?;
             self.close_tool_call_items(tx).await?;
@@ -1585,9 +1592,26 @@ impl ResponseStreamEventEmitter {
         }
         if let Some(item) = self.reasoning_item.as_mut() {
             item.text.push_str(reasoning);
-            let (output_index, item_id) = (item.output_index, item.item_id.clone());
-            let event = self.emit_reasoning_text_delta(output_index, &item_id, reasoning);
-            self.send_event(&event, tx).await?;
+            // The id stays borrowed, as the text delta's does: the counter
+            // advanced on its field, the frame written over the encoder alone.
+            let sequence_number = self.sequence_number;
+            self.sequence_number += 1;
+            let event = TextDelta {
+                kind: REASONING_TEXT_DELTA,
+                sequence_number,
+                output_index: item.output_index,
+                item_id: &item.item_id,
+                content_index: 0,
+                delta: reasoning,
+            };
+            Self::send_frame(
+                &mut self.encoder,
+                self.abandoned,
+                REASONING_TEXT_DELTA,
+                &event,
+                tx,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1645,7 +1669,7 @@ impl ResponseStreamEventEmitter {
         let sequence_number = self.sequence_number;
         self.sequence_number += 1;
         self.accumulated_text.push_str(content);
-        let event = OutputTextDelta {
+        let event = TextDelta {
             kind: OutputTextEvent::DELTA,
             sequence_number,
             output_index,
@@ -1669,7 +1693,7 @@ impl ResponseStreamEventEmitter {
     /// or arguments, and its arguments streamed unless the tool is custom.
     async fn process_tool_call_delta(
         &mut self,
-        tc: &ToolCallDelta,
+        tc: ToolCallParts<'_>,
         tx: &SseSender,
     ) -> Result<(), String> {
         let pos = match self
@@ -1688,8 +1712,7 @@ impl ResponseStreamEventEmitter {
                     item_id,
                     call_id: tc
                         .id
-                        .clone()
-                        .unwrap_or_else(|| format!("call_{}", Uuid::now_v7())),
+                        .map_or_else(|| format!("call_{}", Uuid::now_v7()), str::to_owned),
                     name: String::new(),
                     custom: false,
                     arguments: String::new(),
@@ -1698,13 +1721,8 @@ impl ResponseStreamEventEmitter {
                 self.tool_call_items.len() - 1
             }
         };
-        let function = tc.function.as_ref();
-        let name_delta = function
-            .and_then(|f| f.name.as_deref())
-            .filter(|n| !n.is_empty());
-        let args_delta = function
-            .and_then(|f| f.arguments.as_deref())
-            .filter(|a| !a.is_empty());
+        let name_delta = tc.name.filter(|n| !n.is_empty());
+        let args_delta = tc.arguments.filter(|a| !a.is_empty());
 
         // The name arrives once; whether it names a custom tool is decided
         // then and kept on the item.
@@ -1727,16 +1745,15 @@ impl ResponseStreamEventEmitter {
         let emit_added =
             !item.added_emitted && (!item.name.is_empty() || !item.arguments.is_empty());
         item.added_emitted |= emit_added;
-        // The call id and the name are copied only for the announcement, not
-        // on every delta.
-        let (output_index, item_id, custom) =
-            (item.output_index, item.item_id.clone(), item.custom);
+        // The ids and the name are copied only for the announcement, not on
+        // every delta.
+        let (output_index, custom) = (item.output_index, item.custom);
 
         if emit_added {
             let announced = &self.tool_call_items[pos];
             let item = if custom {
                 json!({
-                    "id": item_id,
+                    "id": announced.item_id,
                     "type": "custom_tool_call",
                     "call_id": announced.call_id,
                     "name": announced.name,
@@ -1744,7 +1761,7 @@ impl ResponseStreamEventEmitter {
                 })
             } else {
                 json!({
-                    "id": item_id,
+                    "id": announced.item_id,
                     "type": "function_call",
                     "call_id": announced.call_id,
                     "name": announced.name,
@@ -1757,8 +1774,23 @@ impl ResponseStreamEventEmitter {
         // Custom tool calls carry their payload as the raw `input`
         // string of the final item, not as streamed JSON arguments.
         if let Some(delta) = args_delta.filter(|_| !custom) {
-            let event = self.emit_function_call_arguments_delta(output_index, &item_id, delta);
-            self.send_event(&event, tx).await?;
+            let sequence_number = self.sequence_number;
+            self.sequence_number += 1;
+            let event = ArgumentsDelta {
+                kind: FunctionCallEvent::ARGUMENTS_DELTA,
+                sequence_number,
+                output_index,
+                item_id: &self.tool_call_items[pos].item_id,
+                delta,
+            };
+            Self::send_frame(
+                &mut self.encoder,
+                self.abandoned,
+                FunctionCallEvent::ARGUMENTS_DELTA,
+                &event,
+                tx,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1821,7 +1853,7 @@ impl ResponseStreamEventEmitter {
     }
 
     /// The `response.output_text.delta` event of one token, sent as
-    /// [`OutputTextDelta`]; the text accumulates as it did under the map.
+    /// [`TextDelta`]; the text accumulates as it did under the map.
     pub async fn send_text_delta(
         &mut self,
         delta: &str,
@@ -1831,7 +1863,7 @@ impl ResponseStreamEventEmitter {
         tx: &SseSender,
     ) -> Result<(), String> {
         self.accumulated_text.push_str(delta);
-        let event = OutputTextDelta {
+        let event = TextDelta {
             kind: OutputTextEvent::DELTA,
             sequence_number: self.next_sequence(),
             output_index,
@@ -1861,6 +1893,44 @@ impl ResponseStreamEventEmitter {
                 tracing::debug!("Failed to send event (likely client disconnect): {}", e);
                 false
             }
+        }
+    }
+
+    /// One fragment of a call's arguments under `kind` (a function call's
+    /// event name or an MCP call's), sent as [`ArgumentsDelta`].
+    pub async fn send_arguments_delta(
+        &mut self,
+        kind: &'static str,
+        delta: &str,
+        output_index: usize,
+        item_id: &str,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        let event = ArgumentsDelta {
+            kind,
+            sequence_number: self.next_sequence(),
+            output_index,
+            item_id,
+            delta,
+        };
+        self.send_typed(kind, &event, tx).await
+    }
+
+    /// [`Self::send_arguments_delta`] for the streams that log a failed send
+    /// instead of ending on it.
+    pub async fn send_arguments_delta_best_effort(
+        &mut self,
+        kind: &'static str,
+        delta: &str,
+        output_index: usize,
+        item_id: &str,
+        tx: &SseSender,
+    ) {
+        if let Err(e) = self
+            .send_arguments_delta(kind, delta, output_index, item_id, tx)
+            .await
+        {
+            tracing::debug!("Failed to send event (likely client disconnect): {}", e);
         }
     }
 
@@ -2270,6 +2340,50 @@ mod tests {
         assert!(std::str::from_utf8(&typed_frames[0])
             .unwrap()
             .starts_with("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":"));
+    }
+
+    /// A call's arguments fragment sent typed writes the frame the `json!`
+    /// event wrote, byte for byte, under the function call's event name and
+    /// under the MCP call's.
+    #[tokio::test]
+    async fn the_typed_arguments_delta_is_the_json_event_frame_byte_for_byte() {
+        let frames = |mut emitter: ResponseStreamEventEmitter, typed: bool| async move {
+            let (tx, mut rx) = sse_channel();
+            for kind in [
+                FunctionCallEvent::ARGUMENTS_DELTA,
+                McpEvent::CALL_ARGUMENTS_DELTA,
+            ] {
+                for delta in ["{\"city\":\"Pa", "", "r\u{ed}s\"}\n\u{1F600}"] {
+                    if typed {
+                        emitter
+                            .send_arguments_delta_best_effort(kind, delta, 1, "fc_1", &tx)
+                            .await;
+                    } else {
+                        // The event as the `json!` map wrote it before the typed form.
+                        let event = json!({
+                            "type": kind,
+                            "sequence_number": emitter.next_sequence(),
+                            "output_index": 1,
+                            "item_id": "fc_1",
+                            "delta": delta
+                        });
+                        emitter.send_event(&event, &tx).await.unwrap();
+                    }
+                }
+            }
+            drop(tx);
+            let mut frames = Vec::new();
+            while let Some(Ok(bytes)) = rx.recv().await {
+                frames.push(bytes);
+            }
+            frames
+        };
+        let new = || ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let typed_frames = frames(new(), true).await;
+        assert_eq!(typed_frames, frames(new(), false).await);
+        assert!(std::str::from_utf8(&typed_frames[3])
+            .unwrap()
+            .starts_with("event: response.mcp_call_arguments.delta\ndata: {\"type\":\"response.mcp_call_arguments.delta\",\"sequence_number\":3,"));
     }
 
     /// The five typed lifecycle events write the frames the `json!` events
@@ -2852,6 +2966,75 @@ mod process_chunk_tests {
         assert_eq!(events[6]["item"], output[0]);
         assert_eq!(events[11]["item"], output[1]);
         assert_eq!(events[10]["arguments"], "{\"city\":\"Paris\"}");
+    }
+
+    /// The reasoning text delta and the function-call arguments delta of a
+    /// chunk write the frames their `json!` events wrote, byte for byte: the
+    /// same keys in the same order, the same escaping, the same sequence
+    /// numbers.
+    #[tokio::test]
+    async fn the_typed_reasoning_and_arguments_deltas_are_the_json_event_frames_byte_for_byte() {
+        let new = || ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let mut emitter = new();
+        let (tx, mut rx) = mpsc::channel(256);
+        for chunk in [
+            chunk(json!({"reasoning_content": "th\u{e9} \"why\"\n"}), None),
+            chunk(json!({"reasoning_content": "\u{1F600} tab\t"}), None),
+            chunk(
+                json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":"}}]}),
+                None,
+            ),
+            chunk(
+                json!({"tool_calls": [{"index": 0, "function": {"arguments": "\"Paris\"}\n"}}]}),
+                None,
+            ),
+        ] {
+            emitter.process_chunk(&chunk, &tx).await.unwrap();
+        }
+        drop(tx);
+        let mut typed = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            typed.push(bytes);
+        }
+        assert_eq!(typed.len(), 10);
+        let item_id = |frame: usize| {
+            let text = std::str::from_utf8(&typed[frame]).unwrap();
+            let data = text.lines().find_map(|l| l.strip_prefix("data: ")).unwrap();
+            serde_json::from_str::<serde_json::Value>(data).unwrap()["item_id"].clone()
+        };
+
+        // The four deltas as the `json!` maps wrote them before the typed form.
+        let mut emitter = new();
+        let (tx, mut rx) = mpsc::channel(8);
+        for event in [
+            json!({"type": "response.reasoning_text.delta", "sequence_number": 2,
+                "output_index": 0, "item_id": item_id(2), "content_index": 0,
+                "delta": "th\u{e9} \"why\"\n"}),
+            json!({"type": "response.reasoning_text.delta", "sequence_number": 3,
+                "output_index": 0, "item_id": item_id(3), "content_index": 0,
+                "delta": "\u{1F600} tab\t"}),
+            json!({"type": "response.function_call_arguments.delta", "sequence_number": 8,
+                "output_index": 1, "item_id": item_id(8), "delta": "{\"city\":"}),
+            json!({"type": "response.function_call_arguments.delta", "sequence_number": 9,
+                "output_index": 1, "item_id": item_id(9), "delta": "\"Paris\"}\n"}),
+        ] {
+            emitter.send_event(&event, &tx).await.unwrap();
+        }
+        drop(tx);
+        let mut json_frames = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            json_frames.push(bytes);
+        }
+        assert_eq!(
+            [&typed[2], &typed[3], &typed[8], &typed[9]],
+            [
+                &json_frames[0],
+                &json_frames[1],
+                &json_frames[2],
+                &json_frames[3]
+            ]
+        );
     }
 
     #[tokio::test]

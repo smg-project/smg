@@ -17,9 +17,17 @@ fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
         .map(|_| &url[scheme.len()..])
 }
 
+/// The scheme `url` starts with, lowercased: a word of scheme characters
+/// (RFC 3986's, a digit or a sign first too, and the empty word) before a
+/// `://`, as every scheme the address type knows is.
+/// An address that starts with no such word has no scheme, as the address
+/// type reads it. A `://` further in belongs to its path or its query, and
+/// what stands before it may hold a userinfo, which a refusal would name.
 fn url_scheme(url: &str) -> Option<String> {
-    url.split_once("://")
-        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+    let (word, _) = url.split_once("://")?;
+    word.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        .then(|| word.to_ascii_lowercase())
 }
 
 /// Strip protocol prefix (http://, https://, grpc://, grpcs://) from URL.
@@ -98,7 +106,7 @@ pub(crate) async fn try_http_reachable(
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| format!("Health check failed: {e}"))?;
+        .map_err(|e| format!("Health check failed: {}", e.without_url()))?;
 
     Ok(())
 }
@@ -311,6 +319,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::{server::http_client, worker::test_support::RefusedAddress};
 
     struct DropFlag(Arc<AtomicBool>);
 
@@ -340,6 +349,21 @@ mod tests {
     fn http_health_url_rejects_grpc_schemes() {
         assert!(http_health_url("grpc://localhost:30001").is_err());
         assert!(http_health_url("grpcs://localhost:30001").is_err());
+    }
+
+    /// An address registered with a query, at a port nobody listens on: the
+    /// failure does not repeat the query. The HTTP client's own error text
+    /// ends with the request URL, the query kept.
+    #[tokio::test]
+    async fn a_failed_http_probe_goes_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}?token=s3cret", refused.http_url());
+
+        let err = try_http_reachable(&url, 1, &http_client())
+            .await
+            .expect_err("nothing listens at the address");
+
+        assert!(!err.contains("s3cret"), "{err}");
     }
 
     #[test]
@@ -376,6 +400,38 @@ mod tests {
         let unknown = grpc_reachable_url("ftp://user:secret@worker:3000").unwrap_err();
         assert!(!unknown.contains("secret"), "{unknown}");
         assert!(unknown.contains("'ftp'"), "{unknown}");
+    }
+
+    /// A scheme is read at the start of an address alone. An address with
+    /// none may hold a `://` further in, in a path or a query: both probes
+    /// dial it as they dial any address with no scheme. Read as a scheme,
+    /// what stood before that `://` was refused by name, a userinfo in it,
+    /// in the detection step's failure message, which a log line carries.
+    /// A word of scheme characters is a scheme, known or not, and one the
+    /// probes do not know is still refused by name.
+    #[test]
+    fn a_scheme_is_read_at_the_start_of_a_probed_address_alone() {
+        for url in [
+            "user:secret@10.0.0.11:8000/a://b",
+            "10.0.0.11:8000/a://b",
+            "10.0.0.11:8000/proxy/http://backend:9000",
+            "decode.internal:8000/v1?next=http://x",
+        ] {
+            assert_eq!(
+                http_health_url(url).as_deref(),
+                Ok(format!("http://{url}/health").as_str()),
+                "{url}"
+            );
+            assert_eq!(
+                grpc_reachable_url(url).as_deref(),
+                Ok(format!("grpc://{url}").as_str()),
+                "{url}"
+            );
+        }
+
+        let unknown = http_health_url("X-tls+v1.2://user:secret@worker:3000").unwrap_err();
+        assert!(!unknown.contains("secret"), "{unknown}");
+        assert!(unknown.contains("'x-tls+v1.2'"), "{unknown}");
     }
 
     #[test]

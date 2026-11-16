@@ -11,7 +11,7 @@ use super::*;
 use crate::worker::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
     identity::metadata::DecodingLabels,
-    test_support::no_health_check,
+    test_support::{no_health_check, RefusedAddress},
     BasicWorkerBuilder, OverloadThresholds,
 };
 
@@ -901,7 +901,12 @@ fn test_capacity_pushback_does_not_close_half_open_breaker() {
 
     worker.record_outcome(500);
     worker.record_outcome(500);
-    assert!(!worker.is_available());
+    // The trip as stored: on a loaded machine the 50 ms timeout can pass
+    // before this line, and `is_available` would already start the trial.
+    assert_eq!(
+        worker.circuit_breaker.load().peek_state(),
+        CircuitState::Open
+    );
     thread::sleep(Duration::from_millis(80));
     assert!(worker.is_available());
     assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
@@ -1819,7 +1824,13 @@ fn a_workers_routing_state_is_one_series_with_the_reason_it_is_out_for() {
         assert_eq!(current_state(&handle.render()), "available/none");
 
         worker.record_circuit_breaker_outcome(false);
-        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        // The state as stored, not the routing decision's read: on a loaded
+        // machine the 50 ms timeout can pass before this line, and the
+        // decision's read would already be the move to half-open.
+        assert_eq!(
+            worker.circuit_breaker.load().peek_state(),
+            CircuitState::Open
+        );
         assert_eq!(current_state(&handle.render()), "excluded/circuit_open");
         // The breaker's timeout moves it to half-open on the next read,
         // which is the routing decision's: the worker is on trial, and
@@ -1931,15 +1942,17 @@ fn the_first_excluding_fact_names_the_state_and_a_registration_republishes_it() 
 /// read one by one, and the counters the snapshot carries are live.
 #[test]
 fn the_routing_reads_follow_every_veto_through_the_published_code() {
-    let worker = BasicWorkerBuilder::new("http://worker:8000")
-        .health_config(no_health_check())
-        .circuit_breaker_config(CircuitBreakerConfig {
-            failure_threshold: 1,
-            timeout_duration: Duration::from_millis(50),
-            ..CircuitBreakerConfig::default()
-        })
-        .build();
-    let agree = |eligible: bool| {
+    let build = |timeout_duration| {
+        BasicWorkerBuilder::new("http://worker:8000")
+            .health_config(no_health_check())
+            .circuit_breaker_config(CircuitBreakerConfig {
+                failure_threshold: 1,
+                timeout_duration,
+                ..CircuitBreakerConfig::default()
+            })
+            .build()
+    };
+    let agree = |worker: &BasicWorker, eligible: bool| {
         let state = worker.routing_state();
         assert_eq!(state.healthy, worker.is_healthy());
         assert_eq!(state.can_execute, worker.circuit_breaker_can_execute());
@@ -1950,34 +1963,41 @@ fn the_routing_reads_follow_every_veto_through_the_published_code() {
         assert_eq!(state.eligible(), eligible);
         assert_eq!(worker.is_available(), eligible);
     };
+    // The vetoes, on a breaker whose timeout the case cannot outlive: a slow
+    // host between the trip and its reads finds it open all the same.
+    let worker = build(Duration::from_secs(60));
     // Nothing published yet: the facts.
-    agree(true);
+    agree(&worker, true);
     worker.republish_state();
     worker.increment_load();
     worker.increment_processed();
-    agree(true);
+    agree(&worker, true);
     assert_eq!(worker.routing_state().load, 1);
     assert_eq!(worker.routing_state().processed, 1);
     worker.set_status(WorkerStatus::NotReady);
-    agree(false);
+    agree(&worker, false);
     worker.set_status(WorkerStatus::Ready);
-    agree(true);
+    agree(&worker, true);
     assert!(worker.set_overloaded(true));
-    agree(false);
+    agree(&worker, false);
     assert!(worker.set_overloaded(false));
-    agree(true);
+    agree(&worker, true);
     assert!(worker.set_stall(Some(StallReason::Unreachable)));
-    agree(false);
+    agree(&worker, false);
     assert!(worker.set_stall(None));
-    agree(true);
+    agree(&worker, true);
     worker.record_circuit_breaker_outcome(false);
-    agree(false);
+    agree(&worker, false);
     // The breaker's timeout moves it to half-open on the routing read
-    // itself, which is then the first to say the worker is back.
+    // itself, which is then the first to say the worker is back: on a
+    // breaker with a short timeout, read only after the sleep.
+    let worker = build(Duration::from_millis(50));
+    worker.republish_state();
+    worker.record_circuit_breaker_outcome(false);
     thread::sleep(Duration::from_millis(60));
     assert!(worker.routing_state().can_execute);
     assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
-    agree(true);
+    agree(&worker, true);
 }
 
 /// The code is a shortcut for `available` alone. A veto written past the
@@ -2150,4 +2170,22 @@ fn a_stall_written_through_a_retired_worker_is_read() {
         "the replacement's read published the stall"
     );
     assert!(replacement.routing_state().stalled);
+}
+
+#[tokio::test]
+async fn a_failed_http_admin_call_names_the_worker_once_without_the_clients_url() {
+    let refused = RefusedAddress::reserve();
+    let url = format!("{}/?token=s3cret", refused.http_url());
+    let text = BasicWorkerBuilder::new(&url)
+        .build()
+        .flush_cache()
+        .await
+        .expect_err("nothing listens at the address")
+        .to_string();
+    assert!(!text.contains("s3cret"), "{text}");
+    assert_eq!(
+        text.matches(&refused.addr().to_string()).count(),
+        1,
+        "{text}"
+    );
 }

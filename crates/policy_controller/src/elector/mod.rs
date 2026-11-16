@@ -13,18 +13,31 @@
 //! resource version on the API server. Everything else is the elector's and
 //! the same over every backend:
 //!
-//! - **Acquire.** A candidate takes a lease that is absent or released at
-//!   once, and one that stood unchanged for the record's duration *by this
+//! - **Acquire.** A candidate that never saw the lease held takes what the
+//!   store shows, absent or released, at once. One that saw it held takes a
+//!   released record at once when the release is a holder's (a release keeps
+//!   the term, so the record's term is at or above the one last seen held),
+//!   and a record that stood unchanged for its duration *by this
 //!   candidate's own clock*, its own identity's record after a restart
 //!   included: it times the record from the instant it first saw it in its
 //!   present shape, never from the wall timestamp the record carries, so no
-//!   second clock enters the decision. A take writes the next term (terms
+//!   second clock enters the decision. A record that is gone after one was
+//!   seen held (a deleted object, a lost or emptied file, a `Lease` replaced
+//!   by an empty one, which reads as released under term zero) is no
+//!   holder's release, and its holder may still lead: the candidate waits
+//!   the duration of the record it saw held last, from its own first sight
+//!   of the change, as for a record that stands still, and follows nobody
+//!   meanwhile ([`Tick::Gone`]). A record with no holder that still says a
+//!   duration is no holder's release either, since a release writes none: a
+//!   hand cleared the holder in place, and every candidate waits the
+//!   duration the record says, from its first sight of it. A take writes
+//!   the next term (terms
 //!   only grow, one per change of holder, and a candidate counts from the
 //!   highest term it saw, so a record that vanished under it is taken at the
-//!   term after the one it held); a resume of its own identity's record
-//!   keeps the record's term where that term is the highest this run saw,
-//!   and is a take above the highest under a lower one: a run leads under no
-//!   term below the highest it saw.
+//!   term after the one it held). A term is taken once: a run that finds
+//!   its own identity's record from an earlier run takes above it as any
+//!   candidate would, so a run leads under no term below the highest it saw
+//!   and under no term it saw another run lead.
 //! - **Renew.** The holder rewrites the record every renew period with a
 //!   later wall timestamp under its own term; a record that moved under it (a
 //!   candidate took the expired lease) refuses the renewal and the holder has
@@ -35,8 +48,13 @@
 //!   `None`, the shard thread answers `NotLeader` with an empty address and
 //!   releases nothing, whether the election thread is stalled on its backend
 //!   or gone. The deadline is shorter than the duration, so a holder stops
-//!   serving before any candidate may take its lease; the residual window is
-//!   the renew deadline plus clock-rate skew, bounded by one decision's send.
+//!   serving before any candidate that saw its record may take its lease; the
+//!   residual window is the renew deadline plus clock-rate skew, bounded by
+//!   one decision's send. Two exceptions lead beside a live holder until
+//!   its next step reads the lease, or its renew deadline where that step
+//!   stalls: a candidate that starts while the holder's record is gone and
+//!   never saw it held, and a candidate whose wait ran out when the record
+//!   is removed again before it saw the next holder's.
 //!
 //! The settings ([`ElectionSettings`]): duration 3 s, renew period 1 s, renew
 //! deadline 2 s by default; a deployment that prefers fewer leadership
@@ -52,14 +70,17 @@
 //! stop. A backend call blocks that thread alone; the shard threads read the
 //! fence's snapshot, never the backend. The identity is
 //! `controller-id@host:port`, dialable without a Service and unique per
-//! instance. A restart under the same identity resumes its own record under
-//! its term once the record stood still for its duration, the wait of every
-//! candidate (the earlier run's fence, stalled or gone, is closed by then);
-//! a record under this identity that came back under a term this run saw
-//! passed (a store put back) is taken after the same wait, above the highest; a
+//! instance. A restart under the same identity counts as a change of
+//! holder: it takes its earlier run's record under the next term once the
+//! record stood still for its duration, the wait of every candidate (the
+//! earlier run's fence, stalled or gone, is closed by then). A term is
+//! taken once, and the restart reads to a gateway as a hand-over to a new
+//! leader, which a new run over an empty store is. That needs a lease that
+//! outlives the process, a file or a `Lease`: the record in this process is
+//! empty at every start, and a controller over it takes term one again. A
 //! second instance under a duplicated identity sees the record move under
-//! its name and refuses to take it for as long as it moves, so two fences
-//! never open under one term.
+//! its name and refuses to take it for as long as it moves, so no second
+//! fence opens beside the first.
 //! A write that landed but reported an error (a sync that failed after the
 //! rename, an update the server applied before the call timed out) is told
 //! from a stranger's by the record the elector attempted, and is adopted as
@@ -134,7 +155,8 @@ pub struct LeaseRecord {
     /// The holder's identity; empty once released.
     pub holder: String,
     /// The fencing term: one more at every change of holder, the same across
-    /// a holder's renewals and its restarts.
+    /// a holder's renewals. A restart under the same identity counts as a
+    /// change of holder.
     pub term: u64,
     /// Wall time of the take, microseconds since the Unix epoch.
     pub acquired_at_micros: u64,
@@ -148,7 +170,7 @@ pub struct LeaseRecord {
 }
 
 impl LeaseRecord {
-    /// Free for the taking: released, or never held.
+    /// No holder is named: released, or never held.
     pub fn is_released(&self) -> bool {
         self.holder.is_empty()
     }
@@ -228,6 +250,13 @@ pub enum Tick {
     Lost { term: u64, holder: String },
     /// Another candidate holds the lease and renews it under `term`.
     Following { holder: String, term: u64 },
+    /// The record this candidate saw held under `term` is gone: absent, or
+    /// released under a lower term, a shape no holder's release leaves. Its
+    /// holder may still lead, so nobody is followed, and the lease is taken
+    /// once that record's duration has passed since this candidate first saw
+    /// the change. Also the answer at a record under `term` with no holder
+    /// and a duration, which a hand's clearing leaves and no release does.
+    Gone { term: u64 },
     /// The lease looked free, but another candidate wrote first; the next
     /// tick reads what it wrote.
     Raced,
@@ -305,14 +334,23 @@ pub struct Elector {
     /// New shapes of the record under this identity that this run did not
     /// write: the first is the earlier run's last write, a second is another
     /// candidate under a duplicated identity. Cleared when the record stands
-    /// still for its duration (this run resumes it, or takes above it where
-    /// its term is under the highest this run saw), is released, or passes
-    /// to another identity: the refusal lasts as long as the writing does.
+    /// still for its duration (this run takes above it), is released, or
+    /// passes to another identity: the refusal lasts as long as the writing
+    /// does.
     strangers: u32,
     /// The highest term this run saw stored or wrote: a record that vanished
     /// (a deleted object, a lost file) is taken at the term after it, so
     /// terms only grow while any candidate that saw them is alive.
     highest_term: u64,
+    /// The term and the duration of the record this run saw held last, its
+    /// own writes included: what a record without a holder is judged
+    /// against. Released at this term or above, it is that holder's release;
+    /// absent, or released under a lower term, it is gone by another hand.
+    last_held: Option<(u64, Duration)>,
+    /// This run's first sight of a record that is gone after one was seen
+    /// held: the wait for it counts from here. Cleared by a held record and
+    /// by a holder's release.
+    gone_since: Option<Instant>,
 }
 
 impl fmt::Debug for Elector {
@@ -350,6 +388,8 @@ impl Elector {
             attempted: None,
             strangers: 0,
             highest_term: 0,
+            last_held: None,
+            gone_since: None,
         })
     }
 
@@ -412,6 +452,8 @@ impl Elector {
             return Ok(false);
         };
         self.fence.set(mine.term, None);
+        // No duration: it tells a holder's release, taken at once, from a
+        // holder that another hand cleared in place.
         let released = LeaseRecord {
             holder: String::new(),
             duration_ms: 0,
@@ -463,7 +505,28 @@ impl Elector {
         }
     }
 
+    /// The term and the duration of the record seen held last, when
+    /// `current` is a shape no holder's release leaves after it: absent, or
+    /// released under a lower term.
+    fn gone(&self, current: Option<&LeaseRecord>) -> Option<(u64, Duration)> {
+        let (term, duration) = self.last_held?;
+        match current {
+            Some(record) if !record.is_released() || record.term >= term => None,
+            _ => Some((term, duration)),
+        }
+    }
+
     fn observe(&mut self, current: Option<&LeaseRecord>, now: Instant) {
+        // The first sight of a record that is gone dates the wait for it;
+        // any other sight ends it.
+        if self.gone(current).is_some() {
+            self.gone_since.get_or_insert(now);
+        } else {
+            self.gone_since = None;
+        }
+        if let Some(record) = current.filter(|record| !record.is_released()) {
+            self.last_held = Some((record.term, record.duration()));
+        }
         // An absent record keeps the attempted write: an initial take whose
         // answer was lost may still land, and the record it leaves is this
         // run's own.
@@ -573,9 +636,32 @@ impl Elector {
         // record in front of it says: a record that vanished and came back
         // lower (a deleted object recreated, a lost file) never lowers it.
         let next_term = self.highest_term + 1;
+        // A record that is gone after one was seen held: no release made it
+        // so, and the holder of the record seen last may lead to its renew
+        // deadline. This run waits that record's duration from its first
+        // sight of the change, the wait of a record that stands still, and
+        // takes after it. The old holder waits as every candidate does.
+        if let Some((term, duration)) = self.gone(current.as_ref()) {
+            let since = self.gone_since.unwrap_or(now);
+            if now.saturating_duration_since(since) < duration {
+                return Ok(Tick::Gone { term });
+            }
+        }
         let (term, acquired_at_micros) = match &current {
+            // Never seen held, or waited out.
             None => (next_term, 0),
-            Some(record) if record.is_released() => (next_term, 0),
+            // A record with no holder is waited out for the duration it
+            // says, from this run's first sight of it. A holder's release
+            // says none and is taken at once. A record whose holder another
+            // hand cleared in place keeps its duration, and that holder may
+            // lead until its own next step reads the lease.
+            Some(record) if record.is_released() => {
+                let since = self.observed.as_ref().map_or(now, |o| o.since);
+                if now.saturating_duration_since(since) < record.duration() {
+                    return Ok(Tick::Gone { term: record.term });
+                }
+                (next_term, 0)
+            }
             // The write this run attempted landed after all: its own lease.
             Some(record) if self.attempted.as_ref() == Some(record) => {
                 (record.term, record.acquired_at_micros)
@@ -584,15 +670,14 @@ impl Elector {
             // earlier run's last write, or another candidate's under a
             // duplicated identity. Either writer's fence may be open to its
             // renew deadline, so this run waits for the record's duration of
-            // stillness, as every candidate does. Then it resumes under the
-            // record's term and acquire stamp where that term is the highest
-            // this run saw (a restart's resume); under a lower one (the store
-            // went back to an older record under this name) the write is a
-            // take in every field, so no write of this run opens the fence
-            // under a term below the highest it saw. A record that moves
-            // again under this name has another writer and is refused for as
-            // long as it keeps moving, since a take would open a second fence
-            // under one term.
+            // stillness, as every candidate does. Then it takes the lease as
+            // any other candidate would, above the highest term it saw and
+            // new in every field: the earlier run led under the record's
+            // term, and a term is taken once, so what a reader holds under
+            // that term came from that run. A record that moves again under
+            // this name has another writer and is refused for as long as it
+            // keeps moving, since a take would open a second fence beside
+            // that writer's.
             Some(record) if record.holder == self.identity => {
                 let since = self.observed.as_ref().map_or(now, |o| o.since);
                 if now.saturating_duration_since(since) < record.duration() {
@@ -607,11 +692,7 @@ impl Elector {
                     });
                 }
                 self.strangers = 0;
-                if record.term < self.highest_term {
-                    (next_term, 0)
-                } else {
-                    (record.term, record.acquired_at_micros)
-                }
+                (next_term, 0)
             }
             Some(record) => {
                 let since = self.observed.as_ref().map_or(now, |o| o.since);
@@ -647,6 +728,10 @@ impl Elector {
             Written::Done => {
                 self.attempted = None;
                 self.highest_term = self.highest_term.max(term);
+                // This run's own record is one it saw held: if it vanishes
+                // before the next step reads it, it is waited out as well.
+                self.last_held = Some((term, record.duration()));
+                self.gone_since = None;
                 self.fence.set(term, Some(now));
                 self.observed = Some(Observation {
                     record: record.clone(),
@@ -742,6 +827,25 @@ mod tests {
 
     fn candidate(lease: &MemoryLease, identity: &str) -> Elector {
         Elector::new(Box::new(lease.clone()), identity, settings()).expect("valid settings")
+    }
+
+    /// A held record no candidate wrote.
+    fn held_by(holder: &str, term: u64, duration_ms: u64) -> LeaseRecord {
+        LeaseRecord {
+            holder: holder.to_string(),
+            term,
+            acquired_at_micros: 1,
+            renewed_at_micros: 1,
+            duration_ms,
+        }
+    }
+
+    impl MemoryLease {
+        /// The record gone by no holder's hand, as a deleted object or a
+        /// deleted file: for the cases of this crate.
+        pub(crate) fn lose(&self) {
+            *self.record.lock() = None;
+        }
     }
 
     #[test]
@@ -917,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn the_same_identity_resumes_its_own_lease_under_its_term() {
+    fn a_restart_under_the_same_identity_takes_the_term_above() {
         let lease = MemoryLease::new();
         let t0 = Instant::now() + S;
         let acquired_at = {
@@ -926,9 +1030,11 @@ mod tests {
             a.observed().expect("the record").acquired_at_micros
         };
         // The process restarts: a fresh elector under the same identity. It
-        // resumes its record once the record stood still for its duration
-        // from its first sight, the wait of every candidate: a live writer
-        // under the same name would have moved it by then.
+        // takes its earlier run's record once the record stood still for its
+        // duration from its first sight, the wait of every candidate: a live
+        // writer under the same name would have moved it by then. The take
+        // is above the record's term: the earlier run led under that one,
+        // and a term is taken once.
         let mut again = candidate(&lease, "a@host:1");
         let first_sight = t0 + S / 10;
         assert_eq!(
@@ -946,17 +1052,21 @@ mod tests {
             Tick::Following { .. }
         ));
         assert_eq!(
-            again.tick(first_sight + 3 * S).expect("resume"),
-            Tick::Acquired { term: 1 }
+            again.tick(first_sight + 3 * S).expect("take"),
+            Tick::Acquired { term: 2 }
         );
         let record = again.observed().expect("the record");
-        assert_eq!(record.acquired_at_micros, acquired_at, "the take stands");
-        assert!(record.renewed_at_micros > acquired_at);
-        assert_eq!(again.fence().leader_term(first_sight + 3 * S), Some(1));
+        assert_eq!(record.term, 2);
+        assert!(
+            record.acquired_at_micros > acquired_at,
+            "a take in every field"
+        );
+        assert_eq!(record.acquired_at_micros, record.renewed_at_micros);
+        assert_eq!(again.fence().leader_term(first_sight + 3 * S), Some(2));
     }
 
     #[test]
-    fn a_restart_resumes_only_once_the_stalled_earlier_runs_fence_is_closed() {
+    fn a_restart_takes_only_once_the_stalled_earlier_runs_fence_is_closed() {
         let lease = MemoryLease::new();
         let t0 = Instant::now() + S;
         let mut earlier = candidate(&lease, "a@host:1");
@@ -966,9 +1076,9 @@ mod tests {
             Tick::Renewed { term: 1 }
         );
         // The earlier run stalls with its fence open to the renew deadline,
-        // and a new run under the same identity starts at once. A resume
-        // after a renew period of stillness would open a second fence under
-        // the term; the new run waits for the record's duration instead.
+        // and a new run under the same identity starts at once. A take
+        // after a renew period of stillness would open a second fence beside
+        // it; the new run waits for the record's duration instead.
         let mut again = candidate(&lease, "a@host:1");
         let first_sight = t0 + S + S / 10;
         assert!(matches!(
@@ -989,11 +1099,11 @@ mod tests {
             Tick::Following { .. }
         ));
         assert_eq!(
-            again.tick(first_sight + 3 * S).expect("resume"),
-            Tick::Acquired { term: 1 }
+            again.tick(first_sight + 3 * S).expect("take"),
+            Tick::Acquired { term: 2 }
         );
         assert_eq!(earlier.fence().leader_term(first_sight + 3 * S), None);
-        assert_eq!(again.fence().leader_term(first_sight + 3 * S), Some(1));
+        assert_eq!(again.fence().leader_term(first_sight + 3 * S), Some(2));
     }
 
     #[test]
@@ -1029,8 +1139,9 @@ mod tests {
         }
         // The holder stalls after its renewal at `last`. Its fence is open to
         // the renew deadline; the twin keeps its distance for the record's
-        // duration from its first sight of that renewal, then resumes the
-        // term with the earlier fence closed: the refusal was not for life.
+        // duration from its first sight of that renewal, then takes the
+        // term above with the earlier fence closed: the refusal was not for
+        // life.
         let last = t0 + 5 * S;
         let first_sight = last + S / 2;
         twin.tick(last + 2 * S)
@@ -1040,11 +1151,11 @@ mod tests {
         twin.tick(first_sight + 3 * S - Duration::from_micros(1))
             .expect_err("not yet");
         assert_eq!(
-            twin.tick(first_sight + 3 * S).expect("resume"),
-            Tick::Acquired { term: 1 }
+            twin.tick(first_sight + 3 * S).expect("take"),
+            Tick::Acquired { term: 2 }
         );
         assert_eq!(a.fence().leader_term(first_sight + 3 * S), None);
-        assert_eq!(twin.fence().leader_term(first_sight + 3 * S), Some(1));
+        assert_eq!(twin.fence().leader_term(first_sight + 3 * S), Some(2));
         // The stalled holder wakes to a record that moved under it.
         assert_eq!(
             a.tick(first_sight + 4 * S).expect("look"),
@@ -1693,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_that_vanished_is_taken_at_the_term_after_the_highest_seen() {
+    fn a_record_that_vanished_is_waited_out_and_taken_at_the_term_after_the_highest_seen() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("lease");
         let mut a = Elector::new(Box::new(FileLease::new(&path)), "a@host:1", settings())
@@ -1709,9 +1820,20 @@ mod tests {
             Tick::Following { term: 2, .. }
         ));
         // The record is deleted under the holder (an operator forcing a
-        // re-election): the holder loses, and the next take counts from the
-        // highest term either candidate saw, never from one.
+        // re-election). No release made it so, and the holder's fence is
+        // open until its own next step reads the lease: a candidate that saw
+        // the record held waits that record's duration from its own first
+        // sight of the loss, the old holder as well, and follows nobody. The
+        // take then counts from the highest term either saw, never from one.
         std::fs::remove_file(&path).expect("the deletion");
+        let a_saw = t0 + S + 3 * S / 4;
+        assert_eq!(a.tick(a_saw).expect("look"), Tick::Gone { term: 2 });
+        assert_eq!(a.observed(), None, "nobody is named");
+        assert_eq!(
+            b.fence().leader_term(a_saw),
+            Some(2),
+            "the holder still leads when the candidate first sees the loss"
+        );
         assert_eq!(
             b.tick(t0 + 2 * S).expect("look"),
             Tick::Lost {
@@ -1719,14 +1841,389 @@ mod tests {
                 holder: String::new()
             }
         );
+        assert_eq!(b.tick(t0 + 3 * S).expect("look"), Tick::Gone { term: 2 });
         assert_eq!(
-            a.tick(t0 + 2 * S + S / 2).expect("take"),
+            a.tick(a_saw + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 2 },
+            "the record's duration counts from a's first sight of the loss"
+        );
+        assert_eq!(
+            a.tick(a_saw + 3 * S).expect("take"),
             Tick::Acquired { term: 3 }
         );
         assert!(matches!(
-            b.tick(t0 + 3 * S).expect("follow"),
+            b.tick(t0 + 5 * S).expect("follow"),
             Tick::Following { term: 3, .. }
         ));
+    }
+
+    #[test]
+    fn an_emptied_lease_file_is_waited_out_as_a_deleted_one() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("lease");
+        let mut a = Elector::new(Box::new(FileLease::new(&path)), "a@host:1", settings())
+            .expect("settings");
+        let mut b = Elector::new(Box::new(FileLease::new(&path)), "b@host:2", settings())
+            .expect("settings");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
+        assert!(matches!(
+            b.tick(t0 + S / 2).expect("follow"),
+            Tick::Following { term: 1, .. }
+        ));
+        // The file is emptied in place: it reads as no lease, as a deleted
+        // one does, and no release wrote it.
+        std::fs::write(&path, b"").expect("the emptying");
+        let b_saw = t0 + 3 * S / 4;
+        assert_eq!(b.tick(b_saw).expect("look"), Tick::Gone { term: 1 });
+        assert_eq!(
+            a.fence().leader_term(b_saw),
+            Some(1),
+            "the holder still leads when the candidate first sees the loss"
+        );
+        assert_eq!(
+            b.tick(b_saw + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 1 }
+        );
+        assert_eq!(
+            a.fence().leader_term(b_saw + 3 * S),
+            None,
+            "the holder's fence closed inside the wait"
+        );
+        assert_eq!(
+            b.tick(b_saw + 3 * S).expect("take"),
+            Tick::Acquired { term: 2 }
+        );
+    }
+
+    /// The record of `holder` with its holder cleared in place, as a hand's
+    /// patch leaves it: the term, the stamps and the duration kept.
+    fn cleared(lease: &MemoryLease, holder: &Elector) {
+        let held = holder.observed().expect("the holder's record").clone();
+        let cleared = LeaseRecord {
+            holder: String::new(),
+            ..held.clone()
+        };
+        let mut hand = lease.clone();
+        assert_eq!(
+            hand.write(Some(&held), &cleared).expect("a write"),
+            Written::Done
+        );
+    }
+
+    #[test]
+    fn a_record_cleared_in_place_under_a_live_holder_is_waited_out() {
+        // A holder's release says no duration. A record whose holder another
+        // hand cleared keeps its term and its duration, and that holder
+        // leads until its next step reads the lease: the record is waited
+        // out for the duration it says, from the first sight of it.
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        let mut b = candidate(&lease, "b@host:2");
+        assert!(matches!(
+            b.tick(t0).expect("follow"),
+            Tick::Following { term: 1, .. }
+        ));
+        cleared(&lease, &a);
+        let saw = t0 + S / 2;
+        assert_eq!(b.tick(saw).expect("look"), Tick::Gone { term: 1 });
+        assert_eq!(a.fence().leader_term(saw), Some(1));
+        assert_eq!(b.fence().leader_term(saw), None);
+        // The holder reads its loss at its next step and waits as every
+        // candidate does.
+        assert_eq!(
+            a.tick(t0 + S).expect("the renewal"),
+            Tick::Lost {
+                term: 1,
+                holder: String::new()
+            }
+        );
+        assert_eq!(a.fence().leader_term(t0 + S), None);
+        assert_eq!(a.tick(t0 + 2 * S).expect("look"), Tick::Gone { term: 1 });
+        assert_eq!(
+            b.tick(saw + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 1 }
+        );
+        assert_eq!(
+            b.tick(saw + 3 * S).expect("take"),
+            Tick::Acquired { term: 2 }
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_never_saw_the_lease_held_waits_out_a_record_cleared_in_place() {
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        cleared(&lease, &a);
+        // A replica that starts now never saw the lease held, and the holder
+        // stalls with its fence open. The record still says its duration:
+        // it is waited out from this first sight, and the holder's fence has
+        // closed by itself before the take.
+        let mut c = candidate(&lease, "c@host:3");
+        let saw = t0 + S / 2;
+        assert_eq!(c.tick(saw).expect("look"), Tick::Gone { term: 1 });
+        assert_eq!(a.fence().leader_term(saw), Some(1));
+        assert_eq!(c.fence().leader_term(saw), None);
+        assert_eq!(
+            c.tick(saw + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 1 }
+        );
+        assert_eq!(
+            c.tick(saw + 3 * S).expect("take"),
+            Tick::Acquired { term: 2 }
+        );
+        assert_eq!(a.fence().leader_term(saw + 3 * S), None);
+        assert_eq!(c.fence().leader_term(saw + 3 * S), Some(2));
+    }
+
+    #[test]
+    fn a_lease_replaced_by_an_empty_one_is_waited_out() {
+        // A `Lease` replaced by a manifest with no record reads as released
+        // under term zero. A release keeps its holder's term, so one under a
+        // term below the record last seen held is no holder's release.
+        let held = held_by("x@host:9", 4, 3_000);
+        let mut lease = MemoryLease::new();
+        assert_eq!(lease.write(None, &held).expect("a write"), Written::Done);
+        let mut b = candidate(&lease, "b@host:2");
+        let t0 = Instant::now() + S;
+        assert!(matches!(
+            b.tick(t0).expect("follow"),
+            Tick::Following { term: 4, .. }
+        ));
+        let empty = LeaseRecord::default();
+        assert_eq!(
+            lease.write(Some(&held), &empty).expect("a write"),
+            Written::Done
+        );
+        let saw = t0 + S;
+        assert_eq!(b.tick(saw).expect("look"), Tick::Gone { term: 4 });
+        assert_eq!(
+            b.tick(saw + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 4 }
+        );
+        assert_eq!(
+            b.tick(saw + 3 * S).expect("take"),
+            Tick::Acquired { term: 5 }
+        );
+        // The taker's own record, replaced again before its next look, is
+        // one it saw held: the wait counts anew from that look.
+        let own = b.observed().expect("the take's record").clone();
+        assert_eq!(
+            lease.write(Some(&own), &empty).expect("a write"),
+            Written::Done
+        );
+        let again = saw + 4 * S;
+        assert_eq!(
+            b.tick(again).expect("look"),
+            Tick::Lost {
+                term: 5,
+                holder: String::new()
+            }
+        );
+        assert_eq!(
+            b.tick(again + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 5 }
+        );
+        assert_eq!(
+            b.tick(again + 3 * S).expect("take"),
+            Tick::Acquired { term: 6 }
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_never_saw_the_lease_held_takes_an_empty_one_at_once() {
+        // A first start over the empty `Lease` a chart renders, or over a
+        // new lease file: there is no record to wait out.
+        let mut lease = MemoryLease::new();
+        assert_eq!(
+            lease.write(None, &LeaseRecord::default()).expect("a write"),
+            Written::Done
+        );
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+    }
+
+    #[test]
+    fn a_release_at_the_held_term_is_taken_at_once_by_a_run_that_saw_a_higher_term() {
+        // The rule is keyed on the record last seen held, not on the highest
+        // term: a store put back to a lower term, then released by the holder
+        // it names, shows that holder's own release.
+        let mut lease = MemoryLease::new();
+        let (first, fallen) = (held_by("x@host:8", 5, 3_000), held_by("y@host:9", 3, 3_000));
+        assert_eq!(lease.write(None, &first).expect("a write"), Written::Done);
+        let mut b = candidate(&lease, "b@host:2");
+        let t0 = Instant::now() + S;
+        assert!(matches!(
+            b.tick(t0).expect("follow"),
+            Tick::Following { term: 5, .. }
+        ));
+        assert_eq!(
+            lease.write(Some(&first), &fallen).expect("a write"),
+            Written::Done
+        );
+        assert!(matches!(
+            b.tick(t0 + S).expect("follow"),
+            Tick::Following { term: 3, .. }
+        ));
+        let released = LeaseRecord {
+            holder: String::new(),
+            duration_ms: 0,
+            renewed_at_micros: 2,
+            ..fallen.clone()
+        };
+        assert_eq!(
+            lease.write(Some(&fallen), &released).expect("a write"),
+            Written::Done
+        );
+        assert_eq!(
+            b.tick(t0 + S + Duration::from_millis(1)).expect("take"),
+            Tick::Acquired { term: 6 },
+            "at once, above the highest term this run saw"
+        );
+    }
+
+    #[test]
+    fn a_held_record_under_a_lower_term_is_no_loss_and_its_own_loss_is_waited_from_that_sight() {
+        // A store put back to a held record under a lower term shows a
+        // holder, not a loss: the wait for the record lost after it is dated
+        // at the first sight of that loss, never at the sight of the holder.
+        let mut lease = MemoryLease::new();
+        let (first, fallen) = (held_by("x@host:8", 5, 3_000), held_by("y@host:9", 3, 3_000));
+        assert_eq!(lease.write(None, &first).expect("a write"), Written::Done);
+        let mut b = candidate(&lease, "b@host:2");
+        let t0 = Instant::now() + S;
+        assert!(matches!(
+            b.tick(t0).expect("follow"),
+            Tick::Following { term: 5, .. }
+        ));
+        assert_eq!(
+            lease.write(Some(&first), &fallen).expect("a write"),
+            Written::Done
+        );
+        assert!(matches!(
+            b.tick(t0 + S).expect("follow"),
+            Tick::Following { term: 3, .. }
+        ));
+        lease.lose();
+        let saw = t0 + 2 * S;
+        assert_eq!(b.tick(saw).expect("look"), Tick::Gone { term: 3 });
+        assert_eq!(
+            b.tick(saw + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 3 },
+            "the duration counts from the first sight of the loss"
+        );
+        assert_eq!(
+            b.tick(saw + 3 * S).expect("take"),
+            Tick::Acquired { term: 6 },
+            "above the highest term this run saw"
+        );
+    }
+
+    #[test]
+    fn a_lost_record_is_waited_out_for_its_own_duration_not_the_waiters() {
+        // Two replicas may run two durations. The wait covers the lost
+        // holder's fence, so it is that record's duration, longer or shorter
+        // than the three seconds this replica runs.
+        let mut lease = MemoryLease::new();
+        let long = held_by("x@host:8", 1, 6_000);
+        assert_eq!(lease.write(None, &long).expect("a write"), Written::Done);
+        let mut b = candidate(&lease, "b@host:2");
+        let t0 = Instant::now() + S;
+        assert!(matches!(
+            b.tick(t0).expect("follow"),
+            Tick::Following { term: 1, .. }
+        ));
+        lease.lose();
+        let saw = t0 + S;
+        assert_eq!(b.tick(saw).expect("look"), Tick::Gone { term: 1 });
+        assert_eq!(
+            b.tick(saw + 6 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 1 },
+            "six seconds, the lost record's, where this replica runs three"
+        );
+        assert_eq!(
+            b.tick(saw + 6 * S).expect("take"),
+            Tick::Acquired { term: 2 }
+        );
+        // A holder with a one second lease writes over this replica's
+        // record, and that record is lost in turn.
+        let own = b.observed().expect("the take's record").clone();
+        let short = held_by("z@host:9", 3, 1_000);
+        assert_eq!(
+            lease.write(Some(&own), &short).expect("a write"),
+            Written::Done
+        );
+        let lost = saw + 7 * S;
+        assert!(matches!(
+            b.tick(lost).expect("look"),
+            Tick::Lost { term: 2, .. }
+        ));
+        lease.lose();
+        let again = lost + S / 2;
+        assert_eq!(b.tick(again).expect("look"), Tick::Gone { term: 3 });
+        assert_eq!(
+            b.tick(again + S - Duration::from_micros(1)).expect("look"),
+            Tick::Gone { term: 3 },
+            "one second, the lost record's"
+        );
+        assert_eq!(b.tick(again + S).expect("take"), Tick::Acquired { term: 4 });
+    }
+
+    #[test]
+    fn a_record_taken_while_it_was_gone_ends_the_wait_and_is_followed() {
+        // A replica that starts while the record is gone never saw it held
+        // and takes at once; a candidate waiting the old record out follows
+        // the new holder as it follows any.
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let mut b = candidate(&lease, "b@host:2");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
+        assert!(matches!(
+            b.tick(t0 + S / 2).expect("follow"),
+            Tick::Following { term: 1, .. }
+        ));
+        lease.lose();
+        assert_eq!(b.tick(t0 + S).expect("look"), Tick::Gone { term: 1 });
+        let mut c = candidate(&lease, "c@host:3");
+        assert_eq!(
+            c.tick(t0 + S + S / 2).expect("take"),
+            Tick::Acquired { term: 1 }
+        );
+        assert_eq!(
+            b.tick(t0 + 2 * S).expect("follow"),
+            Tick::Following {
+                holder: "c@host:3".to_string(),
+                term: 1
+            }
+        );
+        // The new record is lost in turn: the wait for it counts from b's
+        // first sight of this loss, never from the one before it.
+        lease.lose();
+        let again = t0 + 2 * S + S / 2;
+        assert_eq!(b.tick(again).expect("look"), Tick::Gone { term: 1 });
+        assert_eq!(
+            b.tick(again + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 1 }
+        );
+        assert_eq!(
+            b.tick(again + 3 * S).expect("take"),
+            Tick::Acquired { term: 2 }
+        );
     }
 
     #[test]
@@ -1749,8 +2246,9 @@ mod tests {
         // restart racing the first) takes the empty lease at term one and
         // stalls. The first process saw term two: once that record has been
         // still for its duration it takes above the highest term it saw, a
-        // take in every field, and never resumes under the lower term. Its
-        // next take after a deletion is above that again.
+        // take in every field, never one under the lower term. Its next
+        // take after a deletion is above that again, once it waited its own
+        // lost record out as every candidate that saw it does.
         std::fs::remove_file(&path).expect("the deletion");
         let mut again = Elector::new(Box::new(FileLease::new(&path)), "a@host:1", settings())
             .expect("settings");
@@ -1780,7 +2278,12 @@ mod tests {
             }
         );
         assert_eq!(
-            a.tick(first_sight + 4 * S + S / 2).expect("take"),
+            a.tick(first_sight + 7 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Gone { term: 3 }
+        );
+        assert_eq!(
+            a.tick(first_sight + 7 * S).expect("take"),
             Tick::Acquired { term: 4 }
         );
     }

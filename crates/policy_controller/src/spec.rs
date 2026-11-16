@@ -17,11 +17,12 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fmt,
+    sync::LazyLock,
 };
 
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{
-    de::{self, MapAccess, Visitor},
+    de::{self, value::SeqAccessDeserializer, MapAccess, SeqAccess, Visitor},
     ser::SerializeMap,
     Deserialize, Deserializer, Serialize, Serializer,
 };
@@ -29,14 +30,14 @@ use serde::{
 use crate::{
     affinity::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
     builtins::{
-        Best, CountFirst, FewestSessions, HasCapacity, HasRoom, Healthy, LeastLoad, LeastRequests,
-        Manual, NotOverloaded, NotTried, Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random,
-        ResidentWork, RoundRobin, SessionAffinity, DEFAULT_MEAN_PREFILL_TOKENS,
+        FewestSessions, LeastLoad, LeastRequests, ResidentWork, SessionAffinity,
+        DEFAULT_MEAN_PREFILL_TOKENS,
     },
-    framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, Weighted},
+    catalog::{Catalog, Found},
+    framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
     ring::ConsistentHash,
     sessions::SessionRule,
-    view::Phase,
+    view::{permille, Phase},
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -97,6 +98,10 @@ pub const PICKERS: [&str; 9] = [
     "best-with-temperature",
 ];
 
+/// The stock build's catalog: what [`PolicySpec::validate`] resolves a
+/// stage name in.
+static STOCK: LazyLock<Catalog> = LazyLock::new(Catalog::builtin);
+
 /// A sampling picker compares its draws by the profile's scorers, so it
 /// needs at least one.
 const SAMPLING_PICKERS: [&str; 2] = ["power-of-two", "power-of-two-count-first"];
@@ -134,10 +139,15 @@ pub struct Needs {
     /// reads any of the five declares this, whatever feeds them: `events`
     /// asks for the index and the hash fields for the request's hashes, and
     /// neither stands for the column. A host fills the column where this is
-    /// declared and may hand an empty one elsewhere. The engine checks the
-    /// column's shape, never its presence: an unfilled column reads as
-    /// nothing held for every candidate and nothing is refused. What holds
-    /// a host to the need is the builder of its view, by a case of its own.
+    /// declared and may hand an empty column elsewhere. Rows it names in
+    /// the column's place ([`NamedAffinity`](crate::NamedAffinity)) answer
+    /// the crate's own affinity stages and no other reader: a named row
+    /// says its two depths and nothing of its age, growth or index size, so
+    /// a host fills the column for a profile with a stage that reads those,
+    /// a guest's among them. The engine checks the column's shape, never
+    /// its presence: an unfilled column reads as nothing held for every
+    /// candidate and nothing is refused. What holds a host to the need is
+    /// the builder of its view, by a case of its own.
     pub affinity: bool,
 }
 
@@ -666,19 +676,29 @@ impl ScoreStage {
     }
 }
 
-/// A scorer reference: a bare name, or the name mapped to its weight and
+/// A scorer reference: a bare name (a built-in at its defaults, or a scorer
+/// the catalog adds at weight one), or the name mapped to its weight and
 /// parameters ([`ScoreStage`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScoreSpec {
     Name(String),
     Params(ScoreStage),
+    /// A name that is no built-in's, mapped to what the document wrote under
+    /// it: a scorer the catalog adds, with its weight (`{ name: { weight }
+    /// }`). Kept as read: the validator asks the catalog for the name first
+    /// and reads the keys of a name it holds. A key written twice is the
+    /// parser's refusal, as under a built-in.
+    Added {
+        name: String,
+        written: serde_json::Value,
+    },
 }
 
 impl ScoreSpec {
     /// The scorer's name as written.
     pub fn name(&self) -> &str {
         match self {
-            Self::Name(name) => name,
+            Self::Name(name) | Self::Added { name, .. } => name,
             Self::Params(stage) => stage.name(),
         }
     }
@@ -698,8 +718,14 @@ impl From<ScoreStage> for ScoreSpec {
 
 impl Serialize for ScoreSpec {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let Self::Params(stage) = self else {
-            return serializer.serialize_str(self.name());
+        let stage = match self {
+            Self::Name(name) => return serializer.serialize_str(name),
+            Self::Added { name, written } => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(name, written)?;
+                return map.end();
+            }
+            Self::Params(stage) => stage,
         };
         // One key, the stage's name, to its parameters: the document form in
         // JSON and in YAML alike (a derived enum would render as a YAML tag).
@@ -722,10 +748,12 @@ impl Serialize for ScoreSpec {
     }
 }
 
-/// The one scorer of a score entry's map, read by its key; the key chooses
-/// the parameter struct, so the struct's own message names an unknown or
-/// mistyped parameter.
-fn scorer_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<ScoreStage, A::Error> {
+/// The one scorer of a score entry's map, read by its key; a built-in's key
+/// chooses the parameter struct, so the struct's own message names an
+/// unknown or mistyped parameter. Any other key is kept with what is
+/// written under it ([`ScoreSpec::Added`]): only the validator knows the
+/// names a catalog adds.
+fn scorer_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<ScoreSpec, A::Error> {
     let Some(key) = map.next_key::<String>()? else {
         return Err(de::Error::custom("a score entry names one scorer"));
     };
@@ -740,14 +768,84 @@ fn scorer_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<ScoreStage, A::Err
         "bucket" => ScoreStage::Bucket(map.next_value()?),
         "consistent-hash" => ScoreStage::ConsistentHash(map.next_value()?),
         "resident-work" => ScoreStage::ResidentWork(map.next_value()?),
-        other => return Err(de::Error::unknown_variant(other, &SCORERS)),
+        _ => {
+            let Written(written) = map.next_value()?;
+            return single_key(map, ScoreSpec::Added { name: key, written });
+        }
     };
+    single_key(map, ScoreSpec::Params(stage))
+}
+
+/// `entry`, once its map holds no second key.
+fn single_key<'de, A: MapAccess<'de>>(mut map: A, entry: ScoreSpec) -> Result<ScoreSpec, A::Error> {
     if map.next_key::<de::IgnoredAny>()?.is_some() {
         return Err(de::Error::custom(
             "a score entry maps a single key to its parameters; write one entry per scorer",
         ));
     }
-    Ok(stage)
+    Ok(entry)
+}
+
+/// What a document wrote under a scorer's name that is no built-in's, kept
+/// as read for the validator. A key written twice is refused here, in the
+/// words a built-in's parameters refuse it: the map of `serde_json` keeps
+/// the last value and says nothing. Only the entry's own keys are asked:
+/// the validator takes the weight alone, a number.
+struct Written(serde_json::Value);
+
+impl<'de> Deserialize<'de> for Written {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct WrittenVisitor;
+
+        impl<'de> Visitor<'de> for WrittenVisitor {
+            type Value = Written;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a scorer's parameters")
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Written, E> {
+                Ok(Written(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Written, A::Error> {
+                Deserialize::deserialize(SeqAccessDeserializer::new(seq)).map(Written)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Written, A::Error> {
+                let mut keys = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if keys.contains_key(&key) {
+                        return Err(de::Error::custom(format_args!("duplicate field `{key}`")));
+                    }
+                    keys.insert(key, map.next_value()?);
+                }
+                Ok(Written(keys.into()))
+            }
+        }
+
+        deserializer.deserialize_any(WrittenVisitor)
+    }
 }
 
 impl<'de> Deserialize<'de> for ScoreSpec {
@@ -765,10 +863,10 @@ impl<'de> Deserialize<'de> for ScoreSpec {
                 Ok(ScoreSpec::Name(name.to_string()))
             }
 
-            // The map is read by its one key, so the message names an
-            // unknown scorer or a wrong parameter, never "no variant matched".
+            // The map is read by its one key, so the message names a
+            // built-in's wrong parameter, never "no variant matched".
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<ScoreSpec, A::Error> {
-                scorer_entry(map).map(ScoreSpec::Params)
+                scorer_entry(map)
             }
         }
 
@@ -1005,6 +1103,14 @@ impl Default for Match {
         }
     }
 }
+
+/// The queued requests, summed over an engine's ranks, at or above which
+/// its rows are vetoed where a binding's overload block names no count.
+pub const OVERLOAD_WAITING_REQUESTS: u32 = 8;
+
+/// The mean KV usage over an engine's ranks at or above which its rows are
+/// vetoed where a binding's overload block names no usage.
+pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 
 /// The overload veto's defaults for the binding's workers: evaluated per
 /// load report by the host and latched, never per request; a worker's own
@@ -1755,33 +1861,24 @@ fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
     }
 }
 
-fn built_picker(picker: impl Picker + 'static) -> Resolved<Box<dyn Picker>> {
-    Resolved::Built(Box::new(picker))
-}
-
 fn picker_of(
     pick: &PickSpec,
     profile: &str,
     at: &At,
+    catalog: &Catalog,
 ) -> Result<Resolved<Box<dyn Picker>>, SpecError> {
     Ok(match pick {
-        PickSpec::Name(name) => match name.as_str() {
-            "best" => built_picker(Best),
-            "round-robin" => built_picker(RoundRobin::new()),
-            "random" => built_picker(Random),
-            "power-of-two" => built_picker(PowerOfTwo),
-            "count-first" => built_picker(CountFirst),
-            "power-of-two-count-first" => built_picker(PowerOfTwoCountFirst),
-            "passthrough" => built_picker(Passthrough),
-            "manual" => built_picker(Manual),
-            "best-with-temperature" => {
+        PickSpec::Name(name) => match catalog.find_picker(name) {
+            Some(Found::Built(picker)) => Resolved::Built(picker),
+            // The one picker with parameters, named without them.
+            Some(Found::Typed) => {
                 return Err(at.bad(
                     "pick",
                     name,
                     "a picker with its temperature: { best-with-temperature: { temperature } }",
                 ))
             }
-            _ => {
+            None => {
                 return Err(SpecError::UnknownPicker {
                     profile: profile.to_string(),
                     name: name.clone(),
@@ -1801,34 +1898,86 @@ fn picker_of(
     })
 }
 
-fn filter_by_name(name: &str) -> Option<Box<dyn Filter>> {
-    Some(match name {
-        "healthy" => Box::new(Healthy),
-        "not-overloaded" => Box::new(NotOverloaded),
-        "has-capacity" => Box::new(HasCapacity),
-        "has-room" => Box::new(HasRoom),
-        "not-tried" => Box::new(NotTried),
-        _ => return None,
-    })
+/// What a score entry stands for.
+enum Scored {
+    /// A built-in, by its parameters: the written ones, or a bare name's
+    /// defaults.
+    Typed(ScoreStage),
+    /// A scorer the catalog built, with its weight.
+    Built(Weighted),
 }
 
-/// The stage a score entry stands for: a bare catalog name at its defaults,
-/// or the written parameters.
-fn stage_of(entry: &ScoreSpec, profile: &str, at: &At) -> Result<ScoreStage, SpecError> {
-    match entry {
-        ScoreSpec::Params(stage) => Ok(stage.clone()),
-        ScoreSpec::Name(name) if name == "resident-work" => Err(SpecError::BadField {
+/// The stage a score entry stands for. The catalog is asked for the name
+/// first: a name it does not hold is refused as unknown whatever is written
+/// under it, so a misspelt built-in reads its name and not a key it carries.
+fn scored(
+    entry: &ScoreSpec,
+    profile: &str,
+    at: &At,
+    catalog: &Catalog,
+) -> Result<Scored, SpecError> {
+    let name = entry.name();
+    let Some(found) = catalog.find_scorer(name) else {
+        return Err(SpecError::UnknownScorer {
+            profile: profile.to_string(),
+            name: name.to_string(),
+        });
+    };
+    match (entry, found) {
+        (ScoreSpec::Params(stage), _) => Ok(Scored::Typed(stage.clone())),
+        (ScoreSpec::Name(_), Found::Typed) => match ScoreStage::by_name(name) {
+            Some(stage) => Ok(Scored::Typed(stage)),
+            // The one scorer whose parameters have no default.
+            None => Err(SpecError::BadField {
+                path: at.0.clone(),
+                value: name.to_string(),
+                reason: "a scorer with its request_tokens: { resident-work: { request_tokens } }",
+            }),
+        },
+        (ScoreSpec::Name(_), Found::Built(scorer)) => Ok(Scored::Built(Weighted {
+            scorer,
+            weight: 1.0,
+        })),
+        (ScoreSpec::Added { written, .. }, Found::Built(scorer)) => Ok(Scored::Built(Weighted {
+            scorer,
+            weight: added_weight(written, &at.sub(name))?,
+        })),
+        // Only a document built in code: the parser reads a built-in's key
+        // into its parameter struct.
+        (ScoreSpec::Added { .. }, Found::Typed) => Err(SpecError::BadField {
             path: at.0.clone(),
-            value: name.clone(),
-            reason: "a scorer with its request_tokens: { resident-work: { request_tokens } }",
+            value: name.to_string(),
+            reason: "a scorer added in code: a built-in's parameters are typed",
         }),
-        ScoreSpec::Name(name) => {
-            ScoreStage::by_name(name).ok_or_else(|| SpecError::UnknownScorer {
-                profile: profile.to_string(),
-                name: name.clone(),
-            })
+    }
+}
+
+/// The weight a document gives a scorer added in code: `{ weight }` and no
+/// other key, each refused by name; one when the map is empty.
+fn added_weight(written: &serde_json::Value, at: &At) -> Result<f32, SpecError> {
+    let Some(keys) = written.as_object() else {
+        return Err(SpecError::BadField {
+            path: at.0.clone(),
+            value: written.to_string(),
+            reason: "a map of the scorer's weight: { weight }",
+        });
+    };
+    let mut weight = 1.0;
+    for (key, value) in keys {
+        if key != "weight" {
+            return Err(at.bad(
+                key,
+                value,
+                "a parameter of a scorer added in code, which takes its weight alone",
+            ));
+        }
+        // A number past an `f32` narrows to infinity and is refused below.
+        weight = value.as_f64().map_or(f32::NAN, |number| number as f32);
+        if !above_zero(weight) {
+            return Err(at.bad("weight", value, "a finite number above zero"));
         }
     }
+    Ok(weight)
 }
 
 /// One profile's stages, built when this build carries every one of them.
@@ -1836,22 +1985,33 @@ fn check_profile(
     name: &str,
     p: &ProfileSpec,
     view: &ViewSpec,
+    catalog: &Catalog,
     deferred: &mut Deferred,
 ) -> Result<Option<Profile>, SpecError> {
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
     let mut filters = Vec::with_capacity(p.filter.len());
     for f in &p.filter {
-        filters.push(filter_by_name(f).ok_or_else(|| SpecError::UnknownFilter {
-            profile: name.to_string(),
-            name: f.clone(),
-        })?);
+        filters.push(
+            catalog
+                .find_filter(f)
+                .ok_or_else(|| SpecError::UnknownFilter {
+                    profile: name.to_string(),
+                    name: f.clone(),
+                })?,
+        );
     }
     let mut scorers = Vec::with_capacity(p.score.len());
     let mut complete = true;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
-        let stage = stage_of(entry, name, &entry_at)?;
+        let stage = match scored(entry, name, &entry_at, catalog)? {
+            Scored::Typed(stage) => stage,
+            Scored::Built(weighted) => {
+                scorers.push(weighted);
+                continue;
+            }
+        };
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
         match scorer_of(&stage, gates) {
@@ -1865,7 +2025,7 @@ fn check_profile(
             }
         }
     }
-    let picker = match picker_of(&p.pick, name, &at)? {
+    let picker = match picker_of(&p.pick, name, &at, catalog)? {
         Resolved::Built(picker) => Some(picker),
         Resolved::NotInBuild(what) => {
             deferred.note(at.field("pick"), what);
@@ -1977,6 +2137,23 @@ fn check_matcher(
         deferred.note(at.field("labels"), "the label matcher");
     }
     Ok(())
+}
+
+/// The thresholds a binding hands its pools: its block's values, each else
+/// the default, and none when the block is switched off. A binding with no
+/// block has the default block. The usage goes to permille by the rounding
+/// a report's usage takes ([`permille`]), so one rank's usage at or above
+/// the threshold in the document's unit is never read as under it. A usage
+/// that would round to no permille is held as one: at none, every engine
+/// with a row on file would read over it.
+fn overload_thresholds(block: Option<&OverloadSpec>) -> Option<OverloadThresholds> {
+    let (enabled, waiting, usage) = block.map_or((true, None, None), |block| {
+        (block.enabled, block.waiting_requests, block.token_usage)
+    });
+    enabled.then(|| OverloadThresholds {
+        waiting_requests: waiting.unwrap_or(OVERLOAD_WAITING_REQUESTS),
+        kv_usage_permille: permille(f64::from(usage.unwrap_or(OVERLOAD_TOKEN_USAGE))).max(1),
+    })
 }
 
 fn check_overload(overload: &OverloadSpec, at: &At) -> Result<(), SpecError> {
@@ -2141,6 +2318,7 @@ fn resolve_plan(b: &BindingSpec, cx: &BindingContext<'_>) -> Result<Option<Bindi
         profile,
         decode_profile,
         sessions: None,
+        overload: overload_thresholds(b.overload.as_ref()),
     };
     if plan == PlanName::Single {
         if b.profile.is_some() && !b.profiles.is_empty() {
@@ -2498,11 +2676,23 @@ impl PolicySpec {
 
     /// [`PolicySpec::validate`] with the host's own denied header names
     /// (the configured tenant header) added to the built-in deny-list.
+    pub fn validate_with(&self, denied_headers: &[&str]) -> Result<Engine, SpecError> {
+        self.validate_in(&STOCK, denied_headers)
+    }
+
+    /// [`PolicySpec::validate_with`] over the stages `catalog` holds: the
+    /// stock build's and the ones a host added in code, each named in the
+    /// document as a built-in is. Every stage name is resolved here, once;
+    /// a factory builds its stage for this engine alone.
     ///
     /// Every field is checked in shape first; a field this build cannot
     /// honour (a stage, a plan, a matcher or a binding rule of a later step)
     /// is then refused by name as [`SpecError::NotInBuild`].
-    pub fn validate_with(&self, denied_headers: &[&str]) -> Result<Engine, SpecError> {
+    pub fn validate_in(
+        &self,
+        catalog: &Catalog,
+        denied_headers: &[&str],
+    ) -> Result<Engine, SpecError> {
         if let Some(kind) = &self.kind {
             return Err(SpecError::Kind(kind.clone()));
         }
@@ -2534,7 +2724,7 @@ impl PolicySpec {
         // positions only once nothing is deferred.
         let mut by_assignment = Vec::new();
         for (name, profile) in &self.profiles {
-            if let Some(built) = check_profile(name, profile, &self.view, &mut deferred)? {
+            if let Some(built) = check_profile(name, profile, &self.view, catalog, &mut deferred)? {
                 if built.picker.by_assignment() {
                     by_assignment.push(name.as_str());
                 }
@@ -2582,6 +2772,7 @@ impl PolicySpec {
                 profile: 0,
                 decode_profile: None,
                 sessions: None,
+                overload: overload_thresholds(None),
             });
         }
         needs.headers |= !self.view.headers.is_empty();
@@ -2627,6 +2818,74 @@ impl PolicySpec {
         let mut text = serde_json::to_string_pretty(&Self::schema())?;
         text.push('\n');
         Ok(text)
+    }
+}
+
+/// One generation as a store applies it: the engine validated from a
+/// document, with the generation's number and its needs.
+///
+/// One invariant: **a decision reads its rows, its engine and its number
+/// in one load.** A store publishes every world under one of these
+/// ([`World::spec`](crate::store::World::spec)), so no reader pairs one
+/// generation's engine with rows published under another. The number is the
+/// engine's own, the document's `generation` line: there is no second
+/// holder.
+///
+/// A document becomes one by validation alone ([`AppliedSpec::validate`]):
+/// one that fails validation never does. The other constructor validates
+/// nothing: [`AppliedSpec::unbound`] is what a store holds before any
+/// document is applied, and the only generation 0 a store ever holds. A
+/// document that names no generation validates to number 0 too, and the
+/// store's apply refuses it as not above the standing one.
+#[derive(Debug)]
+pub struct AppliedSpec {
+    engine: Engine,
+}
+
+impl AppliedSpec {
+    /// The generation `document` validates into ([`PolicySpec::validate`]).
+    pub fn validate(document: &PolicySpec) -> Result<Self, SpecError> {
+        Self::validate_with(document, &[])
+    }
+
+    /// [`AppliedSpec::validate`] with the host's own denied header names,
+    /// as [`PolicySpec::validate_with`] takes them.
+    pub fn validate_with(
+        document: &PolicySpec,
+        denied_headers: &[&str],
+    ) -> Result<Self, SpecError> {
+        document
+            .validate_with(denied_headers)
+            .map(|engine| Self { engine })
+    }
+
+    /// The generation a store holds before any document is applied: number
+    /// 0, an engine with no profile and no binding, which declines every
+    /// decision by name as an engine declines a model no binding covers.
+    #[must_use]
+    pub fn unbound() -> Self {
+        Self {
+            engine: Engine::new(Vec::new(), Vec::new(), 0, Needs::default()),
+        }
+    }
+
+    /// The generation's number: the engine's own.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.engine.generation()
+    }
+
+    /// The engine a decision under this generation runs.
+    #[must_use]
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// What the host must feed under this generation
+    /// ([`Engine::needs`]).
+    #[must_use]
+    pub fn needs(&self) -> Needs {
+        self.engine.needs()
     }
 }
 
@@ -3212,12 +3471,16 @@ mod tests {
 
     #[test]
     fn a_misspelt_or_unknown_scorer_is_refused_by_name() {
-        // With parameters, the one-key map goes to the stage enum whole, so
-        // the message names the key instead of "no variant matched".
-        let err = parse_error(
-            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":[{"least_load":{"kv_pressure_weight":5}}],"pick":"best"}}}"#,
-        );
-        assert!(err.contains("unknown variant `least_load`"), "{err}");
+        // A key that is no built-in's parses, since a catalog may add the
+        // name; the validator refuses it by name, whatever is written under
+        // it.
+        match spec_with_score(r#"{"least_load":{"kv_pressure_weight":5}}"#).validate() {
+            Err(SpecError::UnknownScorer { name, .. }) => assert_eq!(name, "least_load"),
+            other => panic!("validated as {other:?}"),
+        }
+        // With parameters, a built-in's one-key map goes to its parameter
+        // struct whole, so the message names the key instead of "no variant
+        // matched".
         let err = parse_error(
             r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":[{"least-requests":{"kv_pressure_weight":5}}],"pick":"best"}}}"#,
         );
@@ -3310,6 +3573,33 @@ mod tests {
             .validate()
             .expect("an allow-listed header");
         assert!(engine.needs().headers);
+    }
+
+    #[test]
+    fn a_generation_is_refused_for_a_header_the_host_denies() {
+        let tenant = spec_with_view(r#"{"headers":["x-smg-tenant-id"]}"#);
+        assert!(AppliedSpec::validate(&tenant).is_ok());
+        assert_eq!(
+            AppliedSpec::validate_with(&tenant, &["X-SMG-Tenant-Id"]).err(),
+            Some(SpecError::DeniedHeader {
+                path: "view.headers[0]".into(),
+                name: "x-smg-tenant-id".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_generation_declares_the_needs_of_its_engine() {
+        for name in PRESETS {
+            let document = PolicySpec::preset(name).expect(name);
+            let applied = AppliedSpec::validate(&document).expect(name);
+            assert_eq!(applied.needs(), applied.engine().needs(), "{name}");
+        }
+        let cache_aware = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        let needs = AppliedSpec::validate(&cache_aware)
+            .expect("a preset validates")
+            .needs();
+        assert!(needs.loads && needs.events && needs.affinity);
     }
 
     #[test]
@@ -3697,7 +3987,76 @@ mod tests {
         let overload = spec_with_binding(
             r#"{"profile":"p","overload":{"waiting_requests":32,"token_usage":0.9,"shed_when_all_vetoed":true}}"#,
         );
-        assert!(overload.validate().is_ok());
+        let thresholds = |spec: &PolicySpec| {
+            spec.validate()
+                .expect("the binding validates")
+                .binding("m", Phase::Single)
+                .and_then(|binding| binding.overload)
+        };
+        assert_eq!(
+            thresholds(&overload),
+            Some(OverloadThresholds {
+                waiting_requests: 32,
+                kv_usage_permille: 900,
+            }),
+            "the block's two values, the usage in permille"
+        );
+        // A value the block does not name is the default, and so is a
+        // binding with no block and the binding of a document that
+        // writes none.
+        let defaults = OverloadThresholds {
+            waiting_requests: OVERLOAD_WAITING_REQUESTS,
+            kv_usage_permille: 800,
+        };
+        assert_eq!(
+            thresholds(&spec_with_binding(
+                r#"{"profile":"p","overload":{"waiting_requests":3}}"#
+            )),
+            Some(OverloadThresholds {
+                waiting_requests: 3,
+                ..defaults
+            })
+        );
+        assert_eq!(
+            thresholds(&spec_with_binding(
+                r#"{"profile":"p","overload":{"token_usage":0.25}}"#
+            )),
+            Some(OverloadThresholds {
+                kv_usage_permille: 250,
+                ..defaults
+            })
+        );
+        // A usage that would round to no permille is held as one: at none,
+        // every engine with a row on file would read over it.
+        assert_eq!(
+            thresholds(&spec_with_binding(
+                r#"{"profile":"p","overload":{"token_usage":0.0004}}"#
+            )),
+            Some(OverloadThresholds {
+                kv_usage_permille: 1,
+                ..defaults
+            })
+        );
+        // The usage is rounded to its permille, not cut.
+        assert_eq!(
+            thresholds(&spec_with_binding(
+                r#"{"profile":"p","overload":{"token_usage":0.2496}}"#
+            )),
+            Some(OverloadThresholds {
+                kv_usage_permille: 250,
+                ..defaults
+            })
+        );
+        assert_eq!(
+            thresholds(&spec_with_binding(r#"{"profile":"p"}"#)),
+            Some(defaults)
+        );
+        assert_eq!(
+            thresholds(&doc(
+                r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["kv-pressure"],"pick":"best"}}}"#
+            )),
+            Some(defaults)
+        );
         assert_eq!(
             bad_field(&spec_with_binding(
                 r#"{"profile":"p","overload":{"waiting_requests":0}}"#
@@ -3713,8 +4072,14 @@ mod tests {
                 "{token_usage}"
             );
         }
-        let off = spec_with_binding(r#"{"profile":"p","overload":{"enabled":false}}"#);
-        assert!(off.validate().is_ok());
+        // Off is the block's switch alone: the binding hands no threshold,
+        // whatever values the block still names.
+        for off in [
+            r#"{"profile":"p","overload":{"enabled":false}}"#,
+            r#"{"profile":"p","overload":{"enabled":false,"waiting_requests":3,"token_usage":0.5}}"#,
+        ] {
+            assert_eq!(thresholds(&spec_with_binding(off)), None, "{off}");
+        }
 
         let sessions = spec_with_binding(
             r#"{"profile":"p","sessions":{"sticky_header":"x-session-id","ttl_s":600,"assignment":"min_load"}}"#,

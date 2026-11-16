@@ -396,32 +396,12 @@ macro_rules! wire_field {
 
 /// The accessors every engine-response wrapper answers with the same five-arm
 /// match, written once and invoked inside each wrapper's `impl` (as the engine
-/// clients invoke `impl_engine_client_basics`): the engine predicates, the chunk
-/// semantics of the response shape, the index, the four token counters and the
-/// reported weight version. What differs per wrapper (the typed accessors, the
-/// token ids, the logprobs, the finish reason) stays in its own `impl`.
+/// clients invoke `impl_engine_client_basics`): the chunk semantics of the
+/// response shape, the index, the four token counters and the reported weight
+/// version. What differs per wrapper (the token ids, the logprobs, the finish
+/// reason) stays in its own `impl`.
 macro_rules! engine_response_basics {
     () => {
-        /// Check if this is SGLang
-        pub fn is_sglang(&self) -> bool {
-            matches!(self, Self::Sglang(_))
-        }
-
-        /// Check if this is TensorRT-LLM
-        pub fn is_trtllm(&self) -> bool {
-            matches!(self, Self::Trtllm(_))
-        }
-
-        /// Check if this is MLX
-        pub fn is_mlx(&self) -> bool {
-            matches!(self, Self::Mlx(_))
-        }
-
-        /// Check if this is TokenSpeed
-        pub fn is_tokenspeed(&self) -> bool {
-            matches!(self, Self::TokenSpeed(_))
-        }
-
         /// How this response's payloads relate to the preceding ones of its
         /// stream — see [`ChunkSemantics`]: a `Delta` stream's counts are
         /// accumulated chunk by chunk, a `Cumulative` stream's `Complete` reports
@@ -498,42 +478,6 @@ pub enum ProtoGenerateStreamChunk {
 impl ProtoGenerateStreamChunk {
     engine_response_basics!();
 
-    /// Get SGLang variant (panics if not SGLang)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang(&self) -> &sglang::GenerateStreamChunk {
-        match self {
-            Self::Sglang(chunk) => chunk,
-            _ => panic!("Expected SGLang GenerateStreamChunk"),
-        }
-    }
-
-    /// Get vLLM variant (panics if not vLLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_vllm() check"
-    )]
-    pub fn as_vllm(&self) -> &vllm::GenerateStreamChunk {
-        match self {
-            Self::Vllm(chunk) => chunk,
-            _ => panic!("Expected vLLM GenerateStreamChunk"),
-        }
-    }
-
-    /// Get TensorRT-LLM variant (panics if not TensorRT-LLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_trtllm() check"
-    )]
-    pub fn as_trtllm(&self) -> &trtllm::GenerateStreamChunk {
-        match self {
-            Self::Trtllm(chunk) => chunk,
-            _ => panic!("Expected TensorRT-LLM GenerateStreamChunk"),
-        }
-    }
-
     /// Get token IDs from chunk (common field)
     pub fn token_ids(&self) -> &[u32] {
         match self {
@@ -558,22 +502,6 @@ impl ProtoGenerateStreamChunk {
                 .output_logprobs
                 .as_ref()
                 .map(ProtoOutputLogProbs::TokenSpeed),
-        }
-    }
-
-    /// Get input logprobs (SGLang and vLLM only - streaming chunks don't have prompt logprobs)
-    pub fn input_logprobs(&self) -> Option<ProtoInputLogProbs> {
-        match self {
-            Self::Sglang(c) => c
-                .input_logprobs
-                .as_ref()
-                .map(|lp| convert_input_logprobs!(lp)),
-            Self::Vllm(c) => c
-                .input_logprobs
-                .as_ref()
-                .map(|lp| convert_input_logprobs!(lp)),
-            // TRT-LLM, MLX, and TokenSpeed streaming chunks don't have input_logprobs
-            Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
 }
@@ -605,59 +533,12 @@ impl ProtoGenerateComplete {
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
+        reason = "typed accessor: the caller guarantees the variant"
     )]
     pub fn as_sglang(&self) -> &sglang::GenerateComplete {
         match self {
             Self::Sglang(complete) => complete,
             _ => panic!("Expected SGLang GenerateComplete"),
-        }
-    }
-
-    /// Get mutable SGLang variant (panics if not SGLang)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang_mut(&mut self) -> &mut sglang::GenerateComplete {
-        match self {
-            Self::Sglang(complete) => complete,
-            _ => panic!("Expected SGLang GenerateComplete"),
-        }
-    }
-
-    /// Get vLLM variant (panics if not vLLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_vllm() check"
-    )]
-    pub fn as_vllm(&self) -> &vllm::GenerateComplete {
-        match self {
-            Self::Vllm(complete) => complete,
-            _ => panic!("Expected vLLM GenerateComplete"),
-        }
-    }
-
-    /// Get TensorRT-LLM variant (panics if not TensorRT-LLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_trtllm() check"
-    )]
-    pub fn as_trtllm(&self) -> &trtllm::GenerateComplete {
-        match self {
-            Self::Trtllm(complete) => complete,
-            _ => panic!("Expected TensorRT-LLM GenerateComplete"),
-        }
-    }
-
-    /// Get token IDs from either backend (output_ids in proto)
-    pub fn token_ids(&self) -> &[u32] {
-        match self {
-            Self::Sglang(c) => &c.output_ids,
-            Self::Vllm(c) => &c.output_ids,
-            Self::Trtllm(c) => &c.output_token_ids,
-            Self::Mlx(c) => &c.output_ids,
-            Self::TokenSpeed(c) => &c.output_ids,
         }
     }
 
@@ -791,18 +672,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get KV transfer parameters from prefill response (vLLM Mooncake PD only).
-    /// Returns (remote_host, remote_port) if present.
-    pub fn kv_transfer_params(&self) -> Option<(String, u32)> {
-        match self {
-            Self::Vllm(c) => c
-                .kv_transfer_params
-                .as_ref()
-                .map(|params| (params.remote_host.clone(), params.remote_port)),
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
-        }
-    }
-
     /// The media identity a prefill side returned for its processed
     /// references (vLLM only; absent from older servicers).
     pub fn media_identity(&self) -> Option<&vllm::MediaIdentity> {
@@ -904,8 +773,8 @@ impl WatchedStream {
 /// A disaggregated request's decode side. Its engine loads the prompt's KV
 /// from the prefill side and reports what it loaded as cached, so every chunk
 /// and complete it yields is restamped with the prefill side's prefix-cache
-/// hit before the gateway reads it. Decode sides are not tracked today; if one
-/// ever is, the tracking must sit inside this wrapper, so that a
+/// hit before the gateway reads it. A decode side's tracking sits inside this
+/// wrapper (every route puts the wrapper on last), so that a
 /// [`PrefillTicket`] reads the engine's own `cached_tokens`, not the
 /// restamped value.
 pub struct DecodeStream {
@@ -944,11 +813,12 @@ impl PrefillCachedTokens {
     /// entry, or the one entry of a prefill that completed once for the
     /// whole request.
     pub fn for_index(&self, index: u32) -> Option<u32> {
-        match self.by_index.get(&index) {
-            Some(cached) => Some(*cached),
-            None if self.by_index.len() == 1 => self.by_index.values().next().copied(),
-            None => None,
+        // One entry answers every index, as the sample's own or as the whole
+        // request's: no hash of the index on a decode side's every message.
+        if self.by_index.len() == 1 {
+            return self.by_index.values().next().copied();
         }
+        self.by_index.get(&index).copied()
     }
 
     fn restamp(&self, index: u32, cached: &mut u32) {
@@ -1689,6 +1559,57 @@ mod tracked_tests {
         );
     }
 
+    /// A decode side restamps every response the stream it wraps hands on,
+    /// a held first item as the ones read after it, and once: a wrapper
+    /// inside a wrapper answers with the outer side's figure.
+    #[tokio::test]
+    async fn a_decode_side_restamps_every_response_of_the_stream_it_wraps() {
+        type Item = Result<ProtoGenerateResponse, tonic::Status>;
+        let chunk = |cached_tokens| -> Item {
+            let chunk = vllm::GenerateStreamChunk {
+                cached_tokens,
+                ..Default::default()
+            };
+            let response = Some(vllm::generate_response::Response::Chunk(chunk));
+            Ok(ProtoGenerateResponse::Vllm(Box::new(
+                vllm::GenerateResponse { response },
+            )))
+        };
+        let which = |item: Option<&Item>| Some(item?.as_ref().ok()?.cached_tokens());
+        let prefill = |cached_tokens| {
+            let mut prefill = super::PrefillCachedTokens::default();
+            prefill.note(&super::ProtoGenerateComplete::Vllm(Box::new(
+                vllm::GenerateComplete {
+                    cached_tokens,
+                    ..Default::default()
+                },
+            )));
+            prefill
+        };
+        // Two tracked layers, each holding one chunk for its reader: the
+        // stream yields the chunks 1 and 2 and ends.
+        let engine: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+        let two_chunks = || {
+            let empty = ProtoStream::Fanout(FanoutStream::new(Vec::new()));
+            [2, 1].into_iter().fold(empty, |inner, id| {
+                let mut layer = inner.tracked(Arc::clone(&engine), 0, false);
+                if let ProtoStream::Tracked(tracked) = &mut layer {
+                    tracked.replay = Some(Some(chunk(id)));
+                }
+                layer
+            })
+        };
+        let mut stream = two_chunks().decode_side(prefill(7));
+        assert!(matches!(stream, ProtoStream::DecodeSide(_)), "wrapped");
+        assert_eq!(which(stream.next().await.as_ref()), Some(7), "the held");
+        assert_eq!(which(stream.next().await.as_ref()), Some(7), "the next");
+        assert!(stream.next().await.is_none(), "to the stream's end");
+        let mut stream = two_chunks().decode_side(prefill(7)).decode_side(prefill(9));
+        assert_eq!(which(stream.next().await.as_ref()), Some(9), "the outer");
+        assert_eq!(which(stream.next().await.as_ref()), Some(9), "the outer");
+        assert!(stream.next().await.is_none(), "to the stream's end");
+    }
+
     /// A decode side's first item is its prefill worker's handoff only when
     /// it is output: a chunk, or a complete that ended neither in an abort
     /// (an aborted choice, as the Rust servicers end one) nor in an error.
@@ -2014,10 +1935,34 @@ impl ProtoStream {
         }
     }
 
+    /// `item` as this stream hands it on: under a decode-side wrapper a
+    /// response carries the prefill side's prefix-cache hit instead of its
+    /// own, stamped where the item lies. The inner stream did its own
+    /// bookkeeping and engine-error mapping; only the prompt-side usage
+    /// changes here. The wrapper is looked at when the item is in hand:
+    /// nothing of it is carried across a wait, and a stream with no wrapper
+    /// pays one test a message.
+    #[inline]
+    fn restamp(&self, item: &mut Option<Result<ProtoGenerateResponse, tonic::Status>>) {
+        if let (Self::DecodeSide(side), Some(Ok(response))) = (self, item) {
+            response.restamp_cached_tokens(&side.prefill);
+        }
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
-        let Self::Watched(watched) = self else {
-            return self.next_unwatched().await;
+        // A decode side is read through the layers it wraps, in place, and
+        // restamped on the way out: read through this function a second
+        // time, its messages paid a boxed future and each layer's dispatch
+        // twice.
+        let stream = match &mut *self {
+            Self::DecodeSide(side) => &mut side.inner,
+            stream => stream,
+        };
+        let Self::Watched(watched) = stream else {
+            let mut item = stream.next_unwatched().await;
+            self.restamp(&mut item);
+            return item;
         };
         let WatchedStream {
             inner,
@@ -2050,7 +1995,10 @@ impl ProtoStream {
             .await
         };
         match item {
-            Some(item) => item,
+            Some(mut item) => {
+                self.restamp(&mut item);
+                item
+            }
             None => {
                 watched.client_left();
                 None
@@ -2066,9 +2014,10 @@ impl ProtoStream {
             return Box::pin(self.next()).await;
         }
         if let Self::DecodeSide(side) = self {
-            // A decode side's messages are polled in place as a tracked
-            // stream's are, without a boxed future per message; a wrapper
-            // inside the wrapper recurses. The inner stream did its own
+            // Reached with a watch over the wrapper, or with one wrapper
+            // inside another: [`Self::next`] reads a decode side in place. A
+            // tracked stream or a wrapper under this one is read through
+            // `next`, behind a boxed future. The inner stream did its own
             // bookkeeping and engine-error mapping; only the prompt-side usage
             // changes here.
             let item = if matches!(side.inner, Self::Tracked(_) | Self::DecodeSide(_)) {
@@ -2154,20 +2103,19 @@ impl ProtoStream {
                 .map(|result| result.map(ProtoGenerateResponse::TokenSpeed)),
             // Every ZMQ engine (including TokenSpeed) emits vllm-shaped
             // responses: the adapter translates wire output into
-            // `vllm::GenerateResponse`, so variant checks like
-            // `is_tokenspeed()` on a response are unreliable for ZMQ-backed
-            // streams. Key response-side engine logic on the worker's
-            // `runtime_type()`, never on the response variant; key
-            // accumulation on `chunk_semantics()`, which the vLLM shape
-            // (delta chunks, cumulative `Complete`) defines for this lane.
+            // `vllm::GenerateResponse`, so a response's variant does not name
+            // the engine behind a ZMQ-backed stream. Key response-side engine
+            // logic on the worker's `runtime_type()`, never on the response
+            // variant; key accumulation on `chunk_semantics()`, which the vLLM
+            // shape (delta chunks, cumulative `Complete`) defines for this lane.
             Self::Zmq(stream) => stream
                 .next()
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
             Self::Tracked(_) | Self::Watched(_) => return Box::pin(self.next()).await,
-            // Reached only with one wrapper inside another: [`Self::next`]
-            // polls a decode side in place.
+            // Reached with a tracked layer over the wrapper, which no route
+            // builds: [`Self::next`] reads a decode side in place.
             Self::DecodeSide(_) => return Box::pin(self.next()).await,
             // The held item, mapped when it was read, and the layer goes.
             Self::Ahead(ahead) => {
@@ -2331,10 +2279,6 @@ impl FanoutChild for ProtoStream {
         Self::mark_completed(self);
     }
 
-    fn defer_abort_until_first_item(self) -> Self {
-        Self::defer_abort_until_first_item(self)
-    }
-
     fn defer_abort_within(self, bound: Duration) -> Self {
         Self::defer_abort_within(self, bound)
     }
@@ -2359,12 +2303,8 @@ pub trait FanoutChild: Send {
     /// Mark the child completed so dropping it sends no abort.
     fn mark_completed(&mut self);
 
-    /// Defer the child's abort-on-drop until its first response.
-    #[must_use]
-    fn defer_abort_until_first_item(self) -> Self;
-
-    /// [`Self::defer_abort_until_first_item`] with the wait bounded by
-    /// `bound` where that is shorter than the house cap.
+    /// Defer the child's abort-on-drop until its first response, the wait
+    /// bounded by `bound` where that is shorter than the house cap.
     #[must_use]
     fn defer_abort_within(self, bound: Duration) -> Self;
 
@@ -2405,10 +2345,6 @@ impl<C: FanoutChild> FanoutChild for FanoutStream<C> {
 
     fn mark_completed(&mut self) {
         Self::mark_completed(self);
-    }
-
-    fn defer_abort_until_first_item(self) -> Self {
-        Self::defer_abort_until_first_item(self)
     }
 
     fn defer_abort_within(self, bound: Duration) -> Self {
@@ -2482,21 +2418,8 @@ impl<C: FanoutChild> FanoutStream<C> {
         }
     }
 
-    /// Defer every open child's abort-on-drop until its first response.
-    #[must_use]
-    pub fn defer_abort_until_first_item(self) -> Self {
-        Self {
-            children: self
-                .children
-                .into_iter()
-                .map(|child| child.map(FanoutChild::defer_abort_until_first_item))
-                .collect(),
-            cursor: self.cursor,
-        }
-    }
-
-    /// [`Self::defer_abort_until_first_item`] with every child's wait
-    /// bounded by `bound`.
+    /// Defer every open child's abort-on-drop until its first response,
+    /// each child's wait bounded by `bound`.
     #[must_use]
     pub fn defer_abort_within(self, bound: Duration) -> Self {
         Self {
@@ -2555,10 +2478,6 @@ mod fanout_tests {
 
         fn mark_completed(&mut self) {
             self.completed.store(true, Ordering::SeqCst);
-        }
-
-        fn defer_abort_until_first_item(self) -> Self {
-            self
         }
 
         fn defer_abort_within(self, _bound: Duration) -> Self {
@@ -3498,6 +3417,43 @@ mod watched_tests {
             stream.client_left(),
             "the end was the client's leaving, seen through the wrapper"
         );
+    }
+
+    /// A decode side restamps a watched stream's responses whichever layer
+    /// is outside: the wrapper over the watch, as dual dispatch builds it,
+    /// and the watch over the wrapper.
+    #[tokio::test]
+    async fn a_decode_side_restamps_over_a_watch_and_under_one() {
+        let prefill = || {
+            let mut prefill = PrefillCachedTokens::default();
+            prefill.note(&ProtoGenerateComplete::Vllm(Box::new(
+                vllm::GenerateComplete {
+                    prompt_tokens: 4,
+                    cached_tokens: 2,
+                    ..Default::default()
+                },
+            )));
+            prefill
+        };
+        let (stream, gate, _rx) = watched(vec![chunk(0, "a")], vec![complete(0, "stop")]).await;
+        let mut over = stream.decode_side(prefill());
+        let (under_gate, gate_rx) = oneshot::channel();
+        let (stream, _server) =
+            gated_stream(vec![chunk(0, "a")], gate_rx, vec![complete(0, "stop")], "0").await;
+        let (client, _under_rx) = sse_channel();
+        let mut under = stream
+            .decode_side(prefill())
+            .until_client_gone(&client, "req-watched");
+        gate.send(()).expect("the stream holds its gate");
+        under_gate.send(()).expect("the stream holds its gate");
+        for stream in [&mut over, &mut under] {
+            for _ in 0..2 {
+                let response = stream.next().await.expect("a response");
+                let response = response.expect("no error");
+                assert_eq!(response.cached_tokens(), 2, "the prefill's hit");
+            }
+            assert!(stream.next().await.is_none(), "the engine's end");
+        }
     }
 
     /// The wait for the client's leaving is one for the stream's whole life,

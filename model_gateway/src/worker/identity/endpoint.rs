@@ -51,7 +51,9 @@ impl Scheme {
     }
 
     /// Match a scheme prefix case-insensitively, returning it and the rest.
-    fn split_from(input: &str) -> Option<(Scheme, &str)> {
+    /// An address has a scheme when it starts with one of these, and has
+    /// none otherwise: a `://` further in is part of what follows.
+    pub(crate) fn split_from(input: &str) -> Option<(Scheme, &str)> {
         const SCHEMES: [Scheme; 6] = [
             Scheme::Http,
             Scheme::Https,

@@ -1199,7 +1199,7 @@ async fn upstream_round(
     let response = request_builder
         .send()
         .await
-        .map_err(|e| format!("upstream request failed: {e}"))?;
+        .map_err(|e| format!("upstream request failed: {}", e.without_url()))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1211,7 +1211,7 @@ async fn upstream_round(
     let response_json = response
         .json::<Value>()
         .await
-        .map_err(|e| format!("parse response: {e}"))?;
+        .map_err(|e| format!("parse response: {}", e.without_url()))?;
 
     let function_calls = extract_function_calls(&response_json);
     if function_calls.is_empty() {
@@ -1644,13 +1644,14 @@ mod tests {
     use super::{
         build_transformed_mcp_call_item, extract_openai_response_output_items,
         is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit,
-        not_executed_tool_call_item, ItemType, McpEvent, OutputItemEvent, SseEncoder,
-        ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
+        not_executed_tool_call_item, upstream_round, ItemType, McpEvent, OutputItemEvent,
+        SseEncoder, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
     };
     use crate::{
+        header_utils::ApiProvider,
         openai::mcp::test_support,
         openai_bridge::{FormatRegistry, ResponseFormat},
-        test_support::counting_alloc,
+        test_support::{answering, counting_alloc, http_client, RefusedAddress},
     };
 
     fn test_tool(name: &str) -> Tool {
@@ -2962,6 +2963,45 @@ mod tests {
         );
     }
 
+    /// A session reads the orchestrator's maps by key. A walk of one of them
+    /// allocates once per shard, four times at the least and more with every
+    /// core of the host. No read here has room for one: the tool listing of a
+    /// server without tools allocates nothing, and a session makes only its
+    /// own calls, 4 when the request binds no server and 12 when it binds
+    /// one.
+    #[tokio::test]
+    async fn a_session_walks_no_sharded_map() {
+        let orchestrator = McpOrchestrator::new(McpConfig::default())
+            .await
+            .expect("an orchestrator with no servers");
+
+        let before = counting_alloc::calls();
+        let session = McpToolSession::new(&orchestrator, Vec::new(), "test-request");
+        let unbound = counting_alloc::calls() - before;
+
+        let bindings = vec![McpServerBinding {
+            label: "a-label".to_string(),
+            server_key: "a-server".to_string(),
+            allowed_tools: None,
+            list_error: None,
+        }];
+        let before = counting_alloc::calls();
+        let bound_session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        let bound = counting_alloc::calls() - before;
+
+        let keys = ["a-server".to_string()];
+        let before = counting_alloc::calls();
+        let listed = orchestrator.list_tools_for_servers(&keys);
+        let listing = counting_alloc::calls() - before;
+
+        assert!(session.mcp_tools().is_empty() && listed.is_empty());
+        assert!(bound_session.mcp_tools().is_empty() && bound_session.mcp_servers().len() == 1);
+        assert!(
+            unbound < 8 && bound < 16 && listing < 4,
+            "allocation calls: {unbound} for a session without a server, {bound} for a session that binds one, {listing} for a server's tool listing"
+        );
+    }
+
     /// Allocation calls of the tool descriptors above, today.
     const PINNED_DESCRIPTOR_CALLS: usize = 4643;
 
@@ -2985,5 +3025,52 @@ mod tests {
             serde_json::to_string(&built).expect("JSON"),
             serde_json::to_string(&typed).expect("JSON")
         );
+    }
+
+    /// A round nothing answers fails without the request URL in its text. The
+    /// HTTP client's own error text ends with it, its query kept.
+    #[tokio::test]
+    async fn a_round_nothing_answers_goes_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("http://{}/v1/responses?key=s3cret", refused.addr());
+
+        let Err(text) = upstream_round(
+            &http_client(),
+            &url,
+            &ApiProvider::Generic,
+            None,
+            &json!({}),
+        )
+        .await
+        else {
+            panic!("a failed send");
+        };
+
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(!text.contains(&refused.addr().to_string()), "{text}");
+    }
+
+    /// A round answered with no JSON fails without the request URL in its
+    /// text. The HTTP client's text of a failed body read ends with it, its
+    /// query kept.
+    #[tokio::test]
+    async fn a_round_answered_with_no_json_goes_without_the_clients_url() {
+        let addr = answering(200, "not json", false).await;
+        let url = format!("http://{addr}/v1/responses?key=s3cret");
+
+        let Err(text) = upstream_round(
+            &http_client(),
+            &url,
+            &ApiProvider::Generic,
+            None,
+            &json!({}),
+        )
+        .await
+        else {
+            panic!("an answer that is no JSON");
+        };
+
+        assert!(text.starts_with("parse response"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
     }
 }

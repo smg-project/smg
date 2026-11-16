@@ -27,14 +27,20 @@
 //!   a request; the [`Engine`] resolves a request to its binding and decides.
 //!   A scorer or picker allocates nothing per decision. The consistent-hash
 //!   scorer owns its ring ([`ring`]), fed by the membership hooks.
+//! - 4.5, the stages in code ([`catalog`]): the [`Catalog`] of the stages a
+//!   build knows by name, the stock build's and the ones a host registers.
+//!   A document names either kind the same way, and the validator resolves
+//!   every name once ([`PolicySpec::validate_in`]).
 //! - 4.6, the schema ([`spec`]): [`PolicySpec`] (`apiVersion: smg.policy/v1`,
 //!   no `kind`), its validator and the [`Needs`] summary the host reads at
 //!   apply, before any request exists.
 //!
 //! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
-//!   which the controller's store is fed (membership, health, loads, KV event
-//!   cursors, reservations, sessions, leases), the one-process
-//!   [`store::MemoryStore`] behind them and the contract tests over it. A
+//!   which the controller's store is fed (membership, health, loads, KV
+//!   events, reservations, sessions, leases), the one-process
+//!   [`store::MemoryStore`] behind them and the contract tests over it. The
+//!   KV events feed the index the store holds for each model
+//!   ([`store::index`]), which no decision reads yet. A
 //!   gateway in the embedded mode implements the same traits over its own
 //!   structures. The store publishes what a decision reads
 //!   ([`store::World`]: every pool as whole candidate rows) and builds one
@@ -72,6 +78,7 @@
 
 pub mod affinity;
 pub mod builtins;
+pub mod catalog;
 #[cfg(feature = "controller")]
 pub mod controller;
 pub mod decision;
@@ -93,6 +100,7 @@ pub mod view;
 pub mod wasm;
 pub mod wit;
 
+pub use catalog::{Catalog, CatalogError, StageKind};
 pub use decision::{
     Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
 };
@@ -107,12 +115,12 @@ pub use lease::{
 pub use ring::{ConsistentHash, Ring};
 pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
 pub use spec::{
-    Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
+    AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
 };
 pub use view::{
     fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Header, Health, Identity,
-    LoadRow, MediaCounts, ModelFingerprint, OverloadRegime, Phase, PoolFacts, RequestFacts, Role,
-    Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
+    LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime, Phase,
+    PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
 };
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a

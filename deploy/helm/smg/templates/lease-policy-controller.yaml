@@ -1,0 +1,14 @@
+{{- if and (.Values.policyController).enabled (include "smg.policyControllerElection" .) }}
+{{- /* The one Lease the controllers elect their leader over. It is rendered
+     with no spec: the record (the holder, the times, the term) is the
+     controllers' and lives in the cluster, so an upgrade has nothing to
+     say of it, and a controller reads an object with no record as a free
+     lease. */}}
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: {{ include "smg.policyControllerLeaseName" . | quote }}
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: policy-controller
+{{- end }}

@@ -3,17 +3,22 @@
 //! one lease file, asked who leads by the generated client. One leads and
 //! the others name it by its id and its dialable address; the leader is
 //! killed, and a follower takes the lease under the next term once the
-//! record stood still for its duration; that leader is stopped, releases the
-//! lease and the last replica takes it. The case holds the run to order and
-//! terms, never to a clock: across every answer, no call sent after a
+//! record stood still for its duration; that leader is stopped beside the
+//! last follower, which leads under the next term; the replica left is
+//! stopped alone, releases the lease, and a replica started after it takes
+//! the released lease under the next term. The case holds the run to order
+//! and terms, never to a clock: across every answer, no call sent after a
 //! replica answered as the leader under a term is answered as the leader
-//! under a lower one, one replica's terms never fall, and the three logs
+//! under a lower one, one replica's terms never fall, and the replicas' logs
 //! hold one take a term. The promotion's time is read and printed; its bound
 //! is the settings' own with room for a loaded host.
 //!
+//! A second case kills a lone leader and starts it again under its
+//! identity: the new run leads under the term above, after the wait of
+//! every candidate.
+//!
 //! No stub server: the client is the generated one and the server is the
-//! binary. The two cells at the end are the Numbers table's rows, run by
-//! name.
+//! binary. The cells at the end are the Numbers table's rows, run by name.
 #![expect(
     clippy::expect_used,
     reason = "the case's helpers run inside the test; a failure there is the test's failure"
@@ -41,7 +46,7 @@ use std::{
 use net::http_get;
 use replicas::{Lease, Record, Replica, ROOM};
 use smg_policy_controller::{
-    elector::{ElectionSettings, FileLease, LeaseBackend, LeaseRecord},
+    elector::{ElectionSettings, FileLease, LeaseBackend, LeaseRecord, Written},
     proto::{
         policy_controller_client::PolicyControllerClient, GetPolicySpecRequest, SnapshotRequest,
     },
@@ -62,8 +67,37 @@ fn short() -> ElectionSettings {
 /// through its own hand-over.
 const SETTLE_SECS: u64 = 1;
 
+/// What a stopped replica logs when its election thread did not end within
+/// the grace period: the release was given up, and the lease expires.
+const GIVEN_UP: &str =
+    "the election thread outlived the grace period; a lease it holds expires by its duration";
+
 fn start(id: &str, lease: &Path, settings: ElectionSettings) -> Replica {
     Replica::start(id, Lease::File(lease), settings, SETTLE_SECS).expect("the replica starts")
+}
+
+/// The address a replica of the restart cases advertises: the holder
+/// identity is the id at this address whatever its listeners bind, so a
+/// second process started the same way is the first one's restart to the
+/// election. Nothing dials it: the cases ask each process where it listens.
+const ADVERTISED: &str = "127.0.0.1:9";
+
+fn start_at(id: &str, lease: &Path, settings: ElectionSettings) -> Replica {
+    Replica::start_at(id, ADVERTISED, Lease::File(lease), settings, SETTLE_SECS)
+        .expect("the replica starts")
+}
+
+/// Samples until a replica answers as the leader: that answer.
+async fn led(record: &mut Record, replicas: &mut [Replica]) -> replicas::Answer {
+    let started = Instant::now();
+    loop {
+        let answers = record.sample(replicas).await;
+        if let Some(answer) = answers.into_iter().find(|answer| answer.info.is_leader) {
+            return answer;
+        }
+        assert!(started.elapsed() < ROOM, "no replica led in {ROOM:?}");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
 }
 
 /// One leader, named by every replica: its place and the term.
@@ -106,6 +140,63 @@ fn millis(duration: Duration) -> u128 {
     duration.as_millis()
 }
 
+/// A leader killed and started again under its identity, as a lone
+/// controller over its lease file or a container restarted in its pod. The
+/// new run waits its earlier run's record out for the record's duration, as
+/// every candidate does, and takes the term above: it never leads under the
+/// term its earlier run led under. A term is taken once, so what a reader
+/// holds under a term came from one run of one store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leader_restarted_under_its_identity_leads_under_the_term_above() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let lease = dir.path().join("lease");
+    let settings = short();
+    let mut record = Record::default();
+    let mut replicas = vec![start_at("replica-a", &lease, settings)];
+    let first = led(&mut record, &mut replicas).await;
+    let identity = replicas[0].identity();
+    let mut earlier = replicas.remove(0);
+    earlier.kill().expect("SIGKILL");
+    let killed = Instant::now();
+    let last = stored(&lease);
+    assert_eq!(
+        (last.holder.as_str(), last.term),
+        (identity.as_str(), first.info.term)
+    );
+
+    // The same id at the same advertised address: the earlier run's record
+    // is under this run's own name. The new process answers into a record
+    // of its own: it answers term zero until its first look at the lease,
+    // which one record over both runs would read as the first run's term
+    // falling.
+    replicas.push(start_at("replica-a", &lease, settings));
+    let mut restarted = Record::default();
+    let again = led(&mut restarted, &mut replicas).await;
+    assert_eq!(
+        again.info.term,
+        first.info.term + 1,
+        "the restart leads under the term above its earlier run's"
+    );
+    let waited = again.returned.duration_since(killed);
+    assert!(
+        waited >= settings.duration,
+        "the restart led {waited:?} after the kill, inside the record's duration"
+    );
+    let taken = stored(&lease);
+    assert_eq!(
+        (taken.holder.as_str(), taken.term),
+        (identity.as_str(), again.info.term)
+    );
+    assert!(
+        taken.acquired_at_micros > last.renewed_at_micros,
+        "a take in every field"
+    );
+    record.check().expect("the election's promise holds");
+    restarted
+        .check()
+        .expect("the election's promise holds after the restart");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_stop() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -134,6 +225,12 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
         }
         let held = stored(&lease);
         if agreed(&mut record, &mut replicas).await != (first, term) {
+            // Read again, under the loop's own clock: a lease that moves
+            // between every two looks is this case's failure, not its wait.
+            assert!(
+                Instant::now() < settled,
+                "the lease kept moving between two looks at it"
+            );
             continue;
         }
         assert_eq!(held.holder, replicas[first].identity());
@@ -153,8 +250,9 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
         );
     };
 
-    // The scopes over the wire: a listener answers the calls of the scopes
-    // it mounts as unimplemented, and denies the others.
+    // The scopes over the wire: a listener denies the calls of the scopes
+    // it does not mount. Those of its own it refuses as unauthenticated: no
+    // listener of these replicas takes an identity as told.
     let follower = &replicas[(first + 1) % replicas.len()];
     for (listener, read, snapshot) in [
         (
@@ -162,11 +260,15 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
             Code::PermissionDenied,
             Code::PermissionDenied,
         ),
-        (follower.control, Code::Unimplemented, Code::Unimplemented),
+        (
+            follower.control,
+            Code::Unauthenticated,
+            Code::Unauthenticated,
+        ),
         (
             follower.replication,
             Code::PermissionDenied,
-            Code::Unimplemented,
+            Code::Unauthenticated,
         ),
     ] {
         let mut client = PolicyControllerClient::connect(format!("http://{listener}"))
@@ -192,22 +294,38 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
     let successor = promoted(&mut record, &mut replicas, term, within).await;
     let after_kill = successor.returned.duration_since(at);
     writeln!(out, "PROMOTION_AFTER_KILL_MS {}", millis(after_kill)).expect("stdout");
-    let (mut leader, mut term) = agreed(&mut record, &mut replicas).await;
+    let (leader, term) = agreed(&mut record, &mut replicas).await;
     assert!(term > successor.info.term || replicas[leader].id == successor.replica);
     assert_eq!(readiness(&replicas[leader]).await.0, 200);
 
-    // THE STOP. The leader closes its fence, releases the lease and exits
-    // clean; the last replica takes the released lease. A leader stalled
-    // past the duration before its signal has lost the lease and none to
-    // release: its log says the lease moved, that stop tests nothing, and
-    // the leader after it is stopped beside a fresh follower.
+    // THE HAND-OVER AT A STOP. The leader is stopped beside the live
+    // follower, and the follower leads under a term above: it takes the
+    // released lease, or the one a leader held back past the duration lost
+    // before it read its stop. That leader has none to release and logs
+    // nothing, so its log cannot tell the two apart, and this stop is read
+    // by order alone: who leads next.
     let mut gone = vec![killed];
-    loop {
-        let mut stopped = replicas.remove(leader);
+    let mut stopped = replicas.remove(leader);
+    stopped.terminate().expect("SIGTERM");
+    promoted(&mut record, &mut replicas, term, within).await;
+    let status = stopped.exited().expect("the stopped leader exits");
+    assert!(
+        status.success(),
+        "a stopped leader exits clean, read {status}:\n{}",
+        stopped.log()
+    );
+    gone.push(stopped);
+
+    // THE RELEASE. The replica that is left runs alone, so nothing but its
+    // own release can move the lease. It closes its fence, releases the
+    // lease and exits clean, and the stop is read from what it left: the
+    // release in its log, and the record released under its term. A release
+    // given up at the grace period is in the log too: that stop tests
+    // nothing, and the replica started after it is stopped in its turn.
+    let term = loop {
+        let (alone, term) = agreed(&mut record, &mut replicas).await;
+        let mut stopped = replicas.remove(alone);
         stopped.terminate().expect("SIGTERM");
-        let at = Instant::now();
-        let successor = promoted(&mut record, &mut replicas, term, within).await;
-        let after_stop = successor.returned.duration_since(at);
         let status = stopped.exited().expect("the stopped leader exits");
         assert!(
             status.success(),
@@ -216,34 +334,52 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
         );
         let released = stopped.logged("the lease is released");
         assert!(
-            released || stopped.lost_its_lease(),
+            released || stopped.logged(GIVEN_UP),
             "the stopped leader released its lease:\n{}",
             stopped.log()
         );
-        if released {
-            writeln!(out, "PROMOTION_AFTER_STOP_MS {}", millis(after_stop)).expect("stdout");
-        }
-        gone.push(stopped);
-        if released {
-            break;
-        }
+        let left = stored(&lease);
         assert!(
-            gone.len() < 4,
-            "three leaders in a row lost the lease before their stop"
+            !released || (left.is_released() && left.term == term),
+            "a release leaves the record released under term {term}, read {left:?}"
+        );
+        gone.push(stopped);
+        assert!(
+            released || gone.len() < 5,
+            "three leaders in a row gave their release up at the grace period"
         );
         replicas.push(start(
-            &format!("replica-{}", gone.len() + 2),
+            &format!("replica-{}", gone.len() + 1),
             &lease,
             settings,
         ));
-        (leader, term) = agreed(&mut record, &mut replicas).await;
-    }
-    let (last, term) = agreed(&mut record, &mut replicas).await;
-    assert_eq!(last, 0, "one replica is left, and it leads");
-    assert_eq!(
-        readiness(&replicas[last]).await,
-        (200, r#"{"status":"ready","role":"leader"}"#.to_owned())
-    );
+        if released {
+            break term;
+        }
+    };
+
+    // The replica started after the release takes the released lease under
+    // the next term and leads alone. A host that held it past its own
+    // deadline between the answer and the probe reads follower until its
+    // next renewal lands, under the same term: the pair is read again.
+    let settled = Instant::now() + ROOM;
+    let last = loop {
+        let (last, taken) = agreed(&mut record, &mut replicas).await;
+        assert_eq!(
+            taken,
+            term + 1,
+            "the released lease is taken under the next term"
+        );
+        let probe = readiness(&replicas[last]).await;
+        if probe == (200, r#"{"status":"ready","role":"leader"}"#.to_owned()) {
+            break last;
+        }
+        assert!(
+            Instant::now() < settled,
+            "the last replica's probe never said leader: {probe:?}"
+        );
+    };
+    let term = term + 1;
     assert_eq!(stored(&lease).holder, replicas[last].identity());
     assert_eq!(stored(&lease).term, term);
 
@@ -274,8 +410,14 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
     writeln!(out, "LEADER_ANSWERS_RECORDED {}", record.len()).expect("stdout");
 }
 
-/// The middle of a sorted list and its last entry.
-fn median_and_worst(samples: &mut [u128]) -> (u128, u128) {
+/// The middle of a sorted list and its last entry. A group with no sample
+/// (no round ran, or none passed its filter) has neither and is refused by
+/// its name.
+fn median_and_worst(name: &str, samples: &mut [u128]) -> (u128, u128) {
+    assert!(
+        !samples.is_empty(),
+        "{name}: no sample; a summary needs one round at the least"
+    );
     samples.sort_unstable();
     (
         samples[samples.len() / 2],
@@ -294,6 +436,21 @@ fn spread(round: u64, offset: u64, period: Duration) -> Duration {
 
 /// A day in microseconds: a wall stamp's time of day, as a log line's.
 const DAY_MICROS: u64 = 86_400_000_000;
+
+/// One line a group of a measurement cell: its count, best, median and
+/// worst.
+fn summaries<const N: usize>(out: &mut impl Write, groups: [(&str, &mut Vec<u128>); N]) {
+    for (name, samples) in groups {
+        let n = samples.len();
+        let (median, worst) = median_and_worst(name, samples);
+        let best = samples.first().copied().unwrap_or_default();
+        writeln!(
+            out,
+            "{name} n={n} best={best} median={median} worst={worst}"
+        )
+        .expect("stdout");
+    }
+}
 
 fn rounds(variable: &str, default: u64) -> u64 {
     std::env::var(variable)
@@ -426,23 +583,17 @@ async fn promotion_times_over_repeated_kills_and_stops() {
         replicas.push(fresh(&lease));
     }
 
-    for (name, samples) in [
-        ("KILL_TO_LEADER_ANSWER_MS", &mut from_kill),
-        ("LAST_RENEWAL_TO_TAKE_MS", &mut from_renewal),
-        ("FENCE_CLOSE_TO_TAKE_MS", &mut from_close),
-        ("STOP_TO_LEADER_ANSWER_MS", &mut from_stop),
-        ("STOP_TO_RELEASE_US", &mut to_release),
-        ("STOP_SIGNAL_TO_TAKE_MS", &mut to_take),
-    ] {
-        let n = samples.len();
-        let (median, worst) = median_and_worst(samples);
-        let best = samples.first().copied().unwrap_or_default();
-        writeln!(
-            out,
-            "{name} n={n} best={best} median={median} worst={worst}"
-        )
-        .expect("stdout");
-    }
+    summaries(
+        &mut out,
+        [
+            ("KILL_TO_LEADER_ANSWER_MS", &mut from_kill),
+            ("LAST_RENEWAL_TO_TAKE_MS", &mut from_renewal),
+            ("FENCE_CLOSE_TO_TAKE_MS", &mut from_close),
+            ("STOP_TO_LEADER_ANSWER_MS", &mut from_stop),
+            ("STOP_TO_RELEASE_US", &mut to_release),
+            ("STOP_SIGNAL_TO_TAKE_MS", &mut to_take),
+        ],
+    );
     record.check().expect("the election's promise holds");
     writeln!(out, "LEADER_ANSWERS_RECORDED {}", record.len()).expect("stdout");
 }
@@ -491,4 +642,271 @@ async fn cpu_and_resident_memory_of_an_idle_leader_and_an_idle_follower() {
         "the idle leader kept its lease"
     );
     record.check().expect("the election's promise holds");
+}
+
+/// The longest run of samples in a row that met a condition, from the
+/// run's first sample to its last.
+#[derive(Default)]
+struct Stretch {
+    since: Option<Instant>,
+    longest: Duration,
+}
+
+impl Stretch {
+    fn read(&mut self, met: bool, at: Instant) {
+        if met {
+            let since = *self.since.get_or_insert(at);
+            self.longest = self.longest.max(at.duration_since(since));
+        } else {
+            self.since = None;
+        }
+    }
+}
+
+/// What a removed lease file costs, at the design's default settings or at
+/// the timings the environment names. Over `SMG_REPLICAS_ROUNDS` rounds
+/// (default 5) a replica starts over a new lease file and its first answer
+/// as the leader is timed from its start; a standby joins; the lease file
+/// is removed under the leader, at another point of the renew period each
+/// round; and both replicas are asked `Leader` every few milliseconds until
+/// one answers as the leader above the lost term and a renew deadline more.
+/// A removal is read four ways: the longest run of samples in which both
+/// answered as the leader, the longest in which neither did, the removal to
+/// the first answer above the lost term, and whether the election's promise
+/// held over the round's answers. A measurement, run by name with
+/// `--ignored`; it asserts nothing of the election, so it reads a binary
+/// that takes a removed record at once as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement for the Numbers table, run by name"]
+async fn a_lease_file_removed_under_a_live_leader_with_a_standby_looking() {
+    lost_under_a_live_leader("REMOVED").await;
+}
+
+/// The same rounds with the record's holder cleared in place, the term, the
+/// stamps and the duration kept, as a hand's patch of the holder leaves it:
+/// a write through the store, so no renewal in flight puts the holder back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement for the Numbers table, run by name"]
+async fn a_holder_cleared_in_place_under_a_live_leader_with_a_standby_looking() {
+    lost_under_a_live_leader("CLEARED").await;
+}
+
+/// The rounds of the two cells above; `label` names the loss and the
+/// printed lines.
+async fn lost_under_a_live_leader(label: &str) {
+    let mut out = std::io::stdout();
+    let settings = replicas::timings(ElectionSettings::default(), &mut out);
+    let rounds = rounds("SMG_REPLICAS_ROUNDS", 5);
+    let period = settings.renew_period;
+    let within = settings.duration + 2 * period + ROOM;
+    let (mut first, mut two_ms, mut nobody_ms, mut take_ms) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut with_two, mut broken) = (0u64, 0u64);
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lease = dir.path().join("lease");
+        let mut record = Record::default();
+        let started = Instant::now();
+        let mut replicas = vec![start(&format!("replica-{round}-a"), &lease, settings)];
+        agreed(&mut record, &mut replicas).await;
+        let first_ms = millis(started.elapsed());
+        tokio::time::sleep(spread(round, 333, period)).await;
+        replicas.push(start(&format!("replica-{round}-b"), &lease, settings));
+        // The term the loss is read against: the one both replicas agree on
+        // right before it.
+        let (_, term) = agreed(&mut record, &mut replicas).await;
+        tokio::time::sleep(spread(round, 0, period)).await;
+        if label == "CLEARED" {
+            // A compare and swap through the store: a renewal that lands
+            // first moves the record, and the clearing is tried again.
+            let mut store = FileLease::new(&lease);
+            loop {
+                let held = store.read().expect("the lease file reads");
+                let held = held.expect("the lease file holds a record");
+                let cleared = LeaseRecord {
+                    holder: String::new(),
+                    ..held.clone()
+                };
+                if store.write(Some(&held), &cleared).expect("the clearing") == Written::Done {
+                    break;
+                }
+            }
+        } else {
+            // The removal under the store's own lock, as a writer of the
+            // store moves the file: no renewal in flight puts the record
+            // back.
+            let lock = std::fs::File::create(dir.path().join("lease.lock")).expect("the lock");
+            lock.lock().expect("the store's lock");
+            std::fs::remove_file(&lease).expect("the removal");
+        }
+        let removed = Instant::now();
+        let (mut samples, mut both) = (0u64, 0u64);
+        let (mut two, mut nobody) = (Stretch::default(), Stretch::default());
+        let mut taken: Option<(Instant, u64)> = None;
+        loop {
+            let at = Instant::now();
+            let answers = record.sample(&mut replicas).await;
+            let leaders = answers.iter().filter(|a| a.info.is_leader).count();
+            samples += 1;
+            both += u64::from(leaders == 2);
+            two.read(leaders == 2, at);
+            nobody.read(leaders == 0, at);
+            if taken.is_none() {
+                taken = answers
+                    .iter()
+                    .find(|a| a.info.is_leader && a.info.term > term)
+                    .map(|a| (a.returned, a.info.term));
+            }
+            match taken {
+                Some((since, _)) if since.elapsed() >= settings.renew_deadline => break,
+                None if removed.elapsed() > within => break,
+                _ => tokio::time::sleep(Duration::from_millis(2)).await,
+            }
+        }
+        let Some((at, next)) = taken else {
+            writeln!(out, "{label} round={round} void: no take in {within:?}").expect("stdout");
+            continue;
+        };
+        let promise = if record.check().is_ok() {
+            "held"
+        } else {
+            broken += 1;
+            "broken"
+        };
+        with_two += u64::from(both > 0);
+        let (both_ms, none_ms, to_take_ms) = (
+            millis(two.longest),
+            millis(nobody.longest),
+            millis(at.duration_since(removed)),
+        );
+        writeln!(
+            out,
+            "{label} round={round} term={term}->{next} first_start_ms={first_ms} samples={samples} both={both} both_ms={both_ms} nobody_ms={none_ms} to_take_ms={to_take_ms} promise={promise}"
+        )
+        .expect("stdout");
+        first.push(first_ms);
+        two_ms.push(both_ms);
+        nobody_ms.push(none_ms);
+        take_ms.push(to_take_ms);
+    }
+    let counted = take_ms.len();
+    let names =
+        ["TWO_LEADERS_MS", "NOBODY_LEADS_MS", "TO_TAKE_MS"].map(|name| format!("{label}_{name}"));
+    summaries(
+        &mut out,
+        [
+            ("FIRST_START_TO_LEADER_ANSWER_MS", &mut first),
+            (names[0].as_str(), &mut two_ms),
+            (names[1].as_str(), &mut nobody_ms),
+            (names[2].as_str(), &mut take_ms),
+        ],
+    );
+    writeln!(
+        out,
+        "{label}_ROUNDS n={counted} with_two_leaders={with_two} promise_broken={broken}"
+    )
+    .expect("stdout");
+}
+
+/// What a leader's restart costs, at the design's default settings or at
+/// the timings the environment names. Over `SMG_REPLICAS_ROUNDS` rounds
+/// (default 5) a lone leader under an advertised identity is killed, at
+/// another point of its renew period each round, and started again at once;
+/// the kill to the new run's first answer as the leader is read by this
+/// test's clock, with the term before and after. A measurement, run by name
+/// with `--ignored`; it asserts nothing of the election, so it reads a
+/// binary that leads again under its earlier run's term, or one that takes
+/// with no wait, as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement for the Numbers table, run by name"]
+async fn restart_times_of_a_leader_under_its_identity() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let lease = dir.path().join("lease");
+    let mut out = std::io::stdout();
+    let settings = replicas::timings(ElectionSettings::default(), &mut out);
+    let rounds = rounds("SMG_REPLICAS_ROUNDS", 5);
+    let period = settings.renew_period;
+    let mut record = Record::default();
+    let mut replicas = vec![start_at("replica-a", &lease, settings)];
+    let (mut from_kill, mut same_term) = (Vec::new(), 0u64);
+    for round in 0..rounds {
+        let term = led(&mut record, &mut replicas).await.info.term;
+        tokio::time::sleep(spread(round, 0, period)).await;
+        let mut earlier = replicas.remove(0);
+        earlier.kill().expect("SIGKILL");
+        let at = Instant::now();
+        replicas.push(start_at("replica-a", &lease, settings));
+        let again = led(&mut record, &mut replicas).await;
+        let kill_ms = millis(again.returned.duration_since(at));
+        same_term += u64::from(again.info.term == term);
+        writeln!(
+            out,
+            "RESTART round={round} term={term}->{} from_kill_ms={kill_ms}",
+            again.info.term
+        )
+        .expect("stdout");
+        from_kill.push(kill_ms);
+    }
+    summaries(
+        &mut out,
+        [("RESTART_KILL_TO_LEADER_ANSWER_MS", &mut from_kill)],
+    );
+    writeln!(
+        out,
+        "RESTART_ROUNDS n={rounds} under_the_earlier_term={same_term}"
+    )
+    .expect("stdout");
+}
+
+/// What the restart's wait is for, at the same timings. Over the rounds a
+/// second process is started under a live leader's identity, at another
+/// point of the leader's renew period each round, and both are asked
+/// `Leader` every few milliseconds for a lease duration and a renew period
+/// more. A round is read two ways: the longest run of samples in which both
+/// answered as the leader, and whether the second process led at all. A
+/// measurement, run by name with `--ignored`; it asserts nothing of the
+/// election, so it reads a binary that takes with no wait as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement for the Numbers table, run by name"]
+async fn a_second_process_started_under_a_live_leaders_identity() {
+    let mut out = std::io::stdout();
+    let settings = replicas::timings(ElectionSettings::default(), &mut out);
+    let rounds = rounds("SMG_REPLICAS_ROUNDS", 5);
+    let period = settings.renew_period;
+    let (mut two_ms, mut second_led) = (Vec::new(), 0u64);
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lease = dir.path().join("lease");
+        let mut record = Record::default();
+        let mut replicas = vec![start_at("replica-a", &lease, settings)];
+        led(&mut record, &mut replicas).await;
+        tokio::time::sleep(spread(round, 0, period)).await;
+        replicas.push(start_at("replica-a", &lease, settings));
+        let started = Instant::now();
+        let (mut samples, mut both, mut led_too) = (0u64, 0u64, false);
+        let mut two = Stretch::default();
+        while started.elapsed() < settings.duration + period {
+            let at = Instant::now();
+            let mut leaders = 0;
+            for (place, replica) in replicas.iter_mut().enumerate() {
+                let leads = replica.leader().await.is_some_and(|info| info.is_leader);
+                leaders += usize::from(leads);
+                led_too |= leads && place == 1;
+            }
+            samples += 1;
+            both += u64::from(leaders == 2);
+            two.read(leaders == 2, at);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        second_led += u64::from(led_too);
+        writeln!(
+            out,
+            "TWIN round={round} samples={samples} both={both} both_ms={} second_led={led_too}",
+            millis(two.longest)
+        )
+        .expect("stdout");
+        two_ms.push(millis(two.longest));
+    }
+    summaries(&mut out, [("TWIN_TWO_LEADERS_MS", &mut two_ms)]);
+    writeln!(out, "TWIN_ROUNDS n={rounds} second_led={second_led}").expect("stdout");
 }

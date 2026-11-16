@@ -147,6 +147,15 @@ impl Config {
         if self.listeners.is_empty() {
             return Err(ConfigError::NoListeners);
         }
+        // A listener is told apart by its name: in a refusal, in a log
+        // line and by a setting that names it.
+        let mut names: Vec<&str> = Vec::with_capacity(self.listeners.len());
+        for listener in &self.listeners {
+            if names.contains(&listener.name.as_str()) {
+                return Err(ConfigError::ListenerNameShared(listener.name.clone()));
+            }
+            names.push(&listener.name);
+        }
         let mut mounted: BTreeMap<Scope, &str> = BTreeMap::new();
         for listener in &self.listeners {
             if listener.scopes.is_empty() {
@@ -210,7 +219,7 @@ impl Config {
 
 /// A configuration refused, by name. The last four come from the binary's
 /// command line, which maps one server identity and one client authority
-/// per scope onto the listeners; the five before them are the election's.
+/// per scope onto the listeners; the eight before them are the election's.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ConfigError {
     /// `controller_id` is empty.
@@ -226,6 +235,10 @@ pub enum ConfigError {
     /// A listener with an empty scope list.
     #[error("listener {0} mounts no scope")]
     ListenerWithoutScope(String),
+    /// Two listeners with one name: a listener is told apart by its name,
+    /// in a refusal, in a log line and by a setting that names it.
+    #[error("two listeners are named {0}: a listener's name is its own")]
+    ListenerNameShared(String),
     /// One scope on two listeners.
     #[error("scope {scope} is mounted on listeners {first} and {second}")]
     ScopeMountedTwice {
@@ -249,6 +262,15 @@ pub enum ConfigError {
         /// The listener that named it again.
         second: String,
     },
+    /// A listener named to take identities as told that the configuration
+    /// does not hold.
+    #[error("no listener is named {0:?}: identities are taken as told on a listener of the configuration")]
+    UnknownListener(String),
+    /// A listener named to take identities as told that verifies its
+    /// callers against a client CA: the verified subject is the principal,
+    /// and a listener has one credential rule.
+    #[error("listener {0} verifies its callers against a client CA: it takes no identity as told")]
+    AsToldBesideClientCa(String),
     /// A grace period of zero: a drain needs a bound above zero.
     #[error("the shutdown grace period is zero")]
     ZeroShutdownGrace,
@@ -375,6 +397,19 @@ pub(crate) mod tests {
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             election: Election::default(),
         }
+    }
+
+    /// A setting names a listener by its name, so no two share one.
+    #[test]
+    fn two_listeners_of_one_name_are_refused() {
+        let mut config = valid();
+        if let Some(second) = config.listeners.get_mut(1) {
+            second.name = "gateway".to_owned();
+        }
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::ListenerNameShared("gateway".to_owned()))
+        );
     }
 
     #[test]
