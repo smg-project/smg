@@ -153,6 +153,73 @@ mod tests {
     }
 
     #[test]
+    fn a_generation_prompt_keeps_the_end_alone() {
+        // The template ends every generation prompt with the last message's close and writes no
+        // opener: nothing before that close is kept or searched, on a first turn and after an
+        // assistant message alike.
+        let first = "<|message_user|>What is the capital of France?<|end_message|>";
+        let later = concat!(
+            "<|message_user|>Hi<|end_message|><|message_model|><|content_text|>Hello.",
+            "<|end_message|><|message_user|>And the capital of France?<|end_message|>"
+        );
+        for prompt in [first, later] {
+            assert_eq!(inkling2().replay(prompt), UNOPENED, "{prompt:?}");
+            assert_eq!(
+                run(prompt, &[OUTPUT]),
+                run(UNOPENED, &[OUTPUT]),
+                "{prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_a_table_or_its_variant_keeps_replays_as_the_whole_prompt() {
+        // A forced call's variant has no unopened row (the row's state is not a thought's) and
+        // walks what was kept, the close alone included: it rests where the whole prompt leaves
+        // it, whichever table kept the text.
+        let table = inkling2();
+        let variants = [
+            table.clone(),
+            table.clone().without_calls(),
+            table.clone().without_reasoning(),
+            table.clone().without_calls().without_reasoning(),
+            table.clone().with_forced_call(ForcedCall::Arguments),
+            table.clone().with_forced_call(ForcedCall::List),
+            table
+                .clone()
+                .with_forced_call(ForcedCall::Arguments)
+                .without_reasoning(),
+            table
+                .clone()
+                .with_forced_call(ForcedCall::List)
+                .without_reasoning(),
+        ];
+        let prompts = [
+            "<|message_user|>Hi<|end_message|>",
+            concat!(
+                "<|message_user|>Hi<|end_message|><|message_model|><|content_text|>Hello.",
+                "<|end_message|><|message_user|>More<|end_message|>"
+            ),
+            concat!(
+                "<|message_user|>Hi<|end_message|><|message_model|><|content_thinking|>Plan",
+                "<|end_message|><|message_model|><|content_text|>Hello.<|end_message|>",
+                "<|message_user|>More<|end_message|>"
+            ),
+        ];
+        for prompt in prompts {
+            for (number, variant) in variants.iter().enumerate() {
+                for kept in [variant.replay(prompt), table.replay(prompt)] {
+                    assert_eq!(
+                        variant.replayed(kept),
+                        variant.replayed(prompt),
+                        "variant {number}: {kept:?} kept of {prompt:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_continued_thought_goes_on_past_an_opener_said_again_inside_it() {
         // The last opener stands inside the thought the prompt left open, where no row reads it as
         // an opener: the replay starts at the message's own, so the output goes on as the thought
