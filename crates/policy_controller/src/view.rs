@@ -362,7 +362,7 @@ pub struct NamedHolder {
     pub predicted_blocks: u32,
 }
 
-impl NamedAffinity<'_> {
+impl<'a> NamedAffinity<'a> {
     /// Row `index`'s entry: what the host said the row holds when it is
     /// named, nothing held otherwise.
     #[inline]
@@ -373,12 +373,89 @@ impl NamedAffinity<'_> {
         else {
             return AffinityFacts::default();
         };
-        let holder = self.holders[at];
+        self.holders[at].facts()
+    }
+
+    /// One pass's reads of the rows, walked beside the rows the pass asks.
+    #[inline]
+    pub(crate) fn walk(self) -> NamedWalk<'a> {
+        NamedWalk(Walk::new(self.holders))
+    }
+}
+
+impl NamedHolder {
+    /// The row's entry of a column: what it holds by both readings, and
+    /// nothing said of its age or its index.
+    #[inline]
+    fn facts(self) -> AffinityFacts {
         AffinityFacts {
-            overlap_blocks: holder.overlap_blocks,
-            predicted_blocks: holder.predicted_blocks,
+            overlap_blocks: self.overlap_blocks,
+            predicted_blocks: self.predicted_blocks,
             ..AffinityFacts::default()
         }
+    }
+}
+
+/// A forward cursor over a list its host keeps ascending by row, for one
+/// pass that asks its rows in order: a read is a compare, and each entry is
+/// passed once. A row before the cursor starts it over by a search, so rows
+/// asked in any order read as a search reads them.
+#[derive(Debug)]
+pub(crate) struct Walk<'a, T> {
+    list: &'a [T],
+    at: usize,
+    last: u32,
+}
+
+impl<'a, T: Copy> Walk<'a, T> {
+    pub(crate) fn new(list: &'a [T]) -> Self {
+        Self {
+            list,
+            at: 0,
+            last: 0,
+        }
+    }
+
+    /// The entry of row `index`, where the list names it; `row` reads an
+    /// entry's row.
+    #[inline]
+    pub(crate) fn find(&mut self, index: u32, row: impl Fn(&T) -> u32) -> Option<T> {
+        // The cursor stands at the first entry at or past the last row
+        // asked, so a row before that one is looked for again.
+        if index < self.last {
+            self.at = self.behind(index, &row);
+        }
+        self.last = index;
+        while let Some(entry) = self.list.get(self.at) {
+            let at = row(entry);
+            if at >= index {
+                return (at == index).then_some(*entry);
+            }
+            self.at += 1;
+        }
+        None
+    }
+
+    /// Where the entries at or past row `index` start: the search a row
+    /// behind the cursor costs, out of the walk's own line.
+    #[cold]
+    #[inline(never)]
+    fn behind(&self, index: u32, row: &impl Fn(&T) -> u32) -> usize {
+        self.list.partition_point(|entry| row(entry) < index)
+    }
+}
+
+/// One pass's reads of the rows a host named, in the pass's own order.
+#[derive(Debug)]
+pub(crate) struct NamedWalk<'a>(Walk<'a, NamedHolder>);
+
+impl NamedWalk<'_> {
+    /// Row `index`'s entry, as [`NamedAffinity::entry`] reads it.
+    #[inline]
+    pub(crate) fn entry(&mut self, index: u32) -> AffinityFacts {
+        self.0
+            .find(index, |holder| holder.row)
+            .map_or_else(AffinityFacts::default, NamedHolder::facts)
     }
 }
 
@@ -407,6 +484,36 @@ impl Feed<'_> {
         match self {
             Self::Column(column) => column[index as usize],
             Self::Named(named) => named.entry(index),
+        }
+    }
+}
+
+impl<'a> Feed<'a> {
+    /// One pass's reads of the feed: the column by index, or a walk of the
+    /// rows named. Taken where a pass starts, so no two passes share a
+    /// cursor.
+    pub(crate) fn reads(self) -> Reads<'a> {
+        match self {
+            Self::Column(column) => Reads::Column(column),
+            Self::Named(named) => Reads::Named(named.walk()),
+        }
+    }
+}
+
+/// What one pass reads of what the candidates hold: see [`Feed::reads`].
+#[derive(Debug)]
+pub(crate) enum Reads<'a> {
+    Column(&'a [AffinityFacts]),
+    Named(NamedWalk<'a>),
+}
+
+impl Reads<'_> {
+    /// Row `index`'s entry, as [`Feed::entry`] reads it.
+    #[inline]
+    pub(crate) fn entry(&mut self, index: u32) -> AffinityFacts {
+        match self {
+            Self::Column(column) => column[index as usize],
+            Self::Named(walk) => walk.entry(index),
         }
     }
 }
@@ -573,7 +680,8 @@ pub struct RequestFacts<'a> {
     /// decision is made over: the one column the affinity stages read, in
     /// the candidates' own order. It is EMPTY or holds exactly one entry a
     /// candidate; the engine refuses any other before a stage runs. An
-    /// empty column is the host's word that it holds nothing: it reads as
+    /// empty column is the host's word that it holds nothing, unless the
+    /// host names rows in its place ([`RequestFacts::named`]): it reads as
     /// nothing held for every candidate, under a profile that declared
     /// [`Needs::affinity`](crate::Needs::affinity) as under one that did
     /// not, and the engine neither refuses it nor counts it. A host that
@@ -853,6 +961,40 @@ mod tests {
             ..RequestFacts::default()
         };
         let _ = facts.affinity_at(1);
+    }
+
+    /// A pass's walk of the rows named reads each row as the search does, in
+    /// whatever order the pass asks: ascending, a row twice, a row behind
+    /// the cursor.
+    #[test]
+    fn a_walk_of_the_rows_named_reads_each_row_as_the_search_does() {
+        let holders = [(1, 4, 0), (4, 9, 2), (5, 1, 7), (9, 3, 0)].map(
+            |(row, overlap_blocks, predicted_blocks)| NamedHolder {
+                row,
+                overlap_blocks,
+                predicted_blocks,
+            },
+        );
+        let named = NamedAffinity {
+            holders: &holders,
+            ..NamedAffinity::default()
+        };
+        let orders: [&[u32]; 4] = [
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            &[1, 1, 4, 4, 9, 9],
+            &[10, 9, 5, 4, 1, 0],
+            &[5, 0, 9, 4, 4, 1, 7, 10, 5],
+        ];
+        for order in orders {
+            let mut walk = named.walk();
+            for &row in order {
+                assert_eq!(walk.entry(row), named.entry(row), "row {row} of {order:?}");
+            }
+        }
+        // No row named: nothing held at any row.
+        let mut walk = NamedAffinity::default().walk();
+        assert_eq!(walk.entry(0), AffinityFacts::default());
+        assert_eq!(walk.entry(3), AffinityFacts::default());
     }
 
     /// Rows named in the column's place read through the same accessor: a
