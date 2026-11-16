@@ -580,9 +580,10 @@ fn report(
 /// expires by its duration.
 fn give_up(elector: &mut Elector) {
     let period = elector.settings().renew_period;
-    // A holder whose release finds the record moved lost the lease after
-    // its last step: it has none to release, and says what a step that
-    // read the loss says.
+    // A holder whose release finds the record moved has none to release,
+    // and says what a step that read the loss says. It lost the lease after
+    // its last step, or an earlier attempt of this stop stored the release
+    // with its answer lost and the next candidate took the lease since.
     let held = elector.is_holder().then(|| elector.fence().term());
     for attempt in 1..=RELEASE_ATTEMPTS {
         let began = Instant::now();
@@ -1495,9 +1496,10 @@ mod tests {
     }
 
     /// A leader whose lease moved after its last step finds it at its
-    /// stop's release: it releases nothing and says the lease moved, as a
-    /// step that read the loss would. A replica that held nothing at its
-    /// stop says nothing.
+    /// stop's release: it releases nothing and says the lease moved under
+    /// the term it held, as a step that read the loss would. A replica that
+    /// held nothing at its stop says nothing of a move, and neither does a
+    /// holder whose release lands.
     #[test]
     fn a_stop_that_finds_the_lease_moved_says_so_and_releases_nothing() {
         const MOVED: &str = "the lease moved; the fence is closed";
@@ -1524,6 +1526,15 @@ mod tests {
         store.put(&theirs);
         let (moved, text) = leading.stopped_with(MOVED);
         assert_eq!(moved, 1, "{text}");
+        // The line carries the term this replica held, not the record's.
+        let line = text
+            .lines()
+            .find(|line| line.contains(MOVED))
+            .expect("the line");
+        assert!(
+            line.split_whitespace().any(|field| field == "term=1"),
+            "{line}"
+        );
         assert!(!text.contains("the lease is released"), "{text}");
         let mut lease = store.clone();
         assert_eq!(lease.read().expect("a read"), Some(theirs));
@@ -1535,6 +1546,17 @@ mod tests {
         until("the first look", || stood.borrow().looked);
         let (moved, text) = following.stopped_with(MOVED);
         assert_eq!(moved, 0, "{text}");
+
+        // A holder that stops over a quiet store releases, and says nothing
+        // of a move.
+        let quiet = Elector::new(Box::new(MemoryLease::new()), "d@127.0.0.1:4", settings)
+            .expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let released = looping(quiet, standing);
+        until("the take", || stood.borrow().holder == "d@127.0.0.1:4");
+        let (moved, text) = released.stopped_with(MOVED);
+        assert_eq!(moved, 0, "{text}");
+        assert!(text.contains("the lease is released"), "{text}");
     }
 
     #[test]
