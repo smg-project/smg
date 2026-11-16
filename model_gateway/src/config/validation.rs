@@ -358,7 +358,42 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
             reason,
         ));
     }
+    // A query or a fragment is not carried. Every URL the gateway builds
+    // for an HTTP worker, its own or a provider's, is the address as given
+    // with the route written behind it: a query takes every route into
+    // itself and a client drops a fragment with the route, so no request
+    // reaches the route it names. Refused here, behind every refusal above
+    // (what the two readers read apart is named by its scheme alone). A
+    // gRPC worker's call names its method as its path and sends neither:
+    // it is served as before, and its registration says once that the part
+    // is not sent.
+    if matches!(scheme, "http" | "https") {
+        if let Some(part) = part_behind_the_path(&dialled) {
+            return Err(ConfigError::invalid_value(
+                "worker_url",
+                named_in_a_refusal(url),
+                format!(
+                    "a worker URL takes no {part}: the gateway writes each route behind the \
+                     address, so a {part} is not carried to the worker"
+                ),
+            ));
+        }
+    }
     Ok(())
+}
+
+/// The part a worker address holds behind its path, by name: its query, or
+/// its fragment where it holds no query; `None` where it holds neither. No
+/// request carries either to a worker: the gateway writes each route behind
+/// an HTTP worker's address, and a gRPC call names its method.
+pub(crate) fn part_behind_the_path(dialled: &::url::Url) -> Option<&'static str> {
+    if dialled.query().is_some() {
+        Some("query")
+    } else if dialled.fragment().is_some() {
+        Some("fragment")
+    } else {
+        None
+    }
 }
 
 /// Why the worker URL door refuses `url`, `None` when it takes it: the
@@ -4013,9 +4048,9 @@ mod tests {
     /// What the two readings agree on stays accepted, however it is
     /// written: a userinfo (an `@` inside it too), the scheme's own port
     /// written out or left out, a name in upper case or percent-encoded,
-    /// an IPv4 address as one number, an IPv6 literal, a query that holds
-    /// an `@`, a name outside ASCII under `tcp` or `grpc` in either case, a
-    /// backslash behind the authority or under `grpc`.
+    /// an IPv4 address as one number, an IPv6 literal, a name outside ASCII
+    /// under `tcp` or `grpc` in either case, and under `grpc` a query that
+    /// holds an `@` or a backslash before the host.
     #[test]
     fn a_worker_url_both_readings_agree_on_is_accepted() {
         for url in [
@@ -4033,7 +4068,6 @@ mod tests {
             "grpc://Worker:50051",
             "grpc://[fd00::1]:50051",
             "grpc://worker:50051?token=a@b",
-            "http://worker:8000?x=a\\@b",
             "grpc://user\\@worker:50051",
             "tcp://10.0.0.5:31000",
             "tcp://w\u{f6}rker.example:31000",
@@ -4090,11 +4124,65 @@ mod tests {
             "http://worker:3000//",
             "http://user:pass@worker:3000/",
             "https://worker.example.com/v1/",
-            "http://worker:3000/?token=a@b/",
             "http://2130706433:8000/",
         ] {
             validate_worker_url(url).expect(url);
         }
+    }
+
+    /// A query or a fragment is refused under `http` and `https`: every
+    /// URL the gateway builds for such a worker is the address with the
+    /// route written behind it, so a query takes the route into itself and
+    /// a client drops a fragment with the route. The refusal names the
+    /// address masked and shows neither part. Under `grpc` a call's path is
+    /// its method and neither is sent: such an address is taken as before.
+    #[test]
+    fn a_worker_url_with_a_query_or_a_fragment_is_refused_under_http() {
+        for (url, part) in [
+            ("http://worker:8000?x=a\\@b", "query"),
+            ("http://worker:3000/?token=a@b/", "query"),
+            ("http://worker:8000?", "query"),
+            ("https://worker.example.com/v1?api-version=1", "query"),
+            ("http://user:s3cret@worker:8000/v1?token=s3cret", "query"),
+            ("http://worker:8000#section", "fragment"),
+            ("http://worker:8000/v1#", "fragment"),
+            ("http://worker:8000?x=1#y", "query"),
+        ] {
+            let text = validate_worker_url(url).expect_err(url).to_string();
+            let reason = format!(
+                "a worker URL takes no {part}: the gateway writes each route behind the address, \
+                 so a {part} is not carried to the worker"
+            );
+            assert!(
+                text.starts_with("Invalid value for field 'worker_url': "),
+                "{url}: {text}"
+            );
+            assert!(text.contains(&reason), "{url}: {text}");
+            for shown in ["?", "#", "s3cret", "a@b", "section"] {
+                assert!(
+                    !text.contains(shown),
+                    "{url}: the refusal shows '{shown}': {text}"
+                );
+            }
+        }
+        let credentialed = validate_worker_url("http://user:s3cret@worker:8000/v1?token=s3cret")
+            .expect_err("a query")
+            .to_string();
+        assert!(credentialed.contains("***@worker:8000"), "{credentialed}");
+
+        validate_worker_url("grpc://worker:50051?token=a@b").expect("a query under grpc");
+
+        // A manifest's address with no scheme is asked under `http`.
+        let refusal = listed_worker_url_refusal("decode.internal:8000/v1?next=http://x")
+            .expect("a query under no scheme");
+        assert!(
+            refusal.starts_with("a worker URL takes no query"),
+            "{refusal}"
+        );
+        assert_eq!(
+            listed_worker_url_refusal("grpc://decode.internal:8000/v1?next=http://x"),
+            None
+        );
     }
 
     /// The refusal ends a start too: the configuration's worker URLs go
