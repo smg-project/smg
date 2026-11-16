@@ -337,9 +337,12 @@ impl ShortPieceTable {
     /// of this table has just missed, at the probe's vacancy, and answers
     /// true: the key, the count and the inline ids of an entry read the same
     /// in every table, so the copy is the insert. False, with nothing stored,
-    /// for an entry whose ids are in the other table's spill, for a table at
-    /// its fill bound and for a vacancy that is not of the table as it is:
-    /// [`Self::insert_at`] takes those.
+    /// for an entry whose ids are in the other table's spill, for a table
+    /// grown since the probe or at its fill bound, and for a slot taken
+    /// since: [`Self::insert_at`] takes those. As for [`Self::insert_at`],
+    /// the vacancy must be of this table as it is, with no [`Self::clear`]
+    /// between the probe that made it and this call: a cleared table keeps
+    /// its slots, and the copy would sit off its key's probe path.
     #[inline(always)]
     pub(super) fn keep(&mut self, vacancy: Vacancy, entry: &Entry) -> bool {
         let slot = vacancy.slot as usize;
@@ -350,6 +353,10 @@ impl ShortPieceTable {
         {
             return false;
         }
+        debug_assert!(
+            self.occupied_up_to(vacancy.key, slot),
+            "a vacancy of the table as it is: no clear between the probe and the copy"
+        );
         self.tags[slot] = vacancy.tag;
         self.entries[slot] = *entry;
         self.len += 1;
