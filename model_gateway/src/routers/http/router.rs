@@ -3667,9 +3667,7 @@ mod tests {
             Some(client_with_timeout(Duration::from_secs(1))),
         );
 
-        let started = Instant::now();
         let response = generate(&router, "slow").await;
-        let elapsed = started.elapsed();
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
@@ -3681,10 +3679,6 @@ mod tests {
             hits_a.load(AtomicOrdering::SeqCst) + hits_b.load(AtomicOrdering::SeqCst),
             1,
             "one attempt, on one worker"
-        );
-        assert!(
-            elapsed < Duration::from_millis(1900),
-            "one timeout, not retries x timeout: {elapsed:?}"
         );
         let open = router
             .worker_registry

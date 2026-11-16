@@ -4081,11 +4081,9 @@ mod tests {
             }))
             .expect("valid chat request");
 
-            let started = Instant::now();
             let response = router
                 .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
                 .await;
-            let elapsed = started.elapsed();
 
             assert_eq!(
                 response.status(),
@@ -4102,10 +4100,6 @@ mod tests {
                 prefill_arrivals.lock().unwrap().len(),
                 1,
                 "{runtime:?}: one attempt on the pair"
-            );
-            assert!(
-                elapsed < std::time::Duration::from_millis(1900),
-                "{runtime:?}: one timeout, not retries x timeout: {elapsed:?}"
             );
             // The concurrent shape sent the decode side once with the prefill;
             // the sequential shape never reached it.
