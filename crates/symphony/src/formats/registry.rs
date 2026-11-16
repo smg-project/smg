@@ -703,6 +703,101 @@ mod tests {
         );
     }
 
+    /// A checkpoint whose own template is not its family's. It opens every turn with an open
+    /// mark, the role, a separator, a two-character id it draws on each render and a close mark,
+    /// and it writes a call as tagged JSON. Its group names the table that reads what that
+    /// template writes, and the close mark as the turn opener: the last fixed text before the
+    /// model's own, so the id is the template's framing and no text the answer goes on with.
+    /// The first turn below is an assistant turn of that template's recorded render, fed as the
+    /// prompt up to its close mark; the second answer is one such a checkpoint gave a request
+    /// with tools.
+    #[test]
+    fn a_checkpoint_with_its_own_template_reads_with_the_table_that_template_writes() {
+        use crate::{
+            engine::Engine,
+            event::{Event, Events},
+            format::Replay,
+            input::{EngineFinish, Input},
+            parser::Parser,
+            testing::arguments_of,
+            Declared,
+        };
+        let format = for_model("ibm-granite/granite-4.1-3b-llmon-preview").expect("a table");
+        let opened = "<|open|>assistant<|:|>°ü<|close|>";
+        let turns = [
+            (
+                concat!(
+                    r#"<tool_call>{"name": "get_weather", "arguments": "#,
+                    r#"{"city": "Paris", "unit": "celsius"}}</tool_call>"#
+                ),
+                "get_weather",
+                r#"{"city": "Paris", "unit": "celsius"}"#,
+            ),
+            (
+                concat!(
+                    r#"<tool_call>{"name": "get_stock_info", "arguments": "#,
+                    r#"{"company_name": "Apple Inc.", "detail_level": "detailed"}}</tool_call>"#
+                ),
+                "get_stock_info",
+                r#"{"company_name": "Apple Inc.", "detail_level": "detailed"}"#,
+            ),
+        ];
+        for (answer, name, arguments) in turns {
+            let mut parser = Engine::new(format.clone(), Declared::default());
+            let mut out = Events::new();
+            parser
+                .feed(
+                    Input::Prompt {
+                        token_ids: &[],
+                        text: opened,
+                    },
+                    &mut out,
+                )
+                .expect("prompt");
+            parser
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text: answer,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("delta");
+            parser
+                .feed(
+                    Input::End {
+                        finish: EngineFinish::Stop,
+                    },
+                    &mut out,
+                )
+                .expect("end");
+            let events = out.into_owned().drain();
+            let names: Vec<&str> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::ToolCallStart { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(names, [name]);
+            assert_eq!(arguments_of(&events, 0), arguments);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Content(_))),
+                "{name}"
+            );
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
+                "{name}"
+            );
+        }
+        assert_eq!(format.name(), "qwen2.5");
+        assert_eq!(format.turn_opener(), Some("<|close|>"));
+        assert_eq!(format.replayed(opened), Replay::default());
+    }
+
     /// MiniMax-M3.1-Flash is a checkpoint of the MiniMax-M3 group (the
     /// MiniMax M3 section of `docs/tables.md`: the same tokenizer and wire,
     /// a template that differs only outside the wire), so the `minimax_m3`
