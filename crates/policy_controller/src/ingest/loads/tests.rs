@@ -579,6 +579,37 @@ async fn the_poll_waits_the_interval_between_calls() {
     assert_eq!(probe.polls().len(), 2, "the interval passed: one call");
 }
 
+/// The largest interval the flag holds is one the clock cannot add to the
+/// present. An engine is then polled once and never again, a rank its
+/// stream serves counts its skipped poll once, and no tick stops there.
+#[tokio::test(start_paused = true)]
+async fn an_interval_the_clock_cannot_hold_polls_an_engine_once_and_no_tick_stops() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    ready(&store, "grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0);
+    let streamed = ready(&store, "grpc://b:1", "grpc://b:1", 0, 1, WireModes::GRPC, 0);
+    let driver = driver(&store, &probe, Duration::from_secs(u64::MAX));
+    let mut schedule = Schedule::default();
+    let record = LoadRow {
+        running: 1,
+        ..LoadRow::default()
+    };
+
+    // Three ticks an hour apart, the second engine's stream never stopping.
+    for _ in 0..3 {
+        store.record(streamed, 0, record, now(), LoadSource::Stream);
+        tick(&driver, &mut schedule).await;
+        tokio::time::advance(Duration::from_secs(3_600)).await;
+    }
+
+    assert_eq!(probe.polls().len(), 1, "the first tick's call and no other");
+    assert_eq!(
+        driver.stats().suppressed.load(Ordering::Relaxed),
+        1,
+        "the skipped poll counted once"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_engine_without_a_servicer_is_scraped_at_its_own_interval() {
     let store = Arc::new(MemoryStore::new());
