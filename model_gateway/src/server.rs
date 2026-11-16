@@ -59,10 +59,11 @@ mod rate_limit_document;
 pub(crate) mod tls;
 
 // The HTTP client constructors and the process crypto provider they install
-// first live beside the private-key-file check in `tls`; callers read them as
-// `server::http_client()` and its siblings.
-pub use tls::{blocking_http_client, http_client, http_client_builder, install_crypto_provider};
-
+// first live in the worker tree, which builds the worker-directed clients
+// with them; callers read them as `server::http_client()` and its siblings.
+pub use crate::worker::connection::client_factory::{
+    blocking_http_client, http_client, http_client_builder, install_crypto_provider,
+};
 use crate::{
     admin::{
         json::AdminJson,
