@@ -2559,81 +2559,34 @@ impl Metrics {
         // The handles, built the first time a stream has something for
         // each of them; the model label is interned once per build.
         let model = || intern_model_label(model_id);
-        let ttft_histogram = || {
+        let duration_histogram = |name: &'static str| {
             histogram!(
-                "smg_router_ttft_seconds",
+                name,
                 "router_type" => router_type,
                 "backend_type" => backend_type,
                 "model" => model(),
                 "endpoint" => endpoint
             )
         };
-        let tpot_histogram = || {
-            histogram!(
-                "smg_router_tpot_seconds",
-                "router_type" => router_type,
-                "backend_type" => backend_type,
-                "model" => model(),
-                "endpoint" => endpoint
-            )
-        };
-        let first_token_histogram = || {
-            histogram!(
-                TIME_TO_FIRST_TOKEN_SECONDS,
-                "router_type" => router_type,
-                "backend_type" => backend_type,
-                "model" => model(),
-                "endpoint" => endpoint
-            )
-        };
-        let per_output_token_histogram = || {
-            histogram!(
-                REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS,
-                "router_type" => router_type,
-                "backend_type" => backend_type,
-                "model" => model(),
-                "endpoint" => endpoint
-            )
-        };
-        let generation_histogram = || {
-            histogram!(
-                "smg_router_generation_duration_seconds",
-                "router_type" => router_type,
-                "backend_type" => backend_type,
-                "model" => model(),
-                "endpoint" => endpoint
-            )
-        };
-        let input_counter = || {
+        let ttft_histogram = || duration_histogram("smg_router_ttft_seconds");
+        let tpot_histogram = || duration_histogram("smg_router_tpot_seconds");
+        let first_token_histogram = || duration_histogram(TIME_TO_FIRST_TOKEN_SECONDS);
+        let per_output_token_histogram =
+            || duration_histogram(REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS);
+        let generation_histogram = || duration_histogram("smg_router_generation_duration_seconds");
+        let tokens_counter = |token_type: &'static str| {
             counter!(
                 "smg_router_tokens_total",
                 "router_type" => router_type,
                 "backend_type" => backend_type,
                 "model" => model(),
                 "endpoint" => endpoint,
-                "token_type" => metrics_labels::TOKEN_INPUT
+                "token_type" => token_type
             )
         };
-        let output_counter = || {
-            counter!(
-                "smg_router_tokens_total",
-                "router_type" => router_type,
-                "backend_type" => backend_type,
-                "model" => model(),
-                "endpoint" => endpoint,
-                "token_type" => metrics_labels::TOKEN_OUTPUT
-            )
-        };
-        let cached_counter = || {
-            counter!(
-                "smg_router_tokens_total",
-                "router_type" => router_type,
-                "backend_type" => backend_type,
-                "model" => model(),
-                "endpoint" => endpoint,
-                "token_type" => metrics_labels::TOKEN_CACHED
-            )
-        };
+        let input_counter = || tokens_counter(metrics_labels::TOKEN_INPUT);
+        let output_counter = || tokens_counter(metrics_labels::TOKEN_OUTPUT);
+        let cached_counter = || tokens_counter(metrics_labels::TOKEN_CACHED);
 
         if !handles::keep_handles() {
             if let Some(ttft) = ttft {
