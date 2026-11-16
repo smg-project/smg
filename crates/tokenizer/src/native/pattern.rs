@@ -643,6 +643,11 @@ enum Matcher {
 /// matcher recursed with a continuation (an alternative, a greedy run) is an
 /// entry on an explicit stack of [`Choice`]s instead of a stack frame.
 #[derive(Debug, Clone, Copy)]
+// A plain tag byte. Left to the default layout the tag hides in the spare
+// values of the widest op's payload (the lookahead's end), and the program
+// loop decodes it at every op: a tenth of the instructions of an encode
+// that runs the program.
+#[repr(u8)]
 enum Op {
     /// One character of the class.
     Char(usize),
