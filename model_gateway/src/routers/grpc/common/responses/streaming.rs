@@ -853,21 +853,6 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    pub fn emit_mcp_call_arguments_delta(
-        &mut self,
-        output_index: usize,
-        item_id: &str,
-        delta: &str,
-    ) -> serde_json::Value {
-        json!({
-            "type": McpEvent::CALL_ARGUMENTS_DELTA,
-            "sequence_number": self.next_sequence(),
-            "output_index": output_index,
-            "item_id": item_id,
-            "delta": delta
-        })
-    }
-
     pub fn emit_mcp_call_arguments_done(
         &mut self,
         output_index: usize,
@@ -1880,8 +1865,28 @@ impl ResponseStreamEventEmitter {
         }
     }
 
-    /// One fragment of a call's arguments under `kind`, sent as
-    /// [`ArgumentsDelta`]; a failed send is logged, not returned.
+    /// One fragment of a call's arguments under `kind` (a function call's
+    /// event name or an MCP call's), sent as [`ArgumentsDelta`].
+    pub async fn send_arguments_delta(
+        &mut self,
+        kind: &'static str,
+        delta: &str,
+        output_index: usize,
+        item_id: &str,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        let event = ArgumentsDelta {
+            kind,
+            sequence_number: self.next_sequence(),
+            output_index,
+            item_id,
+            delta,
+        };
+        self.send_typed(kind, &event, tx).await
+    }
+
+    /// [`Self::send_arguments_delta`] for the streams that log a failed send
+    /// instead of ending on it.
     pub async fn send_arguments_delta_best_effort(
         &mut self,
         kind: &'static str,
@@ -1890,14 +1895,10 @@ impl ResponseStreamEventEmitter {
         item_id: &str,
         tx: &SseSender,
     ) {
-        let event = ArgumentsDelta {
-            kind,
-            sequence_number: self.next_sequence(),
-            output_index,
-            item_id,
-            delta,
-        };
-        if let Err(e) = self.send_typed(kind, &event, tx).await {
+        if let Err(e) = self
+            .send_arguments_delta(kind, delta, output_index, item_id, tx)
+            .await
+        {
             tracing::debug!("Failed to send event (likely client disconnect): {}", e);
         }
     }
