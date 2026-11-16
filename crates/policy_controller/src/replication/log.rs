@@ -155,6 +155,9 @@ struct Ring {
     /// The leader's place for the next write, while a standby applies the
     /// leader's event.
     adopting: Option<Position>,
+    /// How many places a standby has asked for. A guard gives the pending
+    /// place up while its own is the last asked for.
+    adoptions: u64,
     /// Whether the store leads the log's term: from its take until it
     /// follows another history.
     leads: bool,
@@ -269,6 +272,7 @@ impl Log {
                 loads: Kept::of(loads),
                 head: Position::default(),
                 adopting: None,
+                adoptions: 0,
                 leads: false,
                 unnamed: 0,
                 first: Position::default(),
@@ -301,9 +305,8 @@ impl Log {
     /// draws, so that a place of another run names no write of this one.
     /// The head of every kind is that place under no term, and the next
     /// write follows it: from there the log is its store's whole history
-    /// ([`Log::first`]). The number is one of the store's own line, so a
-    /// restart at another store's place under no term stands past it
-    /// ([`Log::restart`]).
+    /// ([`Log::first`]). The number is one of the store's own line: after
+    /// a restart below it, a write under no term is numbered past it.
     #[must_use]
     pub fn starting_after(mut self, first: u64) -> Self {
         let ring = self.ring.get_mut();
@@ -639,7 +642,12 @@ impl Log {
             return Err(Lost);
         }
         ring.adopting = Some(at);
-        Ok(Adopting { log: self, at })
+        ring.adoptions += 1;
+        Ok(Adopting {
+            log: self,
+            at,
+            nth: ring.adoptions,
+        })
     }
 
     /// Start again at `at`, the position of a snapshot this store was
@@ -651,14 +659,23 @@ impl Log {
     /// the restart, and none a write of its own took under no term: it is
     /// numbered past both.
     ///
-    /// A snapshot's place under no term is another store's number. Where
-    /// this store's own line reached it, the log stands at the next number
-    /// of that line instead, and that is the head: a reader of the own
-    /// write that stood there is [`Lost`].
-    pub fn restart(&self, mut at: Position) {
+    /// Refused as an event of that term would be ([`Log::adopt`]): a place
+    /// under no term, a term below the highest the log has seen, and the
+    /// term the store leads. The log is then as it was.
+    pub fn restart(&self, at: Position) -> Result<(), Lost> {
+        self.restart_untold(at)?;
+        self.tell();
+        Ok(())
+    }
+
+    /// [`Log::restart`] with its telling left out: for a store that
+    /// restores inside its own locks and tells at their release
+    /// ([`Journal::released`]).
+    fn restart_untold(&self, at: Position) -> Result<(), Lost> {
         let mut ring = self.ring.lock();
-        if at.term == 0 && at.seq != 0 {
-            at.seq = ring.fresh(at.seq);
+        let term = self.term.load(Ordering::Relaxed);
+        if at.term == 0 || at.term < term || (ring.leads && at.term == term) {
+            return Err(Lost);
         }
         ring.watched.restart(at);
         ring.loads.restart(at);
@@ -666,16 +683,21 @@ impl Log {
         ring.adopting = None;
         self.follow(&mut ring, at);
         self.moved(&ring);
-        drop(ring);
-        self.tell();
+        Ok(())
     }
 }
 
 /// One leader's event being applied to a standby's store ([`Log::adopt`]).
+/// The place is this guard's own to give up: an applier that keeps one
+/// binding for its guards makes the next guard before the last one drops,
+/// and the last one leaves the next one's place.
 #[derive(Debug)]
+#[must_use = "the place is given up when the guard drops"]
 pub struct Adopting<'a> {
     log: &'a Log,
     at: Position,
+    /// Which of the log's adoptions this is.
+    nth: u64,
 }
 
 impl Adopting<'_> {
@@ -695,19 +717,30 @@ impl Adopting<'_> {
     /// the log.
     pub fn mark(&self) {
         let mut ring = self.log.ring.lock();
-        if let Some(at) = ring.adopting.take() {
+        if let Some(at) = self.pending(&mut ring) {
             self.log.follow(&mut ring, at);
             self.log.append(&mut ring, at, Event::Term);
         }
         drop(ring);
         self.log.tell();
     }
+
+    /// The place this guard asked for, taken from the log: none once a
+    /// write took it or a later guard asked for its own.
+    fn pending(&self, ring: &mut Ring) -> Option<Position> {
+        if ring.adoptions == self.nth {
+            ring.adopting.take()
+        } else {
+            None
+        }
+    }
 }
 
 impl Drop for Adopting<'_> {
     fn drop(&mut self) {
         // A place no write took is not kept for a later one.
-        self.log.ring.lock().adopting = None;
+        let mut ring = self.log.ring.lock();
+        self.pending(&mut ring);
     }
 }
 
@@ -780,6 +813,10 @@ impl Journal for Log {
 
     fn released(&self) {
         self.tell();
+    }
+
+    fn restart(&self, at: Position) -> bool {
+        self.restart_untold(at).is_ok()
     }
 }
 
@@ -1277,7 +1314,7 @@ mod tests {
         log.adopt(at(7, 3)).expect("the next position").mark();
         assert_eq!(told(), (3, at(7, 3)));
         apply(&log, at(8, 3), 3);
-        log.restart(at(11, 4));
+        log.restart(at(11, 4)).expect("a place the log takes");
         assert_eq!(told(), (4, at(11, 4)));
     }
 
@@ -1361,7 +1398,7 @@ mod tests {
         assert_eq!(reader.reads_beside_the_lock(&log), Some(Ok(vec![])));
         // And a restart, which writes no entry: the reader stood
         // elsewhere, and hears it at each read from there.
-        log.restart(at(11, 4));
+        log.restart(at(11, 4)).expect("a place the log takes");
         assert_eq!(reader.reads(&log, 8), Err(Lost));
         assert_eq!(reader.reads(&log, 8), Err(Lost));
     }
@@ -1446,7 +1483,7 @@ mod tests {
         // takes it. It joined from a snapshot at the leader's first take.
         let follower = Log::new(16, 16);
         follower.term_rose(3);
-        follower.restart(at(2, 4));
+        follower.restart(at(2, 4)).expect("a place the log takes");
         applies(&follower, &led[2..]);
         assert_eq!(follower.head(All), leader.head(All));
         assert_eq!(follower.head(Watched), leader.head(Watched));
@@ -1477,13 +1514,25 @@ mod tests {
         // A term below one the log has seen, wherever its head stands.
         let log = Log::new(8, 8);
         log.term_rose(7);
-        log.restart(at(10, 6));
         assert_eq!(
-            log.adopt(at(11, 6)).err(),
+            log.adopt(at(2, 6)).err(),
             Some(Lost),
             "below a term the log took"
         );
-        assert!(log.adopt(at(11, 7)).is_ok());
+        // A restart is refused as the event is, and leaves the log as it was.
+        assert_eq!(
+            log.restart(at(10, 6)),
+            Err(Lost),
+            "below a term the log took"
+        );
+        assert_eq!(
+            log.restart(at(10, 7)),
+            Err(Lost),
+            "the term the store leads"
+        );
+        assert_eq!(log.restart(at(10, 0)), Err(Lost), "no term");
+        assert_eq!((log.head(All), log.followed()), (at(1, 7), None));
+        assert!(log.adopt(at(2, 8)).is_ok());
     }
 
     #[test]
@@ -1496,14 +1545,14 @@ mod tests {
         assert_eq!(log.read(All, at(1, 0), 8, &mut out), Ok(()));
         // Restored at a leader's place, it writes once more, and a reader
         // reads that write.
-        log.restart(at(2, 2));
+        log.restart(at(2, 2)).expect("a place the log takes");
         member(&log, 2);
         assert_eq!(log.read(Watched, at(2, 2), 8, &mut out), Ok(()));
         assert_eq!(places(&out), [at(3, 0)]);
         // Restored again at the same number: the log no longer has the
         // write that reader stands at, and the next one is numbered past
         // it, so the reader is never served another line as its own.
-        log.restart(at(2, 3));
+        log.restart(at(2, 3)).expect("a place the log takes");
         assert_eq!(log.read(Watched, at(3, 0), 8, &mut out), Err(Lost));
         member(&log, 3);
         for kinds in [All, Watched] {
@@ -1520,7 +1569,7 @@ mod tests {
     fn a_reader_at_a_restarted_logs_own_write_reads_on() {
         let log = Log::new(8, 8);
         let mut out = Vec::new();
-        log.restart(at(2, 2));
+        log.restart(at(2, 2)).expect("a place the log takes");
         member(&log, 1);
         // The head is the store's own write, where a cut of the store
         // stands: its reader continues from it, with nothing to read yet.
@@ -1555,7 +1604,9 @@ mod tests {
     fn make(log: &Log, moves: &[Move]) {
         for made in moves {
             match *made {
-                Move::Restart(seq, term) => log.restart(at(seq, term)),
+                Move::Restart(seq, term) => {
+                    log.restart(at(seq, term)).expect("a place the log takes");
+                }
                 Move::Own => member(log, 1),
                 Move::Row => load(log, 1),
                 Move::Led(seq, term) => apply(log, at(seq, term), 1),
@@ -1567,12 +1618,11 @@ mod tests {
     #[test]
     fn a_place_under_no_term_names_one_write_for_as_long_as_the_log_lives() {
         use Move::{Led, Own, Restart, Row, Take};
-        // A reader stands where the first moves leave the head, a place
-        // under no term: a write of the store's own, or a restart at
-        // another store's place. A restart follows: the reader is lost at
-        // every read after it, whatever is written since, and a reader
+        // A reader stands at the last of the first moves, a write of the
+        // store's own under no term. A restart follows: the reader is lost
+        // at every read after it, whatever is written since, and a reader
         // that starts again at the head reads on.
-        let walks: [(&str, &[Move], &[Move]); 11] = [
+        let walks: [(&str, &[Move], &[Move]); 9] = [
             (
                 "one number under another term",
                 &[Restart(2, 2), Own],
@@ -1618,16 +1668,6 @@ mod tests {
                 &[Own, Own],
                 &[Restart(1, 2), Own, Own],
             ),
-            (
-                "a restart's own place under no term",
-                &[Restart(9, 0)],
-                &[Restart(2, 3), Own, Own, Own, Own, Own, Own, Own],
-            ),
-            (
-                "the same place under no term twice",
-                &[Restart(9, 0)],
-                &[Restart(9, 0), Own],
-            ),
         ];
         for (walk, first, then) in walks {
             let log = Log::new(8, 8);
@@ -1648,46 +1688,15 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_at_a_place_under_no_term_stands_past_every_own_write() {
-        let log = Log::new(8, 8);
-        let mut out = Vec::new();
-        for epoch in 1..=5 {
-            member(&log, epoch);
-        }
-        assert_eq!(log.head(All), at(5, 0));
-        // Another store's place under no term, at a number this store's
-        // own line reached: the reader of the fifth write is not served
-        // the other store's history, since the log stands at the next
-        // number of its own line.
-        log.restart(at(5, 0));
-        member(&log, 6);
-        assert_eq!(log.read(All, at(5, 0), 8, &mut out), Err(Lost));
-        assert_eq!(log.floor(All), at(6, 0));
-        assert_eq!(log.read(All, at(6, 0), 8, &mut out), Ok(()));
-        assert_eq!(places(&out), [at(7, 0)]);
-        // A number no own write reached is the log's place as told.
-        log.restart(at(9, 0));
-        assert_eq!(log.head(All), at(9, 0));
-        member(&log, 7);
-        assert_eq!(log.head(All), at(10, 0));
-        // The place before every write is no write's number.
-        log.restart(at(0, 0));
-        assert_eq!(log.head(All), at(0, 0));
-        member(&log, 8);
-        assert_eq!(log.read(All, at(0, 0), 8, &mut out), Ok(()));
-        assert_eq!(places(&out), [at(11, 0)]);
-    }
-
-    #[test]
     fn a_leaders_positions_follow_its_head_whatever_its_own_line_reached() {
         let leader = Log::new(8, 8);
         // Own writes under no term reach position 4. A restart sets the
         // head below them, and the store takes a term.
-        leader.restart(at(2, 2));
+        leader.restart(at(2, 2)).expect("a place the log takes");
         member(&leader, 1);
         member(&leader, 2);
         assert_eq!(leader.head(All), at(4, 0));
-        leader.restart(at(1, 5));
+        leader.restart(at(1, 5)).expect("a place the log takes");
         leader.term_rose(6);
         load(&leader, 1);
         member(&leader, 3);
@@ -1696,7 +1705,7 @@ mod tests {
         let led = all_after(&leader, All, at(1, 5));
         assert_eq!(places(&led), [at(2, 6), at(3, 6), at(4, 6)]);
         let follower = Log::new(8, 8);
-        follower.restart(at(1, 5));
+        follower.restart(at(1, 5)).expect("a place the log takes");
         applies(&follower, &led);
         assert_eq!(follower.head(All), leader.head(All));
         // Position 4 is the leader's now: the reader of the own write that
@@ -1718,6 +1727,29 @@ mod tests {
             at(2, 2),
             "the store's own write, under its own term"
         );
+    }
+
+    #[test]
+    fn a_guard_gives_up_its_own_place_and_no_later_guards() {
+        let log = Log::new(8, 8);
+        // An applier that keeps one binding for its guards: the second
+        // guard is made before the first drops.
+        let mut adopting = log.adopt(at(1, 3)).expect("the next position");
+        load(&log, 1);
+        assert!(adopting.landed());
+        adopting = log.adopt(at(2, 3)).expect("the next position");
+        load(&log, 2);
+        assert!(adopting.landed(), "the first guard's drop took the place");
+        // An event tried again while its first guard stands: neither the
+        // first guard's mark nor its drop takes the second's place.
+        let first = log.adopt(at(3, 3)).expect("the next position");
+        let second = log.adopt(at(3, 3)).expect("the same position");
+        first.mark();
+        assert_eq!(log.head(All), at(2, 3), "the first guard's mark wrote");
+        drop(first);
+        load(&log, 3);
+        assert!(second.landed(), "the first guard's drop took the place");
+        assert_eq!(marks(&all(&log)), [1, 2, 3]);
     }
 
     #[test]
@@ -1778,7 +1810,7 @@ mod tests {
         assert_eq!(log.followed(), Some(7), "a term's start marked");
         log.term_rose(8);
         assert_eq!(log.followed(), None, "a later take");
-        log.restart(at(40, 9));
+        log.restart(at(40, 9)).expect("a place the log takes");
         assert_eq!(log.followed(), Some(9), "a restart");
         // A take at or below the term the log followed starts no lead: it
         // writes no position, and the store's next write is under no term.
@@ -1818,7 +1850,7 @@ mod tests {
         apply(&log, at(1, 3), 1);
         // A snapshot is restored while a leader's event is half applied.
         let adopting = log.adopt(at(2, 3)).expect("the next position");
-        log.restart(at(40, 5));
+        log.restart(at(40, 5)).expect("a place the log takes");
         // The store's next write follows the snapshot's place: the place of
         // the event that never landed went with its history.
         load(&log, 2);
@@ -1838,7 +1870,7 @@ mod tests {
         for mark in 0..3 {
             load(&log, mark);
         }
-        log.restart(at(100, 7));
+        log.restart(at(100, 7)).expect("a place the log takes");
         assert_eq!(log.term(), 7, "the term of the snapshot's place");
         for kinds in [All, Watched] {
             assert_eq!(log.head(kinds), at(100, 7));
@@ -1914,13 +1946,14 @@ mod tests {
     #[test]
     fn a_log_restarted_at_a_snapshots_place_has_no_first_place() {
         let log = Log::new(8, 8).starting_after(1_000);
-        log.restart(at(1_050, 7));
+        log.restart(at(1_050, 7)).expect("a place the log takes");
         // What the store held at the snapshot is no event of the log.
         assert_eq!((log.first(All), log.first(Watched)), (None, None));
-        // Another store's place under no term, at the first place's own
-        // number: the log stands past it, as past a write of its own line.
+        // The first place's number stays one of the store's own line: after
+        // a restart below it, a write under no term is numbered past it.
         let log = Log::new(8, 8).starting_after(1_000);
-        log.restart(at(1_000, 0));
+        log.restart(at(5, 7)).expect("a place the log takes");
+        member(&log, 1);
         assert_eq!(log.head(All), at(1_001, 0));
         assert_eq!(log.first(All), None);
         // A log that carries no load row serves no reader of every kind.
@@ -1942,7 +1975,7 @@ mod tests {
             match way {
                 "a write" => apply(&log, at(3, 5), 7),
                 "a mark" => log.adopt(at(3, 5)).expect("the next position").mark(),
-                "a restart" => log.restart(at(3, 5)),
+                "a restart" => log.restart(at(3, 5)).expect("a place the log takes"),
                 _ => {
                     let adopting = log.adopt(at(3, 5)).expect("the next position");
                     log.term_rose(5);
@@ -1998,7 +2031,9 @@ mod tests {
         // The first, deposed, is not held there. It is restored from that
         // leader's snapshot, and one write of its own lands a moment later.
         assert!(!behind.holds(All, first.head(All)));
-        first.restart(behind.head(All));
+        first
+            .restart(behind.head(All))
+            .expect("a place the log takes");
         assert!(
             !first.holds(All, at(4, 1)),
             "a place of the history it left"

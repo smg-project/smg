@@ -2431,7 +2431,12 @@ mod tests {
                 seq: 40,
                 term: followed,
             };
-            service.shared.feed.log.restart(place);
+            service
+                .shared
+                .feed
+                .log
+                .restart(place)
+                .expect("a place the log takes");
             elector.lead_at(Instant::now());
             service.shared.store.set_term(1);
             assert_eq!(service.shared.feed.log.followed(), Some(followed));
@@ -2469,7 +2474,12 @@ mod tests {
     async fn a_take_that_started_no_term_serves_no_spec_call() {
         let (mut elector, standing, control) = sourced(false);
         let place = Position { seq: 40, term: 1 };
-        control.shared.feed.log.restart(place);
+        control
+            .shared
+            .feed
+            .log
+            .restart(place)
+            .expect("a place the log takes");
         elector.lead_at(Instant::now());
         control.shared.store.set_term(1);
         standing.send_replace(saw(IDENTITY, 1));
@@ -2501,7 +2511,12 @@ mod tests {
     async fn a_take_that_started_no_term_serves_no_standbys_stream() {
         let (mut elector, _standing, service) = service_alone(&[Scope::Replication]);
         let place = Position { seq: 40, term: 1 };
-        service.shared.feed.log.restart(place);
+        service
+            .shared
+            .feed
+            .log
+            .restart(place)
+            .expect("a place the log takes");
         elector.lead_at(Instant::now());
         service.shared.store.set_term(1);
         let listener = TcpListener::bind("127.0.0.1:0")

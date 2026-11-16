@@ -117,6 +117,12 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("MemoryStore", "journaled", Fate::Read),
     ("MemoryStore", "followed", Fate::Read),
     ("MemoryStore", "cut", Fate::Read),
+    (
+        "MemoryStore",
+        "restore_from",
+        Fate::Rebuilt("the journal starts again: a reader re-syncs from this store's own snapshot"),
+    ),
+    ("MemoryStore", "follow", Fate::Journaled),
     ("MemoryStore", "apply", Fate::NotYet(GENERATION)),
     ("MemoryStore", "world", Fate::Read),
     ("MemoryStore", "build_view", Fate::Read),

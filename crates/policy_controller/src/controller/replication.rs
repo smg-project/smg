@@ -1180,10 +1180,13 @@ mod tests {
         assert!(matches!(join(named).1, End::Resync(_)));
         // A log that restarted at a snapshot's place is no longer its
         // store's whole history: that standby starts from a snapshot.
-        after.log.restart(Position {
-            seq: head.seq + 9,
-            term: head.term + 1,
-        });
+        after
+            .log
+            .restart(Position {
+                seq: head.seq + 9,
+                term: head.term + 1,
+            })
+            .expect("a place the log takes");
         assert!(matches!(join(START).1, End::Resync(_)));
     }
 
@@ -1382,6 +1385,10 @@ mod tests {
         fn released(&self) {
             self.log.released();
         }
+
+        fn restart(&self, at: Position) -> bool {
+            self.log.restart(at).is_ok()
+        }
     }
 
     #[test]
@@ -1494,7 +1501,10 @@ mod tests {
         // one before the store is told the take and after it: no write of
         // that take starts the term.
         let leader = Leader::elected();
-        leader.log.restart(Position { seq: 9, term: 7 });
+        leader
+            .log
+            .restart(Position { seq: 9, term: 7 })
+            .expect("a place the log takes");
         for told in [false, true] {
             if told {
                 leader.store.set_term(leader.term);
@@ -1515,7 +1525,10 @@ mod tests {
         // that applied that term's start does: a take does not lower it,
         // and the refusal names both terms, never a write still to come.
         let leader = Leader::elected();
-        leader.log.restart(Position { seq: 9, term: 7 });
+        leader
+            .log
+            .restart(Position { seq: 9, term: 7 })
+            .expect("a place the log takes");
         leader.store.set_term(7);
         leader.store.set_term(leader.term);
         assert_eq!(leader.store.term(), 7);
