@@ -6693,3 +6693,119 @@ fn a_unit_opens_as_ascii_up_to_one_byte_in_eight_of_its_head() {
     assert!(!NativeEncoder::opens_as_ascii("abcde\u{e9}"));
     assert!(!NativeEncoder::opens_as_ascii("abcdefgh\u{e9}"));
 }
+
+/// A piece that holds no byte whose image a stage over the image can begin
+/// a match with is final before its image is built (`image_opens`). Its
+/// pieces are the full walk's and the reference's: on the two listed shapes
+/// with digit stages over the image and on one with two opening classes
+/// there (digit runs, then runs of `!`, the whole unit one piece). The
+/// texts: words without an opening byte, with one at either end and inside,
+/// with the bytes beyond ASCII whose image is numeric, and random ones over
+/// such an alphabet.
+#[test]
+fn a_piece_without_an_opening_byte_is_final_before_its_image() {
+    let mut state = 0x494D_4147_4546_494Cu64;
+    let random = |state: &mut u64| {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    };
+    let table = bytes_char();
+    let listed = [
+        "punctuation-then-byte-level-regex-then-digits",
+        "punctuation-then-byte-level-regex-then-digit-runs-then-threes",
+    ];
+    let mut cases: Vec<Shape> = shapes()
+        .into_iter()
+        .filter(|shape| listed.contains(&shape.name))
+        .collect();
+    assert_eq!(cases.len(), listed.len());
+    cases.push(Shape {
+        name: "byte-level-then-digit-runs-then-bangs",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            byte_level(false),
+            PreTokenizerWrapper::Digits(Digits::new(false)),
+            split("!+", SplitDelimiterBehavior::Isolated, false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    });
+    let alphabet: Vec<char> = "ab z0189!,.\u{B2}\u{BC}\u{E9}\u{4E32}\u{4E39}\u{E52} \n"
+        .chars()
+        .collect();
+    let fixed = [
+        "word",
+        "two words",
+        "a1",
+        "1a",
+        "a1b",
+        "12345",
+        "a!b",
+        "!!1!!",
+        "x\u{B2}",
+        "caf\u{E9}",
+        "\u{4E32}\u{4E39}",
+        "price 1234 units!",
+        "tab\there 7\n",
+    ];
+    for shape in &cases {
+        let name = shape.name;
+        let tokenizer = tokenizer_of(shape, &mut state);
+        let native = seeded(&tokenizer);
+        let from = native.mapped_from.expect("the map");
+        let opens = native.image_opens.as_deref().expect("the opening bytes");
+        for byte in [b'0', b'7', 0xB2, 0xBC] {
+            assert!(opens[usize::from(byte)], "{name}: {byte:#x}");
+        }
+        for byte in [b'a', b' ', 0xA9, 0xC3, 0xE4] {
+            assert!(!opens[usize::from(byte)], "{name}: {byte:#x}");
+        }
+        assert_eq!(opens[usize::from(b'!')], name.ends_with("bangs"), "{name}");
+        let mut full = seeded(&tokenizer);
+        full.image_opens = None;
+        let pre_tokenizer = tokenizer.get_pre_tokenizer().expect("the pre-tokenizer");
+        let mut image = String::new();
+        let mut texts: Vec<String> = fixed.iter().map(|text| (*text).to_owned()).collect();
+        for _ in 0..300 {
+            let len = 1 + (random(&mut state) % 24) as usize;
+            texts.push(
+                (0..len)
+                    .map(|_| alphabet[(random(&mut state) % alphabet.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        for text in &texts {
+            let mut split = PreTokenizedString::from(text.as_str());
+            pre_tokenizer
+                .pre_tokenize(&mut split)
+                .expect("the reference");
+            let theirs: Vec<String> = split
+                .get_splits(OffsetReferential::Original, OffsetType::Byte)
+                .into_iter()
+                .map(|(piece, _, _)| piece.to_owned())
+                .collect();
+            let mut ours = Vec::new();
+            native.pieces_mapping(0, from, text, &mut image, &mut |raw: &[u8]| {
+                ours.push(
+                    raw.iter()
+                        .map(|&b| table[usize::from(b)])
+                        .collect::<String>(),
+                );
+            });
+            let mut walked = Vec::new();
+            full.pieces_mapping(0, from, text, &mut image, &mut |raw: &[u8]| {
+                walked.push(
+                    raw.iter()
+                        .map(|&b| table[usize::from(b)])
+                        .collect::<String>(),
+                );
+            });
+            assert_eq!(ours, walked, "{name}: the full walk's pieces of {text:?}");
+            assert_eq!(ours, theirs, "{name}: the reference's pieces of {text:?}");
+        }
+    }
+}
