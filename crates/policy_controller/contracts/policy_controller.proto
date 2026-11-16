@@ -51,9 +51,10 @@
 // digest guard, or a rejoin position not held under its term (a
 // resync_required batch precedes it; the rejoin opens a new Replicate
 // stream); INVALID_ARGUMENT a spec or registration rejected (the field
-// path in ApplyResult.issues and the status detail), or a Dispatched,
-// Completed or Released whose side, class, reason or number reads wrong
-// (the field's name in the message); RESOURCE_EXHAUSTED a
+// path in ApplyResult.issues and the status detail), a Dispatched,
+// Completed or Released whose side, class, reason or number reads wrong,
+// or a Released that names neither a lease nor a ticket (the field's name
+// in the message); RESOURCE_EXHAUSTED a
 // relay over its per-subscriber budget or a standby over its backlog (a
 // resync_required batch precedes it), a Hello past the controller's
 // ceiling of present gateways, or a Session frame over the transport's

@@ -46,7 +46,11 @@ use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
 use tracing::{debug, info};
 
 use super::{
-    gateways::Refused, lifecycle, principal::Principal, service::Shared, PROTOCOL_VERSION,
+    gateways::{Refused, Seat},
+    lifecycle,
+    principal::Principal,
+    service::Shared,
+    PROTOCOL_VERSION,
 };
 use crate::{
     proto::{self, controller_frame, gateway_frame::Frame},
@@ -363,7 +367,7 @@ async fn session(
                     Ok(None) => break None,
                     Err(status) => break Some(unread(status)),
                 };
-                if let Some(status) = judge(shared, gateway, term, &frame, answers).await {
+                if let Some(status) = judge(shared, gateway, term, &seat, &frame, answers).await {
                     break Some(status);
                 }
             }
@@ -376,11 +380,7 @@ async fn session(
                     break Some(status);
                 }
             }
-            () = seat.superseded() => {
-                break Some(Status::aborted(
-                    "a newer session of this gateway took this one's place",
-                ));
-            }
+            () = seat.superseded() => break Some(replaced()),
         }
     };
     debug!(gateway = %principal.subject, term, ended = ?status.as_ref().map(Status::code), "a gateway's session ended");
@@ -416,15 +416,26 @@ fn floor(floor: u64, term: u64) -> Option<Status> {
     })
 }
 
-/// One frame after the `Welcome`: the fence, the floor, then its kind's
-/// arm. `Some` ends the session; the frame is then not applied.
+/// The end of a session a newer one of its gateway replaced.
+fn replaced() -> Status {
+    Status::aborted("a newer session of this gateway took this one's place")
+}
+
+/// One frame after the `Welcome`: the seat, the fence, the floor, then its
+/// kind's arm. `Some` ends the session; the frame is then not applied.
 async fn judge(
     shared: &Shared,
     gateway: GatewayId,
     term: u64,
+    seat: &Seat,
     frame: &proto::GatewayFrame,
     answers: &mut Answers,
 ) -> Option<Status> {
+    // A session that was replaced applies no frame: its gateway may be let
+    // go under it, and a write under a gone gateway's key would outlive it.
+    if seat.replaced() {
+        return Some(replaced());
+    }
     // One read of the clock a frame: the fence's verdict and the instant
     // an arm writes under are the same.
     let now = Instant::now();
@@ -480,7 +491,8 @@ mod tests {
     use tonic_prost::ProstCodec;
 
     use super::{
-        refusal, release, GRACE_PERIOD, HELLO_DEADLINE, LEADER_POLL, PRESENT_MAX, RELEASE_MAX,
+        judge, refusal, release, Answers, GRACE_PERIOD, HELLO_DEADLINE, LEADER_POLL, OUT_QUEUE,
+        PRESENT_MAX, RELEASE_MAX,
     };
     use crate::{
         controller::{
@@ -1171,6 +1183,66 @@ mod tests {
             Some(LeaseState::Issued),
             "a fenced replica releases nothing"
         );
+    }
+
+    /// A session that was replaced applies no frame, whichever arm the
+    /// loop's turn took: its gateway may be let go under it.
+    #[tokio::test]
+    async fn a_replaced_sessions_frame_is_not_applied() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let gateway = told(GATEWAY).gateway();
+        let store = Arc::clone(&bed.shared.store);
+        let (first, second) = (
+            worker(&store, "http://a:8000"),
+            worker(&store, "http://b:8000"),
+        );
+        let now = Instant::now();
+        let seat = bed
+            .shared
+            .gateways
+            .welcome(gateway, GATEWAY, 1, now)
+            .expect("a seat");
+        let (sender, _out) = mpsc::channel(OUT_QUEUE);
+        let mut answers = Answers { sender, seq: 0 };
+
+        // While its seat stands the session's frame is applied.
+        let report = frame(1, Some(Frame::Completed(a_completed(1, first))));
+        assert!(judge(&bed.shared, gateway, 1, &seat, &report, &mut answers)
+            .await
+            .is_none());
+        assert!(store.completed_ok_since(gateway, first, now));
+
+        let newer = bed
+            .shared
+            .gateways
+            .welcome(gateway, GATEWAY, 1, now)
+            .expect("a seat");
+        let late = frame(1, Some(Frame::Completed(a_completed(1, second))));
+        let status = judge(&bed.shared, gateway, 1, &seat, &late, &mut answers)
+            .await
+            .expect("the replaced session ends");
+        assert_eq!(
+            (status.code(), status.message()),
+            (
+                Code::Aborted,
+                "a newer session of this gateway took this one's place"
+            )
+        );
+        assert!(
+            !store.completed_ok_since(gateway, second, now),
+            "a replaced session writes nothing"
+        );
+
+        // The session that replaced it was never told: its frame is applied.
+        let third = worker(&store, "http://c:8000");
+        let report = frame(1, Some(Frame::Completed(a_completed(1, third))));
+        assert!(
+            judge(&bed.shared, gateway, 1, &newer, &report, &mut answers)
+                .await
+                .is_none()
+        );
+        assert!(store.completed_ok_since(gateway, third, now));
     }
 
     /// And for the floor: a lifecycle frame whose floor is above the term

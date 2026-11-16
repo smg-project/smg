@@ -22,6 +22,12 @@
 //! it held, or let go and welcomed with nothing, never welcomed and then
 //! let go. The table's lock is taken before any lock of the store.
 //!
+//! A session that was replaced applies no frame from the instant it is
+//! told: the session asks its seat before each frame, under no lock. A
+//! frame already past that question may still be written after its gateway
+//! was let go: the completion it writes is reclaimed at the sweep's next
+//! pass.
+//!
 //! The table holds two bounds of its own. A ceiling of rows: a `Hello` that
 //! would make a new row past it is refused, so the names a listener lets in
 //! never grow the table without end; a present gateway's `Hello` makes no
@@ -30,7 +36,10 @@
 //! present gateway's key is refused, never merged into that gateway's row.
 
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -94,7 +103,7 @@ struct Row {
     /// When the last session ended; `None` while one stands.
     gone: Option<Instant>,
     /// Wakes the standing session when a newer one takes its place.
-    superseded: Arc<Notify>,
+    superseded: Arc<Replaced>,
     /// Held for as long as this presence lasts: a [`Presence`] waits for
     /// its drop.
     #[cfg_attr(
@@ -107,18 +116,33 @@ struct Row {
     ended: watch::Sender<()>,
 }
 
+/// What a session is told when a newer one of its gateway takes its place.
+/// The flag is asked before every frame, under no lock; the wake ends a
+/// stream that waits.
+#[derive(Default)]
+struct Replaced {
+    told: AtomicBool,
+    wake: Notify,
+}
+
 /// A standing session's place in the table. Its drop is the session's end.
 pub(crate) struct Seat {
     gateways: Arc<Gateways>,
     gateway: GatewayId,
     session: u64,
-    superseded: Arc<Notify>,
+    superseded: Arc<Replaced>,
 }
 
 impl Seat {
     /// Resolves when a newer session of the gateway took this one's place.
     pub(crate) async fn superseded(&self) {
-        self.superseded.notified().await;
+        self.superseded.wake.notified().await;
+    }
+
+    /// Whether a newer session of the gateway took this one's place: asked
+    /// before a frame is applied, under no lock.
+    pub(crate) fn replaced(&self) -> bool {
+        self.superseded.told.load(Ordering::Acquire)
     }
 
     /// The session ended at `now`, where a case names the instant.
@@ -261,15 +285,16 @@ impl Gateways {
             subject: subject.to_owned(),
             session: 0,
             gone: None,
-            superseded: Arc::new(Notify::new()),
+            superseded: Arc::new(Replaced::default()),
             ended: watch::channel(()).0,
         });
         if row.session > 0 && row.gone.is_none() {
-            row.superseded.notify_one();
+            row.superseded.told.store(true, Ordering::Release);
+            row.superseded.wake.notify_one();
         }
         row.session = session;
         row.gone = None;
-        row.superseded = Arc::new(Notify::new());
+        row.superseded = Arc::new(Replaced::default());
         Ok(Seat {
             gateways: Arc::clone(self),
             gateway,
@@ -295,8 +320,9 @@ impl Gateways {
     }
 
     /// One pass of the sweep at `now`: every gateway whose period is over
-    /// is let go. Returns how many. A replica that does not lead at `now`
-    /// lets nothing go.
+    /// is let go, and the store keeps the completions of the gateways the
+    /// table holds and no other's. Returns how many were let go. A replica
+    /// that does not lead at `now` lets nothing go.
     pub(crate) fn sweep(&self, now: Instant) -> usize {
         let mut table = self.table.lock();
         if !Self::observe(&mut table, self.fence.leader_term(now), now) {
@@ -313,6 +339,10 @@ impl Gateways {
                 self.end(*gateway, row);
             }
         }
+        // A frame past its session's question of the seat may be written
+        // after its gateway's end: what it wrote is reclaimed here.
+        self.store
+            .keep_gateways(|gateway| table.rows.contains_key(&gateway));
         over.len()
     }
 
@@ -582,6 +612,56 @@ pub(crate) mod tests {
             store.completed_ok_since(B, served, t0),
             "another gateway's stands"
         );
+    }
+
+    /// A `Hello` past the grace period lets the gateway go before it is
+    /// welcomed anew, with no pass of the sweep between: the new presence
+    /// starts with no completion of the one that ended.
+    #[test]
+    fn a_gateway_welcomed_anew_past_its_grace_period_starts_with_no_completion() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let served = worker(&store, "http://a:8000");
+        let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        lifecycle::completed(&store, A, &a_completed(1, served), t0).expect("the frame reads");
+        gone.end(t0);
+
+        let _anew = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE);
+        assert!(
+            !store.completed_ok_since(A, served, t0),
+            "the completion ended with the presence that wrote it"
+        );
+        assert_eq!(store.health_entries(), 0);
+    }
+
+    /// A frame of a replaced session that is past the seat's question may
+    /// still be written after its gateway was let go. What it wrote is
+    /// reclaimed at the sweep's next pass, and a
+    /// present gateway's completions stand through it.
+    #[test]
+    fn a_completion_written_after_its_gateways_end_is_reclaimed_at_the_next_pass() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let served = worker(&store, "http://a:8000");
+        let replaced = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
+        let _stands = welcomed(&gateways, B, "gateway-b", TERM, t0);
+        lifecycle::completed(&store, B, &a_completed(1, served), t0).expect("the frame reads");
+        assert_eq!(gateways.sweep(t0 + GRACE), 1);
+
+        // The replaced session's late frame.
+        lifecycle::completed(&store, A, &a_completed(1, served), t0 + GRACE)
+            .expect("the frame reads");
+        drop(replaced);
+        assert!(store.completed_ok_since(A, served, t0));
+        assert_eq!(gateways.sweep(t0 + GRACE + MS), 0, "no gateway is let go");
+        assert!(
+            !store.completed_ok_since(A, served, t0),
+            "the pass reclaimed it"
+        );
+        assert!(
+            store.completed_ok_since(B, served, t0),
+            "a present gateway's stands"
+        );
+        assert_eq!(store.health_entries(), 1);
     }
 
     /// The completions on file are bounded by who is present, never by who

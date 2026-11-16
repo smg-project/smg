@@ -294,6 +294,30 @@ fn a_gateway_veto_masks_the_worker_for_that_gateway_until_its_end_or_its_clear()
     );
 }
 
+/// The health table keeps the latest instant of a gateway's completions on
+/// a worker: an earlier one that arrives after it moves nothing back.
+#[test]
+fn a_gateways_completion_on_a_worker_is_kept_at_its_latest_instant() {
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://e:8000");
+    let health: &dyn HealthSink = &store;
+    let gateway = GatewayId(1);
+    let first = Instant::now();
+    let second = first + Duration::from_millis(5);
+    health.completed(gateway, id, TransportClass::Ok, first);
+    assert!(!health.completed_ok_since(gateway, id, second));
+    health.completed(gateway, id, TransportClass::Ok, second);
+    assert!(
+        health.completed_ok_since(gateway, id, second),
+        "the later completion is the one kept"
+    );
+    health.completed(gateway, id, TransportClass::Ok, first);
+    assert!(
+        health.completed_ok_since(gateway, id, second),
+        "an earlier one that arrives late moves nothing back"
+    );
+}
+
 #[test]
 fn a_removed_worker_leaves_the_health_tables_and_takes_no_late_write() {
     let store = MemoryStore::new();
