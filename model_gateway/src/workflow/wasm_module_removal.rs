@@ -8,7 +8,7 @@ use wfaas::{
     WorkflowDefinition, WorkflowError, WorkflowResult,
 };
 
-use super::data::WasmRemovalWorkflowData;
+use super::{data::WasmRemovalWorkflowData, wasm_module_registration::module_manager};
 use crate::app_context::AppContext;
 
 /// WASM module removal request
@@ -49,15 +49,7 @@ impl StepExecutor<WasmRemovalWorkflowData> for FindModuleToRemoveStep {
 
         debug!("Finding module to remove: {}", removal_request.module_uuid);
 
-        // Get WASM module manager from app context
-        let wasm_manager =
-            app_context
-                .wasm_manager
-                .as_ref()
-                .ok_or_else(|| WorkflowError::StepFailed {
-                    step_id: StepId::new("find_module_to_remove"),
-                    message: "WASM module manager not initialized".to_string(),
-                })?;
+        let wasm_manager = module_manager(app_context, "find_module_to_remove")?;
 
         // Check if module exists
         let module = wasm_manager
@@ -109,15 +101,7 @@ impl StepExecutor<WasmRemovalWorkflowData> for RemoveModuleStep {
 
         debug!("Removing WASM module: {}", removal_request.module_uuid);
 
-        // Get WASM module manager from app context
-        let wasm_manager =
-            app_context
-                .wasm_manager
-                .as_ref()
-                .ok_or_else(|| WorkflowError::StepFailed {
-                    step_id: StepId::new("remove_module"),
-                    message: "WASM module manager not initialized".to_string(),
-                })?;
+        let wasm_manager = module_manager(app_context, "remove_module")?;
 
         // Remove module from manager
         wasm_manager

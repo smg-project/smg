@@ -8,7 +8,8 @@
 //! checks its candidates against is the affinity stage's. What they read of
 //! a candidate beyond its row (the request's blocks it holds, its age in the
 //! pool, its index size) is the affinity column the host fills beside the
-//! rows ([`RequestFacts::affinity`]), never the row. A stateful part (the
+//! rows ([`RequestFacts::affinity`]) or the rows it names in the column's
+//! place ([`NamedAffinity`]), never the row. A stateful part (the
 //! slice's period, the diversion's window per worker) keeps its state behind
 //! the lifecycle alone, and no stage allocates per decision.
 //!
@@ -28,7 +29,10 @@ use crate::{
     framework::{Scorer, TieBand},
     lease::{Lifecycle, Membership},
     spec::{AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams},
-    view::{AffinityFacts, Candidate, HashKind, Phase, RequestFacts, WorkerId},
+    view::{
+        AffinityFacts, Candidate, Feed, HashKind, NamedAffinity, Phase, RequestFacts, Walk,
+        WorkerId,
+    },
     Draw,
 };
 
@@ -203,14 +207,40 @@ impl Gates {
     }
 }
 
-/// What one pass of the warm-up stage over a decision reads: the rows, their
-/// affinity column (one entry a row), the fleet's index level, the request's
-/// deepest index match and size, and the decision's draw.
+/// How a pass of the warm-up stage tells a warming row: by the stage's own
+/// rule over a host's column, or by the rows the host named.
+#[derive(Clone, Copy)]
+enum Warm<'a> {
+    /// Over a column: the fleet's index level, whether any row is thin
+    /// against it, and whether every row is young.
+    Ruled {
+        level: u32,
+        thin_any: bool,
+        young_all: bool,
+    },
+    /// The host's warming rows, ascending, and whether they are the thin.
+    Named { rows: &'a [u32], thin: bool },
+}
+
+impl Warm<'_> {
+    /// Whether the warming rows are thin ones: a hit is diverted to no
+    /// other.
+    fn thin(self) -> bool {
+        match self {
+            Self::Ruled { thin_any, .. } => thin_any,
+            Self::Named { thin, .. } => thin,
+        }
+    }
+}
+
+/// What one pass of the warm-up stage over a decision reads: the rows, what
+/// they hold, how a warming row is told, the request's deepest index match
+/// and size, and the decision's draw.
 struct Pass<'a> {
     candidates: &'a [Candidate],
     kept: &'a [u32],
-    column: &'a [AffinityFacts],
-    level: u32,
+    feed: Feed<'a>,
+    warm: Warm<'a>,
     best: u32,
     request_blocks: u32,
     draw: Draw,
@@ -219,15 +249,12 @@ struct Pass<'a> {
 impl Pass<'_> {
     /// The slot of the least-loaded kept row `wanted` admits, equal loads
     /// drawn uniformly from the decision's seed.
-    fn least_loaded(
-        &mut self,
-        mut wanted: impl FnMut(&Candidate, AffinityFacts) -> bool,
-    ) -> Option<usize> {
+    fn least_loaded(&mut self, mut wanted: impl FnMut(u32, &Candidate) -> bool) -> Option<usize> {
         let mut pick: Option<(usize, u32)> = None;
         let mut tied = 0usize;
         for (slot, &i) in self.kept.iter().enumerate() {
             let c = &self.candidates[i as usize];
-            if !wanted(c, self.column[i as usize]) {
+            if !wanted(i, c) {
                 continue;
             }
             match pick {
@@ -309,6 +336,80 @@ impl PrefixAffinity {
         };
         index.max(predicted)
     }
+
+    /// The stage's scores over what its two passes read of the kept rows;
+    /// `holds` is whether anybody holds anything. `reads` hands each pass a
+    /// reader of its own: a column's is a read by index, and the rows a
+    /// host named are walked beside the kept rows. One body a feed, the
+    /// feed chosen where the body is entered.
+    #[inline(always)]
+    fn rank<R: FnMut(u32) -> AffinityFacts>(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        holds: bool,
+        reads: impl Fn() -> R,
+    ) -> TieBand {
+        let request_blocks = self.gates.request_blocks(facts);
+        // Nobody holding anything, the deepest match is zero without a
+        // pass; any other feed answers for every kept row.
+        let best = if holds {
+            let mut entry = reads();
+            kept.iter()
+                .map(|&i| self.matched(entry(i), request_blocks))
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let avg = mean_in_flight(candidates, kept);
+        // A decode worker prefills nothing again: its held prefix is not
+        // priced.
+        let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
+        let held = if priced {
+            self.gates.tokens_of(best, facts)
+        } else {
+            0.0
+        };
+        let mut entry = reads();
+        for (o, &i) in out.iter_mut().zip(kept) {
+            let c = &candidates[i as usize];
+            let load = c.in_flight as f32;
+            // A match above zero was read from a feed that holds entries.
+            *o = if best > 0
+                && self.matched(entry(i), request_blocks) == best
+                && !self.gates.over(load, avg, held)
+            {
+                1.0
+            } else if !self.gates.over(load, avg, 0.0) {
+                0.5
+            } else {
+                0.0
+            };
+        }
+        TieBand(0.0)
+    }
+
+    /// The stage's scores over the rows a host named: a holder reads its
+    /// depth, and each pass walks the holders beside its kept rows. Out of
+    /// line: see [`Scorer::score`] of this stage.
+    #[inline(never)]
+    fn rank_named(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        named: NamedAffinity<'_>,
+    ) -> TieBand {
+        let holds = !named.holders.is_empty();
+        self.rank(facts, candidates, kept, out, holds, || {
+            let mut walk = named.walk();
+            move |i: u32| walk.entry(i)
+        })
+    }
 }
 
 impl Lifecycle for PrefixAffinity {}
@@ -328,45 +429,18 @@ impl Scorer for PrefixAffinity {
         if self.gates.kv_imbalanced(candidates, kept) {
             return neutral(out);
         }
-        let request_blocks = self.gates.request_blocks(facts);
-        // The column is taken once a pass: a read by index tests its
-        // emptiness and its bound for every row. Empty, nobody holds
-        // anything and the deepest match is zero without a pass; any other
-        // column holds one entry a candidate and a kept row reads its own.
-        let column = facts.affinity;
-        let best = if column.is_empty() {
-            0
-        } else {
-            kept.iter()
-                .map(|&i| self.matched(column[i as usize], request_blocks))
-                .max()
-                .unwrap_or(0)
-        };
-        let avg = mean_in_flight(candidates, kept);
-        // A decode worker prefills nothing again: its held prefix is not
-        // priced.
-        let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
-        let held = if priced {
-            self.gates.tokens_of(best, facts)
-        } else {
-            0.0
-        };
-        for (o, &i) in out.iter_mut().zip(kept) {
-            let c = &candidates[i as usize];
-            let load = c.in_flight as f32;
-            // A match above zero was read from a column that holds entries.
-            *o = if best > 0
-                && self.matched(column[i as usize], request_blocks) == best
-                && !self.gates.over(load, avg, held)
-            {
-                1.0
-            } else if !self.gates.over(load, avg, 0.0) {
-                0.5
-            } else {
-                0.0
-            };
+        // What the rows hold is taken once a pass: a read by index tests
+        // the feed and its bound for every row. The rows a host named
+        // answer out of line, so a pass over a column keeps the code it
+        // had: one entry a candidate, and a kept row reads its own.
+        if let Some(named) = facts.named_alone() {
+            return self.rank_named(facts, candidates, kept, out, named);
         }
-        TieBand(0.0)
+        let column = facts.affinity;
+        let holds = !column.is_empty();
+        self.rank(facts, candidates, kept, out, holds, || {
+            |i: u32| column[i as usize]
+        })
     }
 
     fn needs(&self) -> Needs {
@@ -504,23 +578,140 @@ impl WarmupSlice {
         *level
     }
 
-    /// The slot of the kept row the slice sends this miss to, if it is due.
-    fn slice(&self, pass: &mut Pass<'_>, thin_any: bool, young_all: bool) -> Option<usize> {
-        let avg = mean_in_flight(pass.candidates, pass.kept);
-        let level = pass.level;
-        // A thin worker is a candidate whatever the fleet's age; workers
-        // warming only because they are young are candidates only when the
-        // fleet is not all young.
-        let warming = |held: AffinityFacts| {
-            if thin_any {
-                self.is_thin(held.indexed_blocks, level)
-            } else {
-                !young_all && self.is_young(held)
-            }
+    /// The stage over the rows a host named: it ruled the warming rows
+    /// where it wrote, and none named slices nothing. Out of line, so a
+    /// pass over a column keeps the code it had.
+    #[inline(never)]
+    fn score_named(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        named: NamedAffinity<'_>,
+    ) -> TieBand {
+        if named.warming.is_empty() {
+            return neutral(out);
+        }
+        let warm = Warm::Named {
+            rows: named.warming,
+            thin: named.thin,
         };
-        let slot = pass.least_loaded(|c, held| {
-            warming(held) && !self.gates.over(c.in_flight as f32, avg, 0.0)
-        })?;
+        self.turn(facts, candidates, kept, out, Feed::Named(named), warm)
+    }
+
+    /// One pass where somebody warms: the request is a miss the slice may
+    /// take or a hit the divert may take, and the row that takes it scores
+    /// alone.
+    #[inline(always)]
+    fn turn(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        feed: Feed<'_>,
+        warm: Warm<'_>,
+    ) -> TieBand {
+        let request_blocks = self.gates.request_blocks(facts);
+        let mut reads = feed.reads();
+        let best = kept
+            .iter()
+            .map(|&i| reads.entry(i).overlap_blocks)
+            .max()
+            .unwrap_or(0);
+        let thin_overlap = best as f32 / request_blocks as f32 <= self.miss_share
+            || (best <= WARMUP_MISS_BLOCKS && best * 2 < request_blocks);
+        let mut pass = Pass {
+            candidates,
+            kept,
+            feed,
+            warm,
+            best,
+            request_blocks,
+            draw: Draw::new(facts.seed ^ 0x77a7_2d5e_6f1c_3b09),
+        };
+        let slot = if thin_overlap {
+            self.slice(&mut pass)
+        } else if warm.thin() {
+            self.divert(&mut pass, facts.now_micros)
+        } else {
+            None
+        };
+        let Some(slot) = slot else {
+            return neutral(out);
+        };
+        out.fill(0.0);
+        out[slot] = 1.0;
+        TieBand(0.0)
+    }
+
+    /// How a pass tells a warming row over a host's column, which the
+    /// passes over the pool walk: `None` when nobody warms. A settled fleet
+    /// (no index size fed, nobody young) costs one pass over it.
+    #[inline(always)]
+    fn ruled(&self, column: &[AffinityFacts]) -> Option<Warm<'static>> {
+        let mut any_indexed = false;
+        let mut young = 0usize;
+        for &held in column {
+            any_indexed |= held.indexed_blocks > 0;
+            young += usize::from(self.is_young(held));
+        }
+        if !any_indexed && young == 0 {
+            return None;
+        }
+        let level = if any_indexed {
+            self.fleet_level(column)
+        } else {
+            0
+        };
+        let thin_any = column
+            .iter()
+            .any(|held| self.is_thin(held.indexed_blocks, level));
+        if !thin_any && (young == 0 || young == column.len()) {
+            return None;
+        }
+        Some(Warm::Ruled {
+            level,
+            thin_any,
+            young_all: young == column.len(),
+        })
+    }
+
+    /// How one pass tells its warming rows, asked in the pass's own order.
+    /// A thin worker is one whatever the fleet's age; workers warming only
+    /// because they are young are ones only when the fleet is not all
+    /// young. A host that named the rows ruled the same where it derived
+    /// them, and the pass walks its list beside the kept rows.
+    fn warming<'a>(&'a self, warm: Warm<'a>, feed: Feed<'a>) -> impl FnMut(u32) -> bool + 'a {
+        let mut reads = feed.reads();
+        let mut named = Walk::new(match warm {
+            Warm::Named { rows, .. } => rows,
+            Warm::Ruled { .. } => &[],
+        });
+        move |i| match warm {
+            Warm::Ruled {
+                level,
+                thin_any,
+                young_all,
+            } => {
+                let held = reads.entry(i);
+                if thin_any {
+                    self.is_thin(held.indexed_blocks, level)
+                } else {
+                    !young_all && self.is_young(held)
+                }
+            }
+            Warm::Named { .. } => named.find(i, |&row| row).is_some(),
+        }
+    }
+
+    /// The slot of the kept row the slice sends this miss to, if it is due.
+    fn slice(&self, pass: &mut Pass<'_>) -> Option<usize> {
+        let avg = mean_in_flight(pass.candidates, pass.kept);
+        let mut warming = self.warming(pass.warm, pass.feed);
+        let slot =
+            pass.least_loaded(|i, c| warming(i) && !self.gates.over(c.in_flight as f32, avg, 0.0))?;
         let seen = self.misses.fetch_add(1, Ordering::Relaxed);
         seen.is_multiple_of(self.period()).then_some(slot)
     }
@@ -533,8 +724,8 @@ impl WarmupSlice {
         let Pass {
             candidates,
             kept,
-            column,
-            level,
+            feed,
+            warm,
             best,
             request_blocks,
             ..
@@ -556,21 +747,24 @@ impl WarmupSlice {
         let holder_load = if shallow {
             None
         } else {
+            let mut reads = feed.reads();
             kept.iter()
-                .filter(|&&i| column[i as usize].overlap_blocks == best)
+                .filter(|&&i| reads.entry(i).overlap_blocks == best)
                 .map(|&i| candidates[i as usize].in_flight)
                 .min()
         };
         // The eligibility read and the window's reservation on one lock
         // turn: two decisions due together cannot both divert to the same
-        // thin worker inside one window.
+        // thin worker inside one window. A hit is diverted only where the
+        // warming rows are the thin, so a warming row here is a thin one.
         let slot = {
             let mut until = self.divert_until.lock();
-            let slot = pass.least_loaded(|c, held| {
-                self.is_thin(held.indexed_blocks, level)
+            let (mut warming, mut held) = (self.warming(warm, feed), feed.reads());
+            let slot = pass.least_loaded(|i, c| {
+                warming(i)
                     && !(c.in_flight > 0 && until.get(&c.id).is_some_and(|&t| now < t))
                     && !(holder_load.is_some_and(|h| c.in_flight >= h)
-                        && held.overlap_blocks != best)
+                        && held.entry(i).overlap_blocks != best)
             })?;
             until.insert(
                 candidates[kept[slot] as usize].id,
@@ -617,6 +811,11 @@ impl Scorer for WarmupSlice {
         if self.share <= 0.0 || self.gates.kv_imbalanced(candidates, kept) {
             return neutral(out);
         }
+        // The rows a host named answer out of line, so a pass over a column
+        // keeps the code it had.
+        if let Some(named) = facts.named_alone() {
+            return self.score_named(facts, candidates, kept, out, named);
+        }
         // A decision fed no column has nothing to slice: every row reads as
         // just admitted with nothing indexed, a young fleet, and a young
         // fleet slices nothing.
@@ -626,59 +825,12 @@ impl Scorer for WarmupSlice {
         // The column is taken once: one entry a candidate, walked by the
         // passes over the pool and indexed by the reads of a kept row. One
         // that ends before the candidates is a host's mistake and fails
-        // here, as an index past its end does. A settled fleet (no index
-        // size fed, nobody young) costs one pass over it.
+        // here, as an index past its end does.
         let column = &facts.affinity[..candidates.len()];
-        let mut any_indexed = false;
-        let mut young = 0usize;
-        for &held in column {
-            any_indexed |= held.indexed_blocks > 0;
-            young += usize::from(self.is_young(held));
-        }
-        if !any_indexed && young == 0 {
-            return neutral(out);
-        }
-        let level = if any_indexed {
-            self.fleet_level(column)
-        } else {
-            0
-        };
-        let thin_any = column
-            .iter()
-            .any(|held| self.is_thin(held.indexed_blocks, level));
-        if !thin_any && (young == 0 || young == candidates.len()) {
-            return neutral(out);
-        }
-        let request_blocks = self.gates.request_blocks(facts);
-        let best = kept
-            .iter()
-            .map(|&i| column[i as usize].overlap_blocks)
-            .max()
-            .unwrap_or(0);
-        let thin_overlap = best as f32 / request_blocks as f32 <= self.miss_share
-            || (best <= WARMUP_MISS_BLOCKS && best * 2 < request_blocks);
-        let mut pass = Pass {
-            candidates,
-            kept,
-            column,
-            level,
-            best,
-            request_blocks,
-            draw: Draw::new(facts.seed ^ 0x77a7_2d5e_6f1c_3b09),
-        };
-        let slot = if thin_overlap {
-            self.slice(&mut pass, thin_any, young == candidates.len())
-        } else if thin_any {
-            self.divert(&mut pass, facts.now_micros)
-        } else {
-            None
-        };
-        let Some(slot) = slot else {
+        let Some(warm) = self.ruled(column) else {
             return neutral(out);
         };
-        out.fill(0.0);
-        out[slot] = 1.0;
-        TieBand(0.0)
+        self.turn(facts, candidates, kept, out, Feed::Column(column), warm)
     }
 
     fn needs(&self) -> Needs {
@@ -698,7 +850,7 @@ mod tests {
     use super::*;
     use crate::{
         spec::SpillParams,
-        view::{Health, LoadRow},
+        view::{Health, LoadRow, NamedHolder},
     };
 
     /// A row and its entry of the affinity column, as a case writes a pool.
@@ -1132,6 +1284,32 @@ mod tests {
         assert_eq!(scores(&slice, &now, &shallow), vec![0.0, 0.0, 1.0]);
     }
 
+    /// A thin worker among a deep hit's deepest holders recomputes nothing:
+    /// the due hit goes to it however busy it stands beside the other
+    /// holders, on either feed.
+    #[test]
+    fn a_thin_worker_among_the_deepest_holders_takes_a_due_hit_however_busy() {
+        // Rows 0 and 2 hold the deepest match; row 2 is thin and the busier.
+        let pool = [sized(0, 0, 12, 64), sized(1, 0, 0, 64), sized(2, 3, 12, 12)];
+        let sizes = column(&pool);
+        let holders = [holder(0, 12), holder(2, 12)];
+        let by_column = RequestFacts {
+            affinity: &sizes,
+            now_micros: 5_000_000,
+            ..facts(16)
+        };
+        let by_named = RequestFacts {
+            named: Some(named(&holders, &[2], true)),
+            now_micros: 5_000_000,
+            ..facts(16)
+        };
+        for (facts, feed) in [(&by_column, "the column"), (&by_named, "the rows named")] {
+            let mut out = [0.0; 3];
+            warmup(0.25, 1).score(facts, &rows(&pool), &[0, 1, 2], &mut out);
+            assert_eq!(out, [0.0, 0.0, 1.0], "{feed}");
+        }
+    }
+
     /// The stages read the column and never the row: a decision fed no
     /// column reads as a miss for every row, and leaves the warm-up stage
     /// neutral before any counter moves, the answer its pass gives over rows
@@ -1356,5 +1534,308 @@ mod tests {
         }
         assert!(warmup(1.0, 0).needs().affinity);
         assert!(!KvPressure.needs().affinity);
+    }
+
+    /// `row` named as holding `blocks` by the index.
+    fn holder(row: u32, blocks: u32) -> NamedHolder {
+        NamedHolder {
+            row,
+            overlap_blocks: blocks,
+            predicted_blocks: 0,
+        }
+    }
+
+    /// The rows a host names: the `holders`, and the `warming` rows, thin
+    /// or young.
+    fn named<'a>(holders: &'a [NamedHolder], warming: &'a [u32], thin: bool) -> NamedAffinity<'a> {
+        NamedAffinity {
+            holders,
+            warming,
+            thin,
+        }
+    }
+
+    /// The scores of `rows` beside the rows a host named and no column.
+    fn scores_named(
+        scorer: &dyn Scorer,
+        facts: &RequestFacts<'_>,
+        rows: &[Candidate],
+        named: NamedAffinity<'_>,
+    ) -> Vec<f32> {
+        let facts = RequestFacts {
+            named: Some(named),
+            ..*facts
+        };
+        let kept = kept(rows.len() as u32);
+        let mut out = vec![0.0; rows.len()];
+        scorer.score(&facts, rows, &kept, &mut out);
+        out
+    }
+
+    /// The two feeds are one reading: over one pool, the rows a host named
+    /// (each holder with what it holds, the warming rows) score as the
+    /// column they were derived from, turn by turn and whichever rows a
+    /// filter kept.
+    #[test]
+    fn rows_a_host_named_score_as_the_column_they_were_derived_from() {
+        // Two holders of the deepest match, a shallower holder, a miss.
+        let pool = [
+            candidate(0, 1, 8),
+            candidate(1, 1, 2),
+            candidate(2, 1, 8),
+            candidate(3, 1, 0),
+        ];
+        let each = [holder(0, 8), holder(1, 2), holder(2, 8)];
+        let stage = affinity(None);
+        let by_column = scores(&stage, &facts(16), &pool);
+        assert_eq!(by_column, vec![1.0, 0.5, 1.0, 0.5]);
+        assert_eq!(
+            scores_named(&stage, &facts(16), &rows(&pool), named(&each, &[], false)),
+            by_column
+        );
+        // A filter drops the deepest holders (a retry's tried rows): the
+        // shallower holder is the deepest kept and leads on either feed.
+        let over = |facts: RequestFacts<'_>| {
+            let mut out = vec![0.0; 2];
+            stage.score(&facts, &rows(&pool), &[1, 3], &mut out);
+            out
+        };
+        let entries = column(&pool);
+        let by_column = over(RequestFacts {
+            affinity: &entries,
+            ..facts(16)
+        });
+        assert_eq!(by_column, vec![1.0, 0.5]);
+        assert_eq!(
+            over(RequestFacts {
+                named: Some(named(&each, &[], false)),
+                ..facts(16)
+            }),
+            by_column
+        );
+        // A miss names no holder.
+        let miss = [candidate(0, 1, 0), candidate(1, 1, 0)];
+        assert_eq!(
+            scores_named(&stage, &facts(16), &rows(&miss), named(&[], &[], false)),
+            scores(&stage, &facts(16), &miss)
+        );
+        // A placement the predictor made rides a named row as it rides a
+        // column's entry, for a source that reads it.
+        let params = PrefixAffinityParams {
+            threshold: Some(0.5),
+            source: Some(AffinitySource::Merged),
+            ..PrefixAffinityParams::default()
+        };
+        let merged = PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16)));
+        let placed = |(row, held): Held, predicted_blocks: u32| {
+            (
+                row,
+                AffinityFacts {
+                    predicted_blocks,
+                    ..held
+                },
+            )
+        };
+        let pool = [
+            placed(candidate(0, 0, 0), 4),
+            placed(candidate(1, 0, 0), 9),
+            candidate(2, 0, 1),
+        ];
+        let each = [
+            NamedHolder {
+                row: 0,
+                overlap_blocks: 0,
+                predicted_blocks: 4,
+            },
+            NamedHolder {
+                row: 1,
+                overlap_blocks: 0,
+                predicted_blocks: 9,
+            },
+            holder(2, 1),
+        ];
+        let by_column = scores(&merged, &facts(16), &pool);
+        assert_eq!(by_column, vec![0.5, 1.0, 0.5]);
+        assert_eq!(
+            scores_named(&merged, &facts(16), &rows(&pool), named(&each, &[], false)),
+            by_column
+        );
+        // One thin worker: a miss in a period goes to it on either feed.
+        let thin = [sized(0, 3, 0, 64), sized(1, 2, 0, 64), sized(2, 5, 0, 0)];
+        let (by_column, by_named) = (warmup(0.25, 0), warmup(0.25, 0));
+        for turn in 0..8 {
+            assert_eq!(
+                scores_named(&by_named, &facts(16), &rows(&thin), named(&[], &[2], true)),
+                scores(&by_column, &facts(16), &thin),
+                "a miss, turn {turn}"
+            );
+        }
+        assert_eq!(by_named.misses.load(Ordering::Relaxed), 8);
+        // Three thin workers: the miss goes to the least loaded one, the
+        // middle of the warming rows named.
+        let thin = [
+            sized(0, 3, 0, 64),
+            sized(1, 2, 0, 64),
+            sized(2, 2, 0, 64),
+            sized(3, 4, 0, 64),
+            sized(4, 6, 0, 0),
+            sized(5, 1, 0, 0),
+            sized(6, 7, 0, 0),
+        ];
+        let (by_column, by_named) = (warmup(0.25, 0), warmup(0.25, 0));
+        let mut taken = 0;
+        for turn in 0..8 {
+            let scored = scores_named(
+                &by_named,
+                &facts(16),
+                &rows(&thin),
+                named(&[], &[4, 5, 6], true),
+            );
+            assert_eq!(
+                scored,
+                scores(&by_column, &facts(16), &thin),
+                "three thin rows, turn {turn}"
+            );
+            taken += usize::from(scored == vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        }
+        assert!(taken > 0, "the middle warming row takes a miss");
+        // A deep hit on worker 0 is diverted to the thin worker on the same
+        // turns.
+        let hit = [sized(0, 2, 12, 64), sized(1, 1, 0, 64), sized(2, 0, 0, 0)];
+        let (by_column, by_named) = (warmup(0.25, 4), warmup(0.25, 4));
+        let mut now = facts(16);
+        now.now_micros = 1_000;
+        let mut diverted = 0;
+        for turn in 0..8 {
+            let scored = scores_named(
+                &by_named,
+                &now,
+                &rows(&hit),
+                named(&[holder(0, 12)], &[2], true),
+            );
+            assert_eq!(scored, scores(&by_column, &now, &hit), "a hit, turn {turn}");
+            diverted += usize::from(scored == vec![0.0, 0.0, 1.0]);
+        }
+        assert_eq!(diverted, 2);
+        // Young rows among warm ones take the misses and no diverted hit.
+        let young = [sized(0, 1, 0, 0), sized(1, 1, 0, 0), sized(2, 0, 0, 2)];
+        let slice = warmup(1.0, 1);
+        assert_eq!(
+            scores_named(&slice, &facts(16), &rows(&young), named(&[], &[2], false)),
+            vec![0.0, 0.0, 1.0]
+        );
+        assert_eq!(
+            scores_named(
+                &slice,
+                &facts(16),
+                &rows(&young),
+                named(&[holder(0, 12)], &[2], false)
+            ),
+            vec![1.0, 1.0, 1.0]
+        );
+    }
+
+    /// Kept rows a narrowing stage swapped: a pass's walk starts over at a
+    /// row behind its cursor, so each kept row scores by its own entry on
+    /// either feed, at the prefix stage and at the slice.
+    #[test]
+    fn kept_rows_out_of_order_score_alike_on_either_feed() {
+        let pool = [
+            candidate(0, 1, 8),
+            candidate(1, 1, 6),
+            candidate(2, 1, 2),
+            candidate(3, 1, 4),
+        ];
+        let depths = column(&pool);
+        let holders = [holder(0, 8), holder(1, 6), holder(2, 2), holder(3, 4)];
+        let by_column = RequestFacts {
+            affinity: &depths,
+            ..facts(16)
+        };
+        let by_named = RequestFacts {
+            named: Some(named(&holders, &[], false)),
+            ..facts(16)
+        };
+        for (facts, feed) in [(&by_column, "the column"), (&by_named, "the rows named")] {
+            let mut out = [0.0; 3];
+            affinity(None).score(facts, &rows(&pool), &[3, 1, 2], &mut out);
+            assert_eq!(out, [0.5, 1.0, 0.5], "{feed}");
+        }
+        // Two thin workers, the less loaded behind the other among the kept.
+        let pool = [
+            sized(0, 5, 0, 64),
+            sized(1, 1, 0, 0),
+            sized(2, 2, 0, 64),
+            sized(3, 4, 0, 0),
+        ];
+        let sizes = column(&pool);
+        let by_column = RequestFacts {
+            affinity: &sizes,
+            ..facts(16)
+        };
+        let by_named = RequestFacts {
+            named: Some(named(&[], &[1, 3], true)),
+            ..facts(16)
+        };
+        for (facts, feed) in [(&by_column, "the column"), (&by_named, "the rows named")] {
+            let mut out = [0.0; 3];
+            warmup(1.0, 0).score(facts, &rows(&pool), &[3, 1, 2], &mut out);
+            assert_eq!(out, [0.0, 1.0, 0.0], "{feed}");
+        }
+    }
+
+    /// Two arms of the rule that tells who warms and who takes a miss: a
+    /// fleet fed no index size still warms its young worker, and a warming
+    /// worker over the load gate takes no miss.
+    #[test]
+    fn a_young_worker_warms_with_no_size_fed_and_none_over_the_load_gate_takes_a_miss() {
+        let (row, held) = sized(2, 0, 0, 0);
+        let young = (
+            row,
+            AffinityFacts {
+                admitted_age_ms: 1_000,
+                ..held
+            },
+        );
+        let unfed = [sized(0, 1, 0, 0), sized(1, 1, 0, 0), young];
+        assert_eq!(
+            scores(&warmup(1.0, 0), &facts(16), &unfed),
+            vec![0.0, 0.0, 1.0]
+        );
+        // One thin worker beside nine warm ones: level with them it takes
+        // the miss alone, far over the load gate it takes none.
+        let fleet = |load: u32| {
+            let mut pool: Vec<Held> = (0..9).map(|at| sized(at, 10, 0, 64)).collect();
+            pool.push(sized(9, load, 0, 0));
+            pool
+        };
+        let mut alone = vec![0.0; 10];
+        alone[9] = 1.0;
+        assert_eq!(scores(&warmup(1.0, 0), &facts(16), &fleet(10)), alone);
+        assert_eq!(
+            scores(&warmup(1.0, 0), &facts(16), &fleet(1_000)),
+            vec![1.0; 10]
+        );
+    }
+
+    /// A host that names no warming row ruled that nobody warms: the stage
+    /// is neutral before any counter moves, hit or miss.
+    #[test]
+    fn no_warming_row_named_slices_nothing_and_moves_no_counter() {
+        let slice = warmup(1.0, 1);
+        let pool = [candidate(0, 3, 0), candidate(1, 2, 0), candidate(2, 5, 0)];
+        for holders in [&[][..], &[holder(1, 9)][..]] {
+            assert_eq!(
+                scores_named(&slice, &facts(16), &rows(&pool), named(holders, &[], true)),
+                vec![1.0, 1.0, 1.0]
+            );
+        }
+        assert_eq!(
+            (
+                slice.misses.load(Ordering::Relaxed),
+                slice.hits.load(Ordering::Relaxed)
+            ),
+            (0, 0)
+        );
     }
 }
