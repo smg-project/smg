@@ -4486,15 +4486,17 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
 fn validate_openai_structured_output_rules(
     request: &ResponsesRequest,
 ) -> Result<(), ValidationError> {
-    for tool in request.tools.as_deref().unwrap_or_default() {
+    let tools = request.tools.as_deref().unwrap_or_default();
+    for (idx, tool) in tools.iter().enumerate() {
         match tool {
             ResponseTool::Function(function_tool) => {
-                validate_strict_function_schema(&function_tool.function)?;
+                validate_strict_function_schema(&function_tool.function, FunctionPlace::Tool(idx))?;
             }
             ResponseTool::Namespace(namespace) => {
-                for member in &namespace.tools {
+                for (member_idx, member) in namespace.tools.iter().enumerate() {
                     if let NamespaceTool::Function(function_tool) = member {
-                        validate_strict_function_schema(&function_tool.function)?;
+                        let at = FunctionPlace::Member(idx, member_idx);
+                        validate_strict_function_schema(&function_tool.function, at)?;
                     }
                 }
             }
@@ -4530,8 +4532,14 @@ fn validate_openai_structured_output_rules(
 }
 
 /// A strict function's schema pins `additionalProperties: false` on every
-/// object node; a function that is not strict is not judged.
-fn validate_strict_function_schema(function: &Function) -> Result<(), ValidationError> {
+/// object node; a function that is not strict is not judged. A top-level
+/// function is refused in the public API's sentence, which names it by its
+/// name alone. A namespace member's refusal adds its place: two namespaces
+/// may each declare a member of that name.
+fn validate_strict_function_schema(
+    function: &Function,
+    at: FunctionPlace,
+) -> Result<(), ValidationError> {
     if function.strict != Some(true) {
         return Ok(());
     }
@@ -4539,11 +4547,15 @@ fn validate_strict_function_schema(function: &Function) -> Result<(), Validation
     else {
         return Ok(());
     };
+    let name = &function.name;
+    let named = match at {
+        FunctionPlace::Tool(_) => format!("'{name}'"),
+        FunctionPlace::Member(..) => format!("'{name}' ({at}.parameters)"),
+    };
     Err(invalid(
         "invalid_function_parameters",
         format!(
-            "Invalid schema for function '{}': In context={path}, 'additionalProperties' is required to be supplied and to be false.",
-            function.name
+            "Invalid schema for function {named}: In context={path}, 'additionalProperties' is required to be supplied and to be false."
         ),
     ))
 }

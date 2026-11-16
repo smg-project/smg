@@ -170,11 +170,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `invalid_type`, `Invalid type for 'tools[0].tools[1].parameters': expected an object, but got a
   string instead.`, `error.param` `tools`). For one of OpenAI's own models a strict member whose
   schema does not pin `additionalProperties: false` on every object is refused
-  (`invalid_function_parameters`, the message naming the member's function), as a top-level strict
-  function is. Such a member passed validation, and the model was handed a function whose schema
-  was a string, an array, a number or a boolean. A member with an object, with `null` or with no
-  `parameters` is accepted as before, and a self-hosted model's strict member is passed through as
-  before.
+  (`invalid_function_parameters`), as a top-level strict function is. The refusal names the member
+  by its name and its place, since two namespaces may each declare a member of one name: `Invalid
+  schema for function 'search' (tools[1].tools[0].parameters): In context=(), ...`. A top-level
+  function keeps the public API's sentence. Such a member passed validation, and the model was
+  handed a function whose schema was a string, an array, a number or a boolean. A member with an
+  object, with `null` or with no `parameters` is accepted as before, and a self-hosted model's
+  strict member is passed through as before.
 - A tool the model calls by name is refused when that name is the empty string (`400`,
   `error.code` `empty_string`, in the public API's words: `Invalid 'tools[1].function.name': empty
   string. Expected a string with minimum length 1, but got an empty string instead.`). On Chat
