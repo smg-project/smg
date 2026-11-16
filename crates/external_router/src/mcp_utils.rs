@@ -492,7 +492,7 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
         time::Duration,
@@ -507,7 +507,9 @@ mod tests {
         },
     };
     use serde_json::json;
-    use smg_mcp::{McpConfig, McpToolSession, ResponseFormatConfig, ToolConfig};
+    use smg_mcp::{
+        McpConfig, McpToolSession, ResponseFormatConfig, ToolConfig, ToolExecutionInput,
+    };
     use tokio::sync::{oneshot, Notify};
 
     use super::*;
@@ -583,7 +585,13 @@ mod tests {
     /// refusal is decided; a listing arriving while `hold` is holding waits
     /// for its release; the answer comes after `list_delay`. With `changed`
     /// the server opens a session, and its notification stream sends
-    /// `notifications/tools/list_changed` at each signal.
+    /// `notifications/tools/list_changed` at each signal. With `numbered`
+    /// each tool lists under its name and the number held (`echo-1`), so a
+    /// listing shows its moment. The server has no prompts and answers so; a
+    /// `prompts/list` arriving while `prompts_gate` holds signals the gate
+    /// and waits for its release first. With `drops_calls` a `tools/call`
+    /// fails at the transport (an HTTP 500), which its caller takes as a
+    /// dropped connection.
     #[derive(Clone, Default)]
     struct LocalServer {
         tools: Option<&'static [&'static str]>,
@@ -596,6 +604,9 @@ mod tests {
         arrived: Option<Arc<Notify>>,
         hold: Option<Arc<Hold>>,
         changed: Option<Arc<Notify>>,
+        numbered: Option<Arc<AtomicUsize>>,
+        prompts_gate: Option<Arc<Gate>>,
+        drops_calls: bool,
     }
 
     /// A gate the local server's `tools/list` waits at while `holding` is
@@ -604,6 +615,14 @@ mod tests {
     struct Hold {
         holding: AtomicBool,
         release: Notify,
+    }
+
+    /// A [`Hold`] that tells when a listing reached it: each listing it
+    /// stops signals `arrived` first.
+    #[derive(Default)]
+    struct Gate {
+        arrived: Notify,
+        hold: Hold,
     }
 
     /// A local MCP server over HTTP that initializes and answers `tools/list`
@@ -623,6 +642,13 @@ mod tests {
         ) -> Response {
             use axum::response::IntoResponse;
             let id = message.get("id").cloned().unwrap_or(Value::Null);
+            if message["method"] == "prompts/list" {
+                let gate = server.prompts_gate.as_ref();
+                if let Some(gate) = gate.filter(|gate| gate.hold.holding.load(Ordering::SeqCst)) {
+                    gate.arrived.notify_one();
+                    gate.hold.release.notified().await;
+                }
+            }
             let mut response = match message.get("method").and_then(Value::as_str) {
                 Some("initialize") => Json(json!({
                     "jsonrpc": "2.0", "id": id,
@@ -662,11 +688,19 @@ mod tests {
                         .as_ref()
                         .is_some_and(|flag| flag.load(Ordering::SeqCst));
                     let note = if relisted { ", relisted" } else { "" };
+                    let moment = server
+                        .numbered
+                        .as_ref()
+                        .map(|moment| moment.load(Ordering::SeqCst));
+                    let numbered = |name: &str| match moment {
+                        Some(moment) => format!("{name}-{moment}"),
+                        None => name.to_string(),
+                    };
                     match server.tools {
                         Some(names) if !refused => Json(json!({
                             "jsonrpc": "2.0", "id": id,
                             "result": {"tools": names.iter().skip(usize::from(relisted)).map(|name| json!({
-                                "name": name,
+                                "name": numbered(name),
                                 "description": format!("the {name} tool{note}"),
                                 "inputSchema": {"type": "object", "properties": {}}
                             })).collect::<Vec<_>>()}
@@ -678,6 +712,9 @@ mod tests {
                         }))
                         .into_response(),
                     }
+                }
+                Some("tools/call") if server.drops_calls => {
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
                 }
                 Some(method) if method.starts_with("notifications/") => {
                     StatusCode::ACCEPTED.into_response()
@@ -1336,6 +1373,166 @@ mod tests {
             reader.await.expect("the reader ends"),
             names.len(),
             "the fewest tools a reader found through a refresh"
+        );
+    }
+
+    /// Waits for one of the local server's signals, ten seconds at most;
+    /// `step` names what did not happen.
+    async fn reached(signal: &Notify, step: &str) {
+        tokio::time::timeout(Duration::from_secs(10), signal.notified())
+            .await
+            .expect(step);
+    }
+
+    /// An orchestrator holding one static server, `conf`, registered after
+    /// start-up and connected to the local server at `url`.
+    async fn orchestrator_connected_to(url: String) -> Arc<McpOrchestrator> {
+        let orchestrator = Arc::new(McpOrchestrator::new(McpConfig::default()).await.unwrap());
+        orchestrator
+            .connect_static_server(&McpServerConfig {
+                name: "conf".to_string(),
+                transport: McpTransport::Streamable {
+                    url,
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: None,
+                builtin_type: None,
+                builtin_tool_name: None,
+                internal: false,
+            })
+            .await
+            .expect("the server connects");
+        orchestrator
+    }
+
+    /// One call of `tool` on the static server `conf`, through a session
+    /// that binds it; whether the call failed. A local server that drops its
+    /// calls fails the call's transport: the call is answered after the
+    /// recovery that follows, as a failure (the tool is not replayed).
+    async fn call_on_conf(orchestrator: &McpOrchestrator, tool: &str) -> bool {
+        let conf = McpServerBinding {
+            label: "conf".to_string(),
+            server_key: "conf".to_string(),
+            allowed_tools: None,
+            list_error: None,
+        };
+        McpToolSession::new(orchestrator, vec![conf], "test-request")
+            .execute_tool(ToolExecutionInput {
+                call_id: "call-1".to_string(),
+                tool_name: tool.to_string(),
+                arguments: json!({}),
+            })
+            .await
+            .is_error
+    }
+
+    /// A recovery keeps the server's tools until its new listing is in. The
+    /// local server drops a tool call, so the call's recovery connects
+    /// again, and holds the new connection's listing. A request that binds
+    /// the server at that moment reads no listing error, because the dropped
+    /// connection's entry stands until the new one replaces it, and finds
+    /// the tools.
+    #[tokio::test]
+    async fn a_recovery_keeps_the_tools_until_its_listing_is_in() {
+        let arrived = Arc::new(Notify::new());
+        let hold = Arc::new(Hold::default());
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            arrived: Some(Arc::clone(&arrived)),
+            hold: Some(Arc::clone(&hold)),
+            drops_calls: true,
+            ..Default::default()
+        })
+        .await;
+        let orchestrator = orchestrator_connected_to(url).await;
+        // The first load's listing.
+        arrived.notified().await;
+        hold.holding.store(true, Ordering::SeqCst);
+
+        let conf = ["conf".to_string()];
+        let (dropped, read) = tokio::join!(call_on_conf(&orchestrator, "echo"), async {
+            reached(&arrived, "the dropped call's recovery lists again").await;
+            let read = (
+                orchestrator.list_error_for_server("conf"),
+                orchestrator.list_tools_for_servers(&conf).len(),
+            );
+            hold.holding.store(false, Ordering::SeqCst);
+            hold.release.notify_one();
+            read
+        });
+        assert!(dropped, "the call the server dropped fails");
+        assert_eq!(
+            read,
+            (None, 1),
+            "the listing error and the tools a request reads while the recovery lists"
+        );
+        assert_eq!(
+            orchestrator.list_tools_for_servers(&conf).len(),
+            1,
+            "the tools after the recovery"
+        );
+    }
+
+    /// A refresh that listed on a dropped connection does not stand over the
+    /// recovery's listing. Each listing of the local server carries the
+    /// number of its moment. A refresh takes its tools at moment 1 on the
+    /// first connection and waits in its prompts listing. A dropped call's
+    /// recovery connects again, takes its tools at moment 2 and waits in its
+    /// own prompts listing. The refresh is released and writes back, as the
+    /// entry still holds its connection; then the recovery. The server keeps
+    /// the tools of moment 2.
+    #[tokio::test]
+    async fn a_dropped_connections_refresh_does_not_stand_over_the_recovery() {
+        let moment = Arc::new(AtomicUsize::new(0));
+        let changed = Arc::new(Notify::new());
+        let gate = Arc::new(Gate::default());
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            changed: Some(Arc::clone(&changed)),
+            numbered: Some(Arc::clone(&moment)),
+            prompts_gate: Some(Arc::clone(&gate)),
+            drops_calls: true,
+            ..Default::default()
+        })
+        .await;
+        let orchestrator = orchestrator_connected_to(url).await;
+        let conf = ["conf".to_string()];
+        let names = || -> Vec<String> {
+            orchestrator
+                .list_tools_for_servers(&conf)
+                .iter()
+                .map(|tool| tool.tool_name().to_string())
+                .collect()
+        };
+        assert_eq!(names(), ["echo-0"], "the first load's listing");
+
+        gate.hold.holding.store(true, Ordering::SeqCst);
+        moment.store(1, Ordering::SeqCst);
+        changed.notify_one();
+        reached(&gate.arrived, "the refresh reaches its prompts listing").await;
+
+        moment.store(2, Ordering::SeqCst);
+        let (dropped, ()) = tokio::join!(call_on_conf(&orchestrator, "echo-0"), async {
+            reached(&gate.arrived, "the recovery reaches its prompts listing").await;
+            // The refresh first: its write-back lands while the recovery waits.
+            gate.hold.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while names() != ["echo-1"] {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the refresh writes back while the entry holds its connection");
+            gate.hold.release.notify_one();
+        });
+        assert!(dropped, "the call the server dropped fails");
+        assert_eq!(
+            names(),
+            ["echo-2"],
+            "the recovery's listing stands, not the dropped connection's"
         );
     }
 
