@@ -2904,9 +2904,14 @@ impl NativeEncoder {
             (None, [stage], None)
                 if matches!(stage.pieces.walk(), Walk::Apart { matches: true, .. }) =>
             {
-                if let Err(declined) =
-                    self.encode_single_stage(model, stage, text, words, mapped, ids, cache)
-                {
+                // An all-ASCII unit has a copy of the stage's loop compiled
+                // for it (see `encode_single_stage`).
+                let encoded = if cache.unit_ascii {
+                    self.encode_single_stage::<true>(model, stage, text, words, mapped, ids, cache)
+                } else {
+                    self.encode_single_stage::<false>(model, stage, text, words, mapped, ids, cache)
+                };
+                if let Err(declined) = encoded {
                     fallback = Some(declined);
                 }
             }
@@ -3131,9 +3136,20 @@ impl NativeEncoder {
     /// loop inlined there cost that path 3 % of its instructions per token
     /// (measured); one call per unit here is nothing against a unit's
     /// pieces.
+    ///
+    /// Compiled twice. `ASCII` is the copy an all-ASCII unit takes (the
+    /// flag [`Self::encode_unit`] reads once per unit): in it the template
+    /// scanner ends every run by the lean scan (`Roles::run_end_ascii`),
+    /// which has no character beyond ASCII to care for, whatever the
+    /// input's length. It is a copy and no third loop of the one function:
+    /// compiled in here, the lean loop moved the code of the other loops,
+    /// and the byte loops and the cased scanner cost 1 to 2 % more
+    /// operations per token on text the lean scan never reads (counted). A
+    /// pattern with no lean scan goes on to the other copy, which is the
+    /// function as it was.
     #[inline(never)]
     #[expect(clippy::too_many_arguments)]
-    fn encode_single_stage(
+    fn encode_single_stage<const ASCII: bool>(
         &self,
         model: Option<&ModelWrapper>,
         stage: &Stage,
@@ -3143,6 +3159,10 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
+        if ASCII && !stage.pattern.has_lean_scan() {
+            return self
+                .encode_single_stage::<false>(model, stage, text, words, mapped, ids, cache);
+        }
         let gaps = matches!(stage.pieces.walk(), Walk::Apart { gaps: true, .. });
         let mut cursor = 0;
         let mut fallback = None;
@@ -3152,7 +3172,7 @@ impl NativeEncoder {
         // instructions for a hit of which the probe is about 50 (counted on
         // the long warm cells). The gap piece stays out of line: a scanner's
         // alternatives tile the text, so a gap is the rare case there.
-        stage.pattern.for_each_match(
+        stage.pattern.for_each_match::<ASCII, _>(
             text,
             words,
             #[inline(always)]

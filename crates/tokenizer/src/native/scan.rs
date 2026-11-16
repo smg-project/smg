@@ -115,14 +115,29 @@ impl WordScan {
     /// function is instantiated.
     #[inline(always)]
     fn outside<const SCAN: u8>(word: u64) -> u64 {
+        (Self::inside::<SCAN>(word & !HIGH_BITS) & !word & HIGH_BITS) ^ HIGH_BITS
+    }
+
+    /// [`Self::outside`] for a word of an all-ASCII text: no byte has its
+    /// high bit set, so the set's test is the whole of it, three operations
+    /// and one constant fewer per word.
+    #[inline(always)]
+    fn outside_ascii<const SCAN: u8>(word: u64) -> u64 {
+        debug_assert_eq!(word & HIGH_BITS, 0, "a word of an all-ASCII text");
+        !Self::inside::<SCAN>(word) & HIGH_BITS
+    }
+
+    /// Bit 7 of each byte of `low` (every high bit clear) that is in the set
+    /// of `SCAN`; the other bits of the result are not defined.
+    #[inline(always)]
+    fn inside<const SCAN: u8>(low: u64) -> u64 {
         const {
             assert!(
                 SCAN >= Self::LETTERS && SCAN <= Self::SPACES,
                 "one of the four word scans"
             );
         };
-        let low = word & !HIGH_BITS;
-        let inside = if SCAN == Self::LETTERS {
+        if SCAN == Self::LETTERS {
             between(low | (EACH_BYTE * 0x20), b'a', b'z')
         } else if SCAN == Self::LOWER {
             between(low, b'a', b'z')
@@ -131,8 +146,7 @@ impl WordScan {
         } else {
             // `SPACES`, the one scan left.
             between(low, b'\t', b'\r') | between(low, b' ', b' ')
-        };
-        (inside & !word & HIGH_BITS) ^ HIGH_BITS
+        }
     }
 }
 
@@ -392,6 +406,122 @@ impl Roles {
                 }
                 pos += 8;
             }
+        }
+    }
+
+    /// [`Self::run_end_as`] for a text that is all ASCII (the encoder reads
+    /// that once per unit): there is no character beyond ASCII to decode
+    /// and none for a run to end at, so the word test is the whole scan and
+    /// a run costs the same few operations whatever its length up to a
+    /// word. The letters' run goes straight to the word test: its caller
+    /// has read the run's first letter, and a second mostly follows.
+    /// Another role's run often ends at once and reads its first byte
+    /// through the table, as the byte loop does, before the word. The first
+    /// word is tested in line and ends nine runs in ten of English prose; a
+    /// longer run, and the tail under eight bytes, go out of line
+    /// ([`Self::run_end_ascii_rest`]): as a loop in here the scan cost every
+    /// run the loop's setup, as many operations as the test itself
+    /// (counted). A role whose ASCII members are not the set of `SCAN` runs
+    /// byte by byte.
+    #[inline(always)]
+    pub(super) fn run_end_ascii<const SCAN: u8>(
+        &self,
+        text: &str,
+        mut pos: usize,
+        bit: Bits,
+    ) -> usize {
+        const {
+            assert!(
+                SCAN >= WordScan::LETTERS && SCAN <= WordScan::SPACES,
+                "one of the four word scans; a role with no scan runs through the byte loop"
+            );
+        };
+        debug_assert_eq!(bit.count_ones(), 1, "one role's bit");
+        let bytes = text.as_bytes();
+        if self.scans[bit.trailing_zeros() as usize % Bits::BITS as usize] != SCAN {
+            return self.run_end_bytes(bytes, pos, bit);
+        }
+        if SCAN != WordScan::LETTERS {
+            match bytes.get(pos) {
+                Some(&lead) if self.bytes[usize::from(lead)] & bit != 0 => pos += 1,
+                _ => return pos,
+            }
+        }
+        let Some(word) = bytes.get(pos..).and_then(<[u8]>::first_chunk::<8>) else {
+            return self.run_end_ascii_rest::<SCAN>(bytes, pos, bit);
+        };
+        let outside = WordScan::outside_ascii::<SCAN>(u64::from_le_bytes(*word));
+        if outside != 0 {
+            return pos + (outside.trailing_zeros() / 8) as usize;
+        }
+        self.run_end_ascii_rest::<SCAN>(bytes, pos + 8, bit)
+    }
+
+    /// The rest of a lean run ([`Self::run_end_ascii`]) from `pos`: whole
+    /// words while every byte is in the set, then the tail under eight bytes
+    /// byte by byte.
+    #[cold]
+    #[inline(never)]
+    fn run_end_ascii_rest<const SCAN: u8>(&self, bytes: &[u8], mut pos: usize, bit: Bits) -> usize {
+        while let Some(word) = bytes.get(pos..).and_then(<[u8]>::first_chunk::<8>) {
+            let outside = WordScan::outside_ascii::<SCAN>(u64::from_le_bytes(*word));
+            if outside != 0 {
+                return pos + (outside.trailing_zeros() / 8) as usize;
+            }
+            pos += 8;
+        }
+        self.run_end_bytes(bytes, pos, bit)
+    }
+
+    /// [`Self::run_end`] on a text that is all ASCII: a character is its
+    /// byte, and the byte table is the whole test.
+    #[inline(always)]
+    fn run_end_bytes(&self, bytes: &[u8], mut pos: usize, bit: Bits) -> usize {
+        while let Some(&byte) = bytes.get(pos) {
+            if self.bytes[usize::from(byte)] & bit == 0 {
+                break;
+            }
+            pos += 1;
+        }
+        pos
+    }
+
+    /// [`Self::at`] by the walk's text: on a text that is all ASCII
+    /// (`ASCII`) a character is its byte, and the byte table is the read.
+    #[inline(always)]
+    pub(super) fn at_by<const ASCII: bool>(&self, text: &str, pos: usize) -> Option<(Bits, usize)> {
+        if ASCII {
+            let byte = *text.as_bytes().get(pos)?;
+            Some((self.bytes[usize::from(byte)], 1))
+        } else {
+            self.at(text, pos)
+        }
+    }
+
+    /// [`Self::run_end`] by the walk's text: on a text that is all ASCII the
+    /// byte table is the whole test.
+    #[inline(always)]
+    pub(super) fn run_end_of<const ASCII: bool>(&self, text: &str, pos: usize, bit: Bits) -> usize {
+        if ASCII {
+            self.run_end_bytes(text.as_bytes(), pos, bit)
+        } else {
+            self.run_end(text, pos, bit)
+        }
+    }
+
+    /// A run's end by the scans a walk takes: [`Self::run_end_ascii`] when
+    /// its text is all ASCII (`ASCII`), else [`Self::run_end_as`].
+    #[inline(always)]
+    pub(super) fn run_end_by<const SCAN: u8, const WORDS: bool, const ASCII: bool>(
+        &self,
+        text: &str,
+        pos: usize,
+        bit: Bits,
+    ) -> usize {
+        if ASCII {
+            self.run_end_ascii::<SCAN>(text, pos, bit)
+        } else {
+            self.run_end_as::<SCAN, WORDS>(text, pos, bit)
         }
     }
 
@@ -690,6 +820,86 @@ mod tests {
         assert!(
             reached.iter().all(|&times| times >= 100),
             "a word, two words, a tail after a word, beyond ASCII after a word: {reached:?}"
+        );
+    }
+
+    /// The lean scan of an all-ASCII text ends every run where the byte loop
+    /// ends it: every role at every offset of texts made of ASCII pieces of
+    /// every kind, so a run that ends at once, one inside a word, one over
+    /// two words and one into the tail under eight bytes after a word are
+    /// each reached hundreds of times (counted from the byte loop's answer);
+    /// and a scan named for a role whose members are another set is the
+    /// byte loop.
+    #[test]
+    fn the_lean_scan_of_an_ascii_text_ends_runs_as_the_byte_loop_does() {
+        let pattern = Pattern::parse(r"\p{L}|\s|\p{Ll}|[\r\n]").expect("parses");
+        let classes: Vec<&Class> = pattern.classes().iter().collect();
+        let roles = Roles::build(&classes);
+        let pieces = [
+            "a",
+            "Z",
+            " ",
+            "\n",
+            "\r",
+            "1",
+            ".",
+            "abcdefgh",
+            "ABCDEFGHIJK",
+            "lowercase",
+            "        ",
+            "\t\t\t\t\t",
+        ];
+        let mut reached = [0usize; 4];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut text = String::new();
+        for _ in 0..3_000 {
+            text.clear();
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let len = (seed % 40) as usize;
+            let mut pick = seed;
+            for _ in 0..len {
+                pick = pick.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(1);
+                text.push_str(pieces[((pick >> 33) % pieces.len() as u64) as usize]);
+            }
+            for pos in 0..=text.len() {
+                let by_bytes = |bit: Bits| roles.run_end(&text, pos, bit);
+                for bit in [1, 2, 4] {
+                    let run = by_bytes(bit) - pos;
+                    reached[0] += usize::from(run == 0);
+                    reached[1] += usize::from((1..8).contains(&run));
+                    reached[2] += usize::from(run >= 17);
+                    reached[3] += usize::from(
+                        run >= 9 && pos + run == text.len() && !(run - 1).is_multiple_of(8),
+                    );
+                }
+                assert_eq!(
+                    roles.run_end_ascii::<{ WordScan::LETTERS }>(&text, pos, 1),
+                    by_bytes(1),
+                    "{text:?} at {pos} letters"
+                );
+                assert_eq!(
+                    roles.run_end_ascii::<{ WordScan::SPACES }>(&text, pos, 2),
+                    by_bytes(2),
+                    "{text:?} at {pos} spaces"
+                );
+                assert_eq!(
+                    roles.run_end_ascii::<{ WordScan::LOWER }>(&text, pos, 4),
+                    by_bytes(4),
+                    "{text:?} at {pos} lower"
+                );
+                // The line breaks are no scan's set: the byte loop under any name.
+                assert_eq!(
+                    roles.run_end_ascii::<{ WordScan::SPACES }>(&text, pos, 8),
+                    by_bytes(8),
+                    "{text:?} at {pos} breaks"
+                );
+            }
+        }
+        assert!(
+            reached.iter().all(|&times| times >= 100),
+            "a run at once, one inside a word, one over two words, a tail after a word: {reached:?}"
         );
     }
 }

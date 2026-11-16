@@ -5734,10 +5734,19 @@ fn scanner_differential(patterns: &[&str]) {
             );
             for words in [false, true] {
                 let mut each = Vec::new();
-                parsed.for_each_match(text, words, |start, end| each.push((start, end)));
+                parsed
+                    .for_each_match::<false, _>(text, words, |start, end| each.push((start, end)));
                 assert_eq!(
                     each, expected,
                     "for_each_match words={words}: pattern {pattern:?} text {text:?}"
+                );
+            }
+            if text.is_ascii() {
+                let mut each = Vec::new();
+                parsed.for_each_match::<true, _>(text, false, |start, end| each.push((start, end)));
+                assert_eq!(
+                    each, expected,
+                    "for_each_match of an all-ASCII text: pattern {pattern:?} text {text:?}"
                 );
             }
         };
