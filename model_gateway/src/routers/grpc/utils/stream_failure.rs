@@ -33,7 +33,8 @@
 use std::{fmt, sync::Arc};
 
 use axum::http::StatusCode;
-use smg_grpc_client::is_constraint_failure;
+use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
+use smg_grpc_client::{is_constraint_failure, is_request_timeout};
 use tracing::{error, warn};
 
 use super::{
@@ -281,12 +282,16 @@ impl StreamFailure {
     /// The `code` of the SSE error event that ends the response, when the
     /// failure has one of its own: `constraint_failed` for a worker's report
     /// that the engine could not continue the request under its constraint,
-    /// `reader_panicked` for a reading that panicked; each the code the HTTP
-    /// answer to the same failure carries. `None` otherwise.
+    /// `call_upstream_timeout` for a stream the gateway's request timeout
+    /// cut, `reader_panicked` for a reading that panicked; each the code the
+    /// HTTP answer to the same failure carries. `None` otherwise.
     pub(crate) fn code(&self) -> Option<&'static str> {
         match self {
             Self::Upstream { status, .. } if is_constraint_failure(status) => {
                 Some(CONSTRAINT_FAILED_CODE)
+            }
+            Self::Upstream { status, .. } if is_request_timeout(status) => {
+                Some(REQUEST_TIMEOUT_CODE)
             }
             Self::Panicked(_) => Some(READER_PANICKED_CODE),
             Self::Upstream { .. } | Self::Internal(_) => None,
@@ -828,6 +833,20 @@ mod tests {
         assert_eq!(worker_error_type(&rendered), None, "{rendered}");
         assert_eq!(router_error_type(&rendered), "validation_error");
         assert_eq!(router_error_reason(&rendered), "invalid_request");
+    }
+
+    /// The gateway's own request timeout names itself in the event as its
+    /// 504 does; a deadline the engine reports has no code of its own.
+    #[test]
+    fn a_stream_cut_by_the_request_timeout_carries_the_timeouts_code() {
+        let bound =
+            smg_grpc_client::RequestDeadline::after(std::time::Duration::from_secs(5)).status();
+        assert_eq!(
+            StreamFailure::upstream(bound, 0).code(),
+            Some("call_upstream_timeout")
+        );
+        let engines_own = tonic::Status::deadline_exceeded("decode step took too long");
+        assert_eq!(StreamFailure::upstream(engines_own, 7).code(), None);
     }
 
     #[test]
