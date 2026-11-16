@@ -8,12 +8,14 @@ use serde::{
     de::{
         self,
         value::{MapDeserializer, SeqAccessDeserializer},
-        SeqAccess, Visitor,
+        DeserializeSeed, SeqAccess, Visitor,
     },
     Deserialize, Deserializer, Serialize,
 };
 use serde_json::{Map, Value};
 use validator;
+
+use crate::strict_value::StrictValue;
 
 // ============================================================================
 // Default value helpers
@@ -524,13 +526,7 @@ impl From<KnownContentPart> for ContentPart {
 impl<'de> Deserialize<'de> for ContentPart {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let fields = Map::<String, Value>::deserialize(deserializer)?;
-        let kind = match fields.get("type").and_then(Value::as_str) {
-            Some(kind) if KnownContentPart::names(kind) => kind.to_string(),
-            _ => return Ok(Self::Unknown(fields)),
-        };
-        serde_json::from_value::<KnownContentPart>(Value::Object(fields))
-            .map(Self::from)
-            .map_err(|error| de::Error::custom(known_part_reason(&kind, &error)))
+        Self::from_fields(fields).map_err(de::Error::custom)
     }
 }
 
@@ -552,6 +548,17 @@ fn known_part_reason(kind: &str, error: &serde_json::Error) -> String {
 }
 
 impl ContentPart {
+    /// The part an object's fields make, for a reader that holds them already.
+    pub(crate) fn from_fields(fields: Map<String, Value>) -> Result<Self, serde_json::Error> {
+        let kind = match fields.get("type").and_then(Value::as_str) {
+            Some(kind) if KnownContentPart::names(kind) => kind.to_string(),
+            _ => return Ok(Self::Unknown(fields)),
+        };
+        serde_json::from_value::<KnownContentPart>(Value::Object(fields))
+            .map(Self::from)
+            .map_err(|error| de::Error::custom(known_part_reason(&kind, &error)))
+    }
+
     /// The text a renderer reads from the part: a text part's text, a
     /// refusal's text (the engines' own servers render a refusal part as the
     /// turn's text); none for a media or an unknown part.
@@ -1618,7 +1625,8 @@ impl Serialize for FunctionCall {
 
 impl<'de> Deserialize<'de> for FunctionCall {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(deserializer)?;
+        // Buffered strictly: the plain value reader keeps the last of a repeated `name`.
+        let value = StrictValue.deserialize(deserializer)?;
         match &value {
             Value::String(s) => match s.as_str() {
                 "none" => Ok(FunctionCall::None),

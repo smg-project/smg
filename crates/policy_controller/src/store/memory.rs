@@ -20,9 +20,8 @@ use crate::{
     spec::AppliedSpec,
     store::{
         health::HealthSink,
-        kv_events::{
-            Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
-        },
+        index::{indexed_under, KvEvent, KvTables, LaneCounts},
+        kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{LeaseRecord, LeaseRefused, LeaseState, LeasesStore},
         loads::{LoadSample, LoadSink, LoadSource, PollMode},
         reservations::{ReservationKind, ReservationStore},
@@ -57,7 +56,10 @@ pub struct MemoryStore {
     /// made. It is the last lock a writer takes: the workers lock, then the
     /// health lock, then this one.
     loads: Mutex<Loads>,
-    kv: Mutex<Kv>,
+    /// The KV lanes and the indexes they write, behind locks of their own
+    /// ([`KvTables`]): a membership write takes the table's after the
+    /// workers lock, a batch takes it alone.
+    kv: KvTables,
     reservations: Mutex<Reservations>,
     sessions: Mutex<FxHashMap<u64, Pin>>,
     leases: Mutex<Leases>,
@@ -117,7 +119,7 @@ impl MemoryStore {
                 ranks: FxHashMap::default(),
                 writer,
             }),
-            kv: Mutex::default(),
+            kv: KvTables::default(),
             reservations: Mutex::default(),
             sessions: Mutex::default(),
             leases: Mutex::default(),
@@ -275,6 +277,14 @@ impl MemoryStore {
         health.vetoes.len() + health.ok_at.len()
     }
 
+    /// How many writes to the load table moved an overload verdict: a
+    /// record, a report, the word that no report came, an eviction. A
+    /// membership write and an applied generation judge again and count
+    /// nothing.
+    pub fn overload_flips(&self) -> u64 {
+        self.loads.lock().writer.flips()
+    }
+
     /// How many workers the load table holds an entry for.
     #[cfg(test)]
     pub(super) fn load_entries(&self) -> usize {
@@ -287,10 +297,16 @@ impl MemoryStore {
         self.loads.lock().writer.held_rows()
     }
 
+    /// The KV tables, for the index's cases.
+    #[cfg(test)]
+    pub(super) fn kv(&self) -> &KvTables {
+        &self.kv
+    }
+
     /// A worker's row is gone (removed, or replaced by a new incarnation):
     /// the store's tables that live exactly as long as the row leave with
-    /// it, here and nowhere else. The health tables and the load rows today;
-    /// the KV tables join with their first writer. The vetoes a world
+    /// it, here and nowhere else: the health tables, the load rows and the
+    /// worker's KV lane with its blocks in the index. The vetoes a world
     /// carries are not among them: they leave with the row in the
     /// publication of the membership write that calls this. Called under
     /// the workers lock:
@@ -298,6 +314,7 @@ impl MemoryStore {
     /// worker's entry or nowhere, so a write racing the removal finds the
     /// row gone or lands before the tables are cleared.
     fn forget_worker(&self, id: WorkerId) {
+        self.kv.forget(id);
         let mut health = self.health.lock();
         health.forget(id);
         let mut loads = self.loads.lock();
@@ -316,25 +333,44 @@ impl MemoryStore {
         self.loads.lock().writer.allocations()
     }
 
-    /// How many resyncs were recorded for `reason`.
-    pub fn resyncs(&self, reason: ResyncReason) -> u64 {
-        self.kv
-            .lock()
-            .resyncs
-            .get(reason.as_str())
-            .copied()
-            .unwrap_or(0)
+    /// Give the row of `id` its KV lane as its facts ask
+    /// ([`KvTables::member`]). Called under the workers lock by every write
+    /// that makes a row or changes its facts.
+    fn index_member(&self, workers: &Workers, id: WorkerId) {
+        if let Some(row) = workers.rows.get(&id) {
+            self.kv.member(&row.row);
+        }
     }
 
-    /// Batches applied for one rank since its last clear: the stand-in for
-    /// the index's blocks of the rank.
-    pub fn applied_batches(&self, id: WorkerId, rank: u16) -> u64 {
-        self.kv
-            .lock()
-            .applied
-            .get(&(id, rank))
-            .copied()
-            .unwrap_or(0)
+    /// How many resyncs were recorded for `reason`.
+    pub fn resyncs(&self, reason: ResyncReason) -> u64 {
+        self.kv.resyncs(reason)
+    }
+
+    /// Blocks the index holds for the row of `id` at `rank`; `0` for a row
+    /// the store does not index.
+    pub fn indexed_blocks(&self, id: WorkerId, rank: u16) -> usize {
+        self.kv.indexed_blocks(id, rank)
+    }
+
+    /// What the lane of `id` at `rank` counted beside its blocks; `None`
+    /// for a row the store does not index.
+    pub fn lane_counts(&self, id: WorkerId, rank: u16) -> Option<LaneCounts> {
+        self.kv.counts(id, rank)
+    }
+
+    /// Rows that ask for events and hold no lane. Each was written while
+    /// its model's index stood at its ceiling
+    /// ([`INDEX_WORKERS`](crate::store::INDEX_WORKERS)): it holds nothing
+    /// in the index until one of its own later writes finds a place.
+    pub fn unindexed_rows(&self) -> usize {
+        let workers = self.workers.lock();
+        let asking = workers
+            .rows
+            .values()
+            .filter(|row| indexed_under(&row.row).is_some())
+            .count();
+        asking.saturating_sub(self.kv.lanes())
     }
 }
 
@@ -415,6 +451,7 @@ impl WorkersStore for MemoryStore {
                 } else {
                     MembershipChange::Relabelled { id: old_id }
                 });
+                self.index_member(&workers, old_id);
                 self.rebuild_world(&workers);
                 return change;
             }
@@ -456,6 +493,7 @@ impl WorkersStore for MemoryStore {
             // the old one reported is the new one's.
             self.forget_worker(old_id);
             self.loads.lock().ranks.insert(new_id, Ranks::default());
+            self.index_member(&workers, new_id);
             self.rebuild_world(&workers);
             return change;
         }
@@ -478,6 +516,7 @@ impl WorkersStore for MemoryStore {
         // writes go into.
         self.loads.lock().ranks.insert(id, Ranks::default());
         let change = workers.record(MembershipChange::Registered { id });
+        self.index_member(&workers, id);
         self.rebuild_world(&workers);
         change
     }
@@ -747,6 +786,13 @@ struct Ranks {
     pushed_at: BTreeMap<u16, Instant>,
 }
 
+impl Ranks {
+    /// Whether the rank's own record arrived at or after `since`.
+    fn pushed_since(&self, rank: u16, since: Instant) -> bool {
+        self.pushed_at.get(&rank).is_some_and(|&at| at >= since)
+    }
+}
+
 /// The load table and the world's write side, behind one lock.
 struct Loads {
     ranks: FxHashMap<WorkerId, Ranks>,
@@ -783,7 +829,8 @@ impl LoadSink for MemoryStore {
             ranks.pushed_at.insert(rank, received_at);
         }
         ranks.samples.insert(rank, sample);
-        if writer.fold_load(id, rank, Some(&sample)) {
+        if let Some(place) = writer.fold_load(id, rank, Some(&sample)) {
+            writer.recorded(place);
             let world = writer.folded_at(received_at);
             self.show(world);
         }
@@ -791,8 +838,7 @@ impl LoadSink for MemoryStore {
 
     fn report(
         &self,
-        id: WorkerId,
-        rows: &[(u16, LoadRow)],
+        answer: &[(WorkerId, u16, Option<LoadRow>)],
         polled_at: Instant,
         source: LoadSource,
     ) {
@@ -801,33 +847,75 @@ impl LoadSink for MemoryStore {
             ranks: table,
             writer,
         } = &mut *loads;
-        // A report that lands after its worker left (the poll was out when
-        // the row went) finds no entry and is dropped.
-        let Some(ranks) = table.get_mut(&id) else {
-            return;
-        };
-        // The report is folded whole before any publication: its ranks are
-        // read as one report left them.
-        let mut folded = false;
-        for &(rank, row) in rows {
-            let pushed_since = ranks
-                .pushed_at
-                .get(&rank)
-                .is_some_and(|&at| at >= polled_at);
-            if pushed_since {
+        // The answer is one engine's: its rows are written whole before
+        // the one judgment and the one publication, so its ranks are read
+        // as one answer left them. A caller's mix of engines judges each,
+        // and each engine is heard by its own ranks' rows.
+        let mut first: Option<(u32, bool)> = None;
+        let mut others: Vec<(u32, bool)> = Vec::new();
+        for &(id, rank, row) in answer {
+            // A report that lands after its worker left (the poll was out
+            // when the row went) finds no entry and is dropped.
+            let Some(ranks) = table.get_mut(&id) else {
+                continue;
+            };
+            // A rank that pushed since the poll began keeps its record,
+            // and its stream is heard: no word of the poll stands over it.
+            if ranks.pushed_since(rank, polled_at) {
                 continue;
             }
-            let age = Duration::from_millis(u64::from(row.report_age_ms));
-            let sample = LoadSample {
-                row,
-                received_at: polled_at,
-                sampled_at: polled_at.checked_sub(age).unwrap_or(polled_at),
-                source,
+            let (engine, heard) = match row {
+                Some(row) => {
+                    let age = Duration::from_millis(u64::from(row.report_age_ms));
+                    let sample = LoadSample {
+                        row,
+                        received_at: polled_at,
+                        sampled_at: polled_at.checked_sub(age).unwrap_or(polled_at),
+                        source,
+                    };
+                    ranks.samples.insert(rank, sample);
+                    let place = writer.fold_load(id, rank, Some(&sample));
+                    (place.and_then(|place| writer.engine_at(place)), true)
+                }
+                // A rank the answer omits keeps what is on file.
+                None => (writer.engine_of(id), false),
             };
-            ranks.samples.insert(rank, sample);
-            folded |= writer.fold_load(id, rank, Some(&sample));
+            let Some(engine) = engine else {
+                continue;
+            };
+            match &mut first {
+                None => first = Some((engine, heard)),
+                Some(seen) if seen.0 == engine => seen.1 |= heard,
+                Some(_) => match others.iter_mut().find(|seen| seen.0 == engine) {
+                    Some(seen) => seen.1 |= heard,
+                    None => others.push((engine, heard)),
+                },
+            }
         }
-        if folded {
+        let Some(first) = first else {
+            return;
+        };
+        let mut changed = false;
+        for (engine, heard) in std::iter::once(first).chain(others) {
+            changed |= if heard {
+                // A row was written: the engine is judged once, and the
+                // write is shown whether or not a verdict moved.
+                writer.judged(engine, true);
+                true
+            } else {
+                // No row came for the engine: the word that none came,
+                // unless a rank of it pushed since the poll began, whether
+                // the answer names that rank or not. The word is shown
+                // where it moves a verdict.
+                let pushed = writer.ranks_of(engine).any(|(id, rank)| {
+                    table
+                        .get(&id)
+                        .is_some_and(|ranks| ranks.pushed_since(rank, polled_at))
+                });
+                !pushed && writer.silence(engine)
+            };
+        }
+        if changed {
             let world = writer.folded_at(polled_at);
             self.show(world);
         }
@@ -882,12 +970,15 @@ impl LoadSink for MemoryStore {
             writer,
         } = &mut *loads;
         if let Some(ranks) = table.get_mut(&id) {
-            let mut folded = false;
+            let mut folded = None;
             for &rank in ranks.samples.keys() {
-                folded |= writer.fold_load(id, rank, None);
+                folded = writer.fold_load(id, rank, None).or(folded);
             }
             *ranks = Ranks::default();
-            if folded {
+            if let Some(place) = folded {
+                if let Some(engine) = writer.engine_at(place) {
+                    writer.judged(engine, false);
+                }
                 let world = writer.folded();
                 self.show(world);
             }
@@ -907,121 +998,44 @@ impl LoadSink for MemoryStore {
 
 // -------------------------------------------------------------- KV events
 
-#[derive(Default)]
-struct Kv {
-    cursors: FxHashMap<(WorkerId, u16), RankCursor>,
-    /// Batches applied per rank since its last clear.
-    applied: FxHashMap<(WorkerId, u16), u64>,
-    block_sizes: HashMap<String, u32>,
-    resyncs: HashMap<&'static str, u64>,
-}
-
-impl Kv {
-    fn note_resync(&mut self, reason: ResyncReason) {
-        *self.resyncs.entry(reason.as_str()).or_insert(0) += 1;
-    }
-
-    fn clear_rank(&mut self, id: WorkerId, rank: u16) {
-        self.applied.remove(&(id, rank));
-    }
-}
-
 impl KvEventSink for MemoryStore {
-    /// The store applies nothing but the count of a batch; the index is the
-    /// host's.
-    type Batch = ();
+    /// The batch's events as its collector decoded them: the store applies
+    /// them to the index of the worker's model
+    /// ([`index`](crate::store::index)).
+    type Batch = [KvEvent];
 
-    fn admit(&self, id: WorkerId, rank: u16, facts: BatchFacts, (): &Self::Batch) -> BatchOutcome {
-        let mut kv = self.kv.lock();
-        if let Some(chunk) = facts.snapshot {
-            if chunk.index == 0 {
-                kv.clear_rank(id, rank);
-                kv.note_resync(ResyncReason::Snapshot);
-            }
-            kv.cursors
-                .entry((id, rank))
-                .or_default()
-                .resync_to(facts.sequence, chunk.unknown_before);
-            *kv.applied.entry((id, rank)).or_insert(0) += 1;
-            return BatchOutcome::Applied;
-        }
-        let admission = kv
-            .cursors
-            .entry((id, rank))
-            .or_default()
-            .admit(facts.sequence, facts.clears);
-        match admission {
-            Admission::Stale => return BatchOutcome::Skipped,
-            Admission::Replay { expected } => {
-                return BatchOutcome::Gap {
-                    expected,
-                    received: facts.sequence,
-                };
-            }
-            Admission::Restart => {
-                kv.clear_rank(id, rank);
-                kv.note_resync(ResyncReason::PublisherRestart);
-            }
-            Admission::Unrecovered { cleared: true, .. } => {
-                kv.clear_rank(id, rank);
-                kv.note_resync(ResyncReason::GapCleared);
-            }
-            Admission::Apply | Admission::Unrecovered { cleared: false, .. } => {}
-        }
-        *kv.applied.entry((id, rank)).or_insert(0) += 1;
-        BatchOutcome::Applied
+    fn admit(
+        &self,
+        id: WorkerId,
+        rank: u16,
+        facts: BatchFacts,
+        batch: &Self::Batch,
+    ) -> BatchOutcome {
+        self.kv.admit(id, rank, facts, batch)
     }
 
     fn reconnected(&self, id: WorkerId) {
-        let mut kv = self.kv.lock();
-        for ((worker, _), cursor) in &mut kv.cursors {
-            if *worker == id {
-                cursor.reconnected();
-            }
-        }
+        self.kv.reconnected(id);
     }
 
     fn resync(&self, id: WorkerId, rank: Option<u16>, reason: ResyncReason) {
-        let mut kv = self.kv.lock();
-        let ranks: Vec<u16> = kv
-            .cursors
-            .keys()
-            .filter(|(worker, at)| *worker == id && rank.is_none_or(|rank| rank == *at))
-            .map(|(_, at)| *at)
-            .collect();
-        for at in ranks {
-            if let Some(cursor) = kv.cursors.get_mut(&(id, at)) {
-                cursor.reset();
-            }
-            kv.clear_rank(id, at);
-        }
-        kv.note_resync(reason);
+        self.kv.resync(id, rank, reason);
     }
 
     fn cursor(&self, id: WorkerId, rank: u16) -> Option<KvCursor> {
-        self.kv
-            .lock()
-            .cursors
-            .get(&(id, rank))
-            .map(RankCursor::view)
+        self.kv.cursor(id, rank)
     }
 
     fn removed(&self, id: WorkerId) {
-        let mut kv = self.kv.lock();
-        kv.cursors.retain(|(worker, _), _| *worker != id);
-        kv.applied.retain(|(worker, _), _| *worker != id);
+        self.kv.removed(id);
     }
 
     fn block_size(&self, model: &str) -> Option<u32> {
-        self.kv.lock().block_sizes.get(model).copied()
+        self.kv.block_size(model)
     }
 
     fn set_block_size(&self, model: &str, size: u32) {
-        let mut kv = self.kv.lock();
-        let of_record = kv.block_sizes.entry(model.to_string()).or_insert(size);
-        if size > *of_record {
-            *of_record = size;
-        }
+        self.kv.set_block_size(model, size);
     }
 }
 

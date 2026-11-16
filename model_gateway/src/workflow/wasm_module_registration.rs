@@ -17,7 +17,10 @@ use wfaas::{
 use super::data::WasmRegistrationWorkflowData;
 use crate::{
     app_context::AppContext,
-    wasm::module::{WasmModule, WasmModuleDescriptor, WasmModuleMeta},
+    wasm::{
+        module::{WasmModule, WasmModuleDescriptor, WasmModuleMeta},
+        module_manager::WasmModuleManager,
+    },
 };
 
 /// WASM module registration request
@@ -68,6 +71,19 @@ fn find_blocked_prefix(path: &str) -> Option<&'static str> {
 fn has_wasm_extension(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
+}
+
+pub(super) fn module_manager<'a>(
+    app_context: &'a AppContext,
+    step: &str,
+) -> WorkflowResult<&'a Arc<WasmModuleManager>> {
+    app_context
+        .wasm_manager
+        .as_ref()
+        .ok_or_else(|| WorkflowError::StepFailed {
+            step_id: StepId::new(step),
+            message: "WASM module manager not initialized".to_string(),
+        })
 }
 
 /// Step 1: Validate module descriptor
@@ -322,15 +338,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for CheckDuplicateStep {
             context.data.config.descriptor.name
         );
 
-        // Get WASM module manager from app context
-        let wasm_manager =
-            app_context
-                .wasm_manager
-                .as_ref()
-                .ok_or_else(|| WorkflowError::StepFailed {
-                    step_id: StepId::new("check_duplicate"),
-                    message: "WASM module manager not initialized".to_string(),
-                })?;
+        let wasm_manager = module_manager(app_context, "check_duplicate")?;
 
         // Check for duplicate hash using manager's internal method
         wasm_manager
@@ -482,15 +490,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for RegisterModuleStep {
 
         debug!("Registering WASM module in manager: {}", descriptor.name);
 
-        // Get WASM module manager from app context
-        let wasm_manager =
-            app_context
-                .wasm_manager
-                .as_ref()
-                .ok_or_else(|| WorkflowError::StepFailed {
-                    step_id: StepId::new("register_module"),
-                    message: "WASM module manager not initialized".to_string(),
-                })?;
+        let wasm_manager = module_manager(app_context, "register_module")?;
 
         // Create module metadata
         let now = std::time::SystemTime::now()

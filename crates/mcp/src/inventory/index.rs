@@ -32,7 +32,7 @@ pub(crate) struct CachedResource {
 pub struct ToolInventory {
     tools_by_qualified: DashMap<QualifiedToolName, ToolEntry>,
     tools_by_simple_name: DashMap<String, Vec<QualifiedToolName>>,
-    tools_by_server: DashMap<String, HashSet<String>>,
+    tools_by_server: DashMap<String, HashSet<QualifiedToolName>>,
     tools_by_category: DashMap<ToolCategory, HashSet<QualifiedToolName>>,
     aliases: DashMap<String, QualifiedToolName>,
     prompts: DashMap<String, CachedPrompt>,
@@ -111,19 +111,19 @@ impl ToolInventory {
 
         // Update simple name index
         self.tools_by_simple_name
-            .entry(tool_name.clone())
+            .entry(tool_name)
             .and_modify(|v| {
                 if !v.contains(&qualified) {
                     v.push(qualified.clone());
                 }
             })
-            .or_insert_with(|| vec![qualified]);
+            .or_insert_with(|| vec![qualified.clone()]);
 
         // Update server index
         self.tools_by_server
             .entry(server_key)
             .or_default()
-            .insert(tool_name);
+            .insert(qualified);
     }
 
     /// Get the full tool entry by qualified name.
@@ -132,16 +132,31 @@ impl ToolInventory {
         self.tools_by_qualified.get(&qualified).map(|e| e.clone())
     }
 
-    /// The entries `key` keeps, each with its key and cloned once: one walk
-    /// of the inventory and no copy of the entries left out.
-    pub fn entries_keyed<K>(
-        &self,
-        mut key: impl FnMut(&ToolEntry) -> Option<K>,
-    ) -> Vec<(K, ToolEntry)> {
-        self.tools_by_qualified
-            .iter()
-            .filter_map(|entry| key(entry.value()).map(|k| (k, entry.value().clone())))
-            .collect()
+    /// The entries of the servers named, each with its server's place in
+    /// `server_keys` (the first, for a key named twice) and cloned once.
+    /// Read through the server index: the cost follows these servers' tools,
+    /// not the size of the inventory or the shard count of its maps.
+    pub(crate) fn entries_of_servers(&self, server_keys: &[String]) -> Vec<(usize, ToolEntry)> {
+        let mut entries = Vec::new();
+        for (rank, server_key) in server_keys.iter().enumerate() {
+            if server_keys
+                .iter()
+                .take(rank)
+                .any(|earlier| earlier == server_key)
+            {
+                continue;
+            }
+            let Some(names) = self.tools_by_server.get(server_key) else {
+                continue;
+            };
+            entries.reserve(names.len());
+            entries.extend(names.iter().filter_map(|qualified| {
+                self.tools_by_qualified
+                    .get(qualified)
+                    .map(|entry| (rank, entry.clone()))
+            }));
+        }
+        entries
     }
 
     /// Atomically update a tool entry if it exists.
@@ -349,9 +364,9 @@ impl ToolInventory {
     /// dropped is not still offered under its alias. Prompts and resources
     /// stay.
     pub fn clear_server_tool_entries(&self, server_key: &str) {
-        if let Some((_, tool_names)) = self.tools_by_server.remove(server_key) {
-            for tool_name in tool_names {
-                self.remove_entry(&QualifiedToolName::new(server_key, &tool_name));
+        if let Some((_, names)) = self.tools_by_server.remove(server_key) {
+            for qualified in names {
+                self.remove_entry(&qualified);
             }
         }
 
@@ -367,7 +382,7 @@ impl ToolInventory {
             let qualified = QualifiedToolName::new(ALIAS_SERVER_KEY, &alias);
             self.remove_entry(&qualified);
             if let Some(mut names) = self.tools_by_server.get_mut(ALIAS_SERVER_KEY) {
-                names.remove(&alias);
+                names.remove(&qualified);
             }
             self.tools_by_server
                 .remove_if(ALIAS_SERVER_KEY, |_, names| names.is_empty());
@@ -1087,5 +1102,28 @@ mod tests {
         assert_eq!(inventory.counts(), (1, 0, 0));
         inventory.clear_server_tools("s");
         assert_eq!(inventory.counts(), (0, 0, 0));
+    }
+
+    /// The server index lists each named server's entries under the server's
+    /// first place in the keys: a key named twice once, an unknown key none,
+    /// the other servers' entries left out.
+    #[test]
+    fn the_entries_of_servers_come_through_the_server_index() {
+        let inventory = ToolInventory::new();
+        for (server, tool) in [("a", "one"), ("a", "two"), ("b", "three"), ("c", "four")] {
+            inventory.insert_tool(tool.to_string(), server.to_string(), create_test_tool(tool));
+        }
+
+        let keys = ["b", "missing", "a", "b"].map(str::to_string);
+        let mut listed: Vec<(usize, String)> = inventory
+            .entries_of_servers(&keys)
+            .into_iter()
+            .map(|(rank, entry)| (rank, entry.tool_name().to_string()))
+            .collect();
+        listed.sort();
+
+        let expected =
+            [(0, "three"), (2, "one"), (2, "two")].map(|(rank, tool)| (rank, tool.to_string()));
+        assert_eq!(listed, expected);
     }
 }
