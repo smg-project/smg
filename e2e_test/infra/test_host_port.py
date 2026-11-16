@@ -32,6 +32,7 @@ def test_the_mock_mcp_server_defaults_to_the_host_e2e_host_names(monkeypatch):
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
+        timeout=60,
     )
     assert (child.returncode, child.stdout.strip()) == (0, "::1"), child.stderr
 
