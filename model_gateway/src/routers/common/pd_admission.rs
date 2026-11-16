@@ -59,6 +59,7 @@ use tokio::{sync::Notify, time::Instant};
 use tracing::{debug, warn};
 
 use crate::{
+    deadline::deadline_from_now,
     observability::metrics::Metrics,
     routers::common::overload,
     worker::{Worker, WorkerType},
@@ -184,7 +185,7 @@ async fn claim_within(
     wake: Option<&Notify>,
     try_claim: impl Fn() -> bool,
 ) -> Claim {
-    let deadline = Instant::now() + wait;
+    let deadline = deadline_from_now(wait);
     let mut first = true;
     loop {
         // Registered before the try, so a room released between this try and
@@ -584,6 +585,29 @@ mod tests {
         let claim = claim_within(Duration::ZERO, None, || false).await;
         assert_eq!(claim, Claim::Refused);
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// A wait the clock cannot hold (an operator's "never", written as the
+    /// largest number) claims a free room at once and waits for a full
+    /// window like any other wait. The plain sum of such a wait and the
+    /// clock panics before the first try, on the request's own path.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_past_the_clocks_range_claims_and_waits_like_any_other() {
+        let never = Duration::from_secs(u64::MAX);
+        assert_eq!(claim_within(never, None, || true).await, Claim::Immediate);
+
+        let claimed = AtomicUsize::new(1);
+        let free_a_room = async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            claimed.store(0, AtomicOrdering::SeqCst);
+        };
+        let gate = claim_within(never, None, || {
+            claimed
+                .compare_exchange(0, 1, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
+                .is_ok()
+        });
+        let ((), claim) = tokio::join!(free_a_room, gate);
+        assert_eq!(claim, Claim::Waited);
     }
 
     /// A decode worker that reports no window is announced once, as a WARN,

@@ -24,6 +24,7 @@
 pub mod admin;
 pub mod app_context;
 pub mod config;
+pub(crate) mod deadline;
 pub mod endpoints;
 pub(crate) mod fs_watch;
 pub mod health;

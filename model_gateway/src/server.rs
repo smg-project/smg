@@ -2840,7 +2840,7 @@ async fn graceful_shutdown(
     // window and the leave of the mesh leave of it. A grace the clock cannot
     // hold ends at the far future: the plain sum would panic here, in the
     // signal's task, before readiness drains.
-    let deadline = middleware::body_timeout::deadline_from_now(budget.grace);
+    let deadline = crate::deadline::deadline_from_now(budget.grace);
     inflight_tracker.begin_drain();
     let left_in_time = if budget.settle.is_zero() {
         tokio::time::timeout(budget.grace, leave_mesh).await.is_ok()

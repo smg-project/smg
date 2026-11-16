@@ -36,6 +36,7 @@ use tower::{Layer, Service};
 use super::edge_body::BodyDuties;
 use crate::{
     config::types::RouterConfig,
+    deadline::deadline_after,
     routers::http::stream_failure::{note_sent, on_frame_boundary, SentTail},
 };
 
@@ -235,7 +236,7 @@ impl KeepAlive {
             // The first quiet poll after a burst: its last frame just left.
             self.last_sent = Instant::now();
         }
-        let first_due = self.last_sent + self.interval;
+        let first_due = deadline_after(self.last_sent, self.interval);
         let timer = self
             .timer
             .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(first_due)));
@@ -244,15 +245,15 @@ impl KeepAlive {
                 return Poll::Pending;
             }
             let now = Instant::now();
-            let due = self.last_sent + self.interval;
+            let due = deadline_after(self.last_sent, self.interval);
             if now < due {
                 timer.as_mut().reset(due);
             } else if on_frame_boundary(self.tail.as_slice()) {
                 self.last_sent = now;
-                timer.as_mut().reset(now + self.interval);
+                timer.as_mut().reset(deadline_after(now, self.interval));
                 return Poll::Ready(self.frame.clone());
             } else {
-                timer.as_mut().reset(now + self.interval);
+                timer.as_mut().reset(deadline_after(now, self.interval));
             }
         }
     }
@@ -378,6 +379,51 @@ mod tests {
     async fn an_interval_of_zero_sends_nothing() {
         let (_tx, mut body) = wrapped(0, false);
         assert_eq!(next_within(&mut body, 3600).await, Read::Silence);
+    }
+
+    /// An interval the clock cannot hold (an operator's "never", written as
+    /// the largest number) sends no keep-alive and cuts no stream: frames
+    /// pass as they come. The plain sum of such an interval and the clock
+    /// panics in the first quiet poll, and the client's answer ends there.
+    #[tokio::test(start_paused = true)]
+    async fn an_interval_past_the_clocks_range_sends_nothing_and_cuts_nothing() {
+        let (tx, mut body) = wrapped(u64::MAX, false);
+        assert_eq!(next_within(&mut body, 3600).await, Read::Silence);
+        send(&tx, b"data: {\"delta\":\"x\"}\n\n").await;
+        assert_eq!(
+            next_within(&mut body, 0).await,
+            Read::Frame(Bytes::from_static(b"data: {\"delta\":\"x\"}\n\n"))
+        );
+        assert_eq!(next_within(&mut body, 3600).await, Read::Silence);
+        drop(tx);
+        assert_eq!(next_within(&mut body, 1).await, Read::End);
+    }
+
+    /// Thirty years on, where a wait the clock cannot hold ends, the quiet
+    /// stream gets its keep-alive and the timer is armed again: on a frame
+    /// boundary the comment goes out, inside a frame nothing does.
+    #[tokio::test(start_paused = true)]
+    async fn an_interval_past_the_clocks_range_comes_due_thirty_years_on() {
+        const THIRTY_YEARS: u64 = 86_400 * 365 * 30;
+        let (tx, mut body) = wrapped(u64::MAX, false);
+        assert_eq!(
+            next_within(&mut body, THIRTY_YEARS - 1).await,
+            Read::Silence
+        );
+        assert_eq!(
+            next_within(&mut body, 2).await,
+            Read::Frame(Bytes::from_static(COMMENT))
+        );
+        // Inside a frame the timer is armed again and nothing is written.
+        send(&tx, b"data: {\"del").await;
+        assert_eq!(
+            next_within(&mut body, 0).await,
+            Read::Frame(Bytes::from_static(b"data: {\"del"))
+        );
+        assert_eq!(
+            next_within(&mut body, THIRTY_YEARS + 1).await,
+            Read::Silence
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -33,7 +33,9 @@ use tokio::time::Sleep;
 use tower::{Layer, Service};
 use tracing::warn;
 
-use crate::{config::types::RouterConfig, routers::error::create_error};
+use crate::{
+    config::types::RouterConfig, deadline::deadline_from_now, routers::error::create_error,
+};
 
 /// Error code of a body whose client made no progress for the stall timeout.
 pub const REQUEST_BODY_STALLED: &str = "request_body_stalled";
@@ -248,22 +250,14 @@ struct TimedBody {
     ended: bool,
 }
 
-/// `now + total`, saturated to a far future when the sum does not fit an
-/// instant: seconds too large to hold (the "no timeout" idiom of
-/// `request_timeout_secs`, a shutdown grace written as the largest number)
-/// are a deadline that never comes, as `tokio::time::sleep` treats them.
-pub(crate) fn deadline_from_now(total: Duration) -> tokio::time::Instant {
-    let now = tokio::time::Instant::now();
-    now.checked_add(total)
-        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
-}
-
 impl TimedBody {
     fn new(inner: Body, timeouts: RequestBodyTimeouts, outcome: Arc<AtomicU8>) -> Self {
         Self {
             inner,
             stall: timeouts.stall,
             stall_timer: None,
+            // A `request_timeout_secs` too large to hold (the "no timeout"
+            // idiom) is a deadline that never comes.
             deadline_at: deadline_from_now(timeouts.total),
             deadline: None,
             outcome,
