@@ -71,7 +71,7 @@ with no error: a stage over one ties or keeps every worker.
 
 | A stage reads | Where it comes from | In this controller today |
 |---|---|---|
-| `Candidate::health` | The prober's status of the worker, the pool's circuit breaker and the last load report's overload verdict. | The prober's status, and a stall where a veto of the asking gateway stands. The breaker and the overload verdict are not fed yet and read as clear. |
+| `Candidate::health` | The prober's status of the worker, the pool's circuit breaker and the overload verdict on its engine's load reports. | The prober's status, and a stall where a veto of the asking gateway stands. The breaker is not fed yet and reads as clear. The overload bit reads as clear unless the store judges the engine's load reports over a threshold. |
 | `Candidate::load` (`LoadRow`) | The engine's own load report: requests running and queued, KV-cache usage, the drain rate, the report's age. A stage that reads it declares `Needs::loads`. | Fed. |
 | `Candidate::in_flight` | The requests the deciding host holds on the worker right now. | Not fed yet: reads 0. |
 | `Candidate::session_hit`, `session_in_flight` | The request's session key: whether it is pinned to this worker, and its requests in flight there. | `session_hit` is set on the worker the ask names as pinned. `session_in_flight` is not fed yet and reads 0. |
@@ -100,9 +100,9 @@ your binary's: read them in `main`, from the environment or a file, and move
 them into the factory. The command line is the crate's, and it refuses a flag
 it does not know.
 
-The stock `not-overloaded` filter is left out: the store feeds no overload
-verdict yet, so it would drop nothing here. Add it once the load reports
-carry the verdict.
+The stock `not-overloaded` filter is not in this document. It drops a worker
+over the overload thresholds. Add it where the store judges overload, and
+`pack` stops filling a worker there.
 
 The stock controller refuses this document by the scorer's name. The
 published schema (`crates/policy_controller/policyspec.schema.json`) lists
@@ -158,8 +158,7 @@ The Helm chart runs the image that `policyController.image.repository` and
 - A name of its own. `--version` and `/version` answer the crate's name and
   version, as the stock controller does.
 - Data the store does not feed yet. The table above names each field that
-  reads as its default, and the overload filter is out of the document with
-  it.
+  reads as its default.
 - A decision through the controller. No call hands the controller a policy
   document yet, so it holds `pack` and judges a document against it, and
   runs no decision with it. The tests run `pack` over the store's rows.
