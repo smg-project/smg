@@ -137,6 +137,60 @@ mod tests {
     }
 
     #[test]
+    fn dsml_tag_whitespace_keeps_valid_arguments_and_all_source_bytes() {
+        for invoke_space in ["", " ", "  ", "\t", "\n"] {
+            for attribute_space in ["", " ", "  ", "\t", "\n"] {
+                let text = format!(
+                    "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\"{invoke_space}>\n<｜DSML｜ parameter name=\"message\" string=\"true\"{attribute_space}>fixture</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"count\"  string=\"false\"{attribute_space}>2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+                );
+                let cuts: Vec<usize> = text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain([text.len()])
+                    .collect();
+                for split in cuts {
+                    let events = run("<｜Assistant｜><think>", &[&text[..split], &text[split..]]);
+                    assert_eq!(bytes(&events), text);
+                    assert_eq!(
+                        arguments_of(&events, 0),
+                        r#"{"message": "fixture", "count": 2}"#
+                    );
+                    assert!(
+                        !events.iter().any(|e| matches!(e, Event::Malformed { .. })),
+                        "{invoke_space:?} {attribute_space:?} {split}: {events:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dsml_non_whitespace_tag_tails_still_refuse_the_call() {
+        let text = "</think><｜DSML｜ calls><｜DSML｜ invoke name=\"f\"xx><｜DSML｜ parameter name=\"value\" string=\"true\">fixture</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+        let events = run("<｜Assistant｜><think>", &[text]);
+        assert_eq!(bytes(&events), text);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Malformed {
+                why: crate::MalformedReason::TagTail,
+                ..
+            }
+        )));
+        assert!(serde_json::from_str::<serde_json::Value>(&arguments_of(&events, 0)).is_err());
+        let missing_separator = "</think><｜DSML｜ calls><｜DSML｜ invoke name=\"f\"><｜DSML｜ parameter name=\"value\"string=\"true\">fixture</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+        let events = run("<｜Assistant｜><think>", &[missing_separator]);
+        assert_eq!(bytes(&events), missing_separator);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Malformed {
+                why: crate::MalformedReason::TagTail,
+                ..
+            }
+        )));
+        assert!(serde_json::from_str::<serde_json::Value>(&arguments_of(&events, 0)).is_err());
+    }
+
+    #[test]
     fn a_recorded_output_gives_its_two_calls_with_their_types_and_every_byte() {
         let events = run("<｜Assistant｜><think>", &[OUTPUT]);
         assert_eq!(bytes(&events), OUTPUT);
