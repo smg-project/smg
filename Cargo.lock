@@ -8120,6 +8120,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "thread_local",
+ "tikv-jemallocator",
  "tokio",
  "tokio-stream",
  "tonic",

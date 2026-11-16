@@ -91,6 +91,13 @@ tracing-subscriber = { workspace = true, optional = true }
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 rustix = { version = "1", default-features = false, features = ["process", "std", "time", "use-libc-auxv"], optional = true }
 
+# The binary's allocator, the one the gateway's binary registers, on the
+# targets the gateway registers it: a burst of registrations builds the
+# store's world again at every write, and the system allocator keeps resident
+# what those builds free.
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
 # The build script compiles the protocol under the `controller` feature
 # alone: the engine's own build runs nothing and needs no `protoc`.
 [build-dependencies]
@@ -127,6 +134,7 @@ controller = [
     "dep:rustix",
     "dep:rustls",
     "dep:thread_local",
+    "dep:tikv-jemallocator",
     "dep:tokio",
     "dep:tokio-stream",
     "dep:tonic",
