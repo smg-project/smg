@@ -325,16 +325,18 @@ mod tests {
             );
             // Alone, after a letter, before one, twice over, and twice over
             // between letters (the first is decoded, the second starts a
-            // run); then inside a run that mixes the two lengths, after a
-            // two-byte letter and after a three-byte one.
+            // run); then inside a run, after a two-byte letter and after a
+            // three-byte one (of two letters behind an ASCII one the first
+            // is decoded and the second starts the run), and in the middle
+            // of a run that mixes the two lengths.
             for text in [
                 format!("{ch}"),
                 format!("a{ch}"),
                 format!("{ch}a"),
                 format!("{ch}{ch}"),
                 format!("a{ch}{ch}a"),
-                format!("a\u{436}{ch}\u{3042}"),
-                format!("a\u{3042}{ch}\u{436}"),
+                format!("a\u{436}\u{436}{ch}\u{3042}"),
+                format!("a\u{3042}\u{3042}{ch}\u{436}"),
                 format!("\u{436}\u{3042}{ch}\u{436}\u{3042}a"),
             ] {
                 assert_eq!(quick.is_nfc(&text), library_is_nfc(&text), "{text:?}");
