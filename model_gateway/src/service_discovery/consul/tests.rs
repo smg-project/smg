@@ -1028,7 +1028,10 @@ async fn fake_engine(held: Option<watch::Receiver<bool>>) -> (u16, task::JoinHan
 async fn an_instance_dropped_while_it_registers_is_removed_by_the_next_pass() {
     let (a, _engine_a) = fake_engine(None).await;
     // Its registration waits on this engine's health answer, which the
-    // test holds until Consul has dropped the instance.
+    // test holds until Consul has dropped the instance. That is 2 s or
+    // more, as long as the classification probe waits, so the case leans
+    // on classify defaulting to Local and on connection detection's
+    // retried probe taking the answer.
     let (answer, held) = watch::channel(false);
     let (b, _engine_b) = fake_engine(Some(held)).await;
     let instance = |node: &str, id: &str, port: u16, created: u64| {
