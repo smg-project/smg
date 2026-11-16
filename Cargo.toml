@@ -5,7 +5,7 @@ resolver = "2"
 
 [workspace.package]
 # The oldest toolchain the workspace builds with; rust-toolchain.toml pins the same release.
-rust-version = "1.98"
+rust-version = "1.100"
 
 [workspace.dependencies]
 # Internal workspace crates
@@ -22,7 +22,6 @@ smg-mcp = { version = "2.3.7", path = "crates/mcp" }
 # Members build it with its default features (none); a member-side `default-features = false` is ignored for an entry without one.
 smg-external-router = { version = "0.4.1", path = "crates/external_router" }
 kv-index = { version = "2.1.0", path = "crates/kv_index" }
-smg-radix-tree = { version = "0.1.1", path = "crates/radix_tree" }
 smg-data-connector = { version = "2.5.0", path = "crates/data_connector", package = "data-connector" }
 # Members build it with its default features (`hf-hub`): the gateway asks for `hf-hub` itself and the Python binding depends on the crate directly, taking the default.
 llm-multimodal = { version = "1.16.0", path = "crates/multimodal" }
@@ -33,7 +32,6 @@ engine-zmq-client = { version = "0.5.0", path = "crates/engine_zmq_client" }
 engine-zmq-adapter = { version = "0.3.0", path = "crates/engine_zmq_adapter" }
 engine-servicer = { version = "0.4.0", path = "crates/engine_servicer" }
 smg-rl = { version = "0.3.1", path = "crates/rl" }
-smg-policy-controller = { version = "0.1.0", path = "crates/policy_controller" }
 
 # Shared dependencies
 anyhow = "1.0"
@@ -80,10 +78,16 @@ tokio = { version = "1.54.1" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 uuid = { version = "1.23", features = ["v7", "serde"] }
-# The wasm runtime's default feature set as of wasmtime 49, named explicitly and without `cache`:
-# nothing configures wasmtime's compilation cache (no `Config::cache` call anywhere), and that
-# cache crate was the only path by which zstd 0.13 reached the lockfile. A wasmtime bump re-reads
-# the `default` list in its Cargo.toml and adds a new default here on purpose, not by inheritance.
+# The wasm runtime's default feature set as of wasmtime 49, named explicitly, without `cache` and
+# without `component-model-async`. Nothing configures wasmtime's compilation cache (no
+# `Config::cache` call anywhere), and that cache crate was the only path by which zstd 0.13
+# reached the lockfile. No crate here makes an async component call (a concurrent call, or a
+# stream or a future across the component boundary), and a runtime built with
+# `component-model-async` charges every component call that feature's task bookkeeping.
+# `wasmtime-wasi` turns the feature on for each build that links it (its `p3` default), so this
+# list decides for the builds that do not: the policy controller's. A crate that comes to make
+# such a call names the feature on its own dependency line. A wasmtime bump re-reads the
+# `default` list in its Cargo.toml and adds a new default here on purpose, not by inheritance.
 wasmtime = { version = "49.0", default-features = false, features = [
     "anyhow",
     "async",
@@ -103,7 +107,6 @@ wasmtime = { version = "49.0", default-features = false, features = [
     "debug-builtins",
     "runtime",
     "component-model",
-    "component-model-async",
     "threads",
     "stack-switching",
     "std",

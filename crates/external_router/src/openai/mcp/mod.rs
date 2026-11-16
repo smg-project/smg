@@ -13,7 +13,7 @@ pub(crate) use tool_handler::{StreamAction, StreamingToolHandler};
 // Re-export functions used by responses/streaming.rs and responses/non_streaming.rs
 pub(crate) use tool_loop::{
     execute_streaming_tool_calls, execute_tool_loop, inject_mcp_metadata_last,
-    inject_mcp_metadata_streaming, prepare_mcp_tools_as_functions, resume_payload_in_place,
-    retained_output_items, send_mcp_list_tools_events, skip_streaming_tool_calls,
-    ToolLoopExecutionContext, ToolLoopState, TOOL_CALL_LIMIT_REASON,
+    prepare_mcp_tools_as_functions, resume_payload_in_place, retained_output_items,
+    send_mcp_list_tools_events, skip_streaming_tool_calls, ToolLoopExecutionContext, ToolLoopState,
+    TOOL_CALL_LIMIT_REASON,
 };

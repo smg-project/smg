@@ -117,6 +117,10 @@ pub struct Assembler {
     header: Header,
     /// The JSON after the marker, once it has arrived.
     body: Option<Body>,
+    /// Where in the last piece fed the object's bytes began: the piece's length while the
+    /// header still reads, the marker's end in the piece that carried it, zero once the object
+    /// has begun ([`CallAssembler::quote_value`](crate::engine::CallAssembler::quote_value)).
+    value_from: usize,
 }
 
 /// The JSON after the marker, read as it arrives.
@@ -139,6 +143,7 @@ impl Assembler {
             after,
             header: Header::new(marker),
             body: None,
+            value_from: 0,
         }
     }
 
@@ -153,11 +158,14 @@ impl Assembler {
     /// the piece that carries it, none after it.
     pub fn feed<'d>(&mut self, bytes: &'d str, out: &mut Events<'d>) -> usize {
         if let Some(body) = &mut self.body {
+            self.value_from = 0;
             return body.feed(bytes, out);
         }
         let Some(Found { framing, at, after }) = self.header.push(bytes) else {
+            self.value_from = bytes.len();
             return bytes.len();
         };
+        self.value_from = bytes.len() - after.len();
         let mut body = self.after.open(self.index, &self.id, framing, at, out);
         // What followed the marker is the header's own text, so the events of this first piece
         // are taken owned; every later piece is the delta's and its fragments borrow it.
@@ -228,6 +236,11 @@ impl crate::engine::CallAssembler for Assembler {
         out: &mut Events<'d>,
     ) -> usize {
         self.feed(text, out)
+    }
+
+    /// The object's bytes alone: the header before the marker is the tool's name, no JSON.
+    fn quote_value(&self, taken: usize, piece: &str, quoted: &mut crate::engine::Quoted) {
+        quoted.advance(&piece[self.value_from.min(taken)..taken]);
     }
 
     /// The region's terminal (the message's close, the next call's opener) is the region's: the

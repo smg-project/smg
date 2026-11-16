@@ -106,7 +106,9 @@ impl From<std::io::Error> for BridgeSetupError {
 
 impl From<reqwest::Error> for BridgeSetupError {
     fn from(err: reqwest::Error) -> Self {
-        Self::Other(err.into())
+        // The client's text ends with the request URL, its query kept, and
+        // the setup's failure line writes the text.
+        Self::Other(err.without_url().into())
     }
 }
 
@@ -619,7 +621,7 @@ impl WebRtcBridge {
                     "Client data channel opened"
                 );
                 self.client_channel = Some(id);
-                self.flush_pending_to_client();
+                self.flush_pending(Side::Client);
             }
             Event::ChannelData(data) => {
                 log_data_channel(&self.call_id, &data, "Client→Upstream");
@@ -688,7 +690,7 @@ impl WebRtcBridge {
                 );
                 self.upstream_channel = Some(id);
                 self.upstream_channel_ready = true;
-                self.flush_pending_to_upstream();
+                self.flush_pending(Side::Upstream);
             }
             Event::ChannelData(data) => {
                 log_data_channel(&self.call_id, &data, "Upstream→Client");
@@ -737,41 +739,38 @@ impl WebRtcBridge {
         }
     }
 
-    /// Send all buffered upstream events to the now-open client data channel.
-    fn flush_pending_to_client(&mut self) {
-        let Some(ch_id) = self.client_channel else {
+    /// Send the messages buffered for `target` to its now-open data channel.
+    fn flush_pending(&mut self, target: Side) {
+        let (channel, pending, rtc) = match target {
+            Side::Client => (
+                self.client_channel,
+                &mut self.pending_to_client,
+                &mut self.client_rtc,
+            ),
+            Side::Upstream => (
+                self.upstream_channel,
+                &mut self.pending_to_upstream,
+                &mut self.upstream_rtc,
+            ),
+        };
+        let Some(ch_id) = channel else {
             return;
         };
-        let pending = std::mem::take(&mut self.pending_to_client);
+        let pending = std::mem::take(pending);
         if pending.is_empty() {
             return;
         }
+        let from = Self::side_label(match target {
+            Side::Client => Side::Upstream,
+            Side::Upstream => Side::Client,
+        });
+        let to = Self::side_label(target);
         info!(
             call_id = self.call_id,
             count = pending.len(),
-            "Flushing buffered upstream events to client"
+            "Flushing buffered {from} events to {to}"
         );
-        if let Some(mut ch) = self.client_rtc.channel(ch_id) {
-            for (binary, data) in pending {
-                let _ = ch.write(binary, &data);
-            }
-        }
-    }
-
-    fn flush_pending_to_upstream(&mut self) {
-        let Some(ch_id) = self.upstream_channel else {
-            return;
-        };
-        let pending = std::mem::take(&mut self.pending_to_upstream);
-        if pending.is_empty() {
-            return;
-        }
-        info!(
-            call_id = self.call_id,
-            count = pending.len(),
-            "Flushing buffered client events to upstream"
-        );
-        if let Some(mut ch) = self.upstream_rtc.channel(ch_id) {
+        if let Some(mut ch) = rtc.channel(ch_id) {
             for (binary, data) in pending {
                 let _ = ch.write(binary, &data);
             }
@@ -1093,6 +1092,7 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+    use crate::test_support::{http_client, RefusedAddress};
 
     const TXN: [u8; 12] = [
         0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
@@ -1275,5 +1275,24 @@ mod tests {
                 assert!(data.iter().all(|byte| *byte == n as u8), "packet {n}");
             }
         }
+    }
+
+    /// An offer nothing answers fails without the request URL in its text,
+    /// which the setup's failure line writes. The HTTP client's own error
+    /// text ends with the URL, its query kept.
+    #[tokio::test]
+    async fn an_offer_nothing_answers_goes_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("http://{}/v1/realtime/calls?key=s3cret", refused.addr());
+
+        let Err(BridgeSetupError::Other(error)) =
+            send_sdp_to_upstream(&http_client(), &url, "Bearer k", "v=0", None, "m").await
+        else {
+            panic!("a failed send");
+        };
+
+        let text = error.to_string();
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(!text.contains(&refused.addr().to_string()), "{text}");
     }
 }

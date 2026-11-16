@@ -453,14 +453,8 @@ impl MockWorker {
     /// configured port stays the worker's *name*: the per-port test tables
     /// are keyed by it, and the app test context rewrites URLs a test spells
     /// out with it to the bound address.
-    #[expect(
-        clippy::disallowed_methods,
-        clippy::print_stderr,
-        reason = "test infrastructure"
-    )]
     pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
-        let config = self.config.clone();
-        let named_port = config.read().await.port;
+        let named_port = self.config.read().await.port;
         let listener = match named_port {
             0 => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
             named => match tokio::net::TcpListener::bind(("127.0.0.1", named)).await {
@@ -468,6 +462,29 @@ impl MockWorker {
                 Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
             },
         };
+        self.start_on(listener).await
+    }
+
+    /// Start the mock worker server on a listener the caller holds and
+    /// return the URL it answers on.
+    ///
+    /// For a test whose engine comes up on a port it announced while the
+    /// engine was down: the test holds the port from the moment it learns the
+    /// number and hands its socket over here, so no other test of the binary
+    /// can be given the port in between. The worker's name is found as in
+    /// [`MockWorker::start`]: the configured port, or the listener's own
+    /// when the config left it 0.
+    #[expect(
+        clippy::disallowed_methods,
+        clippy::print_stderr,
+        reason = "test infrastructure"
+    )]
+    pub async fn start_on(
+        &mut self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let config = self.config.clone();
+        let named_port = config.read().await.port;
         let port = listener.local_addr()?.port();
         if named_port == 0 {
             config.write().await.port = port;
@@ -2120,5 +2137,41 @@ mod named_port_tests {
             .start()
             .await
             .expect("the name is free once the first worker dropped");
+    }
+
+    /// A worker started on a listener its test holds serves on that very
+    /// socket: the URL names the listener's port and the health route
+    /// answers there.
+    #[tokio::test]
+    async fn a_worker_started_on_a_held_listener_serves_on_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a listener the test holds");
+        let port = listener
+            .local_addr()
+            .expect("the listener's address")
+            .port();
+        let mut worker = MockWorker::new(named(port));
+        let url = worker
+            .start_on(listener)
+            .await
+            .expect("the worker starts on the held listener");
+        assert_eq!(url, format!("http://127.0.0.1:{port}"));
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the held port answers");
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: worker\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("the request is written");
+        let mut answer = String::new();
+        stream
+            .read_to_string(&mut answer)
+            .await
+            .expect("the answer is read");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
     }
 }

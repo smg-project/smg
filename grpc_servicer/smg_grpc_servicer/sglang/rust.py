@@ -391,7 +391,7 @@ def launch_scheduler_ranks(
     from sglang.srt.plugins import load_plugins
     from sglang.srt.runtime_context import publish
     from sglang.srt.server_args import PortArgs
-    from sglang.srt.utils import configure_logger
+    from sglang.srt.utils import common, configure_logger
 
     from smg_grpc_servicer.sglang.zmq_plugin import ENGINE_INDEX_ENV, HANDSHAKE_ENV
 
@@ -400,6 +400,9 @@ def launch_scheduler_ranks(
     os.environ[ENGINE_INDEX_ENV] = "0"
     configure_logger(server_args)
     server_args.resolve_once()
+    # The gRPC entrypoint may already own the metrics directory. Native setup
+    # replaces that owner; keep its root alive while the scheduler uses it.
+    metrics_dir_owner = getattr(common, "prometheus_multiproc_dir", None)
     _set_envs_and_config(server_args)
     ensure_spawn_start_method("SGLang scheduler")
     load_plugins()
@@ -415,7 +418,11 @@ def launch_scheduler_ranks(
     # context they read, before the ranks; held the same way.
     if encode_bridge is not None:
         encode_bridge.start()
-    held = [server for server in (bootstrap_server, encode_bridge) if server is not None]
+    held = [
+        resource
+        for resource in (metrics_dir_owner, bootstrap_server, encode_bridge)
+        if resource is not None
+    ]
     port_args = PortArgs.init_new(server_args)
     # The fault handler goes in before the spawner starts a rank: a rank that
     # fails during its start signals its parent at once.

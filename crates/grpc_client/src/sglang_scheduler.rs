@@ -29,7 +29,7 @@ pub mod proto {
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
 pub type AbortOnDropStream =
-    crate::AbortOnDropStream<proto::GenerateResponse, SglangSchedulerClient>;
+    crate::AbortOnDropStream<Box<proto::GenerateResponse>, SglangSchedulerClient>;
 
 /// gRPC client for SGLang scheduler
 #[derive(Clone)]
@@ -71,7 +71,9 @@ impl SglangSchedulerClient {
     crate::impl_engine_client_basics!(
         proto,
         proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
-        "SGLang scheduler"
+        "SGLang scheduler",
+        "sglang.grpc.scheduler.SglangScheduler",
+        proto::sglang_scheduler_server::SERVICE_NAME
     );
 
     crate::impl_embed!(proto);
@@ -806,7 +808,7 @@ impl SglangSchedulerClient {
                 warn!("Failed to inject trace context: {}", e);
             }
             let (metadata, _extensions, ()) = carrier.into_parts();
-            let stream = call_with_frames::<proto::GenerateResponse>(
+            let stream = call_with_frames::<Box<proto::GenerateResponse>>(
                 self.channel(),
                 "/sglang.grpc.scheduler.SglangScheduler/Generate",
                 metadata.into_headers(),

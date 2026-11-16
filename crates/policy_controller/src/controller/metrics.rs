@@ -14,12 +14,15 @@ use std::{
 
 use metrics::{Counter, Gauge, Key, KeyName, Label, Level, Metadata, Recorder};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use parking_lot::Mutex;
 
 use super::readiness::State;
 use crate::ingest::loads::{Failures, Stats};
 
-/// `1` for the controller's state (`starting`, `ready`, `draining`), `0` for
-/// the other two.
+/// `1` for the controller's state (`starting`, `leader`, `follower`,
+/// `draining`), `0` for the other three. The admin listener sets it from the
+/// readiness at each render, so the role is the fence's at the scrape, and
+/// one scrape's sample is one write: two scrapes never mix theirs.
 pub const STATE: &str = "smg_policy_controller_state";
 /// The controller's start, in seconds since the Unix epoch.
 pub const START_TIME_SECONDS: &str = "smg_policy_controller_start_time_seconds";
@@ -40,8 +43,11 @@ pub const LOAD_ROWS_TOTAL: &str = "smg_policy_controller_load_rows_total";
 pub(crate) struct Metrics {
     handle: PrometheusHandle,
     /// One gauge per [`State::ALL`] entry, in that order.
-    state: [Gauge; 3],
+    state: [Gauge; 4],
     loads: LoadCounters,
+    /// Held from a scrape's sample of the state to the end of its render:
+    /// the four gauges are written from one sample and read back whole.
+    scrape: Mutex<()>,
 }
 
 /// The load driver's counts as the recorder's counters, set absolute from
@@ -69,7 +75,8 @@ impl Metrics {
         recorder.describe_gauge(
             KeyName::from_const_str(STATE),
             None,
-            "1 for the controller's state (starting, ready, draining), 0 for the others".into(),
+            "1 for the controller's state (starting, leader, follower, draining), 0 for the others"
+                .into(),
         );
         recorder.describe_gauge(
             KeyName::from_const_str(START_TIME_SECONDS),
@@ -136,13 +143,19 @@ impl Metrics {
             handle,
             state,
             loads,
+            scrape: Mutex::new(()),
         };
         metrics.set_state(State::Starting);
         metrics
     }
 
-    /// The text form, the load driver's counts read first.
-    pub(crate) fn render(&self, loads: &Stats) -> String {
+    /// One scrape's text form: the state sampled once by `state` and its
+    /// gauge written, the load driver's counts read, and the render, with
+    /// no other scrape between the sample and the render. Two scrapes
+    /// across a change of role each render one state, their own.
+    pub(crate) fn render(&self, state: impl FnOnce() -> State, loads: &Stats) -> String {
+        let _one = self.scrape.lock();
+        self.set_state(state());
         self.observe_loads(loads);
         self.handle.render()
     }
@@ -176,7 +189,7 @@ impl Metrics {
     }
 
     /// Moves the state gauge: `1` on `now`, `0` on the others.
-    pub(crate) fn set_state(&self, now: State) {
+    fn set_state(&self, now: State) {
         for (gauge, state) in self.state.iter().zip(State::ALL) {
             gauge.set(if state == now { 1.0 } else { 0.0 });
         }
@@ -200,34 +213,111 @@ mod tests {
     #[test]
     fn the_state_gauge_follows_the_transitions_on_the_controllers_own_recorder() {
         let metrics = Metrics::new();
-        let rendered = metrics.render(&Stats::default());
+        let rendered = metrics.render(|| State::Starting, &Stats::default());
         assert_eq!(
             line(&rendered, STATE, "state=\"starting\"").as_deref(),
             Some("smg_policy_controller_state{state=\"starting\"} 1")
         );
         assert_eq!(
-            line(&rendered, STATE, "state=\"ready\"").as_deref(),
-            Some("smg_policy_controller_state{state=\"ready\"} 0")
+            line(&rendered, STATE, "state=\"leader\"").as_deref(),
+            Some("smg_policy_controller_state{state=\"leader\"} 0")
         );
         assert!(rendered.contains("# HELP smg_policy_controller_state "));
 
-        metrics.set_state(State::Ready);
-        let rendered = metrics.render(&Stats::default());
+        let rendered = metrics.render(|| State::Leader, &Stats::default());
         assert_eq!(
             line(&rendered, STATE, "state=\"starting\"").as_deref(),
             Some("smg_policy_controller_state{state=\"starting\"} 0")
         );
         assert_eq!(
-            line(&rendered, STATE, "state=\"ready\"").as_deref(),
-            Some("smg_policy_controller_state{state=\"ready\"} 1")
+            line(&rendered, STATE, "state=\"leader\"").as_deref(),
+            Some("smg_policy_controller_state{state=\"leader\"} 1")
         );
 
         let other = Metrics::new();
         assert_eq!(
-            line(&other.render(&Stats::default()), STATE, "state=\"ready\"").as_deref(),
-            Some("smg_policy_controller_state{state=\"ready\"} 0"),
+            line(
+                &other.render(|| State::Starting, &Stats::default()),
+                STATE,
+                "state=\"leader\""
+            )
+            .as_deref(),
+            Some("smg_policy_controller_state{state=\"leader\"} 0"),
             "a second controller starts from its own recorder"
         );
+    }
+
+    #[test]
+    fn two_scrapes_across_a_change_of_role_each_render_one_state() {
+        use std::{
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                mpsc, Arc,
+            },
+            thread,
+            time::Instant,
+        };
+
+        let metrics = Arc::new(Metrics::new());
+        let stats = Arc::new(Stats::default());
+        let inside = Arc::new(AtomicBool::new(false));
+        let (sampling, sampled) = mpsc::channel();
+        // The first scrape stays inside its sample while the second begins,
+        // and the role changes between the two. It runs on a thread the
+        // case does not wait for without a bound.
+        let first = thread::spawn({
+            let (metrics, stats, inside) = (
+                Arc::clone(&metrics),
+                Arc::clone(&stats),
+                Arc::clone(&inside),
+            );
+            move || {
+                metrics.render(
+                    || {
+                        inside.store(true, Ordering::SeqCst);
+                        sampling.send(()).expect("the case listens");
+                        thread::sleep(Duration::from_millis(100));
+                        inside.store(false, Ordering::SeqCst);
+                        State::Leader
+                    },
+                    &stats,
+                )
+            }
+        });
+        // A scrape that blocks before its sample fails the case by name.
+        sampled
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the first scrape samples within 20 s");
+        let mut overlapped = false;
+        let second = metrics.render(
+            || {
+                overlapped = inside.load(Ordering::SeqCst);
+                State::Follower
+            },
+            &stats,
+        );
+        let waited = Instant::now();
+        while !first.is_finished() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(20),
+                "the first scrape did not end in 20 s"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let first = first.join().expect("the first scrape ends");
+        assert!(!overlapped, "the second scrape sampled inside the first");
+        for (rendered, own) in [(&first, State::Leader), (&second, State::Follower)] {
+            for state in State::ALL {
+                let label = format!("state=\"{}\"", state.as_str());
+                let value = u8::from(state == own);
+                assert_eq!(
+                    line(rendered, STATE, &label),
+                    Some(format!("{STATE}{{{label}}} {value}")),
+                    "the scrape that sampled {}",
+                    own.as_str()
+                );
+            }
+        }
     }
 
     #[test]
@@ -238,7 +328,7 @@ mod tests {
 
         let metrics = Metrics::new();
         let stats = Stats::default();
-        let rendered = metrics.render(&stats);
+        let rendered = metrics.render(|| State::Starting, &stats);
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"poll\"} 0"));
         assert!(rendered.contains("smg_policy_controller_load_rows_total 0"));
 
@@ -247,7 +337,7 @@ mod tests {
         stats.rows.fetch_add(7, Ordering::Relaxed);
         stats.scrapes.fetch_add(1, Ordering::Relaxed);
         stats.poll_failures.deadline.fetch_add(1, Ordering::Relaxed);
-        let rendered = metrics.render(&stats);
+        let rendered = metrics.render(|| State::Starting, &stats);
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"poll\"} 3"));
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"suppressed\"} 2"));
         assert!(rendered
@@ -265,7 +355,7 @@ mod tests {
     #[test]
     fn the_start_time_is_set_once_at_construction() {
         let metrics = Metrics::new();
-        let rendered = metrics.render(&Stats::default());
+        let rendered = metrics.render(|| State::Starting, &Stats::default());
         let start = rendered
             .lines()
             .find(|l| l.starts_with(START_TIME_SECONDS) && !l.starts_with('#'))

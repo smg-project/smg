@@ -110,6 +110,52 @@ pub(crate) fn tool_call_limit(max_tool_calls: Option<usize>) -> usize {
     })
 }
 
+/// The server calls a request may still run once `executed` ran: its cap (see
+/// `tool_call_limit`) less them.
+pub(crate) fn tool_call_allowance(max_tool_calls: Option<usize>, executed: usize) -> usize {
+    tool_call_limit(max_tool_calls).saturating_sub(executed)
+}
+
+/// Whether a Harmony loop generation is past the loop's safety net. The call
+/// limit (see `tool_call_limit`) already bounds the loop, since every turn
+/// that continues it runs at least one server call, so the net allows that
+/// many generations plus the one that answers on the last result; the final
+/// turn after the request's cap is always the last generation and is exempt.
+pub(crate) fn iteration_exceeds_safety_limit(iteration_count: usize, final_turn: bool) -> bool {
+    iteration_count > DEFAULT_MAX_ITERATIONS + 1 && !final_turn
+}
+
+/// Why a generated batch of server calls must stop after its permitted prefix
+/// executes: the request's own `max_tool_calls`, or the loop's internal safety
+/// limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpToolCallLimit {
+    User,
+    Safety,
+}
+
+/// The cap a batch of `batch` server calls overflows once `executed` calls
+/// ran: `None` when the batch fits the remaining allowance, else the cap and
+/// the length of the batch's permitted prefix. The cap is the request's own
+/// when it names one at or under the safety limit (a user cap wins when both
+/// are equal), else the safety limit.
+pub(crate) fn tool_call_overflow(
+    max_tool_calls: Option<usize>,
+    executed: usize,
+    batch: usize,
+) -> Option<(McpToolCallLimit, usize)> {
+    let remaining = tool_call_allowance(max_tool_calls, executed);
+    if batch <= remaining {
+        return None;
+    }
+    let limit = if max_tool_calls.is_some_and(|limit| limit <= DEFAULT_MAX_ITERATIONS) {
+        McpToolCallLimit::User
+    } else {
+        McpToolCallLimit::Safety
+    };
+    Some((limit, remaining))
+}
+
 /// Ensure MCP connection succeeds if MCP tools or builtin tools are declared.
 ///
 /// Checks if the request declares MCP tools or builtin tool types
@@ -1372,6 +1418,26 @@ mod tests {
     }
 
     #[test]
+    fn the_safety_net_allows_the_limits_generations_and_the_answer_on_the_last_result() {
+        assert!(!iteration_exceeds_safety_limit(
+            DEFAULT_MAX_ITERATIONS,
+            false
+        ));
+        assert!(!iteration_exceeds_safety_limit(
+            DEFAULT_MAX_ITERATIONS + 1,
+            false
+        ));
+        assert!(iteration_exceeds_safety_limit(
+            DEFAULT_MAX_ITERATIONS + 2,
+            false
+        ));
+        assert!(!iteration_exceeds_safety_limit(
+            DEFAULT_MAX_ITERATIONS + 2,
+            true
+        ));
+    }
+
+    #[test]
     fn the_tool_call_limit_is_the_users_figure_under_the_safety_limit() {
         assert_eq!(tool_call_limit(None), DEFAULT_MAX_ITERATIONS);
         assert_eq!(tool_call_limit(Some(3)), 3);
@@ -1379,6 +1445,35 @@ mod tests {
         assert_eq!(
             tool_call_limit(Some(DEFAULT_MAX_ITERATIONS + 5)),
             DEFAULT_MAX_ITERATIONS
+        );
+        assert_eq!(tool_call_allowance(Some(3), 1), 2);
+        assert_eq!(tool_call_allowance(Some(3), 5), 0);
+        assert_eq!(tool_call_allowance(None, 4), DEFAULT_MAX_ITERATIONS - 4);
+    }
+
+    #[test]
+    fn a_batch_past_the_cap_keeps_its_permitted_prefix_and_names_the_cap() {
+        assert_eq!(tool_call_overflow(Some(3), 1, 2), None);
+        assert_eq!(tool_call_overflow(None, 0, DEFAULT_MAX_ITERATIONS), None);
+        assert_eq!(
+            tool_call_overflow(Some(3), 1, 4),
+            Some((McpToolCallLimit::User, 2))
+        );
+        assert_eq!(
+            tool_call_overflow(Some(1), 1, 1),
+            Some((McpToolCallLimit::User, 0))
+        );
+        assert_eq!(
+            tool_call_overflow(Some(DEFAULT_MAX_ITERATIONS), DEFAULT_MAX_ITERATIONS, 1),
+            Some((McpToolCallLimit::User, 0))
+        );
+        assert_eq!(
+            tool_call_overflow(None, DEFAULT_MAX_ITERATIONS - 1, 2),
+            Some((McpToolCallLimit::Safety, 1))
+        );
+        assert_eq!(
+            tool_call_overflow(Some(DEFAULT_MAX_ITERATIONS + 5), DEFAULT_MAX_ITERATIONS, 1),
+            Some((McpToolCallLimit::Safety, 0))
         );
     }
 }

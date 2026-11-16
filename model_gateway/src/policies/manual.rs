@@ -1049,10 +1049,19 @@ mod tests {
         assert!(access_after_miss > access_after_hit);
     }
 
+    /// The eviction thread wakes once per interval (`PeriodicTask`: one timed
+    /// wait per interval), so an entry idle for `max_idle` leaves the map at the
+    /// first tick after that, up to one interval later. The test waits for that
+    /// tick with a deadline instead of a fixed sleep: a sleep of exactly
+    /// interval + max_idle ended in the same instant as the tick that evicts,
+    /// and lost the race on a loaded host. Once the entry is gone the test
+    /// also asserts that at least `max_idle` passed since the insert: an
+    /// eviction thread that ignored `max_idle` would clear the map at its
+    /// first tick, one interval early.
     #[test]
     fn test_manual_ttl_eviction_logic() {
         let config = ManualConfig {
-            eviction_interval_secs: 2,
+            eviction_interval_secs: 1,
             max_idle_secs: 2,
             assignment_mode: ManualAssignmentMode::Random,
         };
@@ -1061,13 +1070,30 @@ mod tests {
 
         let headers = headers_with_routing_key("key-0");
         let info = with_headers(&headers);
+        let inserted = Instant::now();
         policy.select_worker_impl(&workers, &info);
 
         assert_eq!(policy.routing_map.len(), 1);
 
-        std::thread::sleep(Duration::from_secs(4));
-
-        assert_eq!(policy.routing_map.len(), 0);
+        // Idle for max_idle (2 s), evicted by the tick that follows (at 3 s at
+        // the latest); the deadline leaves four more seconds for a loaded host.
+        let deadline = Instant::now() + Duration::from_secs(7);
+        while !policy.routing_map.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the idle entry was not evicted within the deadline ({} left)",
+                policy.routing_map.len()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The lower bound: an eviction thread that ignored `max_idle` would
+        // clear the map at its first tick, one second in. Time since the
+        // insert only grows, so this never reads red on a slow host.
+        assert!(
+            inserted.elapsed() >= Duration::from_secs(2),
+            "the entry was evicted before max_idle ({:?} after the insert)",
+            inserted.elapsed()
+        );
     }
 
     #[test]

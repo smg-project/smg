@@ -10,10 +10,16 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
+    store::{
+        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
+        WorkersStore, PUBLISH_WINDOW,
+    },
     Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow, PairPools, PolicySpec,
-    PoolFacts, RequestFacts, Scratch, Side, SignalSource, Target, WorkerId, PRESETS,
+    PoolFacts, RequestFacts, Role, Scratch, Side, SignalSource, Target, WorkerId, PRESETS,
 };
 
 #[global_allocator]
@@ -194,6 +200,52 @@ fn a_decision_over_credited_rows_allocates_nothing() {
 }
 
 #[test]
+fn a_pair_decision_under_a_table_allocates_nothing_after_the_first() {
+    let engine = PolicySpec::pair_presets("least_load", "least_load")
+        .expect("the pair spec")
+        .validate()
+        .expect("the engine");
+    let mut prefills = fleet(16);
+    for p in &mut prefills {
+        p.pair_class = p.position % 4 + 1;
+        p.has_capacity = true;
+    }
+    let mut decodes = fleet(64);
+    for d in &mut decodes {
+        d.pair_class = d.position % 8 + 1;
+        d.has_room = true;
+    }
+    // Prefill class k pairs with decode classes k and k + 4.
+    let (ends, classes) = ([2, 4, 6, 8], [1, 5, 2, 6, 3, 7, 4, 8]);
+    let cx = Constraints::default();
+    let mut scratch = Scratch::new();
+    let mut decide = |decodes: &[Candidate], seed: u64| {
+        let pools = PairPools {
+            prefills: &prefills,
+            decodes,
+            table: smg_policy_controller::PairTable::new(&ends, &classes),
+            ..PairPools::default()
+        };
+        allocations_during(|| {
+            engine.decide_pair(&facts(seed), &pool(80), pools, &cx, &cx, &mut scratch)
+        })
+    };
+    // A pair, then a shed that reads the routable prefills' lists: each
+    // sizes the scratch once.
+    assert!(decide(&decodes, 1).0.pick().is_some(), "the pair routes");
+    let (decision, allocations) = decide(&decodes, 2);
+    assert!(decision.pick().is_some());
+    assert_eq!(allocations, 0, "a pair decision under a table allocated");
+    for d in &mut decodes {
+        d.health.healthy = false;
+    }
+    assert!(decide(&decodes, 3).0.pick().is_none(), "no decode is up");
+    let (decision, allocations) = decide(&decodes, 4);
+    assert!(decision.pick().is_none());
+    assert_eq!(allocations, 0, "a pair shed under a table allocated");
+}
+
+#[test]
 fn a_pair_decision_after_the_first_allocates_nothing() {
     let engine = PolicySpec::pair_presets("least_load", "least_load")
         .expect("the pair spec")
@@ -214,6 +266,7 @@ fn a_pair_decision_after_the_first_allocates_nothing() {
     let pools = PairPools {
         prefills: &prefills,
         decodes: &decodes,
+        ..PairPools::default()
     };
     engine
         .decide_pair(&facts(1), &pool(80), pools, &cx, &cx, &mut scratch)
@@ -224,4 +277,90 @@ fn a_pair_decision_after_the_first_allocates_nothing() {
     });
     assert!(decision.pick().is_some());
     assert_eq!(allocations, 0, "a pair decision allocated");
+}
+
+/// A store of two pools: `n` ready members serving `m` and one member
+/// serving another model, each with a record on file and published. The
+/// members of `m` and the instant the store's last window opened.
+fn store_of(n: usize) -> (MemoryStore, Vec<WorkerId>, Instant) {
+    let store = MemoryStore::new();
+    let opened = Instant::now();
+    let register = |key: String, model: &str| {
+        let id = store
+            .upsert(WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                models: vec![model.to_string()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            })
+            .id();
+        let revision = WorkersStore::get(&store, id).expect("the row").revision;
+        store
+            .set_status(id, WorkerStatus::Ready, revision)
+            .expect("ready");
+        store.record(id, 0, LoadRow::default(), opened, LoadSource::Stream);
+        id
+    };
+    let ids = (0..n)
+        .map(|index| register(format!("http://w{index}:8000"), "m"))
+        .collect();
+    register("http://other:8000".to_string(), "other");
+    // The records that landed inside the first one's window are published
+    // at its end: nothing waits.
+    let opened = opened + PUBLISH_WINDOW;
+    store.publish(opened);
+    assert_eq!(store.publish_due(), None);
+    (store, ids, opened)
+}
+
+#[test]
+fn a_build_from_the_store_after_the_first_allocates_nothing() {
+    for n in [8usize, 64, 512] {
+        let (store, _, opened) = store_of(n);
+        let mut out = ViewBuffers::default();
+        for affinity in [false, true] {
+            let ask = Ask {
+                gateway: GatewayId(1),
+                now: opened + Duration::from_secs(1),
+                pinned: None,
+                affinity,
+            };
+            // The first build sizes the host's buffers.
+            store
+                .build_view("m", Role::Single, &ask, &mut out)
+                .expect("the pool");
+            let (built, allocations) =
+                allocations_during(|| store.build_view("m", Role::Single, &ask, &mut out));
+            assert_eq!(built.map(|built| built.pool_size as usize), Some(n));
+            assert_eq!(out.affinity.len(), if affinity { n } else { 0 });
+            assert_eq!(
+                allocations, 0,
+                "{n} members, column {affinity}: a build allocated"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_record_inside_the_window_allocates_nothing_and_a_publication_derives_nothing() {
+    let (store, ids, opened) = store_of(64);
+    // Inside the window the store's making opened: on file and folded,
+    // nothing published.
+    let inside = opened + Duration::from_millis(1);
+    let record = LoadRow {
+        running: 7,
+        ..LoadRow::default()
+    };
+    let ((), allocations) =
+        allocations_during(|| store.record(ids[0], 0, record, inside, LoadSource::Stream));
+    assert_eq!(allocations, 0, "a load record inside the window allocated");
+    // The window's end: the rows of the one pool a record was folded into,
+    // the world and its pointer a pool. Nothing the membership derived is
+    // built again, and the other pool's rows are not copied.
+    let due = store.publish_due().expect("the record waits");
+    let ((), allocations) = allocations_during(|| store.publish(due));
+    assert_eq!(allocations, 3, "a publication of one pool's rows");
+    assert_eq!(store.publish_due(), None);
 }

@@ -78,7 +78,7 @@ def manager(monkeypatch):
     scheduler."""
     exporter = InMemorySpanExporter()
     symbols = {
-        "sglang.srt.disaggregation.utils": "DisaggregationMode",
+        "sglang.srt.disaggregation.utils": "DisaggregationMode FAKE_BOOTSTRAP_HOST",
         "sglang.srt.managers.io_struct": (
             "AbortReq BatchEmbeddingOutput BatchTokenIDOutput FlushCacheReqOutput "
             "GetInternalStateReqOutput HealthCheckOutput ProfileReqOutput "
@@ -119,6 +119,9 @@ def manager(monkeypatch):
 
     sent: list = []
     rm = module.GrpcRequestManager.__new__(module.GrpcRequestManager)
+    from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
+
+    rm.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
     rm.rid_to_state = {}
     rm.metrics_collector = None  # added field from PR; test fixture only
     rm.disaggregation_mode = "null"
@@ -433,5 +436,111 @@ def test_client_cancel_of_a_non_streaming_n3_request_aborts_only_the_running_sub
         assert _aborts(manager, 3) == ["r-batch-1"], "the sub-request in flight is aborted"
         assert "r-batch-2" not in [m.rid for m in manager.sent], "the third was never dispatched"
         _all_ended(manager, 3)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("layout", ["flat", "legacy", "unknown", "sparse"])
+@pytest.mark.parametrize("dispatch_fails", [False, True])
+def test_invalid_batch_finishes_consumers_and_aborts_decode(manager, layout, dispatch_fails):
+    """A rejected batch wakes every active consumer even if scheduler aborts fail."""
+
+    async def scenario():
+        tasks, responses, states = [], [], []
+        for rid in ("r-invalid", "r-sibling", "r-unaffected"):
+            task, got = await _handle(manager, rid)
+            tasks.append(task)
+            responses.append(got)
+            states.append(manager.rid_to_state[rid])
+            manager.output_adapter._counts[rid] = (10, 2)
+        manager.rid_to_state["r-finished"] = SimpleNamespace(finished=True)
+        manager.output_adapter._counts["r-late"] = (10, 2)
+        batch = SimpleNamespace(
+            rids=["r-invalid", "r-sibling", "r-late", "r-finished"],
+            finished_reasons=[{"type": "stop"}, None, None, None],
+            prompt_tokens=[10] * 4,
+            cached_tokens=[2] * 4,
+        )
+        if layout == "flat":
+            batch.output_ids_flat = [1, 2, 3, 4]
+            batch.output_ids_offsets = [0, 1, 2, 3, 5]
+        elif layout == "legacy":
+            batch.output_ids = [[1]]
+        elif layout == "sparse":
+            batch.output_ids = [[1], [2], [3], [4]]
+            # Usage conversion can fail after caching a preceding request.
+            batch.request_stats = [SimpleNamespace(prompt_tokens=12, cached_tokens=3), object()]
+
+        attempts = []
+
+        def send_abort(obj):
+            attempts.append(obj.rid)
+            if dispatch_fails:
+                raise RuntimeError("scheduler socket closed")
+
+        manager.send_to_scheduler.send_pyobj = send_abort
+        try:
+            await manager._handle_batch_output(batch)
+            await asyncio.wait_for(asyncio.gather(*tasks[:2]), timeout=1)
+            assert attempts == ["r-invalid", "r-sibling"]
+            for state, got in zip(states[:2], responses[:2]):
+                assert state.finished and state.stream_finished and state.event.is_set()
+                assert len(got) == 1 and got[0]["finished"]
+                assert got[0]["error"]
+                assert got[0]["meta_info"]["finish_reason"]["status_code"] == 500
+            assert "r-invalid" not in manager.rid_to_state
+            assert "r-sibling" not in manager.rid_to_state
+            assert manager.output_adapter._counts == {"r-unaffected": (10, 2)}
+            assert not tasks[2].done() and not responses[2]
+            assert not states[2].finished
+            # A late repeat must not dispatch more aborts or duplicate completion.
+            await manager._handle_batch_output(batch)
+            assert attempts == ["r-invalid", "r-sibling"]
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("layout", ["sparse", "unknown"])
+def test_invalid_embedding_usage_finishes_consumers(manager, layout):
+    """Rejected terminal embeddings wake siblings without aborting the scheduler."""
+
+    async def scenario():
+        futures, states = [], []
+        for rid in ("e-invalid", "e-sibling", "e-unaffected"):
+            futures.append(await manager.embedding_request(SimpleNamespace(), rid))
+            states.append(manager.rid_to_state[rid])
+        manager.rid_to_state["e-finished"] = SimpleNamespace(finished=True)
+        batch = SimpleNamespace(
+            rids=["e-invalid", "e-sibling", "e-late", "e-finished"],
+            finished_reasons=[{"type": "stop"}] * 4,
+        )
+        if layout == "sparse":
+            batch.request_stats = [SimpleNamespace(prompt_tokens=12, cached_tokens=3), object()]
+        sent = list(manager.sent)
+        try:
+            await manager._handle_embedding_output(batch)
+            results = await asyncio.wait_for(asyncio.gather(*futures[:2]), timeout=1)
+            for state, result in zip(states[:2], results):
+                assert state.finished and state.event.is_set()
+                assert result["finished"] and result["error"]
+                assert result["meta_info"]["finish_reason"]["status_code"] == 500
+                assert state.time_stats.root_span.ended == 1
+            assert "e-invalid" not in manager.rid_to_state
+            assert "e-sibling" not in manager.rid_to_state
+            assert not futures[2].done() and not states[2].finished
+            assert not manager.output_adapter._counts
+            await manager._handle_embedding_output(batch)
+            assert manager.sent == sent
+            assert all(state.time_stats.root_span.ended == 1 for state in states[:2])
+        finally:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+            await asyncio.gather(*futures, return_exceptions=True)
 
     asyncio.run(scenario())
