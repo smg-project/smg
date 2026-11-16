@@ -166,8 +166,12 @@ const LONG_PIECE_MAX_BYTES: usize = 16 << 10;
 /// instructions with the scans; 256 B and 2 KB texts +2..+7 % instructions
 /// with the scans compiled into their loop, whether or not a run takes
 /// them). The threshold is the pool path's unit size, so a long input keeps
-/// the scans on every unit it is cut into.
+/// the scans on every unit it is cut into. The chain scanner takes them on
+/// a shorter unit too when it opens as ASCII text
+/// (`NativeEncoder::opens_as_ascii`).
 const WORD_SCAN_MIN_BYTES: usize = PARALLEL_CHUNK_BYTES;
+/// Bytes at the head of a unit that `NativeEncoder::opens_as_ascii` reads.
+const ASCII_HEAD_BYTES: usize = 256;
 /// Entries a thread's piece cache holds for one encoder before it is cleared,
 /// at most; see `PIECE_CACHE_TOTAL_CAPACITY`. This is also the cliff of a
 /// repeated document: one with fewer distinct pieces is encoded again at the
@@ -2316,7 +2320,8 @@ impl NativeEncoder {
     ) -> Result<Vec<u32>, Fallback> {
         // The scanners' word scans, chosen once per call on the input's
         // length (`WORD_SCAN_MIN_BYTES`): every unit of a long input takes
-        // them, a short input walks its runs byte by byte.
+        // them; a short input walks its runs byte by byte, the chain
+        // scanner's units that open as ASCII text apart (`encode_unit`).
         let words = text.len() >= WORD_SCAN_MIN_BYTES;
         // Text not in the normalizer's form (by the library's tables, as
         // every normalization read here) is normalized gap by gap first;
@@ -2831,6 +2836,30 @@ impl NativeEncoder {
                 .is_some_and(char::is_whitespace)
     }
 
+    /// Whether `text` opens as ASCII text: at most one byte in eight of its
+    /// first `ASCII_HEAD_BYTES` is beyond ASCII. The chain scanner takes the
+    /// word scans on such a unit whatever its length: on a text the branch
+    /// predictor has not seen its byte loops' exits mispredict about once
+    /// per run, and on a text it has seen its scanned walk costs no more
+    /// than the byte loops (the single-stage scanners' scanned loops do, so
+    /// they keep `WORD_SCAN_MIN_BYTES`). A unit in another script has few
+    /// runs the scans can pass over and keeps the byte loops. The bytes are
+    /// counted a word at a time: 32 steps for a full head.
+    fn opens_as_ascii(text: &str) -> bool {
+        /// The low bit of every byte of a word.
+        const EACH_BYTE: u64 = 0x0101_0101_0101_0101;
+        let head = &text.as_bytes()[..text.len().min(ASCII_HEAD_BYTES)];
+        let (words, tail) = head.as_chunks::<8>();
+        let mut beyond = tail.iter().filter(|byte| !byte.is_ascii()).count() as u64;
+        for word in words {
+            // Each byte's top bit, moved to its low bit; the multiply sums
+            // the eight into the word's top byte.
+            let tops = (u64::from_le_bytes(*word) >> 7) & EACH_BYTE;
+            beyond += tops.wrapping_mul(EACH_BYTE) >> 56;
+        }
+        beyond <= (head.len() / 8) as u64
+    }
+
     /// Appends the ids of one unit: an added token's id, or a text's pieces
     /// through the stages and the model (the text has no added token left in
     /// it, see [`Self::units`]); the reason when the model declines a piece
@@ -2893,6 +2922,12 @@ impl NativeEncoder {
                 self.pieces_mapping(0, from, text, &mut image, &mut per_piece);
             }
             (Some(chain), _, None) => {
+                // The chain's scanned walk costs a repeated text no more
+                // than its byte loops, so a short unit that opens as ASCII
+                // text takes it too. An all-ASCII unit does by definition:
+                // the head is counted only for a unit with a byte beyond
+                // ASCII.
+                let words = words || cache.unit_ascii || Self::opens_as_ascii(text);
                 chain.pieces(text, words, &mut |start, end| {
                     if let Err(declined) =
                         self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)

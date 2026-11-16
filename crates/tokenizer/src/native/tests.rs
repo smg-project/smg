@@ -6424,3 +6424,29 @@ fn a_merged_with_next_stage_over_the_image_is_declined() {
         );
     }
 }
+
+#[test]
+fn a_unit_opens_as_ascii_up_to_one_byte_in_eight_of_its_head() {
+    let ascii = "a".repeat(ASCII_HEAD_BYTES);
+    // 32 bytes beyond ASCII in a full head: one in eight.
+    let cyrillic = "\u{436}".repeat(ASCII_HEAD_BYTES / 16);
+    assert!(NativeEncoder::opens_as_ascii(""));
+    assert!(NativeEncoder::opens_as_ascii(&ascii));
+    assert!(NativeEncoder::opens_as_ascii(&format!("{cyrillic}{ascii}")));
+    assert!(!NativeEncoder::opens_as_ascii(&format!(
+        "\u{436}{cyrillic}{ascii}"
+    )));
+    // Only the head is read, and by bytes: it may end inside a character.
+    assert!(NativeEncoder::opens_as_ascii(&format!(
+        "{ascii}{cyrillic}{cyrillic}"
+    )));
+    assert!(NativeEncoder::opens_as_ascii(&format!(
+        "{}\u{436}",
+        "a".repeat(ASCII_HEAD_BYTES - 1)
+    )));
+    // Under eight bytes, and in the bytes after the last whole word, a byte
+    // beyond ASCII counts as any other.
+    assert!(NativeEncoder::opens_as_ascii("abcdefg"));
+    assert!(!NativeEncoder::opens_as_ascii("abcde\u{e9}"));
+    assert!(!NativeEncoder::opens_as_ascii("abcdefgh\u{e9}"));
+}
