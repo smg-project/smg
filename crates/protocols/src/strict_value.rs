@@ -9,7 +9,7 @@
 //! The refusal is in serde's words for a duplicate field; its place is the
 //! deserializer's to name, as it is for the derived readers.
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use serde::de::{DeserializeSeed, Deserializer, Error, MapAccess, SeqAccess, Visitor};
 use serde_json::{map::Entry, Map, Number, Value};
@@ -47,6 +47,38 @@ where
     }
     Ok(fields)
 }
+
+/// The entries of an object in arrival order, each value read by
+/// [`StrictValue`], for a reader that walks the few keys of one object: no
+/// map is built. A repeated key is refused when it is met, as
+/// [`strict_entries`] refuses it. A walk over the keys met so far tells a
+/// repeat while they are few; past [`WALKED_KEYS`] a hashed set does, so no
+/// object makes the check quadratic. The entries start with room for eight,
+/// which holds most such objects in one allocation; the set is built only
+/// for an object that needs it.
+pub(crate) fn strict_fields<'de, A: MapAccess<'de>>(
+    entries: &mut A,
+) -> Result<Vec<(String, Value)>, A::Error> {
+    let mut fields: Vec<(String, Value)> = Vec::with_capacity(8);
+    let mut hashed: Option<HashSet<String>> = None;
+    while let Some(key) = entries.next_key::<String>()? {
+        let repeated = if fields.len() < WALKED_KEYS {
+            fields.iter().any(|(known, _)| *known == key)
+        } else {
+            let hashed = hashed
+                .get_or_insert_with(|| fields.iter().map(|(known, _)| known.clone()).collect());
+            !hashed.insert(key.clone())
+        };
+        if repeated {
+            return Err(Error::custom(format!("duplicate field `{key}`")));
+        }
+        fields.push((key, entries.next_value_seed(StrictValue)?));
+    }
+    Ok(fields)
+}
+
+/// More keys than any object read by [`strict_fields`] has by its shape.
+const WALKED_KEYS: usize = 16;
 
 /// Builds what [`Value`]'s own reader builds (the same scalars, the same
 /// ordered map) and refuses a key repeated in an object at any depth.
@@ -132,5 +164,53 @@ mod tests {
             .expect("the strict reader accepts it");
         assert_eq!(strict, plain);
         assert_eq!(strict.to_string(), plain.to_string());
+    }
+
+    /// The ordered reader keeps arrival order and refuses a repeated key:
+    /// among few keys (told by the walk), among many (by the hashed set)
+    /// and below the object's own keys.
+    #[test]
+    fn the_ordered_reader_keeps_arrival_order_and_refuses_a_repeated_key() {
+        struct Fields;
+
+        impl<'de> Visitor<'de> for Fields {
+            type Value = Vec<(String, Value)>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("an object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Self::Value, A::Error> {
+                strict_fields(&mut entries)
+            }
+        }
+
+        let read = |text: &str| {
+            let mut deserializer = serde_json::Deserializer::from_str(text);
+            deserializer.deserialize_map(Fields)
+        };
+        let last = 2 * WALKED_KEYS - 1;
+        let many: String = (0..=last)
+            .map(|key| format!(r#""k{key}":{key},"#))
+            .collect();
+        let fields = read(&format!(r#"{{{many}"z":{{"a":1}}}}"#)).expect("no key is repeated");
+        let names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names.len(), last + 2);
+        assert_eq!((names[0], names[last + 1]), ("k0", "z"));
+        assert_eq!(names[last], format!("k{last}"));
+        for (text, key) in [
+            (r#"{"a":1,"b":2,"a":3}"#.to_string(), "a".to_string()),
+            (format!(r#"{{{many}"k1":0}}"#), "k1".to_string()),
+            (format!(r#"{{{many}"k{last}":0}}"#), format!("k{last}")),
+            (r#"{"a":{"b":1,"b":2}}"#.to_string(), "b".to_string()),
+        ] {
+            let error = read(&text).expect_err("a repeated key");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("duplicate field `{key}`")),
+                "{error}"
+            );
+        }
     }
 }
