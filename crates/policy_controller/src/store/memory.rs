@@ -277,6 +277,14 @@ impl MemoryStore {
         health.vetoes.len() + health.ok_at.len()
     }
 
+    /// How many writes to the load table moved an overload verdict: a
+    /// record, a report, the word that no report came, an eviction. A
+    /// membership write and an applied generation judge again and count
+    /// nothing.
+    pub fn overload_flips(&self) -> u64 {
+        self.loads.lock().writer.flips()
+    }
+
     /// How many workers the load table holds an entry for.
     #[cfg(test)]
     pub(super) fn load_entries(&self) -> usize {
@@ -778,6 +786,13 @@ struct Ranks {
     pushed_at: BTreeMap<u16, Instant>,
 }
 
+impl Ranks {
+    /// Whether the rank's own record arrived at or after `since`.
+    fn pushed_since(&self, rank: u16, since: Instant) -> bool {
+        self.pushed_at.get(&rank).is_some_and(|&at| at >= since)
+    }
+}
+
 /// The load table and the world's write side, behind one lock.
 struct Loads {
     ranks: FxHashMap<WorkerId, Ranks>,
@@ -814,7 +829,8 @@ impl LoadSink for MemoryStore {
             ranks.pushed_at.insert(rank, received_at);
         }
         ranks.samples.insert(rank, sample);
-        if writer.fold_load(id, rank, Some(&sample)) {
+        if let Some(place) = writer.fold_load(id, rank, Some(&sample)) {
+            writer.recorded(place);
             let world = writer.folded_at(received_at);
             self.show(world);
         }
@@ -822,8 +838,7 @@ impl LoadSink for MemoryStore {
 
     fn report(
         &self,
-        id: WorkerId,
-        rows: &[(u16, LoadRow)],
+        answer: &[(WorkerId, u16, Option<LoadRow>)],
         polled_at: Instant,
         source: LoadSource,
     ) {
@@ -832,33 +847,75 @@ impl LoadSink for MemoryStore {
             ranks: table,
             writer,
         } = &mut *loads;
-        // A report that lands after its worker left (the poll was out when
-        // the row went) finds no entry and is dropped.
-        let Some(ranks) = table.get_mut(&id) else {
-            return;
-        };
-        // The report is folded whole before any publication: its ranks are
-        // read as one report left them.
-        let mut folded = false;
-        for &(rank, row) in rows {
-            let pushed_since = ranks
-                .pushed_at
-                .get(&rank)
-                .is_some_and(|&at| at >= polled_at);
-            if pushed_since {
+        // The answer is one engine's: its rows are written whole before
+        // the one judgment and the one publication, so its ranks are read
+        // as one answer left them. A caller's mix of engines judges each,
+        // and each engine is heard by its own ranks' rows.
+        let mut first: Option<(u32, bool)> = None;
+        let mut others: Vec<(u32, bool)> = Vec::new();
+        for &(id, rank, row) in answer {
+            // A report that lands after its worker left (the poll was out
+            // when the row went) finds no entry and is dropped.
+            let Some(ranks) = table.get_mut(&id) else {
+                continue;
+            };
+            // A rank that pushed since the poll began keeps its record,
+            // and its stream is heard: no word of the poll stands over it.
+            if ranks.pushed_since(rank, polled_at) {
                 continue;
             }
-            let age = Duration::from_millis(u64::from(row.report_age_ms));
-            let sample = LoadSample {
-                row,
-                received_at: polled_at,
-                sampled_at: polled_at.checked_sub(age).unwrap_or(polled_at),
-                source,
+            let (engine, heard) = match row {
+                Some(row) => {
+                    let age = Duration::from_millis(u64::from(row.report_age_ms));
+                    let sample = LoadSample {
+                        row,
+                        received_at: polled_at,
+                        sampled_at: polled_at.checked_sub(age).unwrap_or(polled_at),
+                        source,
+                    };
+                    ranks.samples.insert(rank, sample);
+                    let place = writer.fold_load(id, rank, Some(&sample));
+                    (place.and_then(|place| writer.engine_at(place)), true)
+                }
+                // A rank the answer omits keeps what is on file.
+                None => (writer.engine_of(id), false),
             };
-            ranks.samples.insert(rank, sample);
-            folded |= writer.fold_load(id, rank, Some(&sample));
+            let Some(engine) = engine else {
+                continue;
+            };
+            match &mut first {
+                None => first = Some((engine, heard)),
+                Some(seen) if seen.0 == engine => seen.1 |= heard,
+                Some(_) => match others.iter_mut().find(|seen| seen.0 == engine) {
+                    Some(seen) => seen.1 |= heard,
+                    None => others.push((engine, heard)),
+                },
+            }
         }
-        if folded {
+        let Some(first) = first else {
+            return;
+        };
+        let mut changed = false;
+        for (engine, heard) in std::iter::once(first).chain(others) {
+            changed |= if heard {
+                // A row was written: the engine is judged once, and the
+                // write is shown whether or not a verdict moved.
+                writer.judged(engine, true);
+                true
+            } else {
+                // No row came for the engine: the word that none came,
+                // unless a rank of it pushed since the poll began, whether
+                // the answer names that rank or not. The word is shown
+                // where it moves a verdict.
+                let pushed = writer.ranks_of(engine).any(|(id, rank)| {
+                    table
+                        .get(&id)
+                        .is_some_and(|ranks| ranks.pushed_since(rank, polled_at))
+                });
+                !pushed && writer.silence(engine)
+            };
+        }
+        if changed {
             let world = writer.folded_at(polled_at);
             self.show(world);
         }
@@ -913,12 +970,15 @@ impl LoadSink for MemoryStore {
             writer,
         } = &mut *loads;
         if let Some(ranks) = table.get_mut(&id) {
-            let mut folded = false;
+            let mut folded = None;
             for &rank in ranks.samples.keys() {
-                folded |= writer.fold_load(id, rank, None);
+                folded = writer.fold_load(id, rank, None).or(folded);
             }
             *ranks = Ranks::default();
-            if folded {
+            if let Some(place) = folded {
+                if let Some(engine) = writer.engine_at(place) {
+                    writer.judged(engine, false);
+                }
                 let world = writer.folded();
                 self.show(world);
             }

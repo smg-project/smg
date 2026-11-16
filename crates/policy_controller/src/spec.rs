@@ -34,10 +34,10 @@ use crate::{
         DEFAULT_MEAN_PREFILL_TOKENS,
     },
     catalog::{Catalog, Found},
-    framework::{Binding, Engine, Picker, Plan, Profile, Scorer, Weighted},
+    framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
     ring::ConsistentHash,
     sessions::SessionRule,
-    view::Phase,
+    view::{permille, Phase},
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -1104,6 +1104,14 @@ impl Default for Match {
     }
 }
 
+/// The queued requests, summed over an engine's ranks, at or above which
+/// its rows are vetoed where a binding's overload block names no count.
+pub const OVERLOAD_WAITING_REQUESTS: u32 = 8;
+
+/// The mean KV usage over an engine's ranks at or above which its rows are
+/// vetoed where a binding's overload block names no usage.
+pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
+
 /// The overload veto's defaults for the binding's workers: evaluated per
 /// load report by the host and latched, never per request; a worker's own
 /// registration thresholds resolve over these.
@@ -2131,6 +2139,23 @@ fn check_matcher(
     Ok(())
 }
 
+/// The thresholds a binding hands its pools: its block's values, each else
+/// the default, and none when the block is switched off. A binding with no
+/// block has the default block. The usage goes to permille by the rounding
+/// a report's usage takes ([`permille`]), so one rank's usage at or above
+/// the threshold in the document's unit is never read as under it. A usage
+/// that would round to no permille is held as one: at none, every engine
+/// with a row on file would read over it.
+fn overload_thresholds(block: Option<&OverloadSpec>) -> Option<OverloadThresholds> {
+    let (enabled, waiting, usage) = block.map_or((true, None, None), |block| {
+        (block.enabled, block.waiting_requests, block.token_usage)
+    });
+    enabled.then(|| OverloadThresholds {
+        waiting_requests: waiting.unwrap_or(OVERLOAD_WAITING_REQUESTS),
+        kv_usage_permille: permille(f64::from(usage.unwrap_or(OVERLOAD_TOKEN_USAGE))).max(1),
+    })
+}
+
 fn check_overload(overload: &OverloadSpec, at: &At) -> Result<(), SpecError> {
     at.nonzero("waiting_requests", overload.waiting_requests)?;
     at.number(
@@ -2293,6 +2318,7 @@ fn resolve_plan(b: &BindingSpec, cx: &BindingContext<'_>) -> Result<Option<Bindi
         profile,
         decode_profile,
         sessions: None,
+        overload: overload_thresholds(b.overload.as_ref()),
     };
     if plan == PlanName::Single {
         if b.profile.is_some() && !b.profiles.is_empty() {
@@ -2746,6 +2772,7 @@ impl PolicySpec {
                 profile: 0,
                 decode_profile: None,
                 sessions: None,
+                overload: overload_thresholds(None),
             });
         }
         needs.headers |= !self.view.headers.is_empty();
@@ -3960,7 +3987,76 @@ mod tests {
         let overload = spec_with_binding(
             r#"{"profile":"p","overload":{"waiting_requests":32,"token_usage":0.9,"shed_when_all_vetoed":true}}"#,
         );
-        assert!(overload.validate().is_ok());
+        let thresholds = |spec: &PolicySpec| {
+            spec.validate()
+                .expect("the binding validates")
+                .binding("m", Phase::Single)
+                .and_then(|binding| binding.overload)
+        };
+        assert_eq!(
+            thresholds(&overload),
+            Some(OverloadThresholds {
+                waiting_requests: 32,
+                kv_usage_permille: 900,
+            }),
+            "the block's two values, the usage in permille"
+        );
+        // A value the block does not name is the default, and so is a
+        // binding with no block and the binding of a document that
+        // writes none.
+        let defaults = OverloadThresholds {
+            waiting_requests: OVERLOAD_WAITING_REQUESTS,
+            kv_usage_permille: 800,
+        };
+        assert_eq!(
+            thresholds(&spec_with_binding(
+                r#"{"profile":"p","overload":{"waiting_requests":3}}"#
+            )),
+            Some(OverloadThresholds {
+                waiting_requests: 3,
+                ..defaults
+            })
+        );
+        assert_eq!(
+            thresholds(&spec_with_binding(
+                r#"{"profile":"p","overload":{"token_usage":0.25}}"#
+            )),
+            Some(OverloadThresholds {
+                kv_usage_permille: 250,
+                ..defaults
+            })
+        );
+        // A usage that would round to no permille is held as one: at none,
+        // every engine with a row on file would read over it.
+        assert_eq!(
+            thresholds(&spec_with_binding(
+                r#"{"profile":"p","overload":{"token_usage":0.0004}}"#
+            )),
+            Some(OverloadThresholds {
+                kv_usage_permille: 1,
+                ..defaults
+            })
+        );
+        // The usage is rounded to its permille, not cut.
+        assert_eq!(
+            thresholds(&spec_with_binding(
+                r#"{"profile":"p","overload":{"token_usage":0.2496}}"#
+            )),
+            Some(OverloadThresholds {
+                kv_usage_permille: 250,
+                ..defaults
+            })
+        );
+        assert_eq!(
+            thresholds(&spec_with_binding(r#"{"profile":"p"}"#)),
+            Some(defaults)
+        );
+        assert_eq!(
+            thresholds(&doc(
+                r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["kv-pressure"],"pick":"best"}}}"#
+            )),
+            Some(defaults)
+        );
         assert_eq!(
             bad_field(&spec_with_binding(
                 r#"{"profile":"p","overload":{"waiting_requests":0}}"#
@@ -3976,8 +4072,14 @@ mod tests {
                 "{token_usage}"
             );
         }
-        let off = spec_with_binding(r#"{"profile":"p","overload":{"enabled":false}}"#);
-        assert!(off.validate().is_ok());
+        // Off is the block's switch alone: the binding hands no threshold,
+        // whatever values the block still names.
+        for off in [
+            r#"{"profile":"p","overload":{"enabled":false}}"#,
+            r#"{"profile":"p","overload":{"enabled":false,"waiting_requests":3,"token_usage":0.5}}"#,
+        ] {
+            assert_eq!(thresholds(&spec_with_binding(off)), None, "{off}");
+        }
 
         let sessions = spec_with_binding(
             r#"{"profile":"p","sessions":{"sticky_header":"x-session-id","ttl_s":600,"assignment":"min_load"}}"#,

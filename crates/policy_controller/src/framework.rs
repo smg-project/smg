@@ -798,6 +798,20 @@ fn profile_index(binding: &Binding, phase: Phase) -> Option<u16> {
     }
 }
 
+/// The overload thresholds a binding hands the pools it matches: its block's
+/// two values, each else the spec's default, resolved once by validation.
+/// The host judges an engine's load reports against them and latches the
+/// verdict on the engine's rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverloadThresholds {
+    /// Queued requests, summed over an engine's ranks, at or above which
+    /// the engine's rows are vetoed.
+    pub waiting_requests: u32,
+    /// KV usage in permille, the mean over an engine's ranks, at or above
+    /// which the engine's rows are vetoed.
+    pub kv_usage_permille: u16,
+}
+
 /// A binding: which profile (or plan of profiles) a request resolves to.
 #[derive(Clone, Debug)]
 pub struct Binding {
@@ -813,6 +827,10 @@ pub struct Binding {
     /// Sticky sessions: a keyed request of the `single` plan stays on the
     /// worker its key was placed on (design 4.6).
     pub sessions: Option<SessionRule>,
+    /// The overload thresholds of the pools the binding matches; `None`
+    /// when its block is switched off, and for a binding built by hand
+    /// that names none.
+    pub overload: Option<OverloadThresholds>,
 }
 
 impl Binding {
@@ -2131,6 +2149,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -2262,6 +2281,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -2291,6 +2311,7 @@ mod tests {
             profile: 0,
             decode_profile: Some(0),
             sessions: None,
+            overload: None,
         }
     }
 
@@ -3145,6 +3166,7 @@ mod tests {
                     profile: 1,
                     decode_profile: None,
                     sessions: None,
+                    overload: None,
                 },
                 pair_binding(),
             ],
@@ -3396,6 +3418,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -3439,6 +3462,7 @@ mod tests {
                 profile: 0,
                 decode_profile: Some(0),
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -3561,6 +3585,7 @@ mod tests {
                 profile: 0,
                 decode_profile: Some(0),
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -3643,6 +3668,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -3946,6 +3972,7 @@ mod tests {
                     profile: 0,
                     decode_profile: Some(1),
                     sessions: None,
+                    overload: None,
                 }],
                 1,
                 Needs::default(),
@@ -4054,6 +4081,7 @@ mod tests {
                 profile: 0,
                 decode_profile: Some(1),
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -4821,6 +4849,7 @@ mod tests {
             profile: 0,
             decode_profile: None,
             sessions: None,
+            overload: None,
         };
         assert!(b.matches("pd/a", Phase::Prefill));
         assert!(!b.matches("pd/a", Phase::Single));
@@ -4832,6 +4861,7 @@ mod tests {
             profile: 0,
             decode_profile: None,
             sessions: None,
+            overload: None,
         };
         assert!(any.matches("anything", Phase::Decode));
         let suffix = Binding {
@@ -4915,6 +4945,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions: Some(rule),
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -5248,6 +5279,7 @@ mod tests {
             profile: 0,
             decode_profile: None,
             sessions: Some(rule),
+            overload: None,
         };
         let engine = Engine::new(
             vec![least_requests_profile()],
@@ -5336,6 +5368,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -5454,6 +5487,7 @@ mod tests {
                 profile: 0,
                 decode_profile: None,
                 sessions,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -5766,6 +5800,7 @@ mod tests {
                 profile: 0,
                 decode_profile: Some(0),
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),
@@ -5806,6 +5841,7 @@ mod tests {
                 profile: 0,
                 decode_profile: Some(0),
                 sessions: None,
+                overload: None,
             }],
             1,
             Needs::default(),

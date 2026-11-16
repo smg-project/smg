@@ -148,6 +148,15 @@ impl Health {
     }
 }
 
+/// A ratio as a permille field: the one rounding a report's ratio and a
+/// spec's usage threshold both take, so one rank's usage at or above a
+/// threshold in the document's unit is never read as under it. A mean of
+/// several ranks' rounded usages within a permille of the threshold can
+/// read on either side of it.
+pub fn permille(ratio: f64) -> u16 {
+    (ratio * 1000.0).round().clamp(0.0, 1000.0) as u16
+}
+
 /// One load row as the view carries it: the engine load record's routing
 /// core, in the record's own names, rounded to narrow fields by the host.
 /// Permille fields are the record's ratios times 1000.
