@@ -3,6 +3,9 @@ bracket-aware ``host_port`` join, the family-aware port reservation and the
 range the engines' late-bound ports come from."""
 
 import socket
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +21,19 @@ def test_default_host_is_the_ipv4_loopback_unless_e2e_host_says_otherwise(monkey
     assert default_host() == "127.0.0.1"
     monkeypatch.setenv(ENV_HOST, "::1")
     assert default_host() == "::1"
+
+
+def test_the_mock_mcp_server_defaults_to_the_host_e2e_host_names(monkeypatch):
+    """``E2E_HOST`` is read once, at import, so the check runs in a fresh interpreter."""
+    monkeypatch.setenv(ENV_HOST, "::1")
+    probe = "from infra.mock_mcp_server import MockMcpServer; print(MockMcpServer().host)"
+    child = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert (child.returncode, child.stdout.strip()) == (0, "::1"), child.stderr
 
 
 @pytest.mark.parametrize(

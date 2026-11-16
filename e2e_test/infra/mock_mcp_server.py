@@ -59,7 +59,7 @@ from typing import Any
 import uvicorn
 from fastmcp import FastMCP
 
-from .constants import host_port
+from .constants import MOCK_MCP_HOST, host_port
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ class MockMcpServer:
     Parameters
     ----------
     host:
-        Bind address. Defaults to ``127.0.0.1``.
+        Bind address. Defaults to ``MOCK_MCP_HOST``, the loopback the lane runs on.
     port:
         TCP port. ``0`` (the default) asks the OS for a free port that is
         captured at ``start()`` time via a short-lived socket probe.
@@ -118,7 +118,7 @@ class MockMcpServer:
 
     def __init__(
         self,
-        host: str = "127.0.0.1",
+        host: str = MOCK_MCP_HOST,
         port: int = 0,
         *,
         log_level: str = "warning",
