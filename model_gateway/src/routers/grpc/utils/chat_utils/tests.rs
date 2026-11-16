@@ -1,7 +1,15 @@
-use llm_tokenizer::{chat_template::ChatTemplateContentFormat, traits::RendererCapabilities};
+use std::{future::Future, sync::mpsc};
+
+use llm_tokenizer::{
+    chat_template::{ChatTemplateContentFormat, ThinkingKeyName},
+    traits::RendererCapabilities,
+};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
+    common::{
+        AudioUrl, ContentPart, ImageUrl, InputAudio, JsonSchemaFormat, ResponseFormat, VideoUrl,
+    },
+    profile::ProviderProfile,
 };
 use serde_json::json;
 
@@ -70,6 +78,73 @@ fn process_chat_messages_rejects_unknown_content_parts() {
     assert!(error.contains("vendor_media"));
 }
 
+/// A refusal part is the assistant's: on any other role it is refused before
+/// the engine wire, as the unknown parts are, so no pipeline drops it.
+#[test]
+fn a_refusal_part_outside_an_assistant_turn_is_refused() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": [{"type": "refusal", "refusal": "I cannot."}]}
+    ]))
+    .unwrap();
+    let error = validate_chat_content_parts(&messages).unwrap_err();
+    assert!(error.contains("refusal"), "{error}");
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "refusal", "refusal": "I cannot."}]}
+    ]))
+    .unwrap();
+    assert!(validate_chat_content_parts(&messages).is_ok());
+}
+
+/// A media part is taken in a user message (and in a tool result): in a
+/// system, developer, assistant or root message it is refused at the door in
+/// this door's own sentence (with the role's article), before any fetch, not
+/// after the pipeline ran it and the rendered prompt's anchors did not match
+/// it (none for the first three, one too many for an assistant part).
+#[test]
+fn a_media_part_in_a_text_only_role_message_is_refused_at_the_door() {
+    let parts = [
+        json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}),
+        json!({"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}),
+        json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}),
+        json!({"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}),
+    ];
+    for (role, phrase) in [
+        ("system", "a system"),
+        ("developer", "a developer"),
+        ("assistant", "an assistant"),
+        ("root", "a root"),
+    ] {
+        for part in &parts {
+            let kind = part["type"].as_str().unwrap();
+            let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+                {"role": role, "content": [{"type": "text", "text": "you see"}, part]},
+                {"role": "user", "content": "describe"}
+            ]))
+            .unwrap();
+            let error = validate_chat_content_parts(&messages).unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "Unsupported chat content part type {kind:?} in {phrase} message for gRPC \
+                     backends: media parts are taken in user and tool messages"
+                )
+            );
+        }
+    }
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "system", "content": [{"type": "text", "text": "you see"}]},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
+        ]}
+    ]))
+    .unwrap();
+    assert!(validate_chat_content_parts(&messages).is_ok());
+}
+
 #[test]
 fn known_chat_content_parts_are_accepted() {
     let messages: Vec<ChatMessage> = serde_json::from_value(json!([
@@ -82,10 +157,101 @@ fn known_chat_content_parts_are_accepted() {
             {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
         ]},
         {"role": "assistant", "content": null},
-        {"role": "function", "name": "lookup", "content": "result"}
+        {"role": "assistant", "content": [{"type": "refusal", "refusal": "I cannot."}]},
+        {"role": "function", "name": "lookup", "content": "result"},
+        {"role": "function", "name": "lookup", "content": null}
     ]))
     .unwrap();
     assert!(validate_chat_content_parts(&messages).is_ok());
+}
+
+/// A function result with `content: null` (the deprecated role's shape for a
+/// call that returned nothing) reaches the template as empty content in the
+/// template's own format, as a tool-call-only assistant turn does.
+#[test]
+fn a_function_result_without_content_reaches_the_template_as_empty_content() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "function", "name": "lookup", "content": null},
+        {"role": "function", "name": "lookup", "content": "found"}
+    ]))
+    .unwrap();
+    let as_string =
+        process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
+    assert_eq!(as_string[1]["content"], json!(""));
+    assert_eq!(as_string[2]["content"], json!("found"));
+    let as_parts =
+        process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
+    assert_eq!(as_parts[1]["content"], json!([]));
+    assert_eq!(as_parts[2]["content"], json!("found"));
+}
+
+/// A replayed assistant refusal part is the turn's text to the template, in
+/// the string format and in the parts format, as the engines' own servers
+/// hand it over; the text parts beside it keep their order.
+#[test]
+fn a_refusal_part_reaches_the_template_as_the_turns_text() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Sorry."},
+            {"type": "refusal", "refusal": "I cannot help with that."}
+        ]},
+        {"role": "user", "content": "ok"}
+    ]))
+    .unwrap();
+    let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
+    let as_string =
+        process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+            .unwrap();
+    assert_eq!(
+        as_string[1]["content"],
+        json!("Sorry.\nI cannot help with that.")
+    );
+    let as_parts =
+        process_content_format(&messages, ChatTemplateContentFormat::OpenAI, Some(&tokens))
+            .unwrap();
+    assert_eq!(
+        as_parts[1]["content"],
+        json!([
+            {"type": "text", "text": "Sorry."},
+            {"type": "text", "text": "I cannot help with that."}
+        ])
+    );
+}
+
+/// A replayed turn's refusal, audio reference and deprecated function call stay
+/// out of the template's messages, as the engines' own chat utils leave them
+/// out: the template gets the same turn as it would without them.
+#[test]
+fn a_replayed_refusal_audio_and_function_call_stay_out_of_the_template() {
+    let with: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {"role": "assistant", "content": "Let me look.",
+         "refusal": "I can't share that.",
+         "audio": {"id": "audio_abc123"},
+         "function_call": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+        {"role": "assistant", "content": null, "refusal": "I can't help with that."},
+        {"role": "function", "name": "get_weather", "content": "18C"}
+    ]))
+    .unwrap();
+    let without: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {"role": "assistant", "content": "Let me look."},
+        {"role": "assistant", "content": null},
+        {"role": "function", "name": "get_weather", "content": "18C"}
+    ]))
+    .unwrap();
+    for format in [
+        ChatTemplateContentFormat::String,
+        ChatTemplateContentFormat::OpenAI,
+    ] {
+        assert_eq!(
+            process_content_format(&with, format, None).unwrap(),
+            process_content_format(&without, format, None).unwrap(),
+            "{format:?}"
+        );
+    }
 }
 
 #[test]
@@ -98,7 +264,7 @@ fn test_transform_messages_string_format() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
+                    url: "https://example.com/image.jpg".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -136,7 +302,7 @@ fn test_transform_messages_string_format_without_placeholders_omits_media() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.png".to_string(),
+                    url: "https://example.com/image.png".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -161,7 +327,7 @@ fn test_transform_messages_string_format_with_video_placeholder() {
             },
             ContentPart::VideoUrl {
                 video_url: VideoUrl {
-                    url: "https://example.com/video.mp4".to_string(),
+                    url: "https://example.com/video.mp4".to_string().into(),
                     fps: None,
                     max_long_side_pixel: None,
                 },
@@ -192,14 +358,14 @@ fn test_transform_messages_string_format_uses_per_modality_placeholders() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
             },
             ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "audio".to_string(),
+                    url: "audio".to_string().into(),
                 },
             },
         ]),
@@ -239,7 +405,7 @@ fn test_transform_messages_input_audio_uses_audio_placeholder() {
             },
             ContentPart::InputAudio {
                 input_audio: InputAudio {
-                    data: "UklGRg==".to_string(),
+                    data: "UklGRg==".to_string().into(),
                     format: "wav".to_string(),
                 },
             },
@@ -271,7 +437,7 @@ fn test_transform_messages_string_format_rejects_missing_modality_placeholder() 
         ext: Default::default(),
         content: MessageContent::Parts(vec![ContentPart::AudioUrl {
             audio_url: AudioUrl {
-                url: "audio".to_string(),
+                url: "audio".to_string().into(),
             },
         }]),
         name: None,
@@ -294,7 +460,7 @@ fn test_transform_messages_openai_format() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
+                    url: "https://example.com/image.jpg".to_string().into(),
                     detail: Some("high".to_string()),
                     max_long_side_pixel: None,
                 },
@@ -357,7 +523,7 @@ fn test_transform_messages_multiple_messages() {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
+                        url: "https://example.com/image.jpg".to_string().into(),
                         detail: None,
                         max_long_side_pixel: None,
                     },
@@ -392,7 +558,7 @@ fn test_transform_messages_empty_text_parts() {
         ext: Default::default(),
         content: MessageContent::Parts(vec![ContentPart::ImageUrl {
             image_url: ImageUrl {
-                url: "https://example.com/image.jpg".to_string(),
+                url: "https://example.com/image.jpg".to_string().into(),
                 detail: None,
                 max_long_side_pixel: None,
             },
@@ -427,7 +593,7 @@ fn test_transform_messages_mixed_content_types() {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
+                        url: "https://example.com/image.jpg".to_string().into(),
                         detail: Some("low".to_string()),
                         max_long_side_pixel: None,
                     },
@@ -475,7 +641,7 @@ fn parts_reach_a_parts_template_in_the_requests_order_whatever_the_media_order()
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -502,7 +668,7 @@ fn test_media_hoisted_before_text_string() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -534,7 +700,7 @@ fn test_media_first_stable_and_multi() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "i1".to_string(),
+                    url: "i1".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -544,7 +710,7 @@ fn test_media_first_stable_and_multi() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "i2".to_string(),
+                    url: "i2".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -612,7 +778,7 @@ fn render_parts(parts: &[&str]) -> String {
         tokenizer.chat_template_content_format(),
         ChatTemplateContentFormat::OpenAI
     );
-    process_chat_messages_with_placeholders(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
+    process_with_derived_profile(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
         .unwrap()
         .0
         .text
@@ -664,7 +830,7 @@ fn test_tml_preserves_authored_multipart_order_openai() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -747,7 +913,7 @@ fn render_through(
         llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase).unwrap();
     tokenizer.set_chat_template(template.to_string()).unwrap();
     assert_eq!(tokenizer.chat_template_content_format(), format);
-    process_chat_messages_with_placeholders(request, &tokenizer, None, MediaPartOrder::MediaFirst)
+    process_with_derived_profile(request, &tokenizer, None, MediaPartOrder::MediaFirst)
         .map(|(processed, _)| processed.text)
 }
 
@@ -888,7 +1054,7 @@ fn test_tml_preserves_authored_multipart_order_string() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "image".to_string(),
+                    url: "image".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -998,10 +1164,28 @@ fn tool_choice_none_renders_the_tools_as_auto_does() {
         serde_json::to_value(&rendered.tools).expect("tools"),
         "the same tools render under none and under auto"
     );
-    assert_eq!(
-        build_chat_template_kwargs(&request)[TOOL_CHOICE_KEY],
-        json!("none")
-    );
+    assert_eq!(kwargs_for(&request)[TOOL_CHOICE_KEY], json!("none"));
+}
+
+/// `build_chat_template_kwargs` with the profile the request's model
+/// derives, as the preparation stage carries it.
+fn kwargs_for(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+    build_chat_template_kwargs(
+        request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| true,
+    )
+}
+
+/// `kwargs_for` under a template that reads the `thinking_mode` switch.
+fn kwargs_for_switch(request: &ChatCompletionRequest) -> HashMap<String, Value> {
+    build_chat_template_kwargs(
+        request,
+        ProviderProfile::for_model(&request.model),
+        Some(ThinkingKeyName::ThinkingMode),
+        |_| true,
+    )
 }
 
 fn effort_request(reasoning_effort: Option<&str>) -> ChatCompletionRequest {
@@ -1022,10 +1206,10 @@ fn reasoning_effort_is_forwarded_verbatim() {
     // The chat template owns level->value mapping, defaulting, and validation;
     // the router forwards the string and omits it when absent so the template
     // applies its own default.
-    let kwargs = build_chat_template_kwargs(&effort_request(Some("high")));
+    let kwargs = kwargs_for(&effort_request(Some("high")));
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("high")));
 
-    let kwargs = build_chat_template_kwargs(&effort_request(None));
+    let kwargs = kwargs_for(&effort_request(None));
     assert!(!kwargs.contains_key(REASONING_EFFORT_KEY));
 }
 
@@ -1040,7 +1224,7 @@ fn top_level_effort_overrides_a_chat_template_kwargs_entry() {
         (REASONING_EFFORT_KEY.to_string(), json!("low")),
         ("custom".to_string(), json!(true)),
     ]));
-    let kwargs = build_chat_template_kwargs(&request);
+    let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("high")));
     assert_eq!(kwargs.get("custom"), Some(&Value::Bool(true)));
 
@@ -1049,8 +1233,75 @@ fn top_level_effort_overrides_a_chat_template_kwargs_entry() {
         REASONING_EFFORT_KEY.to_string(),
         json!("low"),
     )]));
-    let kwargs = build_chat_template_kwargs(&request);
+    let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
+}
+
+/// A control the template never reads is not handed to it: a `response_format`
+/// (its schema copied node by node into the kwarg) or a `tool_choice` the
+/// template has no name for could not reach the prompt. The client's own
+/// entries and the effort pass as before, and a request whose controls are
+/// all unread renders with no kwargs at all.
+#[test]
+fn a_control_the_template_never_reads_is_not_handed_to_it() {
+    let mut request = effort_request(None);
+    request.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+    request.response_format = Some(ResponseFormat::JsonSchema {
+        json_schema: Box::new(JsonSchemaFormat {
+            name: "answer".to_string(),
+            schema: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            strict: Some(true),
+            description: None,
+        }),
+    });
+    let read_all = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| true,
+    );
+    assert_eq!(read_all[TOOL_CHOICE_KEY], json!("auto"));
+    assert_eq!(
+        read_all[RESPONSE_FORMAT_KEY],
+        serde_json::to_value(request.response_format.as_ref().unwrap()).unwrap()
+    );
+
+    let unread = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| false,
+    );
+    assert!(unread.is_empty(), "{unread:?}");
+    assert_eq!(
+        unread.capacity(),
+        0,
+        "no map for controls the template never reads"
+    );
+    let only_format = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |name| name == RESPONSE_FORMAT_KEY,
+    );
+    assert!(!only_format.contains_key(TOOL_CHOICE_KEY));
+    assert_eq!(
+        only_format[RESPONSE_FORMAT_KEY],
+        read_all[RESPONSE_FORMAT_KEY]
+    );
+
+    request.reasoning_effort = Some("high".to_string());
+    request.chat_template_kwargs = Some(HashMap::from([("custom".to_string(), json!(true))]));
+    let unread = build_chat_template_kwargs(
+        &request,
+        ProviderProfile::for_model(&request.model),
+        None,
+        |_| false,
+    );
+    assert_eq!(unread.get(REASONING_EFFORT_KEY), Some(&json!("high")));
+    assert_eq!(unread.get("custom"), Some(&json!(true)));
+    assert!(!unread.contains_key(TOOL_CHOICE_KEY));
+    assert!(!unread.contains_key(RESPONSE_FORMAT_KEY));
 }
 
 fn thinking_request(thinking: Value, reasoning_effort: Option<&str>) -> ChatCompletionRequest {
@@ -1063,12 +1314,12 @@ fn thinking_request(thinking: Value, reasoning_effort: Option<&str>) -> ChatComp
 fn thinking_effort_overrides_top_level_effort_in_kwargs() {
     // KVV test_reasoning_effort_ignored_when_effort_present: effort=low beats max.
     let request = thinking_request(json!({"type": "enabled", "effort": "low"}), Some("max"));
-    let kwargs = build_chat_template_kwargs(&request);
+    let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
 
     // Absent `thinking.effort`, the top-level field still applies.
     let request = thinking_request(json!({"type": "enabled"}), Some("max"));
-    let kwargs = build_chat_template_kwargs(&request);
+    let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("max")));
 
     // The request-level effort outranks an explicit chat_template_kwargs entry too.
@@ -1077,68 +1328,153 @@ fn thinking_effort_overrides_top_level_effort_in_kwargs() {
         REASONING_EFFORT_KEY.to_string(),
         json!("high"),
     )]));
-    let kwargs = build_chat_template_kwargs(&request);
+    let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
 }
 
 #[test]
 fn thinking_disabled_projects_params_thinking_false() {
     let request = thinking_request(json!({"type": "disabled"}), Some("high"));
-    assert_eq!(resolve_template_thinking(&request), Some(false));
+    assert_eq!(resolved_template_thinking(&request), Some(false));
     // `adaptive` and an omitted `type` leave the template default in charge.
     for thinking in [json!({"type": "adaptive"}), json!({"keep": "all"})] {
         assert_eq!(
-            resolve_template_thinking(&thinking_request(thinking, None)),
+            resolved_template_thinking(&thinking_request(thinking, None)),
             None
         );
     }
-    assert_eq!(resolve_template_thinking(&effort_request(None)), None);
+    assert_eq!(resolved_template_thinking(&effort_request(None)), None);
     assert_eq!(
-        resolve_template_thinking(&effort_request(Some("none"))),
+        resolved_template_thinking(&effort_request(Some("none"))),
         Some(false)
     );
 }
 
-/// Under the MiniMax profile no effort value switches thinking off: the
-/// request renders the template's default (thinking on, the model's own
-/// depth). An explicit `thinking.disabled` wins over the effort there too.
+/// Under the MiniMax profile `none` switches thinking off, as
+/// `thinking.type: disabled` does, and renders no effort; `minimal` renders
+/// as the contract's `low`, thinking on; a level the contract names (`low`
+/// to `max`) renders as sent; a value outside the contract renders nothing
+/// and leaves the template's default; no effort renders while thinking is
+/// off. An explicit `thinking.type` wins over the effort.
 #[test]
-fn minimax_effort_keeps_thinking_on() {
+fn minimax_effort_none_switches_thinking_off_and_renders_no_effort() {
     let minimax = |thinking: Option<Value>, reasoning_effort: Option<&str>| {
         let mut request = effort_request(reasoning_effort);
         request.model = "MiniMax-M3".to_string();
         request.thinking = thinking.map(|value| serde_json::from_value(value).unwrap());
         request
     };
-    for effort in ["none", "minimal", "high"] {
+    let effort_kwarg =
+        |request: &ChatCompletionRequest| kwargs_for(request).get(REASONING_EFFORT_KEY).cloned();
+    let request = minimax(None, Some("none"));
+    assert_eq!(resolved_template_thinking(&request), Some(false), "none");
+    assert_eq!(effort_kwarg(&request), None, "none: no effort tag");
+    let request = minimax(Some(json!({"type": "enabled"})), Some("none"));
+    assert_eq!(
+        resolved_template_thinking(&request),
+        Some(true),
+        "none: thinking.enabled wins"
+    );
+    assert_eq!(effort_kwarg(&request), None, "none: not a level");
+    let request = minimax(None, Some("minimal"));
+    assert_eq!(
+        resolved_template_thinking(&request),
+        None,
+        "minimal: thinking on"
+    );
+    assert_eq!(
+        effort_kwarg(&request),
+        Some(json!("low")),
+        "minimal renders as low"
+    );
+    let request = minimax(Some(json!({"type": "disabled"})), Some("minimal"));
+    assert_eq!(resolved_template_thinking(&request), Some(false));
+    assert_eq!(
+        effort_kwarg(&request),
+        None,
+        "minimal: no effort while thinking is off"
+    );
+    for effort in ["low", "medium", "high", "xhigh", "max"] {
+        let request = minimax(None, Some(effort));
+        assert_eq!(resolved_template_thinking(&request), None, "{effort}");
+        assert_eq!(effort_kwarg(&request), Some(json!(effort)), "{effort}");
+        let request = minimax(Some(json!({"type": "disabled"})), Some(effort));
         assert_eq!(
-            resolve_template_thinking(&minimax(None, Some(effort))),
-            None,
-            "{effort}"
-        );
-        assert_eq!(
-            resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), Some(effort))),
+            resolved_template_thinking(&request),
             Some(false),
             "{effort}: thinking.disabled wins"
         );
+        assert_eq!(
+            effort_kwarg(&request),
+            None,
+            "{effort}: no effort while thinking is off"
+        );
     }
+    let request = minimax(None, Some("ultra_super_max_xyz"));
+    assert_eq!(resolved_template_thinking(&request), None);
+    assert_eq!(effort_kwarg(&request), None);
     assert_eq!(
-        resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), None)),
+        resolved_template_thinking(&minimax(Some(json!({"type": "disabled"})), None)),
         Some(false)
     );
+
+    // The request-level effort owns the key: an explicit entry the profile
+    // renders nothing for goes too; one stands when the request carries no
+    // field.
+    let mut request = minimax(None, Some("none"));
+    request.chat_template_kwargs = Some(HashMap::from([
+        (REASONING_EFFORT_KEY.to_string(), json!("high")),
+        ("custom".to_string(), json!(true)),
+    ]));
+    let kwargs = kwargs_for(&request);
+    assert!(!kwargs.contains_key(REASONING_EFFORT_KEY));
+    assert_eq!(kwargs.get("custom"), Some(&Value::Bool(true)));
+    let mut request = minimax(None, None);
+    request.chat_template_kwargs = Some(HashMap::from([(
+        REASONING_EFFORT_KEY.to_string(),
+        json!("high"),
+    )]));
     assert_eq!(
-        resolve_template_thinking(&minimax(Some(json!({"type": "enabled"})), Some("none"))),
-        Some(true)
+        kwargs_for(&request).get(REASONING_EFFORT_KEY),
+        Some(&json!("high"))
+    );
+
+    // The template's own switch sent as a kwarg counts where the template
+    // reads that key, ranking above the typed toggle and the effort as the
+    // template renders it: no effort tag beside its disabled branch, the
+    // level beside its enabled one. A template without the switch (the key
+    // undetected) keeps the effort: the kwarg is inert there.
+    let mut request = minimax(None, Some("high"));
+    request.chat_template_kwargs = Some(HashMap::from([(
+        "thinking_mode".to_string(),
+        json!("disabled"),
+    )]));
+    let kwargs = kwargs_for_switch(&request);
+    assert!(!kwargs.contains_key(REASONING_EFFORT_KEY));
+    assert_eq!(kwargs.get("thinking_mode"), Some(&json!("disabled")));
+    assert_eq!(
+        kwargs_for(&request).get(REASONING_EFFORT_KEY),
+        Some(&json!("high")),
+        "a template without the switch keeps the effort"
+    );
+    let mut request = minimax(Some(json!({"type": "disabled"})), Some("minimal"));
+    request.chat_template_kwargs = Some(HashMap::from([(
+        "thinking_mode".to_string(),
+        json!("enabled"),
+    )]));
+    assert_eq!(
+        kwargs_for_switch(&request).get(REASONING_EFFORT_KEY),
+        Some(&json!("low"))
     );
 }
 
 #[test]
 fn thinking_enabled_beats_reasoning_effort_none() {
     let request = thinking_request(json!({"type": "enabled"}), Some("none"));
-    assert_eq!(resolve_template_thinking(&request), Some(true));
+    assert_eq!(resolved_template_thinking(&request), Some(true));
     // A `none` inside `thinking.effort` is the switch too when no type is given.
     let request = thinking_request(json!({"effort": "none"}), Some("high"));
-    assert_eq!(resolve_template_thinking(&request), Some(false));
+    assert_eq!(resolved_template_thinking(&request), Some(false));
 }
 
 #[test]
@@ -1150,7 +1486,7 @@ fn tool_and_output_controls_are_forwarded_to_renderer() {
         "response_format": {"type": "json_object"}
     }))
     .unwrap();
-    let kwargs = build_chat_template_kwargs(&request);
+    let kwargs = kwargs_for(&request);
     assert_eq!(kwargs.get(TOOL_CHOICE_KEY), Some(&json!("required")));
     assert_eq!(
         kwargs.get(RESPONSE_FORMAT_KEY),
@@ -1163,7 +1499,7 @@ fn tool_and_output_controls_are_forwarded_to_renderer() {
         "messages": [{"role": "user", "content": "hello"}]
     }))
     .unwrap();
-    let kwargs = build_chat_template_kwargs(&bare);
+    let kwargs = kwargs_for(&bare);
     assert!(!kwargs.contains_key(TOOL_CHOICE_KEY));
     assert!(!kwargs.contains_key(RESPONSE_FORMAT_KEY));
 }
@@ -1198,7 +1534,7 @@ fn test_render_image_before_question_real_template() {
             },
             ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    url: "data:image/jpeg;base64,XXX".to_string(),
+                    url: "data:image/jpeg;base64,XXX".to_string().into(),
                     detail: None,
                     max_long_side_pixel: None,
                 },
@@ -1304,7 +1640,7 @@ fn prefill_request() -> ChatCompletionRequest {
     .unwrap()
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1315,7 +1651,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 #[test]
 fn flat_renderer_joins_the_prefill_and_reports_from_text() {
     let tokenizer = llm_tokenizer::MockTokenizer::new();
-    let (processed, encoding) = process_chat_messages_with_placeholders(
+    let (processed, encoding) = process_with_derived_profile(
         &prefill_request(),
         &tokenizer,
         None,
@@ -1344,6 +1680,98 @@ fn flat_renderer_joins_the_prefill_and_reports_from_text() {
 
 // --- renderer-capability gates on the render path ------------------------
 
+fn json_renderer() -> llm_tokenizer::MockTokenizer {
+    llm_tokenizer::MockTokenizer::new()
+        .with_renderer_capabilities(RendererCapabilities {
+            native_assistant_continuation: true,
+            json_requires_separate_reasoning: true,
+            json_requires_empty_assistant_prefix: true,
+            ..Default::default()
+        })
+        .with_json_chat_template()
+}
+
+#[test]
+fn json_reasoning_separation_follows_the_renderer_contract() {
+    for format in [
+        json!({"type":"json_object"}),
+        json!({"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}),
+    ] {
+        let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"m", "messages":[{"role":"user","content":"Hi"}],
+            "response_format":format, "separate_reasoning":false
+        }))
+        .unwrap();
+        let render = |request: &ChatCompletionRequest, tokenizer: &dyn Tokenizer| {
+            process_with_derived_profile(request, tokenizer, None, MediaPartOrder::MediaFirst)
+        };
+        assert!(render(&request, &json_renderer())
+            .unwrap_err()
+            .contains("separate_reasoning=true"));
+        assert!(render(&request, &llm_tokenizer::MockTokenizer::new()).is_ok());
+        request.separate_reasoning = true;
+        assert!(render(&request, &json_renderer()).is_ok());
+    }
+}
+
+#[test]
+fn json_continuation_checks_the_effective_flag_and_actual_response_format() {
+    for top_level in [false, true] {
+        for prefix in ["", "{\"answer\":"] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model":"m", "messages":[{"role":"assistant","content":prefix}],
+                "response_format":{"type":"json_object"},
+                "continue_final_message":top_level,
+                "chat_template_kwargs":{
+                    "continue_final_message":true,
+                    "response_format":{"type":"text"}
+                }
+            }))
+            .unwrap();
+            let result = process_with_derived_profile(
+                &request,
+                &json_renderer(),
+                None,
+                MediaPartOrder::MediaFirst,
+            );
+            if prefix.is_empty() {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.unwrap_err().contains("nonempty assistant"));
+            }
+        }
+    }
+}
+
+#[test]
+fn json_contract_does_not_restrict_text_responses_or_closed_history() {
+    for format in [Value::Null, json!({"type":"text"})] {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model":"m", "messages":[{"role":"assistant","content":"Partial"}],
+            "response_format":format, "continue_final_message":true,
+            "separate_reasoning":false
+        }))
+        .unwrap();
+        assert!(process_with_derived_profile(
+            &request,
+            &json_renderer(),
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .is_ok());
+    }
+    let mut request = prefill_request();
+    request.continue_final_message = false;
+    request.response_format = Some(ResponseFormat::JsonObject);
+    assert!(process_with_derived_profile(
+        &request,
+        &json_renderer(),
+        None,
+        MediaPartOrder::MediaFirst,
+    )
+    .is_ok());
+}
+
 /// Render `request` through a mock that declares `capabilities` and
 /// hands back the message list it received as JSON, so both gates are
 /// observable without a checkpoint: which messages reach the template,
@@ -1353,13 +1781,9 @@ fn render_with(capabilities: RendererCapabilities, request: &ChatCompletionReque
     let tokenizer = llm_tokenizer::MockTokenizer::new()
         .with_renderer_capabilities(capabilities)
         .with_json_chat_template();
-    let (processed, _) = process_chat_messages_with_placeholders(
-        request,
-        &tokenizer,
-        None,
-        MediaPartOrder::MediaFirst,
-    )
-    .unwrap();
+    let (processed, _) =
+        process_with_derived_profile(request, &tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap();
     // The default `apply_chat_template_with_encoding` appends the
     // assistant prefix after the rendered text, so a prefill that was
     // popped shows up as a suffix on the JSON document.
@@ -1376,6 +1800,8 @@ const NATIVE_CONTINUATION: RendererCapabilities = RendererCapabilities {
     native_assistant_continuation: true,
     raw_tool_call_arguments: false,
     leading_system_only: false,
+    json_requires_separate_reasoning: false,
+    json_requires_empty_assistant_prefix: false,
 };
 const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     media_handling: llm_tokenizer::traits::MediaHandling::Preprocess,
@@ -1383,6 +1809,8 @@ const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     native_assistant_continuation: false,
     raw_tool_call_arguments: true,
     leading_system_only: false,
+    json_requires_separate_reasoning: false,
+    json_requires_empty_assistant_prefix: false,
 };
 
 /// Without the capability the trailing assistant message is popped and its
@@ -1469,14 +1897,9 @@ fn jinja_template_renders_no_header_when_add_generation_prompt_is_false() {
             body["add_generation_prompt"] = Value::Null;
         }
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-        process_chat_messages_with_placeholders(
-            &request,
-            &tokenizer,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap()
-        .0
+        process_with_derived_profile(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap()
+            .0
     };
     let closed = render(json!(false));
     assert_eq!(closed.text, "<|turn|>user<|body|>Hello.<|end|>");
@@ -1507,14 +1930,9 @@ fn the_rendered_prompt_reports_its_generation_header() {
             .with_renderer_capabilities(capabilities)
             .with_json_chat_template();
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-        process_chat_messages_with_placeholders(
-            &request,
-            &tokenizer,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap()
-        .0
+        process_with_derived_profile(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap()
+            .0
     };
     let hello = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
     assert!(processed(Default::default(), hello.clone()).generation_prompt);
@@ -1557,7 +1975,7 @@ fn rendered_markers_are_anchored_before_tokenizing() {
     placeholders.insert(Modality::Video, "<SPECIAL_30>".to_string());
     placeholders.add_rendered_marker("<video>".to_string(), "<SPECIAL_30>".to_string());
     let render = |placeholders| {
-        process_chat_messages_with_placeholders(
+        process_with_derived_profile(
             &request,
             &tokenizer,
             placeholders,
@@ -1590,7 +2008,7 @@ fn jinja_template_continues_inside_the_assistant_turn() {
     tokenizer
         .set_chat_template(HEADER_TEMPLATE.to_string())
         .unwrap();
-    let (processed, _) = process_chat_messages_with_placeholders(
+    let (processed, _) = process_with_derived_profile(
         &prefill_request(),
         &tokenizer,
         None,
@@ -1623,13 +2041,9 @@ fn parts_valued_prefill_reaches_the_render_call_under_openai_content_format() {
     let tokenizer = llm_tokenizer::MockTokenizer::new()
         .with_content_format(ChatTemplateContentFormat::OpenAI)
         .with_json_chat_template();
-    let (processed, _) = process_chat_messages_with_placeholders(
-        &request,
-        &tokenizer,
-        None,
-        MediaPartOrder::MediaFirst,
-    )
-    .unwrap();
+    let (processed, _) =
+        process_with_derived_profile(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap();
     let (rendered, prefix) = processed
         .text
         .split_at(processed.text.rfind('}').unwrap() + 1);
@@ -1894,7 +2308,7 @@ fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
     let tokenizer = llm_tokenizer::MockTokenizer::new()
         .with_deferred_chat_ids(vec![7, 8, 9])
         .with_unbilled_prompt_tokens(3);
-    let (processed, encoding) = process_chat_messages_with_placeholders(
+    let (processed, encoding) = process_with_derived_profile(
         &prefill_request(),
         &tokenizer,
         None,
@@ -1910,7 +2324,7 @@ fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
         processed.unbilled_prompt_tokens, 3,
         "the renderer's unbilled count rides along"
     );
-    let (flat, _) = process_chat_messages_with_placeholders(
+    let (flat, _) = process_with_derived_profile(
         &prefill_request(),
         &llm_tokenizer::MockTokenizer::new(),
         None,
@@ -1922,6 +2336,41 @@ fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
     let ids = block_on(encode_prompt_blocking(tokenizer, &processed.text, encoding)).unwrap();
     assert_eq!(ids.token_ids(), &[7, 8, 9]);
+}
+
+#[test]
+fn a_long_decode_takes_the_offload_path_and_a_short_one_runs_inline() {
+    use std::thread;
+
+    use crate::routers::grpc::testing::thread_recording_tokenizer;
+
+    // `block_on` polls on this thread, so an offloaded decode runs somewhere else.
+    let (tokenizer, ran_on) = thread_recording_tokenizer();
+    let hello = tokenizer.token_to_id("Hello").expect("mock vocab");
+    let decode = |ids: Vec<u32>| {
+        block_on(decode_ids_blocking(tokenizer.clone(), vec![ids], false))
+            .unwrap()
+            .remove(0)
+    };
+
+    let long = vec![hello; ENCODE_OFFLOAD_MIN_BYTES / size_of::<u32>()];
+    let expected = tokenizer.decode(&long, false).unwrap();
+    ran_on.lock().unwrap().clear();
+    assert_eq!(decode(long), expected);
+    let offloaded = ran_on.lock().unwrap().pop().expect("the decode ran");
+    assert_ne!(
+        offloaded,
+        thread::current().id(),
+        "a prompt of ids the size of a long text decodes off the worker thread"
+    );
+
+    assert_eq!(decode(vec![hello]), "Hello");
+    let inline = ran_on.lock().unwrap().pop().expect("the decode ran");
+    assert_eq!(
+        inline,
+        thread::current().id(),
+        "a short prompt of ids decodes inline"
+    );
 }
 
 #[test]
@@ -1948,13 +2397,8 @@ fn deferred_encode_takes_the_offload_path_for_large_prompts() {
             "messages": [{"role": "user", "content": content}]
         }))
         .unwrap();
-        process_chat_messages_with_placeholders(
-            &request,
-            &*tokenizer,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap()
+        process_with_derived_profile(&request, &*tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap()
     };
     let encode = |text: &str, encoding: PromptEncoding| {
         block_on(encode_prompt_blocking(tokenizer.clone(), text, encoding)).unwrap()
@@ -1978,6 +2422,175 @@ fn deferred_encode_takes_the_offload_path_for_large_prompts() {
         inline,
         thread::current().id(),
         "a small deferred encode runs inline"
+    );
+}
+
+#[test]
+fn a_conversation_of_a_few_kilobytes_is_encoded_on_the_request_thread() {
+    use std::{
+        sync::Mutex,
+        thread::{self, ThreadId},
+    };
+    // The job records the thread it ran on; `block_on` polls on this thread.
+    let ran_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+    let probe = {
+        let ran_on = ran_on.clone();
+        move || *ran_on.lock().unwrap() = Some(thread::current().id())
+    };
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+        llm_tokenizer::MockTokenizer::new()
+            .with_deferred_chat_ids(vec![1, 2])
+            .with_deferred_chat_probe(probe),
+    );
+    // A system prompt and two rounds of a conversation, about five kilobytes
+    // rendered: the shape of an ordinary multi-turn request, well above the
+    // old 512-byte threshold and below the one that protects the runtime.
+    let paragraph = |seed: usize| {
+        (0..350)
+            .map(|i| format!("w{}", (seed * 7 + i * 13) % 97))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "m",
+        "messages": [
+            {"role": "system", "content": paragraph(1)},
+            {"role": "user", "content": paragraph(2)},
+            {"role": "assistant", "content": paragraph(3)},
+            {"role": "user", "content": paragraph(4)}
+        ]
+    }))
+    .unwrap();
+    let (processed, encoding) =
+        process_with_derived_profile(&request, &*tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap();
+    assert!(
+        processed.text.len() > 4 * 1024 && processed.text.len() < ENCODE_OFFLOAD_MIN_BYTES,
+        "the rendered conversation is a few kilobytes ({} bytes), under the threshold",
+        processed.text.len()
+    );
+    block_on(encode_prompt_blocking(
+        tokenizer.clone(),
+        &processed.text,
+        encoding,
+    ))
+    .unwrap();
+    let ran = ran_on.lock().unwrap().take().expect("the job ran");
+    assert_eq!(
+        ran,
+        thread::current().id(),
+        "a conversation of a few kilobytes is encoded on the thread that holds the request, \
+         not handed to the blocking pool"
+    );
+}
+
+#[test]
+fn a_batch_encodes_in_place_up_to_the_bound_and_the_rest_on_the_pool() {
+    use std::thread;
+
+    use crate::routers::grpc::testing::thread_recording_tokenizer;
+
+    // `block_on` polls on this thread, so an encode in place runs here and an
+    // offloaded one somewhere else.
+    let (tokenizer, ran_on) = thread_recording_tokenizer();
+    let here = thread::current().id();
+    let batch = |texts: Vec<String>| {
+        block_on(encode_texts_blocking(tokenizer.clone(), &texts, false)).unwrap();
+        std::mem::take(&mut *ran_on.lock().unwrap())
+    };
+
+    // Sixty-four prompts of twelve kibibytes, the shape of a completion batch:
+    // each alone is under the bound, the batch is forty times over it.
+    let long = "word ".repeat(12 * 1024 / 5);
+    assert!(long.len() < ENCODE_OFFLOAD_MIN_BYTES && 2 * long.len() > ENCODE_OFFLOAD_MIN_BYTES);
+    let threads = batch(vec![long; 64]);
+    assert_eq!(threads.len(), 64, "every prompt of the batch is encoded");
+    assert_eq!(
+        threads.iter().filter(|t| **t == here).count(),
+        1,
+        "one prompt of the batch fits the bound in place; the other sixty-three go to the pool"
+    );
+
+    // Sixty-four short prompts, under the bound in total, all stay in place.
+    let threads = batch(vec!["hello there".to_string(); 64]);
+    assert_eq!(threads.len(), 64);
+    assert!(
+        threads.iter().all(|t| *t == here),
+        "a batch under the bound in total is encoded on the thread that holds the request"
+    );
+}
+
+/// An input under the break-even size never takes the pool: once a call's
+/// share is spent it yields the worker and starts the next share, whether the
+/// call awaits its inputs one by one (a tokenize call of many short texts)
+/// or joins them, where the join runs about one share per poll pass.
+#[test]
+fn short_inputs_after_a_spent_share_stay_in_place_and_yield_instead() {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        thread,
+    };
+
+    use crate::routers::grpc::testing::thread_recording_tokenizer;
+
+    /// The polls a future took to complete: one per yield of the call.
+    struct Polls<F>(Pin<Box<F>>, usize);
+    impl<F: Future> Future for Polls<F> {
+        type Output = (F::Output, usize);
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.1 += 1;
+            match self.0.as_mut().poll(cx) {
+                Poll::Ready(output) => Poll::Ready((output, self.1)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    let (tokenizer, ran_on) = thread_recording_tokenizer();
+    let here = thread::current().id();
+    let spends_the_share = "word ".repeat((ENCODE_OFFLOAD_MIN_BYTES - 512) / 5);
+    let short = "word ".repeat(20); // 100 bytes, under the break-even size
+    let texts = vec![short; 2_000]; // 200 KB in all: twelve shares and a bit
+
+    // One by one, as the tokenize loop awaits them.
+    let mut budget = InPlaceBudget::default();
+    block_on(async {
+        encode_blocking_in_batch(tokenizer.clone(), &spends_the_share, false, &mut budget)
+            .await
+            .unwrap();
+        for text in &texts {
+            encode_blocking_in_batch(tokenizer.clone(), text, false, &mut budget)
+                .await
+                .unwrap();
+        }
+    });
+    let threads = std::mem::take(&mut *ran_on.lock().unwrap());
+    assert_eq!(threads.len(), 2_001);
+    assert!(
+        threads.iter().all(|t| *t == here),
+        "a short input is never sent to the pool, spent share or not"
+    );
+
+    // As one call's batch, placed in one pass.
+    let ((), polls) = block_on(Polls(
+        Box::pin(async {
+            encode_texts_blocking(tokenizer.clone(), &texts, false)
+                .await
+                .unwrap();
+        }),
+        0,
+    ));
+    let threads = std::mem::take(&mut *ran_on.lock().unwrap());
+    assert_eq!(
+        threads.len(),
+        2_000,
+        "each input of the batch is encoded exactly once"
+    );
+    assert!(threads.iter().all(|t| *t == here));
+    assert!(
+        (12..=16).contains(&polls),
+        "the batch runs about one share of short inputs per pass and yields between passes: {polls} passes"
     );
 }
 
@@ -2083,4 +2696,259 @@ fn the_completion_finish_reason_is_one_table() {
             "local_stop={local_stop} engine={engine:?}"
         );
     }
+}
+
+/// `resolve_template_thinking` with the profile the request's model derives,
+/// as the preparation stage carries it.
+fn resolved_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
+    resolve_template_thinking(request, ProviderProfile::for_model(&request.model))
+}
+
+/// The render reads the profile the stage carries, not one derived again
+/// from the model: a profile that hands the template an effort differently
+/// from the default one decides the kwarg whatever the model id says, and a
+/// typed toggle wins under either.
+#[test]
+fn the_render_reads_the_carried_profile_not_the_model() {
+    let effort_kwarg = |request: &ChatCompletionRequest, provider: ProviderProfile| {
+        build_chat_template_kwargs(request, provider, None, |_| true)
+            .get(REASONING_EFFORT_KEY)
+            .cloned()
+    };
+    // `none` renders as sent under the default profile and renders no effort
+    // under MiniMax's; it switches thinking off under both.
+    let request = effort_request(Some("none"));
+    assert_eq!(
+        effort_kwarg(&request, ProviderProfile::Generic),
+        Some(json!("none"))
+    );
+    assert_eq!(effort_kwarg(&request, ProviderProfile::Minimax), None);
+    assert_eq!(
+        resolve_template_thinking(&request, ProviderProfile::Generic),
+        Some(false)
+    );
+    assert_eq!(
+        resolve_template_thinking(&request, ProviderProfile::Minimax),
+        Some(false)
+    );
+
+    // A MiniMax model id with the default profile carried: the carried
+    // profile decides, not the id.
+    let mut named = effort_request(Some("none"));
+    named.model = "MiniMax-M3".to_string();
+    assert_eq!(
+        ProviderProfile::for_model(&named.model),
+        ProviderProfile::Minimax
+    );
+    assert_eq!(
+        effort_kwarg(&named, ProviderProfile::Generic),
+        Some(json!("none"))
+    );
+    assert_eq!(effort_kwarg(&named, ProviderProfile::Minimax), None);
+
+    // A typed toggle wins over either profile's reading of the effort, and
+    // under MiniMax no effort renders while thinking is off.
+    let toggled = thinking_request(json!({"type": "disabled"}), Some("high"));
+    assert_eq!(
+        resolve_template_thinking(&toggled, ProviderProfile::Generic),
+        Some(false)
+    );
+    assert_eq!(
+        resolve_template_thinking(&toggled, ProviderProfile::Minimax),
+        Some(false)
+    );
+    assert_eq!(
+        effort_kwarg(&toggled, ProviderProfile::Generic),
+        Some(json!("high"))
+    );
+    assert_eq!(effort_kwarg(&toggled, ProviderProfile::Minimax), None);
+}
+
+/// `process_chat_messages_with_placeholders` with the profile the request's
+/// model derives, as the preparation stage carries it.
+fn process_with_derived_profile(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    placeholder_tokens: Option<&PlaceholderTokens>,
+    media_order: MediaPartOrder,
+) -> Result<(ProcessedMessages, PromptEncoding), String> {
+    process_chat_messages_with_placeholders(
+        request,
+        tokenizer,
+        placeholder_tokens,
+        media_order,
+        ProviderProfile::for_model(&request.model),
+    )
+}
+
+/// A tool declared without a parameter schema reaches the template with
+/// `"parameters": null`, whether the request left the field out or wrote
+/// `null`, as the engine's own server hands its declarations to the same
+/// template; a client's own `{}` stays `{}`. The prepared tool set keeps the
+/// two shapes apart as well: the second request reads the kept value.
+#[test]
+fn a_tool_declared_without_a_schema_reaches_the_template_with_a_null_schema() {
+    let tokenizer = llm_tokenizer::MockTokenizer::new()
+        .with_chat_template("{% for tool in tools %}{{ tool | tojson }};{% endfor %}")
+        .expect("chat template");
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "function": {"name": "absent"}},
+            {"type": "function", "function": {"name": "nulled", "parameters": null}},
+            {"type": "function", "function": {"name": "empty", "parameters": {}}},
+        ]
+    }))
+    .expect("chat request");
+    for pass in ["first", "second"] {
+        let processed = process_chat_messages(&request, &tokenizer, None).expect(pass);
+        assert_eq!(
+            processed.text,
+            "{\"type\": \"function\", \"function\": {\"name\": \"absent\", \"parameters\": null}};\
+             {\"type\": \"function\", \"function\": {\"name\": \"nulled\", \"parameters\": null}};\
+             {\"type\": \"function\", \"function\": {\"name\": \"empty\", \"parameters\": {}}};",
+            "{pass} render"
+        );
+    }
+}
+
+/// A tokenizer that records, for every encode, the thread it ran on and the
+/// address of the text it was handed: the caller's own buffer, or a copy.
+struct RecordsEncodes {
+    inner: llm_tokenizer::MockTokenizer,
+    seen: parking_lot::Mutex<Vec<(std::thread::ThreadId, usize)>>,
+}
+
+impl RecordsEncodes {
+    fn new() -> Self {
+        Self {
+            inner: llm_tokenizer::MockTokenizer::new(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl llm_tokenizer::traits::Encoder for RecordsEncodes {
+    fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+        self.seen
+            .lock()
+            .push((std::thread::current().id(), input.as_ptr() as usize));
+        self.inner.encode(input, add_special_tokens)
+    }
+
+    fn encode_batch(
+        &self,
+        inputs: &[&str],
+        add_special_tokens: bool,
+    ) -> anyhow::Result<Vec<Encoding>> {
+        self.inner.encode_batch(inputs, add_special_tokens)
+    }
+}
+
+impl llm_tokenizer::traits::Decoder for RecordsEncodes {
+    fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+        self.inner.decode(token_ids, skip_special_tokens)
+    }
+}
+
+impl Tokenizer for RecordsEncodes {
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+        self.inner.get_special_tokens()
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[test]
+fn a_prompt_below_the_offload_threshold_is_encoded_from_the_callers_own_text() {
+    let recorder = Arc::new(RecordsEncodes::new());
+    let tokenizer: Arc<dyn Tokenizer> = Arc::clone(&recorder) as Arc<dyn Tokenizer>;
+    let short = "a".repeat(ENCODE_OFFLOAD_MIN_BYTES - 1);
+    let long = "a".repeat(ENCODE_OFFLOAD_MIN_BYTES);
+    block_on(encode_prompt_blocking(
+        Arc::clone(&tokenizer),
+        &short,
+        PromptEncoding::FromText,
+    ))
+    .unwrap();
+    block_on(encode_prompt_blocking(
+        tokenizer,
+        &long,
+        PromptEncoding::FromText,
+    ))
+    .unwrap();
+    let seen = recorder.seen.lock();
+    let here = std::thread::current().id();
+    assert_eq!(
+        seen[0],
+        (here, short.as_ptr() as usize),
+        "a prompt below the threshold encodes in place, from the caller's own text, not a copy"
+    );
+    assert_ne!(
+        seen[1].0, here,
+        "a prompt at the threshold encodes on the blocking pool"
+    );
+    assert_ne!(
+        seen[1].1,
+        long.as_ptr() as usize,
+        "the blocking task reads a copy of its own, which outlives the caller's borrow"
+    );
+}
+
+/// A pool call dropped while its job runs keeps the job's permit until the
+/// blocking work ends: a pass ended by one input's error, or dropped by a
+/// client gone, still counts its running jobs against the bound. The bound is
+/// read after the drop and judged only once the job has been let go, so a
+/// regression fails the test instead of hanging the runtime's shutdown on the
+/// parked job.
+#[test]
+fn a_dropped_pool_call_holds_its_permit_until_the_blocking_work_ends() {
+    static PERMITS: Semaphore = Semaphore::const_new(1);
+    let (started, running) = mpsc::channel::<()>();
+    let (release, released) = mpsc::channel::<()>();
+    block_on(async {
+        {
+            let mut call = std::pin::pin!(pool_on(&PERMITS, move || {
+                started.send(()).ok();
+                released.recv_timeout(Duration::from_secs(10)).ok();
+                anyhow::Ok(())
+            }));
+            // One poll takes the permit and hands the job to the blocking pool.
+            assert!(futures::poll!(call.as_mut()).is_pending());
+            assert!(
+                running.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "the job started"
+            );
+            assert_eq!(PERMITS.available_permits(), 0);
+        }
+        // The future is gone while the job still runs: read the bound, then let the job end.
+        let available_after_the_drop = PERMITS.available_permits();
+        release.send(()).ok();
+        for _ in 0..10_000 {
+            if PERMITS.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(PERMITS.available_permits(), 1, "the permit never returned");
+        assert_eq!(
+            available_after_the_drop, 0,
+            "the permit returned before the work ended"
+        );
+    });
 }

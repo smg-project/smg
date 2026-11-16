@@ -7,7 +7,7 @@
 use std::{borrow::Cow, collections::HashMap, fmt::Display, sync::Arc};
 
 use axum::response::Response;
-use llm_multimodal::{MediaPartOrder, Modality};
+use llm_multimodal::{MediaErrorCode, MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
     traits::{MediaHandling, PromptEncoding, Tokenizer},
@@ -18,6 +18,8 @@ use openai_protocol::{
         self, CountMessageTokensRequest, CreateMessageRequest, InputContent, InputContentBlock,
         InputMessage, SystemContent, ToolResultContent,
     },
+    profile::ProviderProfile,
+    worker::MmProcessingMode,
 };
 use serde_json::{json, Value};
 use tracing::error;
@@ -49,7 +51,9 @@ pub(crate) struct MessagesPrompt<'a> {
     /// The thinking preference the prompt is rendered with
     /// (`CreateMessageRequest::template_thinking`).
     pub thinking: Option<bool>,
-    /// `output_config.effort`, rendered as the `reasoning_effort` kwarg.
+    /// `output_config.effort` as the provider profile hands it to the
+    /// template (`CreateMessageRequest::template_reasoning_effort_for`),
+    /// rendered as the `reasoning_effort` kwarg.
     pub reasoning_effort: Option<&'a str>,
     /// The request's tool choice, told to the template as the chat path
     /// tells it; a renderer that declares the tools under `none` writes its
@@ -57,25 +61,38 @@ pub(crate) struct MessagesPrompt<'a> {
     pub tool_choice: Option<&'a messages::ToolChoice>,
 }
 
-impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
-    fn from(request: &'a CreateMessageRequest) -> Self {
+impl<'a> MessagesPrompt<'a> {
+    /// The prompt parts of `request`, with the model's provider profile the
+    /// caller derived already (the preparation stage derives it once per
+    /// request); `From` derives it for a caller without one.
+    pub(crate) fn for_request(
+        request: &'a CreateMessageRequest,
+        provider: ProviderProfile,
+    ) -> Self {
         Self {
             messages: &request.messages,
             system: request.system.as_ref(),
-            thinking: request.template_thinking(),
-            reasoning_effort: request.reasoning_effort(),
+            thinking: request.template_thinking_for(provider),
+            reasoning_effort: request.template_reasoning_effort_for(provider),
             tool_choice: request.tool_choice.as_ref(),
         }
     }
 }
 
+impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
+    fn from(request: &'a CreateMessageRequest) -> Self {
+        Self::for_request(request, ProviderProfile::for_model(&request.model))
+    }
+}
+
 impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
     fn from(request: &'a CountMessageTokensRequest) -> Self {
+        let provider = ProviderProfile::for_model(&request.model);
         Self {
             messages: &request.messages,
             system: request.system.as_ref(),
-            thinking: request.template_thinking(),
-            reasoning_effort: request.reasoning_effort(),
+            thinking: request.template_thinking_for(provider),
+            reasoning_effort: request.template_reasoning_effort_for(provider),
             tool_choice: request.tool_choice.as_ref(),
         }
     }
@@ -94,9 +111,10 @@ pub fn process_messages(
     chat_tools: Option<&[ChatTool]>,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
+    provider: ProviderProfile,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
     process_messages_prompt(
-        MessagesPrompt::from(request),
+        MessagesPrompt::for_request(request, provider),
         tokenizer,
         chat_tools,
         placeholder_tokens,
@@ -118,6 +136,7 @@ pub fn process_messages_with_encoding(
         chat_tools,
         None,
         MediaPartOrder::MediaFirst,
+        ProviderProfile::for_model(&request.model),
     )
 }
 
@@ -183,10 +202,14 @@ fn process_messages_prompt(
     // Step 6: Apply chat template. The template learns the tool choice the
     // way the chat path tells it (the chat value under the same kwarg): a
     // renderer that declares the tools under `none` writes its instruction
-    // not to call them from this key. The effort rides under the chat
-    // path's `reasoning_effort` kwarg as well.
+    // not to call them from this key; a renderer that never reads the key
+    // is not handed it. The effort rides under the chat path's
+    // `reasoning_effort` kwarg as well.
     let mut kwargs = HashMap::with_capacity(2);
-    if let Some(tool_choice) = request.tool_choice {
+    if let Some(tool_choice) = request
+        .tool_choice
+        .filter(|_| tokenizer.template_reads(chat_utils::TOOL_CHOICE_KEY))
+    {
         chat_utils::insert_tool_choice_kwarg(&mut kwargs, &ChatToolChoice::from(tool_choice));
     }
     if let Some(effort) = request.reasoning_effort {
@@ -231,8 +254,8 @@ fn process_messages_prompt(
     };
 
     let rendered = tokenizer
-        .apply_chat_template_with_encoding(
-            &transformed_messages,
+        .apply_chat_template_with_encoding_owned(
+            transformed_messages,
             params,
             assistant_prefix.as_deref(),
         )
@@ -300,10 +323,12 @@ pub(crate) struct MediaContext {
     pub(crate) tokenizer_source: String,
 }
 
-/// The 400 for media the request carries that cannot be prepared.
+/// The 400 for media the request carries that cannot be prepared, under the
+/// media stage's code (`MediaErrorCode::InvalidRequest`, the one the media
+/// pipeline answers media refused as the request sent it under).
 pub(crate) fn invalid_multimodal_request(error: impl Display) -> Response {
     error::bad_request(
-        "invalid_multimodal_request",
+        MediaErrorCode::InvalidRequest.as_str(),
         format!("Invalid multimodal request: {error}"),
     )
 }
@@ -317,6 +342,7 @@ pub(crate) async fn resolve_messages_media(
     tokenizer: &dyn Tokenizer,
     messages: &[InputMessage],
     record_media: bool,
+    has_tools: bool,
 ) -> Result<ResolvedMedia, Response> {
     resolve_media(
         components,
@@ -325,6 +351,7 @@ pub(crate) async fn resolve_messages_media(
         "resolve_messages_media",
         || multimodal::media_plan_messages(messages),
         record_media,
+        has_tools,
     )
     .await
 }
@@ -338,7 +365,10 @@ pub(crate) async fn resolve_messages_media(
 /// recorded all the same. The chat and Messages
 /// preparation stages and count_tokens resolve through here, so the three
 /// refuse a request alike; `stage` names the caller in the log lines, as
-/// each caller's own lines named it before.
+/// each caller's own lines named it before. `has_tools` picks the template
+/// the request renders through, as its renderer picks it: media of a model
+/// without a media spec is refused here when that template takes one string
+/// per message.
 pub(crate) async fn resolve_media(
     components: &SharedComponents,
     model_id: &str,
@@ -346,6 +376,7 @@ pub(crate) async fn resolve_media(
     stage: &'static str,
     plan: impl FnOnce() -> MediaPlan,
     record_media: bool,
+    has_tools: bool,
 ) -> Result<ResolvedMedia, Response> {
     // What a generation request carries, counted once and before any
     // refusal or limit (a refused request's media included); a token count
@@ -380,7 +411,16 @@ pub(crate) async fn resolve_media(
     // such a request and never schedules it), and no modality to a pool whose engines take none of
     // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,
     // on the declared parts, before any byte of media is fetched, decoded or sent.
-    multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
+    let router_processes = components
+        .multimodal
+        .as_ref()
+        .is_some_and(|mm_components| mm_components.processing == MmProcessingMode::Router);
+    multimodal::ensure_model_accepts_media(
+        &components.worker_registry,
+        model_id,
+        &plan,
+        router_processes,
+    )?;
     if plan.is_empty() {
         // A request without media renders the same under either order (its text parts in
         // their own order): the registries are not asked for a model with nothing to place.
@@ -392,28 +432,6 @@ pub(crate) async fn resolve_media(
     // The tokenizer's registry entry (its id and source) is read for the
     // media paths alone, which need the multimodal components; a gateway
     // without them looks nothing up.
-    let tokenizer_entry = components.multimodal.as_ref().and_then(|_| {
-        components
-            .tokenizer_registry
-            .get_by_name(model_id)
-            .or_else(|| components.tokenizer_registry.get_by_id(model_id))
-    });
-    // The media-part order comes from the model registry so every path
-    // renders a model consistently.
-    let media_order = match (components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
-        (Some(mm_components), Some(entry)) => {
-            multimodal::resolve_media_part_order(
-                model_id,
-                tokenizer,
-                mm_components,
-                &entry.id,
-                &entry.source,
-            )
-            .await
-        }
-        _ => MediaPartOrder::MediaFirst,
-    };
-
     let Some(mm_components) = components.multimodal.as_ref() else {
         error!(
             function = stage,
@@ -424,7 +442,13 @@ pub(crate) async fn resolve_media(
             "Multimodal content detected but multimodal processing is not available",
         ));
     };
-    let Some(entry) = tokenizer_entry else {
+    // Bound straight from the lookup: a named `Option` moved from here would
+    // keep its slot in this future beside `entry` across both awaits below.
+    let Some(entry) = components
+        .tokenizer_registry
+        .get_by_name(model_id)
+        .or_else(|| components.tokenizer_registry.get_by_id(model_id))
+    else {
         error!(
             function = stage,
             model = %model_id,
@@ -437,28 +461,74 @@ pub(crate) async fn resolve_media(
     };
 
     // The per-request media limits the model's workers advertise for their
-    // engine, which the plan is held to before any fetch.
-    let engine_limits = multimodal::engine_item_limits(&components.worker_registry, model_id);
-    let placeholders = multimodal::prepare_placeholder_tokens(
-        &plan,
+    // engine, which the plan is held to before any fetch. They live for the
+    // preparation only, not across the order lookup after it: this future is
+    // inlined into the route and stage futures boxed once per request, and its
+    // largest state is the one that holds the prepared placeholders.
+    let placeholders = {
+        let engine_limits = multimodal::engine_item_limits(&components.worker_registry, model_id);
+        multimodal::prepare_placeholder_tokens(
+            &plan,
+            model_id,
+            tokenizer,
+            mm_components,
+            &entry.id,
+            &entry.source,
+            &engine_limits,
+            |format| multimodal::fleet_reads_format(&components.worker_registry, model_id, format),
+        )
+        .await
+    }
+    .map_err(|e| {
+        // The chain, not the outermost context alone: a hub failure's cause
+        // (the file, the hub's answer, its address) is answered generically
+        // below and lives here.
+        error!(
+            function = stage,
+            model = %model_id,
+            error = %format!("{e:#}"),
+            "Failed to prepare the multimodal prompt plan"
+        );
+        multimodal::config_unavailable_response(&e).unwrap_or_else(|| invalid_multimodal_request(e))
+    })?;
+    // A model without a media spec is served where its template takes
+    // content parts and writes the engine's own placeholders. A template
+    // that takes one string per message leaves the anchors to the gateway,
+    // which knows none for this model: rendered, the prompt would carry no
+    // anchor for media the worker is still handed.
+    if placeholders.is_worker_only()
+        && tokenizer.chat_template_content_format_for_request(has_tools)
+            == ChatTemplateContentFormat::String
+    {
+        let modalities = plan
+            .modalities()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(error::bad_request(
+            "multimodal_not_supported",
+            format!(
+                "{modalities} input is not supported by model '{model_id}': its chat template \
+                 takes text content only and the gateway writes no media placeholder for this \
+                 model"
+            ),
+        ));
+    }
+    // The media-part order comes from the model registry so every path
+    // renders a model consistently. It is looked up after the placeholders,
+    // whose preparation resolved the model's configs and cached them, so the
+    // lookup is a cache hit and a request resolves the checkpoint once: looked
+    // up first, it would resolve on its own, fall back to media-first on a
+    // failure it does not report, and leave the preparation to resolve again.
+    let media_order = multimodal::resolve_media_part_order(
         model_id,
         tokenizer,
         mm_components,
         &entry.id,
         &entry.source,
-        &engine_limits,
-        |format| multimodal::fleet_reads_format(&components.worker_registry, model_id, format),
     )
-    .await
-    .map_err(|e| {
-        error!(
-            function = stage,
-            model = %model_id,
-            error = %e,
-            "Failed to prepare the multimodal prompt plan"
-        );
-        invalid_multimodal_request(e)
-    })?;
+    .await;
 
     Ok(ResolvedMedia {
         media_order,
@@ -547,7 +617,11 @@ fn process_message_content_format(
                     )?;
                 }
                 messages::Role::Assistant => {
-                    result.push(convert_assistant_message(&message.content, content_format));
+                    result.push(convert_assistant_message(
+                        index,
+                        &message.content,
+                        content_format,
+                    )?);
                 }
                 // A `system`-role message in `messages[]` (e.g. from Claude Code) is
                 // forwarded in place, preserving its position in the conversation so
@@ -657,6 +731,12 @@ fn convert_user_message(
                         user_parts
                             .extend(tool_result_image_blocks(tr).map(|_| json!({"type": "image"})));
                     }
+                    // An MCP exchange belongs to the MCP loop, which no engine
+                    // route runs: replayed here it is refused by name, as a
+                    // document this gateway cannot render is, never dropped.
+                    InputContentBlock::McpToolUse(_) | InputContentBlock::McpToolResult(_) => {
+                        return Err(mcp_block_refusal(block, index, position));
+                    }
                     _ => {}
                 }
             }
@@ -667,7 +747,7 @@ fn convert_user_message(
                     content_format,
                     placeholder_tokens,
                     media_order,
-                );
+                )?;
                 result.push(json!({"role": "user", "content": content}));
             }
             result.extend(tool_msgs);
@@ -679,13 +759,19 @@ fn convert_user_message(
 /// A document block as prompt text, so that any template reads it: the
 /// title and context the request gave, then the document's text, in the
 /// tagged layout the public API documents for documents in a prompt. Only
-/// text renders: a text source, or a content source made of text blocks. A
-/// PDF or URL source needs a document reader this gateway has no path for
-/// and is refused naming the block (`at`), not handed to the template.
+/// text renders: a text source, or a content source given as a string or
+/// made of text blocks. A PDF or URL source needs a document reader this
+/// gateway has no path for and is refused naming the block (`at`), not
+/// handed to the template.
 fn render_document(document: &messages::DocumentBlock, at: &str) -> Result<String, String> {
     let text = match &document.source {
-        messages::DocumentSource::Text { data } => data.as_str(),
-        messages::DocumentSource::Content { content } => {
+        messages::DocumentSource::Text { data }
+        | messages::DocumentSource::Content {
+            content: messages::DocumentContent::String(data),
+        } => data.as_str(),
+        messages::DocumentSource::Content {
+            content: messages::DocumentContent::Blocks(content),
+        } => {
             let mut texts = Vec::with_capacity(content.len());
             for block in content {
                 match block {
@@ -762,68 +848,84 @@ fn extract_tool_result_text(tool_result: &messages::ToolResultBlock) -> String {
     }
 }
 
+/// The refusal of a replayed MCP block (`mcp_tool_use`, `mcp_tool_result`)
+/// on an engine route, naming the block and its place. The exchange belongs
+/// to the MCP loop, which no engine route runs: the prompt cannot carry it
+/// faithfully, and dropping it in silence would answer without the call.
+fn mcp_block_refusal(block: &InputContentBlock, index: usize, position: usize) -> String {
+    let kind = match block {
+        InputContentBlock::McpToolResult(_) => "mcp_tool_result",
+        _ => "mcp_tool_use",
+    };
+    format!(
+        "messages.{index}.content.{position}: block type '{kind}' is not supported on an engine \
+         route, which runs no MCP loop; send the turn to a provider route or drop the exchange"
+    )
+}
+
 /// Convert an assistant message content to a single JSON value.
 ///
 /// Extracts text content, tool calls, and reasoning/thinking into the
-/// appropriate JSON fields that the chat template expects.
+/// appropriate JSON fields that the chat template expects. A replayed MCP
+/// block is refused by name (`mcp_block_refusal`).
 fn convert_assistant_message(
+    index: usize,
     content: &InputContent,
     content_format: ChatTemplateContentFormat,
-) -> Value {
-    match content {
-        InputContent::String(text) => json!({"role": "assistant", "content": text}),
-        InputContent::Blocks(blocks) => {
-            let (text_parts, tool_calls, thinking_parts) = blocks.iter().fold(
-                (
-                    Vec::<String>::new(),
-                    Vec::<Value>::new(),
-                    Vec::<String>::new(),
-                ),
-                |(mut texts, mut tools, mut thinking), block| {
-                    match block {
-                        InputContentBlock::Text(t) => texts.push(t.text.clone()),
-                        InputContentBlock::ToolUse(tu) => tools.push(json!({
-                            "id": tu.id,
-                            "type": "function",
-                            "function": {
-                                "name": tu.name,
-                                "arguments": serde_json::to_string(&tu.input)
-                                    .unwrap_or_else(|_| "{}".to_string())
-                            }
-                        })),
-                        InputContentBlock::Thinking(t) => thinking.push(t.thinking.clone()),
-                        _ => {}
-                    }
-                    (texts, tools, thinking)
-                },
-            );
-
-            let mut obj = serde_json::Map::new();
-            obj.insert("role".into(), Value::String("assistant".into()));
-
-            // With no text blocks (a tool-use-only turn) the content is the
-            // empty content the engine's chat utils hand a template in its
-            // format (`""` or `[]`), never null, which a template that tests
-            // or concatenates every assistant message's content cannot take.
-            let content = if text_parts.is_empty() {
-                chat_utils::empty_content(content_format)
-            } else {
-                Value::String(text_parts.join(""))
-            };
-            obj.insert("content".into(), content);
-            if !tool_calls.is_empty() {
-                obj.insert("tool_calls".into(), Value::Array(tool_calls));
+) -> Result<Value, String> {
+    let blocks = match content {
+        InputContent::String(text) => return Ok(json!({"role": "assistant", "content": text})),
+        InputContent::Blocks(blocks) => blocks,
+    };
+    let mut text_parts = Vec::<String>::new();
+    let mut tool_calls = Vec::<Value>::new();
+    let mut thinking_parts = Vec::<String>::new();
+    for (position, block) in blocks.iter().enumerate() {
+        match block {
+            InputContentBlock::Text(t) => text_parts.push(t.text.clone()),
+            InputContentBlock::ToolUse(tu) => tool_calls.push(json!({
+                "id": tu.id,
+                "type": "function",
+                "function": {
+                    "name": tu.name,
+                    "arguments": serde_json::to_string(&tu.input)
+                        .unwrap_or_else(|_| "{}".to_string())
+                }
+            })),
+            InputContentBlock::Thinking(t) => thinking_parts.push(t.thinking.clone()),
+            // The exchange the public API puts in the assistant turn:
+            // refused by name, never dropped from the prompt.
+            InputContentBlock::McpToolUse(_) | InputContentBlock::McpToolResult(_) => {
+                return Err(mcp_block_refusal(block, index, position));
             }
-            if !thinking_parts.is_empty() {
-                obj.insert(
-                    "reasoning_content".into(),
-                    Value::String(thinking_parts.join("\n")),
-                );
-            }
-
-            Value::Object(obj)
+            _ => {}
         }
     }
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("role".into(), Value::String("assistant".into()));
+
+    // With no text blocks (a tool-use-only turn) the content is the
+    // empty content the engine's chat utils hand a template in its
+    // format (`""` or `[]`), never null, which a template that tests
+    // or concatenates every assistant message's content cannot take.
+    let content = if text_parts.is_empty() {
+        chat_utils::empty_content(content_format)
+    } else {
+        Value::String(text_parts.join(""))
+    };
+    obj.insert("content".into(), content);
+    if !tool_calls.is_empty() {
+        obj.insert("tool_calls".into(), Value::Array(tool_calls));
+    }
+    if !thinking_parts.is_empty() {
+        obj.insert(
+            "reasoning_content".into(),
+            Value::String(thinking_parts.join("\n")),
+        );
+    }
+
+    Ok(Value::Object(obj))
 }
 
 /// Format content parts based on the template's content format preference.
@@ -838,28 +940,40 @@ fn format_content_parts(
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
-) -> Value {
-    let image_placeholder = placeholder_tokens.and_then(|tokens| tokens.get(Modality::Image));
+) -> Result<Value, String> {
     match content_format {
         ChatTemplateContentFormat::String => {
             let ordered = order_media_parts(parts, media_order);
-            // Extract text parts; optionally replace image parts with placeholders
+            // Text parts as they are, an image part as its placeholder. An
+            // image the placeholders hold no token for is refused, as the
+            // chat renderer refuses it: left out, the prompt would carry no
+            // anchor for media that still travels with the request. A caller
+            // without model metadata passes no placeholders and its media
+            // parts are left out.
             let text: String = ordered
                 .iter()
                 .filter_map(|p| {
                     let obj = p.as_object()?;
                     let type_str = obj.get("type")?.as_str()?;
                     match type_str {
-                        "text" => obj.get("text")?.as_str().map(String::from),
-                        "image" => image_placeholder.map(String::from),
+                        "text" => obj.get("text")?.as_str().map(|text| Ok(String::from(text))),
+                        "image" => placeholder_tokens.map(|tokens| {
+                            tokens
+                                .get(Modality::Image)
+                                .map(String::from)
+                                .ok_or_else(|| {
+                                    "missing image placeholder for string-format chat template"
+                                        .to_owned()
+                                })
+                        }),
                         _ => None,
                     }
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, String>>()?
                 .join("\n");
-            Value::String(text)
+            Ok(Value::String(text))
         }
-        ChatTemplateContentFormat::OpenAI => Value::Array(parts),
+        ChatTemplateContentFormat::OpenAI => Ok(Value::Array(parts)),
     }
 }
 
@@ -1133,11 +1247,17 @@ mod tests {
             ]
         }))
         .unwrap();
-        let rendered =
-            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
-                .unwrap()
-                .0
-                .text;
+        let rendered = process_messages(
+            &request,
+            &tokenizer,
+            None,
+            None,
+            MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
+        )
+        .unwrap()
+        .0
+        .text;
         assert_eq!(
             rendered,
             "<|user|>What is the weather in Paris?<|end|><|assistant|><call:get_weather><|end|>\
@@ -1161,7 +1281,7 @@ mod tests {
                 InputContentBlock::Image(messages::ImageBlock {
                     source: messages::ImageSource::Base64 {
                         media_type: "image/png".to_string(),
-                        data: "AAAA".to_string(),
+                        data: "AAAA".to_string().into(),
                     },
                     cache_control: None,
                 }),
@@ -1261,10 +1381,17 @@ mod tests {
                 "messages": [{"role": "user", "content": blocks}]
             }))
             .unwrap();
-            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
-                .unwrap()
-                .0
-                .text
+            process_messages(
+                &request,
+                &tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
+            )
+            .unwrap()
+            .0
+            .text
         };
         let turn =
             |body: &str| format!("<|turn|>user<|body|>{body}<|end|><|turn|>assistant<|body|>");
@@ -1466,7 +1593,7 @@ mod tests {
                         messages::ToolResultContentBlock::Image(messages::ImageBlock {
                             source: messages::ImageSource::Base64 {
                                 media_type: "image/png".to_string(),
-                                data: "AAAA".to_string(),
+                                data: "AAAA".to_string().into(),
                             },
                             cache_control: None,
                         }),
@@ -1585,6 +1712,30 @@ mod tests {
         );
     }
 
+    /// A content source given as a string renders as the document's text, as
+    /// a text source does.
+    #[test]
+    fn a_content_document_given_as_a_string_renders_its_text() {
+        let messages = document(
+            messages::DocumentSource::Content {
+                content: messages::DocumentContent::String("The whole text.".to_string()),
+            },
+            None,
+            None,
+        );
+        let parts = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap();
+        assert_eq!(
+            parts[0]["content"][0]["text"],
+            "<document>\n<document_content>\nThe whole text.\n</document_content>\n</document>"
+        );
+    }
+
     /// A content-source document joins its text blocks; one holding anything
     /// else is refused naming the block.
     #[test]
@@ -1598,7 +1749,10 @@ mod tests {
         };
         let messages = document(
             messages::DocumentSource::Content {
-                content: vec![text("First paragraph."), text("Second paragraph.")],
+                content: messages::DocumentContent::Blocks(vec![
+                    text("First paragraph."),
+                    text("Second paragraph."),
+                ]),
             },
             None,
             None,
@@ -1617,13 +1771,15 @@ mod tests {
 
         let messages = document(
             messages::DocumentSource::Content {
-                content: vec![InputContentBlock::Image(messages::ImageBlock {
-                    source: messages::ImageSource::Base64 {
-                        media_type: "image/png".to_string(),
-                        data: "AAAA".to_string(),
+                content: messages::DocumentContent::Blocks(vec![InputContentBlock::Image(
+                    messages::ImageBlock {
+                        source: messages::ImageSource::Base64 {
+                            media_type: "image/png".to_string(),
+                            data: "AAAA".to_string().into(),
+                        },
+                        cache_control: None,
                     },
-                    cache_control: None,
-                })],
+                )]),
             },
             None,
             None,
@@ -1854,6 +2010,7 @@ mod tests {
             Some(&*tools),
             None,
             MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
         )
         .expect("render");
         let text = &processed.text;
@@ -1871,6 +2028,107 @@ mod tests {
             declaration < user && user < forbids,
             "declaration at {declaration}, user turn at {user}, instruction at {forbids}"
         );
+    }
+
+    /// The media resolution of one image for model "m", which has no media
+    /// spec, where a worker would process the media, through a template of
+    /// `format`.
+    async fn resolve_image_without_a_spec(
+        format: ChatTemplateContentFormat,
+    ) -> Result<ResolvedMedia, Response> {
+        use llm_tokenizer::mock::MockTokenizer;
+
+        use crate::routers::grpc::regular::stages::testing::components_forwarding_media_of;
+
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(MockTokenizer::new().with_content_format(format));
+        let (_dir, components) = components_forwarding_media_of("m", Arc::clone(&tokenizer)).await;
+        resolve_media(
+            &components,
+            "m",
+            &*tokenizer,
+            "test",
+            || {
+                MediaPlan::new([llm_multimodal::MediaContentPart::ImageUrl {
+                    url: "https://a/1.png".to_string().into(),
+                    detail: None,
+                    uuid: None,
+                    max_long_side_pixel: None,
+                }])
+            },
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// Media of a model without a media spec is refused before rendering
+    /// when its template takes one string per message, with the capability
+    /// code and a sentence naming the modality and the model: neither the
+    /// template nor the gateway would write an anchor for it. A template
+    /// that takes content parts writes the engine's own placeholders, and
+    /// the request goes on to a worker that processes its media.
+    #[tokio::test]
+    async fn media_nothing_would_anchor_is_refused_before_rendering() {
+        let Err(refused) = resolve_image_without_a_spec(ChatTemplateContentFormat::String).await
+        else {
+            panic!("an image that nothing would anchor in the prompt is refused");
+        };
+        assert_eq!(refused.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            refused
+                .headers()
+                .get("x-smg-error-code")
+                .and_then(|code| code.to_str().ok()),
+            Some("multimodal_not_supported")
+        );
+        let body = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["error"]["message"],
+            "image input is not supported by model 'm': its chat template takes text content \
+             only and the gateway writes no media placeholder for this model"
+        );
+
+        let Ok(served) = resolve_image_without_a_spec(ChatTemplateContentFormat::OpenAI).await
+        else {
+            panic!("a template that takes content parts writes the anchor itself");
+        };
+        assert!(served
+            .placeholders()
+            .is_some_and(PlaceholderTokens::is_worker_only));
+    }
+
+    /// An image block the string format has no placeholder to write for is
+    /// refused, as the chat renderer refuses it, never dropped from a prompt
+    /// whose media still travels. A caller without model metadata passes no
+    /// placeholders, and its media parts are left out as before.
+    #[test]
+    fn an_image_block_with_no_placeholder_is_refused_not_dropped() {
+        let messages: Vec<InputMessage> = serde_json::from_value(json!([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "question"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+            ]
+        }]))
+        .unwrap();
+        let render = |placeholders: Option<&PlaceholderTokens>| {
+            process_message_content_format(
+                &messages,
+                ChatTemplateContentFormat::String,
+                placeholders,
+                MediaPartOrder::MediaFirst,
+            )
+        };
+
+        assert_eq!(
+            render(Some(&PlaceholderTokens::worker_only())).unwrap_err(),
+            "missing image placeholder for string-format chat template"
+        );
+        assert_eq!(render(None).unwrap()[0]["content"], "question");
     }
 
     /// With a string-format template an image is the placeholder the model's
@@ -1990,10 +2248,17 @@ mod tests {
     }
 
     fn render(request: &CreateMessageRequest, tokenizer: &dyn Tokenizer) -> String {
-        process_messages(request, tokenizer, None, None, MediaPartOrder::MediaFirst)
-            .unwrap()
-            .0
-            .text
+        process_messages(
+            request,
+            tokenizer,
+            None,
+            None,
+            MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
+        )
+        .unwrap()
+        .0
+        .text
     }
 
     /// A trailing assistant message with text is a prefill: a Jinja template
@@ -2323,12 +2588,14 @@ mod tests {
             )
             .unwrap();
         let rendered = |output_config| {
+            let request = request(output_config);
             process_messages(
-                &request(output_config),
+                &request,
                 &tokenizer,
                 None,
                 None,
                 MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
             )
             .unwrap()
             .0
@@ -2377,11 +2644,17 @@ mod tests {
                 "messages": [{"role": "user", "content": "Hello"}]
             }))
             .unwrap();
-            let rendered =
-                process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
-                    .unwrap()
-                    .0
-                    .text;
+            let rendered = process_messages(
+                &request,
+                &tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
+            )
+            .unwrap()
+            .0
+            .text;
             assert_eq!(rendered, format!("user: Hello\nassistant: {prompt_end}"));
             assert_eq!(
                 messages_reasoning_starts_in_prefill(&request, false, &tokenizer),
@@ -2414,12 +2687,67 @@ mod tests {
                 "messages": [{"role": "user", "content": "Hello"}]
             }))
             .unwrap();
-            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
-                .unwrap()
-                .0
-                .text
+            process_messages(
+                &request,
+                &tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
+            )
+            .unwrap()
+            .0
+            .text
         };
         assert_eq!(rendered("none"), "user: Hello thinking=False");
         assert_eq!(rendered("high"), "user: Hello thinking=unset");
+    }
+
+    /// A replayed MCP exchange (`mcp_tool_use`, `mcp_tool_result`) is refused
+    /// on the engine routes naming the block and its place, in the assistant
+    /// turn the public API puts it in and in a user turn alike: the engine
+    /// runs no MCP loop, and a silent drop would answer without the call.
+    #[test]
+    fn a_replayed_mcp_exchange_is_refused_naming_the_block() {
+        let convert = |messages: &[InputMessage]| {
+            process_message_content_format(
+                messages,
+                ChatTemplateContentFormat::String,
+                None,
+                MediaPartOrder::MediaFirst,
+            )
+            .unwrap_err()
+        };
+        let assistant: Vec<InputMessage> = serde_json::from_value(json!([
+            {"role": "user", "content": "look it up"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "Looking."},
+                {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
+                {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}]},
+                {"type": "text", "text": "it is 42"}
+            ]}
+        ]))
+        .unwrap();
+        let err = convert(&assistant);
+        assert!(
+            err.starts_with(
+                "messages.1.content.1: block type 'mcp_tool_use' is not supported on an engine route"
+            ),
+            "{err}"
+        );
+        let user: Vec<InputMessage> = serde_json::from_value(json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "the result:"},
+                {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}]}
+            ]}
+        ]))
+        .unwrap();
+        let err = convert(&user);
+        assert!(
+            err.starts_with(
+                "messages.0.content.1: block type 'mcp_tool_result' is not supported on an engine route"
+            ),
+            "{err}"
+        );
     }
 }

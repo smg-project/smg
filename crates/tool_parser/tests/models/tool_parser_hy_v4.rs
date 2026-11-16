@@ -387,7 +387,10 @@ async fn hy4_eof_after_call_does_not_leak_partial_group_closer() {
 #[expect(clippy::unwrap_used, reason = "literal test fixture must deserialize")]
 fn constraint_tools() -> Vec<Tool> {
     let mut tools = tools();
-    let parameters = &mut tools[0].function.parameters;
+    let parameters = tools[0]
+        .function
+        .parameters
+        .get_or_insert_with(|| json!({"type": "object"}));
     parameters["required"] = json!(["count"]);
     parameters["additionalProperties"] = json!(false);
     parameters["properties"]["items"] = json!({"type": "array", "items": {"type": "integer"}});
@@ -432,7 +435,7 @@ fn hy4_structural_tag_uses_glm_xml_arguments() {
                     "begin": format!("<tool_call>{}", tool.function.name),
                     "content": {
                         "type": "json_schema",
-                        "json_schema": tool.function.parameters,
+                        "json_schema": tool.function.parameters_schema(),
                         "style": "glm_xml",
                     },
                     "end": "</tool_call>",

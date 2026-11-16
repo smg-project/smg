@@ -29,7 +29,7 @@ async fn collect_score(
     question: &DecisionQuestionSpec,
 ) -> Result<(Vec<f64>, u64, u64), Response> {
     let labels = &question.label_ids;
-    let ExecutionResult::Single { mut stream } = result else {
+    let ExecutionResult::Single { mut stream, .. } = result else {
         return Err(invalid("Expected a single scoring stream per question"));
     };
     let mut complete = None;

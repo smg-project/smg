@@ -17,7 +17,7 @@
 use std::{cmp::Reverse, collections::BTreeMap, sync::Arc, time::Duration};
 
 use parking_lot::RwLock;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::{
     engine::{EngineHandle, LwwEngine, RateLimitEngine},
@@ -248,7 +248,7 @@ impl CrdtOrMap {
     /// canonicalise (merge → compact → apply) internally, so dominated ops
     /// in the incoming batch never reach live state.
     pub fn merge(&self, log: &OperationLog) -> Vec<CrdtChange> {
-        info!(
+        debug!(
             "Merging {} operations into replica {}",
             log.len(),
             self.replica_id

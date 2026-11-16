@@ -180,9 +180,10 @@ pub struct SchedulerSettings {
     /// Per-tenant clamp lookup. Keys come from
     /// [`crate::tenant::RouteRequestMeta::tenant_key`].
     pub tenant_policies: HashMap<TenantKey, TenantPolicyConfig>,
-    /// Cap on the number of tenants emitted as labels for
-    /// `scheduler_tenant_*` gauges. Everything past the cap is
-    /// bucketed under `tenant="other"`.
+    /// Cap on the distinct tenants the scheduler's tenant-labelled counters
+    /// (`smg_scheduler_clamp_total`, `smg_scheduler_unknown_priority_value_total`)
+    /// keep as series of their own: the first tenant keys up to the cap keep
+    /// theirs, everything past the cap is bucketed under `tenant="other"`.
     pub tenant_metric_top_n: u32,
 }
 

@@ -1,5 +1,6 @@
 use std::{
     fs,
+    path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
         Arc,
@@ -7,10 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axum::{http::StatusCode, response::IntoResponse};
 use http::header::{HeaderValue, RETRY_AFTER};
 use llm_tokenizer::factory;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
-use portpicker::pick_unused_port;
 use serde_json::json;
 use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -19,13 +20,20 @@ use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
 use super::*;
 use crate::{
-    config::{ParserChoice, RoutingMode},
+    config::{
+        test_support::{epd_routing_mode, pd_routing_mode, regular_routing_mode},
+        GroupedDpSticky, ParserChoice, RoutingMode,
+    },
     rate_limit::{
         RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle, UsageSettlement,
     },
     routers::grpc::{
         common::stages::RateLimitOutcome,
-        testing::{grpc_config, grpc_ctx, grpc_ctx_from, grpc_ctx_with_parsers, mcp_orchestrator},
+        test_engine::serve_on_loopback,
+        testing::{
+            grpc_config, grpc_ctx, grpc_ctx_from, grpc_ctx_over_stores, grpc_ctx_with_parsers,
+            mcp_orchestrator, unreadable_model_dir,
+        },
     },
     tenant::TenantKey,
     worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType},
@@ -35,32 +43,6 @@ use crate::{
         WorkerWorkflowData, WorkflowEngines,
     },
 };
-
-fn regular_routing_mode() -> RoutingMode {
-    RoutingMode::Regular {
-        worker_urls: vec![],
-    }
-}
-
-fn pd_routing_mode() -> RoutingMode {
-    RoutingMode::PrefillDecode {
-        prefill_urls: vec![],
-        decode_urls: vec![],
-        prefill_policy: None,
-        decode_policy: None,
-    }
-}
-
-fn epd_routing_mode() -> RoutingMode {
-    RoutingMode::EncodePrefillDecode {
-        encode_urls: vec![],
-        prefill_urls: vec![],
-        decode_urls: vec![],
-        encode_policy: None,
-        prefill_policy: None,
-        decode_policy: None,
-    }
-}
 
 /// A mode that does not serve an endpoint refuses it with the JSON error
 /// object under the endpoint's code, as the router trait's default does.
@@ -151,6 +133,40 @@ async fn the_attempt_deadline_is_armed_only_by_grpc_request_timeout_secs() {
     }
 }
 
+/// `--grouped-dp-sticky` reaches every pipeline a regular or PD router
+/// builds, so a sticky request is pinned alike on every endpoint (a PD one
+/// through its bootstrap room): off by default, and the configured placement
+/// when the configuration names one.
+#[tokio::test]
+async fn the_grouped_dp_pinning_reaches_every_pipeline() {
+    let mcp_orchestrator = mcp_orchestrator().await;
+    for mode in [Mode::Regular, Mode::PrefillDecode] {
+        let config = grpc_config(routing_mode(mode)).build_unchecked();
+        let ctx = grpc_ctx_from(&config, Arc::clone(&mcp_orchestrator));
+        let router = GrpcRouter::new(&ctx, mode).expect("router");
+        for pipeline in pipelines_of(&router) {
+            assert_eq!(
+                pipeline.grouped_dp_sticky(),
+                GroupedDpSticky::Off,
+                "{mode:?}"
+            );
+        }
+
+        let config = grpc_config(routing_mode(mode))
+            .grouped_dp_sticky(GroupedDpSticky::Hash)
+            .build_unchecked();
+        let ctx = grpc_ctx_from(&config, Arc::clone(&mcp_orchestrator));
+        let router = GrpcRouter::new(&ctx, mode).expect("router");
+        for pipeline in pipelines_of(&router) {
+            assert_eq!(
+                pipeline.grouped_dp_sticky(),
+                GroupedDpSticky::Hash,
+                "{mode:?}"
+            );
+        }
+    }
+}
+
 /// Every pipeline `router` built: the three of every mode and the optional
 /// ones its mode serves.
 fn pipelines_of(router: &GrpcRouter) -> Vec<&RequestPipeline> {
@@ -186,7 +202,7 @@ fn count_request(model: &str) -> CountMessageTokensRequest {
 /// model_not_found for a model nobody serves. No worker takes part.
 #[tokio::test]
 async fn count_tokens_is_answered_from_the_tokenizer() {
-    let (_ctx, router) = regular_router_over_m(None).await;
+    let (_ctx, router) = regular_router_over_m(None, None).await;
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
     let response = router
@@ -216,9 +232,10 @@ async fn count_tokens_is_answered_from_the_tokenizer() {
 /// capability matrix is refused with the sentence `/v1/messages` gives,
 /// instead of counted, before any media is fetched; to an engine that
 /// takes images the count goes on into media resolution (here, to the
-/// config lookup the mock tokenizer cannot satisfy).
+/// config lookup the test's model directory cannot satisfy).
 #[tokio::test]
 async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
+    let model_dir = unreadable_model_dir();
     for (runtime, code, message) in [
         (
             RuntimeType::Mlx,
@@ -227,7 +244,7 @@ async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
         ),
         (RuntimeType::Sglang, "invalid_multimodal_request", None),
     ] {
-        let (_ctx, router) = regular_router_over_m(Some(runtime)).await;
+        let (_ctx, router) = regular_router_over_m(Some(runtime), Some(model_dir.path())).await;
         let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         let request: CountMessageTokensRequest = serde_json::from_value(json!({
             "model": "m",
@@ -256,6 +273,75 @@ async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
         assert_eq!(body["error"]["code"], code, "{runtime}: {body}");
         if let Some(message) = message {
             assert_eq!(body["error"]["message"], message, "{runtime}: {body}");
+        }
+    }
+}
+
+/// count_tokens judges media of a model without a media spec by the template
+/// the count renders through, as `/v1/messages` does: the one for requests
+/// with tools when the request declares tools, the default one otherwise.
+#[tokio::test]
+async fn count_tokens_media_without_a_spec_is_judged_by_the_template_the_count_renders_through() {
+    use llm_tokenizer::{chat_template::ChatTemplateContentFormat, mock::MockTokenizer};
+
+    use crate::routers::grpc::regular::stages::testing::components_forwarding_media_of;
+
+    let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+    for (default, with_tools) in [
+        (
+            ChatTemplateContentFormat::String,
+            ChatTemplateContentFormat::OpenAI,
+        ),
+        (
+            ChatTemplateContentFormat::OpenAI,
+            ChatTemplateContentFormat::String,
+        ),
+    ] {
+        let tokenizer = MockTokenizer::new()
+            .with_deferred_chat_ids(vec![11, 12, 13])
+            .with_content_format(default)
+            .with_tool_content_format(with_tools);
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        ctx.worker_registry
+            .register(grpc_worker_for_m_on(None))
+            .expect("register worker");
+        let mut router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let (_dir, components) = components_forwarding_media_of("m", Arc::new(tokenizer)).await;
+        router.shared_components = components;
+        for (declares_tools, format) in [(true, with_tools), (false, default)] {
+            let mut body = json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "What colour is this pixel?"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                    }}
+                ]}]
+            });
+            if declares_tools {
+                body["tools"] = json!([{
+                    "name": "lookup", "description": "Look a thing up",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]);
+            }
+            let request: CountMessageTokensRequest =
+                serde_json::from_value(body).expect("count request");
+            let response = router
+                .route_messages_count_tokens(None, &tenant_meta, request, "m")
+                .await;
+            if format == ChatTemplateContentFormat::String {
+                assert_eq!(
+                    error::extract_error_code_from_response(&response),
+                    "multimodal_not_supported",
+                    "declares tools: {declares_tools}"
+                );
+            } else {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "declares tools: {declares_tools}"
+                );
+            }
         }
     }
 }
@@ -339,14 +425,20 @@ fn grpc_worker_for_m_on(runtime: Option<RuntimeType>) -> Arc<BasicWorker> {
 /// A regular gRPC router over one local worker of model `m`, whose
 /// tokenizer is the mock that answers three ids: the context the count and
 /// Messages tests share. `runtime` names the worker's engine when a test's
-/// claim depends on it.
-async fn regular_router_over_m(runtime: Option<RuntimeType>) -> (Arc<AppContext>, GrpcRouter) {
+/// claim depends on it; `model_dir` is the tokenizer's source for a test
+/// whose request carries media, so the model's config lookup stays on this
+/// disk.
+async fn regular_router_over_m(
+    runtime: Option<RuntimeType>,
+    model_dir: Option<&Path>,
+) -> (Arc<AppContext>, GrpcRouter) {
     let ctx = grpc_ctx(regular_routing_mode()).await;
+    let source = model_dir.map_or("mock", |dir| dir.to_str().expect("utf-8 path"));
     let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
         llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
     );
     ctx.tokenizer_registry
-        .load("m", "m", "mock", || async move { Ok(tokenizer) })
+        .load("m", "m", source, || async move { Ok(tokenizer) })
         .await
         .expect("register the tokenizer");
     ctx.worker_registry
@@ -422,12 +514,15 @@ async fn count_tokens_answers_load_failed_without_retry_after_for_a_worker_witho
 /// A one-token tokenizer (`hello`), enough for a count.
 const MINIMAL_TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}"#;
 
-/// A tokenizer registered after a failed load clears the failure: here a
-/// worker re-registering with a usable path (an operator's
-/// `POST /v1/tokenizers` takes the same job), after which the model
-/// answers again.
-#[tokio::test]
-async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
+/// A regular router over the worker of `m` under a context with a job queue
+/// and workflow engines, what a tokenizer job needs, and a tenant for its
+/// requests.
+async fn router_with_a_job_queue() -> (
+    Arc<AppContext>,
+    Arc<BasicWorker>,
+    GrpcRouter,
+    TenantRequestMeta,
+) {
     let ctx = grpc_ctx(regular_routing_mode()).await;
     ctx.worker_job_queue
         .set(JobQueue::new(
@@ -444,6 +539,33 @@ async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
         .expect("register worker");
     let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+    (ctx, worker, router, tenant_meta)
+}
+
+/// A directory holding the one-token tokenizer and a chat template, as a
+/// worker's `tokenizer_path` would.
+fn hello_tokenizer_dir() -> tempfile::TempDir {
+    let tokenizer_dir = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        tokenizer_dir.path().join("tokenizer.json"),
+        MINIMAL_TOKENIZER_JSON,
+    )
+    .expect("tokenizer.json");
+    fs::write(
+        tokenizer_dir.path().join("tokenizer_config.json"),
+        r#"{"chat_template": "hello"}"#,
+    )
+    .expect("tokenizer_config.json");
+    tokenizer_dir
+}
+
+/// A tokenizer registered after a failed load clears the failure: here a
+/// worker re-registering with a usable path (an operator's
+/// `POST /v1/tokenizers` takes the same job), after which the model
+/// answers again.
+#[tokio::test]
+async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
+    let (ctx, worker, router, tenant_meta) = router_with_a_job_queue().await;
     assert!(ctx.tokenizer_load_failures.record(
         "m",
         TokenizerLoadFailure::Failed("Workflow failed at step load_tokenizer: boom".to_string())
@@ -460,17 +582,7 @@ async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
     assert!(response.headers().get(RETRY_AFTER).is_none());
 
     // The worker registers again, this time with a tokenizer to load.
-    let tokenizer_dir = tempfile::tempdir().expect("tempdir");
-    fs::write(
-        tokenizer_dir.path().join("tokenizer.json"),
-        MINIMAL_TOKENIZER_JSON,
-    )
-    .expect("tokenizer.json");
-    fs::write(
-        tokenizer_dir.path().join("tokenizer_config.json"),
-        r#"{"chat_template": "hello"}"#,
-    )
-    .expect("tokenizer_config.json");
+    let tokenizer_dir = hello_tokenizer_dir();
     let path = tokenizer_dir.path().to_str().expect("utf-8 path");
     let mut step = tokenizer_step_input(&ctx, &worker, &[("tokenizer_path", path)]);
     SubmitTokenizerJobStep
@@ -484,6 +596,17 @@ async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
         assert!(Instant::now() < deadline, "the tokenizer did not register");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    // The entry the step's load registered is the worker's: the release
+    // step takes it with the model's last worker.
+    let id = ctx
+        .tokenizer_registry
+        .get_by_name("m")
+        .expect("registered")
+        .id;
+    assert!(
+        ctx.worker_loaded_tokenizers.contains(&id),
+        "the entry a worker's registration loaded is the worker's"
+    );
 
     let response = router
         .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
@@ -499,33 +622,8 @@ async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
 /// answers once A's load ends.
 #[tokio::test]
 async fn a_registration_without_a_path_defers_to_the_models_load_in_flight() {
-    let ctx = grpc_ctx(regular_routing_mode()).await;
-    ctx.worker_job_queue
-        .set(JobQueue::new(
-            JobQueueConfig::default(),
-            Arc::downgrade(&ctx),
-        ))
-        .ok();
-    ctx.workflow_engines
-        .set(WorkflowEngines::new(&ctx.router_config))
-        .ok();
-    let worker = grpc_worker_for_m();
-    ctx.worker_registry
-        .register(worker.clone())
-        .expect("register worker");
-    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
-    let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
-    let tokenizer_dir = tempfile::tempdir().expect("tempdir");
-    fs::write(
-        tokenizer_dir.path().join("tokenizer.json"),
-        MINIMAL_TOKENIZER_JSON,
-    )
-    .expect("tokenizer.json");
-    fs::write(
-        tokenizer_dir.path().join("tokenizer_config.json"),
-        r#"{"chat_template": "hello"}"#,
-    )
-    .expect("tokenizer_config.json");
+    let (ctx, worker, router, tenant_meta) = router_with_a_job_queue().await;
+    let tokenizer_dir = hello_tokenizer_dir();
     let path = tokenizer_dir
         .path()
         .to_str()
@@ -611,7 +709,7 @@ fn sse_event(frame: &str, name: &str) -> serde_json::Value {
 /// context window the model's workers advertise is the pipeline's 400.
 #[tokio::test]
 async fn max_tokens_zero_is_answered_with_an_empty_message() {
-    let (ctx, router) = regular_router_over_m(None).await;
+    let (ctx, router) = regular_router_over_m(None, None).await;
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
     let body = json!({
         "model": "m", "max_tokens": 0,
@@ -823,7 +921,7 @@ struct ClosingBackend {
 
 #[async_trait]
 impl RateLimitBackend for ClosingBackend {
-    async fn reserve(&self, _request: ReserveRequest) -> ReserveOutcome {
+    async fn reserve(&self, _request: ReserveRequest<'_>) -> ReserveOutcome {
         ReserveOutcome::Admitted
     }
     async fn settle_success(&self, _request_charge_id: Uuid, _usage: UsageSettlement) {}
@@ -998,6 +1096,34 @@ async fn epd_router_501s_responses_and_cancel() {
 #[tokio::test]
 async fn responses_request_is_canonical_before_the_responses_layer_sees_it() {
     let ctx = grpc_ctx(pd_routing_mode()).await;
+    register_aliased_pd_workers(&ctx.worker_registry);
+
+    let mut request = responses_request("model-alias");
+    let model_id =
+        canonicalize_responses_request(&ctx.worker_registry, &mut request, "model-alias");
+    assert_eq!(
+        request.model, "canonical-model",
+        "the Responses layer must see the canonical model ID"
+    );
+    assert_eq!(
+        model_id, "canonical-model",
+        "worker selection must use the canonical model ID"
+    );
+
+    // The canonical ID is left alone, and costs no copy.
+    let mut already_canonical = responses_request("canonical-model");
+    let model_id = canonicalize_responses_request(
+        &ctx.worker_registry,
+        &mut already_canonical,
+        "canonical-model",
+    );
+    assert_eq!(already_canonical.model, "canonical-model");
+    assert!(matches!(model_id, Cow::Borrowed(_)));
+}
+
+/// A prefill and a decode worker serving `canonical-model` under the alias
+/// `model-alias`.
+fn register_aliased_pd_workers(registry: &WorkerRegistry) {
     for (url, worker_type) in [
         ("grpc://prefill:30000", WorkerType::Prefill),
         ("grpc://decode:30000", WorkerType::Decode),
@@ -1011,29 +1137,84 @@ async fn responses_request_is_canonical_before_the_responses_layer_sees_it() {
                 ..Default::default()
             })
             .build();
-        ctx.worker_registry
+        registry
             .register(Arc::new(worker))
             .expect("register worker");
     }
+}
 
-    let request = responses_request("model-alias");
-    let (body, model_id) =
-        canonicalize_responses_request(&ctx.worker_registry, &request, "model-alias");
+/// The helper rewrites the model id on the request it is given: the request's
+/// instructions buffer keeps its address across the call, under an alias and
+/// under the canonical id alike. This pins the helper alone; the caller's copy
+/// of the previous tree (an `into_owned` of a borrowed body) is gone with the
+/// body `Cow` itself, which the signature no longer returns.
+#[tokio::test]
+async fn canonicalisation_rewrites_the_owned_request_in_place() {
+    let ctx = grpc_ctx(pd_routing_mode()).await;
+    register_aliased_pd_workers(&ctx.worker_registry);
+    for model in ["model-alias", "canonical-model"] {
+        let mut request = responses_request(model);
+        request.instructions = Some("the buffer whose address the pin follows".to_string());
+        let before = request
+            .instructions
+            .as_deref()
+            .expect("instructions")
+            .as_ptr();
+        canonicalize_responses_request(&ctx.worker_registry, &mut request, model);
+        let after = request
+            .instructions
+            .as_deref()
+            .expect("instructions")
+            .as_ptr();
+        assert!(
+            std::ptr::eq(before, after),
+            "the request sent as {model} was copied to rewrite its model id"
+        );
+    }
+}
+
+/// No engine behind this router applies the reasoning config's `mode`,
+/// `context` or `generate_summary`, so the router clears them before the
+/// Responses layer reads the request. That layer echoes the config into
+/// every Response object: the non-streamed body and the stored object
+/// through the response builder, the streamed terminal event as the
+/// request's config is. Each then says `effort` and `summary`, what ran,
+/// and a `pro` request does not read back as run in `pro` mode.
+#[test]
+fn the_responses_layer_sees_no_reasoning_mode_context_or_generate_summary() {
+    let mut request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "m",
+        "input": "think it through",
+        "reasoning": {
+            "effort": "high",
+            "summary": "concise",
+            "mode": "pro",
+            "context": "all_turns",
+            "generate_summary": "detailed"
+        }
+    }))
+    .expect("responses request");
+    clear_unapplied_reasoning_keys(&mut request);
+
+    let applied = json!({"effort": "high", "summary": "concise"});
+    let built = openai_protocol::responses::ResponsesResponse::builder("resp_1", "m")
+        .copy_from_request(&request)
+        .build();
     assert_eq!(
-        body.model, "canonical-model",
-        "the Responses layer must see the canonical model ID"
+        serde_json::to_value(&built).expect("serialize the response")["reasoning"],
+        applied,
+        "the non-streamed and stored objects"
     );
     assert_eq!(
-        model_id, "canonical-model",
-        "worker selection must use the canonical model ID"
+        serde_json::to_value(&request.reasoning).expect("serialize the config"),
+        applied,
+        "the streamed terminal event"
     );
 
-    // The canonical ID is left alone, and costs no copy.
-    let already_canonical = responses_request("canonical-model");
-    let (body, model_id) =
-        canonicalize_responses_request(&ctx.worker_registry, &already_canonical, "canonical-model");
-    assert!(matches!(body, Cow::Borrowed(_)));
-    assert!(matches!(model_id, Cow::Borrowed(_)));
+    // A request without a reasoning config is left without one.
+    let mut bare = responses_request("m");
+    clear_unapplied_reasoning_keys(&mut bare);
+    assert!(bare.reasoning.is_none());
 }
 
 /// A per-model retry override must survive an alias. The override is keyed
@@ -1090,10 +1271,14 @@ async fn retry_override_survives_a_model_alias() {
 }
 
 /// A gRPC engine on loopback that answers every generate call with
-/// `output_ids`: one chunk carrying them, then the complete frame.
+/// `output_ids`: one chunk carrying them, then the complete frame. With
+/// `seen` it keeps the request it decoded; with `fail` it answers every call
+/// with that status instead (a trailers-only response).
 #[derive(Clone)]
 struct ScriptedEngine {
     output_ids: Vec<u32>,
+    seen: Option<Arc<std::sync::Mutex<Option<ts::GenerateRequest>>>>,
+    fail: Option<tonic::Code>,
 }
 
 type ScriptedStream<T> = std::pin::Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send>>;
@@ -1109,7 +1294,14 @@ impl TokenSpeedScheduler for ScriptedEngine {
         request: TonicRequest<ts::GenerateRequest>,
     ) -> Result<TonicResponse<Self::GenerateStream>, Status> {
         use ts::generate_response::Response as GenResp;
-        let request_id = request.into_inner().request_id;
+        if let Some(code) = self.fail {
+            return Err(Status::new(code, "scripted engine"));
+        }
+        let request = request.into_inner();
+        let request_id = request.request_id.clone();
+        if let Some(seen) = &self.seen {
+            *seen.lock().expect("the recorded request") = Some(request);
+        }
         let completion_tokens = self.output_ids.len() as u32;
         let frames = vec![
             Ok(ts::GenerateResponse {
@@ -1214,34 +1406,103 @@ impl TokenSpeedScheduler for ScriptedEngine {
     }
 }
 
-/// Serves a [`ScriptedEngine`] on a free loopback port and returns the port
-/// once it accepts connections.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test helper; the engine's server lives for the test process"
-)]
+/// Serves a [`ScriptedEngine`] on a loopback port bound before it is handed
+/// out and returns the port.
 async fn spawn_engine(output_ids: Vec<u32>) -> u16 {
-    let port = pick_unused_port().expect("a free port for the scripted engine");
-    let addr = format!("127.0.0.1:{port}").parse().expect("engine address");
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(TokenSpeedSchedulerServer::new(ScriptedEngine {
-                output_ids,
-            }))
-            .serve(addr)
-            .await
-            .expect("scripted engine server");
-    });
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            return port;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    let router = Server::builder().add_service(TokenSpeedSchedulerServer::new(ScriptedEngine {
+        output_ids,
+        seen: None,
+        fail: None,
+    }));
+    serve_on_loopback(router).await.0.port()
+}
+
+/// Serves a [`ScriptedEngine`] that records what it decodes (or fails every
+/// call with `fail`) and returns the port.
+async fn spawn_recording_engine(
+    seen: Arc<std::sync::Mutex<Option<ts::GenerateRequest>>>,
+    fail: Option<tonic::Code>,
+) -> u16 {
+    // The 1080p-class request is 25 MB; tonic's 4 MiB default would refuse it
+    // at the length prefix, before the handler runs (the engine servicers and
+    // the mock worker raise the same limit).
+    let router = Server::builder().add_service(
+        TokenSpeedSchedulerServer::new(ScriptedEngine {
+            output_ids: vec![11],
+            seen: Some(seen),
+            fail,
+        })
+        .max_decoding_message_size(64 << 20),
+    );
+    serve_on_loopback(router).await.0.port()
+}
+
+/// A multimodal item with an inline tensor of `len` bytes.
+fn inline_tensor_item(fill: u8, len: usize) -> ts::MultimodalItem {
+    ts::MultimodalItem {
+        content_hash: vec![fill; 4],
+        encoder_input: Some(ts::TensorData {
+            shape: vec![1, (len / 4) as u32],
+            dtype: "float32".into(),
+            payload: Some(ts::tensor_data::Payload::Inline(bytes::Bytes::from(
+                vec![fill; len],
+            ))),
+        }),
+        placeholder_token_id: Some(7),
+        ..Default::default()
     }
-    panic!("the scripted engine on port {port} never came up");
+}
+
+/// A request with a 1080p-class inline tensor and a small part behind it goes
+/// through the client's channel as body frames and reaches the engine as the
+/// request it was; an engine that answers with a trailers-only status hands
+/// the framed call that status.
+#[tokio::test]
+async fn a_framed_request_reaches_the_engine_as_the_request_it_was() {
+    let request = ts::GenerateRequest {
+        request_id: "framed-1".to_string(),
+        mm_inputs: Some(ts::MultimodalInputs {
+            items: vec![
+                inline_tensor_item(1, 1920 * 1080 * 3 * 4),
+                inline_tensor_item(2, 16),
+            ],
+        }),
+        ..Default::default()
+    };
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let port = spawn_recording_engine(seen.clone(), None).await;
+    let client =
+        smg_grpc_client::TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
+            .await
+            .expect("the client connects");
+    let mut stream = client
+        .generate_framed(request.clone())
+        .await
+        .expect("the framed call is accepted");
+    while let Some(frame) = futures::StreamExt::next(&mut stream).await {
+        frame.expect("a response frame");
+    }
+    assert_eq!(
+        seen.lock().expect("the recorded request").as_ref(),
+        Some(&request),
+        "the engine decoded the request the client framed"
+    );
+
+    let port = spawn_recording_engine(
+        Arc::new(std::sync::Mutex::new(None)),
+        Some(tonic::Code::Unavailable),
+    )
+    .await;
+    let client =
+        smg_grpc_client::TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
+            .await
+            .expect("the client connects");
+    let error = client
+        .generate_framed(request)
+        .await
+        .err()
+        .expect("the trailers-only status");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
 }
 
 /// A gRPC worker of `worker_type` serving `card`'s model at `url`.
@@ -1629,7 +1890,8 @@ fn max_tokens_zero_records_the_requests_media_and_count_tokens_does_not() {
     ]}]);
     ::metrics::with_local_recorder(&recorder, || {
         runtime.block_on(async {
-            let (_ctx, router) = regular_router_over_m(None).await;
+            let model_dir = unreadable_model_dir();
+            let (_ctx, router) = regular_router_over_m(None, Some(model_dir.path())).await;
             let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
             let count: CountMessageTokensRequest =
@@ -1655,4 +1917,152 @@ fn max_tokens_zero_records_the_requests_media_and_count_tokens_does_not() {
             );
         });
     });
+}
+
+/// A streamed regular Responses request persists from a task of its own (the
+/// stream's transform), where the middleware's storage-context task-local is
+/// gone: the route hands this request's context on in the `ResponsesContext`,
+/// as the Harmony and the background routes do, and every write of the
+/// persist reaches the store under it. A hook on the stores reads the context
+/// each operation ran under.
+#[tokio::test]
+async fn a_streamed_regular_response_persists_under_the_request_s_storage_context() {
+    use smg_data_connector::{
+        create_storage, with_request_context, BeforeHookResult, ExtraColumns, HistoryBackend,
+        HookError, RequestContext as StorageRequestContext, StorageFactoryConfig, StorageHook,
+        StorageOperation,
+    };
+
+    /// Records the `tenant_id` of the storage context every operation ran
+    /// under.
+    struct ContextRecordingHook {
+        seen: std::sync::Mutex<Vec<(StorageOperation, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl StorageHook for ContextRecordingHook {
+        async fn before(
+            &self,
+            operation: StorageOperation,
+            context: Option<&StorageRequestContext>,
+            _payload: &serde_json::Value,
+        ) -> Result<BeforeHookResult, HookError> {
+            let tenant = context
+                .and_then(|ctx| ctx.get("tenant_id"))
+                .map(str::to_owned);
+            self.seen
+                .lock()
+                .expect("the recorded operations")
+                .push((operation, tenant));
+            Ok(BeforeHookResult::Continue(ExtraColumns::new()))
+        }
+
+        async fn after(
+            &self,
+            _operation: StorageOperation,
+            _context: Option<&StorageRequestContext>,
+            _payload: &serde_json::Value,
+            _result: &serde_json::Value,
+            extra: &ExtraColumns,
+        ) -> Result<ExtraColumns, HookError> {
+            Ok(extra.clone())
+        }
+    }
+
+    let hook = Arc::new(ContextRecordingHook {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let stores = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Memory,
+        oracle: None,
+        postgres: None,
+        redis: None,
+        memory: None,
+        hook: Some(hook.clone()),
+    })
+    .await
+    .expect("the hooked in-memory stores");
+    let ctx = grpc_ctx_over_stores(
+        &grpc_config(regular_routing_mode()).build_unchecked(),
+        mcp_orchestrator().await,
+        stores.response_storage,
+        stores.conversation_storage,
+        stores.conversation_item_storage,
+    );
+    register_tokenizer_for(&ctx, "m", CHAT_TEMPLATE, ("Hello", 100)).await;
+    let port = spawn_engine(vec![100]).await;
+    register_worker(
+        &ctx,
+        &format!("grpc://127.0.0.1:{port}"),
+        WorkerType::Regular,
+        ModelCard::new("m"),
+    );
+    // Built at start-up, outside any request, as the gateway builds it.
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+
+    let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+    let body: ResponsesRequest =
+        serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
+            .expect("responses request");
+    let mut request_context = StorageRequestContext::new();
+    request_context.set("tenant_id", "tenant-1");
+    // The middleware's scope: the request task carries the context; the
+    // stream's transform, spawned from it, does not.
+    let response = with_request_context(
+        request_context,
+        router.route_responses(None, &tenant_meta, body, "m"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the stream");
+    let frames = String::from_utf8_lossy(&bytes);
+    assert!(
+        frames.contains("response.completed"),
+        "the stream did not complete: {frames}"
+    );
+
+    let seen = hook.seen.lock().expect("the recorded operations").clone();
+    assert!(
+        seen.iter().any(|(operation, _)| matches!(
+            operation,
+            StorageOperation::StoreResponse | StorageOperation::CreateItem
+        )),
+        "the stream persisted nothing: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .all(|(_, tenant)| tenant.as_deref() == Some("tenant-1")),
+        "a store operation ran without the request's storage context: {seen:?}"
+    );
+}
+
+/// The router is built at start-up, outside any request: the storage context
+/// its Responses contexts store is `None` by construction, not a read of
+/// whatever task-local happens to cover the constructor. Every Responses
+/// branch derives this request's context in the request task, and the inline
+/// paths run under the middleware's live task-local; a router built inside a
+/// storage-context scope stores none all the same.
+#[tokio::test]
+async fn a_router_built_inside_a_storage_context_scope_stores_no_request_context() {
+    use smg_data_connector::{with_request_context, RequestContext as StorageRequestContext};
+
+    let ctx = grpc_ctx_from(
+        &grpc_config(regular_routing_mode()).build_unchecked(),
+        mcp_orchestrator().await,
+    );
+    let mut scope = StorageRequestContext::new();
+    scope.set("tenant_id", "tenant-1");
+    let router = with_request_context(scope, async { GrpcRouter::new(&ctx, Mode::Regular) })
+        .await
+        .expect("regular router");
+    for context in [&router.responses_context, &router.harmony_responses_context] {
+        let context = context.as_ref().expect("a responses context");
+        assert!(
+            context.request_context.is_none(),
+            "the router stored a construction-time storage context: {:?}",
+            context.request_context
+        );
+    }
 }

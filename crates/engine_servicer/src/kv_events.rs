@@ -102,24 +102,35 @@
 //! Every batch a subscriber receives carries the servicer's load record
 //! (`LoadSource`, the figures `GetLoads` answers with, as `KvEventBatch.
 //! load`), and a subscriber hears from the relay even when the publisher is
-//! quiet: a batch with no events and the last sequence repeated, marked
-//! `load_only`, goes out when the record changed (checked every
-//! `load_tick`, 100 ms) and as a heartbeat after `heartbeat_interval` (1 s)
-//! of silence, backing off to `heartbeat_backoff` (5 s) once the engine has
-//! been idle for two heartbeats. The record's routing core rides every
+//! quiet: a batch with no events and the rank's last sequence repeated,
+//! marked `load_only`, goes out when the rank's record changed (checked
+//! every `load_tick`, 100 ms) and as a heartbeat after `heartbeat_interval`
+//! (1 s) of the rank's silence, backing off to `heartbeat_backoff` (5 s)
+//! once the rank has been idle for two heartbeats. Each rank is on its own
+//! clock (`RankClock`), so a quiet rank keeps reporting while another
+//! publishes. The record's routing core rides every
 //! batch; the engine's telemetry (cache hit rate, token counts, SGLang's
 //! sections) rides the heartbeats and the stream's first record. The
 //! gateway feeds the record where its `GetLoads` poll goes, admits nothing
 //! from a `load_only` batch, and does not poll a worker while its records
-//! arrive: `GetLoads` is the fallback. Before the publisher's first batch
-//! there is no sequence a `load_only` batch could repeat: one goes out
-//! numbered 0, from the subscription on, only to a subscriber that asked for
+//! arrive: `GetLoads` is the fallback. Before a rank's first batch there is
+//! no sequence its `load_only` batch could repeat: one goes out numbered 0,
+//! from the subscription on, only to a subscriber that asked for
 //! records before the first batch (`SubscribeKvEventsRequest.
 //! load_records_before_first_batch`, set by every gateway that knows
 //! `load_only`), so the engine's silence on the first request it ever
 //! receives reaches the gateway like any later one; an older subscriber,
 //! which would take the publisher's first batch for a duplicate of such a
 //! heartbeat, gets its first record with that batch.
+//!
+//! A batch read live off a publisher socket, in the publisher's sequence, is
+//! a sign of the engine's progress (it stored or freed KV blocks in that
+//! step), which the relay tells the load source's engine link
+//! (`LoadSource::note_engine_progress`): the connected engine's silence
+//! count ends on it as on an output, so a chunked prefill that publishes its
+//! blocks chunk by chunk is not a dead engine on a wire that says nothing
+//! before a prompt's first token. A replayed batch, a snapshot chunk and a
+//! `load_only` batch are not progress and tell it nothing.
 //!
 //! `SMG_KV_EVENT_HASH_CHECK=sglang|vllm-sha256-cbor` turns on the relay's
 //! engine-hash verification ([`crate::engine_hash`]); mismatches are counted,
@@ -146,7 +157,7 @@ use futures::stream;
 use smg_grpc_client::common_proto::{self as common};
 use tokio::sync::{broadcast, Notify};
 use tonic::Status;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use zeromq::{
     prelude::{Socket, SocketRecv, SocketSend},
     DealerSocket, Endpoint, SocketOptions, SubSocket, ZmqError, ZmqMessage,
@@ -154,7 +165,7 @@ use zeromq::{
 
 use crate::{
     engine_link::EngineLink,
-    kv_history::{History, Window},
+    kv_history::{EncodedBatch, History, Window},
     kv_state::{LiveState, RankCut, Snapshot, SnapshotChunks},
     kv_wire::{low64_big_endian, Counts as WireCounts, Normalizer, WireBatch, WireEvent},
     BoxStream,
@@ -173,10 +184,13 @@ pub(crate) const TOKENSPEED_DISABLED_MESSAGE: &str = "KV cache events not enable
      TokenSpeed with --kv-events-config '{\"enable_kv_cache_events\": true, \"publisher\": \
      \"zmq\"}'";
 
-/// The TensorRT-LLM servicer's refusal: its wire relays no KV events yet (the
-/// engine's Python servicer does not implement the RPC either).
+/// The TensorRT-LLM servicer's refusal of a full subscription: the server
+/// relays KV events only when handed a publisher endpoint, and this engine's
+/// launcher hands none (the wire has no publisher yet); the load records
+/// alone (`loads_only`) are served, as on every wire.
 pub(crate) const TRTLLM_DISABLED_MESSAGE: &str = "KV cache events are not relayed for this \
-     engine yet: SubscribeKvEvents is not implemented by its servicer";
+     engine: its launcher hands the servicer no publisher endpoint. The load records are \
+     served to a loads_only subscription";
 
 /// When the relay subscribes to the publisher: at the servicer's start
 /// (default, any other value) or `lazy`, at the first `SubscribeKvEvents`.
@@ -310,18 +324,45 @@ pub(crate) trait LoadSource: Send + Sync {
     /// is known (the engine is not up yet). `sample` and `load_only` are the
     /// relay's to set.
     fn load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad>;
+
+    /// The relay read a batch live off a publisher socket, in the
+    /// publisher's sequence: the engine stepped (it stored or freed KV
+    /// blocks), whatever its output wire has said since. Not called for a
+    /// replayed batch, a snapshot chunk or a `load_only` batch, none of
+    /// which is the engine's work now. Tells nobody unless implemented.
+    fn note_engine_progress(&self) {}
 }
 
 /// A servicer state's own `GetLoads` figures, the half of a load record that
 /// differs by wire; [`LoadFromState`] adds the half every wire shares.
 pub(crate) trait RankLoads: Send + Sync {
     /// The record for `dp_rank` (`None`: a publisher that names no rank)
-    /// without the engine link's liveness fields, or `None` while the engine
-    /// has reported nothing.
+    /// without the engine link's liveness fields: a connected rank's last
+    /// figures, zero-filled until its first batch; `None` while the engine
+    /// is not connected or for a rank past the connected ones.
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad>;
 
     /// The engine link whose liveness the record carries.
     fn engine_link(&self) -> &EngineLink;
+
+    /// The data-parallel ranks the servicer serves now (`Shared::rank_count`):
+    /// how many records a records-only stream reports per tick.
+    fn rank_count(&self) -> usize;
+}
+
+/// One rank's load record from a wire's `GetLoads` entry: the shared
+/// conversion, which leaves `waiting_uncached_tokens` unset (it is the
+/// servicer's to set), plus `queued`, the queued token-work this servicer
+/// estimates for the rank (each wire's `info::rank_load` puts it on the
+/// entry's `num_waiting_uncached_tokens`). The four wires' [`RankLoads`]
+/// impls read their entry and hand it here.
+pub(crate) fn record_with_queue<L>(load: &L, queued: i32) -> common::EngineLoad
+where
+    common::EngineLoad: for<'a> From<&'a L>,
+{
+    let mut record = common::EngineLoad::from(load);
+    record.waiting_uncached_tokens = Some(u32::try_from(queued).unwrap_or(0));
+    record
 }
 
 /// The relay's load source over a servicer state, held weakly (the relay
@@ -341,13 +382,92 @@ impl<S: RankLoads> LoadSource for LoadFromState<S> {
         record.prefill_pending_tokens = engine.prefill_pending_tokens();
         Some(record)
     }
+
+    fn note_engine_progress(&self) {
+        if let Some(state) = self.0.upgrade() {
+            state.engine_link().note_engine_progress();
+        }
+    }
+}
+
+/// One rank's clock on a stream of load records: what the rank last sent and
+/// when. A subscriber's event stream and the records-only stream keep one per
+/// rank, so a quiet rank's record keeps coming while another rank is busy.
+pub(crate) struct RankClock {
+    last_record: Option<common::EngineLoad>,
+    last_sent_at: Option<tokio::time::Instant>,
+    /// Heartbeats in a row with an unchanged record.
+    idle_heartbeats: u32,
+}
+
+impl RankClock {
+    pub(crate) const fn new() -> Self {
+        Self {
+            last_record: None,
+            last_sent_at: None,
+            idle_heartbeats: 0,
+        }
+    }
+
+    /// Whether `record` goes out on a `load_only` batch at `now`: it moved
+    /// since the rank's last one sent ([`load_changed`]), or the rank has
+    /// been silent for `heartbeat_interval` (`heartbeat_backoff` after two
+    /// unchanged heartbeats). Counts the heartbeat; the record as sent then
+    /// goes to [`sent`](Self::sent).
+    pub(crate) fn due(
+        &mut self,
+        record: &common::EngineLoad,
+        now: tokio::time::Instant,
+        heartbeat_interval: Duration,
+        heartbeat_backoff: Duration,
+    ) -> bool {
+        let changed = self
+            .last_record
+            .as_ref()
+            .is_none_or(|last| load_changed(last, record));
+        let due_after = if self.idle_heartbeats >= 2 {
+            heartbeat_backoff
+        } else {
+            heartbeat_interval
+        };
+        let silent_for = self
+            .last_sent_at
+            .map_or(Duration::MAX, |at| now.saturating_duration_since(at));
+        if !changed && silent_for < due_after {
+            return false;
+        }
+        self.idle_heartbeats = if changed {
+            0
+        } else {
+            self.idle_heartbeats.saturating_add(1)
+        };
+        true
+    }
+
+    /// `record` went out at `now`, on a `load_only` batch or with events.
+    pub(crate) fn sent(&mut self, record: &common::EngineLoad, now: tokio::time::Instant) {
+        self.last_record = Some(record.clone());
+        self.last_sent_at = Some(now);
+    }
+
+    /// The rank's events went out at `now`: its silence starts over.
+    pub(crate) fn published(&mut self, now: tokio::time::Instant) {
+        self.last_sent_at = Some(now);
+        self.idle_heartbeats = 0;
+    }
 }
 
 /// Whether a record moved enough from `last` to be worth a `load_only`
 /// batch: any queue, running or window change, KV usage by half a percent,
-/// the rate by 5 % or 50 tokens per second.
-fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
-    last.running_requests != current.running_requests
+/// either throughput by 5 % or 50 tokens per second, or measured input
+/// capacity appearing/disappearing.
+pub(crate) fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
+    let prefill_changed = match (last.prefill_throughput, current.prefill_throughput) {
+        (Some(last), Some(current)) => throughput_changed(last, current),
+        (None, None) => false,
+        _ => true,
+    };
+    prefill_changed || last.running_requests != current.running_requests
         || last.waiting_requests != current.waiting_requests
         || last.waiting_uncached_tokens != current.waiting_uncached_tokens
         || last.max_running_requests != current.max_running_requests
@@ -356,10 +476,7 @@ fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool
             - current.active_token_usage.unwrap_or(current.token_usage))
         .abs()
             > 0.005
-        || {
-            let delta = (last.gen_throughput - current.gen_throughput).abs();
-            delta > 50.0 || delta > 0.05 * last.gen_throughput.max(current.gen_throughput)
-        }
+        || throughput_changed(last.gen_throughput, current.gen_throughput)
         // A growing engine silence goes out once a second, so a subscriber's
         // wedge bound is met within a second of the engine crossing it.
         || last.engine_silence_ms.map(|ms| ms / 1000) != current.engine_silence_ms.map(|ms| ms / 1000)
@@ -367,12 +484,20 @@ fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool
         || last.prefill_pending_tokens != current.prefill_pending_tokens
 }
 
+/// Ignore rate noise while publishing meaningful absolute or relative movement.
+fn throughput_changed(last: f64, current: f64) -> bool {
+    let delta = (last - current).abs();
+    delta > 50.0 || delta > 0.05 * last.max(current)
+}
+
 /// Whether [`RELAY_START_ENV`] set to `value` keeps the start at boot.
 fn starts_at_boot(value: Option<&str>) -> bool {
     !value.is_some_and(|value| value.trim().eq_ignore_ascii_case("lazy"))
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
+/// `name` from the environment as a count, `default` when unset, empty or
+/// not a number (said once in the log).
+pub(crate) fn env_usize(name: &str, default: usize) -> usize {
     match std::env::var(name) {
         Ok(value) if !value.trim().is_empty() => match value.trim().parse::<usize>() {
             Ok(parsed) => parsed,
@@ -637,8 +762,64 @@ fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
 /// What the live channel carries to subscribers.
 #[derive(Clone)]
 enum Live {
-    Batch(Arc<common::KvEventBatch>),
+    Batch(Arc<LiveBatch>),
     Restart { generation: u64 },
+}
+
+/// A relayed batch on its way to the receivers the channel had when it was
+/// sent. Each of them claims it once; the last to claim takes the batch as
+/// it is and the others copy it, so with one subscriber per relay (one
+/// gateway per engine) no batch is copied on its way out. The count is exact
+/// because [`Relaying::relay`] reads it and sends under the lock in which
+/// [`KvEventRelay::subscribe`] adds a receiver, and it moves under the
+/// slot's own lock, so the claims land in the order that lock grants them
+/// and the last of them finds the batch still there. A receiver that lags
+/// past the slot or drops leaves its claim unmade, and the batch stays in
+/// the slot until the channel drops it.
+struct LiveBatch {
+    rank: Option<i32>,
+    sequence: u64,
+    slot: Mutex<Slot>,
+}
+
+/// The batch and the receivers that have not claimed it yet.
+struct Slot {
+    unclaimed: usize,
+    batch: Option<common::KvEventBatch>,
+}
+
+impl LiveBatch {
+    fn new(batch: common::KvEventBatch, receivers: usize) -> Self {
+        Self {
+            rank: batch.dp_rank,
+            sequence: batch.sequence_number,
+            slot: Mutex::new(Slot {
+                unclaimed: receivers,
+                batch: Some(batch),
+            }),
+        }
+    }
+
+    /// The batch for this receiver: the batch itself for the last of the
+    /// counted receivers to claim, a copy for the others. `None` only for a
+    /// receiver the send did not count, which the lock rules out.
+    fn claim(&self) -> Option<common::KvEventBatch> {
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.unclaimed = slot.unclaimed.saturating_sub(1);
+        if slot.unclaimed == 0 {
+            slot.batch.take()
+        } else {
+            slot.batch.clone()
+        }
+    }
+
+    /// A receiver that does not want the batch (a duplicate of what its
+    /// stream sent) still claims, so the last receiver that wants it finds
+    /// the slot its own.
+    fn pass(&self) {
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.unclaimed = slot.unclaimed.saturating_sub(1);
+    }
 }
 
 /// One engine's KV-event relay: the publisher subscriptions (one per rank),
@@ -652,9 +833,10 @@ pub struct KvEventRelay {
     /// A subscriber came while the relay holds nothing: each publisher task
     /// asks its engine replay for the publisher's start again.
     prime_requests: Vec<Arc<Notify>>,
-    /// The servicer's load, attached to every batch sent; none until the
+    /// The servicer's load, attached to every batch sent, and where the
+    /// publisher tasks report the engine's progress; none until the
     /// servicer installs it.
-    load_source: OnceLock<Arc<dyn LoadSource>>,
+    load_source: Arc<OnceLock<Arc<dyn LoadSource>>>,
 }
 
 impl Drop for KvEventRelay {
@@ -719,7 +901,7 @@ impl KvEventRelay {
             live,
             tasks: Mutex::new(Vec::new()),
             prime_requests,
-            load_source: OnceLock::new(),
+            load_source: Arc::new(OnceLock::new()),
         })
     }
 
@@ -780,9 +962,8 @@ impl KvEventRelay {
                 .iter()
                 .position(|source| Some(source.rank) == batch.dp_rank)
                 .unwrap_or(0);
-            let batch = Arc::new(batch);
             let record = &mut shared.ranks[index];
-            record.history.push(sequence, Arc::clone(&batch));
+            record.history.push(sequence, EncodedBatch::new(&batch));
             if record.started_at.is_none() {
                 record.started_at = Some(sequence);
             }
@@ -841,11 +1022,12 @@ impl KvEventRelay {
             let shared = Arc::clone(&self.shared);
             let live = self.live.clone();
             let prime_request = Arc::clone(prime_request);
+            let load_source = Arc::clone(&self.load_source);
             #[expect(
                 clippy::disallowed_methods,
                 reason = "the publisher subscription outlives any one RPC; aborted when the relay drops"
             )]
-            let handle = tokio::spawn(run(config, index, shared, live, prime_request));
+            let handle = tokio::spawn(run(config, index, shared, live, prime_request, load_source));
             tasks.push(handle);
         }
     }
@@ -858,20 +1040,21 @@ impl KvEventRelay {
         request: common::SubscribeKvEventsRequest,
     ) -> Result<BoxStream<common::KvEventBatch>, Status> {
         self.start();
-        // Subscribed before the history is read, so nothing published between
-        // the two is missed; the subscriber skips what it already replayed.
-        let rx = self.live.subscribe();
         let cursor = request.start_sequence_number;
         let records_before_first_batch = request.load_records_before_first_batch;
         let label = self.config.label();
-        let serve = {
+        let (rx, serve) = {
             let mut shared = lock(&self.shared);
             if let Some(error) = &shared.failed {
                 return Err(Status::internal(format!(
                     "SubscribeKvEvents: the relay for {label} is down: {error}"
                 )));
             }
-            if cursor == 0 {
+            // Subscribed under the lock that relays: no batch lands between
+            // the history read below and the live stream, and every batch
+            // sent from here on counts this receiver ([`LiveBatch`]).
+            let rx = self.live.subscribe();
+            let serve = if cursor == 0 {
                 if shared.complete_from_start() {
                     shared.counts.served_from_history += 1;
                     Serve::History {
@@ -992,7 +1175,8 @@ impl KvEventRelay {
                         return Err(Status::out_of_range(message));
                     }
                 }
-            }
+            };
+            (rx, serve)
         };
         let (replay, sent, snapshot) = match serve {
             Serve::History { batches, last_sent } => {
@@ -1060,11 +1244,14 @@ impl KvEventRelay {
             load_tick: self.config.load_tick,
             heartbeat_interval: self.config.heartbeat_interval,
             heartbeat_backoff: self.config.heartbeat_backoff,
-            last_rank: None,
-            last_sequence: None,
-            last_record: None,
-            last_sent_at: Instant::now(),
-            idle_heartbeats: 0,
+            clocks: self
+                .config
+                .sources
+                .iter()
+                .map(|_| RankClock::new())
+                .collect(),
+            next_tick: tokio::time::Instant::now() + self.config.load_tick,
+            due: VecDeque::new(),
             sample: 0,
         };
         Ok(Box::pin(stream::unfold(
@@ -1077,7 +1264,7 @@ impl KvEventRelay {
 /// What a subscription begins with, decided under the relay's lock.
 enum Serve {
     History {
-        batches: Vec<Arc<common::KvEventBatch>>,
+        batches: Vec<EncodedBatch>,
         /// Per rank, the sequence the subscriber is known to hold.
         last_sent: BTreeMap<Option<i32>, u64>,
     },
@@ -1102,7 +1289,7 @@ enum SnapshotPhase {
 }
 
 /// Seconds since the Unix epoch, the way the engines stamp their batches.
-fn unix_seconds() -> f64 {
+pub(crate) fn unix_seconds() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs_f64())
@@ -1116,7 +1303,7 @@ type Item = Result<common::KvEventBatch, Status>;
 /// rank.
 struct Subscriber {
     snapshot: SnapshotPhase,
-    replay: VecDeque<Arc<common::KvEventBatch>>,
+    replay: VecDeque<EncodedBatch>,
     rx: broadcast::Receiver<Live>,
     /// Per rank, the last sequence sent (or the cursor the subscriber came
     /// with): what a live batch is a duplicate of.
@@ -1136,16 +1323,15 @@ struct Subscriber {
     load_tick: Duration,
     heartbeat_interval: Duration,
     heartbeat_backoff: Duration,
-    /// The rank and sequence of the last batch sent: what a `load_only`
-    /// batch names and repeats.
-    last_rank: Option<i32>,
-    last_sequence: Option<u64>,
-    /// The last record sent, for the change check.
-    last_record: Option<common::EngineLoad>,
-    /// When the last batch of any kind went out.
-    last_sent_at: Instant,
-    /// Heartbeats in a row with an unchanged record.
-    idle_heartbeats: u32,
+    /// Per rank of `ranks`: when the rank's record is due. A rank's
+    /// `load_only` batch repeats the rank's last sequence in `sent`.
+    clocks: Vec<RankClock>,
+    /// When the records are looked at next: a deadline that stands across
+    /// batches, so a rank that publishes faster than the tick cannot keep
+    /// the other ranks' records waiting.
+    next_tick: tokio::time::Instant,
+    /// The `load_only` batches a tick found due, sent one per poll.
+    due: VecDeque<common::KvEventBatch>,
     /// Records sent on this stream.
     sample: u64,
 }
@@ -1159,17 +1345,32 @@ enum Waited {
 impl Subscriber {
     /// Attach the load record to a batch about to go out and note it went.
     fn stamped(&mut self, mut batch: common::KvEventBatch) -> common::KvEventBatch {
-        self.last_rank = batch.dp_rank;
-        self.last_sequence = Some(batch.sequence_number);
-        self.last_sent_at = Instant::now();
-        self.idle_heartbeats = 0;
-        batch.load = self.record(batch.dp_rank, false);
+        batch.load = self
+            .current(batch.dp_rank)
+            .map(|record| self.record(record, false));
+        let now = tokio::time::Instant::now();
+        let index = self
+            .ranks
+            .iter()
+            .position(|&rank| Some(rank) == batch.dp_rank);
+        if let Some(clock) = index.and_then(|index| self.clocks.get_mut(index)) {
+            clock.published(now);
+            if let Some(record) = &batch.load {
+                clock.sent(record, now);
+            }
+        }
         batch
     }
 
-    /// The next record for `rank` from the source, numbered.
-    fn record(&mut self, rank: Option<i32>, load_only: bool) -> Option<common::EngineLoad> {
-        let mut record = self.source.as_ref()?.load(rank)?;
+    /// The source's record for `rank` as it stands now, unnumbered; `None`
+    /// without a source or while it knows nothing.
+    fn current(&self, rank: Option<i32>) -> Option<common::EngineLoad> {
+        self.source.as_ref()?.load(rank)
+    }
+
+    /// `record`, read by [`current`](Self::current), numbered as the next
+    /// one sent on this stream.
+    fn record(&mut self, mut record: common::EngineLoad, load_only: bool) -> common::EngineLoad {
         self.sample += 1;
         record.sample = self.sample;
         record.load_only = load_only;
@@ -1178,54 +1379,57 @@ impl Subscriber {
         if !load_only && self.sample > 1 {
             smg_grpc_client::engine_load::core_only(&mut record);
         }
-        self.last_record = Some(record.clone());
-        Some(record)
+        record
     }
 
-    /// A `load_only` batch when the record moved since the last one sent,
-    /// or when the stream has been silent for the heartbeat interval (the
-    /// backoff interval after two unchanged heartbeats); `None` otherwise.
-    fn load_only_batch(&mut self) -> Option<common::KvEventBatch> {
-        // Nothing sent yet, nothing to repeat: a subscriber that takes
-        // records before the publisher's first batch gets them numbered 0
-        // (it admits a `load_only` batch to no cursor), so the engine's
-        // silence on its first request reaches it in time; a gateway that
-        // predates the field would take the publisher's first batch for a
-        // duplicate of such a heartbeat, and waits for that batch.
-        let sequence_number = match self.last_sequence {
-            Some(sequence) => sequence,
-            None if self.records_before_first_batch => 0,
-            None => return None,
-        };
-        let current = self.source.as_ref()?.load(self.last_rank)?;
-        let changed = self
-            .last_record
-            .as_ref()
-            .is_none_or(|last| load_changed(last, &current));
-        let due_after = if self.idle_heartbeats >= 2 {
-            self.heartbeat_backoff
-        } else {
-            self.heartbeat_interval
-        };
-        if !changed && self.last_sent_at.elapsed() < due_after {
-            return None;
+    /// Queue a `load_only` batch for every rank whose record moved since the
+    /// rank's last one sent, or whose side of the stream has been silent for
+    /// the heartbeat interval (the backoff interval after two unchanged
+    /// heartbeats): each rank on its own clock, so a quiet rank's record
+    /// keeps coming while another rank publishes.
+    fn queue_due_records(&mut self) {
+        let now = tokio::time::Instant::now();
+        for index in 0..self.clocks.len() {
+            let Some(&rank) = self.ranks.get(index) else {
+                continue;
+            };
+            // Nothing of the rank sent yet, nothing to repeat: a subscriber
+            // that takes records before the first batch gets them numbered 0
+            // (it admits a `load_only` batch to no cursor), so the engine's
+            // silence on its first request reaches it in time; a gateway
+            // that predates the field would take the rank's first batch for
+            // a duplicate of such a heartbeat, and waits for that batch.
+            let sequence_number = match self.sent.get(&Some(rank)).copied() {
+                Some(sequence) => sequence,
+                None if self.records_before_first_batch => 0,
+                None => continue,
+            };
+            let Some(current) = self.current(Some(rank)) else {
+                continue;
+            };
+            let (interval, backoff) = (self.heartbeat_interval, self.heartbeat_backoff);
+            let due = self
+                .clocks
+                .get_mut(index)
+                .is_some_and(|clock| clock.due(&current, now, interval, backoff));
+            if !due {
+                continue;
+            }
+            // The record read for the change check is the one sent: one
+            // build per rank and tick, whether or not it goes out.
+            let record = self.record(current, true);
+            if let Some(clock) = self.clocks.get_mut(index) {
+                clock.sent(&record, now);
+            }
+            self.due.push_back(common::KvEventBatch {
+                sequence_number,
+                timestamp: unix_seconds(),
+                events: Vec::new(),
+                dp_rank: Some(rank),
+                snapshot: None,
+                load: Some(record),
+            });
         }
-        let rank = self.last_rank;
-        let record = self.record(rank, true)?;
-        self.last_sent_at = Instant::now();
-        self.idle_heartbeats = if changed {
-            0
-        } else {
-            self.idle_heartbeats.saturating_add(1)
-        };
-        Some(common::KvEventBatch {
-            sequence_number,
-            timestamp: unix_seconds(),
-            events: Vec::new(),
-            dp_rank: rank,
-            snapshot: None,
-            load: Some(record),
-        })
     }
 
     async fn next(&mut self) -> Option<Item> {
@@ -1233,6 +1437,9 @@ impl Subscriber {
             return None;
         }
         loop {
+            if let Some(batch) = self.due.pop_front() {
+                return Some(Ok(batch));
+            }
             match &mut self.snapshot {
                 SnapshotPhase::Ordering(ordering) => {
                     let chunks = match ordering.await {
@@ -1263,39 +1470,52 @@ impl Subscriber {
                 }
                 SnapshotPhase::None => {}
             }
-            if let Some(batch) = self.replay.pop_front() {
+            if let Some(encoded) = self.replay.pop_front() {
+                let Some(batch) = encoded.decode() else {
+                    continue;
+                };
                 self.sent.insert(batch.dp_rank, batch.sequence_number);
-                return Some(Ok(self.stamped((*batch).clone())));
+                return Some(Ok(self.stamped(batch)));
             }
             let waited = if self.source.is_some() {
-                let tick = self.load_tick;
+                let next_tick = self.next_tick;
                 tokio::select! {
                     received = self.rx.recv() => Waited::Live(received),
-                    () = tokio::time::sleep(tick) => Waited::Tick,
+                    () = tokio::time::sleep_until(next_tick) => Waited::Tick,
                 }
             } else {
                 Waited::Live(self.rx.recv().await)
             };
             let received = match waited {
                 Waited::Tick => {
-                    if let Some(batch) = self.load_only_batch() {
-                        return Some(Ok(batch));
-                    }
+                    // The next tick a whole period from this one, whatever
+                    // batches arrive meanwhile.
+                    self.next_tick = tokio::time::Instant::now() + self.load_tick;
+                    self.queue_due_records();
                     continue;
                 }
                 Waited::Live(received) => received,
             };
             match received {
-                Ok(Live::Batch(batch)) => {
+                Ok(Live::Batch(live)) => {
                     if self
                         .sent
-                        .get(&batch.dp_rank)
-                        .is_some_and(|&last| batch.sequence_number <= last)
+                        .get(&live.rank)
+                        .is_some_and(|&last| live.sequence <= last)
                     {
+                        live.pass();
                         continue;
                     }
-                    self.sent.insert(batch.dp_rank, batch.sequence_number);
-                    return Some(Ok(self.stamped((*batch).clone())));
+                    let Some(batch) = live.claim() else {
+                        error!(
+                            rank = ?live.rank,
+                            sequence = live.sequence,
+                            "a relayed KV event batch was claimed by more streams than it was sent to; this stream goes on without it"
+                        );
+                        continue;
+                    };
+                    self.sent.insert(live.rank, live.sequence);
+                    return Some(Ok(self.stamped(batch)));
                 }
                 Ok(Live::Restart { generation }) => {
                     self.done = true;
@@ -1386,6 +1606,7 @@ async fn run(
     shared: Arc<Mutex<Shared>>,
     live: broadcast::Sender<Live>,
     prime_request: Arc<Notify>,
+    load_source: Arc<OnceLock<Arc<dyn LoadSource>>>,
 ) {
     let source = &config.sources[index];
     let mut socket = match connect(&source.endpoint, &config.topic).await {
@@ -1405,6 +1626,7 @@ async fn run(
         shared: &shared,
         live: &live,
         normalizer: Normalizer::from_env(),
+        progress: &load_source,
     };
     if index == 0 {
         if let Some(check) = relay.normalizer.hash_check() {
@@ -1479,7 +1701,7 @@ async fn run(
             admission = lock(&shared).ranks[index].admit(sequence, startup_clear);
         }
         match admission {
-            Admission::Accept => relay.relay(sequence, decoded),
+            Admission::Accept => relay.relay_live(sequence, decoded),
             Admission::Gap { .. } | Admission::Duplicate => {}
             Admission::Restart { reason, last } => {
                 let (generation, counts) = {
@@ -1508,7 +1730,7 @@ async fn run(
                         continue;
                     }
                 }
-                relay.relay(sequence, decoded);
+                relay.relay_live(sequence, decoded);
             }
         }
     }
@@ -1549,9 +1771,25 @@ struct Relaying<'a> {
     live: &'a broadcast::Sender<Live>,
     /// This rank's normalizer (its state is the rank's own).
     normalizer: Normalizer,
+    /// Where a batch read live off the socket is reported as the engine's
+    /// progress (the servicer's load source), once installed.
+    progress: &'a OnceLock<Arc<dyn LoadSource>>,
 }
 
 impl Relaying<'_> {
+    /// [`Self::relay`] for a batch read live off the publisher socket, in
+    /// the publisher's sequence: the engine's progress, which the load
+    /// source's engine link is told of first, so the load record the batch
+    /// itself carries to a subscriber already counts from it. The replay
+    /// paths relay through [`Self::relay`] alone: what the engine's replay
+    /// gives back is history, not progress.
+    fn relay_live(&mut self, sequence: u64, decoded: Decoded) {
+        if let Some(source) = self.progress.get() {
+            source.note_engine_progress();
+        }
+        self.relay(sequence, decoded);
+    }
+
     /// Normalize, remember and broadcast one batch under `sequence`, stamped
     /// with this source's rank (the socket's rank wins over the payload's,
     /// as in the Python relay: it is what the gateway keys its cursors by).
@@ -1582,11 +1820,13 @@ impl Relaying<'_> {
                 true,
             ),
         };
-        let batch = Arc::new(batch);
+        // Encoded off the lock: its hold is the push of a ready value, the
+        // state's apply and the send.
+        let encoded = EncodedBatch::new(&batch);
         {
             let mut shared = lock(self.shared);
             let record = &mut shared.ranks[self.index];
-            record.history.push(sequence, Arc::clone(&batch));
+            record.history.push(sequence, encoded);
             if record.started_at.is_none() {
                 record.started_at = Some(sequence);
             }
@@ -1615,8 +1855,17 @@ impl Relaying<'_> {
                     "KV event relay summary"
                 );
             }
+            // Sent under the lock in which subscribers join, so the receivers
+            // counted here are the ones this batch reaches: the last of them
+            // to claim it takes it uncopied ([`LiveBatch`]). With nobody to
+            // send to, the batch ends here.
+            let receivers = self.live.receiver_count();
+            if receivers > 0 {
+                let _ = self
+                    .live
+                    .send(Live::Batch(Arc::new(LiveBatch::new(batch, receivers))));
+            }
         }
-        let _ = self.live.send(Live::Batch(batch));
     }
 
     /// The publisher skipped `gap` on the socket: fill it from the engine's
@@ -1897,7 +2146,7 @@ async fn port_answers(endpoint: &Endpoint) -> bool {
                 .is_ok_and(|connected| connected.is_ok())
         }
         #[cfg(unix)]
-        Endpoint::Ipc(Some(path)) => tokio::net::UnixStream::connect(path).await.is_ok(),
+        Endpoint::Ipc(Some(path)) => engine_zmq_adapter::knock_ipc_socket(path).await.is_ok(),
         // Nothing to knock on (the enum is non-exhaustive): the ZMQ connect
         // below says what is wrong.
         _ => true,

@@ -3,10 +3,28 @@ mod closed_message;
 mod local_stop;
 mod logprobs;
 mod lone_complete;
+mod responses_stop;
+mod server_call_allowance;
 mod status;
 mod usage;
 
+use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
+
 use super::*;
+
+/// A chunk frame of `token_ids` after a three-token prompt (the harmony
+/// streaming tests' one shape of it).
+pub(super) fn chunk(token_ids: Vec<u32>) -> proto::GenerateResponse {
+    proto::GenerateResponse {
+        response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
+            index: 0,
+            prompt_tokens: 3,
+            completion_tokens: token_ids.len() as u32,
+            token_ids,
+            ..Default::default()
+        })),
+    }
+}
 
 /// Compile-time exhaustiveness anchor.
 ///

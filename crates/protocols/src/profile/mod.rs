@@ -179,17 +179,86 @@ impl ProviderProfile {
         registered.unwrap_or_else(|| Self::from_model_segments(model))
     }
 
+    /// Whether a model id selects the GLM-5.3-Flash Chat Completions
+    /// tool-reference syntax. Opaque model names can inherit the Flash contract
+    /// through the registered aliases.
+    pub fn supports_chat_tool_references(self, model: &str) -> bool {
+        self == Self::Zai && zai::is_glm53_flash(model)
+    }
+
     /// The thinking on/off preference the profile reads from a request's
     /// effective `reasoning_effort` (`thinking.effort`, else the top-level
     /// field) when the request states no `thinking.type`. The OpenAI reading
     /// ([`thinking_from_reasoning_effort`]: `none` and `minimal` switch
     /// thinking off, every other value leaves the template's default) for
-    /// every profile but MiniMax, whose contract keeps thinking on for every
-    /// value: `none` is the model's default depth and `minimal` is `low`.
+    /// every profile but MiniMax, whose contract reads `none` as thinking off
+    /// (the request answers as one with `thinking.type: disabled` does: no
+    /// reasoning, `reasoning_tokens` 0) and `minimal` as its lowest named
+    /// level, `low`, thinking on. Which values reach the template is the
+    /// profile's second reading, [`Self::template_reasoning_effort`].
     pub fn thinking_from_reasoning_effort(self, reasoning_effort: Option<&str>) -> Option<bool> {
         match self {
-            ProviderProfile::Minimax => None,
+            ProviderProfile::Minimax => match reasoning_effort {
+                Some("none") => Some(false),
+                _ => None,
+            },
             _ => thinking_from_reasoning_effort(reasoning_effort),
+        }
+    }
+
+    /// The `reasoning_effort` the prompt is rendered with, from the request's
+    /// effective effort and the thinking preference the prompt renders with
+    /// (the typed toggle, else [`Self::thinking_from_reasoning_effort`]): the
+    /// value as sent under every profile but MiniMax, where the template owns
+    /// the level-to-value mapping, defaulting and validation. The MiniMax
+    /// templates write the value into an effort tag the model reads
+    /// literally, and the contract names the levels: `low`, `medium`, `high`,
+    /// `xhigh` and `max` reach the template, `minimal` reaches it as `low`;
+    /// any other value renders no effort (`none` switches thinking off
+    /// instead, an unknown level is the default depth), and no effort is
+    /// rendered while thinking is off, where the contract ignores it.
+    pub fn template_reasoning_effort(
+        self,
+        reasoning_effort: Option<&str>,
+        thinking: Option<bool>,
+    ) -> Option<&str> {
+        let effort = reasoning_effort?;
+        match self {
+            ProviderProfile::Minimax => {
+                if thinking == Some(false) {
+                    return None;
+                }
+                if effort == minimax::EFFORT_MINIMAL {
+                    return Some(minimax::EFFORT_LOW);
+                }
+                minimax::EFFORT_LEVELS.contains(&effort).then_some(effort)
+            }
+            _ => Some(effort),
+        }
+    }
+
+    /// The thinking preference an explicit template switch in the request's
+    /// `chat_template_kwargs` states, read by the profile that knows its
+    /// templates' key: under MiniMax `thinking_mode` `enabled` / `disabled`
+    /// (the templates' own tri-state switch; `adaptive` or any other value
+    /// leaves the default); `None` under every other profile, whose
+    /// templates' switches the gateway reads from the template text instead.
+    /// The gateway applies it where the template reads that key (its detected
+    /// thinking key is `thinking_mode`), as the backed plan and the parser do
+    /// for the mode: there the explicit switch ranks above the typed toggle
+    /// and the effort, as the template renders it; elsewhere it is inert and
+    /// the typed toggle and the effort decide.
+    pub fn thinking_from_template_kwargs(
+        self,
+        kwargs: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Option<bool> {
+        match self {
+            ProviderProfile::Minimax => match kwargs?.get(minimax::THINKING_MODE_KEY)?.as_str()? {
+                minimax::THINKING_MODE_ENABLED => Some(true),
+                minimax::THINKING_MODE_DISABLED => Some(false),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -293,8 +362,13 @@ impl ProviderProfile {
         )
     }
 
-    /// The vendor a model id names in one of its `/`-separated segments.
+    /// The vendor a model id names in one of its `/`-separated segments,
+    /// read in one walk: the first segment naming a vendor decides; with
+    /// none, the id is OpenAI's own when a segment is OpenAI's and no
+    /// segment is `gpt-oss` (the rule of [`is_openai_vendor_model`]).
     fn from_model_segments(model: &str) -> Self {
+        let mut openai = false;
+        let mut gpt_oss = false;
         for segment in model.split('/') {
             if deepseek::matches_model(segment) {
                 return ProviderProfile::DeepSeek;
@@ -315,8 +389,10 @@ impl ProviderProfile {
             {
                 return ProviderProfile::Zai;
             }
+            gpt_oss = gpt_oss || starts_with_ignore_ascii_case(segment, "gpt-oss");
+            openai = openai || is_openai_segment(segment);
         }
-        if is_openai_vendor_model(model) {
+        if openai && !gpt_oss {
             return ProviderProfile::OpenAi;
         }
         ProviderProfile::Generic
@@ -476,6 +552,19 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
+/// The effort fields a request has, `reasoning_effort` and
+/// `thinking.effort`. A profile writes its levels into them through this.
+fn effort_fields(req: &mut ChatCompletionRequest) -> impl Iterator<Item = &mut String> {
+    [
+        req.reasoning_effort.as_mut(),
+        req.thinking
+            .as_mut()
+            .and_then(|thinking| thinking.effort.as_mut()),
+    ]
+    .into_iter()
+    .flatten()
+}
+
 /// Whether the model id names one of OpenAI's own hosted models: `gpt-*`
 /// (but not the open-weight `gpt-oss-*`), `chatgpt-*`, `codex-*`, the
 /// `o1`/`o3`/`o4` reasoning series, `computer-use-preview`, or a model behind
@@ -488,6 +577,24 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
 /// requests through to the engine, whose grammar compiler decides what it can
 /// constrain, so the gateway does not refuse ahead of it.
 pub fn is_openai_vendor_model(model: &str) -> bool {
+    let mut openai = false;
+    for segment in model.split('/') {
+        // The open-weight gpt-oss models are served locally whatever route
+        // segment precedes or follows them: never the vendor's hosted
+        // contract.
+        if starts_with_ignore_ascii_case(segment, "gpt-oss") {
+            return false;
+        }
+        openai = openai || is_openai_segment(segment);
+    }
+    openai
+}
+
+/// One `/`-separated segment of a model id that is OpenAI's: the `openai`
+/// route segment, one of the hosted families' prefixes, or the reasoning
+/// series. The `gpt-oss` exception is the callers' to apply over the whole
+/// id, so the readers walk it once.
+fn is_openai_segment(segment: &str) -> bool {
     const PREFIXES: [&str; 6] = [
         "gpt-",
         "chatgpt-",
@@ -496,21 +603,11 @@ pub fn is_openai_vendor_model(model: &str) -> bool {
         "text-embedding-",
         "omni-moderation",
     ];
-    // The open-weight gpt-oss models are served locally whatever route
-    // segment precedes them: never the vendor's hosted contract.
-    if model
-        .split('/')
-        .any(|segment| starts_with_ignore_ascii_case(segment, "gpt-oss"))
-    {
-        return false;
-    }
-    model.split('/').any(|segment| {
-        segment.eq_ignore_ascii_case("openai")
-            || PREFIXES
-                .iter()
-                .any(|prefix| starts_with_ignore_ascii_case(segment, prefix))
-            || is_openai_reasoning_series(segment)
-    })
+    segment.eq_ignore_ascii_case("openai")
+        || PREFIXES
+            .iter()
+            .any(|prefix| starts_with_ignore_ascii_case(segment, prefix))
+        || is_openai_reasoning_series(segment)
 }
 
 /// `o1`, `o3`, `o4-mini`, `o3-pro-2025-06-10`: an `o`, the series digit, then
@@ -730,6 +827,7 @@ mod tests {
             "meta-llama/Llama-3.3-70B-Instruct",
             "openai/gpt-oss-120b",
             "gpt-oss-20b",
+            "gpt-4.1/gpt-oss-20b",
             "olmo-2",
             "o5",
             "m1",
@@ -799,6 +897,7 @@ mod tests {
         for model in [
             "",
             "/models/llama-3",
+            "gpt-4.1/gpt-oss-20b",
             "qwen3-8b",
             "Qwen/Qwen3-VL-8B-Instruct",
             "gpt-oss-20b",

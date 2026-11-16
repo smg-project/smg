@@ -32,8 +32,10 @@ TOKENIZER_FILES = [
     "merges.txt",
     "tokenizer.model",  # SentencePiece
     "tiktoken.model",  # tiktoken
+    "tekken.json",  # the tekken vocabulary file
     "chat_template.json",
     "preprocessor_config.json",  # multimodal image preprocessor
+    "image_preprocessing.json",  # native image preprocessing policy
     "processor_config.json",  # Transformers v5 nested multimodal processors
     "video_preprocessor_config.json",  # dedicated video preprocessor
 ]

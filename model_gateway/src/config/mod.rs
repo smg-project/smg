@@ -1,14 +1,20 @@
 pub(crate) mod bounds;
 pub mod builder;
+pub(crate) mod redacted;
+pub mod secrets;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod types;
 pub(crate) mod validation;
+mod worker_settings;
 
 pub use builder::*;
 pub use types::*;
 pub(crate) use validation::parse_listen_ip;
 pub use validation::{
     available_cpus, bind_socket_addr, dp_minimum_tokens_scheduler_scope_warning, parse_bind_host,
-    runtime_worker_threads_oversubscription, validate_mesh_listener_port,
+    runtime_worker_threads_oversubscription, unused_credentials_warning,
+    unused_credentials_warnings, validate_encode_policy, validate_mesh_listener_port,
     validate_mesh_server_name, validate_worker_url, RUNTIME_WORKER_THREADS_CEILING,
     RUNTIME_WORKER_THREADS_PER_CPU,
 };

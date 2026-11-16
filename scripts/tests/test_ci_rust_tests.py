@@ -15,6 +15,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -33,8 +34,16 @@ SPLIT_PACKAGES = {
 INFRA_FILES = (
     "Cargo.toml",
     "Cargo.lock",
+    "rust-toolchain.toml",
     ".cargo/config.toml",
+    ".github/actions/setup-rust/action.yml",
     "scripts/ci_rust_tests.sh",
+    "scripts/ci_install_rust.sh",
+    "scripts/ci_apt_mirror.sh",
+    "scripts/ci_apt_update.sh",
+    "scripts/ci_retry.sh",
+    "scripts/ci_install_build_deps.sh",
+    "scripts/ci_install_protoc.sh",
     ".github/workflows/pr-test-rust.yml",
 )
 
@@ -193,12 +202,16 @@ class ShardTableTests(unittest.TestCase):
                     )
 
     def test_shard_filters_cover_the_build_infrastructure(self):
+        # The workflow's rust-ci filter is its own copy of this list (it comes
+        # before the rust-infra anchor, so it cannot reuse it) and the only
+        # gate for rust-lint and the aarch64 job, so it is read beside the
+        # shard filters.
         filters = path_filters()
-        for row in shard_table():
+        for name in sorted({row["filter"] for row in shard_table()} | {"rust-ci"}):
             for path in INFRA_FILES:
-                self.assertTrue(
-                    filter_matches(filters[row["filter"]], path), f"{row['filter']} misses {path}"
-                )
+                self.assertTrue(filter_matches(filters[name], path), f"{name} misses {path}")
+        missing = sorted(set(filters["rust-infra"]) - set(filters["rust-ci"]))
+        self.assertEqual(missing, [], f"rust-ci misses rust-infra patterns: {missing}")
 
     def test_shard_filters_exclude_unrelated_crates(self):
         filters = path_filters()
@@ -230,6 +243,75 @@ class ShardTableTests(unittest.TestCase):
             "examples/wasm/README.md",
         ):
             self.assertFalse(filter_matches(filters["rust-gateway"], path), path)
+
+    def test_the_kv_shard_builds_the_example_policy_plugin_and_requires_it(self):
+        # The policy crate's tests load the example plugin as its own build
+        # line wrote it: the shard that runs them builds it first, requires
+        # it, and runs on a change to the example or to the tool's installer.
+        row = next(r for r in shard_table() if r["shard"] == "kv")
+        self.assertEqual(row["needs"], "policy-guest")
+        workflow = WORKFLOW.read_text()
+        # The step: the pinned tool, the line a user runs, then, inside the
+        # guest's directory, the repository's formatter (nightly) and the
+        # pinned clippy, which the workspace's own runs do not reach.
+        step = workflow.split("- name: Build the example policy plugin", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        for line in (
+            "bash scripts/ci_install_wasm_tools.sh",
+            "bash examples/wasm/wasm-guest-policy/build.sh",
+            "cd examples/wasm/wasm-guest-policy",
+            "rustup toolchain install nightly --profile minimal --component rustfmt",
+            "cargo +nightly fmt -- --check",
+            "cargo clippy --locked --target wasm32-unknown-unknown --target-dir target -- -D warnings",
+        ):
+            self.assertIn(line, step)
+        self.assertIn(
+            "SMG_REQUIRE_POLICY_GUEST: ${{ contains(matrix.needs, 'policy-guest') && '1' || '' }}",
+            workflow,
+        )
+        filters = path_filters()
+        for path in (
+            "examples/wasm/wasm-guest-policy/src/lib.rs",
+            "examples/wasm/wasm-guest-policy/Cargo.lock",
+            "examples/wasm/wasm-guest-policy/build.sh",
+            "scripts/ci_install_wasm_tools.sh",
+        ):
+            self.assertTrue(filter_matches(filters["rust-kv"], path), path)
+        # The other guests are the agentic shard's: they do not run this one.
+        self.assertFalse(
+            filter_matches(filters["rust-kv"], "examples/wasm/wasm-guest-storage-hook/src/lib.rs")
+        )
+
+    def test_the_kv_shard_turns_on_every_feature_a_policy_test_target_requires(self):
+        # cargo skips a test target whose required features are off, in
+        # silence: the shard's line turns each of them on.
+        manifest = tomllib.loads((REPO / "crates/policy_controller/Cargo.toml").read_text())
+        package = manifest["package"]["name"]
+        line = next(
+            text
+            for text in SCRIPT.read_text().splitlines()
+            if f"-p {package} " in text and "--features" in text
+        )
+        todo = ["default"] + [
+            feature.split("/", 1)[1]
+            for feature in re.search(r"--features ([^\s\"]+)", line).group(1).split(",")
+            if feature.startswith(f"{package}/")
+        ]
+        features = manifest.get("features", {})
+        on = set()
+        while todo:
+            feature = todo.pop()
+            if feature in on:
+                continue
+            on.add(feature)
+            todo.extend(
+                name
+                for name in features.get(feature, [])
+                if not name.startswith("dep:") and "/" not in name
+            )
+        for target in manifest.get("test", []):
+            for need in target.get("required-features", []):
+                self.assertIn(need, on, f"the kv shard would skip tests/{target['name']}.rs")
 
     def test_every_shard_has_a_filter_and_setup_flags_the_workflow_knows(self):
         filters = path_filters()
@@ -264,7 +346,7 @@ class ShardTableTests(unittest.TestCase):
                 {
                     "shard": "multimodal",
                     "filter": "rust-multimodal",
-                    "needs": "golden,ffmpeg",
+                    "needs": "golden,ffmpeg,turbojpeg",
                     "test_timeout": 20,
                 }
             ],
@@ -282,6 +364,58 @@ class ShardTableTests(unittest.TestCase):
     def test_check_mode_accepts_the_table(self):
         out = script("check")
         self.assertIn(": OK", out.strip().splitlines()[-1])
+
+
+class RunModeTests(unittest.TestCase):
+    """`run <shard>` runs every invocation of the shard and fails at the end if any did."""
+
+    def run_tokenizer(
+        self, failing_calls: set[int]
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        """The tokenizer shard (two invocations, no metadata read) under a cargo stub on PATH that
+        records each call's arguments and exits 101 on the calls numbered in ``failing_calls``."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stubs = Path(tmp) / "bin"
+            stubs.mkdir()
+            calls = Path(tmp) / "calls"
+            calls.write_text("")
+            stub = stubs / "cargo"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                'printf "%s\\n" "$*" >> "$CARGO_STUB_CALLS"\n'
+                'n=$(wc -l < "$CARGO_STUB_CALLS")\n'
+                'case " $CARGO_STUB_FAIL " in *" $n "*) exit 101 ;; esac\n'
+                "exit 0\n"
+            )
+            stub.chmod(0o755)
+            done = subprocess.run(
+                ["bash", str(SCRIPT), "run", "tokenizer"],
+                capture_output=True,
+                text=True,
+                cwd=REPO,
+                env={
+                    "PATH": f"{stubs}:/usr/bin:/bin",
+                    "CARGO_STUB_CALLS": str(calls),
+                    "CARGO_STUB_FAIL": " ".join(str(n) for n in sorted(failing_calls)),
+                },
+            )
+            return done, calls.read_text().splitlines()
+
+    def test_a_red_invocation_does_not_stop_the_ones_after_it_and_the_shard_still_fails(self):
+        done, calls = self.run_tokenizer(failing_calls={1})
+        self.assertEqual(
+            calls,
+            [
+                "test --no-fail-fast -p llm-tokenizer",
+                "test --no-fail-fast -p llm-tokenizer --features tokenizers-v1",
+            ],
+        )
+        self.assertEqual(done.returncode, 101, done.stderr)
+
+    def test_a_shard_whose_invocations_all_pass_exits_0(self):
+        done, calls = self.run_tokenizer(failing_calls=set())
+        self.assertEqual(len(calls), 2, done.stderr)
+        self.assertEqual(done.returncode, 0, done.stderr)
 
 
 if __name__ == "__main__":

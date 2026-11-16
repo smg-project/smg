@@ -97,18 +97,27 @@ def test_mm_item_limits_follow_the_engines_per_prompt_limits():
     assert model_info.mm_item_limits(SimpleNamespace(model_config=_model_config())) == ""
     bare = _model_config(is_multimodal_model=True, multimodal_config=SimpleNamespace())
     assert model_info.mm_item_limits(SimpleNamespace(model_config=bare)) == ""
-    # The resolved --limit-mm-per-prompt of the modalities a vLLM worker takes,
-    # as sorted pairs the Router parses.
+    # The resolved --limit-mm-per-prompt of every modality the Router's media
+    # pipeline counts, audio included, as the pairs the Router parses, in the
+    # label order the SGLang servicer writes too.
     limits = {"image": 8, "video": 2, "audio": 1}
     config = _model_config(
         is_multimodal_model=True,
         multimodal_config=SimpleNamespace(get_limit_per_prompt=limits.__getitem__),
     )
     label = model_info.mm_item_limits(SimpleNamespace(model_config=config))
-    assert label == "image=8,video=2"
+    assert label == "audio=1,image=8,video=2"
     info = vllm_engine_pb2.GetServerInfoResponse(mm_item_limits=label)
     parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
-    assert parsed.mm_item_limits == "image=8,video=2"
+    assert parsed.mm_item_limits == "audio=1,image=8,video=2"
+    # A modality the engine resolves to no positive count, or to something that
+    # is not a count, is left out: the Router keeps its own cap for it.
+    limits = {"image": 4, "video": 0, "audio": None}
+    config = _model_config(
+        is_multimodal_model=True,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=limits.__getitem__),
+    )
+    assert model_info.mm_item_limits(SimpleNamespace(model_config=config)) == "image=4"
 
 
 def test_mm_encoder_budget_is_the_engines_own(caplog):

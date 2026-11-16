@@ -1,26 +1,25 @@
 //! Chat response processing stage: Handles both streaming and non-streaming responses
 //!
-//! - For streaming: Spawns background task and returns SSE response (early exit)
+//! - For streaming: Builds the reading of the engine's answer and returns the SSE response
+//!   whose body drives it (early exit)
 //! - For non-streaming: Collects all responses and builds final ChatCompletionResponse
 
 use std::sync::Arc;
 
 use axum::response::Response;
-use tracing::error;
 
 use crate::{
     observability::metrics::metrics_labels,
-    routers::{
-        error,
-        grpc::{
-            common::stages::RateLimitCell,
-            context::{DispatchContext, FinalResponse},
-            regular::{processor, streaming},
-            spec::ResponseSpec,
-            utils::StreamSource,
-        },
+    routers::grpc::{
+        common::stages::RateLimitCell,
+        context::{stage_output, wrong_response_spec, DispatchContext, FinalResponse},
+        regular::{processor, streaming},
+        spec::ResponseSpec,
+        utils::StreamSource,
     },
 };
+
+const FUNCTION: &str = "ChatResponseProcessingStage::process";
 
 /// Chat response processing stage
 pub(crate) struct ChatResponseProcessingStage {
@@ -50,51 +49,16 @@ impl ChatResponseProcessingStage {
         spec: ResponseSpec,
     ) -> Result<Option<Response>, Response> {
         let ResponseSpec::Chat(chat_request) = spec else {
-            error!(
-                function = "ChatResponseProcessingStage::process",
-                "Wrong response spec"
-            );
-            return Err(error::internal_error(
-                "wrong_response_spec",
-                "Wrong response spec",
-            ));
+            return Err(wrong_response_spec(FUNCTION));
         };
 
         let is_streaming = ctx.streaming;
 
-        // Extract execution result
-        let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
-            error!(
-                function = "ChatResponseProcessingStage::process",
-                "No execution result"
-            );
-            error::internal_error("no_execution_result", "No execution result")
-        })?;
+        let execution_result = stage_output(ctx.response.execution_result.take(), FUNCTION)?;
 
-        // Get dispatch metadata (needed by both streaming and non-streaming)
-        let dispatch = ctx
-            .dispatch
-            .as_ref()
-            .ok_or_else(|| {
-                error!(
-                    function = "ChatResponseProcessingStage::process",
-                    "Dispatch metadata not set"
-                );
-                error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
-            })?
-            .clone();
+        let dispatch = stage_output(ctx.dispatch.as_ref(), FUNCTION)?.clone();
 
-        // Get cached tokenizer (resolved once in preparation stage)
-        let tokenizer = ctx.tokenizer_arc().ok_or_else(|| {
-            error!(
-                function = "ChatResponseProcessingStage::process",
-                "Tokenizer not cached in context"
-            );
-            error::internal_error(
-                "tokenizer_not_cached",
-                "Tokenizer not cached in context - preparation stage may have been skipped",
-            )
-        })?;
+        let tokenizer = stage_output(ctx.tokenizer_arc(), FUNCTION)?;
 
         if is_streaming {
             // Read derived skip_special_tokens (set in preparation, survives request_building .take())
@@ -113,7 +77,7 @@ impl ChatResponseProcessingStage {
                 .and_then(RateLimitCell::take_for_streaming_handoff);
 
             // Streaming: Use StreamingProcessor and return SSE response. The
-            // stream task consumes the spec, never the parsed request.
+            // reading consumes the spec, never the parsed request.
             let source = StreamSource::new(
                 ctx.workers.as_ref(),
                 &dispatch,
@@ -140,16 +104,7 @@ impl ChatResponseProcessingStage {
         // Non-streaming: Delegate to ResponseProcessor
         let request_logprobs = chat_request.logprobs;
 
-        let stop_decoder = ctx.response.stop_decoder.as_mut().ok_or_else(|| {
-            error!(
-                function = "ChatResponseProcessingStage::process",
-                "Stop decoder not initialized"
-            );
-            error::internal_error(
-                "stop_decoder_not_initialized",
-                "Stop decoder not initialized",
-            )
-        })?;
+        let stop_decoder = stage_output(ctx.response.stop_decoder.as_mut(), FUNCTION)?;
 
         let (response, counts) = self
             .processor

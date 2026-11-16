@@ -1,6 +1,10 @@
 //! What the crate's capture tests drive a request through: a worker at an
 //! address of the test's choosing, a worker source over such workers, the
-//! HTTP client they share, and an address nothing answers at.
+//! HTTP client they share, an address nothing answers at, a provider's
+//! answer of the test's making, a provider stub that sends one whole or cut
+//! short, how a test reads an answer's body back as text, and the counting
+//! allocator every unit test of the crate runs under (the allocation pins
+//! read it).
 
 use std::{
     fmt,
@@ -10,14 +14,21 @@ use std::{
 };
 
 use async_trait::async_trait;
-use axum::{http::HeaderMap, response::Response};
+use axum::{
+    body::to_bytes,
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
+    response::Response,
+};
 use openai_protocol::worker::ProviderType;
 use rustls::crypto::ring::default_provider;
-use tokio::net::TcpSocket;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpSocket},
+};
 
 use crate::{
     error,
-    worker::{ExternalWorker, LoadHold, SelectWorkerRequest, WorkerSource, WorkerStats},
+    worker::{self, ExternalWorker, LoadHold, SelectWorkerRequest, WorkerSource, WorkerStats},
     RetryConfig,
 };
 
@@ -42,6 +53,63 @@ pub(crate) fn http_client() -> reqwest::Client {
         .expect("a client")
 }
 
+/// A provider's answer of the test's making: `status`, the content type
+/// when one is given, and `body`.
+pub(crate) fn upstream(
+    status: u16,
+    content_type: Option<&str>,
+    body: impl Into<reqwest::Body>,
+) -> reqwest::Response {
+    let mut builder = http::Response::builder().status(status);
+    if let Some(ct) = content_type {
+        builder = builder.header(CONTENT_TYPE, ct);
+    }
+    reqwest::Response::from(builder.body(body.into()).expect("a response"))
+}
+
+/// The whole body of `response`, as text.
+pub(crate) async fn text_of(response: Response) -> String {
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("a body");
+    String::from_utf8(bytes.to_vec()).expect("utf-8")
+}
+
+/// A provider stub at an address of its own. Every request is answered
+/// under `status` with `body`; with `cut_short`, the head declares one byte
+/// more than the stub sends, and the client's read of the body fails.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test stub server lives for the duration of the test process"
+)]
+pub(crate) async fn answering(status: u16, body: &'static str, cut_short: bool) -> SocketAddr {
+    let status = StatusCode::from_u16(status).expect("a status code");
+    let declared = body.len() + usize::from(cut_short);
+    let answer = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+         content-length: {declared}\r\nconnection: close\r\n\r\n{body}"
+    );
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("a loopback port");
+    let addr = listener.local_addr().expect("the bound address");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0_u8; 4096];
+            // The answer follows the request and the close follows the
+            // client's: closed over unread bytes, the connection is reset
+            // and the answer may be lost with it.
+            if stream.read(&mut request).await.is_ok()
+                && stream.write_all(answer.as_bytes()).await.is_ok()
+                && stream.shutdown().await.is_ok()
+            {
+                while stream.read(&mut request).await.is_ok_and(|read| read > 0) {}
+            }
+        }
+    });
+    addr
+}
+
 /// A worker at one address, serving model `m`, with no API key of its own.
 pub(crate) struct StubWorker {
     url: String,
@@ -55,7 +123,7 @@ impl StubWorker {
     pub(crate) fn at(url: &str) -> Arc<dyn ExternalWorker> {
         Arc::new(Self {
             url: url.to_string(),
-            redacted: crate::worker::redacted_url(url).into_owned(),
+            redacted: worker::redacted_url(url).into_owned(),
             healthy: true,
             client: http_client(),
         })
@@ -69,7 +137,7 @@ impl StubWorker {
     pub(crate) fn unhealthy_at(url: &str) -> Arc<dyn ExternalWorker> {
         Arc::new(Self {
             url: url.to_string(),
-            redacted: crate::worker::redacted_url(url).into_owned(),
+            redacted: worker::redacted_url(url).into_owned(),
             healthy: false,
             client: http_client(),
         })
@@ -219,5 +287,85 @@ mod tests {
         let taken = TcpListener::bind(refused.addr()).expect_err("the port is held");
         assert_eq!(taken.kind(), ErrorKind::AddrInUse, "{taken}");
         assert_eq!(refused.addr().port(), refused.port());
+    }
+}
+
+/// The crate's unit tests run under a counting allocator, so an allocation
+/// pin can read what a call allocated: the system allocator with a
+/// per-thread count of allocation and reallocation calls. Test builds only.
+pub(crate) mod counting_alloc {
+    #![expect(
+        unsafe_code,
+        reason = "a counting global allocator is the only way to see what a call allocated; test builds only"
+    )]
+
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+
+    thread_local! {
+        /// Allocation and reallocation calls this thread made.
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+        /// Bytes this thread requested, the growth of a reallocation once.
+        static BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Allocation and reallocation calls this thread made so far.
+    pub(crate) fn calls() -> usize {
+        CALLS.with(Cell::get)
+    }
+
+    /// Bytes this thread requested so far (the growth of a reallocation
+    /// counts once).
+    pub(crate) fn bytes() -> usize {
+        BYTES.with(Cell::get)
+    }
+
+    fn count(bytes: usize) {
+        CALLS.with(|calls| calls.set(calls.get() + 1));
+        BYTES.with(|total| total.set(total.get() + bytes));
+    }
+
+    struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            count(layout.size());
+            // SAFETY: the caller's layout contract, forwarded to the system allocator.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr` came from `alloc` or `realloc` with this layout.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            count(new_size.saturating_sub(layout.size()));
+            // SAFETY: `ptr` came from this allocator with `layout`; the new size is the caller's.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: Counting = Counting;
+
+    /// The count moves by one for one allocation and one reallocation,
+    /// and not for a free, and the bytes by what was requested, a
+    /// reallocation's growth once: what every pin in the crate reads.
+    #[test]
+    fn the_count_follows_this_threads_allocation_calls() {
+        let before = calls();
+        let before_bytes = bytes();
+        let mut bytes_held: Vec<u8> = Vec::with_capacity(8);
+        assert_eq!(calls() - before, 1, "one allocation");
+        assert_eq!(bytes() - before_bytes, 8, "the allocation's bytes");
+        bytes_held.extend(std::iter::repeat_n(0u8, 64));
+        assert_eq!(calls() - before, 2, "one reallocation on top");
+        assert_eq!(bytes() - before_bytes, 64, "the reallocation's growth once");
+        drop(bytes_held);
+        assert_eq!(calls() - before, 2, "a free is not counted");
+        assert_eq!(bytes() - before_bytes, 64, "a free takes nothing back");
     }
 }

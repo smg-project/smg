@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
+use clap::ValueEnum;
 pub use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
 pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
@@ -14,8 +15,8 @@ use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
     worker::{
-        endpoint::Endpoint,
-        overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+        health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+        identity::endpoint::Endpoint,
         ConnectionMode, RuntimeType,
     },
 };
@@ -95,6 +96,10 @@ pub struct RouterConfig {
     /// Per-request sticky-session routing (header keys, rid-lineage fallback).
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
+    /// Whether, and how, a request's sticky key pins it to one engine of a
+    /// grouped data-parallel worker; see [`GroupedDpSticky`].
+    #[serde(default)]
+    pub grouped_dp_sticky: GroupedDpSticky,
     /// How strictly PD placement pairs a prefill with a decode on their KV
     /// transfer protocol; see [`PdPairingMode`].
     #[serde(default)]
@@ -118,6 +123,17 @@ pub struct RouterConfig {
     /// Bind host of the admin listener; `None` binds it on `host`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_host: Option<String>,
+    /// Most client connections the admin listener (`admin_port`) holds open
+    /// at once, bounded as `max_connections` bounds the data listener and
+    /// counted in the same `smg_http_connections_rejected_total`. `0` is no
+    /// bound. The bound is the admin listener's own, so the control plane
+    /// stays reachable while the data plane is saturated, and a client that
+    /// reaches the admin listener cannot hold it open without limit. Needs
+    /// `admin_port` (the validator refuses the bound without it). Probes on
+    /// the admin port fall under the bound like any connection;
+    /// `health_check_port` is the listener no bound covers.
+    #[serde(default)]
+    pub admin_max_connections: usize,
     /// Explicit async runtime worker-thread count. `None` uses tokio's default
     /// (`available_parallelism()`), which already honors the cgroup CPU quota on
     /// Rust 1.95+ and is therefore container-aware. `Some` pins a count from 1
@@ -169,10 +185,12 @@ pub struct RouterConfig {
     /// a TLS handshake and upgraded connections included). A connection
     /// beyond the bound is closed at once, before any TLS handshake and
     /// without a response, and counted in
-    /// `smg_http_connections_rejected_total`. The admin listener
-    /// (`admin_port`) and the probe listener (`health_check_port`) are
-    /// outside the bound, so the control plane and the probes stay reachable
-    /// while the data plane is saturated. `0` is no bound.
+    /// `smg_http_connections_rejected_total`. Probes on the data port fall
+    /// under the bound like any connection; `health_check_port` is the
+    /// listener no bound covers. The admin listener (`admin_port`) is outside
+    /// this bound, so the control plane stays reachable while the data plane
+    /// is saturated, and inside its own, `admin_max_connections`. `0` is no
+    /// bound.
     #[serde(default)]
     pub max_connections: usize,
     /// Seconds a request may take: the read of its body overall (`408` past
@@ -499,8 +517,9 @@ pub struct RouterConfig {
     /// legacy admission.
     #[serde(default)]
     pub priority_scheduler_config: Option<String>,
-    /// Cap on per-tenant scheduler metric label cardinality (top-N tenants
-    /// by inflight; the remainder bucket under `tenant="other"`).
+    /// Cap on the distinct tenants the scheduler's clamp and unknown-priority
+    /// counters keep as `tenant` series of their own (the first N seen; the
+    /// remainder bucket under `tenant="other"`).
     #[serde(default = "default_priority_scheduler_tenant_metric_top_n")]
     pub priority_scheduler_tenant_metric_top_n: u32,
     /// Enable per-tenant LLM token/request rate limiting. When false
@@ -572,7 +591,9 @@ pub struct RouterConfig {
     /// Bounds of the memory history backend (`history_backend = "memory"`):
     /// the most stored responses and conversation items it keeps and how long
     /// it keeps a record; unset = the defaults (10,000 responses, 100,000
-    /// items, one day).
+    /// items, one day). The Messages route's thread store, in memory under
+    /// every backend, keeps at most `max_responses` turns for the same
+    /// retention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
     /// For reasoning models (e.g., deepseek-r1, qwen3)
@@ -738,7 +759,11 @@ pub enum AccessLogField {
     /// end; a body that ended early (a client that left, a stream that
     /// failed) has the bytes out so far on that line as
     /// `response_bytes_sent`, a key of its own, so the length is never
-    /// recorded twice.
+    /// recorded twice. A streamed body's end line is written after the
+    /// output was read, so it also carries what the request learned while
+    /// it streamed: the `symphony.*` fields of an output the Symphony reader
+    /// did not read clean, which the finish line of a stream goes out too
+    /// early to carry.
     ResponseBytes,
     /// The worker the request was routed to.
     Worker,
@@ -1001,11 +1026,10 @@ pub enum RoutingMode {
     Gemini { worker_urls: Vec<String> },
 }
 
-/// The derive, with every worker URL masked like [`Endpoint::redacted`]: the
-/// mode is in the gateway's start-up lines, and the derive would have written
-/// the configured URLs with their credentials.
-impl std::fmt::Debug for RoutingMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl RoutingMode {
+    /// This mode with every worker URL masked like [`Endpoint::redacted`]:
+    /// what the start-up lines and the configuration view show.
+    pub fn redacted(&self) -> Self {
         fn masked(urls: &[String]) -> Vec<String> {
             urls.iter().map(|url| Endpoint::redacted_str(url)).collect()
         }
@@ -1015,9 +1039,57 @@ impl std::fmt::Debug for RoutingMode {
                 .collect()
         }
         match self {
+            RoutingMode::Regular { worker_urls } => RoutingMode::Regular {
+                worker_urls: masked(worker_urls),
+            },
+            RoutingMode::PrefillDecode {
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+            } => RoutingMode::PrefillDecode {
+                prefill_urls: masked_with_ports(prefill_urls),
+                decode_urls: masked(decode_urls),
+                prefill_policy: prefill_policy.clone(),
+                decode_policy: decode_policy.clone(),
+            },
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls,
+                encode_policy,
+                prefill_policy,
+                decode_policy,
+            } => RoutingMode::EncodePrefillDecode {
+                encode_urls: masked_with_ports(encode_urls),
+                prefill_urls: masked_with_ports(prefill_urls),
+                decode_urls: masked(decode_urls),
+                encode_policy: encode_policy.clone(),
+                prefill_policy: prefill_policy.clone(),
+                decode_policy: decode_policy.clone(),
+            },
+            RoutingMode::OpenAI { worker_urls } => RoutingMode::OpenAI {
+                worker_urls: masked(worker_urls),
+            },
+            RoutingMode::Anthropic { worker_urls } => RoutingMode::Anthropic {
+                worker_urls: masked(worker_urls),
+            },
+            RoutingMode::Gemini { worker_urls } => RoutingMode::Gemini {
+                worker_urls: masked(worker_urls),
+            },
+        }
+    }
+}
+
+/// The derive's shape over [`RoutingMode::redacted`]: the mode is in the
+/// gateway's start-up lines, and the derive would have written the configured
+/// URLs with their credentials.
+impl std::fmt::Debug for RoutingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.redacted() {
             RoutingMode::Regular { worker_urls } => f
                 .debug_struct("Regular")
-                .field("worker_urls", &masked(worker_urls))
+                .field("worker_urls", &worker_urls)
                 .finish(),
             RoutingMode::PrefillDecode {
                 prefill_urls,
@@ -1026,10 +1098,10 @@ impl std::fmt::Debug for RoutingMode {
                 decode_policy,
             } => f
                 .debug_struct("PrefillDecode")
-                .field("prefill_urls", &masked_with_ports(prefill_urls))
-                .field("decode_urls", &masked(decode_urls))
-                .field("prefill_policy", prefill_policy)
-                .field("decode_policy", decode_policy)
+                .field("prefill_urls", &prefill_urls)
+                .field("decode_urls", &decode_urls)
+                .field("prefill_policy", &prefill_policy)
+                .field("decode_policy", &decode_policy)
                 .finish(),
             RoutingMode::EncodePrefillDecode {
                 encode_urls,
@@ -1040,24 +1112,24 @@ impl std::fmt::Debug for RoutingMode {
                 decode_policy,
             } => f
                 .debug_struct("EncodePrefillDecode")
-                .field("encode_urls", &masked_with_ports(encode_urls))
-                .field("prefill_urls", &masked_with_ports(prefill_urls))
-                .field("decode_urls", &masked(decode_urls))
-                .field("encode_policy", encode_policy)
-                .field("prefill_policy", prefill_policy)
-                .field("decode_policy", decode_policy)
+                .field("encode_urls", &encode_urls)
+                .field("prefill_urls", &prefill_urls)
+                .field("decode_urls", &decode_urls)
+                .field("encode_policy", &encode_policy)
+                .field("prefill_policy", &prefill_policy)
+                .field("decode_policy", &decode_policy)
                 .finish(),
             RoutingMode::OpenAI { worker_urls } => f
                 .debug_struct("OpenAI")
-                .field("worker_urls", &masked(worker_urls))
+                .field("worker_urls", &worker_urls)
                 .finish(),
             RoutingMode::Anthropic { worker_urls } => f
                 .debug_struct("Anthropic")
-                .field("worker_urls", &masked(worker_urls))
+                .field("worker_urls", &worker_urls)
                 .finish(),
             RoutingMode::Gemini { worker_urls } => f
                 .debug_struct("Gemini")
-                .field("worker_urls", &masked(worker_urls))
+                .field("worker_urls", &worker_urls)
                 .finish(),
         }
     }
@@ -1151,7 +1223,9 @@ pub enum ManualAssignmentMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PdPairingMode {
-    /// Pair on nothing: placement behaves as if no descriptor existed.
+    /// Compare nothing of the KV handoff: placement behaves as if no
+    /// descriptor existed. The gRPC wire still keeps two known runtimes
+    /// apart, since its requests are in the runtime's own message type.
     Off,
     /// A known difference in runtime, transport or KV layout refuses the
     /// pair; unknown components and engine versions pair with anything.
@@ -1249,6 +1323,70 @@ impl Default for RoutingKeyOverrideConfig {
     }
 }
 
+/// How a request with a sticky key is placed on the engines (data-parallel
+/// ranks) of a grouped worker: one worker URL whose socket set several
+/// engines dial (as many as `--zmq-engine-count` above one or `dp_size` on
+/// its spec says, or, given no count, as its engines declare at the
+/// handshake). Routing policies see the group as one worker, and its
+/// connection otherwise sends each request to its least-loaded engine,
+/// which scatters one conversation's turns over the engines' separate
+/// prefix caches. The key is the one sticky routing reads: the first valid
+/// routing-key header, or the body `rid` under the routing-key override.
+/// Only a single generate request is pinned: one without a key, a batch's
+/// prompts and an embedding keep the connection's pick under every mode, and
+/// so does a request whose rank is not among the ranks, counted from 0, that
+/// its connection places a pin on (on vLLM, the engine indices from 0 up to
+/// the first the group lacks). On a disaggregated pair the pin is the
+/// bootstrap room of a single TokenSpeed request: a grouped prefill worker
+/// places the request on the rank its room's residue names, modulo the
+/// engines its connection connected, so the room is moved into the residue
+/// class of the key's rank, and the decode side takes the same room. A
+/// batched or EPD request, or one on another runtime, keeps its random room.
+///
+/// The flag and the configuration file take one spelling, and so does a
+/// caller that parses the setting from a string: the flag's values are this
+/// enum's clap [`ValueEnum`] names, serde writes the same ones, and
+/// [`FromStr`](std::str::FromStr) reads them as clap does.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupedDpSticky {
+    /// No pinning: every request goes to the connection's least-loaded
+    /// engine.
+    #[default]
+    Off,
+    /// Every request of a key to its hash engine, `xxh3(key) % ranks` (the
+    /// worker's engines; on a disaggregated pair, the engines the prefill
+    /// connection connected): the same engine across requests, gateway
+    /// restarts and replicas, however unevenly the keys fall.
+    Hash,
+}
+
+impl GroupedDpSticky {
+    /// The spelling of the flag and the configuration file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Hash => "hash",
+        }
+    }
+}
+
+impl std::str::FromStr for GroupedDpSticky {
+    type Err = String;
+
+    /// The flag's spelling, matched exactly as clap matches it, so a caller
+    /// outside clap refuses what the CLI refuses.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        <Self as ValueEnum>::from_str(value, false).map_err(|_| {
+            let known: Vec<&str> = Self::value_variants()
+                .iter()
+                .map(|sticky| sticky.as_str())
+                .collect();
+            format!("expected one of {}", known.join(", "))
+        })
+    }
+}
+
 /// Under-layer index the cache_aware policy keeps per model.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1272,12 +1410,24 @@ pub enum PowerOfTwoLoadMetric {
     Requests,
     /// Router in-flight requests of every healthy worker, then expected wait.
     LeastRequests,
+    /// Resident context tokens of every healthy worker, each request also
+    /// priced at `request_tokens`: the decode step's attention and per-request
+    /// work in one token unit.
+    ResidentTokens { request_tokens: u64 },
 }
 
 impl PowerOfTwoLoadMetric {
-    /// Parse the CLI spelling (`expected_wait` / `requests` / `least_requests`).
+    /// Parse the CLI spelling (`expected_wait` / `requests` / `least_requests`
+    /// / `resident_tokens:<request_tokens>`).
     pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
+        let value = value.trim().to_ascii_lowercase();
+        if let Some(cost) = value.strip_prefix("resident_tokens:") {
+            return cost
+                .parse()
+                .ok()
+                .map(|request_tokens| Self::ResidentTokens { request_tokens });
+        }
+        match value.as_str() {
             "expected_wait" => Some(Self::ExpectedWait),
             "requests" => Some(Self::Requests),
             "least_requests" => Some(Self::LeastRequests),
@@ -1348,7 +1498,7 @@ pub enum PolicyConfig {
         #[serde(default = "default_block_size")]
         block_size: usize,
         /// KV-usage spread (hottest minus coldest backend, 0.0–1.0) above which
-        /// cache affinity is abandoned for shortest-queue. `>= 1.0` disables.
+        /// cache affinity is abandoned for expected-wait routing. `>= 1.0` disables.
         #[serde(default = "default_balance_token_usage_threshold")]
         balance_token_usage_threshold: f32,
         /// Backend KV-utilization ceiling (0.0–1.0): a single engine above it
@@ -1422,13 +1572,6 @@ pub enum PolicyConfig {
         /// separate values.
         #[serde(default = "default_least_load_throughput")]
         default_throughput: f64,
-        /// Per-worker waiting-queue cap: skip workers whose reported waiting
-        /// requests, plus dispatches since their last poll, have reached this
-        /// count; when every candidate is at the cap, selection fails and the
-        /// request falls to the router's admission queue. `0` disables. Set
-        /// below the engine's max batch size.
-        #[serde(default)]
-        max_waiting_requests: u32,
     },
 
     #[serde(rename = "bucket")]
@@ -1466,7 +1609,11 @@ pub enum PolicyConfig {
     },
 
     /// Consistent hashing policy using hash ring for session affinity:
-    /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
+    /// - X-SMG-Target-Worker: Direct routing to a specific worker by its index
+    ///   (0-based) among the workers available when the request arrives; an
+    ///   index past them is answered as no available worker, except in a pool
+    ///   with every worker vetoed, which the all-vetoed fallback serves without
+    ///   reading the header
     /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
     /// - Provides O(log n) lookup with minimal redistribution (~1/N keys) on topology change
     #[serde(rename = "consistent_hashing")]
@@ -1582,6 +1729,13 @@ fn default_least_load_throughput() -> f64 {
 /// sets this key is refused with that knob named, never silently ignored.
 pub const RETIRED_POLICY_INTERVAL_KEY: &str = "load_check_interval_secs";
 
+/// least_load's per-worker waiting-queue cap of earlier releases. The router's
+/// overload veto skips a worker whose waiting queue has reached
+/// `worker_overload_waiting_requests` for every policy and, under
+/// `worker_overload_shed`, refuses an all-vetoed pool; a policy configuration
+/// that still sets this key is refused with those knobs named.
+pub const RETIRED_LEAST_LOAD_CAP_KEY: &str = "max_waiting_requests";
+
 /// The checked reader. `remote = "Self"` leaves the derived reader on the
 /// type as an inherent `PolicyConfig::deserialize`, which a path call would
 /// pick over this trait method and so skip the check: read a policy through
@@ -1595,6 +1749,13 @@ impl<'de> Deserialize<'de> for PolicyConfig {
             return Err(de::Error::custom(format!(
                 "`{RETIRED_POLICY_INTERVAL_KEY}` is no longer a policy setting: the load monitor \
                  polls every worker at `load_monitor_interval_secs`; remove the key"
+            )));
+        }
+        if value.get(RETIRED_LEAST_LOAD_CAP_KEY).is_some() {
+            return Err(de::Error::custom(format!(
+                "`{RETIRED_LEAST_LOAD_CAP_KEY}` is no longer a least_load setting: the overload \
+                 veto skips a worker at `worker_overload_waiting_requests` waiting requests for \
+                 every policy, and `worker_overload_shed` refuses an all-vetoed pool; remove the key"
             )));
         }
         PolicyConfig::deserialize(value).map_err(de::Error::custom)
@@ -2085,6 +2246,7 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
+            grouped_dp_sticky: GroupedDpSticky::default(),
             pd_pairing_mode: PdPairingMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
@@ -2099,6 +2261,7 @@ impl Default for RouterConfig {
             header_read_timeout_secs: default_header_read_timeout_secs(),
             idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             max_connections: 0,
+            admin_max_connections: 0,
             request_timeout_secs: 1800, // 30 minutes
             grpc_request_timeout_secs: 0,
             sse_keepalive_secs: default_sse_keepalive_secs(),
@@ -2223,6 +2386,31 @@ impl RouterConfig {
         ConfigValidator::validate(self)
     }
 
+    /// Connection attempts per health-check success stamped on a worker
+    /// named at startup or an external API endpoint.
+    pub(crate) const CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS: u32 = 10;
+
+    /// Connection attempts per health-check success stamped on a worker a
+    /// discovery provider registers: twice a configured worker's, since a
+    /// discovered engine is often published while it is still loading.
+    pub(crate) const DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS: u32 = 20;
+
+    /// The value the gateway stamps on `WorkerSpec::max_connection_attempts`
+    /// for a worker it registers itself (named at startup, an external API
+    /// endpoint, published by a discovery provider): `attempts_per_success`
+    /// for each health-check success the worker must then show, one success
+    /// counted at least, with the path's own multiplier
+    /// ([`Self::CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS`],
+    /// [`Self::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS`]). A worker added
+    /// through the worker API keeps the spec's default instead. The value
+    /// rides on the spec and shows in the connection-detection step's debug
+    /// line; the step's retries follow the registration workflow's retry
+    /// policy, whose attempt count comes from the worker startup timeout and
+    /// check interval, so no behaviour reads this value today.
+    pub(crate) fn connection_attempt_budget(&self, attempts_per_success: u32) -> u32 {
+        self.health_check.success_threshold.max(1) * attempts_per_success
+    }
+
     /// Which Failed workers the health checker removes: the setting as
     /// given, resolved against whether a discovery provider is selected. The
     /// CLI, the Python binding and a configuration file all keep the setting
@@ -2249,19 +2437,6 @@ impl RouterConfig {
     /// Check if service discovery is enabled
     pub fn has_service_discovery(&self) -> bool {
         self.discovery.is_some()
-    }
-
-    /// Check if metrics are enabled
-    pub fn has_metrics(&self) -> bool {
-        self.metrics.is_some()
-    }
-
-    /// Check if tracing is enabled
-    pub fn has_tracing(&self) -> bool {
-        match &self.trace_config {
-            Some(trace_config) => trace_config.enable_trace,
-            None => false,
-        }
     }
 
     pub fn effective_prefill_queue_size(&self) -> usize {
@@ -2672,6 +2847,26 @@ mod tests {
     }
 
     #[test]
+    fn test_admin_max_connections_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to no bound.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("admin_max_connections")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.admin_max_connections, 0);
+
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .admin_max_connections(64)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.admin_max_connections, 64);
+    }
+
+    #[test]
     fn test_sse_keepalive_serde_default_and_roundtrip() {
         // Config files predating the field deserialize to the 15 s default.
         let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
@@ -2895,6 +3090,38 @@ mod tests {
             RoutingKeyOverrideConfig::default().assignment_mode,
             ManualAssignmentMode::Delegate
         );
+    }
+
+    #[test]
+    fn grouped_dp_sticky_is_off_unless_configured_and_spelled_as_the_flag() {
+        // A configuration file that leaves the key out pins nothing.
+        let mut json = serde_json::to_value(RouterConfig::default()).unwrap();
+        assert_eq!(json["grouped_dp_sticky"], "off");
+        json.as_object_mut().unwrap().remove("grouped_dp_sticky");
+        let read: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(read.grouped_dp_sticky, GroupedDpSticky::Off);
+
+        // One spelling everywhere: the flag's values are the file's, and a
+        // parse outside clap takes them as the flag does, exactly.
+        let flag_values: Vec<String> = GroupedDpSticky::value_variants()
+            .iter()
+            .filter_map(GroupedDpSticky::to_possible_value)
+            .map(|value| value.get_name().to_owned())
+            .collect();
+        assert_eq!(flag_values, ["off", "hash"]);
+        for &sticky in GroupedDpSticky::value_variants() {
+            let json = serde_json::to_value(sticky).unwrap();
+            assert_eq!(json, sticky.as_str());
+            assert_eq!(
+                serde_json::from_value::<GroupedDpSticky>(json).unwrap(),
+                sticky
+            );
+            assert_eq!(sticky.as_str().parse::<GroupedDpSticky>(), Ok(sticky));
+        }
+        for refused in ["least_load", "HASH", " hash", ""] {
+            assert!(refused.parse::<GroupedDpSticky>().is_err(), "{refused:?}");
+        }
+        assert!(serde_json::from_value::<GroupedDpSticky>(serde_json::json!("sticky")).is_err());
     }
 
     #[test]
@@ -3228,6 +3455,14 @@ mod tests {
 
     #[test]
     fn test_power_of_two_parameters() {
+        assert_eq!(
+            PowerOfTwoLoadMetric::parse("resident_tokens:62500"),
+            Some(PowerOfTwoLoadMetric::ResidentTokens {
+                request_tokens: 62_500
+            })
+        );
+        assert_eq!(PowerOfTwoLoadMetric::parse("resident_tokens"), None);
+        assert_eq!(PowerOfTwoLoadMetric::parse("resident_tokens:-1"), None);
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_metric: PowerOfTwoLoadMetric::LeastRequests,
         };
@@ -3600,28 +3835,6 @@ discovery:
     }
 
     #[test]
-    fn test_has_metrics() {
-        let config = RouterConfig::default();
-        assert!(!config.has_metrics());
-
-        let config = RouterConfig::builder()
-            .metrics_config(MetricsConfig::default())
-            .build_unchecked();
-        assert!(config.has_metrics());
-    }
-
-    #[test]
-    fn test_has_tracing() {
-        let config = RouterConfig::default();
-        assert!(!config.has_tracing());
-
-        let config = RouterConfig::builder()
-            .enable_trace("localhost:4317")
-            .build_unchecked();
-        assert!(config.has_tracing());
-    }
-
-    #[test]
     fn test_large_worker_lists() {
         let large_urls: Vec<String> = (0..1000).map(|i| format!("http://worker{i}")).collect();
 
@@ -3717,8 +3930,11 @@ discovery:
         assert_eq!(config.mode.worker_count(), 4);
         assert_eq!(config.policy.name(), "power_of_two");
         assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert!(config.has_tracing());
+        assert!(config.metrics.is_some());
+        assert!(config
+            .trace_config
+            .as_ref()
+            .is_some_and(|trace_config| trace_config.enable_trace));
     }
 
     #[test]
@@ -3759,8 +3975,11 @@ discovery:
         assert_eq!(config.mode.worker_count(), 3);
         assert_eq!(config.policy.name(), "cache_aware");
         assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert!(config.has_tracing());
+        assert!(config.metrics.is_some());
+        assert!(config
+            .trace_config
+            .as_ref()
+            .is_some_and(|trace_config| trace_config.enable_trace));
     }
 
     #[test]
@@ -3805,8 +4024,11 @@ discovery:
             .build_unchecked();
 
         assert!(config.has_service_discovery());
-        assert!(config.has_metrics());
-        assert!(config.has_tracing());
+        assert!(config.metrics.is_some());
+        assert!(config
+            .trace_config
+            .as_ref()
+            .is_some_and(|trace_config| trace_config.enable_trace));
         assert_eq!(config.mode_type(), "regular");
 
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -3968,6 +4190,32 @@ discovery:
         let json: PolicyConfig =
             serde_json::from_value(serde_json::json!({"type": "power_of_two"})).unwrap();
         assert_eq!(json.name(), "power_of_two");
+    }
+
+    #[test]
+    fn a_retired_least_load_waiting_cap_is_refused_with_the_overload_veto_named() {
+        let err =
+            serde_yaml::from_str::<PolicyConfig>("type: least_load\nmax_waiting_requests: 48\n")
+                .expect_err("the retired key is refused")
+                .to_string();
+        assert!(err.contains("max_waiting_requests"), "{err}");
+        assert!(err.contains("worker_overload_waiting_requests"), "{err}");
+        assert!(err.contains("worker_overload_shed"), "{err}");
+        let json = serde_json::from_value::<PolicyConfig>(
+            serde_json::json!({"type": "least_load", "max_waiting_requests": 0}),
+        )
+        .expect_err("even zero is refused: the key no longer exists")
+        .to_string();
+        assert!(json.contains("max_waiting_requests"), "{json}");
+        let least_load: PolicyConfig =
+            serde_yaml::from_str("type: least_load\nmean_prefill_tokens: 2048\n").unwrap();
+        assert!(matches!(
+            least_load,
+            PolicyConfig::LeastLoad {
+                mean_prefill_tokens: 2048,
+                ..
+            }
+        ));
     }
 
     #[test]

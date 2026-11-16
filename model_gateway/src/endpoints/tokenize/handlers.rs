@@ -2,6 +2,13 @@
 //!
 //! Provides tokenization, detokenization, and tokenizer management operations.
 //! These handlers use the TokenizerRegistry for tokenizer storage and retrieval.
+//! A model named by an alias tokenizes as the model the worker registry
+//! resolves it to, as every serving route reads it. The management routes
+//! refuse in the control plane's envelope (`{"error", "code"}`), the shape
+//! the worker routes use; an empty or whitespace name or source is refused
+//! up front, before a load job is queued for it. The tokenize and detokenize
+//! routes refuse in the gateway's public envelope, as the model routes do (an
+//! unknown model is a `404 model_not_found`).
 
 use std::sync::Arc;
 
@@ -16,35 +23,44 @@ use openai_protocol::tokenize::{
     ListTokenizersResponse, RemoveTokenizerResponse, TextResult, TokenizeRequest, TokenizeResponse,
     TokenizerInfo, TokensResult,
 };
+use smg_auth::AuditResource;
 use tracing::{debug, error, warn};
 
 use crate::{
+    admin::json::refusal,
     app_context::AppContext,
-    routers::grpc::utils::encode_blocking,
-    worker::UNKNOWN_MODEL_ID,
+    routers::{
+        error,
+        grpc::utils::{encode_blocking_in_batch, InPlaceBudget},
+    },
+    worker::{WorkerRegistry, UNKNOWN_MODEL_ID},
     workflow::{note_tokenizer_removed, Job, TokenizerConfigRequest},
 };
 
-/// Helper to create error responses
-fn error_response(status: StatusCode, message: &str, error_type: &str) -> Response {
-    (
-        status,
-        Json(serde_json::json!({
-            "error": {
-                "message": message,
-                "type": error_type
-            }
-        })),
-    )
-        .into_response()
-}
-
-/// Get a tokenizer by model name, with fallback strategies
-fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn Tokenizer>, String> {
+/// Get a tokenizer by model name, with fallback strategies: the name or id as
+/// given, then the model the worker registry resolves an alias to (the
+/// name the serving routes use), then any tokenizer for the unknown or empty
+/// model.
+fn get_tokenizer(
+    workers: &WorkerRegistry,
+    registry: &TokenizerRegistry,
+    model: &str,
+) -> Result<Arc<dyn Tokenizer>, String> {
     // First, try exact match (by name or ID)
     if let Some(tokenizer) = registry.get(model) {
         debug!("Found tokenizer for model: {}", model);
         return Ok(tokenizer);
+    }
+
+    // An alias tokenizes as the model it resolves to
+    if let Some(canonical) = workers.resolve_model_alias(model) {
+        if let Some(tokenizer) = registry.get(&canonical) {
+            debug!(
+                "Found tokenizer for model: {} (alias of {})",
+                model, canonical
+            );
+            return Ok(tokenizer);
+        }
     }
 
     // Try UNKNOWN_MODEL_ID if model is "unknown" or empty
@@ -79,13 +95,17 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
 // ============================================================================
 
 /// Handle POST /v1/tokenize
-pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeRequest) -> Response {
+pub async fn tokenize(context: &Arc<AppContext>, request: TokenizeRequest) -> Response {
     debug!("Tokenize request for model: {}", request.model);
 
-    let tokenizer = match get_tokenizer(registry, &request.model) {
+    let tokenizer = match get_tokenizer(
+        &context.worker_registry,
+        &context.tokenizer_registry,
+        &request.model,
+    ) {
         Ok(t) => t,
         Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
+            return error::not_found("model_not_found", e);
         }
     };
 
@@ -97,21 +117,22 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
     let mut all_counts: Vec<i32> = Vec::with_capacity(texts.len());
     let mut all_char_counts: Vec<i32> = Vec::with_capacity(texts.len());
 
+    let mut budget = InPlaceBudget::default();
     for text in texts {
         // Don't add special tokens for tokenize API (matches Python behavior)
-        let encoding = match encode_blocking(tokenizer.clone(), text.to_string(), false).await {
-            Ok(enc) => enc,
-            Err(e) => {
-                error!("Tokenization failed: {}", e);
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Tokenization failed: {e}"),
-                    "tokenization_error",
-                );
-            }
-        };
+        let encoding =
+            match encode_blocking_in_batch(tokenizer.clone(), text, false, &mut budget).await {
+                Ok(enc) => enc,
+                Err(e) => {
+                    error!("Tokenization failed: {}", e);
+                    return error::internal_error(
+                        "tokenization_error",
+                        format!("Tokenization failed: {e}"),
+                    );
+                }
+            };
 
-        let token_ids: Vec<u32> = encoding.token_ids().to_vec();
+        let token_ids: Vec<u32> = encoding.into_token_ids();
         let count = token_ids.len() as i32;
 
         all_tokens.push(token_ids);
@@ -143,13 +164,17 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
 }
 
 /// Handle POST /v1/detokenize
-pub async fn detokenize(registry: &Arc<TokenizerRegistry>, request: DetokenizeRequest) -> Response {
+pub async fn detokenize(context: &Arc<AppContext>, request: DetokenizeRequest) -> Response {
     debug!("Detokenize request for model: {}", request.model);
 
-    let tokenizer = match get_tokenizer(registry, &request.model) {
+    let tokenizer = match get_tokenizer(
+        &context.worker_registry,
+        &context.tokenizer_registry,
+        &request.model,
+    ) {
         Ok(t) => t,
         Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
+            return error::not_found("model_not_found", e);
         }
     };
 
@@ -164,10 +189,9 @@ pub async fn detokenize(registry: &Arc<TokenizerRegistry>, request: DetokenizeRe
             Ok(t) => t,
             Err(e) => {
                 error!("Detokenization failed: {}", e);
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Detokenization failed: {e}"),
+                return error::internal_error(
                     "detokenization_error",
+                    format!("Detokenization failed: {e}"),
                 );
             }
         };
@@ -190,39 +214,48 @@ pub async fn detokenize(registry: &Arc<TokenizerRegistry>, request: DetokenizeRe
 
 /// Handle POST /v1/tokenizers - async version using job queue
 pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerRequest) -> Response {
-    // Check if tokenizer already exists by name
-    if context.tokenizer_registry.contains(&request.name) {
-        // Return the existing tokenizer's ID
-        if let Some(entry) = context.tokenizer_registry.get_by_name(&request.name) {
-            return (
-                StatusCode::CONFLICT,
-                Json(AddTokenizerResponse {
-                    id: entry.id,
-                    status: "failed".to_string(),
-                    message: format!("Tokenizer '{}' already exists", request.name),
-                    vocab_size: None,
-                }),
-            )
-                .into_response();
-        }
+    // An empty or whitespace name is refused up front: the registry's load
+    // refuses an empty one only once the job runs, after a 202, and takes a
+    // whitespace one as a name.
+    if request.name.trim().is_empty() {
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "A tokenizer name must not be empty".to_string(),
+        );
     }
 
-    // Get the job queue
-    let job_queue = match context.worker_job_queue.get() {
-        Some(queue) => queue,
-        None => {
-            error!("Job queue not available");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(AddTokenizerResponse {
-                    id: String::new(),
-                    status: "failed".to_string(),
-                    message: "Job queue not available".to_string(),
-                    vocab_size: None,
-                }),
-            )
-                .into_response();
-        }
+    // An empty or whitespace source is refused up front too: the registry's
+    // load refuses an empty one only once the job runs, after a 202, and a
+    // whitespace one fails its local load and falls back to a worker fetch
+    // under the request's name.
+    if request.source.trim().is_empty() {
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "A tokenizer source must not be empty".to_string(),
+        );
+    }
+
+    // A name in use is refused; the error names the tokenizer that holds it.
+    if let Some(entry) = context.tokenizer_registry.get_by_name(&request.name) {
+        return refusal(
+            StatusCode::CONFLICT,
+            "TOKENIZER_ALREADY_EXISTS",
+            format!(
+                "Tokenizer '{}' already exists with id {}",
+                request.name, entry.id
+            ),
+        );
+    }
+
+    let Some(job_queue) = context.worker_job_queue.get() else {
+        error!("Job queue not available");
+        return refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SERVICE_UNAVAILABLE",
+            "The job queue is not initialized".to_string(),
+        );
     };
 
     // Generate UUID for this tokenizer
@@ -238,6 +271,7 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
         chat_template_path: request.chat_template_path.clone(),
         cache_config: None,
         fail_on_duplicate: true,
+        for_worker: false,
     };
 
     let job = Job::AddTokenizer {
@@ -246,31 +280,25 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
 
     // Submit the job
     match job_queue.submit(job).await {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(AddTokenizerResponse {
-                id: tokenizer_id,
-                status: "pending".to_string(),
-                message: format!(
-                    "Tokenizer '{}' registration job submitted. Loading from: {}",
-                    request.name, request.source
-                ),
-                vocab_size: None,
-            }),
-        )
-            .into_response(),
-        Err(e) => {
-            error!("Failed to submit tokenizer job: {}", e);
+        Ok(()) => AuditResource::name(
             (
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::ACCEPTED,
                 Json(AddTokenizerResponse {
-                    id: String::new(),
-                    status: "failed".to_string(),
-                    message: e,
+                    id: tokenizer_id.clone(),
+                    status: "pending".to_string(),
+                    message: format!(
+                        "Tokenizer '{}' registration job submitted. Loading from: {}",
+                        request.name, request.source
+                    ),
                     vocab_size: None,
                 }),
             )
-                .into_response()
+                .into_response(),
+            tokenizer_id,
+        ),
+        Err(e) => {
+            error!("Failed to submit tokenizer job: {}", e);
+            refusal(StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE", e)
         }
     }
 }
@@ -303,31 +331,37 @@ pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> 
 
     if let Some(entry) = removed {
         context.multimodal_config_registry.remove(&entry.id);
+        context.worker_loaded_tokenizers.remove(&entry.id);
         note_tokenizer_removed(
             &context.tokenizer_load_failures,
             &context.worker_registry,
             &entry.name,
         );
         debug!("Removed tokenizer '{}' (id: {})", entry.name, entry.id);
-        (
-            StatusCode::OK,
-            Json(RemoveTokenizerResponse {
-                success: true,
-                message: format!("Tokenizer '{}' removed successfully", entry.name),
-            }),
+        AuditResource::name(
+            (
+                StatusCode::OK,
+                Json(RemoveTokenizerResponse {
+                    success: true,
+                    message: format!("Tokenizer '{}' removed successfully", entry.name),
+                }),
+            )
+                .into_response(),
+            entry.id,
         )
-            .into_response()
     } else {
         warn!("Tokenizer '{}' not found", tokenizer_id);
-        (
-            StatusCode::NOT_FOUND,
-            Json(RemoveTokenizerResponse {
-                success: false,
-                message: format!("Tokenizer '{tokenizer_id}' not found"),
-            }),
-        )
-            .into_response()
+        tokenizer_not_found(tokenizer_id)
     }
+}
+
+/// 404 in the control plane's envelope: no tokenizer has that id or name.
+fn tokenizer_not_found(tokenizer_id: &str) -> Response {
+    refusal(
+        StatusCode::NOT_FOUND,
+        "TOKENIZER_NOT_FOUND",
+        format!("Tokenizer '{tokenizer_id}' not found"),
+    )
 }
 
 /// Handle GET /v1/tokenizers/{tokenizer_id}
@@ -350,11 +384,7 @@ pub async fn get_tokenizer_info(context: &Arc<AppContext>, tokenizer_id: &str) -
             };
             Json(info).into_response()
         }
-        None => error_response(
-            StatusCode::NOT_FOUND,
-            &format!("Tokenizer '{tokenizer_id}' not found"),
-            "tokenizer_not_found",
-        ),
+        None => tokenizer_not_found(tokenizer_id),
     }
 }
 
@@ -394,10 +424,10 @@ pub async fn get_tokenizer_status(context: &Arc<AppContext>, tokenizer_id: &str)
     }
 
     // Not found
-    error_response(
+    refusal(
         StatusCode::NOT_FOUND,
-        &format!("Tokenizer '{tokenizer_id}' not found and no pending job"),
-        "not_found",
+        "TOKENIZER_NOT_FOUND",
+        format!("Tokenizer '{tokenizer_id}' not found and no pending job"),
     )
 }
 
@@ -407,8 +437,9 @@ mod tests {
 
     #[test]
     fn test_get_tokenizer_empty_registry() {
+        let workers = WorkerRegistry::new();
         let registry = Arc::new(TokenizerRegistry::new());
-        let result = get_tokenizer(&registry, "any");
+        let result = get_tokenizer(&workers, &registry, "any");
         match result {
             Err(e) => assert!(e.contains("No tokenizers available")),
             Ok(_) => panic!("Expected error"),

@@ -1,4 +1,5 @@
-//! Cap on the preprocessed media bytes the gateway holds in flight for engines.
+//! Cap on the preprocessed media bytes the gateway holds in flight for engines,
+//! and the gauge of what it holds, budget or not.
 
 use std::{
     sync::{
@@ -85,7 +86,7 @@ impl MultimodalInflight {
         }
         let acquire = Arc::clone(&self.semaphore).acquire_many_owned(permit_units);
         match tokio::time::timeout(self.wait, acquire).await {
-            Ok(Ok(permit)) => Ok(InflightPermit { _permit: permit }),
+            Ok(Ok(permit)) => Ok(InflightPermit::counting(bytes, Some(permit))),
             Ok(Err(_)) | Err(_) => Err(InflightRefusal::Busy),
         }
     }
@@ -119,19 +120,40 @@ impl Drop for Waiting<'_> {
     }
 }
 
-/// Releases its share of the budget when dropped.
+/// Releases its share of the budget when dropped and takes its bytes off the
+/// in-flight gauge. Without a budget it holds nothing and counts alone.
 #[derive(Debug)]
 pub(crate) struct InflightPermit {
-    _permit: OwnedSemaphorePermit,
+    _permit: Option<OwnedSemaphorePermit>,
+    bytes: usize,
+}
+
+impl InflightPermit {
+    /// `bytes` on the gauge (`smg_mm_inflight_bytes`) until the drop.
+    fn counting(bytes: usize, permit: Option<OwnedSemaphorePermit>) -> Self {
+        Metrics::record_mm_inflight_reserved(bytes);
+        Self {
+            _permit: permit,
+            bytes,
+        }
+    }
+}
+
+impl Drop for InflightPermit {
+    fn drop(&mut self) {
+        Metrics::record_mm_inflight_released(self.bytes);
+    }
 }
 
 /// Reserve room for a request's media bytes, or the response that refuses it.
+/// Without a budget nothing is held: the bytes go on the gauge until the
+/// permit drops, so the gauge reads either way.
 pub(crate) async fn reserve_multimodal_inflight(
     inflight: Option<&MultimodalInflight>,
     bytes: usize,
 ) -> Result<Option<InflightPermit>, Response> {
     let Some(inflight) = inflight else {
-        return Ok(None);
+        return Ok(Some(InflightPermit::counting(bytes, None)));
     };
     match inflight.reserve(bytes).await {
         Ok(permit) => Ok(Some(permit)),
@@ -269,11 +291,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refusals_answer_413_and_429_and_no_budget_means_no_permit() {
-        assert!(reserve_multimodal_inflight(None, usize::MAX)
+    async fn refusals_answer_413_and_429_and_no_budget_means_a_counting_permit() {
+        let counting = reserve_multimodal_inflight(None, usize::MAX)
             .await
             .unwrap()
-            .is_none());
+            .expect("no budget refuses nothing and still hands out a permit");
+        assert!(
+            counting._permit.is_none(),
+            "the permit holds nothing of a budget"
+        );
+        assert_eq!(
+            counting.bytes,
+            usize::MAX,
+            "the permit counts the request's bytes"
+        );
 
         let inflight = quick(4096);
         let too_large = reserve_multimodal_inflight(Some(&inflight), 5000)
@@ -286,5 +317,42 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// The gauge follows the bytes the permits hold: with a budget the
+    /// reserved bytes, without one the counted bytes, both off at the drop.
+    #[test]
+    fn the_inflight_gauge_follows_the_permits_bytes() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let gauge = |handle: &metrics_exporter_prometheus::PrometheusHandle| -> f64 {
+            handle
+                .render()
+                .lines()
+                .find_map(|line| line.strip_prefix("smg_mm_inflight_bytes "))
+                .map(|value| value.trim().parse().expect("a number"))
+                .unwrap_or(0.0)
+        };
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            runtime.block_on(async {
+                let bounded = quick(16 * UNIT_BYTES);
+                let held = bounded.reserve(3_000).await.expect("room");
+                assert_eq!(gauge(&handle), 3_000.0);
+                let counted = reserve_multimodal_inflight(None, 5_000)
+                    .await
+                    .ok()
+                    .flatten()
+                    .expect("a counting permit without a budget");
+                assert_eq!(gauge(&handle), 8_000.0);
+                drop(held);
+                assert_eq!(gauge(&handle), 5_000.0);
+                drop(counted);
+                assert_eq!(gauge(&handle), 0.0);
+            });
+        });
     }
 }

@@ -117,6 +117,9 @@ pub struct MockSearchResponseMCPServer {
 #[derive(Clone)]
 pub struct MockSearchServer {
     calls: Arc<AtomicUsize>,
+    /// How long a search takes before it answers (zero unless a test asks):
+    /// the window in which a client leaves during a tool's execution.
+    latency: Duration,
     tool_router: ToolRouter<MockSearchServer>,
 }
 
@@ -174,21 +177,25 @@ impl MockSearchServer {
     pub fn new() -> Self {
         Self {
             calls: Arc::default(),
+            latency: Duration::ZERO,
             tool_router: Self::tool_router(),
         }
     }
 
     #[tool(description = "Mock web search tool")]
-    fn brave_web_search(
+    async fn brave_web_search(
         &self,
         Parameters(params): Parameters<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if !self.latency.is_zero() {
+            tokio::time::sleep(self.latency).await;
+        }
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
             .unwrap_or("test");
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Mock search results for: {query}"
         ))]))
     }
@@ -199,7 +206,7 @@ impl MockSearchServer {
         Parameters(_params): Parameters<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "Mock local search results",
         )]))
     }
@@ -259,7 +266,7 @@ impl MockSearchResponseServer {
                     }
                 });
 
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     embedded_payload.to_string(),
                 )]))
             }
@@ -269,10 +276,10 @@ impl MockSearchResponseServer {
 
 #[tool_handler]
 impl ServerHandler for MockSearchServer {
-    fn get_info(&self) -> ServerInfo {
-        // `ServerInfo`/`InitializeResult` is `#[non_exhaustive]` in rmcp 1.7;
+    fn get_info(&self) -> ServerConfig {
+        // `ServerConfig` (`InitializeResult`) is `#[non_exhaustive]` (since rmcp 1.7);
         // build via the constructor instead of a struct literal.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions("Mock server for testing")
     }
@@ -287,11 +294,12 @@ impl ServerHandler for MockSearchServer {
 }
 
 impl MockMCPServer {
-    fn router(calls: Arc<AtomicUsize>) -> axum::Router {
+    fn router(calls: Arc<AtomicUsize>, latency: Duration) -> axum::Router {
         let service = StreamableHttpService::new(
             move || {
                 Ok(MockSearchServer {
                     calls: calls.clone(),
+                    latency,
                     ..MockSearchServer::new()
                 })
             },
@@ -304,9 +312,16 @@ impl MockMCPServer {
 
     /// Start a mock MCP server on an available port
     pub async fn start() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::start_with_latency(Duration::ZERO).await
+    }
+
+    /// Start a mock MCP server whose searches answer after `latency`.
+    pub async fn start_with_latency(
+        latency: Duration,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let calls = Arc::default();
         Ok(Self {
-            harness: MockServerHarness::start(Self::router(Arc::clone(&calls))).await?,
+            harness: MockServerHarness::start(Self::router(Arc::clone(&calls), latency)).await?,
             calls,
         })
     }
@@ -351,8 +366,8 @@ impl MockFailingSearchServer {
 
 #[tool_handler]
 impl ServerHandler for MockFailingSearchServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions("Mock failing server for testing")
     }
@@ -368,8 +383,8 @@ impl ServerHandler for MockFailingSearchServer {
 
 #[tool_handler]
 impl ServerHandler for MockSearchResponseServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions("Mock search response server for testing")
     }
@@ -458,7 +473,7 @@ mod tests {
     /// A client transport to `url` over the test binary's HTTP client.
     fn client_transport(url: &str) -> StreamableHttpClientTransport<reqwest::Client> {
         StreamableHttpClientTransport::with_client(
-            smg::clients::http_client(),
+            smg::server::http_client(),
             StreamableHttpClientTransportConfig::with_uri(url),
         )
     }

@@ -37,20 +37,20 @@ shopt -s inherit_errexit
 
 GATEWAY_SHARDS=3
 
-# shard | path filter | extra setup (comma-separated: golden, ffmpeg, postgres, wasm-fixtures) | test step timeout (minutes)
+# shard | path filter | extra setup (comma-separated: golden, ffmpeg, turbojpeg, postgres, wasm-fixtures, policy-guest) | test step timeout (minutes)
 SHARDS='
-gateway-unit rust-gateway    -                      20
+gateway-unit rust-gateway    ffmpeg                 20
 gateway-1    rust-gateway    -                      20
 gateway-2    rust-gateway    -                      20
 gateway-3    rust-gateway    -                      20
 bindings     rust-bindings   -                      20
 tokenizer    rust-tokenizer  -                      20
-multimodal   rust-multimodal golden,ffmpeg          20
+multimodal   rust-multimodal golden,ffmpeg,turbojpeg 20
 symphony     rust-symphony   -                      20
 agentic      rust-agentic    postgres,wasm-fixtures 20
 protocols    rust-protocols  -                      20
 engine       rust-engine     -                      20
-kv           rust-kv         -                      20
+kv           rust-kv         policy-guest           20
 radix-fuzz   rust-radix      -                      15
 '
 
@@ -76,9 +76,9 @@ packages_of() {
         multimodal) echo llm-multimodal ;;
         symphony)   echo smg-symphony tool-parser reasoning-parser smg-response-template ;;
         agentic)    echo data-connector smg-mcp smg-wasm wfaas ;;
-        protocols)  echo openai-protocol smg-external-router smg-auth smg-rl smg-client openapi-gen ;;
+        protocols)  echo openai-protocol smg-worker smg-external-router smg-auth smg-rl smg-client openapi-gen ;;
         engine)     echo smg-grpc-client engine-zmq-client engine-zmq-adapter engine-servicer mock-worker gateway-perf ;;
-        kv)         echo kv-index smg-mesh smg-mm-rdma smg-radix-tree ;;
+        kv)         echo kv-index smg-mesh smg-mm-rdma smg-policy-controller policy-controller-example smg-radix-tree ;;
         radix-fuzz) echo smg-radix-tree ;;
         *) shard_row "$1" >/dev/null ;;
     esac
@@ -173,12 +173,14 @@ commands_of() {
             # Opt-in (#[ignore]) cases against the database the workflow creates for the job.
             echo "-p data-connector --test postgres_integration --test conformance :: --ignored --test-threads=1" ;;
         protocols)
-            echo "-p openai-protocol -p smg-external-router -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini" ;;
+            echo "-p openai-protocol -p smg-worker -p smg-external-router -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini" ;;
         engine)
             echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
         kv)
             local selectors
-            echo "-p kv-index -p smg-mesh -p smg-mm-rdma"
+            # The example controller rides the policy crate's invocation: it asks for the crate's
+            # `controller` feature, which this line turns on already, so nothing is built twice.
+            echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-policy-controller -p policy-controller-example --features smg-policy-controller/client,smg-policy-controller/kubernetes"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
             echo "-p smg-radix-tree --lib$selectors"
@@ -190,7 +192,7 @@ commands_of() {
 }
 
 run_commands() {
-    local shard=$1 mode=$2 line cargo_args test_args commands
+    local shard=$1 mode=$2 line cargo_args test_args commands status=0
     # Assigned first: a process substitution would hide a failure of commands_of.
     commands=$(commands_of "$shard")
     while IFS= read -r line; do
@@ -203,14 +205,22 @@ run_commands() {
             case " $cargo_args " in *" --doc "*) continue ;; esac
             # shellcheck disable=SC2086
             (set -x; cargo test $cargo_args --no-run)
+        # A shard names several binaries per invocation and may run several
+        # invocations: without --no-fail-fast cargo stops at the first binary that
+        # fails, and under the script's errexit a failed invocation would end this
+        # function before the next one, so a red early in the shard would hide the
+        # results after it. Every binary of every invocation runs; the status of a
+        # failed one is kept and returned at the end, so the shard still fails
+        # when any binary did.
         elif [ -n "$test_args" ]; then
             # shellcheck disable=SC2086
-            (set -x; cargo test $cargo_args -- $test_args)
+            (set -x; cargo test --no-fail-fast $cargo_args -- $test_args) || status=$?
         else
             # shellcheck disable=SC2086
-            (set -x; cargo test $cargo_args)
+            (set -x; cargo test --no-fail-fast $cargo_args) || status=$?
         fi
     done <<< "$commands"
+    return "$status"
 }
 
 lint() {

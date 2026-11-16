@@ -12,18 +12,23 @@ use openai_protocol::{
     messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
 use crate::{
+    channel::Channel,
+    framed::{call_with_frames, tokenspeed_frames},
     request_fields::{
-        completion_constraint, plain_constraint, response_format_schema, stop_strings,
-        ConstraintKind, PlainSampling,
+        body_format, completion_constraint, logit_bias_by_token_text, plain_constraint, seed_bits,
+        stop_strings, ConstraintKind, OutputConstraint, PlainSampling,
     },
     BoxedTraceInjector,
 };
 
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod tokenspeed_proto {
     #![allow(
         clippy::all,
@@ -37,13 +42,14 @@ pub mod tokenspeed_proto {
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
 pub type AbortOnDropStream =
-    crate::AbortOnDropStream<tokenspeed_proto::GenerateResponse, TokenSpeedSchedulerClient>;
+    crate::AbortOnDropStream<Box<tokenspeed_proto::GenerateResponse>, TokenSpeedSchedulerClient>;
 
 /// gRPC client for the TokenSpeed scheduler.
 #[derive(Clone)]
 pub struct TokenSpeedSchedulerClient {
     client: tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient<Channel>,
     trace_injector: BoxedTraceInjector,
+    channel: Channel,
 }
 
 crate::impl_abort_for_drop_with_reason!(TokenSpeedSchedulerClient);
@@ -52,7 +58,9 @@ impl TokenSpeedSchedulerClient {
     crate::impl_engine_client_basics!(
         tokenspeed_proto,
         tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient<Channel>,
-        "TokenSpeed"
+        "TokenSpeed",
+        "tokenspeed.grpc.scheduler.TokenSpeedScheduler",
+        tokenspeed_proto::token_speed_scheduler_server::SERVICE_NAME
     );
 
     pub async fn abort_request(
@@ -104,9 +112,9 @@ impl TokenSpeedSchedulerClient {
         processed_text: String,
         token_ids: Vec<u32>,
         multimodal_inputs: Option<tokenspeed_proto::MultimodalInputs>,
-        tool_call_constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<tokenspeed_proto::GenerateRequest, String> {
-        let sampling_params = Self::build_sampling_params_from_chat(body, tool_call_constraint)?;
+        let sampling_params = Self::build_sampling_params_from_chat(body, constraint)?;
         Ok(tokenspeed_proto::GenerateRequest {
             request_id,
             tokenized: Some(tokenspeed_proto::TokenizedInput {
@@ -181,10 +189,9 @@ impl TokenSpeedSchedulerClient {
         processed_text: String,
         token_ids: Vec<u32>,
         multimodal_inputs: Option<tokenspeed_proto::MultimodalInputs>,
-        tool_call_constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<tokenspeed_proto::GenerateRequest, String> {
-        let sampling_params =
-            Self::build_sampling_params_from_messages(body, tool_call_constraint)?;
+        let sampling_params = Self::build_sampling_params_from_messages(body, constraint.tool)?;
         Ok(tokenspeed_proto::GenerateRequest {
             request_id,
             tokenized: Some(tokenspeed_proto::TokenizedInput {
@@ -229,7 +236,7 @@ impl TokenSpeedSchedulerClient {
 
     fn build_sampling_params_from_chat(
         request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<tokenspeed_proto::SamplingParams, String> {
         let stop_sequences = stop_strings(request.stop.as_ref());
 
@@ -243,15 +250,17 @@ impl TokenSpeedSchedulerClient {
             presence_penalty: Some(request.presence_penalty.unwrap_or(0.0)),
             repetition_penalty: Some(request.repetition_penalty.unwrap_or(1.0)),
             max_new_tokens: request.output_token_cap(),
+            min_new_tokens: request.min_tokens.unwrap_or(0),
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens: true,
             spaces_between_special_tokens: true,
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
-            sampling_seed: Self::chat_sampling_seed(request)?,
+            sampling_seed: Self::chat_sampling_seed(request),
             n: request.n.unwrap_or(1),
-            constraint: Self::build_constraint_for_chat(request, tool_call_constraint)?,
+            logit_bias: logit_bias_by_token_text(request.logit_bias.as_ref()),
+            constraint: Self::build_constraint_for_chat(request, constraint)?,
             ..Default::default()
         })
     }
@@ -272,7 +281,7 @@ impl TokenSpeedSchedulerClient {
             presence_penalty: Some(request.presence_penalty.unwrap_or(0.0)),
             repetition_penalty: Some(request.repetition_penalty),
             max_new_tokens: request.max_output_tokens,
-            stop: vec![],               // Does not pass through request.stop yet
+            stop: stop_strings(request.stop.as_ref()),
             stop_token_ids: vec![],     // Handled by Harmony stop tokens
             skip_special_tokens: false, // Keep special tokens for Harmony
             spaces_between_special_tokens: true,
@@ -332,8 +341,9 @@ impl TokenSpeedSchedulerClient {
             spaces_between_special_tokens: true,
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
-            sampling_seed: Self::completion_sampling_seed(request)?,
+            sampling_seed: Self::completion_sampling_seed(request),
             n: request.n.unwrap_or(1),
+            logit_bias: logit_bias_by_token_text(request.logit_bias.as_ref()),
             constraint: Self::constraint_of(completion_constraint(request)?),
             ..Default::default()
         })
@@ -373,29 +383,28 @@ impl TokenSpeedSchedulerClient {
 
     fn build_constraint_for_chat(
         request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
+        OutputConstraint { tool, set_aside }: OutputConstraint,
     ) -> Result<Option<tokenspeed_proto::sampling_params::Constraint>, String> {
         let mut constraints = Vec::new();
 
-        if let Some(schema) = response_format_schema(request)? {
-            constraints.push(tokenspeed_proto::sampling_params::Constraint::JsonSchema(
-                schema,
-            ));
+        let format = body_format(request, set_aside)?;
+        if let Some(constraint) = Self::constraint_of(format.format) {
+            constraints.push(constraint);
         }
 
-        if let Some(ebnf) = &request.ebnf {
+        if let Some(ebnf) = format.ebnf {
             constraints.push(tokenspeed_proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
+                ebnf.to_string(),
             ));
         }
-        if let Some(regex) = &request.regex {
+        if let Some(regex) = format.regex {
             constraints.push(tokenspeed_proto::sampling_params::Constraint::Regex(
-                regex.clone(),
+                regex.to_string(),
             ));
         }
 
-        // response_format wins over tool_call_constraint when both are set.
-        if let Some((constraint_type, constraint_value)) = tool_call_constraint {
+        // response_format wins over the tool constraint when both are set.
+        if let Some((constraint_type, constraint_value)) = tool {
             if constraints.is_empty() {
                 let tool_constraint =
                     Self::constraint_from_pair(constraint_type, constraint_value)?;
@@ -460,37 +469,32 @@ impl TokenSpeedSchedulerClient {
             ConstraintKind::Ebnf => {
                 tokenspeed_proto::sampling_params::Constraint::EbnfGrammar(value)
             }
+            ConstraintKind::StructuralTag => {
+                tokenspeed_proto::sampling_params::Constraint::StructuralTag(value)
+            }
         })
     }
 
-    fn unsigned_sampling_seed(seed: Option<i64>) -> Result<Option<u64>, String> {
-        seed.map(|seed| {
-            u64::try_from(seed).map_err(|_| "sampling seed must be an unsigned integer".to_owned())
-        })
-        .transpose()
+    /// The OpenAI-compatible `seed` on this wire's unsigned word: its bits ([`seed_bits`]).
+    fn unsigned_sampling_seed(seed: Option<i64>) -> Option<u64> {
+        seed.map(seed_bits)
     }
 
     /// Resolve the TokenSpeed sampling seed: the native `sampling_seed` field
     /// wins when set; the OpenAI-compatible `seed` is only the fallback.
-    fn resolve_sampling_seed(
-        sampling_seed: Option<u64>,
-        legacy_seed: Option<i64>,
-    ) -> Result<Option<u64>, String> {
-        match sampling_seed {
-            Some(seed) => Ok(Some(seed)),
-            None => Self::unsigned_sampling_seed(legacy_seed),
-        }
+    fn resolve_sampling_seed(sampling_seed: Option<u64>, legacy_seed: Option<i64>) -> Option<u64> {
+        sampling_seed.or_else(|| Self::unsigned_sampling_seed(legacy_seed))
     }
 
     #[expect(
         deprecated,
         reason = "TokenSpeed preserves the OpenAI-compatible chat seed on its sampling wire"
     )]
-    fn chat_sampling_seed(request: &ChatCompletionRequest) -> Result<Option<u64>, String> {
+    fn chat_sampling_seed(request: &ChatCompletionRequest) -> Option<u64> {
         Self::resolve_sampling_seed(request.sampling_seed, request.seed)
     }
 
-    fn completion_sampling_seed(request: &CompletionRequest) -> Result<Option<u64>, String> {
+    fn completion_sampling_seed(request: &CompletionRequest) -> Option<u64> {
         Self::resolve_sampling_seed(request.sampling_seed, request.seed)
     }
 }
@@ -529,7 +533,9 @@ impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::Schedule
             max_total_num_tokens: load.max_total_num_tokens,
             token_usage: load.token_usage,
             active_token_usage: load.active_token_usage,
+            num_resident_tokens: load.num_resident_tokens,
             gen_throughput: load.gen_throughput,
+            prefill_throughput: load.prefill_throughput,
             cache_hit_rate: load.cache_hit_rate,
             utilization: load.utilization,
             max_running_requests: load.max_running_requests,
@@ -564,6 +570,39 @@ impl From<tokenspeed_proto::GetLoadsResponse> for openai_protocol::worker::Worke
     }
 }
 
+impl TokenSpeedSchedulerClient {
+    /// `generate` with the request's large inline tensors as body frames of
+    /// their own (the crate's private `framed` module): no encode buffer of
+    /// the message's size, the same message on the wire. A plain fn like
+    /// `generate`, for the same reason: the request becomes its frames before
+    /// the future exists, so the boxed future holds the frame list and the
+    /// request id, not the request; the trace context is injected at the
+    /// first poll, as there.
+    pub fn generate_framed(
+        &self,
+        req: tokenspeed_proto::GenerateRequest,
+    ) -> impl std::future::Future<Output = Result<AbortOnDropStream, tonic::Status>> + '_ {
+        let request_id = req.request_id.clone();
+        let frames = tokenspeed_frames(req);
+        async move {
+            let frames = frames?;
+            let mut carrier = Request::new(());
+            if let Err(e) = self.trace_injector.inject(carrier.metadata_mut()) {
+                tracing::warn!("Failed to inject trace context: {}", e);
+            }
+            let (metadata, _extensions, ()) = carrier.into_parts();
+            let stream = call_with_frames::<Box<tokenspeed_proto::GenerateResponse>>(
+                self.channel(),
+                "/tokenspeed.grpc.scheduler.TokenSpeedScheduler/Generate",
+                metadata.into_headers(),
+                frames,
+            )
+            .await?;
+            Ok(AbortOnDropStream::new(stream, request_id, self.clone()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod connect_tests {
     use super::*;
@@ -579,6 +618,108 @@ mod connect_tests {
         let refused = refused_endpoint();
         let result = TokenSpeedSchedulerClient::connect(&refused.url).await;
         assert!(result.is_err(), "a refused dial fails the connect");
+    }
+
+    #[test]
+    fn a_responses_request_s_stop_sequences_reach_the_sampling_params() {
+        // The list form, as the chat builder forwards it.
+        let request = ResponsesRequest {
+            stop: Some(openai_protocol::common::StringOrArray::Array(vec![
+                "STOP".to_string(),
+                "\n\n".to_string(),
+            ])),
+            ..Default::default()
+        };
+        let params =
+            TokenSpeedSchedulerClient::build_sampling_params_from_responses(&request, None)
+                .expect("build sampling params");
+        assert_eq!(params.stop, vec!["STOP", "\n\n"]);
+
+        // A request without `stop` leaves the list empty.
+        let unset = ResponsesRequest::default();
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_responses(&unset, None)
+            .expect("build sampling params");
+        assert!(params.stop.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod logit_bias_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// A chat or completion request's `logit_bias` reaches the proto keyed by
+    /// the token id's text; a request without one sends an empty map.
+    #[test]
+    fn chat_and_completion_sampling_params_carry_logit_bias() {
+        let bias = json!({"1": -100, "2": 100});
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "logit_bias": bias
+        }))
+        .expect("a chat request");
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_chat(
+            &chat,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.logit_bias["1"], -100.0);
+        assert_eq!(params.logit_bias["2"], 100.0);
+        assert_eq!(params.logit_bias.len(), 2);
+        let completion: CompletionRequest = serde_json::from_value(json!({
+            "model": "m", "prompt": "hi", "logit_bias": bias
+        }))
+        .expect("a completion request");
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_completion(&completion)
+            .expect("build sampling params");
+        assert_eq!(params.logit_bias["1"], -100.0);
+        assert_eq!(params.logit_bias.len(), 2);
+        let plain: CompletionRequest =
+            serde_json::from_value(json!({"model": "m", "prompt": "hi"})).expect("a request");
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_completion(&plain)
+            .expect("build sampling params");
+        assert!(params.logit_bias.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod min_tokens_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// A chat request's `min_tokens` reaches the proto as `min_new_tokens`, as
+    /// a completion request's does; a request without one sends the proto's
+    /// zero, which the engine reads as no minimum.
+    #[test]
+    fn chat_and_completion_sampling_params_carry_min_tokens() {
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "min_tokens": 30
+        }))
+        .expect("a chat request");
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_chat(
+            &chat,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 30);
+        let completion: CompletionRequest = serde_json::from_value(json!({
+            "model": "m", "prompt": "hi", "min_tokens": 30
+        }))
+        .expect("a completion request");
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_completion(&completion)
+            .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 30);
+        let unset: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_chat(
+            &unset,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 0);
     }
 }
 
@@ -604,6 +745,7 @@ mod load_conversion_tests {
                 token_usage: 0.5,
                 active_token_usage: Some(0.25),
                 gen_throughput: 105.25,
+                prefill_throughput: None,
                 cache_hit_rate: 0.75,
                 utilization: 0.5,
                 memory: Some(tokenspeed_proto::MemoryMetrics {
@@ -618,6 +760,7 @@ mod load_conversion_tests {
                     paused: 0,
                     retracted: 0,
                 }),
+                num_resident_tokens: None,
             }],
             aggregate: Some(tokenspeed_proto::AggregateMetrics {
                 total_running_reqs: 3,
@@ -682,29 +825,31 @@ mod seed_resolution_tests {
 
     #[test]
     fn native_sampling_seed_wins_over_legacy_seed() {
-        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(Some(7), Some(42))
-            .expect("native seed should resolve");
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(Some(7), Some(42));
         assert_eq!(resolved, Some(7));
     }
 
     #[test]
     fn legacy_seed_is_the_fallback() {
-        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(42))
-            .expect("legacy seed should resolve");
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(42));
         assert_eq!(resolved, Some(42));
     }
 
     #[test]
-    fn negative_legacy_seed_is_rejected() {
-        let err = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(-1))
-            .expect_err("negative legacy seed must be rejected");
-        assert!(err.contains("unsigned integer"), "{err}");
+    fn a_negative_legacy_seed_is_its_bits() {
+        assert_eq!(
+            TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(-1)),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(i64::MIN)),
+            Some(1 << 63)
+        );
     }
 
     #[test]
     fn no_seed_stays_none() {
-        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, None)
-            .expect("absent seeds should resolve");
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, None);
         assert_eq!(resolved, None);
     }
 }
@@ -713,6 +858,54 @@ mod seed_resolution_tests {
 mod constraint_mapping_tests {
     use super::*;
     use crate::request_fields::ConstraintKind;
+
+    /// A `response_format` set aside for the builder reads as absent: the tag
+    /// stays the one constraint, where the body's schema wins when nothing is
+    /// set aside.
+    #[test]
+    fn a_response_format_set_aside_leaves_the_tag_as_the_one_constraint() {
+        use crate::request_fields::FormatSetAside;
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"type": "object"}}}
+        }))
+        .expect("a chat request");
+        let tag = Some(("structural_tag".to_string(), "tag".to_string()));
+        let constraint_of = |constraint: OutputConstraint| {
+            TokenSpeedSchedulerClient::build_generate_request_from_chat(
+                "id".to_string(),
+                &request,
+                "hi".to_string(),
+                vec![1],
+                None,
+                constraint,
+            )
+            .expect("built")
+            .sampling_params
+            .expect("sampling params")
+            .constraint
+        };
+
+        // The body's own format wins over a tool constraint on this engine.
+        assert_eq!(
+            constraint_of(OutputConstraint::tool(tag.clone())),
+            Some(tokenspeed_proto::sampling_params::Constraint::JsonSchema(
+                r#"{"type":"object"}"#.to_string()
+            ))
+        );
+        // Set aside, it is not read, and the tag that answers it is the constraint.
+        assert_eq!(
+            constraint_of(OutputConstraint {
+                tool: tag,
+                set_aside: FormatSetAside {
+                    response_format: true,
+                    grammar: false,
+                },
+            }),
+            Some(tokenspeed_proto::sampling_params::Constraint::StructuralTag("tag".to_string()))
+        );
+    }
 
     /// Each constraint kind reaches the engine as its own variant; none stays none.
     #[test]
@@ -729,6 +922,10 @@ mod constraint_mapping_tests {
             (
                 ConstraintKind::Ebnf,
                 tokenspeed_proto::sampling_params::Constraint::EbnfGrammar("v".to_string()),
+            ),
+            (
+                ConstraintKind::StructuralTag,
+                tokenspeed_proto::sampling_params::Constraint::StructuralTag("v".to_string()),
             ),
         ] {
             assert_eq!(

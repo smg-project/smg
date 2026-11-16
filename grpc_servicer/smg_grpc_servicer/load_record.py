@@ -111,6 +111,8 @@ def engine_load_from(load: object, *, queued_token_work: bool) -> common_pb2.Eng
     fields = load.DESCRIPTOR.fields_by_name
     if "active_token_usage" in fields and load.HasField("active_token_usage"):
         record.active_token_usage = load.active_token_usage
+    if "num_resident_tokens" in fields and load.HasField("num_resident_tokens"):
+        record.num_resident_tokens = max(0, int(load.num_resident_tokens))
     for name in _SECTIONS:
         if name in fields and load.HasField(name):
             _copy_section(getattr(load, name), getattr(record, name))

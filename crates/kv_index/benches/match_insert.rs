@@ -26,7 +26,8 @@ use std::{
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use kv_index::{
     compute_content_hash, compute_request_content_hashes, request_prefix_hashes, ChainBlockMap,
-    ChainIndex, ContentHash, SequenceHash, ShardedChainIndex, StoredBlock, TokenTree, Tree,
+    ChainIndex, ContentHash, GroupKind, SequenceHash, ShardedChainIndex, StoredBlock, TokenTree,
+    Tree, WorkerGroups,
 };
 
 const TENANTS: usize = 64;
@@ -337,6 +338,40 @@ fn bench_event_path(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     group.bench_function("indexer_current_size/64_workers", |b| {
         b.iter(|| indexer.current_size());
+    });
+
+    // A hybrid worker's view over a 128-block request (block 16): the
+    // prefix hashes the rule reads, then the rule itself with the window's
+    // tail at the depth (a handful of lookups) and with nothing retained on
+    // the path (the whole path scanned): what a decision pays per hybrid
+    // holder beyond the index's lookup.
+    let hashes = compute_request_content_hashes(&prompt_2048, 16);
+    let prefixes = request_prefix_hashes(&hashes);
+    let named: Vec<(SequenceHash, ContentHash)> = hashes
+        .iter()
+        .enumerate()
+        .map(|(p, &content)| (SequenceHash::from(mix(0xabc0_0000 | p as u64)), content))
+        .collect();
+    let tail = WorkerGroups::new();
+    tail.main_stored(None, &named);
+    tail.learn(1, Some(GroupKind::SlidingWindow { window: 64 }), 16);
+    tail.learn(2, Some(GroupKind::State), 16);
+    let kept: Vec<SequenceHash> = named[124..].iter().map(|(hash, _)| *hash).collect();
+    tail.group_stored(1, &kept);
+    tail.group_stored(2, &kept[3..]);
+    let bare = WorkerGroups::new();
+    bare.main_stored(None, &named);
+    bare.learn(1, Some(GroupKind::SlidingWindow { window: 64 }), 16);
+    bare.group_stored(1, &[named[0].0]);
+    group.throughput(Throughput::Elements(prefixes.len() as u64));
+    group.bench_function("group_cap/prefix_hashes/128_blocks", |b| {
+        b.iter(|| request_prefix_hashes(&hashes).len());
+    });
+    group.bench_function("group_cap/tail_at_depth/128_blocks", |b| {
+        b.iter(|| tail.cap(&prefixes, 128, 16).depth);
+    });
+    group.bench_function("group_cap/nothing_on_path/128_blocks", |b| {
+        b.iter(|| bare.cap(&prefixes, 128, 16).depth);
     });
     group.finish();
 }

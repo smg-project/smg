@@ -8,9 +8,11 @@
 
 use smg::observability::{metrics::Metrics, metrics_server::start_metrics_server};
 
+use crate::metrics::recorder;
+
 #[tokio::test]
 async fn kv_event_lag_renders_histogram_buckets() {
-    let handle = crate::metrics::recorder();
+    let handle = recorder();
     let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");
@@ -18,7 +20,7 @@ async fn kv_event_lag_renders_histogram_buckets() {
     Metrics::record_kv_event_lag("grpc://worker-a:50051", 0.004);
     Metrics::record_kv_event_lag("grpc://worker-b:50051", 2.0);
 
-    let body = smg::clients::http_client()
+    let body = smg::server::http_client()
         .get(format!("http://{addr}/metrics"))
         .send()
         .await

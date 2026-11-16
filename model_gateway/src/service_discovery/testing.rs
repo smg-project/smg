@@ -1,8 +1,13 @@
 //! Shared test fixtures for the discovery modules.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
-use crate::app_context::AppContext;
+use k8s_openapi::{
+    api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
+    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+};
+
+use crate::{app_context::AppContext, server::http_client, worker::WorkerRegistry};
 
 /// An `AppContext` with an uninitialized worker job queue: submitted jobs are
 /// accepted and queued but never processed, so tests observe what discovery
@@ -17,11 +22,7 @@ pub(crate) fn create_test_app_context() -> Arc<AppContext> {
 
     // Note: Using uninitialized queue for tests to avoid spawning background workers
     // Jobs submitted during tests will queue but not be processed
-    app_context_for_tests(
-        router_config,
-        Arc::new(crate::worker::WorkerRegistry::new()),
-        None,
-    )
+    app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()), None)
 }
 
 /// An `AppContext` whose jobs run: a live job queue and workflow engines, so
@@ -40,7 +41,6 @@ pub(crate) fn live_app_context() -> Arc<AppContext> {
     use crate::{
         config::{HealthCheckConfig, PolicyConfig, RouterConfig, RoutingMode},
         policies::PolicyRegistry,
-        worker::WorkerRegistry,
         workflow::{JobQueue, JobQueueConfig, WorkflowEngines},
     };
 
@@ -59,7 +59,7 @@ pub(crate) fn live_app_context() -> Arc<AppContext> {
     let context = Arc::new(
         AppContext::builder()
             .router_config(config.clone())
-            .client(crate::clients::http_client())
+            .client(http_client())
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
             .worker_registry(Arc::new(WorkerRegistry::new()))
             .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))
@@ -84,4 +84,36 @@ pub(crate) fn live_app_context() -> Arc<AppContext> {
         .set(WorkflowEngines::new(&context.router_config))
         .ok();
     context
+}
+
+/// A running, ready pod named `name` at `ip`, carrying `labels`: the shape
+/// the Kubernetes watchers' tests feed to their label selectors.
+pub(crate) fn make_labeled_pod(name: &str, ip: &str, labels: &[(&str, &str)]) -> Pod {
+    let mut label_map = BTreeMap::new();
+    for &(k, v) in labels {
+        label_map.insert(k.to_string(), v.to_string());
+    }
+    Pod {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            uid: Some(format!("uid-{name}")),
+            labels: Some(label_map),
+            ..Default::default()
+        },
+        spec: Some(PodSpec::default()),
+        status: Some(PodStatus {
+            pod_ip: Some(ip.to_string()),
+            phase: Some("Running".to_string()),
+            conditions: Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "True".to_string(),
+                last_probe_time: None,
+                last_transition_time: None,
+                message: None,
+                reason: None,
+                observed_generation: None,
+            }]),
+            ..Default::default()
+        }),
+    }
 }

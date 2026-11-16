@@ -28,11 +28,15 @@ use smg::{
     },
     routers::grpc::backend_client::BackendClient,
     worker::{
-        basic::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
-        circuit_breaker::{CircuitBreaker, CircuitState},
-        endpoint::Endpoint,
-        metadata::DecodingLabels,
-        resilience::ResolvedResilience,
+        health::{
+            circuit_breaker::{CircuitBreaker, CircuitState},
+            resilience::ResolvedResilience,
+        },
+        identity::{
+            basic::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
+            endpoint::Endpoint,
+            metadata::DecodingLabels,
+        },
         ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
     },
 };
@@ -94,7 +98,7 @@ impl GrpcWorker {
             circuit_breaker: CircuitBreaker::new(),
             metadata,
             api_key: None,
-            http_client: Arc::new(smg::clients::http_client()),
+            http_client: Arc::new(smg::server::http_client()),
             resilience: ResolvedResilience::default(),
             weight_version: fingerprint_of(None),
         }
@@ -158,24 +162,10 @@ impl Worker for GrpcWorker {
         Ok(())
     }
 
-    // FFI workers don't run the state machine — these counters are unused.
+    // FFI workers don't run the health state machine: this worker keeps the
+    // trait's default `runtime_state` (`None`) and so has no probe counts.
     // The Go SDK manages worker health via direct set_status() calls
     // through the `sgl_multi_client_set_worker_health` FFI entry point.
-    fn consecutive_failures_increment(&self) -> usize {
-        0
-    }
-    fn consecutive_failures_reset(&self) {}
-    fn consecutive_successes_increment(&self) -> usize {
-        0
-    }
-    fn consecutive_successes_reset(&self) {}
-    fn total_pending_probes(&self) -> usize {
-        0
-    }
-    fn total_pending_probes_increment(&self) -> usize {
-        0
-    }
-    fn total_pending_probes_reset(&self) {}
 
     fn load(&self) -> usize {
         self.load.load(Ordering::Relaxed)
@@ -187,7 +177,7 @@ impl Worker for GrpcWorker {
 
     fn try_increment_load(&self, max: usize) -> bool {
         self.load
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1).filter(|next| *next <= max)
             })
             .is_ok()
@@ -252,18 +242,6 @@ impl Worker for GrpcWorker {
     async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
         // Not used by policies — the FFI layer handles the backend directly.
         Ok(None)
-    }
-
-    async fn grpc_health_check(&self) -> WorkerResult<bool> {
-        Ok(self.is_healthy())
-    }
-
-    async fn zmq_health_check(&self) -> WorkerResult<bool> {
-        Ok(self.is_healthy())
-    }
-
-    async fn http_health_check(&self) -> WorkerResult<bool> {
-        Ok(self.is_healthy())
     }
 }
 
@@ -345,7 +323,7 @@ pub unsafe extern "C" fn sgl_multi_client_create(
 ) -> *mut MultiWorkerClientHandle {
     // The workers' HTTP clients use the process-level TLS provider the
     // gateway binary installs at start-up; this library has no start-up.
-    smg::clients::install_crypto_provider();
+    smg::server::install_crypto_provider();
     if endpoints.is_null() || tokenizer_path.is_null() || policy_name.is_null() {
         set_error_message(error_out, "Invalid arguments: null pointer");
         return ptr::null_mut();
@@ -706,7 +684,7 @@ mod tests {
     fn connect(endpoint: &str) -> Arc<SglangSchedulerClient> {
         // The worker's HTTP client wants the process-level TLS provider the
         // create entry point installs.
-        smg::clients::install_crypto_provider();
+        smg::server::install_crypto_provider();
         Arc::new(
             RUNTIME
                 .block_on(SglangSchedulerClient::connect(endpoint))

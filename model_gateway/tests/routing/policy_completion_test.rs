@@ -14,8 +14,6 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use http_body_util::BodyExt;
-use openai_protocol::chat::ChatCompletionRequest;
-use serde_json::json;
 use smg::{
     routers::{router::Router as HttpRouter, RouterTrait},
     tenant::{RouteRequestMeta, TenantKey},
@@ -23,6 +21,7 @@ use smg::{
 };
 use tokio::{net::TcpListener, time::timeout};
 
+use super::streaming_chat_request;
 use crate::common::test_app::create_test_app_context;
 
 /// Records the worker URLs that reported a completion.
@@ -78,19 +77,6 @@ async fn router_with_spy(upstream_url: &str) -> (HttpRouter, Arc<CompletionSpy>)
     worker.set_completion_sink(Some(Arc::clone(&spy) as Arc<dyn RequestCompletionSink>));
     ctx.worker_registry.register(worker);
     (HttpRouter::new(&ctx).await.unwrap(), spy)
-}
-
-#[expect(
-    clippy::unwrap_used,
-    reason = "test infrastructure - panicking on failure is intentional"
-)]
-fn streaming_chat_request() -> ChatCompletionRequest {
-    serde_json::from_value(json!({
-        "model": "mock-model",
-        "messages": [{"role": "user", "content": "Hello"}],
-        "stream": true
-    }))
-    .unwrap()
 }
 
 /// A stream the client abandons after the first chunk still reports exactly

@@ -4,13 +4,15 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::profile::ProviderProfile;
+use smg_grpc_client::FormatSetAside;
 
 use crate::routers::{
     error,
     grpc::{
         common::stages::BuildStage,
         context::{
-            stage_output, BuildOutput, ExecutionPlanKind, PreparationOutput, RequestContext,
+            stage_output, BuildOutput, ExecutionPlanKind, PlanSettings, PreparationOutput,
+            RequestContext,
         },
         regular::stages::chat::build_chat_backed_plan,
         spec::{ResponseSpec, TranscriptionResponseSpec},
@@ -70,11 +72,14 @@ impl BuildStage for TranscriptionRequestBuildingStage {
             processed_messages.continued_final_message,
             token_ids,
             None,
+            FormatSetAside::default(),
             None,
             false,
             "transcription-",
-            /* inject_pd_metadata */ false,
-            ExecutionPlanKind::Single,
+            PlanSettings {
+                inject_pd_metadata: false,
+                plan_kind: ExecutionPlanKind::Single,
+            },
         )
         .await?;
 

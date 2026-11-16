@@ -176,6 +176,7 @@ def test_release_hierarchy_without_vllm_client_error_still_maps_validation_to_in
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("the_python_vllm_servicer_chosen")
 async def test_generate_aborts_with_invalid_argument_for_vllm_validation_error():
     pytest.importorskip("vllm")
     from smg_grpc_proto import vllm_engine_pb2

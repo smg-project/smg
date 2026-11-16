@@ -51,8 +51,8 @@ use super::*;
 use crate::{
     kv_events,
     testing::{
-        assert_bucket_edges, assert_golden, bound_port, captured_logs, http_get, servicer_config,
-        Bounded,
+        assert_bucket_edges, assert_golden, bound_port, captured_logs, handshake_address, http_get,
+        next_batch, reported_alive, servicer_config, Bounded,
     },
     tokenizer_bundle, ServicerError,
 };
@@ -75,20 +75,165 @@ fn model_info() -> VllmModelInfo {
     }
 }
 
+/// The model info of an engine with an encoder-cache connector in the given
+/// role (a Mooncake consumer's address per rank included, as the launcher
+/// reports them).
+fn ec_model_info(role: &str) -> VllmModelInfo {
+    VllmModelInfo {
+        supports_ec_transfer: true,
+        ec_connector: "ECMooncakeConnector".to_string(),
+        ec_role: role.to_string(),
+        ec_zmq_addrs: vec!["tcp://10.0.0.9:14579".to_string()],
+        ..model_info()
+    }
+}
+
+/// The model info of an engine with a CPU encoder-cache connector in the
+/// given role.
+fn ec_cpu_model_info(role: &str) -> VllmModelInfo {
+    VllmModelInfo {
+        ec_connector: "ECCPUConnector".to_string(),
+        ec_zmq_addrs: Vec::new(),
+        ..ec_model_info(role)
+    }
+}
+
+/// A pixel-less batch naming its media by hash alone: a consumer's request.
+fn pixel_less_batch(hashes: &[&str]) -> vllm::MultimodalInputs {
+    vllm::MultimodalInputs {
+        mm_hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
+        mm_placeholders: vec![vllm::PlaceholderRange {
+            offset: 1,
+            length: 3,
+        }],
+        modality: common::Modality::Image as i32,
+        ..Default::default()
+    }
+}
+
+/// A prefill side's realistic payload: the grid tensor of two items and their
+/// hashes, no pixels (the encoder ran elsewhere).
+fn grid_only_batch(hashes: &[&str]) -> vllm::MultimodalInputs {
+    let grid: Vec<u8> = [1i64, 2, 2, 1, 2, 2]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    vllm::MultimodalInputs {
+        mm_hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
+        mm_placeholders: vec![
+            vllm::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            },
+            vllm::PlaceholderRange {
+                offset: 6,
+                length: 3,
+            },
+        ],
+        model_specific_tensors: [(
+            "image_grid_thw".to_string(),
+            vllm::TensorData {
+                shape: vec![2, 3],
+                dtype: "int64".to_string(),
+                payload: Some(vllm::tensor_data::Payload::Inline(grid.into())),
+            },
+        )]
+        .into(),
+        batched_keys: vec!["image_grid_thw".to_string()],
+        modality: common::Modality::Image as i32,
+        ..Default::default()
+    }
+}
+
+/// A router-preprocessed image batch of two items whose pixels sit in a fresh
+/// `/dev/shm` file (read and unlinked once by the servicer).
+#[cfg(target_os = "linux")]
+fn shm_pixel_batch(tag: &str) -> vllm::MultimodalInputs {
+    let name = format!(
+        "smg-servicer-test-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let payload: Vec<u8> = (0..8).flat_map(|v| (v as f32).to_le_bytes()).collect();
+    fs::write(std::path::Path::new("/dev/shm").join(&name), &payload).expect("write shm file");
+    vllm::MultimodalInputs {
+        pixel_values: Some(vllm::TensorData {
+            shape: vec![2, 4],
+            dtype: "float32".to_string(),
+            payload: Some(vllm::tensor_data::Payload::Shm(common::ShmHandle {
+                name,
+                offset: 0,
+                nbytes: payload.len() as u64,
+                owner_id: "smg:test".to_string(),
+            })),
+        }),
+        mm_placeholders: vec![
+            vllm::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            },
+            vllm::PlaceholderRange {
+                offset: 6,
+                length: 3,
+            },
+        ],
+        mm_hashes: vec!["h0".to_string(), "h1".to_string()],
+        batched_keys: vec!["pixel_values".to_string()],
+        modality: common::Modality::Image as i32,
+        ..Default::default()
+    }
+}
+
+/// An int64 tensor with its bytes on the wire.
+fn inline_i64_tensor(shape: Vec<u32>, values: &[i64]) -> vllm::TensorData {
+    vllm::TensorData {
+        shape,
+        dtype: "int64".to_string(),
+        payload: Some(vllm::tensor_data::Payload::Inline(
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>()
+                .into(),
+        )),
+    }
+}
+
+/// An int64 tensor whose bytes sit in a fresh `/dev/shm` file (read and
+/// unlinked once by the servicer).
+#[cfg(target_os = "linux")]
+fn shm_i64_tensor(tag: &str, shape: Vec<u32>, values: &[i64]) -> vllm::TensorData {
+    let name = format!(
+        "smg-servicer-test-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let payload: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    fs::write(std::path::Path::new("/dev/shm").join(&name), &payload).expect("write shm file");
+    vllm::TensorData {
+        shape,
+        dtype: "int64".to_string(),
+        payload: Some(vllm::tensor_data::Payload::Shm(common::ShmHandle {
+            name,
+            offset: 0,
+            nbytes: payload.len() as u64,
+            owner_id: "smg:test".to_string(),
+        })),
+    }
+}
+
 fn config(dir: &std::path::Path, handshake: &str, model: VllmModelInfo) -> VllmServicerConfig {
     VllmServicerConfig {
         servicer: servicer_config(dir, handshake),
         model,
         media_processor: None,
     }
-}
-
-/// The handshake endpoint of one test: an IPC socket under its own
-/// directory. A probed TCP port is not reserved, so two tests running in
-/// parallel could pick the same one and a mock engine would handshake with
-/// the other test's servicer and wait forever for its INIT.
-fn handshake_address(dir: &std::path::Path) -> String {
-    format!("ipc://{}", dir.join("handshake").display())
 }
 
 /// The handshake endpoint is free again: ZMQ unlinks the ipc socket file once
@@ -146,6 +291,19 @@ async fn harness_with(
     let handshake = handshake_address(dir.path());
     let mut config = config(dir.path(), &handshake, model);
     config.media_processor = media_processor;
+    started(dir, handshake, config, tokenizer).await
+}
+
+/// The servicer started on `config` (with `tokenizer` when a test brings
+/// its own), one mock engine handshaken on `handshake` and waited for, the
+/// client connected: the single-engine harness [`harness_with`] and
+/// [`metrics_harness_with`] hand back.
+async fn started(
+    dir: tempfile::TempDir,
+    handshake: String,
+    config: VllmServicerConfig,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+) -> Harness {
     let server = match tokenizer {
         Some(tokenizer) => VllmServicerServer::start_with_tokenizer(config, tokenizer),
         None => VllmServicerServer::start(config),
@@ -218,7 +376,7 @@ fn batch(
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: request_id.to_string(),
+            request_id: request_id.into(),
             new_token_ids: tokens,
             finish_reason: finish,
             ..Default::default()
@@ -753,6 +911,85 @@ async fn string_stops_are_matched_by_the_servicer() {
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r3".to_string()]);
 }
 
+/// The servicer's own matched-stop terminal for a fan-out's second choice
+/// carries that choice's index, as the engine's completes do: the stop string
+/// matches on choice 1 while choice 0 is still open, and choice 0 then ends on
+/// the engine's own complete with index 0.
+#[tokio::test]
+async fn a_matched_stop_ends_the_second_choice_with_its_own_index() {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+    let mut h = harness(model_info(), Some(tokenizer)).await;
+    let mut request = generate_request("r8", true, vec!["Hello world".to_string()]);
+    request.sampling_params.as_mut().unwrap().n = 2;
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    h.engine_out
+        .send_outputs(&batch("r8-1", vec![1], None, None))
+        .await
+        .unwrap();
+    h.engine_out
+        .send_outputs(&batch("r8-1", vec![2], None, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![1]
+    );
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![2]
+    );
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (
+            done.index,
+            done.finish_reason.as_str(),
+            done.output_ids.clone()
+        ),
+        (1, "stop", vec![1, 2])
+    );
+    assert_eq!(
+        done.matched_stop,
+        Some(vllm::generate_complete::MatchedStop::MatchedStopStr(
+            "Hello world".to_string()
+        ))
+    );
+
+    h.engine_out
+        .send_outputs(&batch(
+            "r8-0",
+            vec![30],
+            Some(EngineCoreFinishReason::Length),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![30]
+    );
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (
+            done.index,
+            done.finish_reason.as_str(),
+            done.output_ids.clone()
+        ),
+        (0, "length", vec![30])
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    // The engine gets the abort for the choice the servicer ended, and only
+    // that one: nothing follows it.
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r8-1".to_string()]);
+    assert_engine_idle(&mut h.engine_in).await;
+}
+
 /// A stop string that is one token (`world` is mock token 2) also reaches
 /// the engine as a stop id, so the engine finishes on the tick the string
 /// matches. The choice must end with the engine's own `Complete`, carrying
@@ -867,6 +1104,68 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
         })
         .await
         .expect("abort of unknown ids");
+}
+
+/// A fan-out's open choices end on an `Abort` RPC with their own indexes: the
+/// terminal the servicer builds for the second choice carries index 1, as the
+/// engine's own completes do.
+#[tokio::test]
+async fn an_abort_ends_each_choice_of_a_fan_out_with_its_own_index() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("r7", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().n = 2;
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    h.engine_out
+        .send_outputs(&batch("r7-1", vec![21], None, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![21]
+    );
+
+    h.client
+        .abort(vllm::AbortRequest {
+            request_ids: vec!["r7".to_string()],
+        })
+        .await
+        .expect("abort");
+    let mut terminals = [
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+    ];
+    terminals.sort_by_key(|done| done.index);
+    let seen: Vec<_> = terminals
+        .iter()
+        .map(|done| {
+            (
+                done.index,
+                done.finish_reason.clone(),
+                done.output_ids.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (0, "abort".to_string(), vec![]),
+            (1, "abort".to_string(), vec![21])
+        ]
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    let mut aborted = recv_abort(&mut h.engine_in).await;
+    while aborted.len() < 2 {
+        aborted.extend(recv_abort(&mut h.engine_in).await);
+    }
+    aborted.sort();
+    assert_eq!(aborted, vec!["r7-0".to_string(), "r7-1".to_string()]);
 }
 
 /// PD disaggregation rides through as on the Python servicer: the request's
@@ -1144,6 +1443,355 @@ async fn media_refs_are_refused_and_extra_batches_translated() {
     let engine_request = recv_add(&mut h.engine_in).await;
     assert!(engine_request.mm_features.is_none());
     assert_eq!(engine_request.cache_salt.as_deref(), Some("mm:h1,h2"));
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// An encode-prefill-decode request carries encoder-cache transfer parameters:
+/// the encoder's request (a pull connector's empty object, or a push
+/// connector's consumer destination and transfer ids), or the prefill side's
+/// with the encoder's handles. This servicer runs no encoder-cache connector
+/// and advertises none, so each is refused before the engine sees it, naming
+/// the label the Router reads; an empty field is no parameters and the
+/// request goes through.
+#[tokio::test]
+async fn encoder_cache_transfer_parameters_are_refused_before_the_engine() {
+    let mut h = harness(model_info(), None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest::default())
+        .await
+        .expect("server info")
+        .into_inner();
+    assert!(
+        !info.supports_ec_transfer
+            && info.ec_connector.is_empty()
+            && info.ec_role.is_empty()
+            && info.ec_zmq_addrs.is_empty(),
+        "no encoder-cache capability is advertised: {info:?}"
+    );
+    for (id, params) in [
+        (
+            "ec-encode",
+            r#"{"consumer_zmq":"tcp://10.0.0.2:5700","ec_items":[{"transfer_id":"t1"}]}"#,
+        ),
+        (
+            "ec-prefill",
+            r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600,"size_bytes":128}}"#,
+        ),
+        // The encoder's request of a pull connector: an empty object, the payload
+        // the Router sends most often, is parameters all the same.
+        ("ec-encode-pull", "{}"),
+    ] {
+        let mut request = generate_request(id, false, Vec::new());
+        request.ec_transfer_params_json = Some(params.to_string());
+        let status = h.client.generate(request).await.expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+        assert_eq!(
+            status.message(),
+            "ec_transfer_params_json sent but this worker runs no encoder-cache connector; \
+             check this worker's supports_ec_transfer label",
+            "{id}"
+        );
+    }
+    assert_engine_idle(&mut h.engine_in).await;
+
+    let mut request = generate_request("ec-empty", false, Vec::new());
+    request.ec_transfer_params_json = Some(String::new());
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("an empty field is a plain request")
+        .into_inner();
+    assert_eq!(recv_add(&mut h.engine_in).await.request_id, "ec-empty");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// With an encoder-cache connector in the engine, the four info fields are
+/// advertised as the launcher reports them, a request's transfer parameters go
+/// to the engine as the connector's extra argument (a pull connector's empty
+/// object included, beside no KV params) and the connector's answer comes
+/// back on the `Complete`, as the Python servicer carries them.
+#[tokio::test]
+async fn encoder_cache_transfer_parameters_pass_through_both_ways() {
+    let mut h = harness(ec_model_info("ec_consumer"), None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest::default())
+        .await
+        .expect("server info")
+        .into_inner();
+    assert!(info.supports_ec_transfer, "{info:?}");
+    assert_eq!(
+        (info.ec_connector.as_str(), info.ec_role.as_str()),
+        ("ECMooncakeConnector", "ec_consumer")
+    );
+    assert_eq!(info.ec_zmq_addrs, vec!["tcp://10.0.0.9:14579"]);
+    for (id, params) in [
+        (
+            "ec-prefill",
+            r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600,"size_bytes":128}}"#,
+        ),
+        ("ec-encode-pull", "{}"),
+    ] {
+        let mut request = generate_request(id, false, Vec::new());
+        request.ec_transfer_params_json = Some(params.to_string());
+        let mut stream = h
+            .client
+            .generate(request)
+            .await
+            .expect("admitted on an engine with a connector")
+            .into_inner();
+        let engine_request = recv_add(&mut h.engine_in).await;
+        assert_eq!(engine_request.request_id, id);
+        let extra = engine_request
+            .sampling_params
+            .as_ref()
+            .and_then(|sp| sp.extra_args.as_ref())
+            .expect("extra_args carry the connector params");
+        let sent: serde_json::Value = serde_json::from_str(params).unwrap();
+        assert_eq!(extra.get("ec_transfer_params"), Some(&sent), "{id}");
+        assert!(extra.get("kv_transfer_params").is_none(), "{id}");
+
+        let mut outputs = batch(id, vec![7], Some(EngineCoreFinishReason::Length), None);
+        if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
+            batch.outputs[0].ec_transfer_params = Some(Box::new(serde_json::json!({
+                "h1": {"peer_host": "10.0.0.2", "peer_port": 5700, "size_bytes": 128},
+            })));
+        }
+        h.engine_out.send_outputs(&outputs).await.unwrap();
+        let finished = complete(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(finished.finish_reason, "length", "{id}");
+        let returned: serde_json::Value = serde_json::from_str(
+            finished
+                .ec_transfer_params_json
+                .as_deref()
+                .expect("json params"),
+        )
+        .unwrap();
+        assert_eq!(returned["h1"]["peer_port"], 5700, "{id}");
+        assert!(finished.kv_transfer_params_json.is_none(), "{id}");
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A consumer's request (the prefill side of an encode-prefill-decode fleet)
+/// brings pixel-less batches: the engine fetches their encodings by the
+/// handles in the transfer parameters, so a request whose handles do not cover
+/// every item is refused before the engine, in the Python servicer's words
+/// (an empty object, a CPU handle without an address, a Mooncake transfer
+/// id short of one occurrence); one whose handles cover them goes through.
+#[tokio::test]
+async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
+    let mut h = harness(ec_cpu_model_info("ec_consumer"), None).await;
+    let refused = [
+        ("ec-c-empty", "{}"),
+        (
+            "ec-c-short",
+            r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600}}"#,
+        ),
+        (
+            "ec-c-no-port",
+            r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600},"h2":{"peer_host":"10.0.0.1"}}"#,
+        ),
+    ];
+    for (id, params) in refused {
+        let mut request = generate_request(id, false, Vec::new());
+        request.mm_inputs = Some(pixel_less_batch(&["h1", "h2"]));
+        request.ec_transfer_params_json = Some(params.to_string());
+        let status = h.client.generate(request).await.expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+        assert!(
+            status
+                .message()
+                .contains("not usable for every pixel-less media item"),
+            "{id}: {}",
+            status.message()
+        );
+    }
+    assert_engine_idle(&mut h.engine_in).await;
+    let mut request = generate_request("ec-c-ok", false, Vec::new());
+    request.mm_inputs = Some(pixel_less_batch(&["h1", "h2"]));
+    request.ec_transfer_params_json = Some(
+        r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600},"h2":{"peer_host":"10.0.0.1","peer_port":5601}}"#
+            .to_string(),
+    );
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("covered handles go through")
+        .into_inner();
+    let engine_request = recv_add(&mut h.engine_in).await;
+    assert_eq!(engine_request.request_id, "ec-c-ok");
+    assert!(
+        engine_request.mm_features.is_none(),
+        "a pixel-less request carries no features"
+    );
+
+    // The prefill side's realistic payload, grid tensors and hashes without
+    // pixels: admitted on the encoder-cache parameters alone (no KV
+    // parameters), as the Python servicer admits it, the grid riding to the
+    // engine as the items' features.
+    let mut request = generate_request("ec-c-grid", false, Vec::new());
+    request.input = Some(vllm::generate_request::Input::Tokenized(
+        vllm::TokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![1; 9],
+        },
+    ));
+    request.mm_inputs = Some(grid_only_batch(&["h1", "h2"]));
+    request.ec_transfer_params_json = Some(
+        r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600},"h2":{"peer_host":"10.0.0.1","peer_port":5601}}"#
+            .to_string(),
+    );
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("a grid-only batch on an encoder-cache request goes through")
+        .into_inner();
+    let engine_request = recv_add(&mut h.engine_in).await;
+    assert_eq!(engine_request.request_id, "ec-c-grid");
+    assert!(
+        engine_request.mm_features.is_some(),
+        "the grid rides as the items' features"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    // Mooncake consumes one transfer id per occurrence of a hash.
+    let mut h = harness(ec_model_info("ec_consumer"), None).await;
+    let mut request = generate_request("ec-m-short", false, Vec::new());
+    request.mm_inputs = Some(pixel_less_batch(&["h1", "h1"]));
+    request.ec_transfer_params_json =
+        Some(r#"{"ec_items":[{"mm_hash":"h1","transfer_id":"t1"}]}"#.to_string());
+    let status = h
+        .client
+        .generate(request)
+        .await
+        .expect_err("one id for two");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    let mut request = generate_request("ec-m-ok", false, Vec::new());
+    request.mm_inputs = Some(pixel_less_batch(&["h1", "h1"]));
+    request.ec_transfer_params_json = Some(
+        r#"{"ec_items":[{"mm_hash":"h1","transfer_id":"t1"},{"mm_hash":"h1","transfer_id":"t2"}]}"#
+            .to_string(),
+    );
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("one id per occurrence goes through")
+        .into_inner();
+    assert_eq!(recv_add(&mut h.engine_in).await.request_id, "ec-m-ok");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// An encoder's request with router-preprocessed pixels: its `Complete` carries
+/// the media identity (the prompt's ids, the batch without its pixels) beside
+/// the connector's handles, and on a CPU connector a completion short of a
+/// handle for one of the items is refused instead of becoming a handoff.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn encoder_cache_producer_completion_carries_the_identity_and_the_cpu_handles() {
+    let mut h = harness(ec_cpu_model_info("ec_producer"), None).await;
+    let handles = |short: bool| {
+        let mut handles = serde_json::json!({
+            "h0": {"peer_host": "10.0.0.2", "peer_port": 5700, "size_bytes": 64},
+            "h1": {"peer_host": "10.0.0.2", "peer_port": 5700, "size_bytes": 64},
+        });
+        if short {
+            handles["h1"] = serde_json::json!({"size_bytes": 64});
+        }
+        handles
+    };
+    for (id, short) in [("ec-p-full", false), ("ec-p-short", true)] {
+        let mut request = generate_request(id, false, Vec::new());
+        request.input = Some(vllm::generate_request::Input::Tokenized(
+            vllm::TokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![0; 9],
+            },
+        ));
+        // Beside the pixels: a grid inline (kept by the identity), a grid in
+        // shared memory (dropped: unlinked once read) and a non-grid tensor
+        // (dropped: not part of the identity), all batched one row per item.
+        let mut mm = shm_pixel_batch(id);
+        mm.model_specific_tensors.insert(
+            "image_grid_thw".to_string(),
+            inline_i64_tensor(vec![2, 3], &[1, 2, 2, 1, 2, 2]),
+        );
+        mm.model_specific_tensors.insert(
+            "video_grid_thw".to_string(),
+            shm_i64_tensor(&format!("{id}-grid"), vec![2, 3], &[1, 2, 2, 1, 2, 2]),
+        );
+        mm.model_specific_tensors.insert(
+            "patches_per_image".to_string(),
+            inline_i64_tensor(vec![2], &[4, 4]),
+        );
+        mm.batched_keys.extend(
+            ["image_grid_thw", "video_grid_thw", "patches_per_image"]
+                .iter()
+                .map(|key| key.to_string()),
+        );
+        request.mm_inputs = Some(mm);
+        request.ec_transfer_params_json = Some("{}".to_string());
+        let mut stream = h
+            .client
+            .generate(request)
+            .await
+            .expect("an encoder's request is admitted")
+            .into_inner();
+        let engine_request = recv_add(&mut h.engine_in).await;
+        assert_eq!(engine_request.request_id, id);
+        assert!(
+            engine_request.mm_features.is_some(),
+            "the pixels reach the engine"
+        );
+        let mut outputs = batch(id, vec![7], Some(EngineCoreFinishReason::Length), None);
+        if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
+            batch.outputs[0].ec_transfer_params = Some(Box::new(handles(short)));
+        }
+        h.engine_out.send_outputs(&outputs).await.unwrap();
+        let item = stream.message().bounded().await;
+        if short {
+            let status = item.expect_err("a handle short of an address is refused");
+            assert_eq!(status.code(), Code::Internal, "{id}");
+            assert!(
+                status
+                    .message()
+                    .contains("incomplete ECCPU transfer handle"),
+                "{id}: {}",
+                status.message()
+            );
+            continue;
+        }
+        let finished = complete(item.unwrap().expect("the encoder's completion"));
+        let identity = finished.media_identity.expect("the encoder's identity");
+        assert_eq!(identity.prompt_token_ids, vec![0; 9]);
+        let batch = identity.mm_inputs.expect("the batch");
+        assert_eq!(batch.mm_hashes, vec!["h0", "h1"]);
+        assert!(
+            batch.pixel_values.is_none(),
+            "the identity carries no pixels"
+        );
+        assert_eq!(batch.mm_placeholders.len(), 2);
+        let mut kept: Vec<&String> = batch.model_specific_tensors.keys().collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            ["image_grid_thw"],
+            "the identity keeps the inline grid alone: not the grid in shared memory, not a \
+             non-grid tensor"
+        );
+        assert_eq!(batch.batched_keys, vec!["image_grid_thw"]);
+        assert!(batch.flat_keys.is_empty() && batch.keep_on_cpu_keys.is_empty());
+        let returned: serde_json::Value =
+            serde_json::from_str(finished.ec_transfer_params_json.as_deref().unwrap()).unwrap();
+        assert_eq!(returned["h1"]["peer_port"], 5700);
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -1622,11 +2270,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
         .expect("subscribe")
         .into_inner();
     for expected in [0, 1] {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
@@ -1635,7 +2279,8 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
 }
 
 /// Deferred requests survive the wire, adapter, gRPC poll and KV load record,
-/// remain rank-local, and disappear when the engine drains its queues.
+/// remain rank-local (the other rank's zero-filled entry stays zero), and
+/// disappear when the engine drains its queues.
 #[tokio::test]
 async fn remote_kv_waiting_load_is_reported_per_rank() {
     let mut model = model_info();
@@ -1673,21 +2318,82 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(loads.loads.len(), 1);
-        let load = &loads.loads[0];
-        assert_eq!(load.dp_rank, 1);
-        assert_eq!(load.num_waiting_reqs, expected_total);
+        assert_eq!(loads.loads.len(), 2, "one entry per rank: {loads:?}");
+        let by_rank = |rank: i32| {
+            loads
+                .loads
+                .iter()
+                .find(|load| load.dp_rank == rank)
+                .unwrap_or_else(|| panic!("rank {rank}'s entry: {loads:?}"))
+        };
+        assert_eq!(by_rank(1).num_waiting_reqs, expected_total);
         let record = kv_events::LoadSource::load(&source, Some(1)).unwrap();
         assert_eq!(record.waiting_requests, expected_record_total);
-        assert!(kv_events::LoadSource::load(&source, Some(0)).is_none());
+        // Rank 0 has not reported: its entry and record stay zero-filled,
+        // never rank 1's queue.
+        assert_eq!(by_rank(0).num_waiting_reqs, 0);
+        assert_eq!(
+            kv_events::LoadSource::load(&source, Some(0)).map(|record| record.waiting_requests),
+            Some(0)
+        );
     }
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// `GetLoads` with a rank named answers that rank's entry alone, as the
+/// other three wires and the Python servicer answer it; without one, every
+/// rank's; a rank this servicer does not serve answers no entry (the shape
+/// of the three filtering wires).
+#[tokio::test]
+async fn get_loads_answers_the_named_rank_alone() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, _rank1_in, _rank1_out) = two_rank_harness(model).await;
+    let ranks_of = |response: &vllm::GetLoadsResponse| {
+        response
+            .loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>()
+    };
+    let every = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((every.dp_rank_count, ranks_of(&every)), (2, vec![0, 1]));
+    let one = h
+        .client
+        .get_loads(vllm::GetLoadsRequest {
+            dp_rank: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((one.dp_rank_count, ranks_of(&one)), (1, vec![1]), "{one:?}");
+    let unserved = h
+        .client
+        .get_loads(vllm::GetLoadsRequest {
+            dp_rank: Some(7),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (unserved.dp_rank_count, ranks_of(&unserved)),
+        (0, Vec::new()),
+        "{unserved:?}"
+    );
 }
 
 /// Two ranks behind one servicer: the request the second rank serves is
 /// credited to that rank's hit rate and throughput, on the poll and on the
 /// pushed record, and the first rank reads idle rather than carrying the
-/// second's figures (or the second reading zero while it serves).
+/// second's figures (or the second reading zero while it serves), from the
+/// second's first step on: a zero-filled entry, not a missing one.
 #[tokio::test]
 async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
     let mut model = model_info();
@@ -1710,7 +2416,7 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 1,
             outputs: vec![EngineCoreOutput {
-                request_id: "r1".to_string(),
+                request_id: "r1".into(),
                 new_token_ids: vec![10, 11, 12, 13],
                 prefill_stats: Some(PrefillStats {
                     num_prompt_tokens: 3,
@@ -1728,10 +2434,43 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
         chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
         vec![10, 11, 12, 13]
     );
-    // Rank 0 has not reported a scheduler step: a batch of its gets no
-    // record rather than rank 1's figures.
+    // Rank 0 has not reported a scheduler step: its entry, and the record a
+    // batch of its would carry, are zero-filled (an idle rank, not a gone
+    // one), never rank 1's figures.
+    wait_until(|| {
+        h.server
+            .state
+            .shared
+            .engine()
+            .is_ok_and(|client| client.get_loads().loads.len() == 1)
+    })
+    .await;
     let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
-    assert!(kv_events::LoadSource::load(&source, Some(0)).is_none());
+    let idle = kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's zero record");
+    assert_eq!(
+        (
+            idle.running_requests,
+            idle.cache_hit_rate,
+            idle.gen_throughput
+        ),
+        (0, Some(0.0), 0.0),
+        "{idle:?}"
+    );
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2, "{loads:?}");
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs))
+            .collect::<Vec<_>>(),
+        vec![(0, 0), (1, 1)]
+    );
     // Then rank 0 reports an idle step.
     h.engine_out
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
@@ -1823,7 +2562,7 @@ async fn the_entries_before_the_first_snapshot_carry_the_servicers_own_figures()
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
             outputs: vec![EngineCoreOutput {
-                request_id: "r1".to_string(),
+                request_id: "r1".into(),
                 new_token_ids: vec![10, 11, 12, 13],
                 prefill_stats: Some(PrefillStats {
                     num_prompt_tokens: 3,
@@ -1882,6 +2621,72 @@ async fn the_entries_before_the_first_snapshot_carry_the_servicers_own_figures()
 
     drop(second);
     drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Exercise the production path: vLLM wire -> Rust servicer -> gRPC GetLoads,
+/// plus the record used by the KV-event relay. Only actual input work counts.
+#[tokio::test]
+async fn prefill_capacity_reaches_grpc_and_push_per_rank() {
+    use engine_zmq_client::protocol::vllm::output::{EngineCoreEvent, EngineCoreEventType};
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, mut input, mut output) = two_rank_harness(model).await;
+    for (id, start) in [("p1", 10.0), ("p2", 20.0)] {
+        let mut request = generate_request(id, true, vec![]);
+        request.data_parallel_rank = Some(1);
+        let mut stream = h.client.generate(request).await.unwrap().into_inner();
+        assert_eq!(recv_add(&mut input).await.request_id, id);
+        output
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                engine_index: 1,
+                timestamp: start + 0.5,
+                outputs: vec![EngineCoreOutput {
+                    request_id: id.into(),
+                    new_token_ids: vec![10],
+                    finish_reason: Some(EngineCoreFinishReason::Length),
+                    events: Some(vec![
+                        EngineCoreEvent {
+                            r#type: EngineCoreEventType::Queued,
+                            timestamp: start - 9.0,
+                        },
+                        EngineCoreEvent {
+                            r#type: EngineCoreEventType::Scheduled,
+                            timestamp: start,
+                        },
+                    ]),
+                    prefill_stats: Some(PrefillStats {
+                        num_prompt_tokens: 3,
+                        num_cached_tokens: 1,
+                        num_computed_tokens: 2,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                scheduler_stats: Some(SchedulerStats::default()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rank1 = loads.loads.iter().find(|load| load.dp_rank == 1).unwrap();
+    assert_eq!(rank1.prefill_throughput, Some(4.0));
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = kv_events::LoadSource::load(&source, Some(1)).unwrap();
+    assert_eq!(record.prefill_throughput, Some(4.0));
+    assert_eq!(
+        kv_events::LoadSource::load(&source, Some(0))
+            .unwrap()
+            .prefill_throughput,
+        None
+    );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -1981,11 +2786,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .expect("subscribe")
         .into_inner();
     for expected in 0..=3 {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
@@ -2150,6 +2951,136 @@ async fn get_tokenizer_without_a_tokenizer_dir_is_refused() {
     server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A subscriber that wants the load records alone gets them with or without
+/// a relay (the servicer's own figures need none): `load_only` batches
+/// numbered 0, one per rank, with the engine's telemetry, and never an
+/// event; a rank's record follows its own clock.
+#[tokio::test]
+async fn loads_only_streams_each_ranks_record_without_a_relay() {
+    let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model_info()).await;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.client
+            .subscribe_kv_events(common::SubscribeKvEventsRequest {
+                loads_only: true,
+                ..Default::default()
+            }),
+    )
+    .await
+    .expect("the call resolves")
+    .expect("subscribe: no relay is needed for the records")
+    .into_inner();
+    let mut ranks = Vec::new();
+    for _ in 0..2 {
+        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("a record in time")
+            .expect("stream open")
+            .expect("a batch");
+        assert_eq!(batch.sequence_number, 0);
+        assert!(batch.events.is_empty());
+        let load = batch.load.as_ref().expect("a record");
+        assert!(load.load_only);
+        assert_eq!(load.running_requests, 0);
+        assert_eq!(
+            load.max_total_num_tokens,
+            Some(h.server.state.shared.kv_capacity_tokens())
+        );
+        ranks.push(batch.dp_rank.expect("a rank"));
+    }
+    ranks.sort_unstable();
+    assert_eq!(ranks, vec![0, 1], "one record per rank at the first tick");
+    // Rank 1 reports a scheduler step with work: its record moves, rank 0's
+    // does not, so the next batch is rank 1's alone.
+    rank1_out
+        .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 1,
+            scheduler_stats: Some(SchedulerStats {
+                num_waiting_reqs: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    // Rank 1's moved record comes within a tick; a heartbeat of rank 0 may
+    // precede it on a slow box. Every batch is a record without events.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let batch = tokio::time::timeout_at(deadline, stream.message())
+            .await
+            .expect("rank 1's record in time")
+            .expect("stream open")
+            .expect("a batch");
+        let load = batch.load.as_ref().expect("a record");
+        assert!(load.load_only && batch.events.is_empty(), "{batch:?}");
+        if batch.dp_rank == Some(1) && load.waiting_requests == 2 {
+            assert_eq!(load.running_requests, 0);
+            break;
+        }
+    }
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The record the relay reads for a rank is the entry `GetLoads` lists for
+/// it, reported or not yet (the zero-filled entry with the servicer's own
+/// figures), rank 0 for a publisher that names no rank, and nothing for a
+/// rank past the connected ones.
+#[tokio::test]
+async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
+    let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model_info()).await;
+    rank1_out
+        .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 1,
+            scheduler_stats: Some(SchedulerStats {
+                num_running_reqs: 3,
+                num_waiting_reqs: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let answer = loop {
+        let answer = h
+            .client
+            .get_loads(vllm::GetLoadsRequest::default())
+            .await
+            .expect("GetLoads answers")
+            .into_inner();
+        if answer
+            .loads
+            .iter()
+            .any(|load| load.dp_rank == 1 && load.num_waiting_reqs == 2)
+        {
+            break answer;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rank 1's figures in time: {answer:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let ranks: Vec<i32> = answer.loads.iter().map(|load| load.dp_rank).collect();
+    assert_eq!(ranks, [0, 1], "rank 0 is listed before its first step");
+    let state = &h.server.state;
+    for load in &answer.loads {
+        let mut expected = common::EngineLoad::from(load);
+        expected.waiting_uncached_tokens =
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        assert_eq!(
+            state.rank_load(Some(load.dp_rank)),
+            Some(expected),
+            "rank {}",
+            load.dp_rank
+        );
+    }
+    assert_eq!(state.rank_load(None), state.rank_load(Some(0)));
+    assert!(state.rank_load(Some(2)).is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `SubscribeKvEvents` without a publisher is UNIMPLEMENTED with the Python
 /// servicer's message. With one configured, the call resolves before any
 /// event (headers go out eagerly, as the Python relay's initial metadata),
@@ -2190,6 +3121,7 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
             .subscribe_kv_events(common::SubscribeKvEventsRequest {
                 start_sequence_number: 0,
                 load_records_before_first_batch: false,
+                loads_only: false,
             }),
     )
     .await
@@ -2223,11 +3155,7 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
         .await
         .expect("publish");
     let second = loop {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         if batch.sequence_number != 0 {
             break batch;
         }
@@ -2543,7 +3471,7 @@ fn pooling_model_info() -> VllmModelInfo {
 fn pooled_batch(request_id: &str, values: Vec<f32>) -> EngineCoreOutputs {
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         outputs: vec![EngineCoreOutput {
-            request_id: request_id.to_string(),
+            request_id: request_id.into(),
             pooling_output: Some(Box::new(PoolingOutput::new(
                 WireTensor::from_f32(vec![values.len()], values).unwrap(),
             ))),
@@ -3658,6 +4586,61 @@ async fn an_engine_that_never_dials_in_fails_the_link_at_the_startup_bound() {
     assert_handshake_released(&handshake).await;
 }
 
+/// A stop while the link is still waiting for its engine releases the
+/// handshake endpoint too: the connect that was waiting ends with the server,
+/// and its endpoint file does not outlive `stop`.
+#[tokio::test]
+async fn a_stop_during_the_handshake_wait_releases_the_handshake_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = VllmServicerServer::start(config).unwrap();
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    wait_until(|| fs::metadata(&endpoint).is_ok()).await;
+    assert!(
+        server.last_error().unwrap().is_none(),
+        "the link is still waiting for the engine"
+    );
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
+    assert_handshake_released(&handshake).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_leftover_handshake_endpoint_does_not_fail_the_link() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    // A bound-then-dropped listener leaves its socket file behind, as a
+    // process that died without cleanup does.
+    drop(UnixListener::bind(&endpoint).unwrap());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = VllmServicerServer::start(config).unwrap();
+
+    // Only the link's own bind answers a connect: the leftover refuses it.
+    wait_until(|| {
+        assert_eq!(
+            server.last_error().unwrap(),
+            None,
+            "the link failed on the leftover"
+        );
+        UnixStream::connect(&endpoint).is_ok()
+    })
+    .await;
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
+}
+
 /// Between HELLO and READY a real engine loads its model, and nothing crosses
 /// the wire meanwhile. The lifecycle owner's reports that the engine process
 /// is alive keep the link waiting well past the silence bound, and the start
@@ -3669,17 +4652,17 @@ async fn a_slow_engine_stays_linked_while_the_launcher_reports_it_alive() {
     let silence = Duration::from_millis(300);
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
-    let server = VllmServicerServer::start(config).unwrap();
+    let server = Arc::new(VllmServicerServer::start(config).unwrap());
+    // The launcher reports through the whole start, as it polls the process
+    // it launched: the silence bound then meets the engine's quiet load
+    // alone, not the time this host takes over the dial-in or over READY.
+    let _alive = reported_alive(server.clone(), VllmServicerServer::note_engine_alive);
     // The engine dials in at once, then "loads" for four silences.
     let loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
         .expect("HELLO answered with INIT");
-    let load_time = Instant::now() + 4 * silence;
-    while Instant::now() < load_time {
-        server.note_engine_alive();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    tokio::time::sleep(4 * silence).await;
     assert_eq!(
         server.last_error().unwrap(),
         None,
@@ -3707,13 +4690,18 @@ async fn an_engine_that_falls_silent_after_hello_fails_the_link_at_the_bound() {
     let silence = Duration::from_millis(300);
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
-    let server = VllmServicerServer::start(config).unwrap();
+    let server = Arc::new(VllmServicerServer::start(config).unwrap());
+    // Reported alive until HELLO is answered: the silence under test starts
+    // there, whatever time this host takes over the dial-in, and counts
+    // from a sign of life no earlier than `before_hello`.
+    let alive = reported_alive(server.clone(), VllmServicerServer::note_engine_alive);
+    let before_hello = Instant::now();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
         .expect("HELLO answered with INIT");
-    let since_hello = Instant::now();
-    let deadline = since_hello + Duration::from_secs(10);
+    drop(alive);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let error = loop {
         if let Some(error) = server.last_error().unwrap() {
             break error;
@@ -3721,7 +4709,7 @@ async fn an_engine_that_falls_silent_after_hello_fails_the_link_at_the_bound() {
         assert!(Instant::now() < deadline, "no link failure reported");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert!(since_hello.elapsed() >= silence);
+    assert!(before_hello.elapsed() >= silence);
     assert!(
         error.contains("timed out while waiting for READY"),
         "{error}"
@@ -3741,15 +4729,14 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
     config.servicer.engine_startup_ceiling = Some(ceiling);
-    let server = VllmServicerServer::start(config).unwrap();
+    // Read before the start, which the ceiling counts from.
     let started = Instant::now();
-    let _loading = hello(&handshake, EngineId::from_engine_index(0))
-        .bounded()
-        .await
-        .expect("HELLO answered with INIT");
+    let server = Arc::new(VllmServicerServer::start(config).unwrap());
+    // The engine does not dial in: a dial-in would race the ceiling at this
+    // host's pace, and the ceiling bounds every wait of the handshake alike.
+    let _alive = reported_alive(server.clone(), VllmServicerServer::note_engine_alive);
     let deadline = started + Duration::from_secs(10);
     let error = loop {
-        server.note_engine_alive();
         if let Some(error) = server.last_error().unwrap() {
             break error;
         }
@@ -3796,7 +4783,7 @@ async fn concurrent_streams_keep_their_own_chunk_sequences() {
         let last = step + 1 == STEPS;
         let outputs = (0..STREAMS)
             .map(|i| EngineCoreOutput {
-                request_id: format!("c{i}"),
+                request_id: format!("c{i}").into(),
                 new_token_ids: vec![token(i, step)],
                 finish_reason: last.then_some(EngineCoreFinishReason::Length),
                 ..Default::default()
@@ -3970,7 +4957,7 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// Expanded media must be refused before normal engine admission; a PD leg
+/// Expanded media must be refused before normal engine admission; a PD request
 /// still releases its remote prefill through the abort-only notice.
 #[tokio::test]
 async fn expanded_context_rejection_preserves_pd_cleanup() {
@@ -4282,28 +5269,7 @@ async fn metrics_harness_with(
     let mut config = config(dir.path(), &handshake, model);
     config.servicer.metrics_bind_address = Some("127.0.0.1:0".to_string());
     config.media_processor = media_processor;
-    let server = match tokenizer {
-        Some(tokenizer) => VllmServicerServer::start_with_tokenizer(config, tokenizer),
-        None => VllmServicerServer::start(config),
-    }
-    .expect("servicer starts");
-    let engine = connect_to_frontend(
-        &handshake,
-        EngineId::from_engine_index(0),
-        default_ready_response(),
-    )
-    .await
-    .expect("mock engine handshake");
-    wait_until(|| server.engine_ready()).await;
-    let client = VllmEngineClient::new(grpc_channel(server.address()).await);
-    let (engine_in, engine_out) = engine.split();
-    Harness {
-        server,
-        engine_in,
-        engine_out,
-        client,
-        _dir: dir,
-    }
+    started(dir, handshake, config, tokenizer).await
 }
 
 /// One scrape of the servicer's metrics listener.
@@ -4469,7 +5435,7 @@ smg_servicer_metrics_scrape_seconds{model="served",wire="vllm"} <v>
 smg_servicer_metrics_scrapes_total{model="served",wire="vllm",code="200"} 0
 smg_servicer_metrics_scrapes_total{model="served",wire="vllm",code="500"} 0
 smg_servicer_prompt_tokens_cached_total{model="served",wire="vllm",rank="0"} 1
-smg_servicer_prompt_tokens_total{model="served",wire="vllm",rank="0"} 6
+smg_servicer_prompt_tokens_total{model="served",wire="vllm",rank="0"} 15
 smg_servicer_request_errors_total{model="served",wire="vllm",code="unavailable"} 1
 smg_servicer_request_generation_tokens_count{model="served",wire="vllm",rank="0"} 5
 smg_servicer_request_generation_tokens_sum{model="served",wire="vllm",rank="0"} 8
@@ -4528,7 +5494,9 @@ smg_servicer_media_requests_total{model="served",wire="vllm",outcome="unavailabl
 /// One streamed request (three chunks, the engine's stop), one non-streamed
 /// (the budget), one the caller aborts, one duplicate id refused, one a
 /// shutdown cuts: the scrape's families, types, label sets and values are
-/// exactly these.
+/// exactly these. Every request that produced an output counts a prompt:
+/// the engine's figure where its output reported one, the request's own
+/// three ids otherwise.
 #[tokio::test]
 async fn the_scrape_pins_the_families_after_a_scripted_sequence() {
     let mut h = metrics_harness(model_info(), None).await;
@@ -5142,4 +6110,59 @@ async fn server_info_and_the_zero_filled_loads_count_the_connected_ranks() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
+}
+
+/// 256 engine-timed prefills that share one scheduled-to-first-output
+/// interval read the capacity of the whole batch: 256 x 2 computed tokens
+/// over the half second they share, counted once (the reference for the
+/// wires that measure on the servicer's clock; a ring of per-request
+/// samples read the newest 64 of them over the same half second).
+#[tokio::test]
+async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch() {
+    use engine_zmq_client::protocol::vllm::output::{EngineCoreEvent, EngineCoreEventType};
+    let mut h = harness(model_info(), None).await;
+    for index in 0..256 {
+        let id = format!("b{index}");
+        let mut stream = h
+            .client
+            .generate(generate_request(&id, true, vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(recv_add(&mut h.engine_in).await.request_id, id);
+        h.engine_out
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                engine_index: 0,
+                timestamp: 10.5,
+                outputs: vec![EngineCoreOutput {
+                    request_id: id.clone().into(),
+                    new_token_ids: vec![10],
+                    finish_reason: Some(EngineCoreFinishReason::Length),
+                    events: Some(vec![EngineCoreEvent {
+                        r#type: EngineCoreEventType::Scheduled,
+                        timestamp: 10.0,
+                    }]),
+                    prefill_stats: Some(PrefillStats {
+                        num_prompt_tokens: 3,
+                        num_cached_tokens: 1,
+                        num_computed_tokens: 2,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                scheduler_stats: Some(SchedulerStats::default()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.loads[0].prefill_throughput, Some(1_024.0));
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

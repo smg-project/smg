@@ -95,9 +95,13 @@ async fn whole(frames: Vec<proto::GenerateResponse>) -> ResponsesIterationResult
     let (stream, server) = scripted_stream(frames, "0").await;
     let (result, _) = HarmonyResponseProcessor::new()
         .process_responses_iteration(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             std::sync::Arc::new(request()),
             dispatch(),
+            &[],
         )
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));
@@ -127,10 +131,15 @@ async fn iterate(
     let drain = async { while rx.recv().await.is_some() {} };
     let iteration = async {
         let result = HarmonyStreamingProcessor::process_responses_iteration_stream(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             emitter,
             &tx,
             None,
+            None,
+            &[],
             None,
         )
         .await;

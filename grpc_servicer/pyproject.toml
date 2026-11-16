@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-servicer"
-version = "0.15.0"
+version = "0.16.0"
 description = "SMG gRPC servicer implementations for LLM inference engines (vLLM, MLX, TokenSpeed, SGLang)"
 requires-python = ">=3.10"
 dependencies = [
-    "smg-grpc-proto>=0.4.27",  # constrained_decoding and mm_item_limits on the worker handshake
+    "smg-grpc-proto>=0.5.0",  # 0.5.0 adds the EPD ec_* handshake fields, prefill_throughput and num_resident_tokens in the load reports, the KV-event group_mask, loads_only and GetLoads
     "grpcio>=1.81.1",
     "grpcio-reflection>=1.81.1",
     "grpcio-health-checking>=1.81.1",

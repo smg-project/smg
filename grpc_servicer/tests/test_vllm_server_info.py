@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from smg_grpc_proto import vllm_engine_pb2
 from smg_grpc_proto.generated import common_pb2
 from smg_grpc_servicer.vllm import model_info
+from smg_grpc_servicer.vllm.scheduler_loads import managed_ranks
 
 _SERVICER = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm" / "servicer.py"
 
@@ -30,6 +32,7 @@ def _server_info_method(response_type):
     namespace = {
         "vllm_engine_pb2": SimpleNamespace(GetServerInfoResponse=response_type),
         "server_facts": model_info.server_facts,
+        "managed_ranks": managed_ranks,
         "mm_device_do_normalize": model_info.mm_device_do_normalize,
         "mm_item_limits": model_info.mm_item_limits,
         "engine_reasoning_parser": model_info.engine_reasoning_parser,
@@ -164,3 +167,39 @@ def test_get_server_info_reports_the_engines_encoder_budget(legacy):
     servicer._mm_encoder_budget = 0
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     assert info.mm_encoder_budget == 0
+
+
+@pytest.mark.parametrize("ranks", [[0], [1], [0, 1], []])
+def test_ec_addresses_preserve_managed_global_rank_slots(monkeypatch, ranks):
+    """External DP advertises only its own rank without renumbering DP-aware slots."""
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.utils.network_utils",
+        SimpleNamespace(make_zmq_path=lambda scheme, host, port: f"{scheme}://{host}:{port}"),
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype="torch.float16", is_multimodal_model=False),
+        parallel_config=SimpleNamespace(data_parallel_size=2, tensor_parallel_size=4),
+        ec_transfer_config=SimpleNamespace(
+            is_ec_consumer=True,
+            ec_connector="ECMooncakeConnector",
+            ec_role="ec_consumer",
+            ec_ip="127.0.0.1",
+            ec_port=9000,
+        ),
+    )
+    servicer = SimpleNamespace(
+        engine=SimpleNamespace(
+            vllm_config=config, logger_manager=SimpleNamespace(engine_indexes=ranks)
+        ),
+        _mm_processor=None,
+        _mm_encoder_budget=0,
+    )
+    info = asyncio.run(
+        _server_info_method(vllm_engine_pb2.GetServerInfoResponse)(servicer, None, None)
+    )
+    assert info.ec_connector == "ECMooncakeConnector"
+    assert info.ec_role == "ec_consumer"
+    assert list(info.ec_zmq_addrs) == [
+        f"tcp://127.0.0.1:{9000 + rank * 4}" if rank in ranks else "" for rank in range(2)
+    ]

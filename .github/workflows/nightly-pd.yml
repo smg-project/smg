@@ -6,7 +6,9 @@ name: Nightly PD Topologies
 
 on:
   schedule:
-    - cron: "45 9 * * *" # 09:45 UTC daily, after the nightly image builds
+    - cron: "45 9 * * 1-6" # 09:45 UTC Monday-Saturday, all enabled engines
+    - cron: "45 9 * * 0" # Sunday 09:45 UTC, non-AMD engines only
+    - cron: "35 22 * * 0" # Sunday 22:35 UTC, AMD engines only
   workflow_dispatch:
     inputs:
       engines:
@@ -22,7 +24,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: nightly-pd
+  # Keep the deferred AMD run independent of the normal/non-AMD queue.
+  group: ${{ github.event_name == 'schedule' && github.event.schedule == '35 22 * * 0' && 'nightly-pd-amd-sunday' || 'nightly-pd' }}
   cancel-in-progress: false
 
 jobs:
@@ -35,12 +38,25 @@ jobs:
         env:
           ENGINES: ${{ inputs.engines }}
           AMD_ENABLED: ${{ vars.SMG_RUN_AMD_LEGS }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
         run: |
           wanted="${ENGINES:-sglang vllm tokenspeed}"
           # vllm-amd needs AMD's self-hosted runner; until it is online
           # (SMG_RUN_AMD_LEGS=true) only a dispatch that names it runs it.
           if [ -z "$ENGINES" ] && [ "$AMD_ENABLED" = true ]; then
             wanted="$wanted vllm-amd"
+          fi
+          # Match the triggering cron, even if a queued run starts another day.
+          # Explicit workflow_dispatch engine selection keeps its original behavior.
+          if [ "$EVENT_NAME" = schedule ]; then
+            case "$SCHEDULE" in
+              "45 9 * * 0") wanted="sglang vllm tokenspeed" ;;
+              "35 22 * * 0")
+                wanted=""
+                if [ "$AMD_ENABLED" = true ]; then wanted="vllm-amd"; fi
+                ;;
+            esac
           fi
           # One row per engine, plus each engine's other KV transport: vLLM over
           # Mooncake next to its NIXL default, SGLang over NIXL next to its
@@ -59,7 +75,7 @@ jobs:
                 elif . == "vllm-amd" then [
                   {engine: "vllm", kv_backend: "nixl", vendor: "amd"},
                   {engine: "vllm", kv_backend: "moriio", moriio_mode: "write", vendor: "amd"}]
-                else [{engine: .}] end) | add')
+                else [{engine: .}] end) | add // []')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "matrix: $matrix"
 
@@ -161,6 +177,8 @@ jobs:
   pd-topologies:
     name: pd-topologies (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }}${{ matrix.moriio_mode && format('-{0}', matrix.moriio_mode) || '' }}${{ matrix.vendor && format('-{0}', matrix.vendor) || '' }})
     needs: [plan, build-wheel, tokenspeed-image]
+    # A disabled Sunday AMD run has no rows; job-if is evaluated before matrix.
+    if: ${{ needs.plan.outputs.matrix != '[]' }}
     strategy:
       fail-fast: false
       matrix:

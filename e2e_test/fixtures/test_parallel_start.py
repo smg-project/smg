@@ -24,19 +24,24 @@ def fleet(monkeypatch):
 
     def start(**kwargs):
         workers = []
+        wait_ready = kwargs.get("wait_ready", True)  # the pool's default
         for index in range(kwargs["count"]):
             worker = SimpleNamespace(gpu_ids=[kwargs["gpu_offset"] + index])
             worker.wait_ready = lambda timeout, worker=worker: ready(worker, timeout)
             worker.stop = lambda worker=worker: events.append(("stop", worker))
             workers.append(worker)
-            events.append(("start", worker, kwargs["wait_ready"]))
+            events.append(("start", worker, wait_ready))
             clock[0] += 1
-            if kwargs["wait_ready"]:
+            if wait_ready:
                 ready(worker, 10)
         return workers
 
     monkeypatch.setattr(setup, "_start_workers_tracked", start)
-    monkeypatch.setattr(setup, "_start_gateway", lambda *a, **kw: events.append(("gateway",)))
+    monkeypatch.setattr(
+        setup,
+        "_start_gateway",
+        lambda gateway, gateway_config, **kw: events.append(("gateway", gateway_config)),
+    )
     monkeypatch.setattr(setup, "_wait_for_serving", lambda *a: events.append(("serving",)))
     monkeypatch.setattr(setup, "_make_openai_client", lambda _: None)
     gateway = SimpleNamespace(base_url="http://test", shutdown=lambda: events.append(("shutdown",)))
@@ -44,7 +49,14 @@ def fleet(monkeypatch):
 
     def create(**overrides):
         return setup._setup_pd(
-            "model", "path", "vllm", ConnectionMode.HTTP, {**config, **overrides}, {}, gateway, None
+            "model",
+            "path",
+            "vllm",
+            ConnectionMode.HTTP,
+            {**config, **overrides},
+            setup._GW_DEFAULTS,
+            gateway,
+            None,
         )
 
     return events, clock, create
@@ -161,3 +173,40 @@ def test_partial_pd_pool_failure_stops_previously_started_workers(fleet, monkeyp
         )
     assert [event[0] for event in events] == ["start", "stop"]
     assert events[0][1] is events[1][1]
+
+
+def _gateway_timeout(events):
+    """The readiness timeout the fleet's gateway started with."""
+    return next(event[1]["timeout"] for event in events if event[0] == "gateway")
+
+
+def test_pd_gateway_wait_takes_the_startup_floor(fleet, monkeypatch):
+    events, _, create = fleet
+    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "900")
+    backend = create()
+    next(backend)
+    assert setup._GW_DEFAULTS["timeout"] < 900
+    assert _gateway_timeout(events) == 900
+    backend.close()
+
+
+def test_epd_gateway_wait_takes_the_startup_floor(fleet, monkeypatch):
+    events, _, _ = fleet
+    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "900")
+    gateway = SimpleNamespace(base_url="http://test", shutdown=lambda: events.append(("shutdown",)))
+    backend = setup._setup_epd(
+        "model",
+        "path",
+        "vllm",
+        ConnectionMode.HTTP,
+        (1, 1, 1),
+        setup._WORKER_DEFAULTS,
+        setup._GW_DEFAULTS,
+        gateway,
+        None,
+    )
+    next(backend)
+    assert [event[0] for event in events] == ["start", "ready"] * 3 + ["gateway", "serving"]
+    assert _gateway_timeout(events) == 900
+    backend.close()
+    assert [event[0] for event in events[-4:]] == ["shutdown"] + ["stop"] * 3

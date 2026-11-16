@@ -19,6 +19,11 @@ from smg.router_args import RouterArgs
 from smg.smg_rs import Router as _Router
 
 REGULAR = RouterArgs(worker_urls=["http://worker:8000"])
+# A ZMQ worker without --backend: the launcher pins no wire and the gateway's
+# detection step decides, as it does for the Rust CLI.
+ZMQ_UNPINNED = RouterArgs(worker_urls=["ipc:///tmp/smg-zmq/engine-0"])
+# The Gemini provider route, which only the Rust binary could select before.
+GEMINI = RouterArgs(backend="gemini", worker_urls=["https://generativelanguage.googleapis.com"])
 PREFILL_DECODE = RouterArgs(
     worker_urls=[],
     pd_disaggregation=True,
@@ -82,14 +87,38 @@ def test_every_constructor_parameter_is_set_by_the_launcher():
 
 @pytest.mark.parametrize(
     "args",
-    [REGULAR, PREFILL_DECODE, FILE_DISCOVERY, SLURM_DISCOVERY, CONSUL_DISCOVERY],
-    ids=["regular", "prefill-decode", "file-discovery", "slurm-discovery", "consul-discovery"],
+    [
+        REGULAR,
+        ZMQ_UNPINNED,
+        PREFILL_DECODE,
+        GEMINI,
+        FILE_DISCOVERY,
+        SLURM_DISCOVERY,
+        CONSUL_DISCOVERY,
+    ],
+    ids=[
+        "regular",
+        "zmq-unpinned",
+        "prefill-decode",
+        "gemini",
+        "file-discovery",
+        "slurm-discovery",
+        "consul-discovery",
+    ],
 )
 def test_the_launcher_builds_the_real_router(args: RouterArgs):
     # The constructor only keeps the configuration (the file, Slurm and Consul
     # providers' mappings are parsed, no file read, no command run and no
     # request sent); nothing is bound.
     assert Router.from_args(args) is not None
+
+
+def test_no_backend_reaches_the_native_constructor_as_none():
+    """Without ``--backend`` the launcher pins no wire: the constructor gets None
+    and the gateway's detection step decides, as it does for the Rust CLI."""
+    with patch("smg.router._Router") as constructor:
+        Router.from_args(ZMQ_UNPINNED)
+    assert constructor.call_args.kwargs["backend"] is None
 
 
 @pytest.mark.parametrize("settle", [None, 0, 30, 120])

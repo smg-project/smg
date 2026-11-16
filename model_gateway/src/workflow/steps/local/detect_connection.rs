@@ -13,7 +13,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use crate::{
     app_context::AppContext,
-    worker::{endpoint::Endpoint, ConnectionMode},
+    worker::{identity::endpoint::Endpoint, ConnectionMode},
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::util::{try_grpc_reachable, try_http_reachable},
@@ -225,8 +225,8 @@ mod tests {
     use crate::{
         config::RouterConfig,
         policies::PolicyRegistry,
-        test_support::RefusedAddress,
-        worker::WorkerRegistry,
+        server::http_client,
+        worker::{test_support::RefusedAddress, WorkerRegistry},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
 
@@ -237,7 +237,7 @@ mod tests {
         };
         Arc::new(
             AppContext::builder()
-                .client(crate::clients::http_client())
+                .client(http_client())
                 .rate_limiter(None)
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(None)

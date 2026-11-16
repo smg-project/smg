@@ -363,7 +363,7 @@ fn a_layout_is_learned_from_the_probes_renderings() {
     let tools: Vec<Tool> = serde_json::from_value(tools()).expect("the probe's tools");
     assert!(format.grammar(&tools, true, false).is_some());
     assert!(format
-        .answer_grammar(&json!({"type": "object"}), false)
+        .answer_grammar(&Arc::new(json!({"type": "object"})), false)
         .is_some());
     assert_eq!(
         summary(&framed_layout()),
@@ -751,7 +751,7 @@ fn a_thought_closed_one_of_two_ways_is_learned_with_the_close_the_template_rende
     // The tags close the thought as the template does, not with the table's first row.
     let format = learned.apply(closed_two_ways());
     let begin = format
-        .answer_grammar(&json!({"type": "object"}), true)
+        .answer_grammar(&Arc::new(json!({"type": "object"})), true)
         .map(|grammar| grammar.payload()["format"]["begin"].clone());
     assert_eq!(begin, Some(json!("</t>\n <a>")));
     // A template that closes the thought another way before an answer than before the calls has

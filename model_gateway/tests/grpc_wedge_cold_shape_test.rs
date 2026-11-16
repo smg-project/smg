@@ -23,7 +23,7 @@ use smg::{
     middleware::TenantRequestMeta,
     routers::{RouterFactory, RouterTrait},
     tenant::TenantKey,
-    worker::{KvEventMonitor, RuntimeType, Worker, WorkerType},
+    worker::{KvEventMonitor, RuntimeType, SubscriptionKind, Worker, WorkerType},
 };
 use smg_test_harness as common;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
@@ -66,7 +66,15 @@ impl MockEngine {
             .await
             .expect("bind the mock engine");
         let port = listener.local_addr().expect("mock engine address").port();
-        let admin_port = free_port().await;
+        // Bound here and handed to the admin server below, as the engine's
+        // listener is: the port is never released for another test to take.
+        let admin_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the mock engine's admin API");
+        let admin_port = admin_listener
+            .local_addr()
+            .expect("admin API address")
+            .port();
         let cfg = Arc::new(mock_worker::config::Config {
             admin_port: None,
             context_length: 32768,
@@ -100,33 +108,27 @@ impl MockEngine {
             },
         ));
         let (stop_admin, admin_stopped) = oneshot::channel();
-        let admin = tokio::spawn(mock_worker::admin::serve_until(
+        // The listener is bound and queuing connections already: the first
+        // admin call needs no wait for the server to come up.
+        let admin = tokio::spawn(mock_worker::admin::serve_with_listener_until(
             cfg,
-            "127.0.0.1".to_string(),
-            admin_port,
+            admin_listener,
             async move {
                 let _ = admin_stopped.await;
             },
         ));
-        let client = smg::clients::http_client_builder()
+        let client = smg::server::http_client_builder()
             .no_proxy()
             .build()
             .expect("test client");
-        let engine = Self {
+        Self {
             port,
             admin_port,
             name: format!("grpc:{port}"),
             client,
             stop: Some((stop, stop_admin)),
             served: Some((served, admin)),
-        };
-        let health = format!("http://127.0.0.1:{admin_port}/admin/health");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while engine.client.get(&health).send().await.is_err() {
-            assert!(Instant::now() < deadline, "the admin API did not come up");
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        engine
     }
 
     /// Switch a fault hook of the engine through its admin API.
@@ -158,28 +160,6 @@ impl MockEngine {
             let _ = served.await;
             let _ = admin.await;
         }
-    }
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test helper: a port the OS cannot hand out fails the fixture"
-)]
-async fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("ephemeral port address")
-        .port()
-}
-
-/// Wait for `done`, within `bound`.
-async fn wait_until(what: &str, bound: Duration, mut done: impl FnMut() -> bool) {
-    let started = Instant::now();
-    while !done() {
-        assert!(started.elapsed() < bound, "{what}: not within {bound:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -299,7 +279,9 @@ async fn build_bed(port: u16) -> Bed {
         .worker_registry
         .register(Arc::clone(&worker))
         .expect("register the worker");
-    kv_monitor.on_worker_added(&worker).await;
+    kv_monitor
+        .on_worker_added(&worker, SubscriptionKind::Events)
+        .await;
     let router = RouterFactory::create_router(&app_context)
         .await
         .expect("gRPC router");
@@ -322,10 +304,15 @@ async fn a_kernel_built_for_a_new_shape_is_not_a_wedge() {
     let (router, worker) = (bed.router.as_ref(), &bed.worker);
 
     assert_eq!(request_status(router, SHORT_PROMPT).await, 200);
-    wait_until(
+    common::wait_until(
         "the worker's stream pushes load records",
         Duration::from_secs(10),
-        || worker.pushes_load_records(),
+        || {
+            worker
+                .runtime_state()
+                .expect("a gateway worker keeps its state")
+                .pushes_load_records()
+        },
     )
     .await;
 
@@ -378,10 +365,15 @@ async fn a_frozen_engine_on_a_shape_shown_is_still_vetoed_within_the_budget() {
     let (router, worker) = (bed.router.as_ref(), &bed.worker);
 
     assert_eq!(request_status(router, LONG_PROMPT).await, 200);
-    wait_until(
+    common::wait_until(
         "the worker's stream pushes load records",
         Duration::from_secs(10),
-        || worker.pushes_load_records(),
+        || {
+            worker
+                .runtime_state()
+                .expect("a gateway worker keeps its state")
+                .pushes_load_records()
+        },
     )
     .await;
 
@@ -417,7 +409,7 @@ async fn a_frozen_engine_on_a_shape_shown_is_still_vetoed_within_the_budget() {
         at >= WEDGE && at <= VERDICT_BOUND,
         "vetoed {at:?} after the dispatch: the budget is {WEDGE:?}"
     );
-    wait_until("the re-admission", SERVED_BOUND, || {
+    common::wait_until("the re-admission", SERVED_BOUND, || {
         worker.stall_reason().is_none()
     })
     .await;

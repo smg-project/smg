@@ -2,15 +2,10 @@
 //!
 //! Provides optional mTLS encryption for gRPC mesh connections using rustls.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::path::PathBuf;
 
 use anyhow::Result;
-use rustls::{pki_types::CertificateDer, ClientConfig, RootCertStore};
-use rustls_pemfile::certs;
-use tokio::fs;
+use tokio::{fs, sync::OnceCell};
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 
 /// mTLS configuration
@@ -50,58 +45,58 @@ pub(crate) fn tls_server_name(host: &str) -> &str {
         .unwrap_or(host)
 }
 
-/// mTLS certificate manager
+/// The node's TLS material: the paths, and what they hold once read.
 #[derive(Debug)]
 pub struct MTLSManager {
     config: MTLSConfig,
+    /// The CA and this node's identity, read from their files the first time
+    /// the listener or a dial asks for them and kept for the life of the
+    /// process: the probes dial once a second, and read the three files (the
+    /// CA twice) on every dial before.
+    material: OnceCell<Material>,
+}
+
+/// What the three files hold: the CA the peers' certificates chain to and
+/// this node's certificate with its key.
+#[derive(Debug)]
+struct Material {
+    ca: Certificate,
+    identity: Identity,
 }
 
 impl MTLSManager {
     /// Create a new mTLS manager
     pub fn new(config: MTLSConfig) -> Self {
-        Self { config }
-    }
-
-    /// Load client TLS configuration
-    pub async fn load_client_config(&self) -> Result<Arc<ClientConfig>> {
-        let mut root_store = RootCertStore::empty();
-
-        // Load CA certificate
-        let ca_certs = self.load_certs(&self.config.ca_cert_path).await?;
-        for cert in ca_certs {
-            root_store.add(cert)?;
+        Self {
+            config,
+            material: OnceCell::new(),
         }
-
-        let mut client_config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        // Enable ALPN for HTTP/2
-        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-        Ok(Arc::new(client_config))
     }
 
-    /// Load CA certificate for tonic client TLS configuration
-    pub async fn load_ca_certificate(&self) -> Result<Certificate> {
-        let ca_cert = fs::read(&self.config.ca_cert_path).await?;
-        Ok(Certificate::from_pem(ca_cert))
-    }
-
-    /// This node's certificate chain and private key as a tonic identity.
-    async fn load_identity(&self) -> Result<Identity> {
-        let cert = fs::read(&self.config.server_cert_path).await?;
-        let key = fs::read(&self.config.server_key_path).await?;
-        Ok(Identity::from_pem(cert, key))
+    /// The material, read on the first call. A read that fails leaves the
+    /// cell empty, so the next call reads again.
+    async fn material(&self) -> Result<&Material> {
+        self.material
+            .get_or_try_init(|| async {
+                let ca = fs::read(&self.config.ca_cert_path).await?;
+                let cert = fs::read(&self.config.server_cert_path).await?;
+                let key = fs::read(&self.config.server_key_path).await?;
+                Ok(Material {
+                    ca: Certificate::from_pem(ca),
+                    identity: Identity::from_pem(cert, key),
+                })
+            })
+            .await
     }
 
     /// What the mesh listener serves: this node's certificate and key, and,
     /// when client certificates are required, the CA as the trust root the
     /// peers' certificates must chain to.
     pub async fn server_tls_config(&self) -> Result<ServerTlsConfig> {
-        let mut tls = ServerTlsConfig::new().identity(self.load_identity().await?);
+        let material = self.material().await?;
+        let mut tls = ServerTlsConfig::new().identity(material.identity.clone());
         if self.config.require_client_cert {
-            tls = tls.client_ca_root(self.load_ca_certificate().await?);
+            tls = tls.client_ca_root(material.ca.clone());
         }
         Ok(tls)
     }
@@ -109,17 +104,11 @@ impl MTLSManager {
     /// What a dial to the peer named `server_name` trusts and presents: the
     /// CA as the trust root, this node's certificate as its identity.
     pub async fn client_tls_config(&self, server_name: &str) -> Result<ClientTlsConfig> {
+        let material = self.material().await?;
         Ok(ClientTlsConfig::new()
             .domain_name(server_name)
-            .ca_certificate(self.load_ca_certificate().await?)
-            .identity(self.load_identity().await?))
-    }
-
-    /// Load certificates from file
-    async fn load_certs(&self, path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-        let cert_data = fs::read(path).await?;
-        let certs = certs(&mut cert_data.as_slice()).collect::<Result<Vec<_>, _>>()?;
-        Ok(certs)
+            .ca_certificate(material.ca.clone())
+            .identity(material.identity.clone()))
     }
 }
 
@@ -129,7 +118,7 @@ mod tests {
 
     use tonic::transport::{ClientTlsConfig, Endpoint};
 
-    use super::tls_server_name;
+    use super::{tls_server_name, MTLSConfig, MTLSManager};
 
     #[test]
     fn an_ipv6_peer_url_names_the_server_by_its_address() {
@@ -178,5 +167,36 @@ mod tests {
         let unbracketed = Endpoint::from_static("https://[::1]:1")
             .tls_config(ClientTlsConfig::new().domain_name(tls_server_name("[::1]")));
         assert!(unbracketed.is_ok(), "{:?}", unbracketed.err());
+    }
+
+    /// The material is read once: a manager that served a configuration
+    /// keeps serving it after its files are gone, so the dials of a member
+    /// (a probe a second) never read the disk again.
+    #[tokio::test]
+    async fn the_material_is_read_once_and_serves_after_its_files_are_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, bytes: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let manager = MTLSManager::new(MTLSConfig {
+            ca_cert_path: file("ca.pem", "ca"),
+            server_cert_path: file("cert.pem", "cert"),
+            server_key_path: file("key.pem", "key"),
+            require_client_cert: true,
+        });
+        assert!(manager.client_tls_config("peer").await.is_ok());
+
+        drop(dir);
+
+        assert!(
+            manager.client_tls_config("peer").await.is_ok(),
+            "the client configuration comes from the material read at first"
+        );
+        assert!(
+            manager.server_tls_config().await.is_ok(),
+            "the server configuration comes from the same material"
+        );
     }
 }

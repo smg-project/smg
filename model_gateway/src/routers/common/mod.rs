@@ -28,6 +28,11 @@
 //!   HTTP and gRPC families used to each carry a copy of
 //! - [`worker_selection`] — per-request worker-selection helpers used
 //!   by every routing path (regular, PD, fallback, external provider)
+//! - `test_support` (test builds only) — the fast retry policy the HTTP
+//!   and gRPC routers' tests retry under
+//! - `bench_support` (test builds and the `test-util` feature) — the
+//!   regular and the pair selection over a registered fleet, for a
+//!   benchmark of each path
 //! - `attempt_ledger` — one request's bookkeeping across its retry
 //!   attempts: the circuit breaker charged once per request per worker,
 //!   and a worker's definitive answer never replayed on it
@@ -57,12 +62,14 @@ pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
 pub(crate) mod placement;
+pub mod prefill_admission;
 pub(crate) mod rate_limit_cell;
 pub use smg_external_router::realtime;
 pub mod request_lease;
 pub(crate) use smg_external_router::sglang_fields;
 pub use smg_external_router::{retry, sse};
 pub mod sse_rechunk;
+pub mod stream;
 pub mod worker_selection;
 
 /// Threshold above which upstream request bodies are sent as one-shot
@@ -90,6 +97,79 @@ pub(crate) fn serialize_json_sized<T: serde::Serialize>(
     let mut buf = Vec::with_capacity(raw_len.map_or(128, serialized_capacity));
     serde_json::to_writer(&mut buf, value)?;
     Ok(buf)
+}
+
+/// The capacity a thread's JSON answer buffer keeps between answers: a chat
+/// completion, a Messages answer or a JSON-schema answer of a few hundred
+/// bytes fits it many times over; the buffer a larger answer grew goes with
+/// that answer.
+const JSON_ANSWER_RETAINED: usize = 64 * 1024;
+
+thread_local! {
+    /// The buffer a thread's typed JSON answers are serialized into.
+    static JSON_ANSWER_BUFFER: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A typed answer as a JSON response: serialized once into the thread's
+/// buffer (serde's own sink, one `extend_from_slice` per write) and copied
+/// once into a body of exactly its size, with the `application/json`
+/// content type. That is one allocation per answer: a buffer sized per
+/// answer and handed to the body by refcount cost two, the buffer and the
+/// shared header `Bytes::from` boxes for a buffer with spare capacity, and
+/// grew again for a body past its size. `axum::Json` writes the same bytes
+/// through `BytesMut::with_capacity(128).writer()`: the `bytes` writer
+/// adapter slices every write to the buffer's remaining room before it
+/// appends, which prices the one-byte JSON tokens (2.5 % of a chat
+/// request's user instructions on the mock bed), and the 128-byte start
+/// reallocates and copies a 700-byte body three times. A value that does
+/// not serialize answers as axum does: a 500 with the error's text.
+pub fn json_response<T: serde::Serialize>(value: &T) -> axum::response::Response {
+    JSON_ANSWER_BUFFER.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buffer) => {
+            buffer.clear();
+            let result = serde_json::to_writer(&mut *buffer, value);
+            let response = json_answer(&buffer, result);
+            if buffer.capacity() > JSON_ANSWER_RETAINED {
+                *buffer = Vec::new();
+            }
+            response
+        }
+        // A serializer that answers while this thread's buffer is borrowed
+        // (none does today): a buffer of this answer's own.
+        Err(_) => {
+            let mut buffer = Vec::new();
+            let result = serde_json::to_writer(&mut buffer, value);
+            json_answer(&buffer, result)
+        }
+    })
+}
+
+/// The response of a serialized answer, compiled once for every `T`.
+fn json_answer(body: &[u8], result: serde_json::Result<()>) -> axum::response::Response {
+    use axum::{
+        http::{header, HeaderValue, StatusCode},
+        response::IntoResponse,
+    };
+    match result {
+        Ok(()) => (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            bytes::Bytes::copy_from_slice(body),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            error.to_string(),
+        )
+            .into_response(),
+    }
 }
 
 /// A typed request as a `Value`, for the forwarding paths that edit it:
@@ -128,6 +208,178 @@ pub(crate) fn attach_sized_body(
     }
 }
 
+/// What a benchmark needs of the routers' selection: the regular placement
+/// over one model's registered pool and the default pair selection over its
+/// registered prefill-decode fleet, each as a router runs it for a request,
+/// and whether the process captures every request's cache trace.
+#[cfg(any(test, feature = "test-util"))]
+pub mod bench_support {
+    use std::sync::Arc;
+
+    use super::{
+        attempt_ledger::AttemptLedger,
+        placement::{select_pair, select_single, PlacementInputs},
+    };
+    use crate::{
+        observability::cache_trace,
+        policies::PolicyRegistry,
+        worker::{PdPairIndex, PdWire, RoutingPool, Worker, WorkerRegistry},
+    };
+
+    /// Whether a process switch captures every request's cache trace
+    /// (`SMG_CACHE_TRACE=1` or `SMG_CACHE_TRACE_HEADER=1`). A benchmark cell
+    /// labelled untraced is not untraced in such a process.
+    pub fn process_trace_configured() -> bool {
+        cache_trace::configured()
+    }
+
+    /// One model's regular pool over the gRPC pipeline and its policies.
+    pub struct RegularPath {
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+        model: String,
+    }
+
+    impl RegularPath {
+        /// The regular pool of `model` as `registry` holds it at each
+        /// placement.
+        pub fn new(
+            registry: Arc<WorkerRegistry>,
+            policies: Arc<PolicyRegistry>,
+            model: &str,
+        ) -> Self {
+            Self {
+                registry,
+                policies,
+                model: model.to_string(),
+            }
+        }
+
+        /// One placement of a request carrying `tokens`, with no filter, no
+        /// wire pin and no tried engine: the pool drawn from the registry
+        /// and one policy pick over it.
+        pub fn place(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
+            self.select(PlacementInputs {
+                tokens,
+                ..Default::default()
+            })
+        }
+
+        /// [`Self::place`] under a candidate filter that refuses nobody and
+        /// costs nothing itself: what the selection adds when a router hands
+        /// it a filter, as the gRPC pipeline does on a request's first
+        /// attempt for its media and context demands.
+        pub fn place_filtered(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
+            let everyone = |_: &dyn Worker| true;
+            self.select(PlacementInputs {
+                tokens,
+                candidate_filter: Some(&everyone),
+                ..Default::default()
+            })
+        }
+
+        /// [`Self::place`] as the HTTP router runs a request's first
+        /// attempt: under the candidate filter a new request's attempt
+        /// ledger hands. The filter and the entry are that router's; the
+        /// pool is this path's, the gRPC pipeline's regular one.
+        pub fn place_first_attempt(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
+            AttemptLedger::default().with_candidate_filter(|candidate_filter| {
+                self.select(PlacementInputs {
+                    tokens,
+                    candidate_filter,
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn select(&self, inputs: PlacementInputs<'_>) -> Option<Arc<dyn Worker>> {
+            select_single(
+                &self.registry,
+                &self.policies,
+                &self.model,
+                RoutingPool::GrpcPipelineRegular,
+                None,
+                inputs,
+            )
+        }
+    }
+
+    /// One model's fleet, its policies and its pair index over the gRPC wire.
+    pub struct PairPath {
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+        model: String,
+        pairs: Arc<PdPairIndex>,
+    }
+
+    impl PairPath {
+        /// The pair index of `model` over the workers `registry` holds now.
+        pub fn new(
+            registry: Arc<WorkerRegistry>,
+            policies: Arc<PolicyRegistry>,
+            model: &str,
+        ) -> Self {
+            let pairs = registry
+                .get_routing_snapshot(model)
+                .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
+            Self {
+                registry,
+                policies,
+                model: model.to_string(),
+                pairs,
+            }
+        }
+
+        /// One placement of a request carrying `tokens`, with no admission
+        /// window: the prefill and the decode paired with it. With `traced`
+        /// it runs inside a cache-trace capture, as a request that asked for
+        /// its decision record does.
+        pub async fn place(
+            &self,
+            tokens: Option<&[u32]>,
+            traced: bool,
+        ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
+            cache_trace::scope(traced, async {
+                let inputs = PlacementInputs {
+                    tokens,
+                    ..Default::default()
+                };
+                select_pair(
+                    &self.registry,
+                    &self.policies,
+                    &self.model,
+                    &self.pairs,
+                    None,
+                    None,
+                    inputs,
+                )
+                .ok()
+                .map(|pair| (pair.prefill, pair.decode))
+            })
+            .await
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! What the HTTP and gRPC routers' tests share.
+
+    use crate::config::types::RetryConfig;
+
+    /// `max_retries` attempts with one to two milliseconds between them and
+    /// no jitter: a retrying test's whole schedule fits in its own bound.
+    pub(crate) fn fast_retry_config(max_retries: u32) -> RetryConfig {
+        RetryConfig {
+            max_retries,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +398,39 @@ mod tests {
         assert_eq!(body.len(), raw.len());
         assert_eq!(body.capacity(), serialized_capacity(raw.len()));
         assert!(body.capacity() <= body.len() + body.len() / 8 + 1024);
+    }
+
+    #[test]
+    fn a_json_answer_is_the_serializer_bytes_under_the_json_content_type() {
+        use axum::http::{header, StatusCode};
+        let value = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "x".repeat(600)}}],
+        });
+        let response = json_response(&value);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+                .unwrap();
+        assert_eq!(body, serde_json::to_vec(&value).unwrap());
+    }
+
+    #[test]
+    fn a_json_answer_that_does_not_serialize_is_a_plain_text_500() {
+        use axum::http::{header, StatusCode};
+        // A map keyed by a tuple has no JSON key: the serializer refuses it.
+        let value: std::collections::BTreeMap<(u8, u8), u8> = [((1, 2), 3)].into_iter().collect();
+        let response = json_response(&value);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
     }
 
     #[test]

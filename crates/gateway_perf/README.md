@@ -38,7 +38,7 @@ change, and the setup with the base's spread. Paste it.
 | `make perf-build` | nothing: the release binaries. The gateway is built alone (`cargo build --release -p smg --bin smg`), then the mock engine, the client and the driver, because building the gateway together with another package changes its binary through feature unification; `perf-base` uses the same line | copies the gateway under `target/gateway-perf/head/` |
 | `make perf-base` | the base revision's gateway binary, `target/gateway-perf/base/smg` | `gateway-perf base <rev> <out>`: a detached worktree of `PERF_BASE_REV` built into its own target directory (a full release build; sccache shortens it) |
 | `make perf-bed` | the bed comes up and answers: one request per path, the first response shown, the scripted answers' hit and miss counts | `gateway-perf bed smoke` (`bed up` / `bed down` keep one running for `grpc_stress/cell.sh` or by hand) |
-| `make perf-alloc` | allocation calls per request, KiB requested per request (the allocator's size classes, small and large), allocations of 16 KiB and above per request, RSS and peak RSS after the window | jemalloc's exit statistics: the gateway is started with `_RJEM_MALLOC_CONF=stats_print:true,stats_print_opts:Jaxe` and prints them at its clean shutdown; no special build |
+| `make perf-alloc` | allocation calls per request, KiB requested per request (the allocator's size classes, small and large), allocations of 16 KiB and above per request, RSS after the window (whole, anonymous and file-backed) and the peak | jemalloc's exit statistics: the gateway is started with `_RJEM_MALLOC_CONF=stats_print:true,stats_print_opts:Jaxe` and prints them at its clean shutdown; no special build |
 | `make perf-cpu` | user instructions per request, instructions (user + kernel), cycles, context switches, from `perf stat -p <gateway pid>` over the window; CPU time per request (utime + stime) always | hardware counters need `perf`, a kernel that allows them (`kernel.perf_event_paranoid` at 2 or below for a process of your own) and hardware that exposes them (a virtual machine often does not: the run then says so and keeps the CPU-time column) |
 | `make perf-mem` | RSS after each of several windows on ONE gateway, the growth per 10,000 requests, the peak (`VmHWM`) after a burst window at twice the rate, the allocator's live bytes | `PERF_MEM_PATHS` (default `stream`, the path that holds the most per request), `--windows`, `--burst` |
 | `make perf-live` | an open-loop ramp: offered rate against achieved rate, TTFT and end-to-end p50/p99, errors, gateway CPU per request and RSS per step, and the capacity | a fresh gateway per step; the capacity rule below; the base too when its binary exists |
@@ -58,7 +58,8 @@ the rest; the driver finds the bed script under `--repo` (the current directory 
 Every cell drives one path: 64 distinct deterministic prompts of 64 words (a shared head
 from a pool of 16, a unique tail), the client's seed per path, and ONE scripted answer for
 every request of the cell, handed to the mock engines before the cell starts (the worker's
-admin queue) and served by the wire with no engine time: the numbers are the gateway's.
+admin queue) and served by the wire with no engine time, except the pause between frames the
+spaced paths ask of the engine: the numbers are the gateway's.
 
 | path | request | answer | rate |
 |---|---|---|---|
@@ -68,9 +69,85 @@ admin queue) and served by the wire with no engine time: the numbers are the gat
 | `json` | chat with `response_format: json_schema` | a JSON object | 500/s |
 | `messages` | `POST /v1/messages`, `max_tokens` 8 | 8 tokens | 500/s |
 
+Ten streamed shapes are opt-in (name them in `PERF_PATHS`; their rates keep the frames
+per second near the `stream` path's, except where said):
+
+| path | request | answer | rate |
+|---|---|---|---|
+| `messages_stream` | `POST /v1/messages`, `stream: true`, `max_tokens` 300 | 300 tokens, one per event, `length` | 100/s |
+| `generate_stream` | `POST /generate`, `stream: true`, `max_new_tokens` 300 | 300 tokens, one per frame, the whole text so far in every frame, `length` | 100/s |
+| `completion_stream` | `POST /v1/completions`, `stream: true`, `max_tokens` 300 | 300 tokens, one `text` delta per frame, `length` | 100/s |
+| `generate_stream_long` | the same, `max_new_tokens` 2000 | 2,000 tokens, one per frame | 16/s |
+| `generate_stream_spaced` | the same, `max_new_tokens` 300, the engine pausing 20 ms between frames | 300 tokens, one per frame 20 ms apart, the whole text so far in every frame | 100/s |
+| `stream_spaced` | the `stream` request, the engine pausing 20 ms between frames | 128 tokens, one per frame 20 ms apart | 250/s |
+| `completion_stream_spaced` | the `completion_stream` request, the engine pausing 20 ms between frames | 300 tokens, one `text` delta per frame 20 ms apart | 100/s |
+| `messages_stream_spaced` | the `messages_stream` request, the engine pausing 20 ms between frames | 300 tokens, one per event 20 ms apart | 100/s |
+| `generate_stream_spaced_long` | the `generate_stream` request with `max_new_tokens` 5000, the engine pausing 20 ms between frames | 5,000 tokens, one per frame 20 ms apart, the whole text so far in every frame | 6/s |
+| `stream_logprobs` | the `stream` request with `logprobs: true, top_logprobs: 5` | 128 tokens, one per frame, the sampled logprob and 5 candidates each, `length` | 100/s |
+
+The spaced paths read the stream loops as a decoding engine drives them, one frame at a time
+(about 600 streams open at once at their rates), where the burst paths hand a whole answer over
+at once. Their pause is engine time by design: a 300-frame answer takes about six seconds, so
+they serve the cost cells (`cpu`, `alloc`, `mem`), and `live` on one of them needs
+`--slo-e2e-p99-ms` above about 6,000 to hold a step.
+
+`generate_stream_spaced_long` is the spaced generate path on a long answer: its text passes
+the gateway's 16 KiB frame bound about two thirds of the way through, so each of the last 1,700
+or so events fills a frame of its own with 20 ms between them, where `generate_stream_long`
+fills its frames from a burst (its events stay under 10 KiB; two or three make a frame) and the
+300-frame spaced path never reaches the bound. It
+reads what a whole-text-per-event stream loop's frame buffer does between full frames at an
+engine's pace: the allocation calls, the KiB and the allocations of 16 KiB and above per
+request, and the RSS after the window, beside the instruction count. An answer takes about 100 s and about 600
+streams are open at once at 6/s; 10,000 requests at that rate are about 28 minutes of window
+per cell, so name it with a smaller count (`PERF_REQUESTS=5000` is about 15 minutes); its rate
+stays a whole number at `--rate-scale 0.5`. Its answer fits the load client's 120 s drain with
+about 15 s to spare (a longer or slower paced path needs the drain made a knob first; a cell whose
+last requests the drain cuts off warns, as a cell with failed requests does), and `live` on it
+names its rates beside its SLO, since the ramp's default steps start at 200/s, the burst paths'
+rates: `gateway-perf live --path generate_stream_spaced_long --rates 3,6 --slo-e2e-p99-ms 110000`,
+the SLO above the answer's own 105 s and under the drain (a step's sampled answers complete in
+the client's drain after the step's seconds, so the default `--step-seconds` holds).
+
+The logprobs path's rate is the gateway's load, not a frame-rate match: a logprobs answer costs
+the gateway about 3.5 times the instructions and 13 times the allocation calls of the plain
+128-token stream, so at 100/s the cell runs about 1.4 times the `stream` cell's gateway
+instructions per second and about five times its allocation calls, where the `stream` rate would
+run 3.5 and 13 times them; the cell is read against its own base spreads, not balanced with
+`stream`.
+
+The long path's cells are long at the Makefile's default `PERF_REQUESTS` (10,000 requests at
+16/s is 625 s per cell, twice that at `--rate-scale 0.5`): pass a smaller count when naming it,
+for example `PERF_REQUESTS=3000`; its rate stays a whole number at `--rate-scale 0.5`.
+
 The gateway runs with `--parser symphony --tool-call-parser json` (`--gw-args` changes it),
-`cache_aware` routing, 8 runtime threads and log level `warn`, as `grpc_stress/bed.sh` sets
-it up; 4 mock engines (`--workers`).
+`cache_aware` routing (`GW_POLICY` in the environment names another), 8 runtime threads and
+log level `warn`, as `grpc_stress/bed.sh` sets it up; 4 mock engines (`--workers`).
+
+## The fleets
+
+Every path above runs on any fleet (`--fleet`, a bed flag of every mode), except on the HTTP
+fleet the generate paths (that wire answers `/generate` in the chat shape): the driver refuses
+them there, and each
+fleet has a default path list (`chat,stream,tools,json` on HTTP). A run is one fleet, named in its
+setup line, and the ids of `results.json` are the same on every fleet, so a gate file reads a
+prefill-decode or an HTTP run as it reads a regular one. On the HTTP wire the scripted
+text goes as one piece per word, the units that wire streams by, so a streamed answer frames one
+token at a time there too, and a path that asks for logprobs scripts one value per piece.
+
+| fleet | engines | the gateway path a cell reads |
+|---|---|---|
+| `grpc` (the default) | 4 regular gRPC engines | the gRPC regular path: one selection per request |
+| `http` | 4 regular engines on the mock's HTTP wire (`--http-count`), registered with `connection_mode: http` and no runtime (the gateway reads it at registration) | the HTTP regular path: one selection per request under the request lease, the body forwarded as JSON, the answer relayed |
+| `prefill-decode` | 1 prefill engine (`--prefill-workers`; `--worker-type prefill`, a bootstrap port the gateway probes at registration, a prompt-side answer of 1 ms from the realistic engine's admission) and 4 decode engines (`--workers`; `--worker-type decode`, `--max-running 8` and the `max_running_requests: 8` label), both registered with their roles behind one gateway in multi-router mode with `--pd-disaggregation`; the gateway's in-flight bound of 8 per prefill engine (`--prefill-max-inflight-requests-per-worker`) | the gRPC prefill-decode path: the prefill admission queue, the pair selection, the decode rooms claimed against the label's window, two dispatches per request; the scripted answer is the decode side's (the prefill side answers the prompt alone, from no script) |
+
+The prefill-decode fleet's shape is the bed script's (`FLEET=prefill-decode`; `PREFILL_WINDOW`,
+`DECODE_WINDOW`, `PREFILL_ENGINE_ARGS` and the ports in its header), and the driver passes its
+environment through, so `DECODE_WINDOW=64 gateway-perf cpu --fleet prefill-decode ...` widens
+the rooms for a paced path whose streams stay open longer than 32 rooms hold. `make perf-cpu
+PERF_ARGS="--fleet prefill-decode"` runs the usual cells on it; a prefill-decode block takes
+`10 + workers + 2 x prefill` ports (the second admin API at +8, the prefill engines and their
+bootstrap ports after the decode engines).
 
 ## The tokenizer
 
@@ -107,9 +184,28 @@ or hub id>`.
   request read 530 us with the counters on and 320 us without, on the same binary and bed);
   the column is comparable between the two sides of one run, and `alloc` mode gives the
   absolute.
-- **RSS**: after the window, from `/proc`; `VmHWM` is the peak. RSS moves with the allocator's
-  decay and the request mix in flight at the moment of reading: a few percent is its band.
-  `perf-mem` separates a slope (growth per 10,000 requests on one gateway) from the band.
+- **RSS**: after the window, from `/proc`: the whole set (`VmRSS`), its anonymous part and
+  its file part; `VmHWM` is the peak of the whole set (the kernel reports no peak of a
+  part), so it carries the file part too. The read waits one second after the driver's own
+  metrics scrape. The scrape is the gateway's first allocating work after an idle second,
+  and the purge pass it starts in the allocator steps the anonymous part down for up to
+  half a second: a read taken right after the scrape stood 56 to 1,784 kB above the level
+  the set settled at. The whole set is those two parts and shared memory
+  (`RssShmem`, zero for the gateway on the bed). The anonymous part (`RssAnon`) is what the
+  gateway allocated. It moves with the allocator's decay and the request mix in flight at
+  the moment of reading, a few percent, and it is the part the gate judges. The file part
+  (`RssFile`) is the file pages the kernel has mapped: mostly the gateway's own binary, and
+  its shared libraries (3.8 MB of 40 at idle on the bed). A fault maps the cached
+  neighbours inside the 64 KB window around it, so the part follows two things that are
+  not the gateway's work. One is how much of the measured FILE is cached: two copies of
+  one binary read apart, and on the hosted runner the copy whose pages the cache has
+  dropped reads lower. The other is where the linker put the code that runs: a change
+  that touched nearly as many pages of its binary on both sides held one megabyte more,
+  the same code lying in more windows. So the whole set, its peak and the file part are
+  reported and never judged. To compare them, read
+  both binaries whole before the run on an idle machine, and on a machine under memory
+  pressure keep both files locked in memory for its length. `perf-mem` separates a slope
+  (growth per 10,000 requests on one gateway) from the band.
 - **The spread** in the setup column is the base's (max - min) / median over its repeats:
   the floor under which a change is not a change. The verdict table applies the rule of
   `scripts/bench_gate.py`: an id regresses only when its change is worse than the threshold
@@ -134,7 +230,9 @@ to 8 cores, over the five paths ((max - min) / median of the per-side repeats):
 | user instructions per request | 0.08 - 0.17 % | the judgement; 2 % is a change |
 | allocation calls per request | 0.08 - 0.22 % | the judgement; 2 % is a change (the tools path's per-process modes stay under it) |
 | KiB requested per request | 0.01 - 0.02 % | the judgement; 2 % is a change |
-| RSS after the window | 1.3 - 2.6 % | 5 % is a change |
+| anonymous RSS after the window | 0.0 - 5.7 % (the pull-request job's cell: 4,000 requests, three paths; 95 of 96 per-side samples, one at 10.4 %) | 10 % is a change |
+| RSS after the window, whole | 1.3 - 2.6 % with both files cached alike; it carries the file part | report only |
+| file-backed RSS after the window | follows the page cache of the measured file and where the linker put the code that runs | report only |
 | instructions per request, user + kernel | 0.5 - 3.2 % | the kernel share is the host's noise: report only |
 | CPU time per request | 6.8 - 18.8 % | load-dependent: report only; read it with the load line under the table |
 | cycles per request | 9 - 29 % | load-dependent: report only |
@@ -146,7 +244,9 @@ request that touches `model_gateway/` or `crates/` (tests and benches excluded):
 commit's first parent against the pull request, built by the same cargo line (`perf-build`'s),
 on the chat, stream and tools paths, 4,000 requests per cell at half the bed's rates, 3+3 interleaved cells, judged by
 `.github/bench-gates/gateway-perf.toml` (allocation calls, KiB and user instructions at 2 %,
-RSS at 5 %; CPU time and cycles report only). The job is ADVISORY: the tables go to the step
+anonymous RSS at 10 %; the whole RSS, its peak, its file part, CPU time and cycles report only). The
+job reads both gateway binaries whole right before it measures, so both files are in the
+page cache when the cells start. The job is ADVISORY: the tables go to the step
 summary, to a comment on the pull request when the token may write one, and to the
 `gateway-perf-<sha>` artifact (with `results.json`, the per-repeat values); its verdict never
 fails the job. A hosted runner exposes no hardware counters, so the instruction ids are
@@ -166,7 +266,7 @@ gateway each, so a step never inherits the previous step's queue.
 | module | what |
 |---|---|
 | `main.rs` | the `gateway-perf` binary: `cpu`, `alloc`, `mem`, `live`, `bed up\|down\|smoke`, `report`, `tokenizer`, `base` |
-| `paths.rs` | the five paths: the client's flags, the scripted answer, the rate; the interleaving |
+| `paths.rs` | the paths: the client's flags, the scripted answer, the rate; the interleaving |
 | `bed.rs` | the bed through `bed.sh` (ports, environment, up/down, bed.json) and the engines' script API (enqueue, hit/miss counts) |
 | `http.rs` | a small HTTP/1.1 client over `std::net` for the loopback endpoints (no TLS, no runtime) |
 | `counters.rs` | `/proc` CPU time and memory, the allocator gauges, `perf stat`, jemalloc's exit statistics |
@@ -183,5 +283,7 @@ client, `perf.csv`, `cell.json`), `cells.json`, `results.json`, `numbers.md`, `g
 <run>/results.json` re-evaluates a run with the Python gate.
 
 Ports: a free block from 29700 (gateway, +1 metrics, +9 the mock admin API, +10.. the
-engines) unless `--port-base` names one; pass `--gw-cores`, `--mock-cores` and `--gen-cores`
-to keep the three parties on cores of their own when the machine is shared.
+engines; on the prefill-decode fleet +8 the prefill fleet's admin API and, after the decode
+engines, the prefill engines and their bootstrap ports) unless `--port-base` names one; pass
+`--gw-cores`, `--mock-cores` and `--gen-cores` to keep the three parties on cores of their own
+when the machine is shared.

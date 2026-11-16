@@ -28,6 +28,13 @@ message SubscribeKvEventsRequest {
   // before: it would take that batch for a duplicate of a heartbeat
   // numbered 0.
   bool load_records_before_first_batch = 2;
+  // The subscriber wants the load records alone: no history, snapshot or
+  // events, only `load_only` batches (numbered 0; it admits nothing), one
+  // per data-parallel rank whose record changed or whose heartbeat is due,
+  // each stamped with its `dp_rank`. What a gateway asks for when it routes
+  // by load and keeps no KV index. A servicer that predates the field
+  // streams its events too; such a subscriber drops them.
+  bool loads_only = 3;
 }
 
 message KvEventBatch {
@@ -114,6 +121,11 @@ message EngineLoad {
   // silence allows for it at the prefill rate it has measured on the
   // worker, whatever it has in flight there itself.
   optional uint32 prefill_pending_tokens = 21;
+  // Computed input tokens per active prefill second; absent if unknown or stale.
+  optional double prefill_throughput = 22;
+  // Context tokens (prompt plus committed output) of every request the rank
+  // holds. Part of the routing core: sent on every record when reported.
+  optional uint64 num_resident_tokens = 23;
 }
 
 // The sections below mirror the SGLang scheduler's GetLoads messages field
@@ -234,6 +246,10 @@ message KvBlocksStored {
   // computed under. Consumers fold them into their own content hashes.
   optional string lora_name = 11;
   optional string cache_salt = 12;
+  // The cache groups that hold the blocks after this store, bit i for the
+  // engine's group i, from a publisher that reports a boundary once for
+  // every group; group_idx then names the lowest group the store is about.
+  optional uint64 group_mask = 13;
 }
 
 // One entry of vLLM's per-block `extra_keys`: the inputs beyond token ids
@@ -270,6 +286,9 @@ message KvBlocksRemoved {
   optional uint32 group_idx = 5;
   optional KvCacheLocality locality = 6;
   optional string ownership = 7;
+  // The cache groups that dropped the blocks, bit i for the engine's group
+  // i, from a publisher that reports a boundary once for every group.
+  optional uint64 group_mask = 8;
 }
 
 message KvCacheCleared {

@@ -9,7 +9,10 @@ use std::{os::raw::c_char, sync::Arc, time::Duration};
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::chat::ChatCompletionRequest;
 use smg::routers::grpc::utils::{chat_reasoning_starts_in_rendered_prefill, process_chat_messages};
-use smg_grpc_client::sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient};
+use smg_grpc_client::{
+    sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient},
+    FormatSetAside,
+};
 use uuid::Uuid;
 
 use super::{
@@ -141,7 +144,7 @@ pub(crate) unsafe fn start_chat_stream(
     let prompt_tokens = token_ids.len() as u32;
 
     let tool_constraint = match tool_constraint_for(&request) {
-        Ok(constraint) => constraint.map(|c| c.to_tuple()),
+        Ok(constraint) => constraint,
         Err(e) => {
             set_error_message(
                 error_out,
@@ -166,14 +169,25 @@ pub(crate) unsafe fn start_chat_stream(
         continued_final_message,
         tokenizer.as_ref(),
     );
-    let proto_request = match client.build_generate_request_from_chat(
+    // The readers replay the rendered prompt, as the gateway's readers do:
+    // the converter keeps the part they replay, taken before the request
+    // takes the text.
+    let mut converter = GrpcResponseConverterHandle::for_chat(
+        Arc::clone(tokenizer),
+        &request,
         request_id.clone(),
+        &text,
+    );
+    let proto_request = match client.build_generate_request_from_chat(
+        request_id,
         &request,
         text,
         token_ids,
         SglangGenerateRequestOptions {
             multimodal_inputs: None, // multimodal not supported in golang bindings
             tool_call_constraint: tool_constraint,
+            // No table answers the body's format here: the engine reads it as sent.
+            format_set_aside: FormatSetAside::default(),
             require_reasoning,
         },
     ) {
@@ -191,8 +205,6 @@ pub(crate) unsafe fn start_chat_stream(
         }
     };
 
-    let mut converter =
-        GrpcResponseConverterHandle::for_chat(Arc::clone(tokenizer), &request, request_id);
     converter.initial_prompt_tokens = Some(prompt_tokens);
     converter.system_fingerprint = Some(weight_version.to_owned());
     Ok(SglangStreamHandle {

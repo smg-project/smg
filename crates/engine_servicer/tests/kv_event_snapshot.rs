@@ -507,6 +507,7 @@ fn wire_stored(stored: &KvBlocksStored) -> WireEvent {
             locality: None,
             ownership: stored.ownership.clone(),
             session_id: stored.session_id.clone(),
+            group_mask: stored.group_mask,
         },
     })
 }

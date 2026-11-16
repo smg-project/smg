@@ -7,11 +7,12 @@
 //! one event, including bytes that were dropped or could not be parsed, so nothing disappears
 //! silently.
 //!
-//! This crate replaces the separate tool-call and reasoning parser crates over time. Until the
-//! gateway is switched over, it is developed and verified on its own: it changes nothing outside
-//! `crates/symphony/`, and its formats are proven against recorded fixtures before they are wired
-//! in. The design and the delivery plan live with the maintainers; the short version is in this
-//! crate's `README.md`.
+//! This crate replaced the separate tool-call and reasoning parser crates on the gateway's request
+//! path: the gateway reads a model's output through it by default, and the older readers stay
+//! behind `--parser legacy` (or a request's `X-SMG-Parser: legacy`) and read the models no table
+//! reads yet. Its formats are proven against recorded fixtures before they are wired in. The
+//! design and the delivery plan live with the maintainers; the short version is in this crate's
+//! `README.md`.
 //!
 //! The standard this crate is held to is craftsmanship: code that reads as well as it runs, with no
 //! compromise kept for convenience. A change whose only reason is "this can be better" is welcome.
@@ -49,10 +50,10 @@ mod tokens;
 pub use declared::Declared;
 pub use engine::Engine;
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
-pub use format::{CallId, CallSyntax, Emits, Format, Whitespace};
+pub use format::{CallId, CallSyntax, Emits, ForcedCall, Format, Whitespace};
 pub use grammar::{
-    Bound, Grammar, GrammarStart, Output, OutputAnswer, OutputChoice, OutputPosition,
-    OutputSpelling, Tag, Turn,
+    AddedTokens, Bound, Grammar, GrammarBackend, GrammarStart, Inexpressible, Lark, Output,
+    OutputAnswer, OutputChoice, OutputPosition, OutputSpelling, Spelling, Tag, Turn, Unspelled,
 };
 pub use ids::CallIds;
 pub use input::{EngineFinish, Input, TokenSpan};

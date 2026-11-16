@@ -1,10 +1,14 @@
-# Opt-in full ByteLevel decoding
+# Full ByteLevel decoding
 
-`cargo build --release -p smg --features tokenizers-v1` enables both the v1
-encoder and the full ByteLevel decode fast path. Neither is enabled by default.
-The decoder reuses SMG's immutable byte table, which was already built for
-streaming. It does not invoke the RC decoder, allocate a second vocabulary, or
-change incremental decoding. Non-ByteLevel decoders retain tokenizers 0.23.
+The full ByteLevel decode reuses SMG's immutable byte table, which is built for
+streaming, and serves every `ByteLevel` vocabulary in every build (it was
+opt-in behind `tokenizers-v1` when the results below were recorded; that
+feature now enables the v1 encoder only). It does not invoke the RC decoder,
+allocate a second vocabulary, or change incremental decoding. Non-ByteLevel
+decoders take the piece table when the chain has one (byte fallback), else
+tokenizers 0.23. The runner below compares the default and the opt-in build of
+one source; with the decode path shared by both, its decode rows measure the
+same code and only the loads differ.
 
 ## Reproduce
 

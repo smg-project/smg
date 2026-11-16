@@ -45,6 +45,17 @@ def test_a_model_specific_int64_tensor_keeps_its_shape():
     assert torch.equal(got, want)
 
 
+def test_a_tensor_with_a_zero_dimension_decodes_to_its_empty_shape():
+    # A family whose images take crops ships the batch's crops as one tensor
+    # even when no image took any: zero rows of the crop shape, no bytes.
+    td = sglang_scheduler_pb2.TensorData(dtype="float32", shape=[0, 3, 4, 4], data=b"")
+
+    got = _decode(td)
+
+    assert tuple(got.shape) == (0, 3, 4, 4)
+    assert got.dtype == torch.float32
+
+
 def test_an_unknown_dtype_is_refused_rather_than_guessed():
     # Read as float32 this would have produced a well-shaped tensor of
     # meaningless numbers, and the model would have answered from it.

@@ -13,8 +13,10 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
+use openai_protocol::worker::WorkerStatus;
 use serde_json::json;
 use smg::{
+    config::PolicyConfig,
     policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
     routers::common::header_utils::parse_routing_tokens_hint,
     worker::{BasicWorkerBuilder, Worker, WorkerType},
@@ -251,6 +253,95 @@ mod header_routing_hints_tests {
             "distinct keys must not pile onto one worker, got {spread:?}"
         );
         assert_eq!(served.iter().sum::<usize>(), 18);
+
+        ctx.shutdown().await;
+    }
+
+    /// `x-smg-target-worker` under consistent hashing counts the workers
+    /// available when the request arrives: with the worker behind index 1
+    /// not ready, index 1 lands on the worker that was behind index 2 and
+    /// index 2 is answered 503 with no worker asked. Ready again, the
+    /// indexes read as before.
+    #[tokio::test]
+    async fn test_target_worker_hint_indexes_the_available_workers() {
+        let mut config = TestRouterConfig::round_robin(3174);
+        config.policy = PolicyConfig::ConsistentHashing;
+        let (ctx, recorders, model_id) = setup(config, 19462).await;
+        let app = ctx.create_app();
+
+        // The worker behind each index, learned from a healthy pool.
+        let served = || -> Vec<usize> { recorders.iter().map(|r| r.bodies().len()).collect() };
+        let mut behind = Vec::new();
+        for index in 0..3u8 {
+            let before = served();
+            let response = app
+                .clone()
+                .oneshot(chat_request(
+                    &model_id,
+                    "prompt",
+                    &[("x-smg-target-worker", &index.to_string())],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let after = served();
+            let hit: Vec<usize> = (0..recorders.len())
+                .filter(|&r| after[r] == before[r] + 1)
+                .collect();
+            assert_eq!(
+                hit.len(),
+                1,
+                "index {index} lands on one worker, got {hit:?}"
+            );
+            behind.push(hit[0]);
+        }
+        assert_eq!(behind.len(), 3);
+        assert_ne!(behind[0], behind[1]);
+        assert_ne!(behind[1], behind[2]);
+        assert_ne!(behind[0], behind[2]);
+
+        let out = ctx
+            .app_context
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .find(|worker| worker.url() == ctx.worker_urls[behind[1]])
+            .expect("the worker behind index 1 is registered");
+        out.set_status(WorkerStatus::NotReady);
+
+        let expect = |index: u8, status: StatusCode, recorder: Option<usize>| {
+            let app = app.clone();
+            let model_id = model_id.clone();
+            let served = &served;
+            async move {
+                let before = served();
+                let response = app
+                    .oneshot(chat_request(
+                        &model_id,
+                        "prompt",
+                        &[("x-smg-target-worker", &index.to_string())],
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status, "index {index}");
+                let after = served();
+                let hit: Vec<usize> = (0..before.len())
+                    .filter(|&r| after[r] == before[r] + 1)
+                    .collect();
+                assert_eq!(
+                    hit,
+                    recorder.into_iter().collect::<Vec<_>>(),
+                    "index {index}: the worker asked"
+                );
+            }
+        };
+        expect(1, StatusCode::OK, Some(behind[2])).await;
+        expect(2, StatusCode::SERVICE_UNAVAILABLE, None).await;
+        expect(0, StatusCode::OK, Some(behind[0])).await;
+
+        out.set_status(WorkerStatus::Ready);
+        expect(1, StatusCode::OK, Some(behind[1])).await;
+        expect(2, StatusCode::OK, Some(behind[2])).await;
 
         ctx.shutdown().await;
     }

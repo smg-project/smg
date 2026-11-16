@@ -15,7 +15,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use llm_tokenizer::{
     mock::MockTokenizer,
     sequence::Sequence,
-    stop::{StopSequenceConfig, StopSequenceDecoder},
+    stop::{StopRules, StopSequenceConfig, StopSequenceDecoder},
 };
 
 /// Benchmark the full stop decoder processing N tokens with varying stop sequence counts.
@@ -236,6 +236,49 @@ fn bench_per_token_at_position(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark a choice's decoder construction: from the request's stop parameters, the config
+/// built and compiled per decoder, against a copy of rules built once per request.
+fn bench_stop_decoder_build(c: &mut Criterion) {
+    let tokenizer = Arc::new(MockTokenizer::new());
+    let mut group = c.benchmark_group("stop_decoder_build");
+
+    for num_stops in [1, 4, 16] {
+        let stop_sequences: Vec<String> = (0..num_stops)
+            .map(|i| format!("STOP_SEQUENCE_{i}_END"))
+            .collect();
+        let config = || {
+            let mut config = StopSequenceConfig::default().with_stop_token(2);
+            for s in &stop_sequences {
+                config = config.with_stop_sequence(s);
+            }
+            config
+        };
+        group.bench_with_input(
+            BenchmarkId::new("from_config", format!("{num_stops}_stops")),
+            &num_stops,
+            |b, _| {
+                b.iter(|| black_box(StopSequenceDecoder::new(tokenizer.clone(), config(), false)));
+            },
+        );
+        let rules = StopRules::new(config());
+        group.bench_with_input(
+            BenchmarkId::new("from_rules", format!("{num_stops}_stops")),
+            &num_stops,
+            |b, _| {
+                b.iter(|| {
+                    black_box(StopSequenceDecoder::with_rules(
+                        tokenizer.clone(),
+                        rules.clone(),
+                        false,
+                    ))
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_stop_decoder_process_tokens,
@@ -243,5 +286,6 @@ criterion_group!(
     bench_stop_decoder_token_only,
     bench_sequence_append_token,
     bench_per_token_at_position,
+    bench_stop_decoder_build,
 );
 criterion_main!(benches);

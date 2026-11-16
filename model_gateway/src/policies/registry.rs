@@ -9,6 +9,7 @@ use std::{
 use dashmap::DashMap;
 use http::{header::HeaderName, HeaderMap};
 use parking_lot::{Mutex, RwLock};
+use rustc_hash::FxBuildHasher;
 use tracing::{debug, info, warn};
 
 /// Policy Registry for managing model-to-policy mappings
@@ -18,11 +19,13 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    get_healthy_worker_indices,
+    as_bucket, as_cache_aware, get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    normalize_model_key, BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy,
-    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
+    normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
+    PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
+#[cfg(test)]
+use crate::worker::UNKNOWN_MODEL_ID;
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
@@ -30,7 +33,10 @@ use crate::{
     routers::common::header_utils::{
         extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
     },
-    worker::{load_state::LoadReceiver, KvEventMonitor, RequestCompletionSink, Worker, WorkerType},
+    worker::{
+        identity::endpoint::Endpoint, load::state::LoadReceiver, KvEventMonitor,
+        RequestCompletionSink, Worker, WorkerType,
+    },
 };
 
 /// Routes a request completion to the policy that placed the request: the
@@ -49,7 +55,7 @@ impl RequestCompletionSink for PolicyCompletionSink {
         };
         registry
             .policy_for_worker(worker)
-            .on_request_complete(worker.url(), true);
+            .on_request_complete(worker.url());
     }
 }
 
@@ -72,16 +78,19 @@ impl TextNeeds {
 
     /// What `policy` answers.
     fn of(policy: &dyn LoadBalancingPolicy) -> Self {
-        let keeps_text_under_key = !PolicyRegistry::routing_key_override_applies(policy.name());
+        Self::from_answers(
+            policy.needs_request_text(),
+            policy.needs_request_text_with_tokens(),
+            !PolicyRegistry::routing_key_override_applies(policy.name()),
+        )
+    }
+
+    fn from_answers(text: bool, text_with_tokens: bool, keeps_text_under_key: bool) -> Self {
         let mut bits = 0;
         for (wants, any, under_key) in [
+            (text, Self::TEXT, Self::TEXT_UNDER_KEY),
             (
-                policy.needs_request_text(),
-                Self::TEXT,
-                Self::TEXT_UNDER_KEY,
-            ),
-            (
-                policy.needs_request_text_with_tokens(),
+                text_with_tokens,
                 Self::TEXT_WITH_TOKENS,
                 Self::TEXT_WITH_TOKENS_UNDER_KEY,
             ),
@@ -117,8 +126,9 @@ impl TextNeeds {
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
 pub struct PolicyRegistry {
-    /// Model ID -> Policy instance mapping (lock-free reads via DashMap)
-    model_policies: Arc<DashMap<String, Arc<dyn LoadBalancingPolicy>>>,
+    /// Model ID -> Policy instance mapping (lock-free reads via DashMap; the
+    /// Fx hasher over the operator's model ids, read on every request)
+    model_policies: Arc<DashMap<String, Arc<dyn LoadBalancingPolicy>, FxBuildHasher>>,
 
     /// The text questions' answers over the default and the per-model
     /// policies ([`TextNeeds`]), recomputed where one is added or removed
@@ -129,9 +139,6 @@ pub struct PolicyRegistry {
     /// started before a concurrent addition's insert must not publish over
     /// the bits that addition published.
     text_needs_refresh: Arc<Mutex<()>>,
-
-    /// Model ID -> Worker count for cleanup tracking (lock-free reads via DashMap)
-    model_worker_counts: Arc<DashMap<String, usize>>,
 
     /// Default policy instance (cached, immutable after creation)
     default_policy: Arc<dyn LoadBalancingPolicy>,
@@ -185,7 +192,7 @@ pub struct PolicyRegistry {
 /// pinned worker (router-local, counted per replica) is bypassed and the
 /// request reassigned. Guards one conversation stacking onto its pin; total
 /// worker load is not a respill trigger.
-const STICKY_INFLIGHT_CAP: usize = 2;
+const STICKY_INFLIGHT_CAP: u16 = 2;
 
 /// `conv_t2_r1` -> `conv`: strip one trailing `_r<n>` retry suffix, then one
 /// trailing `_t<n>` turn suffix. A bare retry suffix is stripped too: a retry
@@ -244,10 +251,9 @@ impl PolicyRegistry {
             .collect();
         let text_needs = TextNeeds::of(default_policy.as_ref());
         Self {
-            model_policies: Arc::new(DashMap::new()),
+            model_policies: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             text_needs: Arc::new(AtomicU8::new(text_needs.0)),
             text_needs_refresh: Arc::new(Mutex::new(())),
-            model_worker_counts: Arc::new(DashMap::new()),
             default_policy,
             default_policy_config,
             prefill_policy: Arc::new(OnceLock::new()),
@@ -297,6 +303,12 @@ impl PolicyRegistry {
             .find_map(|name| extract_routing_key_hint_named(headers, name))
     }
 
+    /// The header the gateway sets a key under itself: the first configured
+    /// routing-key name, the one [`Self::resolve_routing_key`] reads first.
+    pub(crate) fn routing_key_header(&self) -> Option<&HeaderName> {
+        self.routing_key_headers.first()
+    }
+
     /// A key that is nothing but suffix keys as itself, like the rid path.
     fn strip_header_key(raw: &str) -> &str {
         let stripped = strip_lineage_suffixes(raw);
@@ -307,9 +319,10 @@ impl PolicyRegistry {
         }
     }
 
-    /// The header-derived sticky key: the resolved routing key,
-    /// lineage-stripped when the override is enabled (matching selection),
-    /// raw otherwise.
+    /// The one header-derived key: the resolved routing key, lineage-stripped
+    /// when the override is enabled, raw otherwise. Placement hands it to
+    /// every policy as `SelectWorkerInfo::routing_key` and the load guard
+    /// counts under it, so selection and accounting agree by construction.
     pub fn sticky_header_key<'a>(&self, headers: Option<&'a HeaderMap>) -> Option<&'a str> {
         let raw = self.resolve_routing_key(headers)?;
         Some(if self.routing_key_sticky.is_some() {
@@ -336,25 +349,44 @@ impl PolicyRegistry {
     }
 
     /// Resolve the effective sticky key: a valid configured routing-key header
-    /// wins, with the rid-derived key as fallback. Header keys get the same
-    /// lineage stripping as rid keys, so a
-    /// proxy forwarding `conv_t2` as a header pins the entry `conv`.
+    /// wins, with the rid-derived key as fallback. `info.routing_key` is the
+    /// header key as placement derived it ([`Self::sticky_header_key`]:
+    /// lineage-stripped under the override, so a proxy forwarding `conv_t2`
+    /// pins the entry `conv`); a caller that left it empty gets the same
+    /// derivation from the headers here. Nothing strips twice.
     fn effective_sticky_key<'a>(
         &self,
         info: &SelectWorkerInfo<'a>,
     ) -> Option<(&'a str, &'static str)> {
         info.routing_key
-            .or_else(|| self.resolve_routing_key(info.headers))
-            .map(|raw| (Self::strip_header_key(raw), "header"))
+            .or_else(|| self.sticky_header_key(info.headers))
+            .map(|key| (key, "header"))
             .or_else(|| info.rid_key.map(|key| (key, "rid")))
     }
 
-    /// Select a worker, applying the sticky routing-key override when it is
-    /// enabled, the request carries a key from the configured source, and the
-    /// configured policy does not already honor the key (`manual` /
-    /// `consistent_hashing`, which read `rid_key` and the header themselves
-    /// with the same header-first precedence). Otherwise delegates to `policy`.
-    /// `policy.name()` stays the real policy (for metrics).
+    /// The sticky routing-key override's selector, with the request's key and
+    /// its source, when the override places this request: it is enabled,
+    /// `policy` does not honor the key itself (`manual` and
+    /// `consistent_hashing` read `rid_key` and the header themselves with the
+    /// same header-first precedence), and the request carries a key from a
+    /// configured source. The one predicate the keyed path is entered by; the
+    /// policy's name is read only when the override is enabled.
+    fn sticky_for<'a>(
+        &self,
+        policy: &dyn LoadBalancingPolicy,
+        info: &SelectWorkerInfo<'a>,
+    ) -> Option<(&Arc<ManualPolicy>, &'a str, &'static str)> {
+        let sticky = self.routing_key_sticky.as_ref()?;
+        if !Self::routing_key_override_applies(policy.name()) {
+            return None;
+        }
+        let (key, source) = self.effective_sticky_key(info)?;
+        Some((sticky, key, source))
+    }
+
+    /// Select a worker, applying the sticky routing-key override when it
+    /// places the request (`sticky_for`); otherwise delegates to
+    /// `policy`. `policy.name()` stays the real policy (for metrics).
     pub fn select_worker_for_model(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
@@ -363,14 +395,8 @@ impl PolicyRegistry {
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
         cache_trace::begin_selection(workers);
-        if let Some(sticky) = self.routing_key_sticky.as_ref() {
-            if Self::routing_key_override_applies(policy.name()) {
-                if let Some((key, source)) = self.effective_sticky_key(info) {
-                    return Self::select_sticky(
-                        sticky, policy, model_id, workers, info, key, source,
-                    );
-                }
-            }
+        if let Some((sticky, key, source)) = self.sticky_for(policy.as_ref(), info) {
+            return Self::select_sticky(sticky, policy, model_id, workers, info, key, source);
         }
         let selected = policy.select_worker(workers, info);
         cache_trace::selection(policy.name(), "policy", workers, selected);
@@ -387,7 +413,7 @@ impl PolicyRegistry {
         let model_id = workers
             .first()
             .map(|worker| worker.model_id())
-            .unwrap_or(crate::worker::UNKNOWN_MODEL_ID);
+            .unwrap_or(UNKNOWN_MODEL_ID);
         self.select_worker_for_model(policy, model_id, workers, info)
     }
 
@@ -420,30 +446,30 @@ impl PolicyRegistry {
         let namespaced = format!("{}:{model}:{role}:{key}", model.len());
         let key = namespaced.as_str();
 
-        let over_cap =
-            |idx: usize| workers[idx].routing_key_inflight(load_key) >= STICKY_INFLIGHT_CAP;
+        let over_cap = |idx: usize| {
+            workers[idx].routing_key_inflight(load_key) >= usize::from(STICKY_INFLIGHT_CAP)
+        };
         let finish = |result: Option<usize>, branch: ExecutionBranch| {
             cache_trace::selection(policy.name(), branch.as_str(), workers, result);
             Metrics::record_worker_manual_policy_branch(branch.as_str());
-            Metrics::set_manual_policy_cache_entries(sticky.map_len());
             debug!(
                 source,
                 key,
                 branch = branch.as_str(),
-                worker = result.map_or("none", |idx| workers[idx].url()),
+                worker = result.map_or("none", |idx| workers[idx].redacted_url()),
                 model_id = result.map_or("none", |idx| workers[idx].model_id()),
                 "Sticky routing decision"
             );
             result
         };
 
-        let healthy = get_healthy_worker_indices(workers, info);
-        if healthy.is_empty() {
-            return finish(None, ExecutionBranch::NoHealthyWorkers);
-        }
         let delegate = sticky.assignment_mode() == ManualAssignmentMode::Delegate;
 
-        let pin = sticky.peek_pin(workers, key, &healthy);
+        // A hit reads the pin's candidates alone; the eligible list is built
+        // only where a worker has to be chosen from it.
+        let pin = sticky.peek_pin(workers, key, |idx| {
+            info.admits(workers[idx].routing_state())
+        });
         if let PinState::Pinned(idx) = pin {
             if !over_cap(idx) {
                 return finish(Some(idx), ExecutionBranch::OccupiedHit);
@@ -458,12 +484,23 @@ impl PolicyRegistry {
                     None => return finish(None, ExecutionBranch::CapRespill),
                 }
             } else {
+                // The pin was admitted by a live read above; the pool can lose
+                // every eligible worker before this second read.
+                let healthy = get_healthy_worker_indices(workers, info);
+                if healthy.is_empty() {
+                    return finish(None, ExecutionBranch::NoHealthyWorkers);
+                }
                 sticky.assign_index(workers, &healthy)
             };
             if new_idx != idx && !over_cap(new_idx) {
                 sticky.pin_front(key, workers[new_idx].url());
             }
             return finish(Some(new_idx), ExecutionBranch::CapRespill);
+        }
+
+        let healthy = get_healthy_worker_indices(workers, info);
+        if healthy.is_empty() {
+            return finish(None, ExecutionBranch::NoHealthyWorkers);
         }
 
         if delegate {
@@ -521,7 +558,7 @@ impl PolicyRegistry {
         policy: &Arc<dyn LoadBalancingPolicy>,
         monitor: Option<&Arc<KvEventMonitor>>,
     ) {
-        if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+        if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
             cache_aware.set_kv_event_monitor(monitor.cloned());
         }
     }
@@ -568,8 +605,8 @@ impl PolicyRegistry {
 
     /// Attach the mesh outbound bridge (thread-safe, can be called after
     /// initialization). Every existing cache-aware policy gets the adapter
-    /// wired in and its `populate_hash_index` flag flipped on (both flip
-    /// atomically inside [`CacheAwarePolicy::set_mesh_tree_sync`]); every
+    /// wired in and its mesh flag raised (both flip
+    /// atomically inside [`super::CacheAwarePolicy::set_mesh_tree_sync`]); every
     /// future cache-aware policy created here inherits both. Pass `None`
     /// to detach.
     pub fn set_mesh_tree_sync(&self, adapter: Option<Arc<TreeSyncAdapter>>) {
@@ -593,19 +630,17 @@ impl PolicyRegistry {
     }
 
     /// Inject the mesh adapter into a policy if it's cache-aware.
-    /// The setter also flips `populate_hash_index` to match adapter
+    /// The setter also flips the policy's mesh flag to match adapter
     /// presence, so callers do not need to touch that flag directly.
     fn maybe_inject_mesh_tree_sync(
         policy: &Arc<dyn LoadBalancingPolicy>,
         adapter: Option<&Arc<TreeSyncAdapter>>,
     ) {
-        if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+        if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
             cache_aware.set_mesh_tree_sync(adapter.cloned());
         }
     }
 
-    /// Called when a worker is added
-    /// Returns the policy that should be used for this worker's model
     /// The request-completion observer to install on every worker (see
     /// [`RequestCompletionSink`]): policies that book state at dispatch
     /// release it when the request's load guard drops.
@@ -617,8 +652,9 @@ impl PolicyRegistry {
 
     /// The policy that places requests on `worker`: the prefill, decode or
     /// encode policy by worker type, else the model's policy. Completion
-    /// reports and in-flight reconciliation both go there.
-    fn policy_for_worker(&self, worker: &dyn Worker) -> Arc<dyn LoadBalancingPolicy> {
+    /// reports and in-flight reconciliation both go there, and the worker's
+    /// stream is chosen by what it needs (see `UpdatePoliciesStep`).
+    pub(crate) fn policy_for_worker(&self, worker: &dyn Worker) -> Arc<dyn LoadBalancingPolicy> {
         match worker.worker_type() {
             WorkerType::Prefill => self.get_prefill_policy(),
             WorkerType::Decode => self.get_decode_policy(),
@@ -636,20 +672,16 @@ impl PolicyRegistry {
             .reconcile_in_flight(worker.url(), worker.load());
     }
 
+    /// The policy for `model_id`'s requests: built for the model's first
+    /// worker (from `policy_hint`, its `policy` label) and returned as it is
+    /// for every later one, until no worker of this node serves the model
+    /// ([`Self::on_model_unserved`]). Registering or replacing a worker of
+    /// the model calls this as often as it likes.
     pub fn on_worker_added(
         &self,
         model_id: &str,
         policy_hint: Option<&str>,
     ) -> Arc<dyn LoadBalancingPolicy> {
-        // Increment worker count using DashMap entry API
-        let count = self
-            .model_worker_counts
-            .entry(model_id.to_string())
-            .and_modify(|c| *c += 1)
-            .or_insert(1);
-        debug!("Worker added for model {}, count: {}", model_id, *count);
-        drop(count); // Release the entry lock
-
         // Check if model already has a policy (lock-free read via DashMap)
         if let Some(existing_policy) = self.model_policies.get(model_id) {
             debug!(
@@ -698,41 +730,18 @@ impl PolicyRegistry {
         publish();
     }
 
-    /// Called when a worker is removed
-    pub fn on_worker_removed(&self, model_id: &str) {
-        // Decrement worker count and check if cleanup needed
-        let should_cleanup = if let Some(mut count_ref) = self.model_worker_counts.get_mut(model_id)
-        {
-            *count_ref = count_ref.saturating_sub(1);
-            debug!(
-                "Worker removed for model {}, count: {}",
-                model_id, *count_ref
-            );
-            if *count_ref == 0 {
-                drop(count_ref); // Release before remove
-                self.model_worker_counts.remove(model_id);
-                true
-            } else {
-                false
-            }
-        } else {
-            warn!(
-                "Attempted to remove worker for model {} with no registered workers",
+    /// Called once no worker of this node serves `model_id` any more (see
+    /// `WorkerRegistry::serves_model_locally`): the model's policy goes with
+    /// its last worker, so a later registration builds the policy its own
+    /// labels name.
+    pub fn on_model_unserved(&self, model_id: &str) {
+        if let Some((_, policy)) = self.model_policies.remove(model_id) {
+            info!(
+                "Removed policy {} for model {} (no worker of this node serves it)",
+                policy.name(),
                 model_id
             );
-            false
-        };
-
-        // Clean up policy if this was the last worker
-        if should_cleanup {
-            if let Some((_, policy)) = self.model_policies.remove(model_id) {
-                info!(
-                    "Removed policy {} for model {} (last worker removed)",
-                    policy.name(),
-                    model_id
-                );
-                self.refresh_text_needs();
-            }
+            self.refresh_text_needs();
         }
     }
 
@@ -843,18 +852,9 @@ impl PolicyRegistry {
             .collect()
     }
 
-    /// Get worker counts per model
-    pub fn get_worker_counts(&self) -> HashMap<String, usize> {
-        self.model_worker_counts
-            .iter()
-            .map(|entry| (entry.key().clone(), *entry.value()))
-            .collect()
-    }
-
     /// Clear all policies (useful for testing)
     pub fn clear(&self) {
         self.model_policies.clear();
-        self.model_worker_counts.clear();
         self.refresh_text_needs();
     }
 
@@ -980,7 +980,8 @@ impl PolicyRegistry {
         let _one_at_a_time = self.text_needs_refresh.lock();
         let mut needs = TextNeeds::of(self.default_policy.as_ref());
         for entry in self.model_policies.iter() {
-            needs = needs.join(TextNeeds::of(entry.value().as_ref()));
+            let policy = entry.value().as_ref();
+            needs = needs.join(TextNeeds::of(policy));
         }
         self.text_needs.store(needs.0, Ordering::Release);
     }
@@ -994,20 +995,32 @@ impl PolicyRegistry {
         needs
     }
 
+    /// Whether the prefill or the decode policy reads the request text: the
+    /// pair routers' body question.
+    pub(crate) fn pair_needs_request_text(&self) -> bool {
+        self.get_prefill_policy().needs_request_text()
+            || self.get_decode_policy().needs_request_text()
+    }
+
+    /// Whether `worker`'s stream carries its KV events into its model's
+    /// index: what the policy that places requests on it reads
+    /// ([`Self::policy_for_worker`]).
+    pub(crate) fn worker_needs_kv_events(&self, worker: &dyn Worker) -> bool {
+        self.policy_for_worker(worker).needs_kv_events()
+    }
+
     /// Initialize cache-aware policy with workers if applicable
     /// This should be called after workers are registered for a model
     pub fn init_cache_aware_policy(&self, model_id: &str, workers: &[Arc<dyn Worker>]) {
         // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                    debug!(
-                        "Initializing cache-aware policy with {} workers for model {}",
-                        workers.len(),
-                        model_id
-                    );
-                    cache_aware.init_workers(workers);
-                }
+            if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
+                debug!(
+                    "Initializing cache-aware policy with {} workers for model {}",
+                    workers.len(),
+                    model_id
+                );
+                cache_aware.init_workers(workers);
             }
         }
     }
@@ -1017,14 +1030,13 @@ impl PolicyRegistry {
     pub fn remove_worker_from_cache_aware(&self, model_id: &str, worker_url: &str) {
         // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                    cache_aware.remove_worker_by_url(worker_url);
-                    debug!(
-                        "Removed worker {} from cache-aware policy for model {}",
-                        worker_url, model_id
-                    );
-                }
+            if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
+                cache_aware.remove_worker_by_url(worker_url);
+                debug!(
+                    "Removed worker {} from cache-aware policy for model {}",
+                    Endpoint::redacted_url(worker_url),
+                    model_id
+                );
             }
         }
     }
@@ -1038,14 +1050,13 @@ impl PolicyRegistry {
             ("encode", self.encode_policy.get()),
         ] {
             if let Some(policy) = policy {
-                if policy.name() == "cache_aware" {
-                    if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                        cache_aware.remove_worker_by_url(worker_url);
-                        debug!(
-                            "Removed worker {} from {} cache-aware policy",
-                            worker_url, worker_type
-                        );
-                    }
+                if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
+                    cache_aware.remove_worker_by_url(worker_url);
+                    debug!(
+                        "Removed worker {} from {} cache-aware policy",
+                        Endpoint::redacted_url(worker_url),
+                        worker_type
+                    );
                 }
             }
         }
@@ -1062,15 +1073,13 @@ impl PolicyRegistry {
         // `policies_for_model` deduplicates shared policy instances so each
         // tree is cleaned at most once.
         for policy in self.policies_for_model(model_id) {
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                    cache_aware.remove_workers_from_model(model_id, worker_urls);
-                    debug!(
-                        "Removed {} workers from cache-aware policy for model {}",
-                        worker_urls.len(),
-                        model_id
-                    );
-                }
+            if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
+                cache_aware.remove_workers_from_model(model_id, worker_urls);
+                debug!(
+                    "Removed {} workers from cache-aware policy for model {}",
+                    worker_urls.len(),
+                    model_id
+                );
             }
         }
     }
@@ -1091,33 +1100,26 @@ impl PolicyRegistry {
     ) {
         // Initialize prefill policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(prefill_policy) = self.prefill_policy.get() {
-            if prefill_policy.name() == "cache_aware" {
-                if let Some(cache_aware) =
-                    prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
-                {
-                    if !prefill_workers.is_empty() {
-                        debug!(
-                            "Initializing prefill cache-aware policy with {} workers",
-                            prefill_workers.len()
-                        );
-                        cache_aware.init_workers(prefill_workers);
-                    }
+            if let Some(cache_aware) = as_cache_aware(prefill_policy.as_ref()) {
+                if !prefill_workers.is_empty() {
+                    debug!(
+                        "Initializing prefill cache-aware policy with {} workers",
+                        prefill_workers.len()
+                    );
+                    cache_aware.init_workers(prefill_workers);
                 }
             }
         }
 
         // Initialize decode policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(decode_policy) = self.decode_policy.get() {
-            if decode_policy.name() == "cache_aware" {
-                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
-                {
-                    if !decode_workers.is_empty() {
-                        debug!(
-                            "Initializing decode cache-aware policy with {} workers",
-                            decode_workers.len()
-                        );
-                        cache_aware.init_workers(decode_workers);
-                    }
+            if let Some(cache_aware) = as_cache_aware(decode_policy.as_ref()) {
+                if !decode_workers.is_empty() {
+                    debug!(
+                        "Initializing decode cache-aware policy with {} workers",
+                        decode_workers.len()
+                    );
+                    cache_aware.init_workers(decode_workers);
                 }
             }
         }
@@ -1127,15 +1129,13 @@ impl PolicyRegistry {
     pub fn init_pd_bucket_policies(&self, prefill_workers: &[Arc<dyn Worker>]) {
         // Initialize prefill policy if it's bucket (lock-free via OnceLock::get)
         if let Some(prefill_policy) = self.prefill_policy.get() {
-            if prefill_policy.name() == "bucket" {
-                if let Some(bucket) = prefill_policy.as_any().downcast_ref::<BucketPolicy>() {
-                    if !prefill_workers.is_empty() {
-                        debug!(
-                            "Initializing prefill bucket policy with {} workers",
-                            prefill_workers.len()
-                        );
-                        bucket.init_prefill_worker_urls(prefill_workers);
-                    }
+            if let Some(bucket) = as_bucket(prefill_policy.as_ref()) {
+                if !prefill_workers.is_empty() {
+                    debug!(
+                        "Initializing prefill bucket policy with {} workers",
+                        prefill_workers.len()
+                    );
+                    bucket.init_prefill_worker_urls(prefill_workers);
                 }
             }
         }
@@ -1146,7 +1146,6 @@ impl std::fmt::Debug for PolicyRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PolicyRegistry")
             .field("model_policies", &self.model_policies)
-            .field("model_worker_counts", &self.model_worker_counts)
             .field("default_policy", &self.default_policy.name())
             .field(
                 "text_needs",
@@ -1164,20 +1163,49 @@ mod tests {
 
     use super::*;
     use crate::{
-        policies::{BucketConfig, CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
+        policies::{
+            hash_ring::HashRing, test_support::headers_with_routing_key, BucketConfig,
+            BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
+        },
         worker::{
-            load_state::LoadSnapshot, test_support::no_health_check, BasicWorkerBuilder, HashRing,
+            load::state::LoadSnapshot,
+            test_support::{ready_worker, worker_of},
             Worker, WorkerLoadGuard, WorkerType,
         },
     };
 
-    fn worker(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(worker_type)
-                .health_config(no_health_check())
-                .build(),
-        )
+    /// The static needs the host answers before any request exists: a
+    /// cache-aware default policy reads the request text, the load poll and
+    /// a regular worker's KV events, and the pair's text question is the two
+    /// pair policies'.
+    #[test]
+    fn a_cache_aware_default_needs_the_text_the_load_poll_and_the_kv_events() {
+        let registry = PolicyRegistry::new(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        let regular = worker_of("http://w1:8000", WorkerType::Regular);
+        assert!(registry.any_policy_needs_request_text(None));
+        assert!(registry.needs_backend_loads());
+        assert!(registry.worker_needs_kv_events(regular.as_ref()));
+        assert!(registry.pair_needs_request_text());
+    }
+
+    /// An encode worker's KV-event question is the encode policy's own
+    /// answer, not the default policy's: the encode policy places the
+    /// requests on it.
+    #[test]
+    fn an_encode_workers_kv_event_need_is_the_encode_policys_own() {
+        let encode = worker_of("grpc://encode:9000", WorkerType::Encode);
+        let regular = worker_of("http://w1:8000", WorkerType::Regular);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        // The encode router publishes the mode's encode policy at start-up.
+        policies.set_encode_policy(cache_aware_policy());
+        assert!(
+            policies.worker_needs_kv_events(encode.as_ref()),
+            "the encode policy reads the KV events"
+        );
+        assert!(
+            !policies.worker_needs_kv_events(regular.as_ref()),
+            "the round-robin default reads none"
+        );
     }
 
     fn cache_aware_policy() -> Arc<dyn LoadBalancingPolicy> {
@@ -1185,12 +1213,6 @@ mod tests {
             eviction_interval_secs: 0,
             ..Default::default()
         }))
-    }
-
-    fn headers_with_key(key: &str) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert("x-smg-routing-key", key.parse().unwrap());
-        h
     }
 
     #[test]
@@ -1217,11 +1239,11 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-            worker("http://w3", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
+            worker_of("http://w3", WorkerType::Regular),
         ];
-        let headers = headers_with_key("session-A");
+        let headers = headers_with_routing_key("session-A");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -1245,11 +1267,11 @@ mod tests {
         let policy = reg.get_default_policy();
         let pools = [
             vec![
-                worker("http://a1", WorkerType::Regular),
-                worker("http://a2", WorkerType::Regular),
+                worker_of("http://a1", WorkerType::Regular),
+                worker_of("http://a2", WorkerType::Regular),
             ],
-            vec![worker("http://b1", WorkerType::Regular)],
-            vec![worker("http://c1", WorkerType::Regular)],
+            vec![worker_of("http://b1", WorkerType::Regular)],
+            vec![worker_of("http://c1", WorkerType::Regular)],
         ];
         let info = SelectWorkerInfo {
             rid_key: Some("session-42"),
@@ -1295,13 +1317,13 @@ mod tests {
             let name = policy.name();
             assert!(!PolicyRegistry::routing_key_override_applies(name));
             let workers = vec![
-                worker("http://w1", WorkerType::Regular),
-                worker("http://w2", WorkerType::Regular),
-                worker("http://w3", WorkerType::Regular),
-                worker("http://w4", WorkerType::Regular),
+                worker_of("http://w1", WorkerType::Regular),
+                worker_of("http://w2", WorkerType::Regular),
+                worker_of("http://w3", WorkerType::Regular),
+                worker_of("http://w4", WorkerType::Regular),
             ];
             let hash_ring = Some(Arc::new(HashRing::new(workers.iter().map(|w| w.url()))));
-            let headers = headers_with_key("conversation-42");
+            let headers = headers_with_routing_key("conversation-42");
             let pinned = reg
                 .select_worker(
                     &policy,
@@ -1331,7 +1353,7 @@ mod tests {
                 );
             }
             if let Some(manual) = policy.as_any().downcast_ref::<ManualPolicy>() {
-                assert_eq!(manual.map_len(), 1);
+                assert_eq!(manual.entry_count(), 1);
             }
         }
     }
@@ -1347,8 +1369,8 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
         let info = SelectWorkerInfo::default(); // no key header
                                                 // RoundRobin alternates -> proves the configured policy is used, not sticky.
@@ -1378,7 +1400,7 @@ mod tests {
     fn request_text_scan_is_false_for_text_free_policies() {
         let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
         assert!(!reg.any_policy_needs_request_text(None));
-        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_key("k"))));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_routing_key("k"))));
     }
 
     #[test]
@@ -1395,13 +1417,13 @@ mod tests {
     #[test]
     fn key_hint_lifts_text_requirement_only_under_enabled_override() {
         let without = PolicyRegistry::new(cache_aware_config());
-        assert!(without.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
+        assert!(without.any_policy_needs_request_text(Some(&headers_with_routing_key("session-A"))));
 
         let with = PolicyRegistry::with_override(cache_aware_config(), enabled_override());
         assert!(with.any_policy_needs_request_text(None));
-        assert!(!with.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
+        assert!(!with.any_policy_needs_request_text(Some(&headers_with_routing_key("session-A"))));
         let over_cap = "k".repeat(129);
-        assert!(with.any_policy_needs_request_text(Some(&headers_with_key(&over_cap))));
+        assert!(with.any_policy_needs_request_text(Some(&headers_with_routing_key(&over_cap))));
     }
 
     #[test]
@@ -1411,7 +1433,7 @@ mod tests {
         reg.on_worker_added("llama-3", Some("cache_aware"));
         assert!(reg.any_policy_needs_request_text(None));
         assert!(!reg.any_policy_needs_request_text(Some(&headers_with_tokens("1,2,3"))));
-        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_routing_key("session-A"))));
     }
 
     /// The answer follows the per-model map: a text policy's model lifts the
@@ -1427,11 +1449,9 @@ mod tests {
         reg.on_worker_added("affine", Some("cache_aware"));
         reg.on_worker_added("affine", Some("cache_aware"));
         assert!(reg.any_policy_needs_request_text(None));
-        reg.on_worker_removed("affine");
-        assert!(reg.any_policy_needs_request_text(None));
-        reg.on_worker_removed("affine");
+        reg.on_model_unserved("affine");
         assert!(!reg.any_policy_needs_request_text(None));
-        reg.on_worker_removed("plain");
+        reg.on_model_unserved("plain");
         assert!(!reg.any_policy_needs_request_text(None));
 
         reg.on_worker_added("affine", Some("cache_aware"));
@@ -1450,7 +1470,7 @@ mod tests {
     #[test]
     fn text_requirement_under_a_key_counts_the_exempt_policies_only() {
         let reg = PolicyRegistry::with_override(cache_aware_config(), enabled_override());
-        let keyed = headers_with_key("session-A");
+        let keyed = headers_with_routing_key("session-A");
         assert!(reg.any_policy_needs_request_text(None));
         assert!(!reg.any_policy_needs_request_text(Some(&keyed)));
         assert!(!reg.any_policy_needs_request_text_with_tokens(None));
@@ -1575,10 +1595,10 @@ mod tests {
         let reg = PolicyRegistry::new(PolicyConfig::RoundRobin); // override off
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
-        let headers = headers_with_key("session-A");
+        let headers = headers_with_routing_key("session-A");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -1614,7 +1634,7 @@ mod tests {
         both.insert("x-smg-routing-key", "legacy".parse().unwrap());
         assert_eq!(reg.resolve_routing_key(Some(&both)), Some("primary"));
 
-        let legacy_only = headers_with_key("legacy");
+        let legacy_only = headers_with_routing_key("legacy");
         assert_eq!(reg.resolve_routing_key(Some(&legacy_only)), Some("legacy"));
 
         // An invalid value under the first name falls through to the next.
@@ -1636,7 +1656,7 @@ mod tests {
             None
         );
         assert_eq!(
-            reg.resolve_routing_key(Some(&headers_with_key("legacy"))),
+            reg.resolve_routing_key(Some(&headers_with_routing_key("legacy"))),
             Some("legacy")
         );
     }
@@ -1657,23 +1677,23 @@ mod tests {
     fn header_keys_share_rid_lineage_stripping() {
         let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
         assert_eq!(
-            reg.sticky_header_key(Some(&headers_with_key("conv_t2"))),
+            reg.sticky_header_key(Some(&headers_with_routing_key("conv_t2"))),
             Some("conv")
         );
         assert_eq!(
-            reg.sticky_header_key(Some(&headers_with_key("conv_t2_r1"))),
+            reg.sticky_header_key(Some(&headers_with_routing_key("conv_t2_r1"))),
             Some("conv")
         );
         // A key that is nothing but suffix keys as itself.
         assert_eq!(
-            reg.sticky_header_key(Some(&headers_with_key("_t1"))),
+            reg.sticky_header_key(Some(&headers_with_routing_key("_t1"))),
             Some("_t1")
         );
 
         // Override disabled: raw key, no stripping.
         let disabled = PolicyRegistry::new(PolicyConfig::RoundRobin);
         assert_eq!(
-            disabled.sticky_header_key(Some(&headers_with_key("conv_t2"))),
+            disabled.sticky_header_key(Some(&headers_with_routing_key("conv_t2"))),
             Some("conv_t2")
         );
     }
@@ -1683,17 +1703,17 @@ mod tests {
         let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-            worker("http://w3", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
+            worker_of("http://w3", WorkerType::Regular),
         ];
-        let t1 = headers_with_key("conv_t1");
+        let t1 = headers_with_routing_key("conv_t1");
         let info_t1 = SelectWorkerInfo {
             headers: Some(&t1),
             ..Default::default()
         };
         let first = reg.select_worker(&policy, &workers, &info_t1).unwrap();
-        let t2 = headers_with_key("conv_t2");
+        let t2 = headers_with_routing_key("conv_t2");
         let info_t2 = SelectWorkerInfo {
             headers: Some(&t2),
             ..Default::default()
@@ -1711,9 +1731,9 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-            worker("http://w3", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
+            worker_of("http://w3", WorkerType::Regular),
         ];
         let headers = headers_with("x-routing-key", "session-A");
         let info = SelectWorkerInfo {
@@ -1760,8 +1780,8 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
         (reg, policy, workers)
     }
@@ -1799,7 +1819,7 @@ mod tests {
     fn header_key_wins_over_rid_and_rid_is_fallback() {
         let (reg, policy, workers) = delegating_registry_with_two_workers();
 
-        let headers = headers_with_key("conversation-42");
+        let headers = headers_with_routing_key("conversation-42");
         let first = reg
             .select_worker(
                 &policy,
@@ -1826,7 +1846,7 @@ mod tests {
             );
         }
 
-        assert_eq!(reg.routing_key_sticky.as_ref().unwrap().map_len(), 1);
+        assert_eq!(reg.routing_key_sticky.as_ref().unwrap().entry_count(), 1);
 
         // No header: request-ID lineage still gets its own stable pin.
         let rid_info = SelectWorkerInfo {
@@ -1859,8 +1879,8 @@ mod tests {
         );
         for headers in [
             HeaderMap::new(),
-            headers_with_key(""),
-            headers_with_key(&"k".repeat(ROUTING_KEY_HINT_MAX_BYTES + 1)),
+            headers_with_routing_key(""),
+            headers_with_routing_key(&"k".repeat(ROUTING_KEY_HINT_MAX_BYTES + 1)),
             invalid_utf8,
         ] {
             let info = SelectWorkerInfo {
@@ -1882,7 +1902,7 @@ mod tests {
     #[test]
     fn header_priority_accounts_inflight_requests_under_the_selected_key() {
         let (reg, policy, workers) = delegating_registry_with_two_workers();
-        let headers = headers_with_key("conversation_t1");
+        let headers = headers_with_routing_key("conversation_t1");
         let mut guards = Vec::new();
         for rid in ["request-1", "request-2", "request-3"] {
             let info = SelectWorkerInfo {
@@ -1895,7 +1915,10 @@ mod tests {
                 Some(("conversation", "header"))
             );
             let selected = reg.select_worker(&policy, &workers, &info).unwrap();
-            assert_eq!(selected, usize::from(guards.len() == STICKY_INFLIGHT_CAP));
+            assert_eq!(
+                selected,
+                usize::from(guards.len() == usize::from(STICKY_INFLIGHT_CAP))
+            );
             guards.push(WorkerLoadGuard::with_key(
                 workers[selected].clone(),
                 reg.sticky_key(Some(&headers), info.rid_key),
@@ -1917,12 +1940,10 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
-        policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
+        as_cache_aware(policy.as_ref())
             .unwrap()
             .init_workers(&workers);
 
@@ -1978,6 +1999,82 @@ mod tests {
         assert!(logs_contain("vacant"));
         reg.select_worker(&policy, &workers, &info).unwrap();
         assert!(logs_contain("occupied_hit"));
+    }
+
+    /// The sticky decision line and the two removal lines name a worker
+    /// registered with a password and a query token by its masked address.
+    #[test]
+    #[traced_test]
+    fn the_debug_lines_name_a_worker_masked() {
+        // What tells each line among the test's lines.
+        const LINES: [(&str, &str); 3] = [
+            ("the sticky decision", "Sticky routing decision"),
+            (
+                "the removal from a model's policy",
+                "from cache-aware policy for model",
+            ),
+            (
+                "the removal from a role's policy",
+                "from prefill cache-aware policy",
+            ),
+        ];
+        let address = |host: &str| format!("http://user:s3cret@{host}:8000/v1?token=s3cret");
+
+        let registry = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let workers = vec![
+            worker_of(&address("w1"), WorkerType::Regular),
+            worker_of(&address("w2"), WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("conv1"),
+            ..Default::default()
+        };
+        registry
+            .select_worker(&registry.get_default_policy(), &workers, &info)
+            .unwrap();
+
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.on_worker_added("llama-3", Some("cache_aware"));
+        registry.remove_worker_from_cache_aware("llama-3", &address("w3"));
+        registry.set_prefill_policy(cache_aware_policy());
+        registry.remove_worker_from_pd_cache_aware(&address("w4"));
+
+        logs_assert(|lines: &[&str]| {
+            let written = |told_by: &str| -> Vec<&str> {
+                lines
+                    .iter()
+                    .copied()
+                    .filter(|line| line.contains(told_by))
+                    .collect()
+            };
+            let unwritten: Vec<&str> = LINES
+                .iter()
+                .filter(|(_, told_by)| written(told_by).is_empty())
+                .map(|(line, _)| *line)
+                .collect();
+            if !unwritten.is_empty() {
+                return Err(format!("lines nothing wrote: {unwritten:#?}"));
+            }
+            let whole: Vec<&str> = LINES
+                .iter()
+                .filter(|(_, told_by)| {
+                    written(told_by)
+                        .iter()
+                        .any(|line| !line.contains("http://***@") || line.contains("s3cret"))
+                })
+                .map(|(line, _)| *line)
+                .collect();
+            if whole.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "lines that do not name their worker masked: {whole:#?}"
+                ))
+            }
+        });
     }
 
     /// An overloaded pin must respill through the existing reassignment path.
@@ -2113,8 +2210,8 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
         let info = SelectWorkerInfo {
             rid_key: Some("convC"),
@@ -2147,8 +2244,8 @@ mod tests {
         let _unrelated = [
             WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convZ")),
             WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convZ")),
-            WorkerLoadGuard::new(workers[pinned].clone(), None),
-            WorkerLoadGuard::new(workers[pinned].clone(), None),
+            WorkerLoadGuard::with_key(workers[pinned].clone(), None),
+            WorkerLoadGuard::with_key(workers[pinned].clone(), None),
         ];
         assert_eq!(reg.select_worker(&policy, &workers, &info), Some(pinned));
         assert!(logs_contain("occupied_hit"));
@@ -2181,7 +2278,7 @@ mod tests {
         let policy = reg.get_default_policy();
         // Single worker: the respill has nowhere to go, so the branch flips
         // purely on the key's in-flight count.
-        let workers = vec![worker("http://w1", WorkerType::Regular)];
+        let workers = vec![worker_of("http://w1", WorkerType::Regular)];
         let info = SelectWorkerInfo {
             rid_key: Some("convF"),
             ..Default::default()
@@ -2219,31 +2316,25 @@ mod tests {
         let mappings = registry.get_all_mappings();
         assert_eq!(mappings.get("llama-3").unwrap(), "cache_aware");
         assert_eq!(mappings.get("gpt-4").unwrap(), "random");
-
-        // Check worker counts
-        let counts = registry.get_worker_counts();
-        assert_eq!(*counts.get("llama-3").unwrap(), 2);
-        assert_eq!(*counts.get("gpt-4").unwrap(), 1);
     }
 
     #[test]
     fn test_policy_registry_cleanup() {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
-        // Add workers
+        // A model's policy outlives any number of adds: a registration or a
+        // replacement of a worker adds again.
         registry.on_worker_added("llama-3", Some("cache_aware"));
         registry.on_worker_added("llama-3", None);
-        assert_eq!(registry.get_worker_counts().get("llama-3"), Some(&2));
-
-        // Remove one worker - policy should remain
-        registry.on_worker_removed("llama-3");
+        registry.on_worker_added("llama-3", None);
         assert!(registry.get_policy("llama-3").is_some());
-        assert_eq!(registry.get_worker_counts().get("llama-3"), Some(&1));
 
-        // Remove last worker - policy should be cleaned up
-        registry.on_worker_removed("llama-3");
+        // It goes once no worker serves the model, and the next first
+        // worker's hint builds the next one.
+        registry.on_model_unserved("llama-3");
         assert!(registry.get_policy("llama-3").is_none());
-        assert_eq!(registry.get_worker_counts().get("llama-3"), None);
+        let policy = registry.on_worker_added("llama-3", Some("round_robin"));
+        assert_eq!(policy.name(), "round_robin");
     }
 
     /// A policy shared between slots is visited once: a model with no hint
@@ -2305,8 +2396,8 @@ mod tests {
         let later = registry.on_worker_added("m", Some("least_load"));
 
         let workers = vec![
-            worker("http://a:8000", WorkerType::Regular),
-            worker("http://b:8000", WorkerType::Regular),
+            worker_of("http://a:8000", WorkerType::Regular),
+            worker_of("http://b:8000", WorkerType::Regular),
         ];
         for policy in [registry.get_default_policy(), later] {
             for _ in 0..20 {
@@ -2403,11 +2494,7 @@ mod tests {
         let policy = registry.on_worker_added("llama-3", Some("cache_aware"));
         assert!(!Arc::ptr_eq(&policy, &registry.get_default_policy()));
 
-        let config = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .unwrap()
-            .config_for_test();
+        let config = as_cache_aware(policy.as_ref()).unwrap().config_for_test();
         assert_eq!(config.cache_threshold, 0.9);
         assert_eq!(config.balance_abs_threshold, 64);
         assert_eq!(config.balance_rel_threshold, 2.5);
@@ -2419,11 +2506,7 @@ mod tests {
 
         // Aliases accepted by create_by_name inherit too.
         let alias = registry.on_worker_added("llama-4", Some("CacheAware"));
-        let alias_config = alias
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .unwrap()
-            .config_for_test();
+        let alias_config = as_cache_aware(alias.as_ref()).unwrap().config_for_test();
         assert_eq!(alias_config.max_tree_size, 4096);
     }
 
@@ -2433,13 +2516,12 @@ mod tests {
             kv_pressure_weight: 0.4,
             mean_prefill_tokens: 2048,
             default_throughput: 555.0,
-            max_waiting_requests: 48,
         });
 
         let policy = registry.on_worker_added("llama-3", Some("least_load"));
         assert!(!Arc::ptr_eq(&policy, &registry.get_default_policy()));
         let least_load = policy.as_any().downcast_ref::<LeastLoadPolicy>().unwrap();
-        assert_eq!(least_load.params_for_test(), (0.4, 2048, 555.0, 48));
+        assert_eq!(least_load.params_for_test(), (0.4, 2048, 555.0));
     }
 
     /// An integration setter racing policy publication must never be
@@ -2478,11 +2560,7 @@ mod tests {
                 handle.join().unwrap();
             }
             for entry in registry.model_policies.iter() {
-                let cache_aware = entry
-                    .value()
-                    .as_any()
-                    .downcast_ref::<CacheAwarePolicy>()
-                    .unwrap();
+                let cache_aware = as_cache_aware(entry.value().as_ref()).unwrap();
                 assert!(
                     cache_aware.kv_event_monitor_is_set_for_test(),
                     "policy for {} missed the concurrently-set monitor",
@@ -2527,7 +2605,7 @@ mod tests {
         registry.set_encode_policy(Arc::clone(&encode));
 
         for (role, policy) in [("prefill", prefill), ("decode", decode), ("encode", encode)] {
-            let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
+            let cache_aware = as_cache_aware(policy.as_ref()).unwrap();
             assert!(
                 cache_aware.kv_event_monitor_is_set_for_test(),
                 "{role} policy missed the KV event monitor"
@@ -2537,7 +2615,7 @@ mod tests {
                 "{role} policy missed the load feed"
             );
             assert!(
-                cache_aware.should_populate_hash_index_for_test(),
+                cache_aware.mesh_attached_for_test(),
                 "{role} policy missed the mesh tree bridge"
             );
         }
@@ -2547,11 +2625,7 @@ mod tests {
     fn hinted_policy_without_operator_config_uses_type_defaults() {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let policy = registry.on_worker_added("llama-3", Some("cache_aware"));
-        let config = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .unwrap()
-            .config_for_test();
+        let config = as_cache_aware(policy.as_ref()).unwrap().config_for_test();
         let defaults = CacheAwareConfig::default();
         assert_eq!(config.cache_threshold, defaults.cache_threshold);
         assert_eq!(config.max_tree_size, defaults.max_tree_size);
@@ -2568,12 +2642,12 @@ mod tests {
         registry.set_decode_policy(cache_aware_policy());
 
         let prefill_workers = vec![
-            worker("http://prefill-1:8000", WorkerType::Prefill),
-            worker("http://prefill-2:8000", WorkerType::Prefill),
+            worker_of("http://prefill-1:8000", WorkerType::Prefill),
+            worker_of("http://prefill-2:8000", WorkerType::Prefill),
         ];
         let decode_workers = vec![
-            worker("http://decode-1:8000", WorkerType::Decode),
-            worker("http://decode-2:8000", WorkerType::Decode),
+            worker_of("http://decode-1:8000", WorkerType::Decode),
+            worker_of("http://decode-2:8000", WorkerType::Decode),
         ];
 
         registry.init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
@@ -2599,6 +2673,76 @@ mod tests {
         registry.remove_worker_from_pd_cache_aware("http://decode-1:8000");
     }
 
+    /// The worker URLs a cache-aware policy's string tree routes to for `model`.
+    fn tree_of(policy: &Arc<dyn LoadBalancingPolicy>, model: &str) -> Vec<String> {
+        as_cache_aware(policy.as_ref())
+            .expect("a cache-aware policy")
+            .tree_tenants_for_test(model)
+    }
+
+    /// A registry whose policy for `llama-3` is cache-aware, and two of that
+    /// model's workers, routed by `init_cache_aware_policy`.
+    fn cache_aware_model() -> (
+        PolicyRegistry,
+        Arc<dyn LoadBalancingPolicy>,
+        Vec<Arc<dyn Worker>>,
+    ) {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let policy = registry.on_worker_added("llama-3", Some("cache_aware"));
+        let workers = vec![
+            ready_worker("http://w1:8000", "llama-3"),
+            ready_worker("http://w2:8000", "llama-3"),
+        ];
+        assert!(
+            tree_of(&policy, "llama-3").is_empty(),
+            "a fresh tree is empty"
+        );
+        registry.init_cache_aware_policy("llama-3", &workers);
+        (registry, policy, workers)
+    }
+
+    #[test]
+    fn init_cache_aware_policy_fills_the_models_tree() {
+        let (_registry, policy, _workers) = cache_aware_model();
+        assert_eq!(
+            tree_of(&policy, "llama-3"),
+            ["http://w1:8000", "http://w2:8000"]
+        );
+    }
+
+    #[test]
+    fn remove_worker_from_cache_aware_drops_the_worker_from_the_tree() {
+        let (registry, policy, _workers) = cache_aware_model();
+        registry.remove_worker_from_cache_aware("llama-3", "http://w1:8000");
+        assert_eq!(tree_of(&policy, "llama-3"), ["http://w2:8000"]);
+    }
+
+    #[test]
+    fn remove_workers_from_cache_aware_empties_the_models_tree() {
+        let (registry, policy, workers) = cache_aware_model();
+        let urls: HashSet<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        registry.remove_workers_from_cache_aware("llama-3", &urls);
+        assert!(tree_of(&policy, "llama-3").is_empty());
+    }
+
+    #[test]
+    fn init_pd_cache_aware_policies_fills_both_role_trees() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_prefill_policy(cache_aware_policy());
+        registry.set_decode_policy(cache_aware_policy());
+        let prefill = vec![worker_of("http://prefill-1:8000", WorkerType::Prefill)];
+        let decode = vec![worker_of("http://decode-1:8000", WorkerType::Decode)];
+        registry.init_pd_cache_aware_policies(&prefill, &decode);
+        assert_eq!(
+            tree_of(&registry.get_prefill_policy(), prefill[0].model_id()),
+            ["http://prefill-1:8000"]
+        );
+        assert_eq!(
+            tree_of(&registry.get_decode_policy(), decode[0].model_id()),
+            ["http://decode-1:8000"]
+        );
+    }
+
     /// A policy that remembers completions and reconciliation ticks.
     #[derive(Debug, Default)]
     struct CompletionRecorder {
@@ -2615,7 +2759,7 @@ mod tests {
             (!workers.is_empty()).then_some(0)
         }
 
-        fn on_request_complete(&self, worker_url: &str, _success: bool) {
+        fn on_request_complete(&self, worker_url: &str) {
             self.completed.lock().unwrap().push(worker_url.to_string());
         }
 
@@ -2665,10 +2809,10 @@ mod tests {
             worker.set_completion_sink(Some(Arc::clone(&sink)));
         }
 
-        drop(WorkerLoadGuard::new(Arc::clone(&prefill), None));
-        drop(WorkerLoadGuard::new(Arc::clone(&decode), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&prefill), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&decode), None));
         // The regular worker's model policy (random) accepts the completion silently.
-        drop(WorkerLoadGuard::new(Arc::clone(&regular), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&regular), None));
 
         assert_eq!(
             prefill_policy.completed.lock().unwrap().as_slice(),
@@ -2681,7 +2825,7 @@ mod tests {
 
         // A worker that outlives its registry reports to nobody.
         drop(registry);
-        drop(WorkerLoadGuard::new(Arc::clone(&prefill), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&prefill), None));
         assert_eq!(prefill_policy.completed.lock().unwrap().len(), 1);
     }
 
@@ -2701,8 +2845,8 @@ mod tests {
         // The count handed over is the router's live one: two guards held,
         // then none.
         let held = [
-            WorkerLoadGuard::new(Arc::clone(&decode), None),
-            WorkerLoadGuard::new(Arc::clone(&decode), None),
+            WorkerLoadGuard::with_key(Arc::clone(&decode), None),
+            WorkerLoadGuard::with_key(Arc::clone(&decode), None),
         ];
         registry.reconcile_in_flight(decode.as_ref());
         drop(held);
@@ -2772,6 +2916,46 @@ mod tests {
         );
     }
 
+    /// The PD bucket init reaches a bucket prefill policy by its type: the
+    /// partition exists after it, so the largest size is placed in the last
+    /// range and not by the no-partition fallback.
+    #[traced_test]
+    #[test]
+    fn init_pd_bucket_policies_reaches_the_bucket_policy() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_prefill_policy(Arc::new(BucketPolicy::with_config(BucketConfig {
+            balance_abs_threshold: usize::MAX,
+            bucket_adjust_interval_secs: 3600,
+            ..Default::default()
+        })));
+        let prefill = vec![
+            worker_of("http://prefill-1:8000", WorkerType::Prefill),
+            worker_of("http://prefill-2:8000", WorkerType::Prefill),
+            worker_of("http://prefill-3:8000", WorkerType::Prefill),
+        ];
+
+        registry.init_pd_bucket_policies(&prefill);
+
+        assert!(logs_contain(
+            "Initializing prefill bucket policy with 3 workers"
+        ));
+        let text = "a".repeat(10_000);
+        let info = SelectWorkerInfo {
+            request_text: Some(&text),
+            ..Default::default()
+        };
+        let selected = registry
+            .get_prefill_policy()
+            .select_worker(&prefill, &info)
+            .unwrap_or_else(|| panic!("a request of 10000 chars selects no prefill worker"));
+        assert_eq!(
+            prefill[selected].url(),
+            "http://prefill-3:8000",
+            "the largest size falls in the last range of the even split"
+        );
+        assert!(!logs_contain("No bucket found for model"));
+    }
+
     /// A prefill worker's removal reaches the bucket policy, which keeps the
     /// prefill workers' size partition without consuming load reports: every
     /// request size still selects one of the workers left.
@@ -2784,9 +2968,9 @@ mod tests {
             ..Default::default()
         })));
         let prefill = vec![
-            worker("http://prefill-1:8000", WorkerType::Prefill),
-            worker("http://prefill-2:8000", WorkerType::Prefill),
-            worker("http://prefill-3:8000", WorkerType::Prefill),
+            worker_of("http://prefill-1:8000", WorkerType::Prefill),
+            worker_of("http://prefill-2:8000", WorkerType::Prefill),
+            worker_of("http://prefill-3:8000", WorkerType::Prefill),
         ];
         registry.init_pd_bucket_policies(&prefill);
 
@@ -2809,5 +2993,50 @@ mod tests {
                 "size {size}"
             );
         }
+    }
+
+    /// The keyed decisions of a replay under the delegating override: eight
+    /// regular workers behind a round-robin registry, sixteen session keys
+    /// picked over three rounds, two workers vetoed for the second round and
+    /// back for the third (a pin whose worker is vetoed respills and
+    /// follows the respill). The sequence was recorded from the override
+    /// that built its eligible list before reading the pin and copied the
+    /// key per lookup; the override that reads the pin borrowed and lists
+    /// only to assign must pick the same.
+    #[test]
+    fn the_replayed_keyed_requests_pick_the_recorded_sequence() {
+        const RECORDED: [usize; 48] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 1, 3, 4, 3, 6, 7, 0, 1, 4, 3, 4,
+            6, 6, 7, 0, 1, 1, 3, 4, 3, 6, 7, 0, 1, 4, 3, 4, 6, 6, 7,
+        ];
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| worker_of(&format!("http://w{i}"), WorkerType::Regular))
+            .collect();
+        let keys: Vec<String> = (0..16).map(|i| format!("conv{i}_t{}", i % 3)).collect();
+        let mut picks = Vec::with_capacity(RECORDED.len());
+        for round in 0..3 {
+            for vetoed in [2, 5] {
+                workers[vetoed].set_overloaded(round == 1);
+            }
+            for key in &keys {
+                let info = SelectWorkerInfo {
+                    rid_key: Some(key),
+                    ..Default::default()
+                };
+                picks.push(
+                    reg.select_worker(&policy, &workers, &info)
+                        .expect("six workers stay eligible"),
+                );
+            }
+        }
+        assert_eq!(
+            picks, RECORDED,
+            "the replay picked {picks:?}; the recorded sequence is the decision"
+        );
     }
 }

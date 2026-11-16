@@ -5,9 +5,11 @@
 //!
 //! # Processing Pipeline
 //!
-//! 1. **HD Transform**: Resize and pad image to multiples of 336
-//! 2. **Normalize**: Apply CLIP normalization
-//! 3. **Create Global Image**: Bicubic interpolate to 336x336
+//! 1. **HD Transform**: Resize (Pillow's bilinear, what torchvision's
+//!    `resize` runs on a PIL image) and pad image to multiples of 336
+//! 2. **Normalize**: `ToTensor` then CLIP `Normalize`, in torchvision's steps
+//! 3. **Create Global Image**: torch's bicubic interpolation (no
+//!    antialiasing) to 336x336
 //! 4. **Tile**: Reshape into (num_tiles, 3, 336, 336)
 //! 5. **Concatenate**: [global_image, tiles...]
 //! 6. **Pad**: Zero-pad to (num_crops+1, 3, 336, 336)
@@ -19,12 +21,15 @@
 //! - CLIP normalization: mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]
 //! - Token count formula: `((h//336)*(w//336)+1)*144 + 1 + (h//336+1)*12`
 
-use image::{imageops::FilterType, DynamicImage, GenericImageView, Rgb, RgbImage};
-use ndarray::{s, Array3, Array4, IxDyn};
+use std::borrow::Cow;
+
+use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
+use ndarray::{Array3, IxDyn};
 
 use crate::vision::{
     preprocessor_config::PreProcessorConfig,
     processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
+    scratch,
     transforms::{self, TransformError},
 };
 
@@ -115,6 +120,79 @@ impl Phi3VisionProcessor {
         self.num_crops
     }
 
+    /// The HD transform's target size for an image of `width` x `height`
+    /// in landscape orientation (the transform turns a portrait image on its
+    /// side first): the scale is the largest whose tiles fit the crop budget,
+    /// the width `scale * 336`, the height that width over the aspect ratio.
+    /// Both sides must have a pixel: the scale loop does not end on a zero
+    /// side (`hd_target_or_refuse` refuses one before calling this).
+    fn hd_target(&self, width: u32, height: u32) -> (u32, u32) {
+        let ratio = width as f64 / height as f64;
+        let mut scale = 1.0f64;
+        while scale * (scale / ratio).ceil() <= self.num_crops as f64 {
+            scale += 1.0;
+        }
+        scale -= 1.0;
+        let new_w = (scale * TILE_SIZE as f64) as u32;
+        let new_h = (new_w as f64 / ratio) as u32;
+        (new_w, new_h)
+    }
+
+    /// The HD transform's target for an image as given (either orientation),
+    /// refused when it has no pixel on its shorter side (a landscape image's
+    /// height, a portrait image's width): an image whose longer side is more
+    /// than `num_crops * 336` times its shorter side scales to a target with
+    /// a zero side, on which the reference's resize raises rather than
+    /// producing a pad-only tile. An image with no pixel on a side to begin
+    /// with is refused before the target is computed: the scale loop divides
+    /// by the shorter side and would not end on it.
+    fn hd_target_or_refuse(&self, width: u32, height: u32) -> Result<(u32, u32), TransformError> {
+        if width == 0 || height == 0 {
+            return Err(TransformError::ShapeError(format!(
+                "a {width}x{height} image has a side with no pixel; the HD transform needs a \
+                 pixel on each side"
+            )));
+        }
+        let (long, short) = if width < height {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        let target = self.hd_target(long, short);
+        if target.0 == 0 || target.1 == 0 {
+            // The target in the image's own orientation: a portrait image
+            // loses its width, not its height.
+            let (target_w, target_h) = if width < height {
+                (target.1, target.0)
+            } else {
+                target
+            };
+            return Err(TransformError::ShapeError(format!(
+                "a {width}x{height} image has no pixel on its shorter side after the HD transform \
+                 (target {target_w}x{target_h}): an image whose longer side is more than {} times \
+                 its shorter side is refused, as the reference's resize refuses it",
+                self.num_crops as u32 * TILE_SIZE
+            )));
+        }
+        Ok(target)
+    }
+
+    /// The HD transform's output size for an image as given, in the image's
+    /// own orientation, from the target alone: the target's height padded up
+    /// to whole tiles (`padding_336`; the width is whole tiles already), the
+    /// sides swapped back for a portrait image, which the transform turns on
+    /// its side and back. The token count needs only this size, not the
+    /// transformed image.
+    fn hd_output_size(&self, width: u32, height: u32) -> Result<(u32, u32), TransformError> {
+        let (target_w, target_h) = self.hd_target_or_refuse(width, height)?;
+        let padded_h = target_h.div_ceil(TILE_SIZE) * TILE_SIZE;
+        Ok(if width < height {
+            (padded_h, target_w)
+        } else {
+            (target_w, padded_h)
+        })
+    }
+
     /// HD transform: resize and pad image to multiples of 336.
     ///
     /// Algorithm:
@@ -126,42 +204,39 @@ impl Phi3VisionProcessor {
     pub fn hd_transform(&self, image: &DynamicImage) -> DynamicImage {
         let (width, height) = image.dimensions();
 
-        let (img, transposed) = if width < height {
-            // Transpose (PIL's Image.TRANSPOSE): equivalent to fliph + rotate270 (ccw 90°)
-            // This swaps x and y coordinates: pixel at (x, y) goes to (y, x)
-            (image.fliph().rotate270(), true)
+        let transposed = width < height;
+        let img = if transposed {
+            // Transpose (PIL's Image.TRANSPOSE): the pixel at (x, y) goes to
+            // (y, x). An RGB8 image in one pass, any other through the flip and
+            // the quarter turn that make the same image.
+            Cow::Owned(match image {
+                DynamicImage::ImageRgb8(rgb) => {
+                    DynamicImage::ImageRgb8(transforms::transpose_rgb(rgb))
+                }
+                other => other.fliph().rotate270(),
+            })
         } else {
-            (image.clone(), false)
+            Cow::Borrowed(image)
         };
 
         let (width, height) = img.dimensions();
-        let ratio = width as f64 / height as f64;
+        let (new_w, new_h) = self.hd_target(width, height);
 
-        // Calculate scale factor
-        let mut scale = 1.0f64;
-        while scale * (scale / ratio).ceil() <= self.num_crops as f64 {
-            scale += 1.0;
-        }
-        scale -= 1.0;
-
-        let new_w = (scale * TILE_SIZE as f64) as u32;
-        let new_h = (new_w as f64 / ratio) as u32;
-
-        // Resize using bilinear filter (matching torchvision's bilinear+antialias)
-        // HuggingFace uses torchvision.transforms.functional.resize with
-        // BILINEAR interpolation and antialias=True. PIL's BILINEAR includes
-        // implicit antialiasing that closely matches torchvision.
-        let resized = transforms::resize(&img, new_w, new_h, FilterType::Triangle);
+        // The reference resizes the PIL image through torchvision's `resize`
+        // at its default interpolation, which is `PIL.Image.resize(BILINEAR)`:
+        // Pillow's triangle filter widened by the downscale factor, in its
+        // fixed point, two passes.
+        let resized = transforms::resize_bilinear_pil(&img, new_w, new_h);
 
         // Pad height to multiple of 336
-        let padded = self.padding_336(&resized);
+        let padded = self.padding_336(resized.into_rgb8());
 
         // Transpose back if needed (transpose is self-inverse)
-        if transposed {
-            padded.fliph().rotate270()
+        DynamicImage::ImageRgb8(if transposed {
+            transforms::transpose_rgb(&padded)
         } else {
             padded
-        }
+        })
     }
 
     /// Pad image height to multiple of 336 (centered, white padding).
@@ -169,66 +244,39 @@ impl Phi3VisionProcessor {
         clippy::unused_self,
         reason = "method logically belongs to the processor; keeps API consistent"
     )]
-    fn padding_336(&self, image: &DynamicImage) -> DynamicImage {
+    fn padding_336(&self, image: RgbImage) -> RgbImage {
         let (width, height) = image.dimensions();
         let target_h = ((height as f64 / TILE_SIZE as f64).ceil() * TILE_SIZE as f64) as u32;
 
         if height == target_h {
-            return image.clone();
+            return image;
         }
 
         let top_padding = (target_h - height) / 2;
 
         // Create white-padded image
-        let mut new_image =
-            DynamicImage::from(RgbImage::from_pixel(width, target_h, Rgb([255, 255, 255])));
+        let mut padded = RgbImage::from_pixel(width, target_h, Rgb([255, 255, 255]));
 
-        // Copy original image to center
-        image::imageops::overlay(&mut new_image, image, 0, top_padding as i64);
-
-        new_image
+        // Copy original image to center: the two have one width, so its
+        // rows are one block of the canvas.
+        let top = top_padding as usize * width as usize * 3;
+        let canvas: &mut [u8] = &mut padded;
+        canvas[top..top + image.as_raw().len()].copy_from_slice(image.as_raw());
+        padded
     }
 
     /// Create global image by bicubic interpolation to 336x336.
     ///
-    /// Uses the shared `bicubic_resize` which matches PyTorch's
-    /// `torch.nn.functional.interpolate(mode='bicubic', align_corners=False)`.
+    /// The reference interpolates the normalized tensor with
+    /// `torch.nn.functional.interpolate(mode='bicubic')`: no antialiasing,
+    /// `align_corners=False`, the `a = -0.75` cubic; `resize_bicubic_torch_f32`
+    /// is that kernel bit for bit.
     #[expect(
         clippy::unused_self,
         reason = "method logically belongs to the processor; keeps API consistent"
     )]
     fn create_global_image(&self, tensor: &Array3<f32>) -> Array3<f32> {
-        transforms::bicubic_resize(tensor, TILE_SIZE as usize, TILE_SIZE as usize)
-    }
-
-    /// Reshape HD image into tiles.
-    ///
-    /// Transforms [3, H, W] -> [num_tiles, 3, 336, 336]
-    /// where H and W are multiples of 336.
-    #[expect(
-        clippy::unused_self,
-        reason = "method logically belongs to the processor; keeps API consistent"
-    )]
-    fn reshape_to_tiles(&self, tensor: &Array3<f32>) -> Vec<Array3<f32>> {
-        let (_c, h, w) = (tensor.shape()[0], tensor.shape()[1], tensor.shape()[2]);
-        let grid_h = h / TILE_SIZE as usize;
-        let grid_w = w / TILE_SIZE as usize;
-
-        let mut tiles = Vec::with_capacity(grid_h * grid_w);
-
-        for gh in 0..grid_h {
-            for gw in 0..grid_w {
-                let y_start = gh * TILE_SIZE as usize;
-                let x_start = gw * TILE_SIZE as usize;
-                let y_end = y_start + TILE_SIZE as usize;
-                let x_end = x_start + TILE_SIZE as usize;
-
-                let tile_view = tensor.slice(s![.., y_start..y_end, x_start..x_end]);
-                tiles.push(tile_view.to_owned());
-            }
-        }
-
-        tiles
+        transforms::resize_bicubic_torch_f32(tensor, TILE_SIZE as usize, TILE_SIZE as usize)
     }
 
     /// Calculate number of image tokens for given HD size.
@@ -246,47 +294,60 @@ impl Phi3VisionProcessor {
         (grid_h * grid_w + 1) * 144 + 1 + (grid_h + 1) * 12
     }
 
-    /// Process a single image through the full pipeline.
-    fn process_single_image(&self, image: &DynamicImage) -> (Array4<f32>, (usize, usize), usize) {
+    /// Process a single image through the full pipeline and append its
+    /// `[num_crops + 1, 3, 336, 336]` values to `values`: the global image,
+    /// the HD image's tiles in row-major order, zeros for the crops the image
+    /// does not fill.
+    fn process_single_image(
+        &self,
+        image: &DynamicImage,
+        values: &mut Vec<f32>,
+    ) -> ((usize, usize), usize) {
         // 1. Convert to RGB
-        let image = DynamicImage::ImageRgb8(image.to_rgb8());
+        let image = match image {
+            DynamicImage::ImageRgb8(_) => Cow::Borrowed(image),
+            other => Cow::Owned(DynamicImage::ImageRgb8(other.to_rgb8())),
+        };
 
         // 2. HD transform
         let hd_image = self.hd_transform(&image);
         let (hd_w, hd_h) = hd_image.dimensions();
 
-        // 3. To tensor [0, 1] and normalize
-        let mut tensor = transforms::to_tensor(&hd_image);
-        transforms::normalize(&mut tensor, &self.mean, &self.std);
+        // 3. To tensor [0, 1] and normalize, in torchvision's steps (the
+        //    reference composes `ToTensor` and `Normalize`: three roundings)
+        let tensor = transforms::to_tensor_then_normalize(&hd_image, &self.mean, &self.std);
 
-        // 4. Create global image (336x336)
-        let global_image = self.create_global_image(&tensor);
+        // 4. The global image (336x336) comes first
+        let tile = TILE_SIZE as usize;
+        let end = values.len() + (self.num_crops + 1) * 3 * tile * tile;
+        let (global, _) = self.create_global_image(&tensor).into_raw_vec_and_offset();
+        values.extend_from_slice(&global);
 
-        // 5. Reshape HD image into tiles
-        let tiles = self.reshape_to_tiles(&tensor);
-
-        // 6. Concatenate global + tiles
-        let max_crops = self.num_crops + 1; // num_crops + 1 for global
-
-        // Create output tensor [max_crops, 3, 336, 336]
-        let mut output =
-            Array4::<f32>::zeros((max_crops, 3, TILE_SIZE as usize, TILE_SIZE as usize));
-
-        // Copy global image (first position)
-        output.slice_mut(s![0, .., .., ..]).assign(&global_image);
-
-        // Copy tiles (positions 1..num_actual_crops)
-        for (i, tile) in tiles.iter().enumerate() {
-            if i + 1 < max_crops {
-                output.slice_mut(s![i + 1, .., .., ..]).assign(tile);
+        // 5. The HD image's tiles, row-major, as far as the crops go
+        let (h, w) = (hd_h as usize, hd_w as usize);
+        let (planes, _) = tensor.into_raw_vec_and_offset();
+        'tiles: for grid_y in 0..h / tile {
+            for grid_x in 0..w / tile {
+                if values.len() + 3 * tile * tile > end {
+                    break 'tiles;
+                }
+                for plane in planes.chunks_exact(h * w) {
+                    for row in plane.chunks_exact(w).skip(grid_y * tile).take(tile) {
+                        values.extend_from_slice(&row[grid_x * tile..(grid_x + 1) * tile]);
+                    }
+                }
             }
         }
+        scratch::give_f32(planes);
+
+        // 6. Zeros for the crops the image does not fill
+        values.resize(end, 0.0);
 
         // Calculate token count
-        let num_tokens = self.calculate_num_tokens(hd_h as usize, hd_w as usize);
+        let num_tokens = self.calculate_num_tokens(h, w);
 
         // The returned size is the HD-transformed image size.
-        (output, (hd_h as usize, hd_w as usize), num_tokens)
+        ((h, w), num_tokens)
     }
 }
 
@@ -301,41 +362,33 @@ impl VisionPreProcessor for Phi3VisionProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
 
-        let mut all_pixel_values = Vec::with_capacity(images.len());
+        for image in images {
+            let (width, height) = image.dimensions();
+            self.hd_target_or_refuse(width, height)?;
+        }
+
+        // The batch [B, num_crops+1, 3, 336, 336], written once per image.
+        // Pooled: it is the encoder input's storage, which returns to the
+        // pool when the input is written out.
+        let max_crops = self.num_crops + 1;
+        let batch_size = images.len();
+        let tile = TILE_SIZE as usize;
+        let shape = vec![batch_size, max_crops, 3, tile, tile];
+        let mut flat_data = scratch::take_f32_cap(shape.iter().product());
         let mut all_image_sizes = Vec::with_capacity(images.len());
         let mut all_num_tokens = Vec::with_capacity(images.len());
 
         for image in images {
-            let (encoder_input, image_size, num_tokens) = self.process_single_image(image);
-            all_pixel_values.push(encoder_input);
+            let (image_size, num_tokens) = self.process_single_image(image, &mut flat_data);
             all_image_sizes.push((image_size.1 as u32, image_size.0 as u32)); // (width, height)
             all_num_tokens.push(num_tokens);
         }
-
-        // Stack into batch [B, num_crops+1, 3, 336, 336]
-        let max_crops = self.num_crops + 1;
-        let batch_size = images.len();
-        let mut batch_tensor = ndarray::Array5::<f32>::zeros((
-            batch_size,
-            max_crops,
-            3,
-            TILE_SIZE as usize,
-            TILE_SIZE as usize,
-        ));
-
-        for (i, pv) in all_pixel_values.iter().enumerate() {
-            batch_tensor.slice_mut(s![i, .., .., .., ..]).assign(pv);
-        }
-
-        // Convert to dynamic array for storage
-        let shape = batch_tensor.shape().to_vec();
-        let (flat_data, _offset) = batch_tensor.into_raw_vec_and_offset();
 
         // Store model-specific image_sizes data.
         let mut model_specific = std::collections::HashMap::new();
@@ -376,12 +429,7 @@ impl VisionPreProcessor for Phi3VisionProcessor {
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
-        // First apply HD transform to get the actual size
-        let image = DynamicImage::new_rgb8(width, height);
-        let hd_image = self.hd_transform(&image);
-        let (_, hd_h) = hd_image.dimensions();
-        let hd_w = hd_image.width();
-
+        let (hd_w, hd_h) = self.hd_output_size(width, height)?;
         Ok(self.calculate_num_tokens(hd_h as usize, hd_w as usize))
     }
 
@@ -473,7 +521,7 @@ mod tests {
         let processor = Phi3VisionProcessor::new();
 
         let image = create_test_image(504, 504, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
 
@@ -495,16 +543,55 @@ mod tests {
     fn test_phi3_vision_preprocess_multiple() {
         let processor = Phi3VisionProcessor::new();
 
-        let images = vec![
+        let images = [
             create_test_image(504, 504, Rgb([100, 100, 100])),
             create_test_image(400, 600, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images).unwrap();
+        let result = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
 
         assert_eq!(result.batch_size(), 2);
         assert_eq!(result.item_sizes.len(), 2);
         assert_eq!(result.feature_token_counts.len(), 2);
+    }
+
+    /// A batch is its images' own outputs in turn, and the crops an image
+    /// does not fill are zeros: an image's slot starts where the slot before
+    /// it ends, whatever that image filled.
+    #[test]
+    fn a_batch_is_its_images_in_turn_and_unfilled_crops_are_zero() {
+        use crate::test_support::lcg_rgb_image;
+
+        let processor = Phi3VisionProcessor::new();
+        let images = [
+            lcg_rgb_image(300, 200, 1),
+            lcg_rgb_image(90, 700, 2),
+            lcg_rgb_image(700, 400, 3),
+        ];
+        let crop = 3 * (TILE_SIZE * TILE_SIZE) as usize;
+        let mut joined = Vec::new();
+        let mut filled_crops = Vec::new();
+        for image in &images {
+            let single = processor.preprocess(&[image]).unwrap();
+            let (width, height) = single.item_sizes[0];
+            let filled = 1 + ((width / TILE_SIZE) * (height / TILE_SIZE)) as usize;
+            let values = single.encoder_input.as_f32();
+            let values = values.as_slice().unwrap();
+            assert!(values[filled * crop..]
+                .iter()
+                .all(|value| value.to_bits() == 0));
+            joined.extend_from_slice(values);
+            filled_crops.push(filled);
+        }
+        // Two of the three leave crops unfilled; the tall one fills them all.
+        assert_eq!(filled_crops, [13, 17, 16]);
+
+        let batch = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(batch.encoder_input.as_f32().as_slice().unwrap(), joined);
     }
 
     #[test]
@@ -546,6 +633,191 @@ mod tests {
         assert_eq!(transposed.get_pixel(0, 99).0[0..3], [0, 255, 0]); // (99,0) -> (0,99)
         assert_eq!(transposed.get_pixel(199, 0).0[0..3], [0, 0, 255]); // (0,199) -> (199,0)
         assert_eq!(transposed.get_pixel(199, 99).0[0..3], [255, 255, 0]); // (99,199) -> (199,99)
+    }
+
+    /// The pixel values of the checkpoint's own image processor (num_crops 4),
+    /// bit for bit in `f32` and on the bfloat16 wire, on four generator
+    /// images: a landscape and a portrait (the transposed path) that pad to
+    /// 672x672, a 7x5 image, and a 1000x60 one whose HD size is 1344x336 (the
+    /// width axis at four times the tile). The digests are SHA-256 of the
+    /// processor's `pixel_values` bytes.
+    #[test]
+    fn pixel_values_match_the_checkpoint_processor() {
+        use sha2::{Digest, Sha256};
+
+        use crate::{
+            encoder_inputs::EncoderDtype,
+            test_support::{hex, lcg_rgb_image},
+        };
+
+        let processor = Phi3VisionProcessor::with_config(4);
+        for (width, height, seed, size, tokens, f32_digest, bf16_digest) in [
+            (
+                100,
+                70,
+                5,
+                (672, 672),
+                757,
+                "4ba40c76a86e532377e6f0d06588ec56b28368f787bd553cd76be9d3f978dba6",
+                "1445925777c30b43f0684447a69ba5ce1843dd10a8e243d0d28a05da5a1f04b4",
+            ),
+            (
+                50,
+                90,
+                6,
+                (672, 672),
+                757,
+                "cc18aa698c7ef428146a204a673ea2718deb2f868fd806ebff1cd06038f70839",
+                "d18defa6d67345620762d932ea558315425ba0b260fdc3ac3b9e925c16c5f507",
+            ),
+            (
+                7,
+                5,
+                7,
+                (672, 672),
+                757,
+                "70d7d5c83cb601d5e6bc462e4fba7985600a7bb0d816ff8c5b60043eead595a1",
+                "a2b93fca8a9e60bd909adac8ba72b8a93428b0e7184bab8feabd6bfff6d3e85a",
+            ),
+            (
+                1000,
+                60,
+                8,
+                (336, 1344),
+                745,
+                "6323dbef746a9113b0d47154eca9c81e7f958dd31f50f9bf2440ce153eac5899",
+                "8b206fbd9154dd3708c94f77db1857110d1a9cf92e1491ec722ac97c0182bb53",
+            ),
+        ] {
+            let image = lcg_rgb_image(width, height, seed);
+            let result = processor.preprocess(&[&image]).unwrap();
+            assert_eq!(
+                result.encoder_input.shape(),
+                &[1, 5, 3, 336, 336],
+                "{width}x{height}"
+            );
+            assert_eq!(
+                result.item_sizes,
+                vec![(size.1, size.0)],
+                "{width}x{height}"
+            );
+            assert_eq!(
+                result.feature_token_counts,
+                vec![tokens],
+                "{width}x{height}"
+            );
+            let digest = |dtype| hex(&Sha256::digest(result.encoder_input.write_as(dtype)));
+            assert_eq!(
+                digest(EncoderDtype::Float32),
+                f32_digest,
+                "{width}x{height} f32"
+            );
+            assert_eq!(
+                digest(EncoderDtype::BFloat16),
+                bf16_digest,
+                "{width}x{height} bf16"
+            );
+        }
+    }
+
+    /// An image with no pixel on a side never reaches the HD transform's scale
+    /// loop, which divides by the shorter side and would not end: the batch
+    /// and the token count refuse it first, in either orientation and at 0x0.
+    #[test]
+    fn an_image_with_a_zero_side_is_refused_before_the_hd_transform() {
+        let processor = Phi3VisionProcessor::with_config(4);
+        for (width, height) in [(0, 7), (7, 0), (0, 0)] {
+            let image = DynamicImage::new_rgb8(width, height);
+            let error = processor
+                .preprocess(&[&image])
+                .expect_err("a side with no pixel");
+            assert!(
+                matches!(&error, TransformError::ShapeError(message)
+                    if message.contains(&format!("{width}x{height}"))
+                        && message.contains("a side with no pixel")),
+                "{width}x{height}: {error}"
+            );
+            let error = VisionPreProcessor::calculate_num_tokens(&processor, width, height)
+                .expect_err("a side with no pixel");
+            assert!(
+                matches!(&error, TransformError::ShapeError(message)
+                    if message.contains("a side with no pixel")),
+                "{width}x{height}: {error}"
+            );
+        }
+    }
+
+    /// The token count from the declared size alone agrees with the count the
+    /// transformed image gives, at both crop budgets, in both orientations,
+    /// whether or not the target's height needs padding to a whole tile.
+    #[test]
+    fn the_token_count_from_the_declared_size_matches_the_transformed_image() {
+        for num_crops in [4, 16] {
+            let processor = Phi3VisionProcessor::with_config(num_crops);
+            for (width, height) in [
+                (336, 336),
+                (1344, 1344),
+                (1008, 1344),
+                (1344, 1008),
+                (640, 480),
+                (480, 640),
+                (1920, 1080),
+                (1080, 1920),
+                (50, 30),
+                (30, 50),
+                (1344, 1),
+                (1, 1344),
+                (4000, 300),
+                (300, 4000),
+            ] {
+                let image = DynamicImage::new_rgb8(width, height);
+                let batch = processor.preprocess(&[&image]).expect("served");
+                assert_eq!(
+                    VisionPreProcessor::calculate_num_tokens(&processor, width, height)
+                        .expect("served"),
+                    batch.feature_token_counts[0],
+                    "{num_crops} crops, {width}x{height}"
+                );
+            }
+        }
+    }
+
+    /// An image whose longer side is more than `num_crops * 336` times its
+    /// shorter side scales to a target with no pixel on its shorter side
+    /// (6000x1 -> 1344x0 at four crops, 1x6000 -> 0x1344), on which the
+    /// reference's resize raises: the batch and the token count refuse it
+    /// with the sizes named in the image's own orientation, while the 1344x1
+    /// edge that keeps a pixel is served.
+    #[test]
+    fn an_image_with_no_pixel_of_height_after_the_hd_transform_is_refused() {
+        let processor = Phi3VisionProcessor::with_config(4);
+        for (width, height, target) in [
+            (6000, 1, "1344x0"),
+            (1, 6000, "0x1344"),
+            (2689, 2, "1344x0"),
+        ] {
+            let image = DynamicImage::new_rgb8(width, height);
+            let error = processor
+                .preprocess(&[&image])
+                .expect_err("no pixel on the shorter side");
+            assert!(
+                matches!(&error, TransformError::ShapeError(message)
+                    if message.contains(target) && message.contains("shorter side")),
+                "{width}x{height}: {error}"
+            );
+            assert!(
+                VisionPreProcessor::calculate_num_tokens(&processor, width, height).is_err(),
+                "{width}x{height}"
+            );
+        }
+        for (width, height) in [(1344, 1), (1, 1344)] {
+            let image = DynamicImage::new_rgb8(width, height);
+            assert!(processor.preprocess(&[&image]).is_ok(), "{width}x{height}");
+            assert!(
+                VisionPreProcessor::calculate_num_tokens(&processor, width, height).is_ok(),
+                "{width}x{height}"
+            );
+        }
     }
 
     #[test]

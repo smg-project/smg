@@ -1,7 +1,8 @@
 """TokenSpeed gRPC servicer — wraps :class:`AsyncLLM` behind the gRPC wire.
 
-``--servicer-impl rust`` on the launcher (``python -m smg_grpc_servicer.tokenspeed``)
-or ``SMG_TOKENSPEED_SERVICER_IMPL=rust`` serves the same contract from Rust; see
+The launcher (``python -m smg_grpc_servicer.tokenspeed``) serves the same contract
+from Rust by default; ``--servicer-impl python`` or
+``SMG_TOKENSPEED_SERVICER_IMPL=python`` selects this deprecated Python servicer; see
 :mod:`smg_grpc_servicer.tokenspeed.rust`.
 """
 
@@ -16,8 +17,9 @@ __all__ = [
 
 # The flag that selects the Rust request path; see `smg_grpc_servicer.tokenspeed.rust`.
 SERVICER_IMPL_ENV = "SMG_TOKENSPEED_SERVICER_IMPL"
-# The Rust servicer's Prometheus endpoint: the fallbacks of --metrics-port and
-# --metrics-host (see `smg_grpc_servicer.rust_lifecycle.metrics_bind_address`).
+# The Rust servicer's Prometheus endpoint, separate from the engine's metrics.
+METRICS_PORT_FLAG = "--servicer-metrics-port"
+METRICS_HOST_FLAG = "--servicer-metrics-host"
 METRICS_PORT_ENV = "SMG_TOKENSPEED_SERVICER_METRICS_PORT"
 METRICS_HOST_ENV = "SMG_TOKENSPEED_SERVICER_METRICS_HOST"
 

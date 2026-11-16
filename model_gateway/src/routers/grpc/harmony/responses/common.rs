@@ -1,6 +1,6 @@
 //! Shared helpers and state tracking for Harmony Responses
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use openai_protocol::{
     common::ToolCall,
@@ -11,14 +11,16 @@ use openai_protocol::{
     },
 };
 use serde_json::to_string;
-use smg_mcp::McpToolSession;
+use smg_mcp::{McpServerBinding, McpToolSession};
 use tracing::debug;
 use uuid::Uuid;
 
-use super::execution::ToolResult;
+use super::execution::{convert_mcp_tools_to_response_tools, ToolResult};
 use crate::routers::{
     common::openai_bridge::{self, FormatRegistry, ResponseFormat},
-    grpc::common::responses::utils::resolve_function_identity,
+    grpc::common::responses::{
+        streaming::OutputItemKind, utils::resolve_function_identity, ResponsesContext,
+    },
 };
 
 /// Record of a single MCP tool call execution
@@ -57,6 +59,54 @@ impl McpCallTracking {
     }
 }
 
+/// The request's MCP session, opened once for the loop; the session's MCP
+/// tools join the request's tool list, so the model sees them beside the
+/// user's own.
+pub(super) fn open_mcp_session<'a>(
+    ctx: &'a ResponsesContext,
+    mcp_servers: Vec<McpServerBinding>,
+    request: &mut ResponsesRequest,
+) -> McpToolSession<'a> {
+    let session_request_id = format!("resp_{}", Uuid::now_v7());
+    let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &session_request_id);
+    let mcp_tools = session.mcp_tools();
+    if !mcp_tools.is_empty() {
+        let mcp_response_tools = convert_mcp_tools_to_response_tools(&session);
+        let mut all_tools = request.tools.take().unwrap_or_default();
+        all_tools.extend(mcp_response_tools);
+        request.tools = Some(all_tools);
+        debug!(
+            mcp_tool_count = mcp_tools.len(),
+            total_tool_count = request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            "MCP client available - added static MCP tools to Harmony Responses request"
+        );
+    }
+    session
+}
+
+/// The loop's request back as an owned value once an iteration has run with
+/// it: the iteration's context let go of its share when the run returned, so
+/// this is a move; a copy only while something still shares it.
+pub(super) fn owned_request(request: Arc<ResponsesRequest>) -> ResponsesRequest {
+    Arc::try_unwrap(request).unwrap_or_else(|shared| (*shared).clone())
+}
+
+/// The request's tool list without the server tools (the function tools
+/// `is_server_tool` names, the session's): the final turn after the request's
+/// `max_tool_calls` offers the model the caller's own tools only, so it
+/// answers on the results it has.
+pub(super) fn withhold_server_tools(
+    request: &mut ResponsesRequest,
+    is_server_tool: impl Fn(&str) -> bool,
+) {
+    if let Some(tools) = request.tools.as_mut() {
+        tools.retain(|tool| {
+            !matches!(tool, ResponseTool::Function(function)
+                if is_server_tool(&function.function.name))
+        });
+    }
+}
+
 /// Build next request with tool results appended to history
 ///
 /// Constructs a new ResponsesRequest with:
@@ -91,7 +141,7 @@ pub(super) fn build_next_request_with_tools(
     // Add reasoning if present (from analysis channel)
     if let Some(analysis_text) = analysis {
         items.push(ResponseInputOutputItem::new_reasoning(
-            format!("reasoning_{assistant_id}"),
+            OutputItemKind::Reasoning.new_id(),
             vec![],
             vec![ResponseReasoningContent::ReasoningText {
                 text: analysis_text,
@@ -268,5 +318,35 @@ mod namespace_tests {
         assert_eq!(wire["name"], "lookup");
         assert_eq!(wire["namespace"], "weather");
         assert_eq!(wire["call_id"], "call_test");
+    }
+
+    #[test]
+    fn the_final_turn_withholds_the_servers_functions_and_keeps_the_callers_tools() {
+        let mut request: ResponsesRequest = namespace_test_request();
+        request.tools = from_value(serde_json::json!([
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            {"type": "function", "name": "echo", "parameters": {"type": "object"}},
+            {"type": "mcp", "server_label": "tools", "server_url": "http://127.0.0.1:1/mcp"},
+        ]))
+        .unwrap();
+
+        withhold_server_tools(&mut request, |name| name == "echo");
+
+        let kept: Vec<serde_json::Value> = request
+            .tools
+            .unwrap_or_default()
+            .iter()
+            .map(|tool| {
+                let wire = serde_json::to_value(tool).unwrap();
+                serde_json::json!([wire["type"], wire["name"]])
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                serde_json::json!(["function", "lookup"]),
+                serde_json::json!(["mcp", serde_json::Value::Null]),
+            ]
+        );
     }
 }

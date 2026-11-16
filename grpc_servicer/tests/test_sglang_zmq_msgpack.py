@@ -832,6 +832,34 @@ def test_sender_slims_embeddings_and_answers_control_replies():
     ]
 
 
+def test_sender_relays_the_schedulers_bare_health_signal_as_an_empty_batch_without_a_tail():
+    """A scheduler busy with a chunked prefill or a running batch never
+    queues the health probe and answers it with a bare ``HealthCheckOutput``;
+    SMG reads any output since its probe started as alive, so the signal
+    leaves as a token batch with no columns and, with a load probe attached,
+    still no load tail: an outputs-less batch with a tail is a stats-only
+    step report to SMG, which this scheduler never sends."""
+    from types import SimpleNamespace
+
+    from sglang.srt.managers.io_struct import HealthCheckOutput
+
+    sender = wire.MsgpackSendSocket()
+    sink = _Sink()
+    sender.attach(
+        sink,
+        3,
+        lambda: SimpleNamespace(
+            num_running_reqs=1, num_waiting_reqs=2, num_used_tokens=5, max_total_num_tokens=100
+        ),
+    )
+    sender.send_output(HealthCheckOutput())
+    (signal,) = sink.sent
+    assert signal[0] == "BatchTokenIDSlimOutput"
+    assert signal[1:11] == [[]] * 10, "no request columns"
+    assert signal[11] == 3, "the producing rank"
+    assert signal[12:16] == [0, 0, 0, 0], "no load tail"
+
+
 def test_slim_output_appends_prompt_logprobs_and_reasoning_tokens():
     full = _full_output()
     full.reasoning_tokens = [0, 4]

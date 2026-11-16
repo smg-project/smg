@@ -539,17 +539,54 @@ jobs:
           trap 'cleanup; exit 143' INT TERM
           BFCL="$(command -v bfcl)"
           ROOT="$RUNNER_TEMP/bfcl_ab"
-          # run_ab.py exit codes: 0 clean, 1 score regression (informational — this
-          # A/B is never a merge gate), 2 an arm timed out or scored nothing. Only 2
-          # fails the job: a "—" column is a broken run, not a passing one.
+          # Final comparison: 0 clean, 1 regression (warning only), 2 incomplete.
+          # Score regressions are not a merge gate. Per-arm/stop failures are hard;
+          # retain their first nonzero status after a fixed-size partial report.
           AB_RC=0
+          INCOMPLETE_PHASE=comparison
+          # Defer a hard arm/stop failure only until its partial report is saved.
+          # A per-arm exit 1 is an error, not the final comparison's regression.
+          run_arm_step() {
+            local phase="$1" rc=0
+            shift
+            "$@" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::BFCL $phase failed (exit $rc)"
+              if [ "$AB_RC" -eq 0 ]; then
+                AB_RC=$rc
+                INCOMPLETE_PHASE=$phase
+              fi
+            fi
+          }
+          launch_arm() {
+            local arm="$1" gpu="$2" output_var="$3" url rc=0
+            url=$(BFCL_GPU="$gpu" bash scripts/bfcl/launch_arm.sh "$arm" 9>&-) || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              return "$rc"
+            fi
+            printf -v "$output_var" '%s' "$url"
+          }
+          partial_report() {
+            local rc=0
+            # Never replace a comparison report already emitted by run_ab.py.
+            # These fixed-size diagnostics contain no invented arm scores.
+            if [ ! -s "$RUNNER_TEMP/bfcl_ab.md" ]; then
+              printf '# BFCL A/B incomplete\n\nCaller phase: `%s`; exit: `%s`.\nNo complete A/B comparison is qualified. Saved arm scores and transcripts remain separate when present.\n' \
+                "$INCOMPLETE_PHASE" "$AB_RC" > "$RUNNER_TEMP/bfcl_ab.md" || rc=$?
+            fi
+            if [ ! -s "$RUNNER_TEMP/bfcl_ab.json" ]; then
+              printf '{"report_type":"caller-incomplete","phase":"%s","exit_code":%s,"complete":false}\n' \
+                "$INCOMPLETE_PHASE" "$AB_RC" > "$RUNNER_TEMP/bfcl_ab.json" || rc=$?
+            fi
+            return "$rc"
+          }
           gate() {
             local rc=0
             "$@" || rc=$?
             case "$rc" in
               0) ;;
               1) echo "::warning::BFCL A/B score regression beyond tolerance — see job summary" ;;
-              *) echo "::error::BFCL A/B incomplete (run_ab exit $rc): an arm timed out or produced no scores"
+              *) echo "::error::BFCL A/B incomplete (run_ab exit $rc): an arm or the driver did not complete; see the step log"
                  AB_RC=$rc ;;
             esac
           }
@@ -557,46 +594,62 @@ jobs:
             # Whole node per arm (TP=8), one at a time: each model needs all 8 GPUs
             # for enough KV cache at the larger max_model_len. Score arm A, tear it
             # down to free the GPUs, score arm B, then diff the two saved results.
-            A_URL=$(BFCL_GPU="$GPU_A" bash scripts/bfcl/launch_arm.sh a 9>&-)
-            echo "arm A (vllm): $A_URL"
-            python scripts/bfcl/run_ab.py --score-arm "vllm=$A_URL" \
-              --scores-out "$ROOT/scores_vllm.json" \
-              --bfcl-model "$BFCL_MODEL_FC" --categories "$CATEGORIES" \
-              --bfcl "$BFCL" --project-root "$ROOT" --run-timeout "$RUN_TIMEOUT"
-            bash scripts/bfcl/launch_arm.sh stop 9>&-
-            B_URL=$(BFCL_GPU="$GPU_A" bash scripts/bfcl/launch_arm.sh b 9>&-)
-            echo "arm B (smg): $B_URL"
-            python scripts/bfcl/run_ab.py --score-arm "smg=$B_URL" \
-              --scores-out "$ROOT/scores_smg.json" \
-              --bfcl-model "$BFCL_MODEL_FC" --categories "$CATEGORIES" \
-              --bfcl "$BFCL" --project-root "$ROOT" --run-timeout "$RUN_TIMEOUT"
-            bash scripts/bfcl/launch_arm.sh stop 9>&-
-            gate python scripts/bfcl/run_ab.py \
-              --diff-baseline "$ROOT/scores_vllm.json" --diff-candidate "$ROOT/scores_smg.json" \
-              --categories "$CATEGORIES" \
-              --out "$RUNNER_TEMP/bfcl_ab.md" --json-out "$RUNNER_TEMP/bfcl_ab.json" \
-              --tolerance 0.02
+            run_arm_step launch-a launch_arm a "$GPU_A" A_URL
+            if [ "$AB_RC" -eq 0 ]; then
+              echo "arm A (vllm): $A_URL"
+              run_arm_step score-a python scripts/bfcl/run_ab.py --score-arm "vllm=$A_URL" \
+                --scores-out "$ROOT/scores_vllm.json" \
+                --bfcl-model "$BFCL_MODEL_FC" --categories "$CATEGORIES" \
+                --bfcl "$BFCL" --project-root "$ROOT" --run-timeout "$RUN_TIMEOUT"
+            fi
+            run_arm_step stop-a bash scripts/bfcl/launch_arm.sh stop 9>&-
+            # A hard scoring/stop failure must never fall through to native B.
+            if [ "$AB_RC" -eq 0 ]; then
+              run_arm_step launch-b launch_arm b "$GPU_A" B_URL
+              if [ "$AB_RC" -eq 0 ]; then
+                echo "arm B (smg): $B_URL"
+                run_arm_step score-b python scripts/bfcl/run_ab.py --score-arm "smg=$B_URL" \
+                  --scores-out "$ROOT/scores_smg.json" \
+                  --bfcl-model "$BFCL_MODEL_FC" --categories "$CATEGORIES" \
+                  --bfcl "$BFCL" --project-root "$ROOT" --run-timeout "$RUN_TIMEOUT"
+              fi
+              run_arm_step stop-b bash scripts/bfcl/launch_arm.sh stop 9>&-
+            fi
+            if [ "$AB_RC" -eq 0 ]; then
+              gate python scripts/bfcl/run_ab.py \
+                --diff-baseline "$ROOT/scores_vllm.json" --diff-candidate "$ROOT/scores_smg.json" \
+                --categories "$CATEGORIES" \
+                --out "$RUNNER_TEMP/bfcl_ab.md" --json-out "$RUNNER_TEMP/bfcl_ab.json" \
+                --tolerance 0.02
+            fi
           else
             # Concurrent: arm A (pure vLLM) on the first GPU half, arm B (SMG ->
             # vLLM gRPC) on the second; ports left unset so launch_arm.sh picks free.
-            A_URL=$(BFCL_GPU="$GPU_A" bash scripts/bfcl/launch_arm.sh a 9>&-)
-            B_URL=$(BFCL_GPU="$GPU_B" bash scripts/bfcl/launch_arm.sh b 9>&-)
-            echo "arm A: $A_URL   arm B: $B_URL"
-            gate python scripts/bfcl/run_ab.py \
-              --baseline  "vllm=$A_URL" \
-              --candidate "smg=$B_URL" \
-              --bfcl-model "$BFCL_MODEL_FC" \
-              --categories "$CATEGORIES" \
-              --bfcl "$BFCL" \
-              --project-root "$ROOT" \
-              --out "$RUNNER_TEMP/bfcl_ab.md" \
-              --json-out "$RUNNER_TEMP/bfcl_ab.json" \
-              --run-timeout "$RUN_TIMEOUT" \
-              --tolerance 0.02
+            run_arm_step launch-a launch_arm a "$GPU_A" A_URL
+            if [ "$AB_RC" -eq 0 ]; then
+              run_arm_step launch-b launch_arm b "$GPU_B" B_URL
+            fi
+            if [ "$AB_RC" -eq 0 ]; then
+              echo "arm A: $A_URL   arm B: $B_URL"
+              gate python scripts/bfcl/run_ab.py \
+                --baseline  "vllm=$A_URL" \
+                --candidate "smg=$B_URL" \
+                --bfcl-model "$BFCL_MODEL_FC" \
+                --categories "$CATEGORIES" \
+                --bfcl "$BFCL" \
+                --project-root "$ROOT" \
+                --out "$RUNNER_TEMP/bfcl_ab.md" \
+                --json-out "$RUNNER_TEMP/bfcl_ab.json" \
+                --run-timeout "$RUN_TIMEOUT" \
+                --tolerance 0.02
+            fi
           fi
-          # Fail after the report is written, so Render summary / Upload results
-          # (both always()) still publish the partial table and transcripts.
-          [ "$AB_RC" -eq 0 ] || exit "$AB_RC"
+          # Fail only after attempting a fixed-size partial report. Report-write
+          # failure cannot erase the original hard arm/stop/comparison status.
+          if [ "$AB_RC" -ne 0 ]; then
+            partial_report || echo "::error::BFCL partial report could not be written"
+            exit "$AB_RC"
+          fi
       - name: Render summary
         if: always()
         run: |

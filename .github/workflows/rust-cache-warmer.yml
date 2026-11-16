@@ -68,7 +68,3 @@ jobs:
           for leg in all-features self-hosted anthropic-only; do
             bash scripts/ci_rust_tests.sh lint "$leg"
           done
-
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats

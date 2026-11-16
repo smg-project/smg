@@ -7,7 +7,9 @@
 //! declines the rest with a reason (`Declined`); the load logs the path it
 //! ended on and those reasons, once. After the choice an input can still
 //! leave the direct encoder for `tokenizers` (`Fallback`), which costs the
-//! work done up to that point.
+//! work done up to that point. A tiktoken vocabulary takes the direct
+//! encoder too when its ranks and pattern fit it (`tiktoken`), and counts
+//! as a load of that path; one that does not keeps its own encoder.
 //!
 //! The process-lifetime totals here have the shape of `cache::activity`:
 //! fixed-size snapshots, no locks, never reset, read through
@@ -124,7 +126,8 @@ pub(crate) fn note_fallback(fallback: Fallback) {
 #[derive(Debug, Clone, Copy)]
 pub struct EncodePathLoads {
     pub path: EncodePath,
-    /// Hugging Face tokenizers loaded whose encodes take `path`; a
+    /// Hugging Face tokenizers loaded whose encodes take `path` (and, for
+    /// the direct encoder, the tiktoken vocabularies that take it); a
     /// tokenizer loaded twice counts twice.
     pub loads: u64,
 }

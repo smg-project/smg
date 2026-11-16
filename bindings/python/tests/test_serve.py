@@ -411,6 +411,16 @@ class TestParseServeArgs:
 # ---------------------------------------------------------------------------
 
 
+def _vllm_args_without_vllm(backend: str, parser: argparse.ArgumentParser) -> None:
+    """The second parse pass adds the backend's own arguments; for vllm that
+    imports vLLM, absent here, so the two it needs are added by hand."""
+    if backend == "vllm":
+        parser.add_argument("--tensor-parallel-size", type=int, default=1)
+        parser.add_argument("--model", type=str)
+    else:
+        _import_backend_args(backend, parser)
+
+
 class TestWorkerLauncherGpuEnv:
     """Test GPU assignment via _get_tp_size() and gpu_env().
 
@@ -468,6 +478,76 @@ class TestWorkerLauncherGpuEnv:
         launcher = VllmWorkerLauncher()
         env = launcher.gpu_env(args, dp_rank=0, env={})
         assert env["CUDA_VISIBLE_DEVICES"] == expected_devices
+
+    def test_the_default_servicer_parses_without_the_servicer_package(self, monkeypatch):
+        """`smg serve --backend vllm` with nothing chosen runs the servicer
+        package's default (the Rust servicer): a host without the package
+        parses (the worker's own entrypoint needs the package for either
+        servicer and says so itself); an explicit `--servicer-impl rust` is
+        refused here."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def no_servicer_package(name, *args, **kwargs):
+            if name.startswith("smg_grpc_servicer"):
+                raise ImportError(name)
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", no_servicer_package)
+        with patch("smg.serve._import_backend_args", side_effect=_vllm_args_without_vllm):
+            _, args, _ = parse_serve_args(["--backend", "vllm", "--model", "/tmp/m"])
+            assert args.servicer_impl is None
+            _, args, _ = parse_serve_args(
+                ["--backend", "vllm", "--model", "/tmp/m", "--servicer-impl", "python"]
+            )
+            assert args.servicer_impl == "python"
+            with pytest.raises(SystemExit):
+                parse_serve_args(
+                    ["--backend", "vllm", "--model", "/tmp/m", "--servicer-impl", "rust"]
+                )
+
+    def test_the_hook_is_checked_for_the_default_and_the_explicit_rust_choice(self, monkeypatch):
+        """The vLLM hook check runs whenever the Rust servicer is the effective
+        choice: softly on the default (a missing package is the worker's to
+        report), hard on an explicit rust; never for an explicit python."""
+        checks: list[bool] = []
+        monkeypatch.setattr(
+            "smg.serve._require_rust_servicer_hook", lambda explicit=True: checks.append(explicit)
+        )
+        with patch("smg.serve._import_backend_args", side_effect=_vllm_args_without_vllm):
+            parse_serve_args(["--backend", "vllm", "--model", "/tmp/m"])
+            parse_serve_args(["--backend", "vllm", "--model", "/tmp/m", "--servicer-impl", "rust"])
+            parse_serve_args(
+                ["--backend", "vllm", "--model", "/tmp/m", "--servicer-impl", "python"]
+            )
+        assert checks == [False, True]
+
+    def test_the_hook_check_follows_an_inherited_servicer_variable_like_the_worker(
+        self, monkeypatch
+    ):
+        """With the flag unset the worker honours an exported
+        `SMG_VLLM_SERVICER_IMPL`, so the parse-time check reads the same
+        choice: an inherited python skips the hook check, an inherited rust
+        runs it as an explicit choice, and the flag still wins over the
+        variable."""
+        checks: list[bool] = []
+        monkeypatch.setattr(
+            "smg.serve._require_rust_servicer_hook", lambda explicit=True: checks.append(explicit)
+        )
+        with patch("smg.serve._import_backend_args", side_effect=_vllm_args_without_vllm):
+            monkeypatch.setenv("SMG_VLLM_SERVICER_IMPL", "python")
+            parse_serve_args(["--backend", "vllm", "--model", "/tmp/m"])
+            assert checks == []
+            parse_serve_args(["--backend", "vllm", "--model", "/tmp/m", "--servicer-impl", "rust"])
+            assert checks == [True]
+            monkeypatch.setenv("SMG_VLLM_SERVICER_IMPL", " RUST ")
+            parse_serve_args(["--backend", "vllm", "--model", "/tmp/m"])
+            assert checks == [True, True]
+            parse_serve_args(
+                ["--backend", "vllm", "--model", "/tmp/m", "--servicer-impl", "python"]
+            )
+            assert checks == [True, True]
 
     def test_trtllm_tp_from_cli(self):
         """CLI --tp_size flows through to CUDA_VISIBLE_DEVICES for trtllm."""
@@ -797,19 +877,26 @@ class TestVllmWorkerLauncher:
         assert env["SMG_VLLM_SERVICER_IMPL"] == "rust"
         assert env["CUDA_VISIBLE_DEVICES"] == "3"
 
-    def test_python_servicer_clears_an_inherited_rust_flag(self):
-        """The CLI flag is authoritative: a `SMG_VLLM_SERVICER_IMPL=rust`
-        exported in the operator's shell must not survive `--servicer-impl
-        python` (the default) into the worker's environment."""
+    def test_an_explicit_servicer_flag_overrides_an_inherited_value(self):
+        """The CLI flag is authoritative: `--servicer-impl python` travels as
+        python even when the operator's shell exported `rust`, an unset flag
+        leaves the operator's export alone (the package default decides when
+        nothing is exported), and an HTTP worker carries no servicer flag."""
         launcher = VllmWorkerLauncher()
-        for connection_mode, impl in [("grpc", "python"), ("http", "rust")]:
-            args = argparse.Namespace(
-                model="/tmp/model", connection_mode=connection_mode, servicer_impl=impl
-            )
-            inherited = {"CUDA_VISIBLE_DEVICES": "0", "SMG_VLLM_SERVICER_IMPL": "rust"}
-            env = launcher.gpu_env(args, 0, inherited)
-            assert "SMG_VLLM_SERVICER_IMPL" not in env
-            assert env["CUDA_VISIBLE_DEVICES"] == "0"
+        inherited = {"CUDA_VISIBLE_DEVICES": "0", "SMG_VLLM_SERVICER_IMPL": "rust"}
+        python = argparse.Namespace(
+            model="/tmp/model", connection_mode="grpc", servicer_impl="python"
+        )
+        env = launcher.gpu_env(python, 0, dict(inherited))
+        assert env["SMG_VLLM_SERVICER_IMPL"] == "python"
+        assert env["CUDA_VISIBLE_DEVICES"] == "0"
+        unset = argparse.Namespace(model="/tmp/model", connection_mode="grpc", servicer_impl=None)
+        assert launcher.gpu_env(unset, 0, dict(inherited))["SMG_VLLM_SERVICER_IMPL"] == "rust"
+        assert "SMG_VLLM_SERVICER_IMPL" not in launcher.gpu_env(
+            unset, 0, {"CUDA_VISIBLE_DEVICES": "0"}
+        )
+        http = argparse.Namespace(model="/tmp/model", connection_mode="http", servicer_impl="rust")
+        assert "SMG_VLLM_SERVICER_IMPL" not in launcher.gpu_env(http, 0, dict(inherited))
 
     def test_build_zmq_command_defaults_to_single_engine(self):
         launcher = VllmWorkerLauncher()

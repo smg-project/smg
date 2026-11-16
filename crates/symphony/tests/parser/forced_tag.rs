@@ -11,6 +11,8 @@
 //! table writes for `tool_choice: auto` and every answer grammar, so a tag the engines would refuse
 //! fails here and not at the first request.
 
+use std::sync::Arc;
+
 use openai_protocol::common::{Function, Tool};
 use serde_json::json;
 use symphony::{
@@ -34,6 +36,11 @@ const KNOWN_GAPS: &[(Table, Gap, &str)] = &[
         Gap::OpenThoughtAtFirstToken,
         "the thought is a message of its own, and the tag finds no close of it to write before the call",
     ),
+    (
+        Table::Inkling2,
+        Gap::OpenThoughtAtFirstToken,
+        "Inkling's rows: the thought is a message of its own, and the tag finds no close of it to write before the call",
+    ),
 ];
 
 fn tool(name: &str, parameters: serde_json::Value) -> Tool {
@@ -42,7 +49,7 @@ fn tool(name: &str, parameters: serde_json::Value) -> Tool {
         function: Function {
             name: name.to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },
@@ -120,7 +127,7 @@ fn every_table_that_reads_calls_writes_a_forced_tag_in_every_configuration() {
             continue;
         };
         assert!(
-            !matches!(syntax, CallSyntax::ForcedArguments),
+            !matches!(syntax, CallSyntax::ForcedArguments | CallSyntax::ForcedList),
             "{}: the forced table is not a registry table",
             table.name()
         );
@@ -178,11 +185,11 @@ fn every_answer_grammar_a_table_writes_passes_the_engines_rule() {
     // An answer held to a JSON schema (`response_format`), with the prompt's thought closed or
     // open and the engine's grammar started where it does not say, after its reasoning parser or
     // at the first token: a table may write none; one it writes passes the engines' rule.
-    let schema = json!({
+    let schema = Arc::new(json!({
         "type": "object",
         "properties": {"answer": {"type": "string"}},
         "required": ["answer"],
-    });
+    }));
     let mut checked = 0;
     for table in Table::ALL {
         let format = table.format();

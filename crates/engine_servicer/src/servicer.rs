@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use engine_zmq_adapter::ZmqEngineClient;
+use engine_zmq_adapter::{is_leftover_handshake_socket, ZmqEngineClient};
 use engine_zmq_client::protocol::handshake::EngineCoreReadyResponse;
 use futures::FutureExt;
 use tokio::net::TcpListener;
@@ -29,14 +29,49 @@ use crate::{
     engine_link::{ConnectInputs, EngineLink},
     health::HealthReporter,
     kv_events::{KvEventRelay, LoadFromState, RankLoads},
+    load_tracker::LoadTracker,
     metrics::{MetricsListener, ServicerMetrics, ServicerState, Snapshot},
     requests::RequestRegistry,
-    ServerThread, ServicerConfig, ServicerError, Shutdown,
+    ServerThread, ServicerConfig, ServicerError, Shutdown, STOP_MARGIN,
 };
+
+/// The proto integers a handshake figure is read into, each with the value
+/// it saturates at.
+pub(crate) trait ProtoInt: Copy + Default + PartialEq + TryFrom<u64> {
+    const MAX: Self;
+}
+
+impl ProtoInt for i32 {
+    const MAX: Self = i32::MAX;
+}
+
+impl ProtoInt for u32 {
+    const MAX: Self = u32::MAX;
+}
+
+/// The proto's `int32` token ids of the launcher's ids, saturating: the
+/// `eos_token_ids` every wire's `GetModelInfo` reports.
+pub(crate) fn proto_token_ids(ids: &[u32]) -> Vec<i32> {
+    ids.iter()
+        .map(|&id| i32::try_from(id).unwrap_or(i32::MAX))
+        .collect()
+}
 
 /// A wire's state as the shared code sees it: where its shared half is.
 pub(crate) trait WireState: Send + Sync + 'static {
     fn shared(&self) -> &Shared;
+}
+
+/// Whose request a wire's generate path serves, which decides what is
+/// counted: a client's goes into the request metrics and the load tracker;
+/// the servicer's own health probe of the scheduler goes into neither, so a
+/// one-token probe on an idle rank every probe interval never reads as a
+/// client's request in the counters and latencies, nor as a sample of the
+/// rank's prefill capacity, hit rate or generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestOrigin {
+    Client,
+    HealthProbe,
 }
 
 /// The half of a servicer's state every wire shares.
@@ -59,6 +94,10 @@ pub(crate) struct Shared {
     serving: AtomicBool,
     pub(crate) started: Instant,
     pub(crate) started_at: SystemTime,
+    /// Queued token-work, prefill and generation throughput and the hit rate
+    /// from the requests this servicer forwards, per rank, for `GetLoads`
+    /// and the pushed load record of every wire.
+    pub(crate) loads: LoadTracker,
 }
 
 impl Shared {
@@ -68,16 +107,18 @@ impl Shared {
         kv_relay: Option<Arc<KvEventRelay>>,
         metrics: Arc<ServicerMetrics>,
         tokenizer_dir: Option<String>,
+        warmup_nonce: Option<String>,
     ) -> Self {
         Self {
             kv_relay,
             tokenizer_dir,
             engine: EngineLink::default(),
             metrics,
-            registry: Arc::new(RequestRegistry::default()),
+            registry: Arc::new(RequestRegistry::with_warmup_nonce(warmup_nonce)),
             serving: AtomicBool::new(true),
             started: Instant::now(),
             started_at: SystemTime::now(),
+            loads: LoadTracker::default(),
         }
     }
 
@@ -118,6 +159,19 @@ impl Shared {
         self.ready()
             .map(|ready| i32::try_from(ready.max_num_seqs).unwrap_or(i32::MAX))
             .unwrap_or(0)
+    }
+
+    /// The model's context length: the launcher's figure when it reported
+    /// one (zero means none), else the handshake's `max_model_len` in the
+    /// proto's integer, saturating; the launcher's zero before the engine is
+    /// up.
+    pub(crate) fn context_window<T: ProtoInt>(&self, launcher: T) -> T {
+        if launcher != T::default() {
+            return launcher;
+        }
+        self.ready()
+            .map(|ready| T::try_from(ready.max_model_len).unwrap_or(T::MAX))
+            .unwrap_or(launcher)
     }
 
     /// The engine version to report: the launcher's, else the handshake's
@@ -206,7 +260,8 @@ impl Shared {
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
     /// with `set_serving`, admission stays open to the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<nonce>-<n>`
+    /// with the configured `warmup_nonce`, else `smg-warmup-<n>`) and to
     /// nothing else, so the warm-up's steps share the engine with no client
     /// request. `set_serving(false)` is the drain switch and closes admission
     /// as well.
@@ -275,6 +330,44 @@ pub(crate) struct Server {
     metrics_listener: Option<MetricsListener>,
 }
 
+/// How long the shutdown waits for an `ipc://` handshake endpoint file to
+/// disappear after the connect task is gone: the socket library unlinks it
+/// from a task of this runtime, a few polls away even on a starved host.
+/// Half the stop margin at most, so a file that stays leaves the thread the
+/// other half to wind down and cannot turn a stop that drained in time into
+/// a timeout.
+const HANDSHAKE_RELEASE_BOUND: Duration = Duration::from_millis(500);
+const _: () = assert!(HANDSHAKE_RELEASE_BOUND.as_millis() * 2 <= STOP_MARGIN.as_millis());
+
+/// The `ipc://` handshake endpoint file this servicer is about to bind, read
+/// before the connect is spawned: `None` when the address names no file, and
+/// when something is already at the path that the bind sequence leaves there.
+/// That file is another process's (the bind fails as in use), and nothing
+/// here would release it. A leftover socket the bind sequence sweeps first
+/// counts as a free path: the file there at stop is this servicer's.
+async fn own_handshake_endpoint(handshake_address: &str) -> Option<String> {
+    let path = handshake_address.strip_prefix("ipc://")?;
+    (std::fs::metadata(path).is_err() || is_leftover_handshake_socket(handshake_address).await)
+        .then(|| path.to_owned())
+}
+
+/// Wait until the handshake endpoint file at `path` is gone, or `bound` has
+/// passed; a file still there is reported, never an error (the server stops
+/// either way).
+async fn await_handshake_release(path: &str, bound: Duration) {
+    let deadline = tokio::time::Instant::now() + bound;
+    while std::fs::metadata(path).is_ok() {
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                path,
+                "the handshake endpoint file outlived the servicer's stop"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 impl Server {
     /// Bind `config.bind_address` and serve `routes` (the wire's service) with
     /// the health service beside it, on a dedicated runtime thread named
@@ -285,9 +378,10 @@ impl Server {
     /// Once the listener is bound, `connect` gets the inputs of the engine
     /// connect (the endpoints and the engine count off `config`, its two
     /// start-up bounds, its silence bounds and the server's last-error slot)
-    /// and the future it returns runs on the server runtime, fire-and-forget:
-    /// the wire's engine connect, which gates health; dropping the runtime
-    /// with the server thread cancels it. The listening line names `engine`
+    /// and the future it returns runs on the server runtime in the background:
+    /// the wire's engine connect, which gates health; the shutdown aborts it
+    /// after the drain and waits for an `ipc://` handshake endpoint file of
+    /// its own to go before the thread ends. The listening line names `engine`
     /// with the bound address as the engines log it (the listener's
     /// `local_addr`, empty when the read fails).
     pub(crate) fn start<S, C, Fut>(
@@ -358,11 +452,12 @@ impl Server {
                     .local_addr()
                     .map(|address| address.to_string())
                     .unwrap_or_default();
+                let handshake_endpoint = own_handshake_endpoint(&handshake_address).await;
                 #[expect(
                     clippy::disallowed_methods,
-                    reason = "engine connect is fire-and-forget; the runtime drop cancels it"
+                    reason = "engine connect runs in the background; the shutdown aborts it below"
                 )]
-                let _connect = tokio::spawn(connect(ConnectInputs {
+                let connect_task = tokio::spawn(connect(ConnectInputs {
                     ipc_base_url,
                     handshake_address,
                     engine_count,
@@ -407,13 +502,24 @@ impl Server {
                     let grace = shutdown.await;
                     tokio::time::sleep(grace).await;
                 };
-                tokio::select! {
+                let result = tokio::select! {
                     result = graceful => result.map_err(|error| error.to_string()),
                     () = forced => {
                         warn!("gRPC servicer closed its remaining connections after the drain grace");
                         Ok(())
                     }
+                };
+                // The handshake endpoint goes with the server, not with the
+                // runtime: a connect still waiting for its engine is ended
+                // here, so its socket drops while the runtime can still run
+                // the release of an `ipc://` endpoint file, and that release
+                // is awaited before the thread ends and `stop` returns.
+                connect_task.abort();
+                let _ = connect_task.await;
+                if let Some(path) = handshake_endpoint {
+                    await_handshake_release(&path, HANDSHAKE_RELEASE_BOUND).await;
                 }
+                result
             },
         )?;
         Ok(Self {
@@ -480,7 +586,7 @@ mod tests {
             false,
         )
         .expect("metrics without a listener");
-        Shared::new(None, metrics, None)
+        Shared::new(None, metrics, None, None)
     }
 
     /// Before the engine is up every reader answers from the launcher's
@@ -498,6 +604,42 @@ mod tests {
         assert_eq!(shared.rank_count(4), 4);
         assert_eq!(shared.rank_count(0), 1);
         assert_eq!(shared.rank_count(-2), 1);
+    }
+
+    /// The stop waits only for an endpoint file of its own: a path nothing
+    /// holds yet. A file already there is an earlier process's, and an
+    /// address that names no file leaves nothing to wait for.
+    #[tokio::test]
+    async fn the_stop_waits_only_for_a_handshake_endpoint_of_its_own() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("handshake");
+        let address = format!("ipc://{}", path.display());
+        assert_eq!(
+            own_handshake_endpoint(&address).await,
+            Some(path.display().to_string())
+        );
+
+        std::fs::write(&path, b"").expect("an earlier process's file");
+        assert_eq!(own_handshake_endpoint(&address).await, None);
+        assert_eq!(own_handshake_endpoint("tcp://127.0.0.1:5555").await, None);
+
+        std::fs::remove_file(&path).expect("the file goes");
+        let listener = UnixListener::bind(&path).expect("a listener");
+        assert_eq!(
+            own_handshake_endpoint(&address).await,
+            None,
+            "a socket a listener answers at is a live process's"
+        );
+        drop(listener);
+        // The bind sequence sweeps a leftover on Linux alone.
+        let swept = cfg!(target_os = "linux").then(|| path.display().to_string());
+        assert_eq!(
+            own_handshake_endpoint(&address).await,
+            swept,
+            "a leftover socket reads as free where the bind sequence sweeps it"
+        );
     }
 
     /// The drain switch closes admission with health; the readiness switch
@@ -591,6 +733,10 @@ mod tests {
 
         fn engine_link(&self) -> &EngineLink {
             &self.0.engine
+        }
+
+        fn rank_count(&self) -> usize {
+            1
         }
     }
 

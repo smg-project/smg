@@ -103,7 +103,7 @@ pub async fn start_service_discovery(
         }
         RuntimeDiscoveryConfig::File(config) => Ok(file::start_file_discovery(config, app_context)),
         RuntimeDiscoveryConfig::Slurm(config) => {
-            Ok(slurm::start_slurm_discovery(config, app_context))
+            Ok(slurm::start_slurm_discovery(config, app_context)?)
         }
         RuntimeDiscoveryConfig::Consul(config) => {
             Ok(consul::start_consul_discovery(config, app_context)?)
@@ -114,12 +114,10 @@ pub async fn start_service_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn regular() -> RoutingMode {
-        RoutingMode::Regular {
-            worker_urls: vec![],
-        }
-    }
+    use crate::config::{
+        test_support::regular_routing_mode, ConsulDiscoveryConfig, FileDiscoveryConfig,
+        SlurmDiscoveryConfig,
+    };
 
     fn kubernetes(config: &DiscoveryConfig, mode: &RoutingMode) -> ServiceDiscoveryConfig {
         let Ok(RuntimeDiscoveryConfig::Kubernetes(runtime)) =
@@ -148,7 +146,7 @@ mod tests {
             ..Default::default()
         });
 
-        let runtime = kubernetes(&config, &regular());
+        let runtime = kubernetes(&config, &regular_routing_mode());
 
         assert_eq!(runtime.namespace.as_deref(), Some("prod"));
         assert_eq!(runtime.port, 9000);
@@ -193,12 +191,12 @@ mod tests {
 
     #[test]
     fn file_settings_reach_the_runtime() {
-        let config = DiscoveryConfig::File(crate::config::FileDiscoveryConfig {
+        let config = DiscoveryConfig::File(FileDiscoveryConfig {
             path: "/run/smg/workers.json".into(),
             check_interval_secs: 15,
         });
         let Ok(RuntimeDiscoveryConfig::File(runtime)) =
-            RuntimeDiscoveryConfig::from_config(&config, &regular())
+            RuntimeDiscoveryConfig::from_config(&config, &regular_routing_mode())
         else {
             panic!("expected file runtime discovery");
         };
@@ -208,7 +206,7 @@ mod tests {
 
     #[test]
     fn slurm_settings_reach_the_runtime() {
-        let config = DiscoveryConfig::Slurm(crate::config::SlurmDiscoveryConfig {
+        let config = DiscoveryConfig::Slurm(SlurmDiscoveryConfig {
             job_names: vec!["smg-worker".to_string()],
             encode_job_names: vec![],
             prefill_job_names: vec![],
@@ -221,7 +219,7 @@ mod tests {
             check_interval_secs: 10,
         });
         let Ok(RuntimeDiscoveryConfig::Slurm(runtime)) =
-            RuntimeDiscoveryConfig::from_config(&config, &regular())
+            RuntimeDiscoveryConfig::from_config(&config, &regular_routing_mode())
         else {
             panic!("expected Slurm runtime discovery");
         };
@@ -230,14 +228,14 @@ mod tests {
 
     #[test]
     fn consul_settings_reach_the_runtime() {
-        let config = DiscoveryConfig::Consul(crate::config::ConsulDiscoveryConfig {
+        let config = DiscoveryConfig::Consul(ConsulDiscoveryConfig {
             service: "smg-worker".to_string(),
             address: Some("http://consul.internal:8500".to_string()),
             datacenter: Some("dc2".to_string()),
             check_interval_secs: 10,
         });
         let Ok(RuntimeDiscoveryConfig::Consul(runtime)) =
-            RuntimeDiscoveryConfig::from_config(&config, &regular())
+            RuntimeDiscoveryConfig::from_config(&config, &regular_routing_mode())
         else {
             panic!("expected Consul runtime discovery");
         };
@@ -250,7 +248,8 @@ mod tests {
             model_id_source: Some("pod-name".to_string()),
             ..Default::default()
         });
-        let err = RuntimeDiscoveryConfig::from_config(&config, &regular()).unwrap_err();
+        let err =
+            RuntimeDiscoveryConfig::from_config(&config, &regular_routing_mode()).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidValue { ref field, .. } if field == "discovery.model_id_source"),
             "{err}"

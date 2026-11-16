@@ -104,12 +104,14 @@ mod tests {
     };
     use bytes::Bytes;
     use futures_util::stream;
-    use serde_json::Value;
     use tower::ServiceExt;
 
     use super::*;
     use crate::{
-        middleware::body_timeout::{crossed_payload_limit, REQUEST_BODY_TOO_LARGE},
+        middleware::{
+            body_timeout::{crossed_payload_limit, REQUEST_BODY_TOO_LARGE},
+            test_support::{json_of, text_of},
+        },
         routers::error::extract_error_code_from_response,
     };
 
@@ -167,11 +169,6 @@ mod tests {
             .unwrap()
     }
 
-    async fn text(response: Response) -> String {
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        String::from_utf8(body.to_vec()).unwrap()
-    }
-
     /// A declared length over the limit is refused with the gateway's
     /// envelope and code before the handler runs.
     #[tokio::test]
@@ -186,7 +183,7 @@ mod tests {
             extract_error_code_from_response(&response),
             REQUEST_BODY_TOO_LARGE
         );
-        let json: Value = serde_json::from_str(&text(response).await).unwrap();
+        let json = json_of(response).await;
         assert_eq!(json["error"]["code"], REQUEST_BODY_TOO_LARGE, "{json}");
         assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
         assert_eq!(reads.load(Ordering::SeqCst), 0, "the handler never ran");
@@ -203,7 +200,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(text(response).await, "limit");
+        assert_eq!(text_of(response).await, "limit");
         assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 
@@ -215,14 +212,14 @@ mod tests {
         let app = app(16, reads.clone());
         let response = app.clone().oneshot(declared("/read", 16)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(text(response).await, "16");
+        assert_eq!(text_of(response).await, "16");
 
         let response = app
             .oneshot(chunked("/read", &[b"0123", b"4567"]))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(text(response).await, "8");
+        assert_eq!(text_of(response).await, "8");
         assert_eq!(reads.load(Ordering::SeqCst), 2);
     }
 
@@ -236,6 +233,6 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(extract_error_code_from_response(&response), "");
-        assert_eq!(text(response).await, "Request Entity Too Large");
+        assert_eq!(text_of(response).await, "Request Entity Too Large");
     }
 }

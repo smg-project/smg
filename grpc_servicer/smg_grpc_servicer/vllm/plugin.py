@@ -61,9 +61,10 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
         parser,
         applies=serves_grpc,
         help=(
-            "Which implementation serves the gRPC contract under --grpc: the Python "
-            "servicer (default) or the Rust one (smg.servicer.VllmGrpcServer, with the "
-            f"engine headless). Unset falls back to ${SERVICER_IMPL_ENV}. The Rust one needs "
+            "Which implementation serves the gRPC contract under --grpc: the Rust "
+            "servicer (default; smg.servicer.VllmGrpcServer, with the engine headless) or "
+            f"the deprecated Python one. Unset falls back to ${SERVICER_IMPL_ENV}, then rust. "
+            "The Rust one needs "
             "a launcher the switch binds (`vllm serve <model> --grpc`, or `python -m` on the "
             f"launcher module; vLLM {SUPPORTED_VLLM_RELEASES} checked) or one that carries "
             "the check in its own source; any other launcher is refused at this parse, "

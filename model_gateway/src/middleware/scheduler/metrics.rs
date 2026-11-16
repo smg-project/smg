@@ -11,12 +11,11 @@
 //! metrics. Class/outcome labels are `&'static str` (no per-request
 //! allocation).
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 
 use super::Class;
-use crate::observability::metrics::intern_string;
 
 const ADMIT_TOTAL: &str = "smg_scheduler_admit_total";
 const QUEUE_WAIT_SECONDS: &str = "smg_scheduler_queue_wait_seconds";
@@ -106,23 +105,26 @@ pub fn record_preemption(victim_class: Class, by_class: Class) {
 }
 
 /// Record a priority clamp (only when the effective class is below the
-/// requested class). `tenant` is interned — clamps are rare, so its
-/// cardinality is bounded by the set of tenants that actually over-ask.
-pub fn record_clamp(requested: Class, effective: Class, tenant: &str) {
+/// requested class). `tenant` is the key as the scheduler's bounded label
+/// set interned it (`SchedulerState::tenant_labels`, sized from
+/// `tenant_metric_top_n`): the keys are client-chosen, so a tenant past the
+/// cap counts under `other` rather than minting a series of its own.
+pub fn record_clamp(requested: Class, effective: Class, tenant: Arc<str>) {
     counter!(
         CLAMP_TOTAL,
-        "tenant" => intern_string(tenant),
+        "tenant" => tenant,
         "requested_class" => requested.as_str(),
         "effective_class" => effective.as_str()
     )
     .increment(1);
 }
 
-/// Record an unrecognized priority header value. `tenant` is interned (bad
-/// header values are rare), and is the actionable dimension — it tells ops
-/// which tenant is mis-setting the priority header.
-pub fn record_unknown_priority(tenant: &str) {
-    counter!(UNKNOWN_PRIORITY_TOTAL, "tenant" => intern_string(tenant)).increment(1);
+/// Record an unrecognized priority header value under the tenant that sent
+/// it, the actionable dimension (it tells ops which tenant is mis-setting
+/// the priority header). `tenant` is the scheduler's bounded label, as for
+/// [`record_clamp`]: a tenant past the cap counts under `other`.
+pub fn record_unknown_priority(tenant: Arc<str>) {
+    counter!(UNKNOWN_PRIORITY_TOTAL, "tenant" => tenant).increment(1);
 }
 
 /// Record a starvation-override promotion.
@@ -153,4 +155,42 @@ pub fn set_queue_size_limit(class: Class, limit: usize) {
 /// Set the normalized capacity-pressure gauge for a class (sampler).
 pub fn set_class_capacity_pressure(class: Class, pressure: f64) {
     gauge!(CLASS_CAPACITY_PRESSURE, "class" => class.as_str()).set(pressure);
+}
+
+#[cfg(test)]
+mod tests {
+    use smg_external_router::metrics::BoundedLabels;
+
+    use super::*;
+    use crate::observability::metrics::{interner_size, test_support::render_with_recorder};
+
+    /// Forty distinct tenant keys at a cap of 32 render 32 tenant series of
+    /// their own and one `other` series carrying the rest; the process-wide
+    /// interner, which never frees, does not grow with them.
+    #[test]
+    fn tenants_past_the_cap_count_under_other_and_grow_no_interner() {
+        let labels = BoundedLabels::new(32);
+        let interned_before = interner_size();
+        let rendered = render_with_recorder(|| {
+            for tenant in 0..40 {
+                record_unknown_priority(labels.intern(&format!("header:tenant-{tenant}")));
+            }
+        });
+        let series: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with(&format!("{UNKNOWN_PRIORITY_TOTAL}{{")))
+            .collect();
+        assert_eq!(series.len(), 33, "32 tenants and the sentinel:\n{rendered}");
+        let other = series
+            .iter()
+            .find(|line| line.contains("tenant=\"other\""))
+            .expect("the sentinel series");
+        assert!(other.ends_with(" 8"), "the eight past the cap: {other}");
+        // Other tests of the process intern labels of their own meanwhile;
+        // forty tenant keys through the never-freed interner would be forty.
+        assert!(
+            interner_size().saturating_sub(interned_before) < 40,
+            "the tenant keys never reach the process-wide interner"
+        );
+    }
 }

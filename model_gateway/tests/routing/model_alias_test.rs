@@ -120,9 +120,8 @@ mod model_alias_tests {
     /// rather than passing the worker's through, so it needs its own check
     /// that the reported model is the one that actually ran.
     ///
-    /// Uses `/rerank`, not `/v1/rerank`: the latter takes only `query` and
-    /// `documents` and hardcodes the model to the `unknown` wildcard, so no
-    /// alias can reach the router through it.
+    /// Uses `/rerank`, whose body carries the required `model`; `/v1/rerank`
+    /// reads an optional one and is covered by the http tests.
     #[tokio::test]
     async fn test_rerank_forwards_and_reports_the_canonical_model() {
         let recorder = RequestRecorder::new();

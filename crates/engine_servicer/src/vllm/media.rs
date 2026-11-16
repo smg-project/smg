@@ -95,8 +95,8 @@ pub enum MediaError {
     /// code as before.
     Media {
         fault: WorkerMediaFault,
-        /// The code the public API answers: `media_fetch_failed` or
-        /// `media_too_large`.
+        /// The code the public API answers: `invalid_multimodal_request`,
+        /// `media_fetch_failed` or `media_too_large`.
         code: &'static str,
         message: String,
     },
@@ -181,7 +181,7 @@ impl MediaGate {
     async fn acquire(&self) -> Result<OwnedSemaphorePermit, Status> {
         let admitted = self
             .waiting
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
                 (waiting < self.limit).then_some(waiting + 1)
             });
         if admitted.is_err() {
@@ -333,7 +333,9 @@ pub(super) async fn process_media_refs(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0),
-        want_identity: req.kv_transfer_params_json.is_some() || req.kv_transfer_params.is_some(),
+        want_identity: req.kv_transfer_params_json.is_some()
+            || req.kv_transfer_params.is_some()
+            || super::generate::ec_transfer_params_sent(req),
     };
     let waited = Instant::now();
     let permit = gate.acquire().await.map_err(refused)?;

@@ -1,0 +1,9 @@
+# The reference arm's environment: the serving engine image's own pins of the libraries that
+# decide the reference processor's bytes (install torch and torchvision from the CPU index:
+#   pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu
+# then the rest of this file).
+transformers==5.17.0
+pillow==12.3.0
+numpy==2.2.6
+opencv-python-headless==5.0.0.93
+soundfile>=0.13

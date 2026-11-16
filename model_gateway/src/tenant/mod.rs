@@ -1,6 +1,10 @@
 //! Canonical tenant identity and per-request metadata for serving paths.
 
-use std::{net::IpAddr, sync::Arc};
+use std::{
+    fmt::{self, Write as _},
+    net::IpAddr,
+    sync::{Arc, LazyLock},
+};
 
 pub const DEFAULT_TENANT_HEADER_NAME: &str = "x-smg-tenant-id";
 
@@ -21,16 +25,71 @@ pub enum TenantIdentity {
 }
 
 impl TenantIdentity {
+    /// The canonical key, allocated once: a prefixed form is laid out on the
+    /// stack and copied into the key's shared text, the anonymous key is one
+    /// kept value, an explicit key shares the text it was given.
     #[must_use]
     pub fn into_key(self) -> TenantKey {
-        let key = match self {
-            Self::Authenticated(id) => format!("auth:{id}"),
-            Self::Header(id) => format!("header:{id}"),
-            Self::IpAddress(addr) => format!("ip:{addr}"),
-            Self::Anonymous => "anonymous".to_string(),
-            Self::Explicit(key) => key.to_string(),
-        };
-        TenantKey::from(key)
+        match self {
+            Self::Authenticated(id) => prefixed_key("auth:", &id),
+            Self::Header(id) => prefixed_key("header:", &id),
+            Self::IpAddress(addr) => prefixed_key("ip:", &addr),
+            Self::Anonymous => ANONYMOUS_TENANT_KEY.clone(),
+            Self::Explicit(key) => TenantKey::from(key),
+        }
+    }
+}
+
+/// The key of a caller the gateway knows nothing about.
+static ANONYMOUS_TENANT_KEY: LazyLock<TenantKey> = LazyLock::new(|| TenantKey::new("anonymous"));
+
+/// `<prefix><id>` as one allocation: formatted onto the stack (a serving-path
+/// id is at most [`MAX_TENANT_ID_LEN`] bytes), then copied once into the key;
+/// a longer text takes the two-step path through a `String`.
+fn prefixed_key(prefix: &str, id: &dyn fmt::Display) -> TenantKey {
+    let mut text = StackText::<256>::default();
+    if write!(text, "{prefix}{id}").is_ok() {
+        if let Some(text) = text.as_str() {
+            return TenantKey::new(text);
+        }
+    }
+    TenantKey::from(format!("{prefix}{id}"))
+}
+
+/// A fixed-capacity text buffer on the stack, written through [`fmt::Write`];
+/// a write past the capacity fails and leaves the buffer as it was.
+struct StackText<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Default for StackText<N> {
+    fn default() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+}
+
+impl<const N: usize> StackText<N> {
+    /// The text written so far (every write copies whole strings, so the
+    /// bytes are always a valid text).
+    fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.bytes[..self.len]).ok()
+    }
+}
+
+impl<const N: usize> fmt::Write for StackText<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self
+            .len
+            .checked_add(s.len())
+            .filter(|end| *end <= N)
+            .ok_or(fmt::Error)?;
+        self.bytes[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
     }
 }
 
@@ -191,6 +250,28 @@ mod tests {
             None
         );
         assert_eq!(tenant_of(TenantIdentity::Anonymous), None);
+    }
+
+    /// A text past the stack buffer takes the two-step path and reads the
+    /// same as the one-allocation path.
+    #[test]
+    fn a_key_past_the_stack_buffer_keeps_its_form() {
+        let long = "x".repeat(300);
+        let key = TenantIdentity::Header(Arc::from(long.as_str())).into_key();
+        assert_eq!(key.as_str(), format!("header:{long}"));
+        assert!(is_canonical_serving_tenant_key(key.as_str()));
+        let short = TenantIdentity::Header(Arc::from("team-red")).into_key();
+        assert_eq!(short.as_str(), "header:team-red");
+    }
+
+    #[test]
+    fn stack_text_refuses_a_write_past_its_capacity_and_keeps_what_it_had() {
+        let mut text = StackText::<8>::default();
+        assert!(text.write_str("abcd").is_ok());
+        assert!(text.write_str("efghi").is_err());
+        assert_eq!(text.as_str(), Some("abcd"));
+        assert!(text.write_str("efgh").is_ok());
+        assert_eq!(text.as_str(), Some("abcdefgh"));
     }
 
     #[test]

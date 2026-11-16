@@ -1,24 +1,28 @@
 //! z.ai (GLM) contract rules, from the providers-verifier golden set recorded
 //! against GLM-5.3-Flash and docs.z.ai.
 //!
-//! The GLM-5.3 series cannot switch thinking off and takes efforts
-//! low/high/max; other GLM generations keep their thinking switch and the
-//! documented wider set (GLM-5-Next is not pinned: its contract is not
+//! The GLM-5.3 series cannot switch thinking off. It takes the efforts
+//! low, high and max. It reads minimal as low, medium as high and xhigh as
+//! max, as z.ai does. It refuses `none`. Other GLM generations keep their
+//! thinking switch and the documented wider set (GLM-5-Next is not pinned: its contract is not
 //! recorded, and the registry's media grouping says nothing about it). The
-//! sampling defaults go to the models docs.z.ai lists them for. Everything
+//! sampling defaults go to the models docs.z.ai lists them for. GLM-5.3-Flash
+//! also applies its sampling switch and accepts zero top-p as top-1. Everything
 //! else is z.ai-wide: `thinking.clear_thinking` reaches the chat template,
 //! `tool_stream` is consumed, unknown tool types and `file_url` blocks are
 //! 400s. `file_url` is refused at ingress on every backend, deliberately:
 //! the vendor fetches the file itself and no self-hosted engine does, and
 //! validation runs before the backend is known; a pass-through for an
 //! upstream z.ai proxy would need the backend at validation time.
-//! `max_tokens` beyond the window is the gateway's (`context_length_exceeded`).
+//! Flash Chat caps explicit output budgets at the hosted API maximum (128K),
+//! also for self-hosted workers. An omitted budget stays unset so the backend
+//! can fit it to the remaining context window. Worker window checks still apply.
 
 use serde_json::Value;
 
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent, ThinkingType},
-    common::{invalid, ContentPart},
+    common::{invalid, invalid_at, ContentPart},
 };
 
 /// The vendor's sampling defaults, applied when the client omits the field so
@@ -33,8 +37,20 @@ const DEFAULTS_MARKERS: [&str; 5] = ["glm-5", "glm5", "glm_5", "glm-4.6", "glm-4
 /// spellings the multimodal registry matches too (`registry/glm53_flash.rs`).
 const GLM53_MARKERS: [&str; 5] = ["glm-5.3", "glm5.3", "glm_5.3", "glm-5-3", "glm5-3"];
 
-/// The effort levels the GLM-5.3 series accepts.
-const GLM53_EFFORTS: [&str; 3] = ["low", "high", "max"];
+/// Spellings that select the Flash Chat contract.
+const GLM53_FLASH_MARKERS: [&str; 5] = [
+    "glm-5.3-flash",
+    "glm5.3-flash",
+    "glm_5.3-flash",
+    "glm-5-3-flash",
+    "glm5-3-flash",
+];
+
+// Hosted API budgets: https://docs.z.ai/guides/overview/concept-param#max-tokens
+const FLASH_MAX_OUTPUT_TOKENS: u32 = 131_072;
+
+/// The vendor switch that selects greedy decoding when explicitly false.
+const DO_SAMPLE: &str = "do_sample";
 
 /// The effort levels docs.z.ai documents for the other GLM generations.
 const REASONING_EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -53,12 +69,15 @@ const FILE_URL: &str = "file_url";
 
 /// Whether any `/`-separated segment of a model id starts with one of the
 /// markers, the marker's last digit not continued by another (`glm-5.3`
-/// names the 5.3 series, not a `glm-5.30`).
+/// names the 5.3 series, not a `glm-5.30`). Flash markers also reject
+/// alphabetic continuations such as `flashlight`.
 fn model_matches(model: &str, markers: &[&str]) -> bool {
     model.split('/').any(|segment| {
         markers.iter().any(|marker| {
             super::starts_with_ignore_ascii_case(segment, marker)
-                && !segment[marker.len()..].starts_with(|c: char| c.is_ascii_digit())
+                && !segment[marker.len()..].starts_with(|c: char| {
+                    c.is_ascii_digit() || (marker.ends_with("flash") && c.is_ascii_alphabetic())
+                })
         })
     })
 }
@@ -76,10 +95,52 @@ fn is_glm53(model: &str) -> bool {
     is_series(model, &GLM53_MARKERS)
 }
 
+/// Match a Flash model name or registered alias, allowing deployment suffixes
+/// after a separator and excluding names like `glm-5.3-flashlight`.
+pub(super) fn is_glm53_flash(model: &str) -> bool {
+    is_series(model, &GLM53_FLASH_MARKERS)
+}
+
+/// The GLM-5.3 level for an effort name. A level is its own name. z.ai
+/// reads minimal as low, medium as high and xhigh as max. All other names
+/// give `None`. `none` is one of them, because the series cannot switch
+/// thinking off.
+fn glm53_level(effort: &str) -> Option<&'static str> {
+    match effort {
+        "low" | "minimal" => Some("low"),
+        "high" | "medium" => Some("high"),
+        "max" | "xhigh" => Some("max"),
+        _ => None,
+    }
+}
+
+/// Apply GLM request defaults and normalize Flash sampling before validation.
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
-    if is_series(&req.model, &DEFAULTS_MARKERS) {
+    let flash = is_glm53_flash(&req.model);
+    if flash || is_series(&req.model, &DEFAULTS_MARKERS) {
         req.temperature.get_or_insert(DEFAULT_TEMPERATURE);
         req.top_p.get_or_insert(DEFAULT_TOP_P);
+    }
+    if flash {
+        if req.other.get(DO_SAMPLE).and_then(Value::as_bool) == Some(false) {
+            req.temperature = Some(0.0);
+            req.top_p = Some(1.0);
+            req.top_k = Some(1);
+        } else if req.top_p == Some(0.0) {
+            // Encode the compatibility extension as top-1 because the gRPC
+            // backends interpret a zero top_p as unset.
+            req.top_p = Some(1.0);
+            req.top_k = Some(1);
+        }
+    }
+    if is_glm53(&req.model) {
+        // Write the level into each effort field. The engine and an
+        // upstream z.ai then see a level only.
+        for effort in super::effort_fields(req) {
+            if let Some(level) = glm53_level(effort) {
+                *effort = level.into();
+            }
+        }
     }
     if let Some(clear) = req.thinking.as_ref().and_then(|t| t.clear_thinking) {
         req.chat_template_kwargs
@@ -90,21 +151,77 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     req.other.remove(TOOL_STREAM);
 }
 
+/// Validate the GLM contract, including Flash's effective sampling and output limits.
 pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
+    if is_glm53_flash(&req.model) {
+        validate_flash_sampling(req)?;
+        validate_flash_output_budget(req)?;
+    }
     let glm53 = is_glm53(&req.model);
     validate_thinking_type(req, glm53)?;
     if glm53 {
         validate_thinking_enabled(req)?;
-        validate_efforts(req, &GLM53_EFFORTS, "low, high or max")?;
+        validate_efforts(
+            req,
+            |effort| glm53_level(effort).is_some(),
+            "low, high or max, or minimal, medium or xhigh",
+        )?;
     } else {
         validate_efforts(
             req,
-            &REASONING_EFFORTS,
+            |effort| REASONING_EFFORTS.contains(&effort),
             "none, minimal, low, medium, high, xhigh or max",
         )?;
     }
     validate_tools(req)?;
     validate_content_parts(req)
+}
+
+/// Check Flash's vendor switch and its narrower temperature range.
+fn validate_flash_sampling(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
+    if req
+        .other
+        .get(DO_SAMPLE)
+        .is_some_and(|value| !value.is_null() && !value.is_boolean())
+    {
+        return Err(invalid_at(
+            DO_SAMPLE,
+            "invalid_flash_boolean",
+            "do_sample must be a boolean or null for this model",
+        ));
+    }
+    if req
+        .temperature
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        return Err(invalid_at(
+            "temperature",
+            "temperature_out_of_range",
+            "temperature must be between 0 and 1 for this model",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate both output fields independently, including a shadowed legacy
+/// value. The shared Chat validator enforces the lower bound on both fields.
+fn validate_flash_output_budget(
+    req: &ChatCompletionRequest,
+) -> Result<(), validator::ValidationError> {
+    #[expect(deprecated, reason = "the hosted cap applies to both wire fields")]
+    for (field, value) in [
+        ("max_tokens", req.max_tokens),
+        ("max_completion_tokens", req.max_completion_tokens),
+    ] {
+        if value.is_some_and(|value| value > FLASH_MAX_OUTPUT_TOKENS) {
+            return Err(invalid_at(
+                field,
+                "max_tokens_out_of_range",
+                format!("{field} must not exceed {FLASH_MAX_OUTPUT_TOKENS} for this model"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `thinking.type` is `enabled` or `disabled` at z.ai, whatever the model;
@@ -151,12 +268,11 @@ fn validate_thinking_enabled(
     Ok(())
 }
 
-/// The effort must be one the model takes, in each spelling the request
-/// carries: both are forwarded, so a bad value hidden behind the preferred
-/// one still counts.
+/// Refuse an effort name the model does not accept, in `reasoning_effort`
+/// and in `thinking.effort`. Both fields are forwarded, so both are checked.
 fn validate_efforts(
     req: &ChatCompletionRequest,
-    allowed: &[&str],
+    accepted: impl Fn(&str) -> bool,
     hint: &str,
 ) -> Result<(), validator::ValidationError> {
     let efforts = [
@@ -167,7 +283,7 @@ fn validate_efforts(
         ("reasoning_effort", req.reasoning_effort.as_deref()),
     ];
     for (field, effort) in efforts {
-        if effort.is_some_and(|effort| !allowed.contains(&effort)) {
+        if effort.is_some_and(|effort| !accepted(effort)) {
             return Err(pinned("reasoning_effort_not_allowed", field, hint));
         }
     }
@@ -284,8 +400,11 @@ mod tests {
         assert_eq!(validate(&request(json!({}))), Ok(()));
     }
 
+    /// The three levels pass as sent. The three mapped names pass too, and
+    /// normalization writes their levels into both fields. `none` and
+    /// unknown names are refused.
     #[test]
-    fn only_low_high_and_max_efforts_are_accepted() {
+    fn glm53_takes_its_three_levels_and_the_names_zai_maps_to_them() {
         for effort in ["low", "high", "max"] {
             assert_eq!(
                 validate(&request(json!({"reasoning_effort": effort}))),
@@ -297,25 +416,54 @@ mod tests {
                 Ok(()),
                 "thinking.effort {effort}"
             );
+            let mut req = request(json!({"reasoning_effort": effort}));
+            ProviderProfile::Zai.normalize_chat(&mut req);
+            assert_eq!(req.reasoning_effort.as_deref(), Some(effort), "{effort}");
         }
-        for effort in ["none", "minimal", "medium", "xhigh", "ultra", "turbo"] {
+        for (name, level) in [("minimal", "low"), ("medium", "high"), ("xhigh", "max")] {
+            // Validation takes the mapped name as sent, with no normalization.
+            assert_eq!(
+                validate(&request(json!({"reasoning_effort": name}))),
+                Ok(()),
+                "{name}"
+            );
+            assert_eq!(
+                validate(&request(json!({"thinking": {"effort": name}}))),
+                Ok(()),
+                "thinking.effort {name}"
+            );
+            let mut req = request(json!({
+                "reasoning_effort": name,
+                "thinking": {"type": "enabled", "effort": name}
+            }));
+            ProviderProfile::Zai.normalize_chat(&mut req);
+            assert_eq!(req.reasoning_effort.as_deref(), Some(level), "{name}");
+            assert_eq!(
+                req.thinking.as_ref().and_then(|t| t.effort.as_deref()),
+                Some(level),
+                "thinking.effort {name}"
+            );
+            assert_eq!(validate(&req), Ok(()), "{name} after normalization");
+        }
+        for effort in ["none", "ultra", "turbo"] {
             assert_eq!(
                 validate(&request(json!({"reasoning_effort": effort}))),
                 Err("reasoning_effort_not_allowed".into()),
                 "{effort}"
             );
+            assert_eq!(
+                validate(&request(
+                    json!({"thinking": {"type": "enabled", "effort": effort}})
+                )),
+                Err("reasoning_effort_not_allowed".into()),
+                "thinking.effort {effort}"
+            );
         }
-        assert_eq!(
-            validate(&request(
-                json!({"thinking": {"type": "enabled", "effort": "medium"}})
-            )),
-            Err("reasoning_effort_not_allowed".into())
-        );
         // Both spellings are forwarded, so the shadowed one is checked too.
         assert_eq!(
             validate(&request(json!({
                 "thinking": {"type": "enabled", "effort": "low"},
-                "reasoning_effort": "medium"
+                "reasoning_effort": "none"
             }))),
             Err("reasoning_effort_not_allowed".into())
         );
@@ -440,6 +588,19 @@ mod tests {
             let mut req = with_model(model, json!({"tool_stream": true}));
             ProviderProfile::Zai.normalize_chat(&mut req);
             assert!(!req.other.contains_key(TOOL_STREAM), "{model}");
+            // The name mapping is for GLM-5.3 only. These models keep the
+            // name as sent.
+            let mut req = with_model(
+                model,
+                json!({"reasoning_effort": "medium", "thinking": {"effort": "xhigh"}}),
+            );
+            ProviderProfile::Zai.normalize_chat(&mut req);
+            assert_eq!(req.reasoning_effort.as_deref(), Some("medium"), "{model}");
+            assert_eq!(
+                req.thinking.as_ref().and_then(|t| t.effort.as_deref()),
+                Some("xhigh"),
+                "{model}"
+            );
         }
         assert_eq!(
             validate(&with_model(
@@ -529,7 +690,7 @@ mod tests {
         );
         assert_eq!(
             validate(&request(
-                json!({"model": ALIAS, "reasoning_effort": "medium"})
+                json!({"model": ALIAS, "reasoning_effort": "none"})
             )),
             Err("reasoning_effort_not_allowed".into())
         );
@@ -539,6 +700,9 @@ mod tests {
             )),
             Ok(())
         );
+        let mut req = request(json!({"model": ALIAS, "reasoning_effort": "medium"}));
+        ProviderProfile::for_model(&req.model).normalize_chat(&mut req);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -561,9 +725,12 @@ mod tests {
         );
         assert_eq!(
             validate(&request(
-                json!({"model": ALIAS, "reasoning_effort": "medium"})
+                json!({"model": ALIAS, "reasoning_effort": "none"})
             )),
             Err("reasoning_effort_not_allowed".into())
         );
+        let mut req = request(json!({"model": ALIAS, "reasoning_effort": "medium"}));
+        ProviderProfile::for_model(&req.model).normalize_chat(&mut req);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
     }
 }

@@ -5,6 +5,7 @@
 //! per-item encoder inputs and per-item content hashes used for encode routing.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     time::Instant,
 };
@@ -25,8 +26,8 @@ use super::{
         serialize_tokenspeed_encoder_input, serialize_tokenspeed_encoder_input_owned, wire_dtype,
     },
     transport::{
-        mm_encoder_input_dtype, mm_vllm_device_normalizes, mm_vllm_encoder_input_dtype,
-        resolve_mm_shm_enabled, resolve_mm_shm_min_bytes,
+        mm_encoder_input_dtype, mm_sglang_encoder_input_dtype, mm_vllm_device_normalizes,
+        mm_vllm_encoder_input_dtype, resolve_mm_shm_enabled, resolve_mm_shm_min_bytes,
     },
     MediaBatch, MultimodalIntermediate, PrecomputedMultimodalIntermediate, PromptBinding,
 };
@@ -66,6 +67,7 @@ pub(crate) async fn assemble_multimodal_data_after_encode(
     assemble_multimodal_data_impl(intermediate, client, workers, true).await
 }
 
+/// Dispatch assembly using the selected backend and worker metadata.
 async fn assemble_multimodal_data_impl(
     intermediate: MultimodalIntermediate,
     client: &BackendClient,
@@ -78,7 +80,7 @@ async fn assemble_multimodal_data_impl(
     // so assembly can never silently mishandle a modality the backend lacks.
     ensure_client_supports_intermediate(client, &intermediate)?;
     match client {
-        BackendClient::Grpc(GrpcClient::Sglang(_)) => assemble_sglang_data(intermediate),
+        BackendClient::Grpc(GrpcClient::Sglang(_)) => assemble_sglang_data(intermediate, workers),
         BackendClient::Grpc(GrpcClient::Vllm(_)) => Ok(MultimodalData::Vllm(
             assemble_vllm_batches(intermediate, workers)?,
         )),
@@ -143,9 +145,9 @@ async fn assemble_multimodal_data_impl(
                     spawn_tokenspeed_assembly(intermediate, options).await?,
                 ))
             }
-            // The same single batch the gRPC arm sends the servicer: the
+            // The same modality batches the gRPC arm sends the servicer: the
             // adapter frames it as the scheduler's processor output.
-            RuntimeType::Sglang => assemble_sglang_data(intermediate),
+            RuntimeType::Sglang => assemble_sglang_data(intermediate, workers),
             runtime => anyhow::bail!(
                 "multimodal inputs are not supported over the {runtime} ZMQ backend yet"
             ),
@@ -153,10 +155,32 @@ async fn assemble_multimodal_data_impl(
     }
 }
 
-/// The SGLang payload, one batch, as both the gRPC and the ZMQ arm send it.
-fn assemble_sglang_data(intermediate: MultimodalIntermediate) -> Result<MultimodalData> {
-    let batch = into_single_batch(intermediate, "SGLang")?;
-    Ok(MultimodalData::Sglang(assemble_sglang(batch)?))
+/// Both transports share the same per-modality assembly.
+/// Write every SGLang batch in the selected worker's declared floating dtype.
+fn assemble_sglang_data(
+    intermediate: MultimodalIntermediate,
+    workers: Option<&WorkerSelection>,
+) -> Result<MultimodalData> {
+    Ok(MultimodalData::Sglang(assemble_sglang_batches(
+        intermediate,
+        mm_sglang_encoder_input_dtype(workers).as_str(),
+    )?))
+}
+
+/// Assemble each modality independently, retaining its tensors and prompt bindings.
+pub(super) fn assemble_sglang_batches(
+    intermediate: MultimodalIntermediate,
+    dtype: &str,
+) -> Result<SglangMultimodalData> {
+    let mut batches = intermediate.into_batches().into_iter();
+    let first = batches
+        .next()
+        .context("SGLang multimodal input has no batches")?;
+    let mut data = assemble_sglang_with_dtype(first, dtype)?;
+    data.extra_batches = batches
+        .map(|batch| assemble_sglang_with_dtype(batch, dtype))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(data)
 }
 
 /// Run TokenSpeed batch assembly on a blocking thread, guarding SHM output.
@@ -222,8 +246,9 @@ fn assemble_vllm_batches(
 #[derive(Debug, Clone)]
 pub(super) struct VllmAssembly {
     /// The float dtype the primary tensor is written in (`float32`,
-    /// `bfloat16`, `float16`).
-    pub encoder_dtype: String,
+    /// `bfloat16`, `float16`): the process's own name borrowed, or the one
+    /// copy of the worker's label.
+    pub encoder_dtype: Cow<'static, str>,
     /// The engine rescales and normalizes pixels on device: it takes the
     /// pixels' own `uint8` bytes and would normalize floats twice.
     pub device_normalizes: bool,
@@ -269,7 +294,7 @@ pub(super) fn assemble_vllm_batches_with(
     Ok(data)
 }
 
-/// SGLang and TRT-LLM take a single preprocessed batch (one modality). The
+/// TRT-LLM takes a single preprocessed batch (one modality). The
 /// per-modality capability is enforced by
 /// [`ensure_client_supports_intermediate`]; this only enforces the structural
 /// single-batch constraint.
@@ -298,15 +323,6 @@ fn ensure_client_supports_intermediate(
     ensure_backend_supports_modalities(client.runtime_type(), intermediate)
 }
 
-/// Assemble router-side tensors with the backward-compatible float32 dtype.
-fn assemble_sglang(
-    intermediate: PrecomputedMultimodalIntermediate,
-) -> Result<SglangMultimodalData> {
-    // Router-side processing retains its established dtype. A native worker
-    // may select the vision encoder's dtype explicitly.
-    assemble_sglang_with_dtype(intermediate, "float32")
-}
-
 /// Serialize worker pixels in the configured vision dtype, preserving integer metadata.
 pub(super) fn assemble_sglang_with_dtype(
     intermediate: PrecomputedMultimodalIntermediate,
@@ -331,6 +347,7 @@ pub(super) fn assemble_sglang_with_dtype(
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, true)?;
 
     Ok(SglangMultimodalData {
+        extra_batches: Vec::new(),
         modality: modality.to_string(),
         image_data: Vec::new(),
         pixel_values,
@@ -343,35 +360,56 @@ pub(super) fn assemble_sglang_with_dtype(
 }
 
 /// The dtype the primary tensor is written in: the engine's own float dtype,
-/// or the pixels' own bytes for an engine that normalizes on device. A
-/// preprocessor that produces normalized floats has no bytes to give such an
-/// engine, which is a deployment mismatch, said once.
+/// or the pixels' own bytes for an engine that normalizes on device.
+/// Normalized floats have no bytes to give such an engine, which would
+/// normalize them again: the request is refused
+/// ([`FloatsForDeviceNormalization`]) rather than answered wrong.
 fn vllm_pixel_dtype<'a>(
     preprocessed: &PreprocessedEncoderInputs,
     assembly: &'a VllmAssembly,
-) -> &'a str {
+) -> Result<&'a str> {
     if !assembly.device_normalizes {
-        return &assembly.encoder_dtype;
+        return Ok(&assembly.encoder_dtype);
     }
     if preprocessed.encoder_input.pixel_norm().is_some() {
-        return "uint8";
+        return Ok("uint8");
     }
-    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    WARNED.get_or_init(|| {
-        warn!(
-            "the engine normalizes pixels on device but this model's preprocessor produces \
-             normalized floats, which the engine will normalize again; start the engine with \
-             --mm-device-do-normalize=false"
-        );
-    });
-    &assembly.encoder_dtype
+    Err(anyhow::Error::new(FloatsForDeviceNormalization))
 }
+
+/// Normalized floats met a worker that normalizes pixels on device
+/// (`mm_device_do_normalize`): it takes the pixels' own bytes and would
+/// normalize these a second time, so the request is refused instead of
+/// answered wrong. A processor that produces floats meets it on every
+/// request to such a worker (a pairing the in-process pipeline refuses at
+/// startup); a processor that produces bytes meets it on the one batch it
+/// can only pad after normalizing (a Pixtral-tower batch of images of
+/// different sizes), which both pipelines answer as the request's own error
+/// (`assembly_error_response` on the router side, `WorkerMediaError::Invalid`
+/// on the worker side). The remedy is in the message: a worker that does not
+/// normalize on device, or images the processor gives as bytes.
+#[derive(Debug)]
+pub(crate) struct FloatsForDeviceNormalization;
+
+impl std::fmt::Display for FloatsForDeviceNormalization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the selected worker normalizes pixels on device (mm_device_do_normalize) and takes \
+             raw pixel bytes, but these images were prepared as normalized floats, which it \
+             would normalize again; serve the model on a worker that does not normalize on \
+             device (--mm-device-do-normalize=false), or send images the processor gives as \
+             bytes (one image, or images of one size, per request)",
+        )
+    }
+}
+
+impl std::error::Error for FloatsForDeviceNormalization {}
 
 fn assemble_vllm(
     intermediate: PrecomputedMultimodalIntermediate,
     assembly: &VllmAssembly,
 ) -> Result<VllmMultimodalData> {
-    let dtype = vllm_pixel_dtype(&intermediate.preprocessed, assembly);
+    let dtype = vllm_pixel_dtype(&intermediate.preprocessed, assembly)?;
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
         serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, dtype)?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
@@ -442,7 +480,8 @@ fn assemble_trtllm(
     let MediaBatch::Images(images) = &intermediate.media else {
         anyhow::bail!("TRT-LLM assembly requires an image batch");
     };
-    let image_data = images.iter().map(|f| f.raw_bytes.to_vec()).collect();
+    // The request shares each frame's file; nothing is copied per image.
+    let image_data = images.iter().map(|f| f.raw_bytes.clone()).collect();
     Ok(TrtllmMultimodalData { image_data })
 }
 
@@ -484,7 +523,7 @@ pub(crate) fn assemble_tokenspeed_for_encode(
 struct TokenSpeedAssemblyOptions {
     shm_enabled: bool,
     shm_min_bytes: usize,
-    encoder_input_dtype: String,
+    encoder_input_dtype: Cow<'static, str>,
     skip_pixel_values: bool,
 }
 
@@ -559,7 +598,7 @@ fn assemble_tokenspeed_with_options(
         // encoder_input is stripped downstream (clear_mm_pixel_values), so skip
         // the per-item slice + serialize entirely when skip_pixel_values is set.
         let encoder_input = if skip_pixel_values {
-            TokenSpeedTensor::inline(Vec::new(), Vec::new(), encoder_input_dtype.clone())
+            TokenSpeedTensor::inline(Vec::new(), Vec::new(), encoder_input_dtype.to_string())
         } else if let Some(input) = owned_input.take() {
             match serialize_tokenspeed_encoder_input_owned(
                 input,

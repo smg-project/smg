@@ -15,22 +15,24 @@ use axum::{
 use bytes::Bytes;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
-    chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
-    stop::StopSequenceDecoderBuilder,
+    chat_template::{
+        ChatTemplateContentFormat, ChatTemplateParams, PreparedTools, ThinkingKeyName,
+    },
     traits::{Encoding, PromptEncoding, Tokenizer},
-    StopSequenceDecoder,
+    StopRules, StopSequenceConfig, StopSequenceDecoder,
 };
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{
-        ContentPart, FunctionCallResponse, StringOrArray, Tool, ToolCall, ToolChoice,
-        ToolChoiceValue,
+        ContentPart, FunctionCallResponse, ResponseFormat, StringOrArray, Tool, ToolCall,
+        ToolChoice, ToolChoiceValue,
     },
     generate::GenerateFinishReason,
+    profile::ProviderProfile,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, task::yield_now};
 use tool_parser::types::ToolCallItem;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -292,10 +294,41 @@ pub(crate) fn missing_tokenizer_response(
     )
 }
 
-/// Below this input size (in bytes) the `spawn_blocking` + permit round-trip
-/// costs more than the encode itself, so we tokenize inline. Larger prompts —
-/// the ones that actually pin a worker thread — are offloaded.
-const ENCODE_OFFLOAD_MIN_BYTES: usize = 512;
+/// Below this input size (in bytes) a prompt is tokenized on the runtime
+/// thread that holds the request; from this size up the encode runs on the
+/// blocking pool, bounded by [`encode_permits`], so no worker is held for
+/// longer than about one request's own share of work: a single prompt by its
+/// own size, a batch (a completion with several prompts, as text or as ids, a
+/// tokenize call, a Decisions request's prompts and label probes) by what the
+/// call has already encoded or decoded in place, through [`InPlaceBudget`]. A
+/// prompt of ids counts its ids' bytes, four each. An input under the
+/// break-even size ([`OFFLOAD_BREAK_EVEN_BYTES`]) never takes the pool: once
+/// the call's share is spent it yields the worker instead.
+///
+/// The bound is where the encode outweighs its offload. An offloaded encode
+/// costs the request a round trip through the pool: the pool thread's wake,
+/// the request task re-scheduled through the inject queue when the encode
+/// ends, and the parked worker those wakes notify. On the gateway's CPU bed
+/// (the repository's `gateway-perf` cells: eight runtime threads, 500 chat
+/// requests per second against scripted engines) the round trip costs the
+/// same whatever the prompt's length: about 55 k instructions, 3.7 context
+/// switches and, on a virtual machine, 0.25 ms of CPU time per request more
+/// than the same encode in place, and the first token leaves 0.2 ms later.
+/// The encode itself costs about 70 k instructions and 10-20 us per
+/// kilobyte of prompt with a byte-level BPE tokenizer: from one kilobyte up
+/// the work outweighs the trip in instructions, and at 16 KiB (about 3,000
+/// tokens, 0.2-0.3 ms) it still holds a worker for no longer than one short
+/// request's own CPU time (0.3 ms). Above that the pool takes it. The
+/// earlier bound of 512 bytes charged the round trip to every ordinary
+/// conversation: a system prompt and a few turns render to 1-10 KiB.
+const ENCODE_OFFLOAD_MIN_BYTES: usize = 16 * 1024;
+
+/// Below this input size the pool's round trip costs more than the work it
+/// would move (the measurement above: a trip is about 55 k instructions, an
+/// encode about 70 k per kilobyte), so such an input never takes the pool:
+/// when the call's in-place share is spent it yields the worker once instead
+/// and starts the next share.
+const OFFLOAD_BREAK_EVEN_BYTES: usize = 1024;
 
 /// Bounds how many CPU-bound encodes run concurrently on the blocking pool.
 /// tokio's blocking pool is otherwise unbounded (grows to 512 threads), so under
@@ -312,36 +345,249 @@ fn encode_permits() -> &'static Semaphore {
     })
 }
 
-/// Run CPU-bound tokenization off the async worker threads so it cannot stall
-/// the runtime, bounded by [`encode_permits`] so concurrent offloaded encodes
-/// cannot oversubscribe the CPU. Inputs below the threshold run inline to avoid
-/// the offload round-trip dominating.
-async fn offload<F>(len: usize, encode: F) -> anyhow::Result<Encoding>
+/// Whether a prompt of `len` bytes is encoded on the blocking pool: at or above
+/// [`ENCODE_OFFLOAD_MIN_BYTES`]; a shorter one runs inline, so the offload's
+/// round trip does not dominate it. The one rule [`offload`] and
+/// [`encode_blocking`] read.
+fn offloads(len: usize) -> bool {
+    len >= ENCODE_OFFLOAD_MIN_BYTES
+}
+
+/// Run CPU-bound tokenizer work, an encode or a decode, off the async worker
+/// threads so it cannot stall the runtime, bounded by [`encode_permits`] so
+/// concurrent offloaded jobs cannot oversubscribe the CPU. Inputs below the
+/// threshold ([`offloads`]) run inline to avoid the offload round-trip
+/// dominating.
+async fn offload<T, F>(len: usize, work: F) -> anyhow::Result<T>
 where
-    F: FnOnce() -> anyhow::Result<Encoding> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    if len < ENCODE_OFFLOAD_MIN_BYTES {
-        return encode();
+    if !offloads(len) {
+        return work();
     }
-    let _permit = encode_permits()
+    pool(work).await
+}
+
+/// Run `work` on the blocking pool behind the [`encode_permits`].
+async fn pool<T, F>(work: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    pool_on(encode_permits(), work).await
+}
+
+/// Run `work` on the blocking pool behind one of `permits`. The permit rides
+/// in the blocking closure, held until the work ends whatever happens to this
+/// future: a pass ended by another input's error, or dropped by a client
+/// gone, still counts its running jobs against the bound.
+async fn pool_on<T, F>(permits: &'static Semaphore, work: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    let permit = permits
         .acquire()
         .await
         .map_err(|e| anyhow!("encode semaphore closed: {e}"))?;
-    tokio::task::spawn_blocking(encode)
-        .await
-        .map_err(|e| anyhow!("tokenization task failed: {e}"))?
-}
-
-/// Tokenize `text` through the offload policy of [`offload`].
-pub(crate) async fn encode_blocking(
-    tokenizer: Arc<dyn Tokenizer>,
-    text: String,
-    add_special_tokens: bool,
-) -> anyhow::Result<Encoding> {
-    offload(text.len(), move || {
-        tokenizer.encode(&text, add_special_tokens)
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
     })
     .await
+    .map_err(|e| anyhow!("tokenizer task failed: {e}"))?
+}
+
+/// Tokenize `text` through the offload policy of [`offload`]: a prompt below
+/// the threshold ([`offloads`]) encodes in place, from the caller's own text;
+/// one at or above it is copied once, for the blocking task, which outlives
+/// the borrow.
+pub(crate) async fn encode_blocking(
+    tokenizer: Arc<dyn Tokenizer>,
+    text: &str,
+    add_special_tokens: bool,
+) -> anyhow::Result<Encoding> {
+    if !offloads(text.len()) {
+        return tokenizer.encode(text, add_special_tokens);
+    }
+    let text = text.to_string();
+    pool(move || tokenizer.encode(&text, add_special_tokens)).await
+}
+
+/// What one call has encoded or decoded on the runtime thread since it last
+/// yielded it: the call's share. A call places its inputs one after another
+/// against it, so it holds a worker for about one input at the bound before
+/// it lets go: an input that would take the share over the bound goes to the
+/// pool if it is worth the trip ([`OFFLOAD_BREAK_EVEN_BYTES`]), and a smaller
+/// one has the call yield the worker once and start the next share.
+#[derive(Default)]
+pub(crate) struct InPlaceBudget {
+    in_place: usize,
+}
+
+/// Where an input of a call runs, by [`InPlaceBudget::place`].
+enum Placement {
+    /// On the calling thread, within the share.
+    InPlace,
+    /// On the blocking pool.
+    Pool,
+    /// On the calling thread, once the call has yielded it: the share is spent.
+    AfterYield,
+}
+
+impl InPlaceBudget {
+    /// Where an input of `len` bytes runs, the share charged when in place.
+    fn place(&mut self, len: usize) -> Placement {
+        if offloads(len) {
+            return Placement::Pool;
+        }
+        let total = self.in_place + len;
+        if !offloads(total) {
+            self.in_place = total;
+            Placement::InPlace
+        } else if len >= OFFLOAD_BREAK_EVEN_BYTES {
+            Placement::Pool
+        } else {
+            Placement::AfterYield
+        }
+    }
+
+    /// The next share, opened by an input of `len` bytes after the yield.
+    fn next_share(&mut self, len: usize) {
+        self.in_place = len;
+    }
+}
+
+/// Tokenize one `text` of a call's sequence through the offload policy, the
+/// call's [`InPlaceBudget`] placing it: in place from the caller's own text,
+/// as [`encode_blocking`] does below the bound; on the pool from one copy; or
+/// in place once the call has yielded the worker. A call that holds several
+/// inputs at once places them in one pass with [`encode_texts_blocking`].
+pub(crate) async fn encode_blocking_in_batch(
+    tokenizer: Arc<dyn Tokenizer>,
+    text: &str,
+    add_special_tokens: bool,
+    budget: &mut InPlaceBudget,
+) -> anyhow::Result<Encoding> {
+    match budget.place(text.len()) {
+        Placement::InPlace => tokenizer.encode(text, add_special_tokens),
+        Placement::AfterYield => {
+            yield_now().await;
+            budget.next_share(text.len());
+            tokenizer.encode(text, add_special_tokens)
+        }
+        Placement::Pool => {
+            let text = text.to_string();
+            pool(move || tokenizer.encode(&text, add_special_tokens)).await
+        }
+    }
+}
+
+/// Tokenize a call's `texts` as one pass over them: each is placed once by
+/// the call's [`InPlaceBudget`]; the texts in place are encoded one after
+/// another on the calling thread, the call yielding the worker once per spent
+/// share, and the texts worth the trip run on the pool beside them, started
+/// with the pass's first poll and joined at its end. The encodings in the
+/// texts' order.
+pub(crate) async fn encode_texts_blocking(
+    tokenizer: Arc<dyn Tokenizer>,
+    texts: &[String],
+    add_special_tokens: bool,
+) -> anyhow::Result<Vec<Encoding>> {
+    place_all(
+        texts.iter(),
+        |text| text.len(),
+        |text| tokenizer.encode(text.as_str(), add_special_tokens),
+        |text| {
+            let (tokenizer, text) = (tokenizer.clone(), text.to_string());
+            Box::new(move || tokenizer.encode(&text, add_special_tokens))
+        },
+    )
+    .await
+}
+
+/// Decode a call's prompts given as ids, `lists`, as one pass over them, as
+/// [`encode_texts_blocking`] does for texts: a prompt of ids leaves the worker
+/// thread at the same size a text prompt does, four bytes an id. The texts in
+/// the lists' order.
+pub(crate) async fn decode_ids_blocking(
+    tokenizer: Arc<dyn Tokenizer>,
+    lists: Vec<Vec<u32>>,
+    skip_special_tokens: bool,
+) -> anyhow::Result<Vec<String>> {
+    place_all(
+        lists,
+        |ids| ids.len() * size_of::<u32>(),
+        |ids| tokenizer.decode(ids, skip_special_tokens),
+        |ids| {
+            let tokenizer = tokenizer.clone();
+            Box::new(move || tokenizer.decode(&ids, skip_special_tokens))
+        },
+    )
+    .await
+}
+
+/// The pool's job for an input a call does not run in place.
+type PoolJob<T> = Box<dyn FnOnce() -> anyhow::Result<T> + Send + 'static>;
+
+/// One pass of a call over its `inputs` through the offload policy: `len` is
+/// an input's bytes for the budget, `in_place` runs one on the calling
+/// thread, `job` makes the pool's job of one. The pass is planned first, every
+/// input placed and the pool's jobs made; then the pool's join and the
+/// in-place pass run together, the join polled first, so the pool's jobs
+/// start on the pass's first poll and the in-place inputs run one after
+/// another, the call yielding the worker once per spent share. The outputs in
+/// the inputs' order; the first error ends the pass, and a pool job already
+/// running finishes on its thread, its permit held until then ([`pool_on`]).
+async fn place_all<I, T>(
+    inputs: impl IntoIterator<Item = I>,
+    len: impl Fn(&I) -> usize,
+    in_place: impl Fn(&I) -> anyhow::Result<T>,
+    job: impl Fn(I) -> PoolJob<T>,
+) -> anyhow::Result<Vec<T>>
+where
+    T: Send + 'static,
+{
+    let mut budget = InPlaceBudget::default();
+    let mut outputs: Vec<Option<T>> = Vec::new();
+    // The in-place inputs in order, each with whether the call yields before it.
+    let mut placed = Vec::new();
+    let mut pooled = Vec::new();
+    for (index, input) in inputs.into_iter().enumerate() {
+        let len = len(&input);
+        match budget.place(len) {
+            Placement::InPlace => placed.push((index, input, false)),
+            Placement::AfterYield => {
+                budget.next_share(len);
+                placed.push((index, input, true));
+            }
+            Placement::Pool => {
+                let job = job(input);
+                pooled.push(async move { pool(job).await.map(|output| (index, output)) });
+            }
+        }
+        outputs.push(None);
+    }
+    let in_place_pass = async {
+        let mut done = Vec::with_capacity(placed.len());
+        for (index, input, yields_first) in placed {
+            if yields_first {
+                yield_now().await;
+            }
+            done.push((index, in_place(&input)?));
+        }
+        anyhow::Ok(done)
+    };
+    let (from_pool, from_here) =
+        futures::future::try_join(futures::future::try_join_all(pooled), in_place_pass).await?;
+    for (index, output) in from_pool.into_iter().chain(from_here) {
+        outputs[index] = Some(output);
+    }
+    outputs
+        .into_iter()
+        .map(|output| output.ok_or_else(|| anyhow!("an input of the pass was left unplaced")))
+        .collect()
 }
 
 /// Tokenize a rendered chat prompt the way its renderer said to: a deferred
@@ -353,7 +599,7 @@ pub(crate) async fn encode_prompt_blocking(
     encoding: PromptEncoding,
 ) -> anyhow::Result<Encoding> {
     match encoding {
-        PromptEncoding::FromText => encode_blocking(tokenizer, text.to_string(), false).await,
+        PromptEncoding::FromText => encode_blocking(tokenizer, text, false).await,
         PromptEncoding::Deferred(job) => offload(text.len(), move || job.run()).await,
     }
 }
@@ -434,7 +680,7 @@ pub(crate) fn process_content_format(
 }
 
 pub(super) const REASONING_EFFORT_KEY: &str = "reasoning_effort";
-const TOOL_CHOICE_KEY: &str = "tool_choice";
+pub(super) const TOOL_CHOICE_KEY: &str = "tool_choice";
 const RESPONSE_FORMAT_KEY: &str = "response_format";
 
 /// The template kwarg both prompt paths tell the tool choice through: the
@@ -454,15 +700,60 @@ pub(crate) fn insert_tool_choice_kwarg(
 /// owns interpretation (level→value mapping, `tool_choice`/`response_format`
 /// rendering, defaulting, and validation); an explicit `chat_template_kwargs`
 /// entry wins, except for `reasoning_effort`: the request-level effort
-/// (`thinking.effort`, else the top-level field) is written over an entry,
-/// as the engine's own server renders it.
-fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String, Value> {
-    let kwargs_capacity = 3 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
-    let mut combined = HashMap::with_capacity(kwargs_capacity);
-    if let Some(tool_choice) = &request.tool_choice {
+/// (`thinking.effort`, else the top-level field) owns the key, as the
+/// engine's own server renders it, written over an entry as the request's
+/// provider profile hands it to the template
+/// (`ProviderProfile::template_reasoning_effort`, given the thinking
+/// preference the prompt renders with: the template's own `thinking_mode`
+/// switch among the kwargs where the template reads that key, `thinking_key`
+/// being the tokenizer's detected thinking key as the backed plan gates its
+/// mode kwargs, else the typed toggle or the profile's reading of the effort),
+/// and the entry removed when the profile hands the template none. A control
+/// the renderer never reads (`reads`: the tokenizer's
+/// [`Tokenizer::template_reads`]) is left out: it could not reach the prompt,
+/// and a `response_format` carries a schema the copy into the kwarg walks
+/// node by node.
+fn build_chat_template_kwargs(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+    thinking_key: Option<ThinkingKeyName>,
+    reads: impl Fn(&str) -> bool,
+) -> HashMap<String, Value> {
+    let request_kwargs = request
+        .chat_template_kwargs
+        .as_ref()
+        .map_or(0, HashMap::len);
+    let explicit = matches!(thinking_key, Some(ThinkingKeyName::ThinkingMode))
+        .then(|| provider.thinking_from_template_kwargs(request.chat_template_kwargs.as_ref()))
+        .flatten();
+    let reasoning_effort = provider.template_reasoning_effort(
+        request.effective_reasoning_effort(),
+        explicit.or_else(|| request.template_thinking_for(provider)),
+    );
+    let tool_choice = request
+        .tool_choice
+        .as_ref()
+        .filter(|_| reads(TOOL_CHOICE_KEY));
+    let response_format = request
+        .response_format
+        .as_ref()
+        .filter(|_| reads(RESPONSE_FORMAT_KEY));
+    // A plain request (no tool choice, no response format, no kwargs, no
+    // effort), or one whose controls the template never reads, renders with
+    // no kwargs at all: its map stays unallocated.
+    let mut combined = if tool_choice.is_some()
+        || response_format.is_some()
+        || request_kwargs > 0
+        || reasoning_effort.is_some()
+    {
+        HashMap::with_capacity(3 + request_kwargs)
+    } else {
+        HashMap::new()
+    };
+    if let Some(tool_choice) = tool_choice {
         insert_tool_choice_kwarg(&mut combined, tool_choice);
     }
-    if let Some(response_format) = &request.response_format {
+    if let Some(response_format) = response_format {
         if let Ok(value) = serde_json::to_value(response_format) {
             combined.insert(RESPONSE_FORMAT_KEY.to_string(), value);
         }
@@ -470,24 +761,52 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     if let Some(template_kwargs) = &request.chat_template_kwargs {
         combined.extend(template_kwargs.clone());
     }
-    if let Some(reasoning_effort) = request.effective_reasoning_effort() {
-        combined.insert(
-            REASONING_EFFORT_KEY.to_string(),
-            Value::String(reasoning_effort.to_string()),
-        );
+    if request.effective_reasoning_effort().is_some() {
+        match reasoning_effort {
+            Some(reasoning_effort) => {
+                combined.insert(
+                    REASONING_EFFORT_KEY.to_string(),
+                    Value::String(reasoning_effort.to_string()),
+                );
+            }
+            None => {
+                combined.remove(REASONING_EFFORT_KEY);
+            }
+        }
     }
     combined
 }
 
 /// The thinking preference the prompt is rendered with: the typed toggle,
 /// else the effective effort as the request's provider profile reads it
-/// (`ChatCompletionRequest::template_thinking`).
-fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
-    request.template_thinking()
+/// (`ChatCompletionRequest::template_thinking_for`, with the profile the
+/// preparation stage derived once for the request).
+fn resolve_template_thinking(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+) -> Option<bool> {
+    request.template_thinking_for(provider)
 }
 
-/// gRPC backends require content parts the gateway knows how to render.
+/// Validate content sent to a model template, using the tool declarations
+/// that the template will receive.
+pub(crate) fn validate_chat_template_content_parts(
+    request: &ChatCompletionRequest,
+) -> Result<(), String> {
+    validate_chat_parts(&request.messages, Some(request))
+}
+
+/// Validate gRPC chat content outside the regular template preparation path.
 pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<(), String> {
+    validate_chat_parts(messages, None)
+}
+
+/// Reject unsupported parts and permit a homogeneous list of declared Flash
+/// tool references only in a tool message sent to the model template.
+fn validate_chat_parts(
+    messages: &[ChatMessage],
+    template_request: Option<&ChatCompletionRequest>,
+) -> Result<(), String> {
     for message in messages {
         let content = match message {
             ChatMessage::System { content, .. }
@@ -498,18 +817,102 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
             ChatMessage::Assistant { content, .. } => content.as_ref(),
             ChatMessage::Function { .. } => None,
         };
+        let assistant = matches!(message, ChatMessage::Assistant { .. });
+        // The roles whose content the public contract keeps to text: a media
+        // part there is refused here, before any fetch, in this door's own
+        // sentence, not after the pipeline processed it and the rendered
+        // prompt's anchors did not match it (none for a system, developer or
+        // root part; one too many for an assistant part on a template that
+        // renders assistant media). The binding carries the role's article
+        // for the sentence.
+        let text_only_role = match message {
+            ChatMessage::System { .. } => Some("a system"),
+            ChatMessage::Developer { .. } => Some("a developer"),
+            ChatMessage::Assistant { .. } => Some("an assistant"),
+            ChatMessage::Root { .. } => Some("a root"),
+            ChatMessage::User { .. } | ChatMessage::Tool { .. } | ChatMessage::Function { .. } => {
+                None
+            }
+        };
         if let Some(MessageContent::Parts(parts)) = content {
             for part in parts {
-                if let ContentPart::Unknown(fields) = part {
-                    let type_name = fields
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("<missing>");
-                    return Err(format!(
-                        "Unsupported chat content part type {type_name:?} for gRPC backends"
-                    ));
+                match part {
+                    ContentPart::Unknown(fields) => {
+                        let type_name = fields
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<missing>");
+                        if let Some(request) = template_request.filter(|request| {
+                            type_name == "tool_reference"
+                                && matches!(message, ChatMessage::Tool { .. })
+                                && ProviderProfile::for_model(&request.model)
+                                    .supports_chat_tool_references(&request.model)
+                        }) {
+                            validate_tool_references(
+                                parts,
+                                request.tools.as_deref().unwrap_or_default(),
+                            )?;
+                            break;
+                        }
+                        return Err(format!(
+                            "Unsupported chat content part type {type_name:?} for gRPC backends"
+                        ));
+                    }
+                    ContentPart::Refusal { .. } if !assistant => {
+                        return Err(
+                            "Unsupported chat content part type \"refusal\" outside an assistant \
+                             message for gRPC backends"
+                                .to_string(),
+                        );
+                    }
+                    _ => {
+                        if let (Some(kind), Some(role)) = (media_part_type(part), text_only_role) {
+                            return Err(format!(
+                                "Unsupported chat content part type {kind:?} in {role} message \
+                                 for gRPC backends: media parts are taken in user and tool messages"
+                            ));
+                        }
+                    }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// The wire name (`type`) of a media content part; `None` for any other part.
+fn media_part_type(part: &ContentPart) -> Option<&'static str> {
+    match part {
+        ContentPart::ImageUrl { .. } => Some("image_url"),
+        ContentPart::AudioUrl { .. } => Some("audio_url"),
+        ContentPart::InputAudio { .. } => Some("input_audio"),
+        ContentPart::VideoUrl { .. } => Some("video_url"),
+        ContentPart::Text { .. } | ContentPart::Refusal { .. } | ContentPart::Unknown(_) => None,
+    }
+}
+
+/// The template selects the reference path by the first block and emits only
+/// matching tools. Refuse mixed lists and unknown names before they can lose
+/// content in that rendering.
+fn validate_tool_references(parts: &[ContentPart], tools: &[Tool]) -> Result<(), String> {
+    for part in parts {
+        let fields = match part {
+            ContentPart::Unknown(fields)
+                if fields.get("type").and_then(Value::as_str) == Some("tool_reference") =>
+            {
+                fields
+            }
+            _ => return Err("tool_reference content must contain only tool references".into()),
+        };
+        let name = fields.get("name").and_then(Value::as_str);
+        if !name.is_some_and(|name| {
+            tools
+                .iter()
+                .any(|tool| tool.tool_type == "function" && tool.function.name == name)
+        }) {
+            return Err(
+                "tool_reference.name must name a function available to the template".into(),
+            );
         }
     }
     Ok(())
@@ -541,13 +944,28 @@ fn process_content_format_with_order(
                 .map_err(|e| format!("Failed to serialize message: {e}"))?;
 
             if let Some(obj) = message_json.as_object_mut() {
+                // The engines' chat utils build an assistant turn for the
+                // template from its content, tool calls, reasoning and name. A
+                // replayed refusal, audio reference or deprecated function call
+                // is kept for an upstream and left out here, so the prompt is
+                // the one the engine itself renders.
+                if obj.get("role").and_then(Value::as_str) == Some("assistant") {
+                    for key in ["refusal", "audio", "function_call"] {
+                        obj.remove(key);
+                    }
+                }
+
                 // skip_serializing_none omits content when None (a tool-call-only
-                // assistant turn, the OpenAI shape). The engine's chat utils hand
-                // such a turn to the template as empty content in the template's
-                // own format, never as none, which a template that tests, splits
-                // or concatenates every assistant message's content cannot take.
-                if obj.get("role").and_then(|v| v.as_str()) == Some("assistant")
-                    && !obj.contains_key("content")
+                // assistant turn, the OpenAI shape), and a function result with
+                // `content: null` keeps its null on the wire. The engine's chat
+                // utils hand such a turn to the template as empty content in the
+                // template's own format, never as none, which a template that
+                // tests, splits or concatenates every message's content cannot
+                // take.
+                if matches!(
+                    obj.get("role").and_then(|v| v.as_str()),
+                    Some("assistant" | "function")
+                ) && obj.get("content").is_none_or(Value::is_null)
                 {
                     obj.insert("content".to_string(), empty_content(content_format));
                 }
@@ -598,19 +1016,23 @@ fn transform_content_field(
             // Replace media parts with placeholders. The default order builds
             // separate media/text buckets for the front placement; the
             // authored order appends each rendered part as it is encountered.
-            let mut media_parts: Vec<String> = Vec::new();
-            let mut text_parts: Vec<String> = Vec::new();
-            let mut authored_parts: Vec<String> = Vec::new();
+            // The lists borrow the parts from the message's own values and the
+            // template's placeholders; the join copies each part once.
+            let mut media_parts: Vec<&str> = Vec::new();
+            let mut text_parts: Vec<&str> = Vec::new();
+            let mut authored_parts: Vec<&str> = Vec::new();
             for part in content_array {
                 let Some(obj) = part.as_object() else {
                     continue;
                 };
                 match obj.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => {
-                        if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
+                    // A refusal part is the turn's text, as the engines' own
+                    // servers render it.
+                    Some(type_name @ ("text" | "refusal")) => {
+                        if let Some(t) = obj.get(type_name).and_then(|t| t.as_str()) {
                             match media_order {
-                                MediaPartOrder::MediaFirst => text_parts.push(t.to_string()),
-                                MediaPartOrder::Authored => authored_parts.push(t.to_string()),
+                                MediaPartOrder::MediaFirst => text_parts.push(t),
+                                MediaPartOrder::Authored => authored_parts.push(t),
                             }
                         }
                     }
@@ -628,10 +1050,10 @@ fn transform_content_field(
                         })?;
                         match media_order {
                             MediaPartOrder::MediaFirst => {
-                                media_parts.push(placeholder.to_string());
+                                media_parts.push(placeholder);
                             }
                             MediaPartOrder::Authored => {
-                                authored_parts.push(placeholder.to_string());
+                                authored_parts.push(placeholder);
                             }
                         }
                     }
@@ -639,7 +1061,7 @@ fn transform_content_field(
                 }
             }
 
-            let ordered: Vec<String> = match media_order {
+            let ordered: Vec<&str> = match media_order {
                 MediaPartOrder::MediaFirst => media_parts.into_iter().chain(text_parts).collect(),
                 MediaPartOrder::Authored => authored_parts,
             };
@@ -652,17 +1074,23 @@ fn transform_content_field(
             // the request's order whatever `media_order` says: the template
             // walks them and writes each anchor where its part sits (a text
             // part before an image renders before it), which is how the
-            // engine's own server hands them to such a template.
+            // engine's own server hands them to such a template. A refusal
+            // part becomes a text part, as that server hands it over.
             let processed_parts: Vec<Value> = content_array
                 .iter()
                 .map(|part| {
                     part.as_object()
-                        .and_then(|obj| obj.get("type")?.as_str())
-                        .and_then(|type_str| match type_str {
-                            "image_url" => Some(json!({"type": "image"})),
-                            "video_url" => Some(json!({"type": "video"})),
-                            "audio_url" | "input_audio" => Some(json!({"type": "audio"})),
-                            _ => None,
+                        .and_then(|obj| {
+                            let type_str = obj.get("type")?.as_str()?;
+                            match type_str {
+                                "image_url" => Some(json!({"type": "image"})),
+                                "video_url" => Some(json!({"type": "video"})),
+                                "audio_url" | "input_audio" => Some(json!({"type": "audio"})),
+                                "refusal" => {
+                                    Some(json!({"type": "text", "text": obj.get("refusal")?}))
+                                }
+                                _ => None,
+                            }
                         })
                         .unwrap_or_else(|| part.clone())
                 })
@@ -806,6 +1234,7 @@ pub fn process_chat_messages_with_encoding(
         tokenizer,
         placeholder_tokens.as_ref(),
         MediaPartOrder::MediaFirst,
+        ProviderProfile::for_model(&request.model),
     )
 }
 
@@ -817,6 +1246,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
     tokenizer: &dyn Tokenizer,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
+    provider: ProviderProfile,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
     let rendered = {
         // Get content format and transform messages accordingly: the format
@@ -844,7 +1274,31 @@ pub(crate) fn process_chat_messages_with_placeholders(
         // tool set and shared by every request that carries the same tools.
         let prepared_tools = request.tools.as_deref().map(prepare_tools).transpose()?;
 
-        let combined_template_kwargs = build_chat_template_kwargs(request);
+        let combined_template_kwargs =
+            build_chat_template_kwargs(request, provider, tokenizer.thinking_key_name(), |name| {
+                tokenizer.template_reads(name)
+            });
+
+        // A renderer may constrain JSON responses: the actual response format
+        // and the continuation the render will take (an explicit template
+        // argument over the request field) decide the check.
+        if matches!(
+            request.response_format,
+            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        ) {
+            let continuation = combined_template_kwargs
+                .get("continue_final_message")
+                .and_then(Value::as_bool)
+                .unwrap_or(request.continue_final_message);
+            let assistant_prefix = transformed_messages
+                .last()
+                .filter(|message| continuation && message["role"] == "assistant")
+                .and_then(|message| message["content"].as_str());
+            tokenizer
+                .renderer_capabilities()
+                .validate_json_response(request.separate_reasoning, assistant_prefix)
+                .map_err(|error| error.to_string())?;
+        }
 
         let final_template_kwargs = if combined_template_kwargs.is_empty() {
             None
@@ -878,7 +1332,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             prepared_tools: prepared_tools.as_deref(),
             template_kwargs: final_template_kwargs,
             // The tokenizer applies the toggle under the template's own key.
-            thinking: resolve_template_thinking(request),
+            thinking: resolve_template_thinking(request, provider),
             ..Default::default()
         };
 
@@ -910,8 +1364,8 @@ pub(crate) fn process_chat_messages_with_placeholders(
         // The prefill goes into the same call so the text and its encoding are
         // produced together and cannot drift apart.
         tokenizer
-            .apply_chat_template_with_encoding(
-                &transformed_messages,
+            .apply_chat_template_with_encoding_owned(
+                transformed_messages,
                 params,
                 assistant_prefix.as_deref(),
             )
@@ -930,33 +1384,28 @@ pub(crate) fn process_chat_messages_with_placeholders(
     ))
 }
 
-/// Create a StopSequenceDecoder from stop parameters
-pub fn create_stop_decoder(
+/// The stop rules of a request, built once: its stop strings (visible when `no_stop_trim`,
+/// hidden otherwise), the tokenizer's end-of-sequence ids (unless `ignore_eos`) and its stop
+/// token ids. A stream whose request asks several choices copies them into each choice's
+/// decoder ([`StopSequenceDecoder::with_rules`]) instead of compiling them per choice.
+pub fn stop_rules(
     tokenizer: &Arc<dyn Tokenizer>,
     stop: Option<&StringOrArray>,
     stop_token_ids: Option<&Vec<u32>>,
-    skip_special_tokens: bool,
     no_stop_trim: bool,
     ignore_eos: bool,
-) -> StopSequenceDecoder {
-    // Extract stop sequences
+) -> StopRules {
     let stop_sequences: Vec<String> = match stop {
         Some(StringOrArray::String(s)) => vec![s.clone()],
         Some(StringOrArray::Array(arr)) => arr.clone(),
         None => vec![],
     };
-
-    // Build stop sequence decoder
-    let mut builder =
-        StopSequenceDecoderBuilder::new(tokenizer.clone()).skip_special_tokens(skip_special_tokens);
-
-    // Add stop sequences (visible if no_stop_trim is true, hidden otherwise)
-    for seq in stop_sequences {
-        builder = if no_stop_trim {
-            builder.visible_stop_sequence(seq)
-        } else {
-            builder.stop_sequence(seq)
-        };
+    let mut config = StopSequenceConfig::default();
+    // The stop strings are visible when no_stop_trim is set, hidden otherwise.
+    if no_stop_trim {
+        config.visible_stop_sequences = stop_sequences;
+    } else {
+        config.stop_sequences = stop_sequences;
     }
 
     // Collect stop token IDs: EOS from tokenizer (unless ignore_eos) + user-provided.
@@ -972,14 +1421,30 @@ pub fn create_stop_decoder(
         .iter()
         .chain(stop_token_ids.map(|ids| ids.as_slice()).unwrap_or_default())
     {
-        builder = if no_stop_trim {
-            builder.visible_stop_token(token_id)
+        config = if no_stop_trim {
+            config.with_visible_stop_token(token_id)
         } else {
-            builder.stop_token(token_id)
+            config.with_stop_token(token_id)
         };
     }
+    StopRules::new(config)
+}
 
-    builder.build()
+/// Create a StopSequenceDecoder from stop parameters: the request's rules
+/// ([`stop_rules`]) and a decode state of its own.
+pub fn create_stop_decoder(
+    tokenizer: &Arc<dyn Tokenizer>,
+    stop: Option<&StringOrArray>,
+    stop_token_ids: Option<&Vec<u32>>,
+    skip_special_tokens: bool,
+    no_stop_trim: bool,
+    ignore_eos: bool,
+) -> StopSequenceDecoder {
+    StopSequenceDecoder::with_rules(
+        tokenizer.clone(),
+        stop_rules(tokenizer, stop, stop_token_ids, no_stop_trim, ignore_eos),
+        skip_special_tokens,
+    )
 }
 
 /// With parallel tool calls turned off (`parallel_tool_calls: false`, or
@@ -1104,28 +1569,51 @@ pub(crate) fn generate_tool_call_id(
     tool_index: usize,
     history_count: usize,
 ) -> String {
-    // Case-insensitive substring checks without allocation.
-    let is_kimi = model
-        .as_bytes()
-        .windows(4) // "kimi".len()
-        .any(|window| window.eq_ignore_ascii_case(b"kimi"));
-
-    if !is_kimi {
+    match CallIdFamily::of(model) {
+        Some(family) => family.id(tool_name, tool_index, history_count),
         // Standard OpenAI format: call_{24-char-uuid}
-        return format!("call_{}", &Uuid::now_v7().simple().to_string()[..24]);
+        None => format!("call_{}", &Uuid::now_v7().simple().to_string()[..24]),
+    }
+}
+
+/// A model family whose call ids are numbered by the call's place in the
+/// conversation ([`generate_tool_call_id`] has the forms); every other
+/// model's ids are minted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallIdFamily {
+    KimiK2,
+    KimiK3,
+}
+
+impl CallIdFamily {
+    /// The family `model` names, read from the name.
+    pub(crate) fn of(model: &str) -> Option<Self> {
+        // Case-insensitive substring checks without allocation.
+        let names = |word: &[u8]| {
+            model
+                .as_bytes()
+                .windows(word.len())
+                .any(|window| window.eq_ignore_ascii_case(word))
+        };
+        if !names(b"kimi") {
+            return None;
+        }
+        Some(if names(b"k3") {
+            Self::KimiK3
+        } else {
+            Self::KimiK2
+        })
     }
 
-    let is_k3 = model
-        .as_bytes()
-        .windows(2) // "k3".len()
-        .any(|window| window.eq_ignore_ascii_case(b"k3"));
-
-    if is_k3 {
-        // Kimi-K3 (XTML) opaque format: {name}_{global_index}.
-        format!("{tool_name}_{}", history_count + tool_index)
-    } else {
-        // Kimi-K2 format: functions.{name}:{global_index}.
-        format!("functions.{}:{}", tool_name, history_count + tool_index)
+    /// The id of the call to `tool_name`, the `tool_index`-th of its message,
+    /// after `history_count` calls in the conversation's earlier messages.
+    pub(crate) fn id(self, tool_name: &str, tool_index: usize, history_count: usize) -> String {
+        match self {
+            // Kimi-K3 (XTML) opaque format: {name}_{global_index}.
+            Self::KimiK3 => format!("{tool_name}_{}", history_count + tool_index),
+            // Kimi-K2 format: functions.{name}:{global_index}.
+            Self::KimiK2 => format!("functions.{}:{}", tool_name, history_count + tool_index),
+        }
     }
 }
 

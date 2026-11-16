@@ -101,13 +101,13 @@ fn compare_the_one_pass_wire_with_the_two_pass_bytes(images: &[(String, DynamicI
     let mut compared = 0usize;
     for (processor_name, processor) in &processors {
         for (file, image) in images {
-            let batch = std::slice::from_ref(image);
-            let two_pass = match processor.preprocess(batch) {
+            let batch = [image];
+            let two_pass = match processor.preprocess(&batch) {
                 Ok(two_pass) => two_pass,
                 Err(error) => {
                     // A size the rule refuses is refused on both paths.
                     let one_pass = processor
-                        .preprocess_wire(batch, EncoderDtype::BFloat16)
+                        .preprocess_wire(&batch, EncoderDtype::BFloat16)
                         .expect("the pixel-byte processors write wires");
                     assert!(one_pass.is_err(), "{processor_name} {file}: {error}");
                     continue;
@@ -119,7 +119,7 @@ fn compare_the_one_pass_wire_with_the_two_pass_bytes(images: &[(String, DynamicI
                 EncoderDtype::Float32,
             ] {
                 let one_pass = processor
-                    .preprocess_wire(batch, dtype)
+                    .preprocess_wire(&batch, dtype)
                     .expect("the pixel-byte processors write wires")
                     .unwrap();
                 assert_eq!(

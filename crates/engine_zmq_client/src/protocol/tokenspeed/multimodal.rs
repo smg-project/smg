@@ -1,16 +1,16 @@
-// TokenSpeed multimodal wire structs — the native `MultimodalInputs` /
-// `MultimodalDataItem` from `runtime/multimodal/inputs.py`. Unlike the
-// request/output messages these are UNtagged `msgspec.Struct(array_like=True)`
-// positional arrays. **Field order is the wire contract** — append only,
-// never reorder.
-//
-// The msgpack transport bypasses the engine's `InputProcessor`, so everything
-// it would derive must arrive precomputed: `pad_value` (via [`mm_pad_value`]),
-// pad-substituted `input_ids` (the placeholder ranges overwritten with the pad
-// value), the original ids in `input_ids_unpadded`, and the MRoPE position
-// table of the families whose rule the translate computes (slots 3-5 of
-// [`TokenSpeedWireMmInputs`]); an item of an MRoPE family the translate has no
-// rule for is refused rather than let it silently degrade to 1-D positions.
+//! TokenSpeed multimodal wire structs — the native `MultimodalInputs` /
+//! `MultimodalDataItem` from `runtime/multimodal/inputs.py`. Unlike the
+//! request/output messages these are UNtagged `msgspec.Struct(array_like=True)`
+//! positional arrays. **Field order is the wire contract** — append only,
+//! never reorder.
+//!
+//! The msgpack transport bypasses the engine's `InputProcessor`, so everything
+//! it would derive must arrive precomputed: `pad_value` (via [`mm_pad_value`]),
+//! pad-substituted `input_ids` (the placeholder ranges overwritten with the pad
+//! value), the original ids in `input_ids_unpadded`, and the MRoPE position
+//! table of the families whose rule the translate computes (slots 3-5 of
+//! [`TokenSpeedWireMmInputs`]); an item of an MRoPE family the translate has no
+//! rule for is refused rather than let it silently degrade to 1-D positions.
 
 use std::collections::BTreeMap;
 

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex verdicts on another reviewer's findings",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdicts"],
+  "properties": {
+    "verdicts": {
+      "type": "array",
+      "description": "Exactly one entry per target finding.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["comment_id", "verdict", "reason"],
+        "properties": {
+          "comment_id": { "type": "integer", "description": "The target's comment_id, verbatim." },
+          "verdict": { "type": "string", "enum": ["agree", "disagree", "unsure"] },
+          "reason": { "type": "string", "description": "The evidence, in at most two sentences." }
+        }
+      }
+    }
+  }
+}

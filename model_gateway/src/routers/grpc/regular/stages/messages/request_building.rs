@@ -5,16 +5,17 @@ use std::{borrow::Cow, sync::Arc};
 use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::profile::ProviderProfile;
+use smg_grpc_client::FormatSetAside;
 
 use crate::routers::{
     error,
     grpc::{
         common::stages::{
             helpers::{self, TagForStart},
-            BuildStage,
+            selection_context_length, BuildStage,
         },
         context::{
-            stage_output, AttemptStamp, BuildOutput, ExecutionPlan, ExecutionPlanKind,
+            stage_output, AttemptStamp, BuildOutput, ExecutionPlan, PlanSettings,
             PreparationOutput, RequestContext,
         },
         proto_wrapper::MultimodalData,
@@ -32,16 +33,12 @@ use crate::routers::{
 /// Builds a backend-specific proto GenerateRequest from the PreparationOutput
 /// and CreateMessageRequest sampling parameters.
 pub(crate) struct MessageRequestBuildingStage {
-    inject_pd_metadata: bool,
-    plan_kind: ExecutionPlanKind,
+    settings: PlanSettings,
 }
 
 impl MessageRequestBuildingStage {
-    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
-        Self {
-            inject_pd_metadata,
-            plan_kind,
-        }
+    pub fn new(settings: PlanSettings) -> Self {
+        Self { settings }
     }
 }
 
@@ -60,8 +57,7 @@ fn build_messages_backed_plan(
     first_token_tag: bool,
     require_reasoning: bool,
     multimodal_data: Option<MultimodalData>,
-    inject_pd_metadata: bool,
-    plan_kind: ExecutionPlanKind,
+    settings: PlanSettings,
 ) -> Result<(ExecutionPlan, AttemptStamp), Response> {
     let sampling_mask = helpers::SamplingDefaultsMask::from_request_type(&ctx.input.request_type);
     backed_plan::build(
@@ -73,13 +69,14 @@ fn build_messages_backed_plan(
             processed_text,
             token_ids,
             tool_constraints,
+            // A Messages body names no format of its own.
+            format_set_aside: FormatSetAside::default(),
             table_tag,
             first_token_tag,
             require_reasoning,
             multimodal_data,
             sampling_mask,
-            inject_pd_metadata,
-            plan_kind,
+            settings,
         },
         |client, request_id, processed_text, token_ids, options| {
             client.build_messages_request(
@@ -158,6 +155,7 @@ impl BuildStage for MessageRequestBuildingStage {
             symphony::Asks::Messages {
                 request: &messages_request,
                 continues: messages_request.continues_final_assistant(),
+                has_tools: spec.has_tools,
             },
             &spec.chat_tools,
             &processed_messages.text,
@@ -179,6 +177,7 @@ impl BuildStage for MessageRequestBuildingStage {
                         request: Arc::clone(&messages_request),
                         tools,
                         continues: continued_final_message,
+                        has_tools: spec.has_tools,
                     },
                     reasoning_open: require_reasoning,
                     thought_closed,
@@ -186,6 +185,7 @@ impl BuildStage for MessageRequestBuildingStage {
             },
         )?;
 
+        let prompt_tokens = u32::try_from(token_ids.len()).unwrap_or(u32::MAX);
         let (plan, stamp) = build_messages_backed_plan(
             ctx,
             &messages_request,
@@ -196,10 +196,17 @@ impl BuildStage for MessageRequestBuildingStage {
             first_token,
             require_reasoning,
             multimodal_data,
-            self.inject_pd_metadata,
-            self.plan_kind,
+            self.settings,
         )?;
         spec.reasoning_in_prefill = require_reasoning;
+        spec.prompt_tokens = prompt_tokens;
+        // The selected worker's window, for the stop reason of a `length`
+        // finish (`MessagesResponseSpec::length_stop_reason`).
+        spec.context_window = ctx
+            .state
+            .workers
+            .as_ref()
+            .and_then(|workers| selection_context_length(workers, &ctx.input.model_id));
         spec.symphony = assignment;
         spec.parser_names.clone_from(&ctx.state.parser_names);
         Ok(BuildOutput {
@@ -215,10 +222,7 @@ impl BuildStage for MessageRequestBuildingStage {
 
     #[cfg(test)]
     fn signature(&self) -> String {
-        format!(
-            "MessageRequestBuildingStage(inject_pd_metadata={}, {:?})",
-            self.inject_pd_metadata, self.plan_kind
-        )
+        format!("MessageRequestBuildingStage({})", self.settings.signature())
     }
 }
 
@@ -229,7 +233,7 @@ mod tests {
 
     use super::*;
     use crate::routers::grpc::{
-        context::ClientSelection,
+        context::{ClientSelection, ExecutionPlanKind},
         regular::stages::testing::{
             assert_fixed_request_plan, components, mock_backend_client, FORCED_CALL_TAG,
         },
@@ -251,7 +255,7 @@ mod tests {
             }))
             .expect("a Messages request"),
         );
-        let mut ctx = RequestContext::for_messages(
+        let mut ctx = RequestContext::for_messages_carrying_its_tools(
             Arc::clone(&messages),
             None,
             MODEL.to_string(),
@@ -268,8 +272,10 @@ mod tests {
             false,
             false,
             None,
-            false,
-            ExecutionPlanKind::Single,
+            PlanSettings {
+                inject_pd_metadata: false,
+                plan_kind: ExecutionPlanKind::Single,
+            },
         )
         .map_err(|refusal| refusal.status())
         .expect("built");

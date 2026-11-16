@@ -21,15 +21,17 @@ use smg::observability::metrics::SERVER_MALLOC_CONF;
     reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
 )]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 72] = SERVER_MALLOC_CONF;
+pub static MALLOC_CONF: &[u8; 100] = SERVER_MALLOC_CONF;
 
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg::{
     config::{
-        AccessLogField, PowerOfTwoLoadMetric, TurboJpegPolicy, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+        AccessLogField, GroupedDpSticky, PowerOfTwoLoadMetric, TurboJpegPolicy,
+        DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     observability::metrics::register_jemalloc_as_global_allocator,
-    server::{self, posture::SecretSources, ServerConfig},
+    secrets::SecretFiles,
+    server::{self, posture::SecretSources, ServerConfig, DEFAULT_SHUTDOWN_GRACE_SECS},
     version,
 };
 
@@ -66,16 +68,7 @@ pub enum Backend {
 
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Backend::Sglang => "sglang",
-            Backend::Vllm => "vllm",
-            Backend::Trtllm => "trtllm",
-            Backend::Tokenspeed => "tokenspeed",
-            Backend::Openai => "openai",
-            Backend::Anthropic => "anthropic",
-            Backend::Gemini => "gemini",
-        };
-        write!(f, "{s}")
+        write_flag_value(self, f)
     }
 }
 
@@ -92,15 +85,23 @@ pub enum DiscoveryProvider {
     Consul,
 }
 
-impl DiscoveryProvider {
-    /// The spelling `--discovery-provider` takes for this provider.
-    fn flag_value(self) -> &'static str {
-        match self {
-            Self::Kubernetes => "kubernetes",
-            Self::File => "file",
-            Self::Slurm => "slurm",
-            Self::Consul => "consul",
-        }
+impl std::fmt::Display for DiscoveryProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_flag_value(self, f)
+    }
+}
+
+/// A value's spelling on the command line is its one spelling: `Display` writes
+/// the name clap parses, so a message that names a flag's value prints what the
+/// flag takes. A variant clap skips has no command-line name and prints as its
+/// `Debug` form, so a formatter that has not failed never reports an error.
+fn write_flag_value<V: ValueEnum + std::fmt::Debug>(
+    value: &V,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    match value.to_possible_value() {
+        Some(name) => f.write_str(name.get_name()),
+        None => write!(f, "{value:?}"),
     }
 }
 
@@ -309,6 +310,18 @@ struct RoutingArgs {
     #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
     upstream_http2: bool,
 
+    /// Timeout in seconds for worker startup and registration
+    #[arg(long, default_value_t = 1800, help_heading = "Worker Configuration")]
+    worker_startup_timeout_secs: u64,
+
+    /// Grace period in seconds before the first worker startup check
+    #[arg(long, default_value_t = 0, help_heading = "Worker Configuration")]
+    worker_startup_delay: u64,
+
+    /// Interval in seconds between worker startup checks
+    #[arg(long, default_value_t = 30, help_heading = "Worker Configuration")]
+    worker_startup_check_interval: u64,
+
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
@@ -384,7 +397,7 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 5, help_heading = "Routing Policy")]
     bucket_adjust_interval_secs: usize,
 
-    /// Abandon cache affinity for shortest-queue when the KV-usage spread
+    /// Abandon cache affinity for expected-wait routing when the KV-usage spread
     /// (hottest minus coldest backend, 0.0-1.0) exceeds this — catches
     /// long-context KV imbalance that request counts miss. Backend must
     /// report token_usage. Finite and > 0.0; >= 1.0 disables it.
@@ -458,10 +471,10 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     selection_temperature: f32,
 
-    /// Worker selection policy for cache_aware, run over the per-worker
-    /// inputs the router gathers (prefix overlap, in-flight requests,
-    /// backend load reports); cache-aware-default, the affinity-group
-    /// decision, is the one policy
+    /// Worker selection policy for cache_aware, run over each worker's
+    /// prefix overlap and decayed affinity score and the fleet's mean
+    /// in-flight count; cache-aware-default, the affinity-group decision,
+    /// is the one policy
     #[arg(
         long,
         default_value = "cache-aware-default",
@@ -557,13 +570,8 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     least_load_mean_prefill_tokens: u32,
 
-    /// Per-worker waiting-queue cap for least_load: skip workers whose reported
-    /// waiting requests (plus dispatches since their last poll) have reached
-    /// this count; 0 disables. Set below the engine's max batch size
-    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
-    least_load_max_waiting_requests: u32,
-
-    /// What power_of_two compares: expected_wait (default), requests or least_requests
+    /// What power_of_two compares: expected_wait (default), requests, least_requests or
+    /// resident_tokens:<request_tokens> (resident context tokens plus that many per request)
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
     power_of_two_load_metric: PowerOfTwoLoadMetric,
 
@@ -589,7 +597,9 @@ struct RoutingArgs {
     /// transfer protocol. `lenient` refuses only a known difference in
     /// runtime, transport or KV layout (unknown components and engine
     /// versions pair with anything); `strict` also refuses unknown
-    /// components and version differences; `off` pairs on nothing.
+    /// components and version differences; `off` compares nothing of it.
+    /// On the gRPC wire two known runtimes never pair, in any mode: its
+    /// requests are in the runtime's own message type.
     #[arg(
         long,
         value_parser = ["off", "lenient", "strict"],
@@ -604,6 +614,21 @@ struct RoutingArgs {
     /// override is enabled
     #[arg(long, num_args = 0.., default_value = "x-smg-routing-key", value_parser = parse_routing_key_header, help_heading = "Routing Policy")]
     routing_key_headers: Vec<String>,
+
+    /// Whether, and how, a request that carries a routing key is pinned to
+    /// one engine of a grouped data-parallel worker (a ZMQ worker whose
+    /// socket set several engines dial, as many as --zmq-engine-count says
+    /// or its engines declare), so a conversation keeps one engine's prefix
+    /// cache. The key is the sticky-session key: the first valid
+    /// --routing-key-headers header, or the body rid under
+    /// --routing-key-override
+    #[arg(
+        long,
+        value_enum,
+        default_value = "off",
+        help_heading = "Routing Policy"
+    )]
+    grouped_dp_sticky: GroupedDpSticky,
 
     /// Enable IGW (Inference Gateway) mode for multi-model support
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -675,7 +700,7 @@ struct WorkerArgs {
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
     pd_disaggregation: bool,
 
-    /// Enable EPD (Encode-Prefill-Decode) disaggregated mode (gRPC + TokenSpeed only).
+    /// Enable EPD (Encode-Prefill-Decode) disaggregated mode (gRPC vLLM or TokenSpeed).
     /// Encode workers run the vision tower and ship embeddings to prefill over Mooncake;
     /// prefill/decode reuse the PD path. Encode urls are given via `--encode <url> [bootstrap_port]`.
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -709,18 +734,6 @@ struct WorkerArgs {
     /// Specific policy for encode nodes in EPD mode. Defaults to consistent_hashing.
     #[arg(long, value_parser = ["random", "round_robin", "consistent_hashing"], help_heading = "PD Disaggregation")]
     encode_policy: Option<String>,
-
-    /// Timeout in seconds for worker startup and registration
-    #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
-    worker_startup_timeout_secs: u64,
-
-    /// Grace period in seconds before the first worker startup check
-    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
-    worker_startup_delay: u64,
-
-    /// Interval in seconds between worker startup checks
-    #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
-    worker_startup_check_interval: u64,
 
     // ==================== Load Monitoring ====================
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
@@ -1178,7 +1191,11 @@ struct ServingArgs {
     upstream_pool_idle_timeout_secs: u64,
 
     /// Grace period in seconds to wait for in-flight requests during shutdown
-    #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_SHUTDOWN_GRACE_SECS,
+        help_heading = "Request Handling"
+    )]
     shutdown_grace_period_secs: u64,
 
     /// Keep accepting connections after readiness fails. Defaults to 5 seconds;
@@ -1242,11 +1259,24 @@ struct ServingArgs {
     /// and should retry with backoff; each is counted in
     /// smg_http_connections_rejected_total. Readiness is unaffected. Probes
     /// on the data port are subject to the bound like any connection: point
-    /// them at --health-check-port or --admin-port, which it does not cover
-    /// (the admin listener stays reachable while the data plane is
-    /// saturated). 0 = no bound
+    /// them at --health-check-port, which no bound covers. --admin-port is
+    /// outside this bound (the control plane stays reachable while the data
+    /// plane is saturated) and inside its own, --admin-max-connections. 0 =
+    /// no bound
     #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
     max_connections: usize,
+
+    /// Most client connections the admin listener (--admin-port) holds open
+    /// at once, the bound --max-connections puts on the data listener: a
+    /// connection beyond it is closed at accept, unanswered, and counted in
+    /// smg_http_connections_rejected_total. 0 = no bound. The bound is the
+    /// admin listener's own, so the control plane stays reachable while the
+    /// data plane is saturated, and a client that reaches the admin listener
+    /// cannot hold it open without limit. Needs --admin-port. Probes on the
+    /// admin port fall under the bound like any connection: point them at
+    /// --health-check-port, which no bound covers
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    admin_max_connections: usize,
 
     /// Origins a browser may call the gateway from (exact origins,
     /// space-separated), or `*` alone for any origin. Without this flag the
@@ -1306,7 +1336,9 @@ struct ServingArgs {
     #[arg(long, help_heading = "Priority Scheduler")]
     priority_scheduler_config: Option<String>,
 
-    /// Cap on per-tenant scheduler metric label cardinality (top-N + "other").
+    /// Cap on the distinct tenants the scheduler's clamp and unknown-priority
+    /// counters keep as `tenant` series of their own (the first N seen; the
+    /// remainder bucket under `tenant="other"`).
     #[arg(long, default_value_t = 32, help_heading = "Priority Scheduler")]
     priority_scheduler_tenant_metric_top_n: u32,
 
@@ -1322,7 +1354,8 @@ struct ServingArgs {
     tenant_rate_limit_config: Option<String>,
 
     // ==================== Retry Configuration ====================
-    /// Maximum number of retry attempts
+    /// Default attempts per request in all, the first one included (1 disables retries).
+    /// A worker's per-model retry override takes precedence.
     #[arg(long, default_value_t = 5, help_heading = "Retry Configuration")]
     retry_max_retries: u32,
 
@@ -1525,8 +1558,9 @@ struct ModelArgs {
     history_backend: String,
 
     /// Most stored responses the memory history backend keeps; the oldest go
-    /// first, on every write (memory backend only; a stored response takes
-    /// about 12 KB).
+    /// first, on every write (a stored response takes about 12 KB). The
+    /// Messages thread store keeps that many turns under every history
+    /// backend, the oldest evicted first.
     #[arg(long, default_value_t = 10_000, help_heading = "Backend")]
     history_memory_max_responses: usize,
 
@@ -1540,7 +1574,8 @@ struct ModelArgs {
     /// on every write; 0 keeps a record until a count bound drops it. A
     /// conversation is kept that long after its last use (created, read or
     /// updated); a background response still running is not dropped by a
-    /// count bound.
+    /// count bound. The Messages thread store keeps a turn that long after it
+    /// was written, under every history backend.
     #[arg(long, default_value_t = 86_400, help_heading = "Backend")]
     history_memory_retention_secs: u64,
 
@@ -1616,6 +1651,10 @@ struct IntegrationArgs {
     /// Oracle connection pool timeout in seconds
     #[arg(long, env = "ATP_POOL_TIMEOUT_SECS", help_heading = "Oracle Database")]
     oracle_pool_timeout_secs: Option<u64>,
+
+    /// Bound in seconds on each call to the Oracle store (pool wait, connect and the statement); a call past it is answered 503 storage_unavailable (default: 5)
+    #[arg(long, env = "ATP_OP_TIMEOUT_SECS", help_heading = "Oracle Database")]
+    oracle_op_timeout_secs: Option<u64>,
 
     // ==================== PostgreSQL Database ====================
     /// PostgreSQL database connection URL (env: SMG_POSTGRES_DB_URL; or a
@@ -1752,11 +1791,19 @@ struct IntegrationArgs {
     jwt_role_mapping: Vec<String>,
 
     /// API keys for control plane access (format: id:name:role:key; role `admin` reaches every
-    /// control plane route, `user` the read-only GET/HEAD routes)
-    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", hide_env_values = true, help_heading = "Control Plane Authentication")]
+    /// control plane route, `user` the read-only GET/HEAD routes). Also read from the environment
+    /// (CONTROL_PLANE_API_KEYS, entries separated by ',' or a newline) or a file
+    /// (--control-plane-api-keys-file); the flag beats the environment, and entries together
+    /// with a file are refused
+    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, help_heading = "Control Plane Authentication")]
     control_plane_api_keys: Vec<String>,
 
-    /// Disable audit logging for control plane operations
+    /// File holding the control-plane API keys, one id:name:role:key per line (blank lines and
+    /// lines starting with # are skipped), such as a mounted secret (env: CONTROL_PLANE_API_KEYS_FILE)
+    #[arg(long, help_heading = "Control Plane Authentication")]
+    control_plane_api_keys_file: Option<PathBuf>,
+
+    /// Disable the control-plane audit lines (the admission line and the mutation outcome line)
     #[arg(
         long,
         default_value_t = false,
@@ -1788,10 +1835,35 @@ struct IntegrationArgs {
     #[arg(skip)]
     secret_sources: SecretSources,
 
+    /// The files the keys above were read from, where a file was the
+    /// source, filled by `resolve_secret_sources` for the reload route; not
+    /// a flag.
+    #[arg(skip)]
+    secret_files: SecretFiles,
+
+    /// Watch the key files (`--api-key-file`, `--tenant-api-keys-file`,
+    /// `--control-plane-api-keys-file`) and put a changed file's keys in
+    /// force, as `POST /secrets/reload` does: a mounted secret rotated in
+    /// place takes effect without a restart. Off by default; a start with no
+    /// key file has nothing to watch and says so.
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Control Plane Authentication"
+    )]
+    secrets_auto_reload: bool,
+
     // ==================== Mesh Server ====================
+    /// Start the mesh: several gateways find each other, keep one membership
+    /// table and replicate the workers each of them registered locally.
     #[arg(long, default_value_t = false)]
     enable_mesh: bool,
 
+    /// This node's name in the mesh: the owner stamped on the worker keys it
+    /// publishes, the `peer` of its metrics and log lines. Give it a name
+    /// that survives restarts (the chart passes the pod's); the default,
+    /// `Mesh_` and four random characters, does not, and the old name stays
+    /// in the members' tables.
     #[arg(long)]
     mesh_server_name: Option<String>,
 
@@ -1805,10 +1877,17 @@ struct IntegrationArgs {
     #[arg(long)]
     mesh_advertise_host: Option<String>,
 
+    /// The mesh listener's port, advertised with `--mesh-advertise-host`;
+    /// must differ from the other listeners' ports and cannot be 0.
     #[arg(long, default_value_t = 39527)]
     mesh_port: u16,
 
-    #[arg(long, num_args = 0..)]
+    /// Where to join, as `ip:port` of other members' mesh listeners,
+    /// space- or comma-separated: while the membership table holds nobody
+    /// else, the entries are dialed in turn under the retry backoff until
+    /// one answers, and the rest of the mesh is learned from that member. On
+    /// Kubernetes `--router-selector` finds the members instead.
+    #[arg(long, num_args = 0.., value_delimiter = ',')]
     mesh_peer_urls: Vec<String>,
 
     /// The CA certificate (PEM) the mesh peers' certificates chain to. With
@@ -1886,7 +1965,7 @@ fn parse_cli_args(clap_args: Vec<String>) -> (CliArgs, bool) {
 /// on every exit, a clean stop and a failed start-up alike. The runtime is
 /// built only now: a refusal before this point costs no threads.
 fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = match server_config.runtime_worker_threads {
+    let runtime = match server_config.router_config.runtime_worker_threads {
         Some(n) => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(n)
             .enable_all()
@@ -1961,7 +2040,6 @@ mod tests {
                         args.resolve_secret_sources(&|_| Ok(None)).unwrap();
                         let router = args.to_router_config(vec![], vec![]).unwrap();
                         let server = args.to_server_config(router).unwrap();
-                        assert_eq!(server.port, 31000);
                         assert_eq!(server.router_config.port, 31000);
                     }
                 })
@@ -2135,6 +2213,58 @@ mod tests {
         );
     }
 
+    /// The banner names the worker nodes of the two disaggregated modes with
+    /// each address masked: a userinfo whole, a query cut, and an address the
+    /// parser refuses as its marker. An address with none of them reads as it
+    /// was given, so the lines of a fleet with no credential keep their
+    /// bytes. A mode with no node list prints no node line.
+    #[test]
+    fn the_banners_node_lines_mask_every_address() {
+        let node = |url: &str, port: Option<u16>| (url.to_string(), port);
+        let plain = cli_args_from(&["--pd-disaggregation", "--decode", "http://d1:5/"]);
+        assert_eq!(
+            plain.node_lines(
+                &[node("http://p1:1", Some(9001)), node("http://p2:2/", None)],
+                &[]
+            ),
+            [
+                r#"Prefill nodes: [("http://p1:1", Some(9001)), ("http://p2:2/", None)]"#,
+                r#"Decode nodes: ["http://d1:5/"]"#,
+            ]
+        );
+        assert!(plain.node_lines(&[], &[]).is_empty());
+
+        let prefill = [
+            node("http://user:s3cret@10.0.0.7:9", Some(9001)),
+            node("http://p2:2/v1?token=s3cret", None),
+        ];
+        let decode = [
+            "--decode",
+            "http://user:s3cret@10.0.0.7:10",
+            "--decode",
+            "http://user:s3cret@10.0.0.7:port",
+        ];
+        let pd = cli_args_from(&[&["--pd-disaggregation"], &decode[..]].concat());
+        assert_eq!(
+            pd.node_lines(&prefill, &[]),
+            [
+                r#"Prefill nodes: [("http://***@10.0.0.7:9", Some(9001)), ("http://p2:2/v1", None)]"#,
+                r#"Decode nodes: ["http://***@10.0.0.7:10", "<unparsable address>"]"#,
+            ]
+        );
+        let epd = cli_args_from(&[&["--epd-disaggregation"], &decode[..]].concat());
+        assert_eq!(
+            epd.node_lines(&prefill, &[node("http://user:s3cret@10.0.0.7:8", None)]),
+            [
+                r#"Encode nodes: [("http://***@10.0.0.7:8", None)]"#,
+                r#"Prefill nodes: [("http://***@10.0.0.7:9", Some(9001)), ("http://p2:2/v1", None)]"#,
+                r#"Decode nodes: ["http://***@10.0.0.7:10", "<unparsable address>"]"#,
+            ]
+        );
+        let regular = cli_args_from(&["--worker-urls", "http://user:s3cret@10.0.0.7:9"]);
+        assert!(regular.node_lines(&prefill, &[]).is_empty());
+    }
+
     /// A flag whose value has a required shape is refused by name when the
     /// shape is wrong, where it used to be dropped or passed on in silence;
     /// the well-formed spellings pass.
@@ -2185,6 +2315,14 @@ mod tests {
                 vec!["--storage-context-headers", "noeq"],
                 "storage_context_headers",
             ),
+            (vec!["--selector", "app=engine", "tier"], "selector"),
+            (vec!["--selector", "=engine"], "selector"),
+            (vec!["--selector", "app=engine tier"], "selector"),
+            (vec!["--selector", " "], "selector"),
+            (vec!["--encode-selector", "noeq"], "encode_selector"),
+            (vec!["--prefill-selector", "noeq"], "prefill_selector"),
+            (vec!["--decode-selector", "noeq"], "decode_selector"),
+            (vec!["--router-selector", "noeq"], "router_selector"),
             (
                 vec!["--request-id-headers", "bad header"],
                 "request_id_headers",
@@ -2217,6 +2355,13 @@ mod tests {
             "1",
             "--storage-context-headers",
             "x-tenant=tenant",
+            "--selector",
+            "app=engine",
+            "tier=prod",
+            "--prefill-selector",
+            "app=engine role=prefill",
+            "--router-selector",
+            "role=router",
             "--request-id-headers",
             "x-request-id",
             "--api-key",
@@ -2229,6 +2374,34 @@ mod tests {
         cli_args_from(&["--cors-allowed-origins", "*"])
             .to_router_config(vec![], vec![])
             .expect("a lone '*' is the open policy");
+    }
+
+    /// The names `--backend` and `--discovery-provider` accept are the ones
+    /// their values print, so a message that names a value spells it as the
+    /// flag takes it.
+    #[test]
+    fn a_backend_and_a_discovery_provider_print_the_names_their_flags_accept() {
+        let backends: Vec<String> = Backend::value_variants()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            backends,
+            [
+                "sglang",
+                "vllm",
+                "trtllm",
+                "tokenspeed",
+                "openai",
+                "anthropic",
+                "gemini"
+            ]
+        );
+        let providers: Vec<String> = DiscoveryProvider::value_variants()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(providers, ["kubernetes", "file", "slurm", "consul"]);
     }
 
     /// A flag that only acts with a companion is named when the companion is
@@ -2251,6 +2424,8 @@ mod tests {
             "a=b",
             "--priority-scheduler-config",
             "/dev/null",
+            "--tenant-rate-limit-config",
+            "/dev/null",
         ])
         .ignored_companions(&prefill, &encode);
         for flag in [
@@ -2262,6 +2437,7 @@ mod tests {
             "--encode-policy",
             "--selector",
             "--priority-scheduler-config",
+            "--tenant-rate-limit-config",
         ] {
             assert!(
                 ignored.iter().any(|m| m.starts_with(flag)),
@@ -2322,6 +2498,9 @@ mod tests {
             "a=b",
             "--priority-scheduler-enabled",
             "--priority-scheduler-config",
+            "/dev/null",
+            "--tenant-rate-limit-enabled",
+            "--tenant-rate-limit-config",
             "/dev/null",
         ])
         .ignored_companions(&prefill, &[]);
@@ -2399,10 +2578,17 @@ mod tests {
             "postgres://u:p@h:5432/d",
             "--redis-url",
             "redis://h:6379",
+            "--oracle-dsn",
+            "tcps://h:1522/s",
+            "--oracle-user",
+            "u",
+            "--oracle-password",
+            "p",
         ];
         let args = cli_args_from(&stores);
         assert_eq!(args.build_postgres_config(None).unwrap().op_timeout_secs, 5);
         assert_eq!(args.build_redis_config(None).unwrap().op_timeout_secs, 5);
+        assert_eq!(args.build_oracle_config(None).unwrap().op_timeout_secs, 5);
 
         let mut argv = stores.to_vec();
         argv.extend([
@@ -2410,6 +2596,8 @@ mod tests {
             "12",
             "--redis-op-timeout-secs",
             "3",
+            "--oracle-op-timeout-secs",
+            "7",
         ]);
         let args = cli_args_from(&argv);
         assert_eq!(
@@ -2417,6 +2605,7 @@ mod tests {
             12
         );
         assert_eq!(args.build_redis_config(None).unwrap().op_timeout_secs, 3);
+        assert_eq!(args.build_oracle_config(None).unwrap().op_timeout_secs, 7);
 
         let mut argv = stores.to_vec();
         argv.extend([
@@ -2424,11 +2613,15 @@ mod tests {
             "0",
             "--redis-op-timeout-secs",
             "0",
+            "--oracle-op-timeout-secs",
+            "0",
         ]);
         let args = cli_args_from(&argv);
         let err = args.build_postgres_config(None).unwrap_err().to_string();
         assert!(err.contains("op_timeout_secs"), "{err}");
         let err = args.build_redis_config(None).unwrap_err().to_string();
+        assert!(err.contains("op_timeout_secs"), "{err}");
+        let err = args.build_oracle_config(None).unwrap_err().to_string();
         assert!(err.contains("op_timeout_secs"), "{err}");
     }
 
@@ -2458,6 +2651,80 @@ mod tests {
                 other => panic!("expected {value} refused by name, got {other:?}"),
             }
         }
+    }
+
+    /// Every `--mesh-peer-urls` entry is a join peer, in the order given; an
+    /// entry that is no socket address is refused by name, whatever its
+    /// position.
+    #[test]
+    fn every_mesh_peer_url_is_a_join_peer_and_a_bad_one_is_refused_by_name() {
+        let mesh = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-host",
+            "127.0.0.1",
+            "--mesh-peer-urls",
+            "10.0.0.2:39527",
+            "10.0.0.3:39527",
+        ])
+        .build_mesh_server_config()
+        .expect("a valid mesh configuration")
+        .expect("the mesh is on");
+        let expected: Vec<std::net::SocketAddr> = vec![
+            "10.0.0.2:39527".parse().unwrap(),
+            "10.0.0.3:39527".parse().unwrap(),
+        ];
+        assert_eq!(mesh.init_peers, expected, "every entry, in order");
+
+        let err = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-host",
+            "127.0.0.1",
+            "--mesh-peer-urls",
+            "10.0.0.2:39527",
+            "not-an-address",
+        ])
+        .build_mesh_server_config()
+        .err()
+        .expect("a second entry that is no socket address must be refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("mesh_peer_urls") && text.contains("not-an-address"),
+            "the refusal names the field and the value: {text}"
+        );
+    }
+
+    /// The peer URLs may stand as separate values or as one comma-separated
+    /// list; both read as the same join peers, in the order given.
+    #[test]
+    fn mesh_peer_urls_parse_the_same_comma_separated_and_as_separate_values() {
+        let init_peers = |peer_args: &[&str]| {
+            let mut args = vec![
+                "--enable-mesh",
+                "--mesh-host",
+                "127.0.0.1",
+                "--mesh-peer-urls",
+            ];
+            args.extend_from_slice(peer_args);
+            cli_args_from(&args)
+                .build_mesh_server_config()
+                .expect("a valid mesh configuration")
+                .expect("the mesh is on")
+                .init_peers
+        };
+        let expected: Vec<std::net::SocketAddr> = vec![
+            "10.0.0.2:39527".parse().unwrap(),
+            "10.0.0.3:39527".parse().unwrap(),
+        ];
+        assert_eq!(
+            init_peers(&["10.0.0.2:39527", "10.0.0.3:39527"]),
+            expected,
+            "separate values, in order"
+        );
+        assert_eq!(
+            init_peers(&["10.0.0.2:39527,10.0.0.3:39527"]),
+            expected,
+            "one comma-separated list reads as the same join peers"
+        );
     }
 
     /// Mesh bind and advertise hosts go through the shared bind-host rule, so
@@ -2967,6 +3234,19 @@ mod tests {
         assert_eq!(defaults.max_connections, 0);
     }
 
+    /// `--admin-max-connections` is the admin listener's own bound and must
+    /// flow into `RouterConfig`; without the flag there is no bound.
+    #[test]
+    fn admin_max_connections_flag_flows_into_router_config() {
+        let bounded = cli_args_from(&["--admin-max-connections", "64", "--admin-port", "9001"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(bounded.admin_max_connections, 64);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.admin_max_connections, 0);
+    }
+
     /// The SSE keep-alive interval is a router-only setting and must flow
     /// into `RouterConfig`; it is on by default.
     #[test]
@@ -3034,6 +3314,34 @@ mod tests {
             assert!(
                 Cli::try_parse_from(argv).is_err(),
                 "--routing-key-headers {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_dp_sticky_flag_flows_into_router_config() {
+        // Off by default: no request is pinned to an engine of a grouped worker.
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.grouped_dp_sticky, GroupedDpSticky::Off);
+
+        for (flag, sticky) in [
+            ("off", GroupedDpSticky::Off),
+            ("hash", GroupedDpSticky::Hash),
+        ] {
+            let config = cli_args_from(&["--grouped-dp-sticky", flag])
+                .to_router_config(vec![], vec![])
+                .unwrap();
+            assert_eq!(
+                config.grouped_dp_sticky, sticky,
+                "--grouped-dp-sticky {flag}"
+            );
+        }
+
+        for bad in ["", "on", "1", "least_load", "HASH"] {
+            let argv = ["smg", "--grouped-dp-sticky", bad];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "--grouped-dp-sticky {bad:?} should be rejected"
             );
         }
     }
@@ -3116,6 +3424,46 @@ mod tests {
         let server = cli.to_server_config(router).unwrap();
         assert!(server.service_discovery_config.is_some());
         assert!(server.mesh_discovery_config.is_none());
+    }
+
+    /// One selector argument may carry several `key=value` pairs separated
+    /// by whitespace, the form a quoted chart value passes; the CLI reads
+    /// them as the launcher does, into one map.
+    #[test]
+    fn service_discovery_selector_reads_several_pairs_in_one_argument() {
+        let cli = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=engine role=prefill",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let server = cli.to_server_config(router).unwrap();
+        let RuntimeDiscoveryConfig::Kubernetes(discovery) = server
+            .service_discovery_config
+            .expect("service discovery config")
+        else {
+            panic!("the selector configures Kubernetes discovery");
+        };
+        assert_eq!(
+            discovery.selector.get("app").map(String::as_str),
+            Some("engine")
+        );
+        assert_eq!(
+            discovery.selector.get("role").map(String::as_str),
+            Some("prefill")
+        );
+    }
+
+    /// The refusal names the offending token, the text the launcher prints
+    /// for the same line.
+    #[test]
+    fn a_bad_selector_token_is_named_in_the_refusal() {
+        let error = cli_args_from(&["--selector", "app=engine tier"])
+            .to_router_config(vec![], vec![])
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("tier - expected 'key=value'"), "{text}");
+        assert!(!text.contains("app=engine tier -"), "{text}");
     }
 
     /// The router selector reaches the new independent mesh task unchanged.
@@ -3675,13 +4023,11 @@ mod tests {
         );
     }
 
-    /// `--health-check-port` must flow into BOTH conversion paths
-    /// (`to_router_config` and `to_server_config`), mirroring the main
-    /// listener `--port` field exactly. This is the two-path config-plumbing
-    /// guard: wiring only one path would let the flag be silently ignored on
-    /// the other.
+    /// `--health-check-port` reaches `RouterConfig`, the one home of the
+    /// listener settings, which the server configuration nests: there is no
+    /// second copy for a wiring to miss.
     #[test]
-    fn health_check_port_flows_into_both_configs() {
+    fn health_check_port_flows_into_the_router_config() {
         let cli = cli_args_from(&["--health-check-port", "8081"]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
@@ -3692,24 +4038,20 @@ mod tests {
         );
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(
-            server_config.health_check_port,
-            Some(8081),
-            "health_check_port must reach ServerConfig via to_server_config"
-        );
+        assert_eq!(server_config.router_config.health_check_port, Some(8081));
     }
 
     /// Unset `--health-check-port` means the dedicated probe listener is off:
-    /// `None` propagates through both conversions (backward-compatible default).
+    /// `None` reaches the server configuration (backward-compatible default).
     #[test]
-    fn health_check_port_defaults_to_none_in_both_configs() {
+    fn health_check_port_defaults_to_none() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.health_check_port, None);
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.health_check_port, None);
+        assert_eq!(server_config.router_config.health_check_port, None);
     }
 
     /// `--admin-port` and `--admin-host` flow into `RouterConfig`, the copy
@@ -4234,35 +4576,30 @@ mod tests {
         );
     }
 
-    /// The `--runtime-worker-threads` override must flow into BOTH conversion
-    /// paths (`to_router_config` and `to_server_config`); wiring only one path
-    /// would let the flag be silently ignored on the other (the two-path footgun).
+    /// The `--runtime-worker-threads` override reaches `RouterConfig`, from
+    /// which `serve` sizes the runtime; the server configuration nests it.
     #[test]
-    fn runtime_worker_threads_flows_into_both_configs() {
+    fn runtime_worker_threads_flows_into_the_router_config() {
         let cli = cli_args_from(&["--runtime-worker-threads", "3"]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.runtime_worker_threads, Some(3));
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(
-            server_config.runtime_worker_threads,
-            Some(3),
-            "runtime_worker_threads must reach ServerConfig via to_server_config"
-        );
+        assert_eq!(server_config.router_config.runtime_worker_threads, Some(3));
     }
 
-    /// Unset, the flag propagates as `None` through both conversions, so the
+    /// Unset, the flag reaches the server configuration as `None`, so the
     /// runtime uses tokio's container-aware default.
     #[test]
-    fn runtime_worker_threads_default_to_none_in_both_configs() {
+    fn runtime_worker_threads_default_to_none() {
         let cli = cli_args_from(&[]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.runtime_worker_threads, None);
 
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.runtime_worker_threads, None);
+        assert_eq!(server_config.router_config.runtime_worker_threads, None);
     }
 
     /// Both values the validator bounds are checked on the command line's own
@@ -4499,6 +4836,10 @@ mod tests {
                 "SMG_REDIS_URL",
                 "redis://:env-redis-pass@cache.example:6379/0",
             ),
+            (
+                "CONTROL_PLANE_API_KEYS",
+                "ops:Ops:admin:env-ops-key, ro:Read:user:env-ro-key",
+            ),
         ];
 
         let cli = resolved(&["--history-backend", "postgres"], &vars).expect("resolves");
@@ -4506,6 +4847,10 @@ mod tests {
         assert_eq!(
             cli.integrations.tenant_api_keys,
             vec!["red:env-red", "blue:env-blue", "green:env-green"]
+        );
+        assert_eq!(
+            cli.integrations.control_plane_api_keys,
+            vec!["ops:Ops:admin:env-ops-key", "ro:Read:user:env-ro-key"]
         );
         assert_eq!(
             cli.integrations.postgres_db_url.as_deref(),
@@ -4516,9 +4861,21 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::Environment),
                 tenant_api_keys: Some((SecretSource::Environment, 3)),
+                control_plane_api_keys: Some((SecretSource::Environment, 2)),
                 postgres_db_url: Some(SecretSource::Environment),
                 redis_url: None,
             }
+        );
+        let control_plane = cli
+            .build_control_plane_auth_config()
+            .expect("the resolved entries build the control-plane configuration");
+        assert_eq!(
+            control_plane
+                .api_keys
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ops", "ro"]
         );
         let config = cli
             .to_router_config(vec![], vec![])
@@ -4629,6 +4986,7 @@ mod tests {
         let vars = [
             ("SMG_API_KEY", "env-shared-key"),
             ("SMG_TENANT_API_KEYS", "red:env-red"),
+            ("CONTROL_PLANE_API_KEYS", "ops:Ops:admin:env-ops-key"),
             (
                 "SMG_POSTGRES_DB_URL",
                 "postgresql://u:env@db.example:5432/smg",
@@ -4640,6 +4998,8 @@ mod tests {
                 "flag-shared-key",
                 "--tenant-api-key",
                 "blue:flag-blue",
+                "--control-plane-api-keys",
+                "ci:CI:admin:flag-ci-key",
                 "--history-backend",
                 "postgres",
                 "--postgres-db-url",
@@ -4652,6 +5012,10 @@ mod tests {
         assert_eq!(cli.integrations.api_key.as_deref(), Some("flag-shared-key"));
         assert_eq!(cli.integrations.tenant_api_keys, vec!["blue:flag-blue"]);
         assert_eq!(
+            cli.integrations.control_plane_api_keys,
+            vec!["ci:CI:admin:flag-ci-key"]
+        );
+        assert_eq!(
             cli.integrations.postgres_db_url.as_deref(),
             Some("postgresql://u:flag@db.example:5432/smg")
         );
@@ -4660,6 +5024,7 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::Flag),
                 tenant_api_keys: Some((SecretSource::Flag, 1)),
+                control_plane_api_keys: Some((SecretSource::Flag, 1)),
                 postgres_db_url: Some(SecretSource::Flag),
                 redis_url: None,
             }
@@ -4673,6 +5038,7 @@ mod tests {
 
         assert_eq!(cli.integrations.api_key, None);
         assert!(cli.integrations.tenant_api_keys.is_empty());
+        assert!(cli.integrations.control_plane_api_keys.is_empty());
         assert_eq!(cli.integrations.postgres_db_url, None);
         assert_eq!(cli.integrations.redis_url, None);
         assert_eq!(cli.integrations.secret_sources, SecretSources::default());
@@ -4690,7 +5056,13 @@ mod tests {
         let tenants = dir.path().join("tenants");
         let pg = dir.path().join("pg-url");
         let redis = dir.path().join("redis-url");
+        let operators = dir.path().join("control-plane-keys");
         std::fs::write(&api_key, "file-shared-key\n").unwrap();
+        std::fs::write(
+            &operators,
+            "# the operators\n\nops:Ops:admin:file-ops-key\r\n  ro:Read:user:file-ro-key  \n",
+        )
+        .unwrap();
         std::fs::write(
             &tenants,
             "# the tenants\r\n\nred:file-red\r\n  blue : file-blue  \n\n# trailing comment\n",
@@ -4698,11 +5070,12 @@ mod tests {
         .unwrap();
         std::fs::write(&pg, "postgresql://u:file-pg@db.example:5432/smg").unwrap();
         std::fs::write(&redis, "  redis://:file-redis@cache.example:6379/1\n\n").unwrap();
-        let (api_key, tenants, pg, redis) = (
+        let (api_key, tenants, pg, redis, operators) = (
             api_key.to_str().unwrap(),
             tenants.to_str().unwrap(),
             pg.to_str().unwrap(),
             redis.to_str().unwrap(),
+            operators.to_str().unwrap(),
         );
 
         let by_flag = resolved(
@@ -4711,6 +5084,8 @@ mod tests {
                 api_key,
                 "--tenant-api-keys-file",
                 tenants,
+                "--control-plane-api-keys-file",
+                operators,
                 "--history-backend",
                 "postgres",
                 "--postgres-db-url-file",
@@ -4728,6 +5103,10 @@ mod tests {
             vec!["red:file-red", "blue : file-blue"]
         );
         assert_eq!(
+            by_flag.integrations.control_plane_api_keys,
+            vec!["ops:Ops:admin:file-ops-key", "ro:Read:user:file-ro-key"]
+        );
+        assert_eq!(
             by_flag.integrations.postgres_db_url.as_deref(),
             Some("postgresql://u:file-pg@db.example:5432/smg")
         );
@@ -4736,10 +5115,16 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::File),
                 tenant_api_keys: Some((SecretSource::File, 2)),
+                control_plane_api_keys: Some((SecretSource::File, 2)),
                 postgres_db_url: Some(SecretSource::File),
                 redis_url: None,
             }
         );
+        let control_plane = by_flag
+            .build_control_plane_auth_config()
+            .expect("the file's entries build the control-plane configuration");
+        assert_eq!(control_plane.api_keys.len(), 2);
+        assert_eq!(control_plane.api_keys[1].id, "ro");
         let config = by_flag.to_router_config(vec![], vec![]).expect("builds");
         assert_eq!(
             config
@@ -4755,6 +5140,7 @@ mod tests {
             &[
                 ("SMG_API_KEY_FILE", api_key),
                 ("SMG_TENANT_API_KEYS_FILE", tenants),
+                ("CONTROL_PLANE_API_KEYS_FILE", operators),
                 ("SMG_REDIS_URL_FILE", redis),
             ],
         )
@@ -4764,6 +5150,7 @@ mod tests {
             Some("file-shared-key")
         );
         assert_eq!(by_env.integrations.tenant_api_keys.len(), 2);
+        assert_eq!(by_env.integrations.control_plane_api_keys.len(), 2);
         assert_eq!(
             by_env.integrations.redis_url.as_deref(),
             Some("redis://:file-redis@cache.example:6379/1")
@@ -4773,6 +5160,7 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::File),
                 tenant_api_keys: Some((SecretSource::File, 2)),
+                control_plane_api_keys: Some((SecretSource::File, 2)),
                 postgres_db_url: None,
                 redis_url: Some(SecretSource::File),
             }
@@ -4829,6 +5217,21 @@ mod tests {
             ),
             (
                 vec![
+                    "--control-plane-api-keys",
+                    "ci:CI:admin:flag-secret",
+                    "--control-plane-api-keys-file",
+                    file,
+                ],
+                vec![],
+                "--control-plane-api-keys",
+            ),
+            (
+                vec!["--control-plane-api-keys-file", file],
+                vec![("CONTROL_PLANE_API_KEYS", "ci:CI:admin:env-secret")],
+                "--control-plane-api-keys",
+            ),
+            (
+                vec![
                     "--history-backend",
                     "postgres",
                     "--postgres-db-url",
@@ -4866,7 +5269,10 @@ mod tests {
                     "{args:?}: {named} missing from {text}"
                 );
             }
-            assert!(text.contains("SMG_"), "{args:?}: {text}");
+            assert!(
+                text.contains("SMG_") || text.contains("CONTROL_PLANE_API_KEYS"),
+                "{args:?}: {text}"
+            );
             for secret in ["flag-secret", "env-secret", "file-secret"] {
                 assert!(!text.contains(secret), "{args:?}: {text}");
             }
@@ -4912,6 +5318,16 @@ mod tests {
             (
                 vec!["--tenant-api-keys-file".into(), path(&missing)],
                 "tenant-api-keys-file",
+                "cannot be read",
+            ),
+            (
+                vec!["--control-plane-api-keys-file".into(), path(&comments_only)],
+                "control-plane-api-keys-file",
+                "holds no entry",
+            ),
+            (
+                vec!["--control-plane-api-keys-file".into(), path(&missing)],
+                "control-plane-api-keys-file",
                 "cannot be read",
             ),
             (
@@ -5023,6 +5439,7 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::File),
                 tenant_api_keys: Some((SecretSource::Environment, 1)),
+                control_plane_api_keys: None,
                 postgres_db_url: None,
                 redis_url: None,
             }
@@ -5043,16 +5460,15 @@ mod tests {
         use clap::CommandFactory;
 
         let mut command = Cli::command();
-        for id in ["oracle_password", "control_plane_api_keys"] {
-            let arg = command
-                .get_arguments()
-                .find(|arg| arg.get_id().as_str() == id)
-                .unwrap_or_else(|| panic!("{id} is an argument"));
-            assert!(
-                arg.is_hide_env_values_set(),
-                "{id} would show its environment value in the help"
-            );
-        }
+        let id = "oracle_password";
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == id)
+            .unwrap_or_else(|| panic!("{id} is an argument"));
+        assert!(
+            arg.is_hide_env_values_set(),
+            "{id} would show its environment value in the help"
+        );
         let help = command.render_long_help().to_string();
 
         for named in [
@@ -5066,10 +5482,128 @@ mod tests {
             "SMG_REDIS_URL",
             "--redis-url-file",
             "[env: ATP_PASSWORD]",
-            "[env: CONTROL_PLANE_API_KEYS]",
+            "CONTROL_PLANE_API_KEYS",
+            "--control-plane-api-keys-file",
+            "CONTROL_PLANE_API_KEYS_FILE",
         ] {
             assert!(help.contains(named), "{named} missing from the help");
         }
         assert!(!help.contains("hunter2"), "a value in the help:\n{help}");
+    }
+
+    /// The three start-up bounds hold for every worker the gateway starts
+    /// with, so the help lists them with the worker settings and not under
+    /// the disaggregation heading.
+    #[test]
+    fn the_worker_start_up_bounds_are_listed_under_worker_configuration() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        for id in [
+            "worker_startup_timeout_secs",
+            "worker_startup_delay",
+            "worker_startup_check_interval",
+        ] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == id)
+                .unwrap_or_else(|| panic!("{id} is an argument"));
+            assert_eq!(
+                arg.get_help_heading(),
+                Some("Worker Configuration"),
+                "{id} is listed under another heading"
+            );
+        }
+    }
+
+    /// The listener settings the server reads (the bind host and port, the
+    /// probe port, the body limit, the request timeout, the request-id
+    /// headers, the runtime size) live on the router configuration the
+    /// server configuration nests: the value the validator checked is the
+    /// one the listeners bind.
+    #[test]
+    fn the_server_configuration_reads_its_listener_settings_from_the_router_configuration() {
+        let cli = cli_args_from(&[
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "31234",
+            "--health-check-port",
+            "31235",
+            "--max-payload-size",
+            "4096",
+            "--request-timeout-secs",
+            "7",
+            "--request-id-headers",
+            "x-trace-id",
+            "--runtime-worker-threads",
+            "2",
+        ]);
+        let server_config = cli.configure(vec![], vec![]).expect("configures");
+        let listener = &server_config.router_config;
+        assert_eq!(
+            (listener.host.as_str(), listener.port),
+            ("127.0.0.1", 31234)
+        );
+        assert_eq!(listener.health_check_port, Some(31235));
+        assert_eq!(listener.max_payload_size, 4096);
+        assert_eq!(listener.request_timeout_secs, 7);
+        assert_eq!(
+            listener.request_id_headers.as_deref(),
+            Some(&["x-trace-id".to_string()][..])
+        );
+        assert_eq!(listener.runtime_worker_threads, Some(2));
+    }
+
+    /// `configure` validates the configuration once, through the builder's
+    /// `build()`: a second pass over the same value repeats every file read
+    /// of the validators (the scheduler YAML, the log-directory probe) for no
+    /// second opinion. An inotify watch on the scheduler file counts the
+    /// read-only opens `configure` closes; the count does not depend on
+    /// timing, since the events queue until they are read. The watch takes
+    /// the opens as well: the kernel folds two identical queued events into
+    /// one, and the open between two closes keeps them apart.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configure_reads_the_scheduler_file_once() {
+        use std::mem::MaybeUninit;
+
+        use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
+
+        let dir = tempfile::tempdir().unwrap();
+        let scheduler = dir.path().join("scheduler.yaml");
+        std::fs::write(&scheduler, "{}\n").unwrap();
+        let watch = inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).unwrap();
+        inotify::add_watch(
+            &watch,
+            &scheduler,
+            WatchFlags::OPEN | WatchFlags::CLOSE_NOWRITE,
+        )
+        .unwrap();
+
+        let cli = cli_args_from(&[
+            "--priority-scheduler-enabled",
+            "--priority-scheduler-config",
+            scheduler.to_str().unwrap(),
+        ]);
+        cli.configure(vec![], vec![]).expect("configures");
+
+        // Every read-only open `configure` made has closed by now; the
+        // non-blocking read drains what queued and stops at an empty queue.
+        let mut buf = [MaybeUninit::<u8>::uninit(); 4096];
+        let mut events = inotify::Reader::new(&watch, &mut buf);
+        let mut reads = 0;
+        loop {
+            match events.next() {
+                Ok(event) => {
+                    if event.events().contains(ReadFlags::CLOSE_NOWRITE) {
+                        reads += 1;
+                    }
+                }
+                Err(rustix::io::Errno::WOULDBLOCK) => break,
+                Err(error) => panic!("reading the inotify events: {error}"),
+            }
+        }
+        assert_eq!(reads, 1, "configure read the scheduler file {reads} times");
     }
 }

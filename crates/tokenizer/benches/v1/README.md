@@ -1,14 +1,14 @@
 # Optional tokenizers v1 encoding
 
 Build the gateway with `cargo build --release -p smg --features tokenizers-v1`.
-The default build continues using tokenizers 0.23. The optional dependency is
-aliased as `tokenizers_v1` and pinned to `1.0.0-rc.3`. Enabling it accelerates
-single and batch text encoding inside `HuggingFaceTokenizer`. Full decode with a
-plain ByteLevel decoder also reuses SMG's existing byte table (see
-[decode benchmarks](../decode/README.md)). Streaming, other decoders, model metadata
-and chat rendering retain their existing implementation. Both libraries are
-present in the opt-in build; tokenizers 0.23 is still required. The default build
-does not enable either acceleration.
+The default build continues using tokenizers 0.23 for encoding. The optional
+dependency is aliased as `tokenizers_v1` and pinned to `1.0.0-rc.3`. Enabling it
+accelerates single and batch text encoding inside `HuggingFaceTokenizer` and
+nothing else: the full decode of a plain ByteLevel decoder goes through SMG's
+existing byte table in every build (see [decode benchmarks](../decode/README.md)),
+and streaming, other decoders, model metadata and chat rendering keep their
+implementation in both builds. Both libraries are present in the opt-in build;
+tokenizers 0.23 is still required.
 
 The pipeline is constructed **after** tokenizer configuration overrides, so
 configured BOS/EOS processing is preserved. Results use `Encoding::Plain`, like

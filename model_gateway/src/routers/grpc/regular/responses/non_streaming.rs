@@ -35,9 +35,10 @@ use crate::{
         error,
         grpc::common::responses::{
             collect_user_function_names, ensure_mcp_connection, load_history,
-            persist_response_if_needed, NotStored, ResponsesContext,
+            persist_response_if_needed, NotStored, ReplayInto, ResponsesContext,
         },
     },
+    tenant::storage_tenant,
 };
 
 /// Internal implementation for non-streaming responses
@@ -58,8 +59,14 @@ pub(super) async fn route_responses_internal(
 ) -> Result<(ResponsesResponse, Option<ParserChoice>), Response> {
     // 1. Load conversation history (as the caller's tenant may see it) and
     //    build modified request
-    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
-    let modified_request = load_history(ctx.history_stores(), &request, tenant.as_deref()).await?;
+    let tenant = storage_tenant(&params.tenant_request_meta);
+    let modified_request = load_history(
+        ctx.history_stores(),
+        &request,
+        tenant.as_deref(),
+        ReplayInto::Chat,
+    )
+    .await?;
 
     // 2. Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
@@ -110,10 +117,7 @@ async fn execute_without_mcp(
             error = %e,
             "Failed to convert ResponsesRequest to ChatCompletionRequest"
         );
-        error::bad_request(
-            "convert_request_failed",
-            format!("Failed to convert request: {e}"),
-        )
+        error::bad_request(e.code(), e.to_string())
     })?;
 
     // Execute chat pipeline (errors already have proper HTTP status codes)
@@ -163,7 +167,7 @@ pub(super) async fn execute_tool_loop(
 ) -> Result<(ResponsesResponse, Option<ParserChoice>), Response> {
     // The loop is rebuilt on the loaded request: a stored turn's tool calls
     // and outputs stay in front of the calls this loop executes.
-    let mut state = ToolLoopState::new(&current_request);
+    let mut state = ToolLoopState::default();
 
     // Configuration: max iterations as safety limit
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
@@ -201,14 +205,13 @@ pub(super) async fn execute_tool_loop(
                         error = %e,
                         "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
                     );
-                    error::bad_request(
-                        "convert_request_failed",
-                        format!("Failed to convert request: {e}"),
-                    )
+                    error::bad_request(e.code(), e.to_string())
                 })?;
 
         // Prepare tool_choice for this iteration
-        prepare_tool_choice(&mut chat_request, state.iteration);
+        prepare_tool_choice(&mut chat_request, &state, |name| {
+            session.has_exposed_tool(name)
+        });
 
         // Execute chat pipeline (errors already have proper HTTP status codes)
         let (chat_response, parser) = ctx
@@ -242,7 +245,9 @@ pub(super) async fn execute_tool_loop(
             .and_then(|choice| choice.finish_reason.as_deref())
             .is_some_and(|reason| matches!(reason, "length" | "failed" | "error"))
             || has_unfinished_mcp_call(&tool_calls, &session);
-        if tool_calls.is_empty() || generation_interrupted {
+        // The final turn's answer ends the loop whatever it holds: a server
+        // call made anyway is hidden below and does not run.
+        if tool_calls.is_empty() || generation_interrupted || state.final_turn {
             // No more tool calls, we're done
             trace!(
                 "Tool loop completed: {} iterations, {} total calls",
@@ -352,7 +357,7 @@ pub(super) async fn execute_tool_loop(
                 let output_str = result.output.to_string();
                 record_mcp_call(
                     &mut state,
-                    &current_request.model,
+                    &current_request,
                     result,
                     output_str,
                     output_item,
@@ -362,7 +367,11 @@ pub(super) async fn execute_tool_loop(
                 state.total_calls += 1;
             }
 
-            if tool_call_limit.is_some() || !function_tool_calls.is_empty() {
+            // A client call or the internal safety cap ends the response
+            // here. The request's own cap does not: the loop gives the model
+            // one final turn on the results, the server tools withheld.
+            if tool_call_limit == Some(McpToolCallLimit::Safety) || !function_tool_calls.is_empty()
+            {
                 let mut responses_response = conversions::chat_to_responses(
                     &chat_response,
                     original_request,
@@ -393,8 +402,8 @@ pub(super) async fn execute_tool_loop(
                     &user_function_names,
                 );
 
-                // A user processing cap is a normal stop. Only the internal
-                // safety cap introduces an error; keep generation status intact.
+                // Only the internal safety cap introduces an error; a client
+                // call keeps the generation's status intact.
                 if tool_call_limit == Some(McpToolCallLimit::Safety) {
                     responses_response.status = ResponseStatus::Failed;
                     responses_response.incomplete_details = None;
@@ -407,8 +416,10 @@ pub(super) async fn execute_tool_loop(
                 return Ok((responses_response, parser));
             }
 
+            state.final_turn = tool_call_limit == Some(McpToolCallLimit::User);
+
             // Build resume request with conversation history
-            current_request = build_next_request(&state, current_request);
+            current_request = build_next_request(&mut state, current_request);
 
             // Continue to next iteration
         }

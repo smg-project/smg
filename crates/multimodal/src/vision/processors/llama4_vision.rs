@@ -413,7 +413,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -582,7 +582,7 @@ mod tests {
         let processor = Llama4VisionProcessor::new();
 
         let image = create_test_image(500, 500, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         // 4D output: [total_tiles, C, H, W]
         assert_eq!(result.encoder_input.ndim(), 4);
@@ -599,7 +599,7 @@ mod tests {
         let processor = Llama4VisionProcessor::new();
 
         let image = create_test_image(1000, 300, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         // 4D output: [total_tiles, C, H, W]
         assert_eq!(result.encoder_input.ndim(), 4);
@@ -617,12 +617,14 @@ mod tests {
     fn test_preprocess_multiple_images() {
         let processor = Llama4VisionProcessor::new();
 
-        let images = vec![
+        let images = [
             create_test_image(500, 500, Rgb([100, 100, 100])),
             create_test_image(800, 400, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images).unwrap();
+        let result = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
 
         // 4D output: [total_tiles, C, H, W] — tiles from both images concatenated
         assert_eq!(result.encoder_input.ndim(), 4);
@@ -638,7 +640,7 @@ mod tests {
 
         // Large image that will require multiple tiles
         let image = create_test_image(1000, 1000, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         let aspect_ratios = result.model_specific.get("aspect_ratios").unwrap();
         if let ModelSpecificValue::IntTensor { data, .. } = aspect_ratios {

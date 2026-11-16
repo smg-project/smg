@@ -22,6 +22,10 @@ SHIMS = Path(__file__).resolve().parent / "fixtures" / "gpu_guard"
 NODE = "203.0.113.7"  # a documentation address, never a node
 THIS_JOB = "e2e-222-1-runner-new"
 OLD_JOB = "e2e-111-1-runner-old"
+# A pid no host can hold (the kernel's pid limit is 4194304 on 64-bit), so the
+# kill step, which ends every holder of a device file the scratch /proc names,
+# signals nothing of the machine the tests run on.
+GHOST = 4_194_305
 READING = re.compile(r"^gpu guard: (\d+)s: (.*)$", re.M)
 REPORT_HEADER = f"gpu guard: this job: runner 'runner-new', marker '{THIS_JOB}'"
 
@@ -185,24 +189,52 @@ def test_a_visible_holder_is_ended_and_the_cards_pass(guard: Guard) -> None:
             holder.wait()
 
 
+def test_a_holder_of_a_device_file_is_ended_through_proc(guard: Guard) -> None:
+    """The kill step finds the holders of a device file in /proc, as the
+    report below it does: a holder the process table never listed ends."""
+    holder = subprocess.Popen(["sleep", "300"])
+    try:
+        guard.process(holder.pid, "sleep 300", marker=THIS_JOB, device="/dev/nvidia0")
+        result = guard.run(wait=30)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert holder.wait(timeout=10) == -signal.SIGKILL
+        assert "No running processes found" in result.stdout
+        assert error_lines(result.stdout) == []
+        assert result.elapsed < 10
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait()
+
+
+def test_the_kill_step_installs_nothing() -> None:
+    """A package install inside the test step charges the mirror's speed to
+    the step's budget (8 min 23 s for lsof on a slow mirror, two jobs red):
+    the script runs no package manager and needs no lsof."""
+    commands = [
+        line for line in SCRIPT.read_text().splitlines() if not line.lstrip().startswith("#")
+    ]
+    assert [line for line in commands if "apt-get" in line or "lsof" in line] == []
+
+
 def test_a_holder_in_this_job_view_is_named_with_the_job_that_started_it(guard: Guard) -> None:
     guard.busy(cards=(0,))
-    guard.process(777, "python -m engine.server --port 1", marker=OLD_JOB, device="/dev/nvidia0")
+    guard.process(GHOST, "python -m engine.server --port 1", marker=OLD_JOB, device="/dev/nvidia0")
     guard.process(778, "bash run.sh", marker=THIS_JOB, device=None)
-    guard.listed_app(0, 777, name="python")
+    guard.listed_app(0, GHOST, name="python")
     result = guard.run(wait=1)
     assert result.returncode == 1
     assert (
-        "gpu guard: GPU 0: pid 777 (python) holds 80327 MiB; in this job's view: "
+        f"gpu guard: GPU 0: pid {GHOST} (python) holds 80327 MiB; in this job's view: "
         f"python -m engine.server --port 1 E2E_JOB_MARKER={OLD_JOB}" in result.stdout
     )
     assert (
-        "gpu guard: pid 777 holds a GPU device file: python -m engine.server --port 1 "
+        f"gpu guard: pid {GHOST} holds a GPU device file: python -m engine.server --port 1 "
         f"E2E_JOB_MARKER={OLD_JOB}" in result.stdout
     )
     assert "pid 778" not in result.stdout
     (error,) = error_lines(result.stdout)
-    assert error.endswith(", held by pid 777:")
+    assert error.endswith(f", held by pid {GHOST}:")
     assert result.stdout.splitlines()[-1] == "GPU 0: 80327 MiB used"
 
 
@@ -225,3 +257,143 @@ def test_an_unanswered_memory_query_fails_the_guard(guard: Guard) -> None:
     assert result.returncode == 1
     assert error_lines(result.stdout) == [f"::error::Unable to query GPU memory on node '{NODE}'."]
     assert result.elapsed < 10
+
+
+def test_deadline_crossing_after_print_requires_a_new_memory_read(
+    guard: Guard, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-read after crossing the deadline and report the terminal sample time."""
+    guard.busy()
+    guard.listed_app(0, 4242)
+    guard.listed_app(1, 4243)
+    guard.container("0123abcd bench:latest bench-1 up 3 hours")
+    hook = tmp_path / "guard-clock.sh"
+    hook.write_text(
+        """unset SECONDS
+SECONDS=0
+SMG_TEST_CLOCK_ADVANCED=0
+sleep() { :; }
+echo() {
+    builtin echo "$@"
+    local smg_echo_status=$?
+    case "${1-}" in
+        "gpu guard: 0s: "*)
+            if [ "$smg_echo_status" -eq 0 ] && [ "$SMG_TEST_CLOCK_ADVANCED" -eq 0 ]; then
+                SMG_TEST_CLOCK_ADVANCED=1
+                SECONDS=1
+            fi
+            ;;
+        "gpu guard: 1s: "*)
+            if [ "$smg_echo_status" -eq 0 ] && [ "$SMG_TEST_CLOCK_ADVANCED" -eq 1 ]; then
+                SMG_TEST_CLOCK_ADVANCED=2
+                SECONDS=2
+            fi
+            ;;
+    esac
+    return "$smg_echo_status"
+}
+"""
+    )
+    # BASH_ENV affects only the owned child and its shims, and monkeypatch restores it.
+    # Once unset, SECONDS is an ordinary variable: no wall-clock delay drives this case.
+    monkeypatch.setenv("BASH_ENV", str(hook))
+    result = guard.run(wait=1)
+    assert result.returncode == 1, result.stdout + result.stderr
+    readings = READING.findall(result.stdout)
+    assert readings and readings[0][0] == "0", result.stdout
+    assert len(readings) >= 2, result.stdout
+    assert int(readings[-1][0]) >= 1, result.stdout
+    # An extra printed line alone is insufficient: the guard must query memory again.
+    calls = (guard.state / "calls").read_text()
+    assert calls.count("--query-gpu=index,memory.used") >= 2, calls
+    assert result.stdout.count(REPORT_HEADER) == 2, result.stdout
+    for card, pid in ((0, 4242), (1, 4243)):
+        assert (
+            f"gpu guard: GPU {card}: pid {pid} (/usr/bin/python3) holds 80327 MiB; "
+            "not in this job's pid namespace" in result.stdout
+        )
+    assert (
+        "gpu guard: containers of this runner's docker: 0123abcd bench:latest bench-1 up 3 hours"
+        in result.stdout
+    )
+    (error,) = error_lines(result.stdout)
+    assert error.startswith(f"::error::GPU not clean on node '{NODE}' after ")
+    verdict_time = re.search(r" after (\d+)s,", error)
+    assert verdict_time is not None, error
+    assert int(verdict_time.group(1)) == int(readings[-1][0]), result.stdout
+    assert error.endswith(
+        ", held by a process outside this job's view (another pid namespace: "
+        "a previous job's engine still exiting, or a leaked context):"
+    )
+    lines = result.stdout.splitlines()
+    assert lines[lines.index(error) + 1 :] == ["GPU 0: 80327 MiB used", "GPU 1: 80327 MiB used"]
+
+
+def test_poll_sleep_is_capped_by_the_remaining_window(
+    guard: Guard, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cap a polling sleep after processing has consumed part of the window."""
+    guard.busy()
+    guard.listed_app(0, 4242)
+    guard.listed_app(1, 4243)
+    guard.container("0123abcd bench:latest bench-1 up 3 hours")
+    startup_sleeps = tmp_path / "startup-sleeps"
+    poll_sleeps = tmp_path / "poll-sleeps"
+    hook = tmp_path / "guard-capped-sleep-clock.sh"
+    hook.write_text(
+        """unset SECONDS
+SECONDS=0
+SMG_TEST_READING_SEEN=0
+sleep() {
+    if [ "$SMG_TEST_READING_SEEN" -eq 0 ]; then
+        builtin printf '%s\\n' "$*" >> "$SMG_TEST_STARTUP_SLEEP_LOG"
+    else
+        builtin printf '%s\\n' "$*" >> "$SMG_TEST_POLL_SLEEP_LOG"
+        SECONDS=3
+    fi
+}
+echo() {
+    builtin echo "$@"
+    local smg_echo_status=$?
+    case "${1-}" in
+        "gpu guard: 0s: "*)
+            if [ "$smg_echo_status" -eq 0 ] && [ "$SMG_TEST_READING_SEEN" -eq 0 ]; then
+                SMG_TEST_READING_SEEN=1
+                SECONDS=1
+            fi
+            ;;
+    esac
+    return "$smg_echo_status"
+}
+"""
+    )
+    # The startup grace is recorded separately; only a sleep after a reading polls.
+    monkeypatch.setenv("SMG_TEST_STARTUP_SLEEP_LOG", str(startup_sleeps))
+    monkeypatch.setenv("SMG_TEST_POLL_SLEEP_LOG", str(poll_sleeps))
+    monkeypatch.setenv("BASH_ENV", str(hook))
+    result = guard.run(wait=3, poll=5)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert startup_sleeps.read_text().splitlines() == ["2"]
+    assert poll_sleeps.read_text().splitlines() == ["2"]
+    readings = READING.findall(result.stdout)
+    assert [int(second) for second, _ in readings] == [0, 3], result.stdout
+    calls = (guard.state / "calls").read_text()
+    assert calls.count("--query-gpu=index,memory.used") == 2, calls
+    assert result.stdout.count(REPORT_HEADER) == 2, result.stdout
+    for card, pid in ((0, 4242), (1, 4243)):
+        assert (
+            f"gpu guard: GPU {card}: pid {pid} (/usr/bin/python3) holds 80327 MiB; "
+            "not in this job's pid namespace" in result.stdout
+        )
+    assert (
+        "gpu guard: containers of this runner's docker: 0123abcd bench:latest bench-1 up 3 hours"
+        in result.stdout
+    )
+    (error,) = error_lines(result.stdout)
+    assert error.startswith(f"::error::GPU not clean on node '{NODE}' after 3s, ")
+    assert error.endswith(
+        ", held by a process outside this job's view (another pid namespace: "
+        "a previous job's engine still exiting, or a leaked context):"
+    )
+    lines = result.stdout.splitlines()
+    assert lines[lines.index(error) + 1 :] == ["GPU 0: 80327 MiB used", "GPU 1: 80327 MiB used"]

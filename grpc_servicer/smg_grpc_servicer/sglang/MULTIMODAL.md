@@ -8,8 +8,7 @@ the scheduler. Without this selection, existing router preprocessing remains in
 use. Encode disaggregation cannot be combined with this worker processor.
 
 References must identify immutable content for the lifetime of a request,
-including retries and prefill/decode processing. Mixed image/video requests,
-audio and per-item processing hints that cannot be represented by this wire
+including retries and prefill/decode processing. Audio and per-item processing hints that cannot be represented by this wire
 contract are rejected. SGLang drops image alpha; vLLM's white compositing policy
 is unchanged. Video sampling preserves temporal grids, timestamps and offsets.
 Video is admitted through the advertised native media-reference path only;
@@ -23,6 +22,19 @@ MiniMax uses the SGLang day-0 source image geometry, Pillow image and video resi
 including nearest-grid frame alignment before normalization. This differs from the
 vLLM source-size policy, which remains unchanged. Engine support for the checkpoint's
 quantization and Python processor API is required independently of SMG.
+
+## Mixed images and videos
+
+The native worker processor accepts mixed images and videos in either order.
+It reuses the per-modality preprocessing pipeline and preserves each batch's
+patch offsets, grids and tensors. The first batch uses `GenerateRequest.mm_inputs`;
+`extra_mm_inputs` carries additional batches, following the vLLM protocol layout.
+Upgrade the gateway, servicer and proto package together before using mixed inputs.
+Older proto packages remain usable for text and single-modality requests; they do
+not expose the additional batches needed for mixed inputs.
+
+Mixed references are processed on both PD sides; the single-modality media identity
+optimization is not used. Router-side video capability remains unchanged.
 
 ## Prefill/decode reuse
 

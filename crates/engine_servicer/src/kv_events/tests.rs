@@ -3,13 +3,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use engine_zmq_client::mock_engine::MOCK_DEADLINE;
 use futures::StreamExt;
 use smg_grpc_client::common_proto::{kv_cache_event, KvCacheLocality, KvCacheTier};
 use tokio::time::timeout;
 use zeromq::{PubSocket, RouterSocket, SocketEvent};
 
 use super::{golden, *};
-use crate::kv_wire::WireBatch;
+use crate::{kv_state::CHUNK_BLOCKS, kv_wire::WireBatch};
 
 /// A state the relay reads loads from: one rank's fixed record and a
 /// fresh engine link (nothing reported yet).
@@ -26,6 +27,10 @@ impl RankLoads for FixedLoads {
 
     fn engine_link(&self) -> &EngineLink {
         &self.engine
+    }
+
+    fn rank_count(&self) -> usize {
+        1
     }
 }
 
@@ -192,6 +197,7 @@ async fn a_relay_that_gave_up_has_nothing_to_wait_for() {
         .subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: 0,
             load_records_before_first_batch: false,
+            loads_only: false,
         })
         .err()
         .expect("a down relay refuses");
@@ -439,6 +445,8 @@ async fn start_lab(history_batches: usize, with_replay: bool) -> Lab {
 struct StubLoads {
     record: Mutex<common::EngineLoad>,
     asked: AtomicU64,
+    /// Live batches the relay reported as the engine's progress.
+    progress: AtomicU64,
 }
 
 impl StubLoads {
@@ -457,6 +465,7 @@ impl StubLoads {
                 ..Default::default()
             }),
             asked: AtomicU64::new(0),
+            progress: AtomicU64::new(0),
         })
     }
 
@@ -464,6 +473,11 @@ impl StubLoads {
         let mut record = self.record.lock().unwrap_or_else(PoisonError::into_inner);
         record.running_requests = running;
         record.waiting_requests = waiting;
+    }
+
+    /// Live batches reported as the engine's progress so far.
+    fn progress(&self) -> u64 {
+        self.progress.load(Ordering::Relaxed)
     }
 }
 
@@ -477,6 +491,24 @@ impl LoadSource for StubLoads {
                 .clone(),
         )
     }
+
+    fn note_engine_progress(&self) {
+        self.progress.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Wait until `loads` heard of `count` live batches.
+async fn wait_progress(loads: &StubLoads, count: u64) {
+    for _ in 0..250 {
+        if loads.progress() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "the load source heard of {} live batches, not {count}",
+        loads.progress()
+    );
 }
 
 /// A relay with a load source and short record intervals (`tick`,
@@ -550,7 +582,7 @@ async fn every_batch_a_subscriber_receives_carries_the_load_record() {
     .await;
     let batch2 = golden::bytes(golden::BATCH2);
     lab.publish(1, &batch2).await;
-    lab.wait_relayed(2).await;
+    wait_relayed(&lab.relay, 2).await;
     // History first (0 and 1), then live (2).
     let mut stream = lab.subscribe(0).expect("history");
     let first = read(&mut stream).await;
@@ -586,7 +618,7 @@ async fn every_batch_a_subscriber_receives_carries_the_load_record() {
     )
     .await;
     rolled.publish(1, &batch2).await;
-    rolled.wait_relayed(2).await;
+    wait_relayed(&rolled.relay, 2).await;
     let mut whole = rolled.subscribe(0).expect("history");
     assert_eq!(record_of(&read(&mut whole).await).running_requests, 1);
     // No source: no record.
@@ -666,6 +698,30 @@ fn load_only_marker(batch: &common::KvEventBatch) -> bool {
     batch.load.as_ref().is_some_and(|load| load.load_only)
 }
 
+/// A tick reads the source once: the record read for the change check is
+/// the one a heartbeat carries. With the tick, the heartbeat interval and
+/// the backoff equal, every tick sends, so the reads count the ticks.
+#[tokio::test]
+async fn a_heartbeat_reads_the_source_once() {
+    let loads = StubLoads::new(2, 0);
+    let interval = Duration::from_millis(50);
+    let lab = start_lab_with_loads(Arc::clone(&loads), interval, interval, interval).await;
+    let mut stream = lab.subscribe(0).expect("history");
+    let first = read(&mut stream).await;
+    assert!(!load_only_marker(&first));
+    let before = loads.asked.load(Ordering::Relaxed);
+    for _ in 0..10 {
+        let beat = read(&mut stream).await;
+        assert!(load_only_marker(&beat), "{beat:?}");
+    }
+    let reads = loads.asked.load(Ordering::Relaxed) - before;
+    // The tick after the tenth heartbeat may have read already.
+    assert!(
+        (10..=11).contains(&reads),
+        "{reads} reads of the source for ten heartbeats"
+    );
+}
+
 /// A frozen engine's record changes in nothing but its silence; that goes
 /// out once a second, so a subscriber's wedge threshold is met within a
 /// second of the engine crossing it instead of at the heartbeat backoff.
@@ -681,6 +737,69 @@ fn a_growing_engine_silence_changes_the_record_once_a_second() {
     assert!(load_changed(&last, &current), "a whole second crossed");
     current.engine_silence_ms = None;
     assert!(load_changed(&last, &current), "the silence ending");
+}
+
+/// A batch read live off the publisher is the engine's progress and the
+/// load source hears of it once per batch; a duplicate, the relay's own
+/// `load_only` heartbeats and the batches the engine's replay gives back
+/// for a late join are not, and it hears nothing of them.
+#[tokio::test]
+async fn a_live_batch_is_the_engines_progress_a_duplicate_a_heartbeat_and_a_replay_are_not() {
+    let loads = StubLoads::new(2, 0);
+    let mut lab = start_lab_with_loads(
+        Arc::clone(&loads),
+        Duration::from_millis(20),
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    )
+    .await;
+    // The prime's first sequence 0 was live; its repeats were duplicates.
+    wait_progress(&loads, 1).await;
+    let batch2 = golden::bytes(golden::BATCH2);
+    lab.publish(1, &batch2).await;
+    wait_relayed(&lab.relay, 2).await;
+    wait_progress(&loads, 2).await;
+    // Heartbeats to a subscriber are the relay's own, not the engine's.
+    let mut stream = lab.subscribe(0).expect("history");
+    let mut beats = 0;
+    while beats < 2 {
+        if load_only_marker(&read(&mut stream).await) {
+            beats += 1;
+        }
+    }
+    // The publisher repeating its last sequence.
+    lab.publish(1, &batch2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(lab.relay.counts().relayed, 2, "a duplicate is not relayed");
+    assert_eq!(
+        loads.progress(),
+        2,
+        "two heartbeats and a duplicate are not progress"
+    );
+    // A relay that joins a publisher late fills the start from the engine's
+    // replay: those batches are history; the live one is progress.
+    let late_loads = StubLoads::new(1, 0);
+    let mut late = start_lab(100, true).await;
+    late.relay
+        .set_load_source(Arc::<StubLoads>::clone(&late_loads));
+    let request = late.publish_until_replay_requested(3, &batch2, 0).await;
+    late.send_replay(
+        &request,
+        &[
+            (0, batch2.clone()),
+            (1, batch2.clone()),
+            (2, batch2.clone()),
+        ],
+    )
+    .await;
+    wait_relayed(&late.relay, 4).await;
+    wait_progress(&late_loads, 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        late_loads.progress(),
+        1,
+        "one live batch among the four relayed"
+    );
 }
 
 /// A relay whose replay socket is not bound yet: the relay keeps asking
@@ -721,6 +840,21 @@ async fn start_lab_without_replay_socket_yet() -> (Lab, String) {
     )
 }
 
+/// Polls the relay (250 times, 20 ms apart) until it has relayed `count`
+/// batches; fails the test naming the count it saw.
+async fn wait_relayed(relay: &KvEventRelay, count: u64) {
+    for _ in 0..250 {
+        if relay.counts().relayed >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "the relay relayed {} batches, not {count}",
+        relay.counts().relayed
+    );
+}
+
 impl Lab {
     async fn publish(&mut self, sequence: u64, payload: &[u8]) {
         self.publisher
@@ -743,23 +877,11 @@ impl Lab {
         panic!("the relay never saw sequence 0");
     }
 
-    async fn wait_relayed(&self, count: u64) {
-        for _ in 0..250 {
-            if self.relay.counts().relayed >= count {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!(
-            "the relay relayed {} batches, not {count}",
-            self.relay.counts().relayed
-        );
-    }
-
     fn subscribe(&self, cursor: u64) -> Result<BoxStream<common::KvEventBatch>, Status> {
         self.relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: cursor,
             load_records_before_first_batch: false,
+            loads_only: false,
         })
     }
 
@@ -772,6 +894,7 @@ impl Lab {
         self.relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: cursor,
             load_records_before_first_batch: true,
+            loads_only: false,
         })
     }
 
@@ -779,7 +902,7 @@ impl Lab {
     /// `replies` and the end marker; the request must ask from `start`.
     async fn answer_replay(&mut self, start: u64, replies: &[(u64, Vec<u8>)]) {
         let router = self.router.as_mut().expect("a replay socket");
-        let request = timeout(Duration::from_secs(5), router.recv())
+        let request = timeout(MOCK_DEADLINE, router.recv())
             .await
             .expect("a replay request in time")
             .expect("request");
@@ -846,8 +969,11 @@ fn refused(result: Result<BoxStream<common::KvEventBatch>, Status>) -> Status {
     }
 }
 
+// The stream reads wait under the suite's standing deadline, not a shorter
+// one of their own: a loaded host holds a single read of a busy case for
+// seconds.
 async fn read(stream: &mut BoxStream<common::KvEventBatch>) -> common::KvEventBatch {
-    timeout(Duration::from_secs(5), stream.next())
+    timeout(MOCK_DEADLINE, stream.next())
         .await
         .expect("a batch in time")
         .expect("stream open")
@@ -855,7 +981,7 @@ async fn read(stream: &mut BoxStream<common::KvEventBatch>) -> common::KvEventBa
 }
 
 async fn read_error(stream: &mut BoxStream<common::KvEventBatch>) -> Status {
-    timeout(Duration::from_secs(5), stream.next())
+    timeout(MOCK_DEADLINE, stream.next())
         .await
         .expect("an item in time")
         .expect("stream open")
@@ -863,7 +989,7 @@ async fn read_error(stream: &mut BoxStream<common::KvEventBatch>) -> Status {
 }
 
 async fn read_end(stream: &mut BoxStream<common::KvEventBatch>) {
-    assert!(timeout(Duration::from_secs(5), stream.next())
+    assert!(timeout(MOCK_DEADLINE, stream.next())
         .await
         .expect("the end in time")
         .is_none());
@@ -877,7 +1003,7 @@ async fn history_serves_a_cursor_inside_the_window_then_live() {
     for sequence in 1..=5 {
         lab.publish(sequence, &batch2).await;
     }
-    lab.wait_relayed(6).await;
+    wait_relayed(&lab.relay, 6).await;
 
     let mut stream = lab.subscribe(2).expect("inside the window");
     for expected in 3..=5 {
@@ -907,7 +1033,7 @@ async fn cursors_outside_the_window_are_out_of_range() {
     for sequence in 1..=9 {
         lab.publish(sequence, &batch2).await;
     }
-    lab.wait_relayed(10).await;
+    wait_relayed(&lab.relay, 10).await;
     // The window is 7..=9: cursor 6 wants 7, served; cursor 5 wants 6, gone.
     let mut stream = lab.subscribe(6).expect("the oldest batch is wanted");
     for expected in 7..=9 {
@@ -929,7 +1055,7 @@ async fn a_subscriber_without_a_cursor_gets_the_whole_history_or_a_snapshot() {
     let batch2 = golden::bytes(golden::BATCH2);
     lab.publish(1, &batch2).await;
     lab.publish(2, &batch2).await;
-    lab.wait_relayed(3).await;
+    wait_relayed(&lab.relay, 3).await;
     // Everything since the publisher's first batch is here: hand it over.
     let mut stream = lab.subscribe(0).expect("live");
     for expected in 0..=2 {
@@ -985,7 +1111,7 @@ async fn a_publisher_gap_is_filled_from_the_engines_replay() {
     lab.prime().await;
     let batch2 = golden::bytes(golden::BATCH2);
     lab.publish(1, &batch2).await;
-    lab.wait_relayed(2).await;
+    wait_relayed(&lab.relay, 2).await;
     let mut stream = lab.subscribe(1).expect("caught up");
 
     // 2 and 3 never reach the SUB; 4 reveals the gap.
@@ -1031,7 +1157,7 @@ async fn a_gap_the_engine_cannot_fill_leaves_a_hole_not_a_dead_end() {
     lab.prime().await;
     let batch2 = golden::bytes(golden::BATCH2);
     lab.publish(1, &batch2).await;
-    lab.wait_relayed(2).await;
+    wait_relayed(&lab.relay, 2).await;
     let mut stream = lab.subscribe(1).expect("caught up");
     lab.publish(4, &batch2).await;
     assert_eq!(
@@ -1119,7 +1245,7 @@ async fn a_sequence_regression_ends_live_streams_and_clears_the_history() {
     for sequence in 1..=3 {
         lab.publish(sequence, &batch2).await;
     }
-    lab.wait_relayed(4).await;
+    wait_relayed(&lab.relay, 4).await;
     let mut stream = lab.subscribe(0).expect("whole history");
     for expected in 0..=3 {
         assert_eq!(read(&mut stream).await.sequence_number, expected);
@@ -1222,7 +1348,7 @@ async fn the_engines_startup_clear_under_a_passed_cursor_is_a_restart() {
     for sequence in 1..=3 {
         lab.publish(sequence, &batch2).await;
     }
-    lab.wait_relayed(4).await;
+    wait_relayed(&lab.relay, 4).await;
     let mut stream = lab.subscribe(3).expect("caught up");
     // A repeated sequence without a clear is a duplicate.
     lab.publish(3, &batch2).await;
@@ -1256,7 +1382,7 @@ async fn a_counter_back_at_its_start_is_a_restart() {
     for sequence in 1..=5 {
         lab.publish(sequence, &batch2).await;
     }
-    lab.wait_relayed(6).await;
+    wait_relayed(&lab.relay, 6).await;
     let mut stream = lab.subscribe(5).expect("caught up");
     lab.publish(1, &batch2).await;
     let status = read_error(&mut stream).await;
@@ -1296,7 +1422,7 @@ async fn a_publisher_already_counting_when_the_relay_joins_is_replayed_from_its_
         ],
     )
     .await;
-    lab.wait_relayed(4).await;
+    wait_relayed(&lab.relay, 4).await;
     let counts = lab.relay.counts();
     assert_eq!(
         (
@@ -1340,7 +1466,7 @@ async fn a_replay_that_starts_past_zero_leaves_the_earlier_sequences_unknown() {
         ],
     )
     .await;
-    lab.wait_relayed(3).await;
+    wait_relayed(&lab.relay, 3).await;
     let counts = lab.relay.counts();
     assert_eq!(
         (
@@ -1434,7 +1560,7 @@ async fn a_clear_after_a_late_join_ends_the_unknown_stretch() {
     assert_eq!(late.relay.counts().unknown_before_start, 5);
     // The engine resets its cache: BATCH1 ends with its clear.
     late.publish(6, &golden::bytes(golden::BATCH1)).await;
-    late.wait_relayed(2).await;
+    wait_relayed(&late.relay, 2).await;
     let mut fresh = late.subscribe(0).expect("a snapshot");
     let chunk = read(&mut fresh).await;
     assert_eq!((chunk.sequence_number, chunk.dp_rank), (6, Some(0)));
@@ -1472,7 +1598,7 @@ async fn a_clear_among_the_replayed_batches_ends_the_unknown_stretch_too() {
         ],
     )
     .await;
-    lab.wait_relayed(3).await;
+    wait_relayed(&lab.relay, 3).await;
     let counts = lab.relay.counts();
     assert_eq!(
         (counts.gap_batches_lost, counts.unknown_before_start),
@@ -1532,7 +1658,7 @@ async fn the_relay_takes_the_publishers_replay_at_start_before_any_live_batch() 
         ],
     )
     .await;
-    lab.wait_relayed(3).await;
+    wait_relayed(&lab.relay, 3).await;
     let counts = lab.relay.counts();
     assert_eq!(
         (
@@ -1615,7 +1741,7 @@ async fn a_start_replay_that_begins_past_the_publishers_start_marks_the_rest_unk
     lab.router = Some(router);
     lab.answer_replay(0, &[(6, batch2.clone()), (7, batch2.clone())])
         .await;
-    lab.wait_relayed(2).await;
+    wait_relayed(&lab.relay, 2).await;
     let counts = lab.relay.counts();
     assert_eq!(
         (
@@ -1644,7 +1770,7 @@ async fn dropping_the_relay_closes_the_publisher_subscription() {
     assert_eq!(read(&mut stream).await.sequence_number, 0);
     drop(lab.relay);
     read_end(&mut stream).await;
-    let disconnected = timeout(Duration::from_secs(5), async {
+    let disconnected = timeout(MOCK_DEADLINE, async {
         while let Some(event) = monitor.next().await {
             if matches!(event, SocketEvent::Disconnected(_)) {
                 return true;
@@ -1664,6 +1790,27 @@ struct RankLab {
 }
 
 async fn start_rank_lab(ranks: i32, history_batches: usize) -> RankLab {
+    let lab = rank_lab(
+        ranks,
+        history_batches,
+        [
+            DEFAULT_LOAD_TICK,
+            DEFAULT_HEARTBEAT_INTERVAL,
+            DEFAULT_HEARTBEAT_BACKOFF,
+        ],
+    )
+    .await;
+    lab.relay.start();
+    lab
+}
+
+/// The publishers of `ranks` ranks and a relay over them at the record
+/// intervals `[tick, heartbeat, backoff]`, not started.
+async fn rank_lab(
+    ranks: i32,
+    history_batches: usize,
+    [load_tick, heartbeat_interval, heartbeat_backoff]: [Duration; 3],
+) -> RankLab {
     let mut publishers = Vec::new();
     let mut sources = Vec::new();
     for rank in 0..ranks {
@@ -1686,11 +1833,10 @@ async fn start_rank_lab(ranks: i32, history_batches: usize) -> RankLab {
         history_batches,
         history_bytes: 64 << 20,
         replay_timeout: Duration::from_secs(2),
-        load_tick: DEFAULT_LOAD_TICK,
-        heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
-        heartbeat_backoff: DEFAULT_HEARTBEAT_BACKOFF,
+        load_tick,
+        heartbeat_interval,
+        heartbeat_backoff,
     });
-    relay.start();
     RankLab { publishers, relay }
 }
 
@@ -1720,23 +1866,11 @@ impl RankLab {
         panic!("the relay never saw every rank's sequence 0");
     }
 
-    async fn wait_relayed(&self, count: u64) {
-        for _ in 0..250 {
-            if self.relay.counts().relayed >= count {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!(
-            "the relay relayed {} batches, not {count}",
-            self.relay.counts().relayed
-        );
-    }
-
     fn subscribe(&self, cursor: u64) -> Result<BoxStream<common::KvEventBatch>, Status> {
         self.relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: cursor,
             load_records_before_first_batch: false,
+            loads_only: false,
         })
     }
 }
@@ -1767,7 +1901,7 @@ async fn every_rank_of_a_data_parallel_publisher_is_relayed_under_its_own_sequen
     lab.publish(0, 1, &store_payload(1.0, &[2], Some(1))).await;
     lab.publish(0, 2, &store_payload(2.0, &[3], Some(2))).await;
     lab.publish(1, 1, &store_payload(1.0, &[12], Some(1))).await;
-    lab.wait_relayed(5).await;
+    wait_relayed(&lab.relay, 5).await;
     assert_eq!(lab.relay.live_ranks(), 2, "both ranks' blocks are recorded");
 
     let mut stream = lab.subscribe(0).expect("both windows");
@@ -1790,6 +1924,146 @@ async fn every_rank_of_a_data_parallel_publisher_is_relayed_under_its_own_sequen
     assert_eq!(lab.relay.counts().served_from_history, 1);
 }
 
+/// A load source whose record names its rank: `running_requests` is the
+/// rank plus one.
+struct RankedLoads;
+
+impl LoadSource for RankedLoads {
+    fn load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad> {
+        Some(common::EngineLoad {
+            running_requests: u32::try_from(dp_rank?).ok()? + 1,
+            ..Default::default()
+        })
+    }
+}
+
+/// A quiet rank keeps reporting. On a relay over two ranks each rank's
+/// `load_only` batches come on the rank's own clock, repeat the rank's own
+/// last sequence and carry the rank's own record, whichever rank published
+/// last: a gateway that takes the pushed records counts a rank whose
+/// records stop as unreachable.
+#[tokio::test]
+async fn every_rank_of_a_quiet_publisher_keeps_its_own_heartbeat() {
+    let mut lab = rank_lab(
+        2,
+        100,
+        [
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        ],
+    )
+    .await;
+    lab.relay.set_load_source(Arc::new(RankedLoads));
+    lab.relay.start();
+    lab.prime().await;
+    // Rank 1 publishes last, then nobody does.
+    lab.publish(0, 1, &store_payload(1.0, &[2], Some(1))).await;
+    wait_relayed(&lab.relay, 3).await;
+    lab.publish(1, 1, &store_payload(1.0, &[12], Some(1))).await;
+    wait_relayed(&lab.relay, 4).await;
+    let mut stream = lab.subscribe(0).expect("both windows");
+    assert_eq!(
+        tagged(&mut stream, 4).await,
+        vec![(Some(0), 0), (Some(0), 1), (Some(1), 0), (Some(1), 1)]
+    );
+    let mut beats: BTreeMap<Option<i32>, Vec<(u64, u32)>> = BTreeMap::new();
+    for _ in 0..8 {
+        let beat = read(&mut stream).await;
+        assert!(
+            load_only_marker(&beat) && beat.events.is_empty(),
+            "{beat:?}"
+        );
+        beats
+            .entry(beat.dp_rank)
+            .or_default()
+            .push((beat.sequence_number, record_of(&beat).running_requests));
+    }
+    for (rank, running) in [(0, 1), (1, 2)] {
+        let own = beats.get(&Some(rank)).map_or(&[][..], Vec::as_slice);
+        assert!(own.len() >= 3, "rank {rank}'s heartbeats: {beats:?}");
+        assert!(
+            own.iter().all(|&beat| beat == (1, running)),
+            "rank {rank}'s heartbeats: {beats:?}"
+        );
+    }
+}
+
+/// A quiet rank keeps reporting while the other rank publishes faster than
+/// the tick: the tick is a deadline that stands across batches, so rank 1's
+/// `load_only` batches keep coming between rank 0's batches, with rank 1's
+/// own last sequence and record.
+#[tokio::test]
+async fn a_quiet_rank_keeps_its_own_heartbeat_while_another_publishes() {
+    let mut lab = rank_lab(
+        2,
+        200,
+        [
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        ],
+    )
+    .await;
+    lab.relay.set_load_source(Arc::new(RankedLoads));
+    lab.relay.start();
+    lab.prime().await;
+    let mut stream = lab.subscribe(0).expect("both windows");
+    assert_eq!(
+        tagged(&mut stream, 2).await,
+        vec![(Some(0), 0), (Some(1), 0)]
+    );
+    // Rank 0 publishes about every 10 ms, under the 20 ms tick, for 0.8 s.
+    let mut quiet_ranks_beats = Vec::new();
+    for sequence in 1..=80u64 {
+        let block = i64::try_from(sequence).expect("a small sequence");
+        lab.publish(0, sequence, &store_payload(1.0, &[block + 1], Some(block)))
+            .await;
+        while let Ok(batch) = timeout(Duration::from_millis(10), read(&mut stream)).await {
+            if batch.dp_rank == Some(1) {
+                assert!(load_only_marker(&batch), "{batch:?}");
+                quiet_ranks_beats.push((batch.sequence_number, record_of(&batch).running_requests));
+            }
+        }
+    }
+    assert!(
+        quiet_ranks_beats.len() >= 3,
+        "rank 1's heartbeats beside rank 0's traffic: {quiet_ranks_beats:?}"
+    );
+    assert!(
+        quiet_ranks_beats.iter().all(|&beat| beat == (0, 2)),
+        "{quiet_ranks_beats:?}"
+    );
+}
+
+/// A stream resumed at the publisher's newest sequence is owed nothing from
+/// the history, and while the publisher stays quiet its `load_only` batches
+/// repeat the cursor it came with: the rank's entry in `sent` starts at the
+/// cursor, before the stream's first batch.
+#[tokio::test]
+async fn a_resumed_quiet_stream_repeats_its_cursor_in_its_heartbeats() {
+    let mut lab = start_lab_with_loads(
+        StubLoads::new(2, 0),
+        Duration::from_millis(20),
+        Duration::from_millis(100),
+        Duration::from_millis(300),
+    )
+    .await;
+    let batch2 = golden::bytes(golden::BATCH2);
+    for sequence in 1..=3 {
+        lab.publish(sequence, &batch2).await;
+    }
+    wait_relayed(&lab.relay, 4).await;
+    let mut stream = lab.subscribe(3).expect("at the newest");
+    for _ in 0..2 {
+        let beat = timeout(Duration::from_secs(2), read(&mut stream))
+            .await
+            .expect("a resumed stream's heartbeat while its publisher is quiet");
+        assert!(load_only_marker(&beat), "{beat:?}");
+        assert_eq!((beat.sequence_number, beat.events.len()), (3, 0));
+    }
+}
+
 /// The request carries one cursor and a relay over several ranks cannot
 /// tell what the gateway holds of the others (nothing below it may be
 /// resent on a fresh stream): the cursor is refused, and the
@@ -1801,7 +2075,7 @@ async fn a_cursor_on_a_relay_over_several_ranks_is_refused_for_a_resubscription_
     lab.publish(0, 1, &store_payload(1.0, &[2], Some(1))).await;
     lab.publish(0, 2, &store_payload(2.0, &[3], Some(2))).await;
     lab.publish(1, 1, &store_payload(1.0, &[12], Some(1))).await;
-    lab.wait_relayed(5).await;
+    wait_relayed(&lab.relay, 5).await;
 
     let status = refused(lab.subscribe(1));
     assert_eq!(status.code(), tonic::Code::OutOfRange);
@@ -1837,7 +2111,7 @@ async fn a_snapshot_stamps_each_rank_at_its_own_cursor() {
             .await;
     }
     lab.publish(1, 1, &store_payload(1.0, &[100], None)).await;
-    lab.wait_relayed(7).await;
+    wait_relayed(&lab.relay, 7).await;
 
     let mut stream = lab.subscribe(0).expect("a snapshot");
     let first = read(&mut stream).await;
@@ -1892,7 +2166,7 @@ async fn a_restart_on_one_rank_clears_that_ranks_window_only() {
     lab.publish(1, 1, &store_payload(1.0, &[12], Some(1))).await;
     lab.publish(1, 2, &store_payload(2.0, &[13], Some(12)))
         .await;
-    lab.wait_relayed(5).await;
+    wait_relayed(&lab.relay, 5).await;
     let mut stream = lab.subscribe(0).expect("both windows");
     assert_eq!(tagged(&mut stream, 5).await.len(), 5);
 
@@ -1900,7 +2174,7 @@ async fn a_restart_on_one_rank_clears_that_ranks_window_only() {
     let status = read_error(&mut stream).await;
     assert_eq!(status.code(), tonic::Code::DataLoss);
     assert!(status.message().contains("restarted"));
-    lab.wait_relayed(6).await;
+    wait_relayed(&lab.relay, 6).await;
     assert_eq!(lab.relay.counts().publisher_restarts, 1);
 
     let mut fresh = lab.subscribe(0).expect("both windows again");
@@ -1968,11 +2242,11 @@ async fn after_the_window_rolled_a_subscriber_without_a_cursor_gets_a_snapshot_t
     lab.publish(3, &store_payload(3.0, &[20], None)).await;
     lab.publish(4, &remove_payload(&[20])).await;
     lab.publish(5, &store_payload(5.0, &[21, 22], None)).await;
-    lab.wait_relayed(6).await;
+    wait_relayed(&lab.relay, 6).await;
     let mut stream = lab.subscribe(0).expect("a snapshot");
     // Published before the first poll: must follow the snapshot.
     lab.publish(6, &store_payload(6.0, &[30], Some(22))).await;
-    lab.wait_relayed(7).await;
+    wait_relayed(&lab.relay, 7).await;
     let chunk = read(&mut stream).await;
     assert_eq!(chunk.sequence_number, 5, "stamped at the cut");
     assert_eq!(
@@ -2013,7 +2287,7 @@ async fn a_stale_cursor_below_the_window_is_refused_and_zero_gets_the_snapshot()
         lab.publish(seq, &store_payload(seq as f64, &[seq as i64 * 10], None))
             .await;
     }
-    lab.wait_relayed(5).await;
+    wait_relayed(&lab.relay, 5).await;
     // The window is 3..=4; cursor 1 wants 2, gone.
     let status = refused(lab.subscribe(1));
     assert_eq!(status.code(), tonic::Code::OutOfRange);
@@ -2138,6 +2412,7 @@ async fn a_676k_block_snapshot_is_cut_atomically_and_does_not_stall_the_live_str
         let stream = relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: 0,
             load_records_before_first_batch: false,
+            loads_only: false,
         });
         (stream, started.elapsed())
     });
@@ -2186,7 +2461,7 @@ async fn a_676k_block_snapshot_is_cut_atomically_and_does_not_stall_the_live_str
     let count = u32::try_from(chunks.len()).unwrap();
     assert_eq!(
         count as usize,
-        (blocks_at_cut as usize).div_ceil(crate::kv_state::CHUNK_BLOCKS)
+        (blocks_at_cut as usize).div_ceil(CHUNK_BLOCKS)
     );
     for (index, chunk) in chunks.iter().enumerate() {
         assert_eq!(
@@ -2233,7 +2508,7 @@ async fn the_relays_wire_counts_follow_the_normalizer() {
     assert_eq!(lab.relay.wire_counts(), WireCounts::default());
     lab.prime().await;
     lab.publish(1, &golden::bytes(golden::BATCH2)).await;
-    lab.wait_relayed(2).await;
+    wait_relayed(&lab.relay, 2).await;
     let wire = lab.relay.wire_counts();
     assert!(
         wire.forwarded_stored + wire.forwarded_removed + wire.forwarded_cleared > 0,
@@ -2340,4 +2615,38 @@ async fn a_subscriber_that_asks_gets_records_before_the_publishers_first_batch()
     let beat = read(&mut stream).await;
     assert!(load_only_marker(&beat));
     assert_eq!(beat.sequence_number, 0);
+}
+
+/// Input capacity appearance/expiry is immediate; small sample noise is not a push.
+#[test]
+fn prefill_capacity_changes_use_the_throughput_tolerance() {
+    let mut last = common::EngineLoad::default();
+    let mut current = last.clone();
+    assert!(!load_changed(&last, &current));
+    current.prefill_throughput = Some(1_000.0);
+    assert!(load_changed(&last, &current));
+    assert!(load_changed(&current, &last));
+    for (before, after, changed) in [
+        (1_000.0, 1_001.0, false),
+        (1_000.0, 1_049.0, false),
+        (10_000.0, 10_051.0, true),
+        (10.0, 11.0, true),
+    ] {
+        last.prefill_throughput = Some(before);
+        current.prefill_throughput = Some(after);
+        assert_eq!(load_changed(&last, &current), changed);
+        assert_eq!(load_changed(&current, &last), changed);
+    }
+}
+
+/// A running-count change alone must publish load in either direction.
+#[test]
+fn running_requests_alone_change_the_load_record() {
+    let idle = common::EngineLoad::default();
+    let running = common::EngineLoad {
+        running_requests: 1,
+        ..idle.clone()
+    };
+    assert!(load_changed(&idle, &running));
+    assert!(load_changed(&running, &idle));
 }

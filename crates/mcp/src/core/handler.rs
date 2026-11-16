@@ -8,11 +8,15 @@
 use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
+#[expect(
+    deprecated,
+    reason = "MCP deprecated server-to-client logging (SEP-2577); servers on the earlier protocol versions still send it, so the handler keeps forwarding it until the type goes"
+)]
+use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::{
     model::{
-        CancelledNotificationParam, ClientInfo, CreateElicitationRequestParams,
-        CreateElicitationResult, ElicitationAction, LoggingLevel, LoggingMessageNotificationParam,
-        ProgressNotificationParam, ResourceUpdatedNotificationParam,
+        CancelledNotificationParam, ClientConfig, ElicitRequestParams, ElicitResult,
+        ElicitationAction, ProgressNotificationParam, ResourceUpdatedNotificationParam,
     },
     service::{NotificationContext, RequestContext},
     ClientHandler, RoleClient,
@@ -60,14 +64,14 @@ impl HandlerRequestContext {
 pub struct SmgClientHandler {
     server_key: Arc<str>,
     approval_manager: Arc<ApprovalManager>,
-    client_info: ClientInfo,
+    client_info: ClientConfig,
     request_ctx: Arc<RwLock<Option<HandlerRequestContext>>>,
     refresh_tx: Option<mpsc::Sender<RefreshRequest>>,
 }
 
 impl SmgClientHandler {
     pub fn new(server_key: impl AsRef<str>, approval_manager: Arc<ApprovalManager>) -> Self {
-        let mut client_info = ClientInfo::default();
+        let mut client_info = ClientConfig::default();
         client_info.client_info.name = "smg".to_string();
         client_info.client_info.version = env!("CARGO_PKG_VERSION").to_string();
 
@@ -87,7 +91,7 @@ impl SmgClientHandler {
     }
 
     #[must_use]
-    pub fn with_client_info(mut self, info: ClientInfo) -> Self {
+    pub fn with_client_info(mut self, info: ClientConfig) -> Self {
         self.client_info = info;
         self
     }
@@ -128,9 +132,9 @@ impl SmgClientHandler {
 impl ClientHandler for SmgClientHandler {
     async fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
+        request: ElicitRequestParams,
         context: RequestContext<RoleClient>,
-    ) -> Result<CreateElicitationResult, rmcp::ErrorData> {
+    ) -> Result<ElicitResult, rmcp::ErrorData> {
         use crate::annotations::ToolAnnotations;
 
         let elicitation_id = match &context.id {
@@ -147,8 +151,14 @@ impl ClientHandler for SmgClientHandler {
         // user-facing message, which we use as the tool identifier (elicitation
         // doesn't have a tool name directly).
         let message = match &request {
-            CreateElicitationRequestParams::FormElicitationParams { message, .. }
-            | CreateElicitationRequestParams::UrlElicitationParams { message, .. } => message,
+            ElicitRequestParams::FormElicitationParams { message, .. }
+            | ElicitRequestParams::UrlElicitationParams { message, .. } => message,
+            _ => {
+                return Err(rmcp::ErrorData::invalid_params(
+                    "elicitation kind not supported",
+                    None,
+                ));
+            }
         };
 
         // Default annotations (conservative - not read-only, potentially destructive)
@@ -171,7 +181,7 @@ impl ClientHandler for SmgClientHandler {
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
         let result_for = |allowed: bool| {
-            CreateElicitationResult::new(if allowed {
+            ElicitResult::new(if allowed {
                 ElicitationAction::Accept
             } else {
                 ElicitationAction::Decline
@@ -200,7 +210,7 @@ impl ClientHandler for SmgClientHandler {
     ) {
         info!(
             server_key = %self.server_key,
-            request_id = %params.request_id,
+            request_id = ?params.request_id,
             reason = ?params.reason,
             "MCP server cancelled request"
         );
@@ -248,10 +258,14 @@ impl ClientHandler for SmgClientHandler {
         self.send_refresh();
     }
 
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         self.client_info.clone()
     }
 
+    #[expect(
+        deprecated,
+        reason = "MCP deprecated server-to-client logging (SEP-2577); servers on the earlier protocol versions still send it, so the handler keeps forwarding it until the type goes"
+    )]
     async fn on_logging_message(
         &self,
         params: LoggingMessageNotificationParam,

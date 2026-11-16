@@ -179,6 +179,8 @@ message KvBootstrapInfo {
   int64 bootstrap_room = 3;
 }
 
+// The gateway codec writes this message by hand around its field numbers and
+// GenerateRequest.tokenized = 2: change them together with crates/grpc_client/src/codec.rs.
 message TokenizedInput {
   repeated uint32 input_ids = 1;
   string original_text = 2; // cosmetic, for worker logs
@@ -419,6 +421,14 @@ message SchedulerLoad {
 
   optional MemoryMetrics memory = 12;
   optional QueueMetrics queues = 13;
+
+  // Computed input tokens per active prefill second, the servicer's own
+  // measurement; absent if unknown or stale. Numbered 16 (the next free
+  // number) so the existing field numbers stay stable.
+  optional double prefill_throughput = 16;
+  // Context tokens (prompt plus committed output) of every request the rank
+  // holds: the attention work its decode steps read. Absent on old workers.
+  optional int64 num_resident_tokens = 17;
 }
 
 message MemoryMetrics {

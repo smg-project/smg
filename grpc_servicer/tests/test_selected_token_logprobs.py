@@ -82,8 +82,13 @@ def servicer(monkeypatch, manager_mod):
 
 
 def _manager_and_state(module, *, stream=False):
+    """Build a request manager with real per-stream output state and stubbed engine imports."""
     manager = module.GrpcRequestManager.__new__(module.GrpcRequestManager)
+    from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
+
+    manager.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
     manager.enable_trace = False  # built without __init__: the tracing switch is off
+    manager.metrics_collector = None
     state = module.GrpcReqState(
         request_id="score",
         grpc_context=None,
@@ -101,7 +106,7 @@ def _manager_and_state(module, *, stream=False):
             first_token_time=0.0,
             set_first_token_time=lambda: None,
             set_last_time=lambda: None,
-            set_finished_time=lambda: None,
+            set_finished_time=lambda ts=None: None,
         ),
     )
     manager.rid_to_state = {"score": state}

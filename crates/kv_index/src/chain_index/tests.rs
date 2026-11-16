@@ -1,11 +1,11 @@
 use super::{arena::*, slab::*, *};
 use crate::reference::{request_prefix_hashes, ReferenceIndexer};
 
-fn content(stream: u64, position: usize) -> ContentHash {
+pub(crate) fn content(stream: u64, position: usize) -> ContentHash {
     crate::compute_content_hash(&[stream as u32, (stream >> 32) as u32, position as u32])
 }
 
-fn blocks_of(contents: &[ContentHash]) -> Vec<StoredBlock> {
+pub(crate) fn blocks_of(contents: &[ContentHash]) -> Vec<StoredBlock> {
     contents
         .iter()
         .zip(request_prefix_hashes(contents))
@@ -28,14 +28,90 @@ fn scores(index: &ChainIndex, query: &[ContentHash]) -> Vec<(u32, u32)> {
 
 #[test]
 fn array_classes_round_up_and_back() {
-    for capacity in [1usize, 8, 9, 16, 100, 128, 129, 256, 257, 1000, 4096, 5000] {
+    for capacity in [
+        1usize, 4, 8, 9, 12, 13, 16, 28, 32, 33, 40, 41, 100, 128, 129, 256, 257, 1000, 4096, 5000,
+    ] {
         let class = array_class(capacity);
         assert!(class_capacity(class) >= capacity, "capacity {capacity}");
         assert_eq!(array_class(class_capacity(class)), class);
     }
+    assert_eq!(class_capacity(array_class(1)), 8, "the 8-word floor");
+    assert_eq!(class_capacity(array_class(9)), 12, "a 4-word step to 32");
+    assert_eq!(class_capacity(array_class(13)), 16);
+    assert_eq!(class_capacity(array_class(33)), 40, "an 8-word step to 128");
+    assert_eq!(
+        class_capacity(array_class(129)),
+        160,
+        "a quarter octave above"
+    );
+    for class in 1..ARRAY_CLASSES {
+        assert!(
+            class_capacity(class) > class_capacity(class - 1),
+            "classes grow: {class}"
+        );
+    }
     assert_eq!(table_class(2), 0);
     assert_eq!(table_class(4), 1);
     assert_eq!(table_class(1024), 9);
+}
+
+/// The arena takes memory from the process allocator a whole chunk at a time and keeps it: at a
+/// chunk boundary one more small array moves the bytes held by a chunk while the bytes handed
+/// out move by the array. An index whose arena sits near a boundary therefore holds one of two
+/// amounts a chunk apart for the same blocks, which `arena_chunk_bytes` names beside
+/// `arena_bytes`: nothing before the first array (the reserved word 0 is handed out, no chunk is
+/// held), then the handed-out words rounded up to whole chunks.
+#[test]
+fn the_arena_holds_whole_chunks_and_keeps_them() {
+    const CHUNK_BYTES: usize = WORD_CHUNK * size_of::<AtomicU64>();
+    // Two header words and a 16-word class array: the 18 words a short chain's hashes take.
+    const ARRAY_WORDS: usize = 16 + 2;
+    let contents = [7u64; 16];
+    let arena = WordArena::new();
+    let held_is_rounded_up = |arena: &WordArena| {
+        assert_eq!(
+            arena.chunk_bytes(),
+            (arena.used() as usize).div_ceil(WORD_CHUNK) * CHUNK_BYTES,
+            "held bytes are the handed-out words rounded up to whole chunks"
+        );
+    };
+    assert_eq!(
+        arena.chunk_bytes(),
+        0,
+        "nothing held before the first array"
+    );
+    arena.alloc_array(&contents, contents.len());
+    assert_eq!(
+        arena.chunk_bytes(),
+        CHUNK_BYTES,
+        "the first array takes a whole chunk"
+    );
+    held_is_rounded_up(&arena);
+    while arena.used() as usize + ARRAY_WORDS <= WORD_CHUNK {
+        arena.alloc_array(&contents, contents.len());
+    }
+    let before = arena.used();
+    assert_eq!(
+        arena.chunk_bytes(),
+        CHUNK_BYTES,
+        "one chunk holds every array that fits"
+    );
+    arena.alloc_array(&contents, contents.len());
+    assert_eq!(
+        arena.chunk_bytes(),
+        2 * CHUNK_BYTES,
+        "the first array past the boundary takes the next whole chunk"
+    );
+    assert!(
+        (arena.used() - before) as usize <= 2 * ARRAY_WORDS,
+        "the words handed out moved by one array and the chunk's tail, not by a chunk"
+    );
+    held_is_rounded_up(&arena);
+    // A freed array goes to a free list, never back to the allocator: the chunks stay.
+    let last = arena.used() as u32 - ARRAY_WORDS as u32 + 2;
+    arena.array_release(last);
+    assert_eq!(arena.chunk_bytes(), 2 * CHUNK_BYTES);
+    assert!(arena.free_words() >= ARRAY_WORDS);
 }
 
 #[test]
@@ -219,6 +295,237 @@ fn dead_runs_and_arrays_are_reused() {
     assert_eq!(index.current_size(), 0);
 }
 
+/// A chain stored as four blocks and grown one block at a time to twelve, the shape of a short
+/// prompt with its decode, ends with its hashes in a 12-word class: the one reallocation at the
+/// ninth block asks for eleven words and gets twelve, not sixteen.
+#[test]
+fn a_short_chain_grown_block_by_block_sits_in_a_twelve_word_class() {
+    let index = ChainIndex::with_max_workers(8);
+    let w = index.intern_worker("w").expect("id");
+    let mut mw = ChainBlockMap::default();
+    let held: Vec<ContentHash> = (0..12).map(|p| content(3, p)).collect();
+    let blocks = blocks_of(&held);
+    index
+        .apply_stored(w, &blocks[..4], None, &mut mw)
+        .expect("prompt");
+    let first = mw.get(blocks[0].seq_hash).expect("held").run;
+    let prompt_array = index.slab.run(first).block.load(Ordering::Relaxed);
+    assert_eq!(
+        index.arena.array_capacity(prompt_array),
+        8,
+        "four blocks and their slack take the 8-word floor"
+    );
+    for b in 4..12 {
+        index
+            .apply_stored(w, &blocks[b..b + 1], Some(blocks[b - 1].seq_hash), &mut mw)
+            .expect("decode block");
+    }
+    assert_eq!(scores(&index, &held), vec![(w, 12)]);
+    let at = mw.get(blocks[11].seq_hash).expect("held");
+    let run = index.slab.run(at.run);
+    assert_eq!(run.len(), 12, "one run");
+    let (block, engine) = (
+        run.block.load(Ordering::Relaxed),
+        run.engine.load(Ordering::Relaxed),
+    );
+    assert_eq!(
+        index.arena.array_capacity(block),
+        12,
+        "the content array's class"
+    );
+    assert_eq!(
+        index.arena.array_capacity(engine),
+        12,
+        "the engine twin's class"
+    );
+}
+
+#[test]
+fn the_arena_caps_a_table_and_an_array_at_one_chunk() {
+    let arena = WordArena::new();
+    assert_eq!(
+        arena.largest_table_slots(),
+        1 << 18,
+        "2^18 slots are 524,290 words; 2^19 ask for two words more than a chunk"
+    );
+    assert_eq!(
+        slots_for(196_608),
+        1 << 18,
+        "three-quarters of the largest table"
+    );
+    assert_eq!(slots_for(196_609), 1 << 19);
+    assert!(
+        arena.array_fits(917_504),
+        "the largest class two words short of a chunk"
+    );
+    assert!(
+        !arena.array_fits(917_505),
+        "the next class is a whole chunk, with no room for the header"
+    );
+    assert!(arena.array_fits(capacity_for(815_559)));
+    assert!(!arena.array_fits(capacity_for(815_560)));
+}
+
+/// With the arena's cap lowered to 64 words a run's child table stops at 16 slots and takes
+/// twelve live children, three-quarters of it: a chain of two blocks and twelve more sharing
+/// its first block fit under it (the first chain's second block is the run's own, the others
+/// its children), the next such store is declined and counted, the thirteen still score, and
+/// another run takes children as before. Two children gone, two more fit; the refusal after
+/// them finds an eighth of the table tombstoned and rebuilds it at its size.
+#[test]
+fn a_store_past_the_fan_out_cap_is_declined_and_counted() {
+    let mut index = ChainIndex::with_max_workers(8);
+    index.lower_arena_cap(64);
+    let w = index.intern_worker("w").expect("id");
+    let mut mw = ChainBlockMap::default();
+    let parent = content(5, 0);
+    let chains: Vec<[ContentHash; 2]> = (0..13).map(|i| [parent, content(6, i)]).collect();
+    for chain in &chains {
+        index
+            .apply_stored(w, &blocks_of(chain), None, &mut mw)
+            .expect("a child within the cap");
+    }
+    assert_eq!(
+        index.stats().child_entries,
+        12,
+        "three-quarters of 16 slots"
+    );
+    let past = [parent, content(6, 13)];
+    assert!(matches!(
+        index.apply_stored(w, &blocks_of(&past), None, &mut mw),
+        Err(ApplyError::ArenaCapReached { .. })
+    ));
+    assert_eq!(index.stats().cap_refusals, 1);
+    for chain in &chains {
+        assert_eq!(scores(&index, chain), vec![(w, 2)], "still held");
+    }
+    assert_eq!(scores(&index, &past), vec![(w, 1)], "the shared block only");
+    let elsewhere = [content(7, 0), content(7, 1)];
+    index
+        .apply_stored(w, &blocks_of(&elsewhere), None, &mut mw)
+        .expect("another run is not at its cap");
+    assert_eq!(scores(&index, &elsewhere), vec![(w, 2)]);
+
+    let gone: Vec<SequenceHash> = chains[3..5]
+        .iter()
+        .map(|chain| blocks_of(chain)[1].seq_hash)
+        .collect();
+    index.apply_removed(w, &gone, &mut mw);
+    let stats = index.stats();
+    assert_eq!(
+        (stats.child_entries, stats.child_tombstones),
+        (10, 2),
+        "two children gone, their slots tombstoned"
+    );
+    for i in 13..15 {
+        index
+            .apply_stored(w, &blocks_of(&[parent, content(6, i)]), None, &mut mw)
+            .expect("room again below the cap");
+    }
+    assert!(matches!(
+        index.apply_stored(w, &blocks_of(&[parent, content(6, 15)]), None, &mut mw),
+        Err(ApplyError::ArenaCapReached { .. })
+    ));
+    let stats = index.stats();
+    assert_eq!(
+        (
+            stats.child_entries,
+            stats.child_tombstones,
+            stats.cap_refusals
+        ),
+        (12, 0, 2),
+        "declined, and the table rebuilt at its size without its tombstones"
+    );
+}
+
+/// A store declined at a run's cap keeps what the walk placed before the block that would pass
+/// it: a second worker storing a chain under a run at the cap is a holder of the block it
+/// matched there, in the index and in its lane map (so its later removal works), and the error
+/// says how many leading blocks were placed.
+#[test]
+fn a_store_declined_at_the_cap_keeps_its_placed_prefix() {
+    let mut index = ChainIndex::with_max_workers(8);
+    index.lower_arena_cap(64);
+    let a = index.intern_worker("a").expect("id");
+    let b = index.intern_worker("b").expect("id");
+    let (mut ma, mut mb) = (ChainBlockMap::default(), ChainBlockMap::default());
+    let parent = content(5, 0);
+    for i in 0..13 {
+        index
+            .apply_stored(a, &blocks_of(&[parent, content(6, i)]), None, &mut ma)
+            .expect("a child within the cap");
+    }
+    let late = blocks_of(&[parent, content(6, 13)]);
+    assert!(matches!(
+        index.apply_stored(b, &late, None, &mut mb),
+        Err(ApplyError::ArenaCapReached { placed: 1 })
+    ));
+    assert_eq!(index.stats().cap_refusals, 1);
+    let sorted = |mut scores: Vec<(u32, u32)>| {
+        scores.sort_unstable();
+        scores
+    };
+    assert_eq!(
+        sorted(scores(&index, &[parent])),
+        vec![(a, 1), (b, 1)],
+        "b holds the shared block"
+    );
+    assert_eq!(
+        sorted(scores(&index, &[parent, content(6, 13)])),
+        vec![(a, 1), (b, 1)],
+        "the declined block is held by neither"
+    );
+    assert!(
+        index.is_held(&mb, late[0].seq_hash),
+        "b's map has the placed block"
+    );
+    assert!(!index.is_held(&mb, late[1].seq_hash));
+    index.apply_removed(b, &[late[0].seq_hash], &mut mb);
+    assert_eq!(
+        scores(&index, &[parent]),
+        vec![(a, 1)],
+        "b's removal of it works"
+    );
+}
+
+/// With the cap at 64 words the longest hash array is 56 words: a chain of 57 blocks is
+/// declined whole, a chain of 50 is stored and grows in place to 56, and the block that would
+/// move it to a 64-word array is declined, the chain keeping its 56.
+#[test]
+fn a_store_past_the_run_length_cap_is_declined_and_counted() {
+    let mut index = ChainIndex::with_max_workers(8);
+    index.lower_arena_cap(64);
+    let w = index.intern_worker("w").expect("id");
+    let mut mw = ChainBlockMap::default();
+    let long: Vec<ContentHash> = (0..57).map(|p| content(8, p)).collect();
+    let blocks = blocks_of(&long);
+    assert!(matches!(
+        index.apply_stored(w, &blocks, None, &mut mw),
+        Err(ApplyError::ArenaCapReached { .. })
+    ));
+    assert_eq!(
+        scores(&index, &long),
+        Vec::new(),
+        "nothing of a declined chain"
+    );
+    index
+        .apply_stored(w, &blocks[..50], None, &mut mw)
+        .expect("fifty blocks fit a 56-word array");
+    index
+        .apply_stored(w, &blocks[50..56], Some(blocks[49].seq_hash), &mut mw)
+        .expect("six more fill the array in place");
+    assert!(matches!(
+        index.apply_stored(w, &blocks[56..], Some(blocks[55].seq_hash), &mut mw),
+        Err(ApplyError::ArenaCapReached { .. })
+    ));
+    assert_eq!(
+        scores(&index, &long),
+        vec![(w, 56)],
+        "the chain keeps its fifty-six"
+    );
+    assert_eq!(index.stats().cap_refusals, 2);
+}
+
 #[test]
 fn appends_reuse_the_array_until_another_worker_joins() {
     let index = ChainIndex::with_max_workers(8);
@@ -315,6 +622,104 @@ fn many_children_grow_the_table_and_stay_findable() {
             .expect("ref branch");
     }
     assert_eq!(index.debug_blocks(), reference.blocks());
+}
+
+/// A run with thousands of children, every one of them unlinked in turn: each unlink lands on
+/// its child's slot by the child's key (its offset under the run and its first hash) in a few
+/// probes and never falls back to the scan of the whole table.
+#[test]
+fn a_child_unlink_probes_its_slot_instead_of_scanning_the_table() {
+    let index = ChainIndex::with_max_workers(8);
+    let w = index.intern_worker("w").expect("id");
+    let mut map = ChainBlockMap::default();
+    let parent = content(5, 0);
+    let chains: Vec<[ContentHash; 2]> = (0..3_000).map(|i| [parent, content(6, i)]).collect();
+    for chain in &chains {
+        index
+            .apply_stored(w, &blocks_of(chain), None, &mut map)
+            .expect("a child");
+    }
+    assert_eq!(
+        index.stats().child_entries,
+        2_999,
+        "the first chain's second block is the run's own, the rest hang off it"
+    );
+    let (probes, scans) = (
+        index.arena.take_probes.load(Ordering::Relaxed),
+        index.arena.take_scans.load(Ordering::Relaxed),
+    );
+    for chain in &chains[1..] {
+        index.apply_removed(w, &[blocks_of(chain)[1].seq_hash], &mut map);
+    }
+    let probes = index.arena.take_probes.load(Ordering::Relaxed) - probes;
+    let scans = index.arena.take_scans.load(Ordering::Relaxed) - scans;
+    assert_eq!(scans, 0, "no unlink fell back to the scan");
+    assert!(
+        probes <= 4 * 2_999,
+        "{probes} probes for 2,999 unlinks from a 4,096-slot table"
+    );
+    let stats = index.stats();
+    assert_eq!((stats.child_entries, stats.child_tombstones), (0, 0));
+    assert_eq!(scores(&index, &chains[0]), vec![(w, 2)]);
+    for chain in &chains[1..] {
+        assert_eq!(scores(&index, chain), vec![(w, 1)], "the shared block only");
+    }
+}
+
+/// The other derivation of a child's key: a split moves the children past its cut to the suffix,
+/// keyed by their offset under it. Unlinking them from the suffix lands by probe as well; a key
+/// the split and the unlink derived differently would show here as the scan being taken.
+#[test]
+fn a_child_moved_to_a_suffix_by_a_split_is_unlinked_by_probe_too() {
+    let index = ChainIndex::with_max_workers(8);
+    let w = index.intern_worker("w").expect("id");
+    let mut map = ChainBlockMap::default();
+    let prompt: Vec<ContentHash> = (0..4).map(|p| content(7, p)).collect();
+    index
+        .apply_stored(w, &blocks_of(&prompt), None, &mut map)
+        .expect("prompt");
+    // Children at offset 3 of the four-block run: chains that leave it after its third block.
+    let mut chains = Vec::new();
+    for branch in 0..200u64 {
+        let mut chain = prompt[..3].to_vec();
+        chain.push(content(700 + branch, 0));
+        index
+            .apply_stored(w, &blocks_of(&chain), None, &mut map)
+            .expect("branch");
+        chains.push(chain);
+    }
+    assert_eq!(index.stats().child_entries, 200);
+    // A hole at the second block splits the run at offset 2: the children hang off offset 1 of
+    // the suffix now, and the suffix is the prefix's one child.
+    index.apply_removed(w, &[blocks_of(&prompt)[1].seq_hash], &mut map);
+    let stats = index.stats();
+    assert_eq!(
+        (stats.splits_by_hole, stats.child_entries),
+        (1, 201),
+        "one split; the children moved to the suffix, the suffix under the prefix"
+    );
+    let (probes, scans) = (
+        index.arena.take_probes.load(Ordering::Relaxed),
+        index.arena.take_scans.load(Ordering::Relaxed),
+    );
+    for chain in &chains {
+        index.apply_removed(w, &[blocks_of(chain)[3].seq_hash], &mut map);
+    }
+    let probes = index.arena.take_probes.load(Ordering::Relaxed) - probes;
+    let scans = index.arena.take_scans.load(Ordering::Relaxed) - scans;
+    assert_eq!(scans, 0, "no unlink from the suffix fell back to the scan");
+    assert!(probes <= 4 * 200, "{probes} probes for 200 unlinks");
+    let stats = index.stats();
+    assert_eq!(
+        (stats.child_entries, stats.child_tombstones),
+        (1, 0),
+        "the suffix stays under the prefix; the children's table is gone"
+    );
+    assert_eq!(
+        scores(&index, &prompt),
+        vec![(w, 1)],
+        "the hole stops the match"
+    );
 }
 
 #[test]

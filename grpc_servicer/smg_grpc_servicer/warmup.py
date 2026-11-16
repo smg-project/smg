@@ -17,7 +17,11 @@ flips, so the first-time costs are paid while nothing is routed here:
 - the **decode staircase**: as many concurrent requests as the running window
   holds, each asking for one more output token than the one before, so the
   running batch shrinks by one per step and every batch size from the window
-  down to one runs once;
+  down to one runs once. Not on an engine that runs prefill alone
+  (:attr:`WarmupInputs.prefill_only`: the prefill side of a disaggregated
+  pair, whose decode steps are its peer's): there the staircase would warm
+  nothing and only hold a window's worth of transfers and their KV at once,
+  and such an engine's plan is one request (below);
 - the **prefill ladder**: one request per prefill length class the admission
   step admits (every :data:`PREFILL_CLASS_TOKENS`-token class up to the
   step's token budget at the ``full`` level; the engine tuners' coarser
@@ -37,9 +41,9 @@ flips, so the first-time costs are paid while nothing is routed here:
   lazily loads a never-used kernel on that count's first use; during serving,
   with a collective of the overlapped previous chunk still in flight, that
   load has deadlocked the forward. The ``fast`` level plans none of them and
-  leaves that hazard open (the start log says so): it is for a test leg or a
+  leaves that hazard open (the start log says so): it is for a test run or a
   quick restart, and the shipped default is ``full``;
-- the **media leg**, when the engine module asks for it
+- the **media request**, when the engine module asks for it
   (:attr:`WarmupInputs.media_leg`): one request carrying one media item
   through the engine's own media path, after the second pass and before the
   chunk remainders, so the first-use cost of that path (a kernel compiled on
@@ -68,6 +72,7 @@ import contextlib
 import dataclasses
 import logging
 import random
+import secrets
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from typing import Any, Protocol
@@ -218,10 +223,22 @@ class WarmupInputs:
     #: hazard open, and :func:`plan_for` warns so.
     every_prefill_length: bool = False
     #: The bootstrap host the engine's scheduler takes as a transfer to
-    #: nobody (its own warm-up's stand-in), when the engine is one leg of a
-    #: disaggregated pair: every request carries it, so the leg warms up
+    #: nobody (its own warm-up's stand-in), when the engine is one side of a
+    #: disaggregated pair: every request carries it, so the side warms up
     #: without its peer. ``None`` for a single engine.
     lone_leg_bootstrap: str | None = None
+    #: Whether this engine runs prefill alone: the prefill side of a
+    #: disaggregated pair, whose decode steps run on its peer. No running
+    #: batch of its own ever decodes here, and every warm-up request it
+    #: takes is a stand-in transfer whose slots an engine release has been
+    #: seen not to give back: a ladder of them, one at a time, ran a
+    #: side's pool dry before its top. So such an engine's plan is one request
+    #: of the smallest shape per rank (the first forward and the transfer
+    #: path are paid before the health flips; nothing more is held), plus
+    #: the media step's one request per rank when the engine module asks
+    #: for one, and the length classes are paid by the first request of
+    #: each during serving, as the engine's own warm-up leaves them.
+    prefill_only: bool = False
     #: Whether the plan carries one request with one media item through the
     #: engine's media path (after the second pass, before the chunk
     #: remainders): an engine module sets it for a worker whose first media
@@ -246,7 +263,7 @@ class WarmupRequest:
     #: The data-parallel rank the request is pinned to; ``None`` leaves the
     #: servicer's own routing to pick the engine (one rank, or no pinning).
     data_parallel_rank: int | None = None
-    #: A lone leg's stand-in bootstrap host
+    #: A lone side's stand-in bootstrap host
     #: (:attr:`WarmupInputs.lone_leg_bootstrap`), for the wire to carry.
     lone_leg_bootstrap: str | None = None
     #: The request carries one media item: the wire supplies the item and the
@@ -312,10 +329,11 @@ class WarmupPlan:
             f"{self.inputs.max_num_batched_tokens}"
             + (f" on each of {ranks} data-parallel ranks" if ranks > 1 else "")
             + (
-                ", the requests carrying the lone leg's stand-in bootstrap"
+                ", the requests carrying the lone side's stand-in bootstrap"
                 if self.inputs.lone_leg_bootstrap
                 else ""
             )
+            + (", one request: this engine runs prefill alone" if self.inputs.prefill_only else "")
         )
 
 
@@ -386,12 +404,27 @@ def token_ids(count: int, seed: int, vocab_size: int) -> tuple[int, ...]:
     return tuple(floor + draw.randrange(span) for _ in range(count))
 
 
-class _Requests:
-    """The requests of one plan, numbered: the ordinal seeds the token ids."""
+def draw_nonce() -> str:
+    """A fresh nonce for one process's warm-up request ids
+    (:func:`plan_warmup`), drawn once per launcher process: the Rust servicer
+    constructed with it admits only ids that carry it while readiness is
+    held, so a client's own ``rid`` cannot spell its way into the pass."""
+    return secrets.token_hex(4)
 
-    def __init__(self, vocab_size: int, lone_leg_bootstrap: str | None = None) -> None:
+
+class _Requests:
+    """The requests of one plan, numbered: the ordinal seeds the token ids,
+    and ``nonce`` marks the ids as this process's own."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        lone_leg_bootstrap: str | None = None,
+        nonce: str | None = None,
+    ) -> None:
         self._vocab_size = vocab_size
         self._lone_leg_bootstrap = lone_leg_bootstrap
+        self._nonce = nonce
         self._next = 0
 
     def one(
@@ -405,9 +438,12 @@ class _Requests:
         self._next += 1
         # The exact form the Rust servicers admit while readiness is held
         # (`is_warmup_request_id` in the engine servicer crate's request
-        # registry): the prefix, the ordinal, nothing else.
+        # registry): the prefix, the nonce the server was constructed with,
+        # the ordinal, nothing else; without a nonce the prefix and the
+        # ordinal alone.
+        mark = f"{self._nonce}-" if self._nonce else ""
         return WarmupRequest(
-            request_id=f"smg-warmup-{ordinal}",
+            request_id=f"smg-warmup-{mark}{ordinal}",
             prompt_tokens=prompt_tokens,
             max_tokens=max_tokens,
             seed=ordinal,
@@ -418,27 +454,46 @@ class _Requests:
         )
 
 
-def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
+def _media_step(requests: _Requests, ranks: tuple[int | None, ...]) -> WarmupStep:
+    """One item through the engine's media path, on every rank: its first-use
+    cost is the media path's own, which no text shape reaches."""
+    return WarmupStep(
+        name="one media item through the engine's media path",
+        kind="media",
+        requests=tuple(
+            requests.one(STAIRCASE_PROMPT_TOKENS, 1, rank, media=True) for rank in ranks
+        ),
+    )
+
+
+def plan_warmup(
+    inputs: WarmupInputs, level: str = DEFAULT_LEVEL, nonce: str | None = None
+) -> WarmupPlan:
     """The steps for ``inputs`` at ``level``, in the order they run: the
     decode staircase first (cheap, and every ramp's first shapes), then the
     prefill shapes by length, the odd variants, the second pass, the media
-    leg when the inputs ask for one, and, when
+    request when the inputs ask for one, and, when
     the inputs ask for every prefill length, the chunk remainders in
     :func:`spread_order` at the ``full`` level (the ``fast`` level keeps the
-    merged ladder: a test leg or a quick start takes the classes alone, and
+    merged ladder: a test run or a quick start takes the classes alone, and
     the shipped default is ``full``). A prompt never exceeds the admission
     step, nor the context less its output and the positions the engine's
     scheduler keeps back (:attr:`WarmupInputs.context_reserve_tokens`), so
     no step reaches a shape the engine refuses. Under data parallelism
     (``inputs.data_parallel_size`` above one) the staircase runs once per
     rank and every prefill shape goes to every rank at once, each request
-    pinned to its rank."""
+    pinned to its rank. An engine that runs prefill alone
+    (``inputs.prefill_only``) gets neither the staircase nor the ladder: its
+    plan is one request of the smallest shape per rank, and the media step
+    when the inputs ask for one. ``nonce`` (:func:`draw_nonce`) marks every
+    request id as this process's own, the mark the servicer constructed with
+    it admits while it holds readiness."""
     if level not in LEVELS:
         raise ValueError(f"unknown warm-up level {level!r}; expected one of {LEVELS}")
     steps: list[WarmupStep] = []
     if inputs.max_num_batched_tokens <= 0 or inputs.vocab_size <= 0:
         return WarmupPlan(level, inputs, ())
-    requests = _Requests(inputs.vocab_size, inputs.lone_leg_bootstrap)
+    requests = _Requests(inputs.vocab_size, inputs.lone_leg_bootstrap, nonce)
     window = inputs.max_num_seqs if inputs.max_num_seqs > 0 else DEFAULT_WINDOW
     # The longest prompt a one-token request may carry: the context less the
     # token and the positions the engine keeps back (the step alone when the
@@ -453,6 +508,23 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     ranks: tuple[int | None, ...] = (
         tuple(range(inputs.data_parallel_size)) if inputs.data_parallel_size > 1 else (None,)
     )
+
+    if inputs.prefill_only:
+        # An engine that runs prefill alone: one stand-in request of the
+        # smallest shape per rank (an engine release that gave no stand-in's
+        # slots back ran a side's pool dry under a ladder of them), and the
+        # media step when asked for: the media path's first use is its own,
+        # and one more request per rank.
+        steps.append(
+            WarmupStep(
+                name="one request on the prefill side",
+                kind="prefill",
+                requests=tuple(requests.one(STAIRCASE_PROMPT_TOKENS, 1, rank) for rank in ranks),
+            )
+        )
+        if inputs.media_leg:
+            steps.append(_media_step(requests, ranks))
+        return WarmupPlan(level, inputs, tuple(steps))
 
     # The decode staircase: as many requests as fit the window and one
     # admission step of short prompts, asking for 2..N+1 output tokens (the
@@ -496,17 +568,7 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
             )
         )
     if inputs.media_leg:
-        # One item through the engine's media path, on every rank: its
-        # first-use cost is the media path's own, which no text shape reaches.
-        steps.append(
-            WarmupStep(
-                name="one media item through the engine's media path",
-                kind="media",
-                requests=tuple(
-                    requests.one(STAIRCASE_PROMPT_TOKENS, 1, rank, media=True) for rank in ranks
-                ),
-            )
-        )
+        steps.append(_media_step(requests, ranks))
     if inputs.every_prefill_length and level == LEVEL_FULL:
         for length in spread_order(limit):
             if length in lengths:
@@ -912,17 +974,19 @@ def plan_for(
     *,
     knob: str,
     log: logging.Logger = logger,
+    nonce: str | None = None,
 ) -> WarmupPlan | None:
     """The plan a launcher runs for ``setting`` and ``inputs``, or ``None``
     with the reason logged: the knob is off, the engine or model takes no
-    warm-up (no inputs), or the configuration leaves nothing to plan."""
+    warm-up (no inputs), or the configuration leaves nothing to plan.
+    ``nonce`` marks the plan's request ids (:func:`plan_warmup`)."""
     if not setting.enabled:
         log.info("Planned warm-up off (%s=off)", knob)
         return None
     if inputs is None:
         log.info("Planned warm-up: none for this engine or model")
         return None
-    plan = plan_warmup(inputs, setting.level)
+    plan = plan_warmup(inputs, setting.level, nonce)
     if inputs.every_prefill_length and setting.level != LEVEL_FULL:
         log.warning(
             "Planned warm-up at the %s level plans the length classes alone and leaves out the "

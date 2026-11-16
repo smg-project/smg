@@ -1,0 +1,66 @@
+# SmgHighRouterErrorRatio reads the router families, which count a request's
+# failure whatever its point of failure; the edge's smg_http_responses_total
+# counts a stream by its head. The series carry the labels the chart's job
+# selector renders (run.sh).
+rule_files:
+  - rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # Every fifth stream dies after its first token: at the edge every answer is
+  # a 200 with no error code, in the router families one request in five is an
+  # error. SmgHighErrorRatio stays quiet; SmgHighRouterErrorRatio fires.
+  - interval: 1m
+    name: streams that fail after their first token fire the router ratio
+    input_series:
+      - series: 'smg_http_responses_total{namespace="smg", job="smg-router", path="/v1/chat/completions", status_code="200", error_code=""}'
+        values: '0+10x20'
+      - series: 'smg_router_requests_total{namespace="smg", job="smg-router", router_type="grpc", backend_type="regular", connection_mode="grpc", model="m", endpoint="chat", streaming="true"}'
+        values: '0+10x20'
+      - series: 'smg_router_request_errors_total{namespace="smg", job="smg-router", router_type="grpc", backend_type="regular", connection_mode="grpc", model="m", endpoint="chat", error_type="backend_error", reason="transport_disconnect"}'
+        values: '0+2x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SmgHighErrorRatio
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: SmgHighRouterErrorRatio
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: smg
+              job: smg-router
+            exp_annotations:
+              summary: "Too many routed requests fail"
+              description: "20% of the requests routed by smg/smg-router failed server-side over the last 5 minutes (threshold 0.05), streams that failed after their first token included; the edge's response families count those as 200s, and the client's own refusals are not counted."
+
+  # A healthy fleet: one request in a hundred fails. Quiet.
+  - interval: 1m
+    name: a failing share under the threshold stays quiet
+    input_series:
+      - series: 'smg_router_requests_total{namespace="smg", job="smg-router", router_type="http", backend_type="regular", connection_mode="http", model="m", endpoint="chat", streaming="false"}'
+        values: '0+100x20'
+      - series: 'smg_router_request_errors_total{namespace="smg", job="smg-router", router_type="http", backend_type="regular", connection_mode="http", model="m", endpoint="chat", error_type="server_error", reason="engine_error"}'
+        values: '0+1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SmgHighRouterErrorRatio
+        exp_alerts: []
+
+  # The client's own refusals: one request in five is malformed and one in
+  # ten is a tenant over its limit, no server fails. Quiet: those classes are
+  # out of the numerator.
+  - interval: 1m
+    name: the client's own refusals stay out of the router ratio
+    input_series:
+      - series: 'smg_router_requests_total{namespace="smg", job="smg-router", router_type="grpc", backend_type="regular", connection_mode="grpc", model="m", endpoint="chat", streaming="false"}'
+        values: '0+100x20'
+      - series: 'smg_router_request_errors_total{namespace="smg", job="smg-router", router_type="grpc", backend_type="regular", connection_mode="grpc", model="m", endpoint="chat", error_type="validation_error", reason="invalid_request"}'
+        values: '0+20x20'
+      - series: 'smg_router_request_errors_total{namespace="smg", job="smg-router", router_type="grpc", backend_type="regular", connection_mode="grpc", model="m", endpoint="chat", error_type="rate_limit_error", reason="rate_limited"}'
+        values: '0+10x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SmgHighRouterErrorRatio
+        exp_alerts: []

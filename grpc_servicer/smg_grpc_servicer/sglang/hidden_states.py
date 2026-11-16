@@ -2,9 +2,9 @@
 ``return_hidden_states`` is refused here, ahead of the scheduler, as
 ``INVALID_ARGUMENT``: first under the engine's launch-time cap, in its own
 frontend's words, then by name: hidden states are served by the Rust servicer
-(``crates/engine_servicer``; the worker runs it with ``--servicer-impl rust``
-or ``SMG_SGLANG_SERVICER_IMPL=rust``), and this servicer, which once accepted
-the flag and returned nothing, says so.
+(``crates/engine_servicer``; the switch selects it, ``--servicer-impl rust`` or
+``SMG_SGLANG_SERVICER_IMPL=rust`` where it is not the launcher's default), and
+this servicer, which once accepted the flag and returned nothing, says so.
 
 ``new_hidden_rows`` belongs to the scheduler-side plugin (``zmq_msgpack.py``):
 it turns the engine's cumulative per-request list into the rows a step added,
@@ -16,8 +16,9 @@ from __future__ import annotations
 from typing import Any
 
 RUST_SERVICER_WORDS = (
-    "Hidden states are served by the Rust servicer: run the worker with "
-    "`--servicer-impl rust` (or SMG_SGLANG_SERVICER_IMPL=rust). The Python "
+    "Hidden states are served by the Rust servicer: run the worker on it "
+    "(`--servicer-impl rust` or SMG_SGLANG_SERVICER_IMPL=rust where it is not the "
+    "launcher's default; no explicit python choice where it is). The Python "
     "servicer does not return them."
 )
 

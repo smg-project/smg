@@ -136,15 +136,7 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// under it; the entries of a benchmark set the tree omits (`bellwether unpack
 /// --sample-sets` writes one set in N, picked by its id) are left alone, an id
 /// of one of its cases among them.
-const KNOWN_DIFFERENCES: &[(&str, &str)] = &[(
-    "nanollama/render/swehero-*",
-    "the set's reference encodes a space piece after BOS (`<s> [INST]`, the legacy Llama \
-         tokenizer form) where the checkpoint's fast tokenizer, the engine and the crate \
-         write `<s>[INST]`: every case of the set differs from its second id on with the text \
-         equal, and the model's hand-written sets match (a recording-era class on the \
-         reference side; a re-record of the set removes this entry; 2,500 of 2,500 cases of \
-         swehero-0)",
-)];
+const KNOWN_DIFFERENCES: &[(&str, &str)] = &[];
 
 /// Models whose tokenizer is known not to load, with the reason and where it
 /// is tracked, so the run compares the others: an unlisted model that does

@@ -21,7 +21,7 @@
 )]
 mod common;
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use common::{bytes_of, chunkings, replay_after};
 use openai_protocol::common::{Function, Tool};
@@ -435,10 +435,10 @@ fn weather() -> Declared {
         function: Function {
             name: "get_weather".to_string(),
             description: None,
-            parameters: json!({"type": "object", "properties": {
+            parameters: Some(json!({"type": "object", "properties": {
                 "city": {"type": "string"},
                 "days": {"type": "integer"},
-            }}),
+            }})),
             strict: None,
             extra: Default::default(),
         },
@@ -1200,7 +1200,7 @@ fn probe_tools() -> Vec<Tool> {
         function: Function {
             name: name.to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },
@@ -1554,7 +1554,7 @@ fn modes(format: &Format, reasoning_open: bool) -> [Grammar; 4] {
         tag(options(true, true)),
         tag(options(false, true)),
         format
-            .answer_grammar(&json!({"type": "object"}), reasoning_open)
+            .answer_grammar(&Arc::new(json!({"type": "object"})), reasoning_open)
             .expect("an answer tag"),
     ];
     for grammar in &grammars {
@@ -1651,7 +1651,11 @@ fn qwen3_5s_tags_take_what_its_chat_template_writes() {
         "the schema alone"
     );
     let led = format
-        .answer_grammar_for(&json!({"type": "object"}), true, GrammarStart::FirstToken)
+        .answer_grammar_for(
+            &Arc::new(json!({"type": "object"})),
+            true,
+            GrammarStart::FirstToken,
+        )
         .expect("an answer tag");
     led.check().expect("a tag the engines take");
     assert!(accepts(&led, "\n</think>{\"probe\": 1}"));

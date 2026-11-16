@@ -1,6 +1,8 @@
 //! Common test utilities for the multimodal integration tests.
 #![allow(dead_code, clippy::allow_attributes)] // each test binary uses a subset of these helpers
 
+pub mod counting_alloc;
+
 use std::{
     io::Read,
     net::{Ipv4Addr, SocketAddr, TcpStream},

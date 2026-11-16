@@ -152,7 +152,9 @@ def summarize(output):
             for line in (output / f"{name}-{round_index}.jsonl").read_text().splitlines():
                 row = json.loads(line)
                 if row["kind"] == "model":
-                    assert row["byte_table_decode"] == (name == "opt-in"), row
+                    # The byte-level table decodes every ByteLevel vocabulary in every build;
+                    # the pinned models all have one.
+                    assert row["byte_table_decode"], row
                     loads.append({"round": round_index, "build": name, **row})
                     continue
                 assert row["kind"] == "timing" and row["samples"] > 0, row

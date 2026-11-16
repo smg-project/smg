@@ -1,6 +1,6 @@
 [package]
 name = "smg-golang"
-version = "1.15.0-dev"
+version = "1.16.0-dev"
 edition = "2021"
 rust-version.workspace = true
 
@@ -34,7 +34,7 @@ workspace = true
 [dependencies.llm-tokenizer]
 workspace = true
 
-[dependencies.tool-parser]
+[dependencies.smg-symphony]
 workspace = true
 
 [dependencies.smg-grpc-client]

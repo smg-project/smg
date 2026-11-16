@@ -1974,6 +1974,113 @@ fn per_tree_page_size_is_independent() {
     assert_eq!(fine.match_prefix_with_counts(&seq).matched_token_count, 592);
 }
 
+/// The page-wise prefix count is the token-wise count rounded down to the
+/// page, for every shape: equal runs, one run a prefix of the other, a
+/// difference at every position around a page boundary, and at the default
+/// as well as at odd page sizes.
+#[test]
+fn page_prefix_count_equals_the_rounded_token_wise_count() {
+    fn token_wise(a: &[TokenId], b: &[TokenId], page: usize) -> usize {
+        let common = a.iter().zip(b).take_while(|(a, b)| a == b).count();
+        align_to_page(common, page)
+    }
+    for page in [1usize, 3, 16, 512] {
+        let lens = [
+            0,
+            1,
+            page - 1,
+            page,
+            page + 1,
+            2 * page,
+            2 * page + 3,
+            5 * page,
+        ];
+        for &la in &lens {
+            for &lb in &lens {
+                let a: Vec<TokenId> = (0..la as u32).collect();
+                let b: Vec<TokenId> = (0..lb as u32).collect();
+                assert_eq!(
+                    common_page_prefix(&a, &b, page),
+                    token_wise(&a, &b, page),
+                    "equal runs of {la} and {lb} tokens, page {page}"
+                );
+                let shorter = la.min(lb);
+                let edges = [
+                    0,
+                    1,
+                    page - 1,
+                    page,
+                    page + 1,
+                    2 * page - 1,
+                    2 * page,
+                    2 * page + 1,
+                ];
+                for d in edges.into_iter().chain([shorter.saturating_sub(1)]) {
+                    if d >= shorter {
+                        continue;
+                    }
+                    let mut b = b.clone();
+                    b[d] = u32::MAX;
+                    assert_eq!(
+                        common_page_prefix(&a, &b, page),
+                        token_wise(&a, &b, page),
+                        "runs of {la} and {lb} tokens differing at {d}, page {page}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A run with a partial-page tail: the tail is never cached, a request that
+/// diverges inside a page matches the whole pages before it, and a split at
+/// the page boundary leaves both sides their pages; the fused path reads the
+/// same counts as the match.
+#[test]
+fn partial_page_tails_match_the_whole_pages_before_them() {
+    let tree = TokenTree::new();
+    let seq: Vec<TokenId> = (0..(2 * PAGE_SIZE + 5) as u32).collect();
+    tree.insert_tokens(&seq, "w1");
+    assert_eq!(
+        tree.match_prefix_with_counts(&seq).matched_token_count,
+        2 * PAGE_SIZE
+    );
+
+    // Diverges five tokens into the second page.
+    let mut fork = seq.clone();
+    fork[PAGE_SIZE + 5] = 9_999;
+    assert_eq!(
+        tree.match_prefix_with_counts(&fork).matched_token_count,
+        PAGE_SIZE
+    );
+
+    // Longer than the cached run: the run's whole pages.
+    let mut longer = seq.clone();
+    longer.extend(1_000..1_040);
+    assert_eq!(
+        tree.match_prefix_with_counts(&longer).matched_token_count,
+        2 * PAGE_SIZE
+    );
+
+    // Inserting the fork splits at the page boundary.
+    tree.insert_tokens(&fork, "w2");
+    let forked = tree.match_prefix_with_counts(&fork);
+    assert_eq!(forked.matched_token_count, 2 * PAGE_SIZE);
+    assert_eq!(forked.tenant.as_ref(), "w2");
+    let original = tree.match_prefix_with_counts(&seq);
+    assert_eq!(original.matched_token_count, 2 * PAGE_SIZE);
+    assert_eq!(original.tenant.as_ref(), "w1");
+
+    assert_eq!(
+        tree.match_and_insert(&fork, "w2").matched_token_count,
+        2 * PAGE_SIZE
+    );
+    assert_eq!(
+        tree.match_and_insert(&longer, "w1").matched_token_count,
+        2 * PAGE_SIZE
+    );
+}
+
 /// The nodes a page-aligned sequence descends through, root excluded.
 fn path_nodes(tree: &TokenTree, tokens: &[TokenId]) -> Vec<NodeRef> {
     let mut nodes = Vec::new();
@@ -2301,4 +2408,429 @@ fn test_touch_any_tenant_reports_only_a_stamped_tenant() {
     node.tenant_last_access_time.remove(other.as_ref());
     assert!(node.touch_any_tenant(42, false).is_none());
     assert!(node.tenant_last_access_time.is_empty());
+}
+
+/// A miss of the `last_tenant` cache writes it, so the next lookup of the
+/// node takes the fast path instead of walking the tenant map's shards again
+/// (dashmap's walk allocates once per shard it enters, and a node whose
+/// touches never land on a multiple of sixteen never cached before).
+#[test]
+fn test_any_tenant_lookups_write_the_cache_on_a_miss() {
+    let node = Node::new(make_tokens(1, 1));
+    let w1 = intern_tenant("w1");
+    // ts 1: the one-in-sixteen refresh does not fire; the cache stays empty.
+    node.touch_tenant(&w1, 1, false);
+    assert!(node.last_tenant.read().is_none());
+
+    let picked = node.get_any_tenant().expect("owned node");
+    assert!(Arc::ptr_eq(&picked, &w1));
+    assert!(node
+        .last_tenant
+        .read()
+        .as_ref()
+        .is_some_and(|t| Arc::ptr_eq(t, &w1)));
+
+    // The cached tenant left the node: the miss replaces it with the tenant
+    // the touch stamped (ts 3 is no multiple of sixteen either).
+    let w2 = intern_tenant("w2");
+    node.touch_tenant(&w2, 2, false);
+    node.tenant_last_access_time.remove("w1");
+    let picked = node.touch_any_tenant(3, false).expect("w2 owns the node");
+    assert!(Arc::ptr_eq(&picked, &w2));
+    assert!(node
+        .last_tenant
+        .read()
+        .as_ref()
+        .is_some_and(|t| Arc::ptr_eq(t, &w2)));
+    assert_eq!(*node.tenant_last_access_time.get("w2").expect("w2"), 3);
+
+    // Nothing owns the node: nothing is picked and nothing attached.
+    node.tenant_last_access_time.remove("w2");
+    assert!(node.touch_any_tenant(4, false).is_none());
+    assert!(node.get_any_tenant().is_none());
+    assert!(node.tenant_last_access_time.is_empty());
+}
+
+// ---- the path hash a mesh delta names ---------------------------------------------------
+
+/// Every node carrying a path hash, with its root-to-node tokens.
+fn hashed_nodes(tree: &TokenTree) -> Vec<(Vec<TokenId>, NodeRef)> {
+    fn walk(node: &NodeRef, path: &mut Vec<TokenId>, out: &mut Vec<(Vec<TokenId>, NodeRef)>) {
+        for child in &node.children {
+            let child = child.value();
+            let edge = child.tokens.read().clone();
+            path.extend_from_slice(&edge);
+            if child.path_hash.load(Ordering::Relaxed) != 0 {
+                out.push((path.clone(), Arc::clone(child)));
+            }
+            walk(child, path, out);
+            path.truncate(path.len() - edge.len());
+        }
+    }
+    let mut out = Vec::new();
+    walk(&tree.root, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The lookup's invariant: a node carries a hash iff the map names that node
+/// under it. The hash is the caller's (of the sequence before page alignment),
+/// so the path check reads the node's aligned tokens as a prefix of a pool
+/// sequence instead; `hashed_nodes` gives the walk its texts.
+fn assert_hashes_name_live_nodes(tree: &TokenTree) {
+    let nodes = hashed_nodes(tree);
+    assert_eq!(
+        tree.hashed.len(),
+        nodes.len(),
+        "one entry per hashed node, no stale entry"
+    );
+    for (_, node) in &nodes {
+        let hash = node.path_hash.load(Ordering::Relaxed);
+        let named = tree
+            .hashed
+            .get(&hash)
+            .and_then(|entry| entry.value().upgrade())
+            .expect("the map names a live node");
+        assert!(Arc::ptr_eq(&named, node), "the map names this node");
+    }
+}
+
+fn tenant(name: &str) -> TenantId {
+    Arc::from(name)
+}
+
+#[test]
+fn a_hashed_insert_resolves_by_hash_and_attaches_along_the_whole_path() {
+    let tree = TokenTree::new();
+    let path = make_tokens(0, 2);
+    let hash = crate::hash_token_path(&path);
+    tree.insert_tokens_with_hash(&path, "t1", hash);
+    assert_eq!(tree.hashed_paths(), 1);
+
+    assert!(tree.insert_tenant_by_hash(hash, "t2"));
+    assert_eq!(tree.tenant_token_size(&tenant("t2")), 2 * PAGE_SIZE);
+    let matched = tree.match_prefix_with_counts(&path);
+    assert_eq!(matched.matched_token_count, 2 * PAGE_SIZE);
+    assert!(matched.matched_tenants.iter().any(|t| &**t == "t2"));
+
+    assert!(!tree.insert_tenant_by_hash(crate::hash_token_path(&make_tokens(1_000, 2)), "t2"));
+    assert_eq!(tree.tenant_token_size(&tenant("t2")), 2 * PAGE_SIZE);
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn the_hash_names_the_aligned_path_and_a_sequence_under_one_page_records_nothing() {
+    let tree = TokenTree::new();
+    let mut unaligned = make_tokens(0, 2);
+    unaligned.extend(32..40);
+    let hash = crate::hash_token_path(&unaligned);
+    tree.insert_tokens_with_hash(&unaligned, "t1", hash);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(tree.insert_tenant_by_hash(hash, "t2"));
+    assert_eq!(tree.tenant_token_size(&tenant("t2")), 2 * PAGE_SIZE);
+
+    let short: Vec<TokenId> = (0..(PAGE_SIZE as u32 - 1)).collect();
+    tree.insert_tokens_with_hash(&short, "t1", crate::hash_token_path(&short));
+    tree.match_and_insert_with_hash(&short, Some(crate::hash_token_path(&short)), |_| Some("t1"));
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(crate::hash_token_path(&short), "t2"));
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn two_tails_over_one_aligned_path_leave_one_hash_on_their_node() {
+    // `base ++ [a]` and `base ++ [b, c]` both end at the node of `base` (the
+    // tree aligns to the page): the node keeps the newer hash, the older
+    // entry leaves the map with it, the older tail re-inserted takes the hash
+    // back, and eviction takes the one entry that is left.
+    let tree = TokenTree::new();
+    let base = make_tokens(0, 2);
+    let mut first = base.clone();
+    first.push(100);
+    let mut second = base.clone();
+    second.extend([200, 201]);
+    let (older, newer) = (
+        crate::hash_token_path(&first),
+        crate::hash_token_path(&second),
+    );
+    tree.insert_tokens_with_hash(&first, "t1", older);
+    tree.match_and_insert_with_hash(&second, Some(newer), |_| Some("t1"));
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(older, "t2"));
+    assert!(tree.insert_tenant_by_hash(newer, "t2"));
+    assert_eq!(tree.tenant_token_size(&tenant("t2")), 2 * PAGE_SIZE);
+    assert_hashes_name_live_nodes(&tree);
+
+    tree.insert_tokens_with_hash(&first, "t1", older);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(tree.insert_tenant_by_hash(older, "t3"));
+    assert!(!tree.insert_tenant_by_hash(newer, "t3"));
+    assert_hashes_name_live_nodes(&tree);
+
+    tree.evict_tenant_by_size(0);
+    assert_eq!(tree.hashed_paths(), 0);
+    assert!(!tree.insert_tenant_by_hash(older, "t4"));
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn a_repaired_path_leaves_a_requests_hash_in_place_and_names_an_unnamed_node() {
+    // A request named `base ++ [a]` at the node of `base`; a repair page
+    // brings `base` under its own (aligned) hash: the node keeps the
+    // request's hash and still takes the repair's tenant. A node the tree
+    // never named itself takes the repair's hash.
+    let tree = TokenTree::new();
+    let base = make_tokens(0, 2);
+    let mut tailed = base.clone();
+    tailed.push(100);
+    let (request, aligned) = (
+        crate::hash_token_path(&tailed),
+        crate::hash_token_path(&base),
+    );
+    tree.insert_tokens_with_hash(&tailed, "t1", request);
+    tree.insert_tokens_with_hash_unless_named(&base, "t2", aligned);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert_eq!(tree.tenant_token_size(&tenant("t2")), 2 * PAGE_SIZE);
+    assert!(tree.insert_tenant_by_hash(request, "t3"));
+    assert!(!tree.insert_tenant_by_hash(aligned, "t3"));
+
+    let other = make_tokens(1_000, 1);
+    tree.insert_tokens(&other, "t1");
+    tree.insert_tokens_with_hash_unless_named(&other, "t2", crate::hash_token_path(&other));
+    assert_eq!(tree.hashed_paths(), 2);
+    assert!(tree.insert_tenant_by_hash(crate::hash_token_path(&other), "t3"));
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn a_repair_that_loses_the_claim_to_the_same_hash_keeps_the_shared_entry() {
+    // The interleaving: a repair reads the node as unnamed; a request names
+    // it with the same hash (insert, swap 0 -> h); the repair's claim then
+    // loses the exchange to h itself. The entry is the request's as much as
+    // the repair's and must stay, or the node is named and unreachable until
+    // its eviction. The repair's stale read is played by calling the claim
+    // directly after the request's record.
+    let tree = TokenTree::new();
+    let path = make_tokens(0, 2);
+    let hash = crate::hash_token_path(&path);
+    tree.insert_tokens_with_hash(&path, "t1", hash);
+    let (_, node) = hashed_nodes(&tree)
+        .pop()
+        .expect("the request named the node");
+    tree.claim_unless_named(&node, hash);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(
+        tree.insert_tenant_by_hash(hash, "t2"),
+        "a peer's delta still finds the node"
+    );
+    assert_hashes_name_live_nodes(&tree);
+
+    // Lost to a different hash: the repair's entry is the stray one and goes.
+    let other = crate::hash_token_path(&make_tokens(5_000, 2));
+    tree.claim_unless_named(&node, other);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(other, "t3"));
+    assert!(tree.insert_tenant_by_hash(hash, "t3"));
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn an_eviction_pass_drops_an_entry_whose_node_is_gone() {
+    // A record that crosses its node's detach leaves an entry naming a node
+    // that is gone; the next pass that evicts drops it.
+    let tree = TokenTree::new();
+    let path = make_tokens(0, 1);
+    tree.insert_tokens_with_hash(&path, "t1", crate::hash_token_path(&path));
+    tree.hashed.insert(7, Weak::new());
+    assert_eq!(tree.hashed_paths(), 2);
+    tree.evict_tenant_by_size(0);
+    assert_eq!(tree.hashed_paths(), 0);
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn a_plain_insert_records_no_hash() {
+    let tree = TokenTree::new();
+    let path = make_tokens(0, 2);
+    tree.insert_tokens(&path, "t1");
+    tree.match_and_insert(&path, "t2");
+    tree.match_and_insert_with_hash(&path, None, |_| Some("t3"));
+    assert_eq!(tree.hashed_paths(), 0);
+    assert!(!tree.insert_tenant_by_hash(crate::hash_token_path(&path), "t4"));
+}
+
+#[test]
+fn the_fused_walk_records_the_hash_at_the_node_the_path_ends_at() {
+    let tree = TokenTree::new();
+    let (a, b, c) = branching_paths();
+    let shared = a[..PAGE_SIZE].to_vec();
+    let hashes = [
+        crate::hash_token_path(&a),
+        crate::hash_token_path(&b),
+        crate::hash_token_path(&c),
+        crate::hash_token_path(&shared),
+    ];
+    // A new leaf; a split with a new branch; another branch; the shared
+    // first page (a path ending at the split node); a full match of the
+    // first leaf; a walk that asked for no hash.
+    tree.match_and_insert_with_hash(&a, Some(hashes[0]), |_| Some("t1"));
+    tree.match_and_insert_with_hash(&b, Some(hashes[1]), |_| Some("t1"));
+    tree.match_and_insert_with_hash(&c, Some(hashes[2]), |_| Some("t1"));
+    tree.match_and_insert_with_hash(&shared, Some(hashes[3]), |_| Some("t1"));
+    tree.match_and_insert_with_hash(&a, Some(hashes[0]), |_| Some("t2"));
+    tree.match_and_insert_with_hash(&b, None, |_| Some("t2"));
+    assert_eq!(tree.hashed_paths(), 4);
+    assert_hashes_name_live_nodes(&tree);
+
+    for hash in hashes {
+        assert!(tree.insert_tenant_by_hash(hash, "t3"));
+    }
+    // The shared page plus each path's own remainder.
+    assert_eq!(
+        tree.tenant_token_size(&tenant("t3")),
+        PAGE_SIZE + (a.len() - PAGE_SIZE) + (b.len() - PAGE_SIZE) + (c.len() - PAGE_SIZE)
+    );
+}
+
+#[test]
+fn a_split_leaves_the_hash_on_the_node_that_keeps_the_path() {
+    let tree = TokenTree::new();
+    let (a, b, _) = branching_paths();
+    let hash = crate::hash_token_path(&a);
+    tree.insert_tokens_with_hash(&a, "t1", hash);
+    // Splits `a` at the shared first page.
+    tree.insert_tokens(&b, "t1");
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(tree.insert_tenant_by_hash(hash, "t2"));
+    assert_eq!(tree.tenant_token_size(&tenant("t2")), a.len());
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn eviction_forgets_a_hash_with_its_node_oldest_first() {
+    let tree = TokenTree::new();
+    let (alpha, bravo) = (make_tokens(0, 1), make_tokens(1_000, 1));
+    let older = crate::hash_token_path(&alpha);
+    let newer = crate::hash_token_path(&bravo);
+    tree.insert_tokens_with_hash(&alpha, "t1", older);
+    tree.insert_tokens_with_hash(&bravo, "t1", newer);
+
+    // Room for one of the two one-page paths: the older leaf goes.
+    tree.evict_tenant_by_size(PAGE_SIZE);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(older, "t2"));
+    assert!(tree.insert_tenant_by_hash(newer, "t2"));
+    assert_hashes_name_live_nodes(&tree);
+
+    tree.evict_tenant_by_size(0);
+    assert_eq!(tree.hashed_paths(), 0);
+    assert!(!tree.insert_tenant_by_hash(newer, "t3"));
+}
+
+#[test]
+fn a_working_set_within_the_budget_keeps_every_hash() {
+    let tree = TokenTree::new();
+    let paths: Vec<Vec<TokenId>> = (0..20).map(|i| make_tokens(i * 10_000, 3)).collect();
+    for path in &paths {
+        tree.insert_tokens_with_hash(path, "t1", crate::hash_token_path(path));
+    }
+    tree.evict_tenant_by_size(tree.total_token_size());
+    assert_eq!(tree.hashed_paths(), 20);
+    for path in &paths {
+        assert!(tree.insert_tenant_by_hash(crate::hash_token_path(path), "t2"));
+    }
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn re_inserting_a_path_keeps_one_entry() {
+    let tree = TokenTree::new();
+    let path = make_tokens(0, 2);
+    let hash = crate::hash_token_path(&path);
+    for who in ["t1", "t2", "t1"] {
+        tree.insert_tokens_with_hash(&path, who, hash);
+    }
+    assert!(tree.insert_tenant_by_hash(hash, "t3"));
+    assert!(tree.insert_tenant_by_hash(hash, "t3"));
+    assert_eq!(tree.hashed_paths(), 1);
+    assert_eq!(tree.tenant_token_size(&tenant("t3")), 2 * PAGE_SIZE);
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn removing_a_tenant_everywhere_forgets_the_hashes_of_the_nodes_it_empties() {
+    let tree = TokenTree::new();
+    let (mine, shared) = (make_tokens(0, 1), make_tokens(1_000, 1));
+    tree.insert_tokens_with_hash(&mine, "t1", crate::hash_token_path(&mine));
+    tree.insert_tokens_with_hash(&shared, "t1", crate::hash_token_path(&shared));
+    tree.insert_tokens(&shared, "t2");
+    tree.remove_tenant_all(&tenant("t1"));
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(crate::hash_token_path(&mine), "t3"));
+    assert!(tree.insert_tenant_by_hash(crate::hash_token_path(&shared), "t3"));
+    assert_hashes_name_live_nodes(&tree);
+    tree.clear();
+    assert_eq!(tree.hashed_paths(), 0);
+}
+
+#[test]
+fn hashes_name_live_nodes_through_random_inserts_and_evictions() {
+    // 20,000 operations over conversation-shaped sequences (pages shared
+    // within a conversation, a first page shared across four heads, every
+    // sequence also under a short unaligned tail that ends at the same
+    // node): hashed and plain inserts, lookups by hash and budget evictions.
+    // After every eviction the map names exactly the live hashed nodes, and
+    // a hash that resolves names a sequence the tree then matches to its
+    // page-aligned length.
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(1377);
+    let mut pool: Vec<Vec<TokenId>> = Vec::new();
+    for conversation in 0..60u32 {
+        let mut tokens = make_tokens(conversation % 4 * 100_000, 1);
+        for turn in 0..5u32 {
+            tokens.extend(make_tokens(
+                1_000_000 + conversation * 1_000 + turn * 100,
+                1,
+            ));
+            pool.push(tokens.clone());
+            let mut tailed = tokens.clone();
+            let tail = 1 + conversation % (PAGE_SIZE as u32 - 1);
+            tailed.extend(2_000_000 + turn..2_000_000 + turn + tail);
+            pool.push(tailed);
+        }
+    }
+    let tenants = ["t1", "t2", "t3", "t4"];
+    let tree = TokenTree::new();
+    for _ in 0..20_000 {
+        let tokens = &pool[rng.random_range(0..pool.len())];
+        let who = tenants[rng.random_range(0..tenants.len())];
+        match rng.random_range(0..10) {
+            0 => {
+                tree.evict_tenant_by_size(rng.random_range(0..3_000));
+                assert_hashes_name_live_nodes(&tree);
+            }
+            1 | 2 => {
+                if tree.insert_tenant_by_hash(crate::hash_token_path(tokens), who) {
+                    assert_eq!(
+                        tree.match_prefix_with_counts(tokens).matched_token_count,
+                        align_to_page(tokens.len(), PAGE_SIZE)
+                    );
+                }
+            }
+            3 => tree.insert_tokens(tokens, who),
+            4..=6 => tree.insert_tokens_with_hash(tokens, who, crate::hash_token_path(tokens)),
+            _ => {
+                tree.match_and_insert_with_hash(
+                    tokens,
+                    Some(crate::hash_token_path(tokens)),
+                    |_| Some(who),
+                );
+            }
+        }
+    }
+    assert_hashes_name_live_nodes(&tree);
+    for who in tenants {
+        tree.remove_tenant_all(&tenant(who));
+    }
+    assert_eq!(tree.hashed_paths(), 0);
+    assert_hashes_name_live_nodes(&tree);
 }

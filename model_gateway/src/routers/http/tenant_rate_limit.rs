@@ -1,16 +1,19 @@
-//! Tenant rate limiting on the regular HTTP router: what a request reserves,
-//! and how its answer resolves the reservation.
+//! Tenant rate limiting on the routers that relay a request as HTTP: what a
+//! request reserves, and how its answer resolves the reservation.
 //!
-//! `Router::route_typed_request` reserves once per logical request, before
-//! any dispatch (every attempt dispatches under that one reservation), and
-//! resolves it once, on the one response its no-retry path and its retry
-//! loop converge on ([`resolve`]). This router has no tokenizer, so the
-//! reserve-time estimate ([`TenantCharge::estimated_input_tokens`]) counts
-//! every token id a pre-tokenized input carries and 1.3 tokens per word of
-//! every text input otherwise, the heuristic `pd_router.rs` ranks DP workers
-//! by. A buffered success settles the counts the worker reports in its JSON
-//! body; a streamed success is not parsed and keeps its estimate, as do a
-//! buffered success whose usage cannot be read and every failure.
+//! The regular HTTP router (`Router::route_typed_request`), the
+//! disaggregated HTTP router (`PDRouter::execute_dual_dispatch`) and the
+//! external routers' gateway side (`ExternalRouterAdapter::route_reserved`)
+//! each [`reserve`] once per logical request, before any dispatch (every
+//! attempt dispatches under that one reservation), and [`resolve`] it once,
+//! on the one response their no-retry path and their retry loop converge
+//! on. These routers have no tokenizer, so the reserve-time estimate
+//! ([`TenantCharge::estimated_input_tokens`]) counts every token id a
+//! pre-tokenized input carries and 1.3 tokens per word of every text input
+//! otherwise, the heuristic `pd_router.rs` ranks DP workers by. A buffered
+//! success settles the counts the worker reports in its JSON body; a
+//! streamed success is not parsed and keeps its estimate, as do a buffered
+//! success whose usage cannot be read and every failure.
 
 use axum::{
     body::{to_bytes, Body},
@@ -20,10 +23,11 @@ use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage},
     classify::ClassifyRequest,
     common::{GenerationRequest, InputIds},
-    completion::CompletionRequest,
+    completion::{CompletionPrompt, CompletionRequest},
     decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
+    interactions::InteractionsRequest,
     messages::{
         CountMessageTokensRequest, CreateMessageRequest, InputContent, InputContentBlock,
         ToolResultContent, ToolResultContentBlock,
@@ -35,14 +39,20 @@ use openai_protocol::{
     },
     systemone::SystemOneRequest,
 };
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{value::RawValue, Value};
 
 #[cfg(test)]
 use crate::routers::common::request_lease::test_probe::DropProbeRequest;
 use crate::{
-    rate_limit::{ReservationAttachment, UsageSettlement},
-    routers::{common::rate_limit_cell::RateLimitCell, error},
-    worker::GuardedStream,
+    middleware::TenantRequestMeta,
+    rate_limit::{RateLimitManager, ReservationAttachment, UsageSettlement},
+    routers::{
+        common::{
+            rate_limit_cell::RateLimitCell, retry::mark_non_retryable, stream::GuardedStream,
+        },
+        error,
+    },
 };
 
 /// Estimated tokens per whitespace-separated word of a request's text.
@@ -50,8 +60,9 @@ const TOKENS_PER_WORD: f64 = 1.3;
 
 /// What a typed request charges its tenant: the input it reserves before
 /// dispatch, and the shape its `/generate` answer reports usage in. Every
-/// request type `Router::route_typed_request` takes implements it; the
-/// routes that never reserve take the defaults, which they never ask for.
+/// request type the HTTP routers and the external routers take implements
+/// it; the routes that never reserve take the defaults, which they never
+/// ask for.
 pub(crate) trait TenantCharge: GenerationRequest {
     /// The reserve-time estimate of the request's input tokens. By default,
     /// 1.3 per word of its routing text -- `routing_text` when routing
@@ -62,11 +73,7 @@ pub(crate) trait TenantCharge: GenerationRequest {
     /// hint says nothing the gateway can hold the tenant to, so the estimate
     /// reads the body.
     fn estimated_input_tokens(&self, routing_text: Option<&str>) -> u32 {
-        let words = match routing_text {
-            Some(text) => word_count(text),
-            None => word_count(&self.extract_text_for_routing()),
-        };
-        tokens_for_words(words + self.unrouted_words())
+        tokens_for_words(routed_words(self, routing_text) + self.unrouted_words())
     }
 
     /// The words of the request's input that its routing text leaves out.
@@ -81,26 +88,53 @@ pub(crate) trait TenantCharge: GenerationRequest {
     }
 }
 
-/// The arguments of the assistant's tool calls in the history.
+/// What the assistant's turns in the history carry beside their content and
+/// reasoning: a refusal, and the arguments of their tool calls and of a
+/// deprecated function call, by the words of their JSON. A call's name is not
+/// counted.
 impl TenantCharge for ChatCompletionRequest {
     fn unrouted_words(&self) -> usize {
         self.messages
             .iter()
-            .filter_map(|message| match message {
+            .map(|message| match message {
                 ChatMessage::Assistant {
-                    tool_calls: Some(calls),
+                    refusal,
+                    tool_calls,
+                    function_call,
                     ..
-                } => Some(calls),
-                _ => None,
+                } => {
+                    let arguments: usize = tool_calls
+                        .iter()
+                        .flatten()
+                        .map(|call| &call.function)
+                        .chain(function_call.as_deref())
+                        .filter_map(|function| function.arguments.as_deref())
+                        .map(argument_words)
+                        .sum();
+                    arguments + refusal.as_deref().map_or(0, word_count)
+                }
+                _ => 0,
             })
-            .flatten()
-            .filter_map(|call| call.function.arguments.as_deref())
-            .map(word_count)
             .sum()
     }
 }
 
-impl TenantCharge for CompletionRequest {}
+/// A prompt of ids at its own count, every list of a batch (the `/generate`
+/// rule); the words of its text otherwise. The routing text of ids renders
+/// each id as a word, which the word estimate would charge at 1.3.
+impl TenantCharge for CompletionRequest {
+    fn estimated_input_tokens(&self, routing_text: Option<&str>) -> u32 {
+        let ids = match &self.prompt {
+            CompletionPrompt::TokenIds(ids) => ids.len(),
+            CompletionPrompt::TokenIdBatches(batches) => batches.iter().map(Vec::len).sum(),
+            CompletionPrompt::Text(_) | CompletionPrompt::Texts(_) => 0,
+        };
+        if ids > 0 {
+            return u32::try_from(ids).unwrap_or(u32::MAX);
+        }
+        tokens_for_words(routed_words(self, routing_text) + self.unrouted_words())
+    }
+}
 
 /// The input of each `tool_use` block in the history and the text of each
 /// `tool_result`, a string or text blocks; not their images or documents.
@@ -158,8 +192,8 @@ impl TenantCharge for GenerateRequest {
 }
 
 /// The instructions, and the function and custom tool calls in the history
-/// with their outputs. Images, files and the built-in tools' items are not
-/// counted.
+/// with their outputs, a function call's arguments by the words of their
+/// JSON. Images, files and the built-in tools' items are not counted.
 impl TenantCharge for ResponsesRequest {
     fn unrouted_words(&self) -> usize {
         let instructions = self.instructions.as_deref().map_or(0, word_count);
@@ -171,7 +205,7 @@ impl TenantCharge for ResponsesRequest {
             .map(|item| match item {
                 ResponseInputOutputItem::FunctionToolCall {
                     arguments, output, ..
-                } => word_count(arguments) + output.as_deref().map_or(0, word_count),
+                } => argument_words(arguments) + output.as_deref().map_or(0, word_count),
                 ResponseInputOutputItem::FunctionCallOutput { output, .. } => match output {
                     StringOrContentParts::String(text) => word_count(text),
                     StringOrContentParts::Array(parts) => parts
@@ -210,6 +244,13 @@ impl TenantCharge for ClassifyRequest {
     }
 }
 
+/// The system instruction, which routing text leaves out.
+impl TenantCharge for InteractionsRequest {
+    fn unrouted_words(&self) -> usize {
+        self.system_instruction.as_deref().map_or(0, word_count)
+    }
+}
+
 // Routes that never reserve.
 impl TenantCharge for CountMessageTokensRequest {}
 impl TenantCharge for DecisionsRequest {}
@@ -243,6 +284,15 @@ fn word_count(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+/// The words of the routing text, or of the body's own text when routing
+/// keyed on tokens.
+fn routed_words(request: &(impl GenerationRequest + ?Sized), routing_text: Option<&str>) -> usize {
+    match routing_text {
+        Some(text) => word_count(text),
+        None => word_count(&request.extract_text_for_routing()),
+    }
+}
+
 /// The words of a JSON value: of its strings and its keys, and one for each
 /// number, boolean and null.
 fn json_words(value: &Value) -> usize {
@@ -257,26 +307,129 @@ fn json_words(value: &Value) -> usize {
     }
 }
 
+/// The words of a call's arguments: of their JSON when they parse, as a tool
+/// use's input counts, since JSON written without spaces (as clients send it,
+/// and as an object-form `arguments` is kept) is one word of text. Arguments
+/// that do not parse, as a call cut off mid-way leaves them, count the runs
+/// between spaces and JSON punctuation, so a cut-off compact object still
+/// counts its keys and values.
+fn argument_words(arguments: &str) -> usize {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(value) => json_words(&value),
+        Err(_) => arguments
+            .split(|c: char| c.is_whitespace() || "{}[]:,\"".contains(c))
+            .filter(|word| !word.is_empty())
+            .count(),
+    }
+}
+
 /// 1.3 tokens per word, rounded up.
 fn tokens_for_words(words: usize) -> u32 {
     (words as f64 * TOKENS_PER_WORD).ceil() as u32
 }
 
-/// Resolve `cell`'s reservation on the answer of a request to `route`, once:
-/// a buffered success settles the usage its body reports (or closes at the
+/// One logical request's reservation: taken by [`reserve`] before any
+/// dispatch, resolved by [`resolve`] on the answer the dispatch paths
+/// converge on.
+pub(crate) struct TenantReservation {
+    cell: RateLimitCell,
+    /// The request's own ([`TenantCharge::samples_per_prompt`]), for the
+    /// resolve of a `/generate` answer of several entries.
+    samples_per_prompt: u32,
+}
+
+/// What a tenant reservation charges for one request, with the limiter and
+/// the tenant it was gated on: the reserve-time estimate of the request's
+/// input tokens and the answers each prompt gets, read from the request
+/// before any dispatch ([`estimate`]), so the reservation itself borrows
+/// nothing of the request across its await and cannot be asked for with a
+/// limiter, a tenant and an estimate that were not gated together.
+#[derive(Clone, Copy)]
+pub(crate) struct TenantEstimate<'a> {
+    manager: &'a RateLimitManager,
+    tenant_meta: &'a TenantRequestMeta,
+    estimated_input_tokens: u32,
+    samples_per_prompt: u32,
+}
+
+/// The charge of `request` under the tenant rate limiter: `None` for a
+/// request outside it (no limiter configured, or a route that charges no
+/// tenant), so the estimate is read only when a reservation will use it.
+/// `routing_text` is the request's routing text when routing already
+/// extracted it ([`TenantCharge::estimated_input_tokens`]).
+pub(crate) fn estimate<'a, T: TenantCharge>(
+    manager: Option<&'a RateLimitManager>,
+    tenant_meta: Option<&'a TenantRequestMeta>,
+    request: &T,
+    routing_text: Option<&str>,
+) -> Option<TenantEstimate<'a>> {
+    Some(TenantEstimate {
+        manager: manager?,
+        tenant_meta: tenant_meta?,
+        estimated_input_tokens: request.estimated_input_tokens(routing_text),
+        samples_per_prompt: request.samples_per_prompt(),
+    })
+}
+
+/// Reserve `estimate` once per logical request, before any dispatch: every
+/// attempt dispatches under this one reservation. Either the reservation or
+/// the denial, which is the request's answer, never retried; `(None, None)`
+/// for a request outside the limiter (no estimate: no limiter configured, or
+/// a route that charges no tenant).
+pub(crate) async fn reserve(
+    estimate: Option<TenantEstimate<'_>>,
+    model_id: &str,
+) -> (Option<TenantReservation>, Option<Response>) {
+    let Some(estimate) = estimate else {
+        return (None, None);
+    };
+    let cell = RateLimitCell::new();
+    match cell
+        .reserve(
+            estimate.manager,
+            estimate.tenant_meta,
+            model_id,
+            estimate.estimated_input_tokens,
+        )
+        .await
+    {
+        Ok(()) => (
+            Some(TenantReservation {
+                cell,
+                samples_per_prompt: estimate.samples_per_prompt,
+            }),
+            None,
+        ),
+        Err(mut denied) => {
+            mark_non_retryable(&mut denied);
+            (None, Some(denied))
+        }
+    }
+}
+
+/// Resolve `reservation` on the answer of a request to `route`, once: a
+/// buffered success settles the usage its body reports (or closes at the
 /// estimate when the body reports none it can read), a streamed success
 /// hands the reservation to its body, which keeps the estimate when it
 /// drops, and any other answer closes it at the estimate. The answer is
-/// returned as the client would have had it. `samples_per_prompt` is the
-/// request's own ([`TenantCharge::samples_per_prompt`]).
-pub(super) async fn resolve(
-    cell: &RateLimitCell,
+/// returned as the client would have had it; an answer outside the limiter
+/// (no reservation) passes through. `max_body_bytes` bounds the re-read of
+/// a buffered answer: the bound the router read it under, or none for a
+/// router that holds the body whole already.
+pub(crate) async fn resolve(
+    reservation: Option<&TenantReservation>,
     route: &str,
-    samples_per_prompt: u32,
     is_stream: bool,
     response: Response,
     max_body_bytes: usize,
 ) -> Response {
+    let Some(TenantReservation {
+        cell,
+        samples_per_prompt,
+    }) = reservation
+    else {
+        return response;
+    };
     if !response.status().is_success() {
         cell.close_unsettled().await;
         return response;
@@ -301,7 +454,7 @@ pub(super) async fn resolve(
             );
         }
     };
-    match usage_from_body(route, samples_per_prompt, &bytes) {
+    match usage_from_body(route, *samples_per_prompt, &bytes) {
         Some(usage) => cell.settle(usage).await,
         None => cell.close_unsettled().await,
     }
@@ -322,21 +475,36 @@ fn hold_in_body(response: Response, attachment: ReservationAttachment) -> Respon
 
 /// The usage a worker's buffered JSON answer to `route` reports: SGLang's
 /// `meta_info` on `/generate` ([`generate_usage`]), Anthropic's `usage` on
-/// `/v1/messages` ([`messages_input_tokens`]), and on every other route a
-/// `usage` object in the OpenAI shape (`prompt_tokens` and
+/// `/v1/messages` ([`messages_input_tokens`]), the Interactions `usage`
+/// totals on `/v1/interactions` ([`interactions_usage`]), and on every
+/// other route a `usage` object in the OpenAI shape (`prompt_tokens` and
 /// `completion_tokens`: chat, completions) or the Responses one
 /// (`input_tokens` and `output_tokens`). Embeddings and classify report
 /// `prompt_tokens` alone: they generate nothing, and a `completion_tokens`
 /// they do report must read whole. `None` for a body that is not JSON or
 /// reports none of these whole. Which of the input the engine served from
-/// its cache, and which of the output it counted as reasoning, is not
-/// recorded.
+/// its cache is not recorded; which of the output it counted as reasoning
+/// is recorded on `/v1/interactions` only.
 fn usage_from_body(route: &str, samples_per_prompt: u32, body: &[u8]) -> Option<UsageSettlement> {
-    let value: Value = serde_json::from_slice(body).ok()?;
     if route == "/generate" {
+        let value: Value = serde_json::from_slice(body).ok()?;
         return generate_usage(&value, samples_per_prompt);
     }
-    let usage = value.get("usage")?;
+    // The answer's `usage` object alone is read into a value; the rest of
+    // the document (the choices, the text) is scanned past, not built.
+    #[derive(Deserialize)]
+    struct UsageOnly<'a> {
+        #[serde(borrow)]
+        usage: Option<&'a RawValue>,
+    }
+    let usage: Value = serde_json::from_str(
+        serde_json::from_slice::<UsageOnly<'_>>(body)
+            .ok()?
+            .usage?
+            .get(),
+    )
+    .ok()?;
+    let usage = &usage;
     let (input, output) = match route {
         "/v1/embeddings" | "/v1/classify" => (
             as_u32(usage.get("prompt_tokens")?)?,
@@ -346,6 +514,7 @@ fn usage_from_body(route: &str, samples_per_prompt: u32, body: &[u8]) -> Option<
             messages_input_tokens(usage)?,
             as_u32(usage.get("output_tokens")?)?,
         ),
+        "/v1/interactions" => return interactions_usage(usage),
         _ => token_pair(usage, "prompt_tokens", "completion_tokens")
             .or_else(|| token_pair(usage, "input_tokens", "output_tokens"))?,
     };
@@ -384,6 +553,28 @@ fn generate_usage(value: &Value, samples_per_prompt: u32) -> Option<UsageSettlem
     Some(UsageSettlement {
         actual_input_tokens: u32::try_from(prompts.div_ceil(samples)).ok()?,
         completion_tokens: u32::try_from(completions).ok()?,
+        ..UsageSettlement::default()
+    })
+}
+
+/// The usage of an Interactions answer. The prompt is `total_input_tokens`
+/// and the `total_tool_use_tokens` of its tool use, which count the
+/// tool-use prompts (the tool results the model is fed back), input like
+/// the rest. The generation is `total_output_tokens` and the
+/// `total_thought_tokens` of its thinking, as the OpenAI `completion_tokens`
+/// and the Responses `output_tokens` of the other routes include their
+/// reasoning; the thought count is kept as the reasoning share
+/// (`total_tokens` sums all four). A count the answer leaves out is zero,
+/// as an answer that is all thought leaves `total_output_tokens` out; one
+/// that is not a `u32`, or a `total_input_tokens` left out, makes the usage
+/// unreadable.
+fn interactions_usage(usage: &Value) -> Option<UsageSettlement> {
+    let thought = count_or_zero(usage, "total_thought_tokens")?;
+    Some(UsageSettlement {
+        actual_input_tokens: as_u32(usage.get("total_input_tokens")?)?
+            .checked_add(count_or_zero(usage, "total_tool_use_tokens")?)?,
+        completion_tokens: count_or_zero(usage, "total_output_tokens")?.checked_add(thought)?,
+        reasoning_tokens: thought,
         ..UsageSettlement::default()
     })
 }
@@ -461,6 +652,35 @@ mod tests {
                 "{route}"
             );
         }
+        let interactions = json!({"usage": {
+            "total_input_tokens": 6, "total_output_tokens": 1, "total_tokens": 7,
+        }});
+        assert_eq!(parse("/v1/interactions", interactions), Some(usage(6, 1)));
+        // A thinking model's thought tokens are generated too: charged with
+        // the output and kept as the reasoning share; its tool-use prompts
+        // are input. An answer that is all thought leaves the output count
+        // out: zero, not unreadable.
+        let thinking = json!({"usage": {
+            "total_input_tokens": 6, "total_output_tokens": 1, "total_thought_tokens": 40,
+            "total_tool_use_tokens": 3, "total_tokens": 50,
+        }});
+        assert_eq!(
+            parse("/v1/interactions", thinking),
+            Some(UsageSettlement {
+                reasoning_tokens: 40,
+                ..usage(9, 41)
+            })
+        );
+        let all_thought = json!({"usage": {
+            "total_input_tokens": 6, "total_thought_tokens": 40, "total_tokens": 46,
+        }});
+        assert_eq!(
+            parse("/v1/interactions", all_thought),
+            Some(UsageSettlement {
+                reasoning_tokens: 40,
+                ..usage(6, 40)
+            })
+        );
         assert_eq!(
             parse(
                 "/generate",
@@ -649,6 +869,26 @@ mod tests {
         assert_eq!(chat.estimated_input_tokens(Some("")), 0);
     }
 
+    /// A completion prompt of ids reserves its count and a batch the sum of
+    /// its lists, whatever text routing saw; a text prompt its words.
+    #[test]
+    fn a_completion_token_prompt_reserves_its_ids() {
+        let ids: CompletionRequest = request(json!({"model": "m", "prompt": [1, 2, 3, 4, 5]}));
+        assert_eq!(ids.estimated_input_tokens(Some("1 2 3 4 5")), 5);
+        assert_eq!(ids.estimated_input_tokens(None), 5);
+
+        let batch: CompletionRequest =
+            request(json!({"model": "m", "prompt": [[1, 2], [3, 4, 5, 6]]}));
+        assert_eq!(batch.estimated_input_tokens(None), 6);
+
+        let text: CompletionRequest =
+            request(json!({"model": "m", "prompt": "one two three four five six seven"}));
+        assert_eq!(text.estimated_input_tokens(None), 10);
+        let texts: CompletionRequest =
+            request(json!({"model": "m", "prompt": ["one two", "three"]}));
+        assert_eq!(texts.estimated_input_tokens(Some("one two three")), 4);
+    }
+
     /// Routing keys on the first sequence of a batch; the estimate counts
     /// them all.
     #[test]
@@ -724,6 +964,17 @@ mod tests {
         assert_eq!(tool_turn.estimated_input_tokens(None), 11);
     }
 
+    #[test]
+    fn an_interactions_request_reserves_its_system_instruction() {
+        let instructed: InteractionsRequest = request(json!({
+            "model": "m",
+            "system_instruction": TEN_WORDS,
+            "input": "hello world",
+        }));
+        assert_eq!(instructed.extract_text_for_routing(), "hello world");
+        assert_eq!(instructed.estimated_input_tokens(None), 16);
+    }
+
     /// A custom tool's input and its output, a string or text parts.
     #[test]
     fn a_responses_request_reserves_its_custom_tool_calls() {
@@ -765,6 +1016,94 @@ mod tests {
         // 3 words of text and 10 of arguments: ceil(13 * 1.3).
         assert_eq!(chat.estimated_input_tokens(None), 17);
         assert_eq!(chat.estimated_input_tokens(Some("weather in Paris")), 17);
+    }
+
+    /// A refused turn's refusal and the arguments of a deprecated function
+    /// call, which the upstream reads with the rest of the history.
+    #[test]
+    fn a_chat_history_reserves_its_refusals_and_function_call_arguments() {
+        let chat: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "refusal": TEN_WORDS},
+                {"role": "assistant", "content": null, "function_call": {
+                    "name": "weather",
+                    "arguments": "{\"query\": \"one two three four five six seven eight nine\"}",
+                }},
+            ],
+        }));
+        assert_eq!(chat.extract_text_for_routing(), "weather in Paris");
+        // 3 words of text, 10 of refusal and 10 of arguments: ceil(23 * 1.3).
+        assert_eq!(chat.estimated_input_tokens(None), 30);
+        assert_eq!(chat.estimated_input_tokens(Some("weather in Paris")), 30);
+    }
+
+    /// A call's arguments count by the words of their JSON, as a tool use's
+    /// input does: written without spaces, as clients send them and as an
+    /// object-form `arguments` is kept, they are not one word. Arguments that
+    /// are not JSON, a call cut off mid-way among them, count the runs between
+    /// spaces and JSON punctuation.
+    #[test]
+    fn a_call_s_compact_json_arguments_reserve_their_words() {
+        let compact = "{\"city\":\"Paris\",\"days\":3,\"units\":\"metric\"}";
+        let chat: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "weather", "arguments": compact},
+                }]},
+                {"role": "assistant", "content": null, "function_call": {
+                    "name": "weather",
+                    "arguments": {"city": "Paris", "days": 3, "units": "metric"},
+                }},
+            ],
+        }));
+        assert_eq!(chat.extract_text_for_routing(), "weather in Paris");
+        // 3 words of text and 6 of each call's arguments (three keys, two
+        // words and a number): ceil(15 * 1.3).
+        assert_eq!(chat.estimated_input_tokens(None), 20);
+
+        let responses: ResponsesRequest = request(json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": "weather in Paris"},
+                {"type": "function_call", "call_id": "c1", "name": "weather",
+                 "arguments": compact},
+            ],
+        }));
+        assert_eq!(responses.extract_text_for_routing(), "weather in Paris");
+        // 3 words of text and 6 of arguments: ceil(9 * 1.3).
+        assert_eq!(responses.estimated_input_tokens(None), 12);
+
+        let text: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "weather", "arguments": "city Paris, three days"},
+                }]},
+            ],
+        }));
+        // Not JSON: 3 words of text and 4 of arguments: ceil(7 * 1.3).
+        assert_eq!(text.estimated_input_tokens(None), 10);
+
+        let cut_off: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "weather", "arguments": "{\"city\":\"Paris\",\"days\":3,\"uni"},
+                }]},
+            ],
+        }));
+        // Cut off mid-way, so not JSON: 3 words of text and 5 of arguments
+        // (`city`, `Paris`, `days`, `3`, `uni`): ceil(8 * 1.3).
+        assert_eq!(cut_off.estimated_input_tokens(None), 11);
     }
 
     /// A tool result's text, a string or text blocks, and a tool use's input.

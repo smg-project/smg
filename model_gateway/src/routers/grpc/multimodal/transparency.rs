@@ -313,7 +313,7 @@ mod tests {
         }
         fn preprocess(
             &self,
-            _: &[image::DynamicImage],
+            _: &[&image::DynamicImage],
         ) -> Result<PreprocessedEncoderInputs, TransformError> {
             Err(TransformError::ShapeError("probe".to_string()))
         }

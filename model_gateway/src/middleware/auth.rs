@@ -21,8 +21,9 @@
 //! probe) sit outside it: they forward the caller's header as they did and
 //! add no credential of their own, since there "no header" means anonymous.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt::Write as _, sync::Arc};
 
+use arc_swap::ArcSwap;
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -41,12 +42,13 @@ use crate::{
     tenant::{authenticated_tenant_key_from_sha256, DataPlaneCaller, TenantIdentity, TenantKey},
 };
 
-/// The configured keys by hash. Built once and read-only after: the map
-/// is shared, so the clone axum takes of the middleware's state on every
-/// request is a reference count, whatever the number of keys.
+/// The configured keys by hash, built at start and swapped whole by a
+/// reload of the key files. The map is shared: the clone axum takes of the
+/// middleware's state on every request is a reference count, whatever the
+/// number of keys, and a request takes the map once.
 #[derive(Clone)]
 pub struct AuthConfig {
-    keys: Arc<HashMap<[u8; 32], TenantKey>>,
+    keys: Arc<ArcSwap<HashMap<[u8; 32], TenantKey>>>,
 }
 
 impl AuthConfig {
@@ -62,6 +64,20 @@ impl AuthConfig {
         api_key: Option<String>,
         tenant_api_keys: &[TenantApiKeyEntry],
     ) -> Self {
+        Self {
+            keys: Arc::new(ArcSwap::from_pointee(Self::key_map(
+                api_key,
+                tenant_api_keys,
+            ))),
+        }
+    }
+
+    /// The keys by hash: the shared key's hash-derived identity, then each
+    /// tenant key's own.
+    pub(crate) fn key_map(
+        api_key: Option<String>,
+        tenant_api_keys: &[TenantApiKeyEntry],
+    ) -> HashMap<[u8; 32], TenantKey> {
         let mut keys = HashMap::with_capacity(tenant_api_keys.len() + 1);
 
         if let Some(key) = api_key {
@@ -76,15 +92,22 @@ impl AuthConfig {
             );
         }
 
-        Self {
-            keys: Arc::new(keys),
-        }
+        keys
+    }
+
+    /// Put `keys` in force and return the map they replace; a request that
+    /// took the previous map finishes under it.
+    pub(crate) fn replace(
+        &self,
+        keys: HashMap<[u8; 32], TenantKey>,
+    ) -> Arc<HashMap<[u8; 32], TenantKey>> {
+        self.keys.swap(Arc::new(keys))
     }
 
     /// Whether any key is configured. Empty means [`auth_middleware`]
     /// passes every request through.
     pub fn is_enabled(&self) -> bool {
-        !self.keys.is_empty()
+        !self.keys.load().is_empty()
     }
 
     /// Whether `token` matches any configured key (shared or per-tenant).
@@ -94,12 +117,28 @@ impl AuthConfig {
     /// tenant-scoped key as a foreign upstream-provider credential and
     /// forward it externally.
     pub fn contains_token(&self, token: &str) -> bool {
-        self.keys.contains_key(&hash_key(token))
+        self.keys.load().contains_key(&hash_key(token))
     }
 }
 
 fn hash_key(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
+}
+
+/// The first 16 hex digits of the key's SHA-256: how the access log and the
+/// configuration view name a key without writing it.
+pub fn key_fingerprint(key: &str) -> String {
+    fingerprint_of(&hash_key(key))
+}
+
+/// [`key_fingerprint`] of a key already hashed.
+pub(crate) fn fingerprint_of(key_hash: &[u8; 32]) -> String {
+    let mut id = String::with_capacity(16);
+    for byte in &key_hash[..8] {
+        // Writing into a String cannot fail.
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
 }
 
 /// The header names a provider reads its own key from, which an SDK may fill
@@ -116,7 +155,13 @@ pub async fn auth_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    if !auth_config.keys.is_empty() {
+    // The map is read once and let go before the inner service runs: a
+    // guard kept across a streaming response would hold one of the thread's
+    // few fast load slots for the response's whole life, and every later
+    // load on that thread, this map's or any other swap's, would pay the
+    // shared count instead.
+    let keys = auth_config.keys.load();
+    if !keys.is_empty() {
         let token_hash = request
             .headers()
             .get(header::AUTHORIZATION)
@@ -124,9 +169,7 @@ pub async fn auth_middleware(
             .and_then(bearer_token)
             .map(hash_key);
 
-        let tenant_key = token_hash
-            .as_ref()
-            .and_then(|hash| auth_config.keys.get(hash));
+        let tenant_key = token_hash.as_ref().and_then(|hash| keys.get(hash));
 
         let Some(tenant_key) = tenant_key else {
             return unauthorized(token_hash.is_some());
@@ -149,7 +192,8 @@ pub async fn auth_middleware(
         // gateway key presented a second time under a provider's own header
         // name goes with it (every value of a repeated header is read, since
         // the removal takes the whole name), where a caller's own provider
-        // key there stays.
+        // key there stays. The map already in hand answers, not a second
+        // load.
         request.headers_mut().remove(header::AUTHORIZATION);
         for name in PROVIDER_KEY_HEADERS {
             let is_a_gateway_key = request
@@ -157,12 +201,13 @@ pub async fn auth_middleware(
                 .get_all(name)
                 .iter()
                 .filter_map(|value| value.to_str().ok())
-                .any(|value| auth_config.contains_token(value.trim()));
+                .any(|value| keys.contains_key(&hash_key(value.trim())));
             if is_a_gateway_key {
                 request.headers_mut().remove(name);
             }
         }
     }
+    drop(keys);
 
     next.run(request).await
 }
@@ -223,7 +268,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::routers::common::header_utils::extract_auth_header;
+    use crate::{
+        middleware::test_support::{json_of, text_of},
+        routers::common::header_utils::extract_auth_header,
+    };
 
     async fn handler(request: Request<Body>) -> impl IntoResponse {
         request
@@ -293,7 +341,7 @@ mod tests {
             .unwrap();
         let response = app().oneshot(twice).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_text(response).await, "");
+        assert_eq!(text_of(response).await, "");
 
         let own = Request::builder()
             .uri("/")
@@ -303,7 +351,7 @@ mod tests {
             .unwrap();
         let response = app().oneshot(own).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_text(response).await, "x-api-key=providers-own-key");
+        assert_eq!(text_of(response).await, "x-api-key=providers-own-key");
 
         // The caller's own key first, the gateway's key in a later value of
         // the same header: the whole name goes, since one value is the
@@ -317,7 +365,7 @@ mod tests {
             .unwrap();
         let response = app().oneshot(repeated).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_text(response).await, "");
+        assert_eq!(text_of(response).await, "");
     }
 
     async fn authorization_after(auth_config: AuthConfig, bearer: Option<&str>) -> String {
@@ -330,7 +378,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        body_text(response).await
+        text_of(response).await
     }
 
     /// A matched gateway key ends at the middleware: the route sees the
@@ -387,7 +435,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        body_text(response).await
+        text_of(response).await
     }
 
     /// What leaves for the upstream: under gateway auth the configured
@@ -448,7 +496,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        body_text(response).await
+        text_of(response).await
     }
 
     /// With no key configured the middleware authenticates nothing and leaves
@@ -464,13 +512,6 @@ mod tests {
             authorization_after(AuthConfig::new(None), None).await,
             "absent"
         );
-    }
-
-    async fn body_text(response: Response) -> String {
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        std::str::from_utf8(&body).unwrap().to_string()
     }
 
     #[tokio::test]
@@ -499,7 +540,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_text(response).await, expected.to_string());
+        assert_eq!(text_of(response).await, expected.to_string());
     }
 
     #[tokio::test]
@@ -524,7 +565,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_text(response).await, "auth:team-red");
+        assert_eq!(text_of(response).await, "auth:team-red");
     }
 
     #[tokio::test]
@@ -559,7 +600,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(body_text(response).await, expected_tenant);
+            assert_eq!(text_of(response).await, expected_tenant);
         }
     }
 
@@ -637,7 +678,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(challenge(&response), "Bearer realm=\"data-plane\"");
-        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        let body = json_of(response).await;
         assert_eq!(body["error"]["code"], "invalid_api_key");
         assert!(
             body["error"]["message"]

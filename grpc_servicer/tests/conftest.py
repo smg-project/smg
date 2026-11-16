@@ -84,6 +84,18 @@ def nothing_of_the_launchers_in_the_environment():
                 os.environ[name] = value
 
 
+@pytest.fixture
+def the_python_vllm_servicer_chosen(monkeypatch):
+    """The explicit choice the Python vLLM servicer's constructor requires
+    (``vllm.rust.require_python_impl``: with the Rust servicer the default,
+    nothing chosen means the launcher switch never ran). A test that builds
+    ``VllmEngineServicer`` directly, without the switch, makes the choice the
+    switch would have written back."""
+    from smg_grpc_servicer import vllm
+
+    monkeypatch.setenv(vllm.SERVICER_IMPL_ENV, "python")
+
+
 _TOKENSPEED_SERVICER = _GRPC_SERVICER_ROOT / "smg_grpc_servicer" / "tokenspeed" / "servicer.py"
 _VLLM_ERRORS = _GRPC_SERVICER_ROOT / "smg_grpc_servicer" / "vllm" / "errors.py"
 

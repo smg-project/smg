@@ -1,0 +1,180 @@
+name: Policy Recorded Rows
+
+# The policy controller crate replays rows recorded by running the gateway's
+# own policy code: a pool of workers, what a router knows of them, one
+# request shape, and what the policy picked. The sheets live in bellwether
+# (smg-project/bellwether, `policy/`), each beside its recorder. The crate's
+# suite replays the few rows copied into its test sources; this workflow
+# replays every row of every sheet, so a decision that parts from a recorded
+# one shows on the pull request that makes it.
+#
+# The job starts on what can move a replayed row: the crate, the protocols
+# crate (the replay builds each load report from that crate's wire types and
+# their defaults), the workspace manifest, the lock and the pin. It starts on
+# its own inputs too: this file, the Rust setup, and the two files every
+# build reads, the cargo configuration and the toolchain file. Its build
+# compiles five more workspace members: the gRPC client crate, and the mock
+# worker with the tokenizer and the two engine ZMQ crates behind it. No
+# recorded row reads them, so they are left out here; a change to one of
+# them starts the test shard that builds this crate's tests and replays the
+# copied rows.
+#
+# The sheets come from the bellwether commit in
+# .github/versions/bellwether-policy.ref. To take newer sheets, change that
+# hash: the pull request that does it runs against the new commit. The pin
+# is a file of its own, so moving it starts this job and no other.
+#
+# bellwether is public and the sheets are plain files: the checkout needs no
+# token and fetches nothing from the large-file store, and the job runs the
+# same way for every pull request, forks and Dependabot included.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - crates/policy_controller/**
+      - crates/protocols/**
+      - crates/worker/**
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/config.toml
+      - rust-toolchain.toml
+      - .github/versions/bellwether-policy.ref
+      - .github/workflows/policy-recorded-rows.yml
+      - .github/actions/setup-rust/**
+      - scripts/ci_install_rust.sh
+      - scripts/ci_apt_mirror.sh
+      - scripts/ci_apt_update.sh
+      - scripts/ci_retry.sh
+      - scripts/ci_install_build_deps.sh
+      - scripts/ci_install_protoc.sh
+  pull_request:
+    branches: [ main, release/** ]
+    types: [opened, synchronize, reopened]
+    paths:
+      - crates/policy_controller/**
+      - crates/protocols/**
+      - crates/worker/**
+      - Cargo.toml
+      - Cargo.lock
+      - .cargo/config.toml
+      - rust-toolchain.toml
+      - .github/versions/bellwether-policy.ref
+      - .github/workflows/policy-recorded-rows.yml
+      - .github/actions/setup-rust/**
+      - scripts/ci_install_rust.sh
+      - scripts/ci_apt_mirror.sh
+      - scripts/ci_apt_update.sh
+      - scripts/ci_retry.sh
+      - scripts/ci_install_build_deps.sh
+      - scripts/ci_install_protoc.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One group per pull request and one per branch. A pull request's newer push
+# cancels its superseded run. A run on a branch runs to its end, so a commit
+# of `main` that parts from a recorded row is not hidden by the next push.
+# Keep the pull request form in sync with cancel-pr-workflows.yml.
+concurrency:
+  group: policy-recorded-rows-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  replay:
+    name: replay (policy sheets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # The replay runs this pull request's code, so the workflow token is
+      # not left in the checkout's git configuration.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read the pinned bellwether commit
+        id: pin
+        run: |
+          ref="$(tr -d '[:space:]' < .github/versions/bellwether-policy.ref)"
+          if ! [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error file=.github/versions/bellwether-policy.ref::expected one 40-character commit hash"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      # The `policy/` directory alone: the sheets, their recorders and the
+      # table that states each sheet's commit, row counts and checksum.
+      - name: Check out the policy sheets
+        uses: actions/checkout@v7
+        with:
+          repository: smg-project/bellwether
+          ref: ${{ steps.pin.outputs.ref }}
+          path: .bellwether-policy
+          sparse-checkout: policy
+          persist-credentials: false
+
+      # No Rust cache: the job builds one crate's test target, and an entry
+      # of its own would take more of the repository's cache than its
+      # restore saves.
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache: 'false'
+
+      # The build keeps the crate's default features, because a binary ships
+      # with them, though no case of the target runs the plugin host.
+      - name: Build the replay
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test -p smg-policy-controller --features ingest --test classic_rows --no-run
+
+      # The ignored test replays every sheet of the directory. It prints a line
+      # a sheet and a line a policy with a replay module, each with its rows
+      # and its defects. It fails on a sheet no module replays, on a module
+      # with no sheet at the pin, and on a row copied into the crate's test
+      # sources that is not its sheet's row.
+      #
+      # The step has a floor of its own, because a run that replays nothing
+      # or checks nothing must fail too. Should the test move to another
+      # target or behind a feature this job does not name, cargo runs no test
+      # and exits 0. So the output must hold a policy line, every policy line
+      # must count rows and no defect, and no line may count a defect. The
+      # policy lines come from the replay modules' one table in the test
+      # sources, not from the files the checkout holds, and a policy's name
+      # is read up to its colon, whatever its spelling.
+      # scripts/tests/test_policy_recorded_rows_floor.py runs this script.
+      - name: Replay every recorded row
+        env:
+          SMG_POLICY_CLASSIC_ROWS: ${{ github.workspace }}/.bellwether-policy/policy
+        run: |
+          source "$HOME/.cargo/env"
+          set -o pipefail
+          cargo test -p smg-policy-controller --features ingest --test classic_rows -- \
+            --ignored --nocapture 2>&1 | tee replay_output.txt
+          if ! grep -q -E '^policy [^:]+: ' replay_output.txt; then
+            echo "::error::the replay named no policy: no test ran"
+            exit 1
+          fi
+          short="$(grep -E '^policy [^:]+: ' replay_output.txt | grep -v -E ': [1-9][0-9]* rows, 0 defects$' || true)"
+          if [ -n "$short" ]; then
+            echo "$short"
+            echo "::error::a policy has no sheet with rows and no defect"
+            exit 1
+          fi
+          if grep -E ' rows, [1-9][0-9]* defects$' replay_output.txt; then
+            echo "::error::a sheet counts a defect"
+            exit 1
+          fi
+          echo "the floor: $(grep -c -E '^policy [^:]+: ' replay_output.txt) policies, each with rows and no defect"
+
+      - name: Summary
+        if: always()
+        env:
+          PIN: ${{ steps.pin.outputs.ref }}
+        run: |
+          echo "## Policy sheets replayed at $PIN" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f replay_output.txt ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -E ' rows, [0-9]+ defects$|^policy |^test result' replay_output.txt >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -200,6 +200,17 @@ impl EngineLink {
         let tokens = self.client.get()?.prefill_pending_tokens();
         Some(u32::try_from(tokens).unwrap_or(u32::MAX))
     }
+
+    /// The engine's KV-event publisher sent a batch the relay read live, in
+    /// the publisher's sequence: the engine stepped (it stored or freed KV
+    /// blocks), whatever its output wire has said since. The connected
+    /// client ends its silence count on it as on an output; nothing while
+    /// the handshake runs.
+    pub(crate) fn note_engine_progress(&self) {
+        if let Some(client) = self.client.get() {
+            client.note_progress();
+        }
+    }
 }
 
 #[cfg(test)]

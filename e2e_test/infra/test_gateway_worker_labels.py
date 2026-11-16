@@ -7,7 +7,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from infra import constants
 from infra import gateway as gw
+from infra.constants import ENV_TRTLLM_SERVICER_IMPL
 
 
 class _Response:
@@ -90,6 +92,30 @@ def test_label_workers_reports_a_refused_patch(monkeypatch):
 
     with pytest.raises(RuntimeError, match="PATCH /workers/w1 returned 400"):
         gateway.label_workers([worker], {"structural_tag_vocabulary": "older"})
+
+
+def test_the_hand_set_label_goes_to_trtllm_workers_on_the_engines_own_servicer(monkeypatch):
+    """The engine's own gRPC server advertises no structural-tag vocabulary
+    (the lane's default, an explicit ``python``, the package's own default);
+    the Rust servicer's launcher advertises it, so nothing is set by hand."""
+    trt = SimpleNamespace(engine="trtllm", base_url="grpc://127.0.0.1:5")
+    other = SimpleNamespace(engine="vllm", base_url="grpc://127.0.0.1:6")
+    monkeypatch.delenv(ENV_TRTLLM_SERVICER_IMPL, raising=False)
+    monkeypatch.setattr(constants, "_package_servicer_switch", lambda: None)
+    assert gw.workers_labelled_by_hand([other, trt]) == [trt]
+    assert gw.workers_labelled_by_hand([other]) == []
+    assert gw.workers_labelled_by_hand(None) == []
+    monkeypatch.setenv(ENV_TRTLLM_SERVICER_IMPL, "python")
+    assert gw.workers_labelled_by_hand([trt]) == [trt]
+    monkeypatch.setenv(ENV_TRTLLM_SERVICER_IMPL, "rust")
+    assert gw.workers_labelled_by_hand([other, trt]) == []
+    monkeypatch.delenv(ENV_TRTLLM_SERVICER_IMPL)
+    monkeypatch.setattr(
+        constants,
+        "_package_servicer_switch",
+        lambda: lambda variable, environ=None, **_: ("rust", "default"),
+    )
+    assert gw.workers_labelled_by_hand([trt]) == []
 
 
 def test_label_workers_raises_when_the_queued_label_never_lands(monkeypatch):

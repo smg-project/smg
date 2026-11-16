@@ -1,0 +1,58 @@
+name: PR Helm Chart
+
+# The chart's own checks on a pull request that touches it: `helm lint` and
+# the alert rule unit tests (deploy/helm/smg/tests/rules/run.sh, which renders
+# the PrometheusRule and replays every test file against it with promtool).
+on:
+  pull_request:
+    paths:
+      - 'deploy/helm/smg/**'
+      - '.github/workflows/pr-helm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-helm-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chart:
+    name: Lint the chart and run its alert rule tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # The Prometheus release promtool comes from, and the digest of its
+      # linux-amd64 tarball from the release's sha256sums.txt.
+      PROMETHEUS_VERSION: 3.15.1
+      PROMETHEUS_SHA256: 6a726885328ad9efebbf36e876ce2fb6225468a71fd1e7ce3ba666d5f4d97a84
+    steps:
+      # The job runs a downloaded binary (promtool), so the checkout keeps no
+      # credentials, as the repository's other such workflows do.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.17.0
+
+      - name: Install promtool
+        run: |
+          tarball="prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          bash scripts/ci_retry.sh 3 30 curl -fsSL --connect-timeout 10 --max-time 300 -o "$tarball" \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${tarball}"
+          echo "${PROMETHEUS_SHA256}  ${tarball}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xzf "$tarball" -C "${RUNNER_TEMP}/bin" --strip-components=1 \
+            "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/bin/promtool" --version
+
+      - name: Lint the chart
+        run: helm lint deploy/helm/smg
+
+      - name: Run the alert rule tests
+        run: bash deploy/helm/smg/tests/rules/run.sh

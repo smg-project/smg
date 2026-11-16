@@ -11,6 +11,7 @@ from infra import worker as worker_module
 from infra.constants import (
     ENV_SGLANG_SERVICER_IMPL,
     ENV_TOKENSPEED_SERVICER_IMPL,
+    ENV_TRTLLM_SERVICER_IMPL,
     ENV_VLLM_SERVICER_IMPL,
     ConnectionMode,
 )
@@ -20,6 +21,7 @@ ENGINES = [
     ("vllm", ENV_VLLM_SERVICER_IMPL, "SMG_VLLM_SERVICER_IMPL", True),
     ("tokenspeed", ENV_TOKENSPEED_SERVICER_IMPL, "SMG_TOKENSPEED_SERVICER_IMPL", False),
     ("sglang", ENV_SGLANG_SERVICER_IMPL, "SMG_SGLANG_SERVICER_IMPL", False),
+    ("trtllm", ENV_TRTLLM_SERVICER_IMPL, "SMG_TRTLLM_SERVICER_IMPL", False),
 ]
 
 

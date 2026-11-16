@@ -19,7 +19,7 @@ Usage:
     pytest e2e_test/router/test_pd_messages.py -v
 
     # vLLM (runs gRPC only, HTTP skipped)
-    E2E_RUNTIME=vllm pytest e2e_test/router/test_pd_messages.py -v
+    E2E_RUNTIME=vllm E2E_ENGINE=vllm pytest e2e_test/router/test_pd_messages.py -v
 """
 
 from __future__ import annotations

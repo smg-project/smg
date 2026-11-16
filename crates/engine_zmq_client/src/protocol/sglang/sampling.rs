@@ -1,15 +1,15 @@
-// SGLang `SamplingParams` — a Python `msgspec.Struct(kw_only=True,
-// array_like=True)` (`srt/sampling/sampling_params.py`), so it rides the wire
-// as an untagged positional msgpack array nested inside the tokenized
-// request. **Field order is the wire contract.** This side sends the API
-// parameters, the fields a caller sets, through `custom_params`: the
-// scheduler's own fields after them (`stop_strs`, `stop_str_max_len`,
-// `is_normalized`, ...) come out of its `normalize()`, and `msgspec` fills
-// every trailing field an array leaves out from its default, so one encoding
-// serves a release that inserts a field after `custom_params` (0.5.22 put
-// `watermark` there) as well as the one before it. A release that moves a
-// field inside the prefix is named at the handshake, see
-// [`SglangProtocol::check_layouts`](super::SglangProtocol).
+//! SGLang `SamplingParams` — a Python `msgspec.Struct(kw_only=True,
+//! array_like=True)` (`srt/sampling/sampling_params.py`), so it rides the wire
+//! as an untagged positional msgpack array nested inside the tokenized
+//! request. **Field order is the wire contract.** This side sends the API
+//! parameters, the fields a caller sets, through `custom_params`: the
+//! scheduler's own fields after them (`stop_strs`, `stop_str_max_len`,
+//! `is_normalized`, ...) come out of its `normalize()`, and `msgspec` fills
+//! every trailing field an array leaves out from its default, so one encoding
+//! serves a release that inserts a field after `custom_params` (0.5.22 put
+//! `watermark` there) as well as the one before it. A release that moves a
+//! field inside the prefix is named at the handshake, see
+//! [`SglangProtocol::check_layouts`](super::SglangProtocol).
 
 use std::collections::HashMap;
 

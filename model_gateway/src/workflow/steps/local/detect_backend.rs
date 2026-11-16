@@ -17,7 +17,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use super::discover_metadata::ModelsResponse;
 use crate::{
-    worker::{endpoint::Endpoint, ConnectionMode},
+    worker::{identity::endpoint::Endpoint, ConnectionMode},
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::util::{grpc_base_url, grpc_health_answer, http_base_url},
@@ -104,7 +104,9 @@ async fn probe_models_endpoint(
 
     let response = match req.send().await {
         Ok(response) => response,
-        Err(e) => return ModelsProbe::Failed(format!("failed to reach {shown}: {e}")),
+        Err(e) => {
+            return ModelsProbe::Failed(format!("failed to reach {shown}: {}", e.without_url()))
+        }
     };
 
     if !response.status().is_success() {
@@ -113,7 +115,12 @@ async fn probe_models_endpoint(
 
     let models: ModelsResponse = match response.json().await {
         Ok(models) => models,
-        Err(e) => return ModelsProbe::Failed(format!("failed to parse {shown} response: {e}")),
+        Err(e) => {
+            return ModelsProbe::Failed(format!(
+                "failed to parse {shown} response: {}",
+                e.without_url()
+            ))
+        }
     };
 
     let Some(first_model) = models.data.first() else {
@@ -145,8 +152,9 @@ async fn try_vllm_version(
 
     let response = req.send().await.map_err(|e| {
         format!(
-            "Failed to reach {}: {e}",
-            Endpoint::redacted_str(&version_url)
+            "Failed to reach {}: {}",
+            Endpoint::redacted_str(&version_url),
+            e.without_url()
         )
     })?;
 
@@ -173,10 +181,13 @@ async fn try_sglang_server_info(
         req = req.bearer_auth(key);
     }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach {}: {e}", Endpoint::redacted_str(&info_url)))?;
+    let response = req.send().await.map_err(|e| {
+        format!(
+            "Failed to reach {}: {}",
+            Endpoint::redacted_str(&info_url),
+            e.without_url()
+        )
+    })?;
 
     if !response.status().is_success() {
         return Err(format!("/server_info returned {}", response.status()));
@@ -389,12 +400,19 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
 
 #[cfg(test)]
 mod tests {
-    use axum::{routing::get, Json, Router};
+    use axum::{
+        http::{StatusCode, Uri},
+        routing::get,
+        Json, Router,
+    };
     use serde_json::json;
     use tokio::net::TcpListener;
 
     use super::{detect_grpc_backend, detect_http_backend};
-    use crate::workflow::steps::util::mock_grpc_engine;
+    use crate::{
+        server::http_client, worker::test_support::RefusedAddress,
+        workflow::steps::util::mock_grpc_engine,
+    };
 
     /// A runtime that answers its health RPC with `healthy: false` (its
     /// engine still loading) is identified all the same, with and without
@@ -459,7 +477,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::clients::http_client(), None)
+        let runtime = detect_http_backend(&url, 5, &http_client(), None)
             .await
             .unwrap();
         server.abort();
@@ -475,7 +493,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::clients::http_client(), None)
+        let runtime = detect_http_backend(&url, 5, &http_client(), None)
             .await
             .unwrap();
         server.abort();
@@ -496,7 +514,7 @@ mod tests {
         );
         let (url, server) = serve_router(router).await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::clients::http_client(), None)
+        let runtime = detect_http_backend(&url, 5, &http_client(), None)
             .await
             .unwrap();
         server.abort();
@@ -512,14 +530,13 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn http_detection_failures_name_the_worker_masked() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
 
         let err = detect_http_backend(
             &format!("http://user:secret@127.0.0.1:{port}"),
             1,
-            &crate::clients::http_client(),
+            &http_client(),
             None,
         )
         .await
@@ -537,21 +554,56 @@ mod tests {
         )));
     }
 
+    /// An address registered with a query, at a port nobody listens on: the
+    /// failure does not repeat the query. The HTTP client's own error text
+    /// ends with the request URL, the query kept.
+    #[tokio::test]
+    async fn http_detection_failures_go_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}?token=s3cret", refused.http_url());
+
+        let err = detect_http_backend(&url, 1, &http_client(), None)
+            .await
+            .unwrap_err();
+
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    /// An address registered with a query whose `/v1/models` answers a body
+    /// that is no JSON: the failure does not repeat the query. The HTTP
+    /// client's text of a failed body read ends with the request URL too.
+    #[tokio::test]
+    async fn an_unparsed_models_answer_goes_without_the_clients_url() {
+        // The query takes in the path each probe appends, so the stub tells
+        // the probes apart by the request's tail.
+        let (url, server) = serve_router(Router::new().fallback(|uri: Uri| async move {
+            if uri.to_string().ends_with("/v1/models") {
+                (StatusCode::OK, "not json")
+            } else {
+                (StatusCode::NOT_FOUND, "")
+            }
+        }))
+        .await;
+
+        let result =
+            detect_http_backend(&format!("{url}?token=s3cret"), 1, &http_client(), None).await;
+        server.abort();
+
+        let err = result.unwrap_err();
+        assert!(err.contains("failed to parse"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
     #[tokio::test]
     async fn http_detection_fails_when_models_endpoint_unreachable() {
         // A port that refuses connections: a backend that is not up must stay
         // an error so the retryable step keeps polling.
-        let refused = crate::test_support::RefusedAddress::reserve();
+        let refused = RefusedAddress::reserve();
         let addr = refused.addr();
 
-        let err = detect_http_backend(
-            &format!("http://{addr}"),
-            1,
-            &crate::clients::http_client(),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = detect_http_backend(&format!("http://{addr}"), 1, &http_client(), None)
+            .await
+            .unwrap_err();
 
         assert!(err.contains("Could not detect HTTP backend"), "got: {err}");
     }
@@ -562,7 +614,7 @@ mod tests {
         // retries instead of registering a backend with nothing to serve.
         let (url, server) = serve_router(models_route(json!({"object": "list", "data": []}))).await;
 
-        let result = detect_http_backend(&url, 5, &crate::clients::http_client(), None).await;
+        let result = detect_http_backend(&url, 5, &http_client(), None).await;
         server.abort();
 
         result.unwrap_err();
@@ -576,7 +628,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::clients::http_client(), None)
+        let runtime = detect_http_backend(&url, 5, &http_client(), None)
             .await
             .unwrap();
         server.abort();

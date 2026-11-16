@@ -161,3 +161,15 @@ class TestAdminOpsTokenSpeed(AdminOpsBehavior):
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestFlushCacheVllm(FlushCacheBehavior):
     """vLLM exposes cache flush over gRPC."""
+
+
+@pytest.mark.engine("mock")
+@pytest.mark.gpu(1)
+@pytest.mark.e2e
+@pytest.mark.model("RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8")
+@pytest.mark.workers(extra_engine_args=["--engine", "realistic"])
+@pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
+class TestAdminOpsMock(AdminOpsBehavior):
+    """The scripted mock worker answers the fan-out on both wires, on the CPU row:
+    a flush clears its engine's cache and a profiling run ends with one trace
+    file in the requested output directory."""

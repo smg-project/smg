@@ -7,10 +7,11 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use llm_multimodal::{
     registry::{ModelRegistryError, RegistryResult},
-    MediaConnector, MediaConnectorConfig, Modality, ModelProcessorSpec, ModelRegistry,
-    PreProcessorConfig, VisionPreProcessor,
+    EncoderDtype, MediaConnector, MediaConnectorConfig, Modality, ModelProcessorSpec,
+    ModelRegistry, PreProcessorConfig, TransparencyPolicy, VisionPreProcessor,
 };
 use openai_protocol::worker::MmProcessingMode;
+use parking_lot::RwLock;
 use tracing::{debug, warn};
 
 use super::{
@@ -19,7 +20,7 @@ use super::{
     process::preprocessor_config_for,
     settings::MultimodalSettings,
 };
-use crate::worker::http_client::build_with;
+use crate::{observability::metrics::Metrics, worker::connection::http_client::build_with};
 
 /// Cached model configuration files loaded from the tokenizer directory.
 #[derive(Debug)]
@@ -33,6 +34,36 @@ pub(crate) struct MultimodalModelConfig {
     /// The vision processors built from these configs, by the name of the
     /// spec that built them (see [`Self::vision_processors`]).
     vision_processors: DashMap<&'static str, Arc<VisionProcessors>>,
+    /// The pixel cache's fingerprints of these configs, one per tokenizer,
+    /// model, wire dtype and transparency policy a request named (see
+    /// [`Self::image_fingerprint`]).
+    image_fingerprints: RwLock<Vec<ImageFingerprint>>,
+}
+
+/// One pixel-cache fingerprint of a loaded config, with the request
+/// parameters it was hashed for.
+#[derive(Debug)]
+struct ImageFingerprint {
+    tokenizer_id: Box<str>,
+    model_id: Box<str>,
+    image_wire_dtype: Option<EncoderDtype>,
+    transparency: TransparencyPolicy,
+    value: u64,
+}
+
+impl ImageFingerprint {
+    fn is_for(
+        &self,
+        tokenizer_id: &str,
+        model_id: &str,
+        image_wire_dtype: Option<EncoderDtype>,
+        transparency: TransparencyPolicy,
+    ) -> bool {
+        self.image_wire_dtype == image_wire_dtype
+            && self.transparency == transparency
+            && &*self.tokenizer_id == tokenizer_id
+            && &*self.model_id == model_id
+    }
 }
 
 impl MultimodalModelConfig {
@@ -46,7 +77,48 @@ impl MultimodalModelConfig {
             preprocessor_config,
             video_preprocessor_config,
             vision_processors: DashMap::new(),
+            image_fingerprints: RwLock::new(Vec::new()),
         }
+    }
+
+    /// The pixel cache's fingerprint of these configs for `model_id` behind
+    /// `tokenizer_id`, served over `image_wire_dtype` under `transparency`:
+    /// `hash` runs for the first request with that combination and every
+    /// later one reads its value back, as nothing the fingerprint covers
+    /// changes while a config is loaded (a reload is a new config with no
+    /// entries). A deployment names one combination, so the read is a
+    /// comparison or two under the read lock, no allocation.
+    pub(crate) fn image_fingerprint(
+        &self,
+        tokenizer_id: &str,
+        model_id: &str,
+        image_wire_dtype: Option<EncoderDtype>,
+        transparency: TransparencyPolicy,
+        hash: impl FnOnce() -> Result<u64>,
+    ) -> Result<u64> {
+        if let Some(entry) = self
+            .image_fingerprints
+            .read()
+            .iter()
+            .find(|entry| entry.is_for(tokenizer_id, model_id, image_wire_dtype, transparency))
+        {
+            return Ok(entry.value);
+        }
+        let value = hash()?;
+        let mut entries = self.image_fingerprints.write();
+        if !entries
+            .iter()
+            .any(|entry| entry.is_for(tokenizer_id, model_id, image_wire_dtype, transparency))
+        {
+            entries.push(ImageFingerprint {
+                tokenizer_id: tokenizer_id.into(),
+                model_id: model_id.into(),
+                image_wire_dtype,
+                transparency,
+                value,
+            });
+        }
+        Ok(value)
     }
 
     /// The vision processors `spec` builds from these configs: built by the
@@ -86,7 +158,7 @@ impl VisionProcessors {
     fn build(spec: &dyn ModelProcessorSpec, model_config: &MultimodalModelConfig) -> Self {
         let build = |modality| {
             let mut config = preprocessor_config_for(model_config, modality).clone();
-            if spec.name() == "minimax_m3"
+            if spec.resizes_source_images()
                 && modality == Modality::Image
                 && !config
                     .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY)
@@ -214,11 +286,17 @@ impl MultimodalConfigRegistry {
             "multimodal config cache miss, loading"
         );
 
-        let base_dir = llm_multimodal::hub::resolve_model_config_dir(tokenizer_source)
-            .await
-            .with_context(|| {
-                format!("Failed to resolve model config directory for '{tokenizer_source}'")
-            })?;
+        // The load runs once per tokenizer and is the largest future this
+        // path may await; boxed, so the per-request futures that may reach a
+        // miss carry a pointer to it, not its state (a jemalloc size class per
+        // request on every path, two on Messages, when the loader grows).
+        let base_dir = Box::pin(llm_multimodal::hub::resolve_model_config_dir(
+            tokenizer_source,
+        ))
+        .await
+        .with_context(|| {
+            format!("Failed to resolve model config directory for '{tokenizer_source}'")
+        })?;
 
         let config_path = base_dir.join("config.json");
         let config: serde_json::Value = std::fs::read_to_string(&config_path)
@@ -335,6 +413,12 @@ pub(crate) fn load_video_preprocessor_config(base_dir: &Path) -> Option<PreProce
 }
 
 pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProcessorConfig> {
+    // Native policy files are authoritative. A malformed file must not select
+    // an unrelated generic policy. The native processor rejects empty defaults.
+    let native_path = base_dir.join("image_preprocessing.json");
+    if native_path.exists() {
+        return load_preprocessor_config_file(&native_path, "image_preprocessing.json");
+    }
     with_feature_extractor_section(load_image_processor_section(base_dir), base_dir)
 }
 
@@ -464,7 +548,7 @@ impl MultimodalComponents {
             "media fetch policy for router-side processing"
         );
         let media_connector = build_with(
-            || crate::clients::http_client_builder().timeout(std::time::Duration::from_secs(30)),
+            || crate::server::http_client_builder().timeout(std::time::Duration::from_secs(30)),
             false,
             "media HTTP client",
             |client| MediaConnector::new(client, connector_config.clone()),
@@ -492,6 +576,7 @@ impl MultimodalComponents {
             "multimodal one-pass wire write"
         );
 
+        Metrics::init_mm_inflight_series();
         let inflight = max_inflight_bytes
             .map(|bytes| {
                 let inflight = MultimodalInflight::new(bytes);
@@ -526,11 +611,56 @@ impl MultimodalComponents {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        sync::atomic::{AtomicU16, Ordering},
+    };
 
     use tempfile::TempDir;
 
     use super::*;
+
+    /// The fingerprint is hashed once per tokenizer, model, wire dtype and
+    /// transparency policy: the same combination reads the first value back
+    /// without hashing again, a change in any of the four hashes afresh, and
+    /// the earlier entries keep answering.
+    #[test]
+    fn image_fingerprint_is_hashed_once_per_request_shape() {
+        let config = MultimodalModelConfig::new(
+            serde_json::json!({"model_type": "qwen2_vl"}),
+            PreProcessorConfig::default(),
+            None,
+        );
+        let hashes = std::cell::Cell::new(0u64);
+        let fingerprint = |tokenizer: &str, model: &str, dtype, transparency| {
+            config
+                .image_fingerprint(tokenizer, model, dtype, transparency, || {
+                    hashes.set(hashes.get() + 1);
+                    Ok(hashes.get())
+                })
+                .unwrap()
+        };
+        let keep = TransparencyPolicy::KeepAlpha;
+        assert_eq!(fingerprint("tok", "model", None, keep), 1);
+        assert_eq!(fingerprint("tok", "model", None, keep), 1);
+        assert_eq!(hashes.get(), 1, "the second request read the memo");
+        assert_eq!(
+            fingerprint("tok", "model", Some(EncoderDtype::BFloat16), keep),
+            2
+        );
+        assert_eq!(
+            fingerprint("tok", "model", None, TransparencyPolicy::DropAlpha),
+            3
+        );
+        assert_eq!(fingerprint("other-tokenizer", "model", None, keep), 4);
+        assert_eq!(fingerprint("tok", "other-model", None, keep), 5);
+        assert_eq!(fingerprint("tok", "model", None, keep), 1);
+        assert_eq!(
+            fingerprint("tok", "model", Some(EncoderDtype::BFloat16), keep),
+            2
+        );
+        assert_eq!(hashes.get(), 5);
+    }
 
     #[tokio::test]
     async fn registry_get_or_load_reads_from_local_dir_and_caches() {
@@ -574,6 +704,306 @@ mod tests {
             .expect("must fall back to default preprocessor_config");
         assert_eq!(loaded.config["model_type"].as_str(), Some("llama"));
         assert!(reg.get("tok-uuid-nopp").is_some());
+    }
+
+    /// A Hub that answers `status` to every file request, so a checkpoint's
+    /// processor-config fetches fail or are refused without a network: the
+    /// Hub client asks for a file its cache lacks with one GET and reads the
+    /// status before anything else.
+    async fn hub_answering(status: Arc<AtomicU16>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test's Hub lives as long as the test's runtime, which ends it"
+        )]
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let status = status.load(Ordering::SeqCst);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "one answer per connection, ended with the test's runtime"
+                )]
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let _ = socket.read(&mut request).await;
+                    let reason = if status == 404 {
+                        "Not Found"
+                    } else {
+                        "Service Unavailable"
+                    };
+                    let answer = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-length: 0\r\n\
+                         connection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(answer.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        endpoint
+    }
+
+    /// A local Hub cache under `home` holding `files` of the checkpoint `repo`
+    /// at one commit, laid out as the Hub client keeps it (a cached file is
+    /// served with no request). Returns the snapshot directory the files sit in.
+    fn hub_cache(home: &Path, repo: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let commit = "0".repeat(40);
+        let repo_dir = home
+            .join("hub")
+            .join(format!("models--{}", repo.replace('/', "--")));
+        let snapshot = repo_dir.join("snapshots").join(&commit);
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        fs::write(repo_dir.join("refs").join("main"), commit).unwrap();
+        for (name, text) in files {
+            fs::write(snapshot.join(name), text).unwrap();
+        }
+        snapshot
+    }
+
+    /// `HF_HOME` and `HF_ENDPOINT` pointed at a test's cache and Hub, and put
+    /// back when the test ends, so a failing assertion leaves no other test on
+    /// this Hub. The variables are process-wide, so the tests that set them
+    /// take turns: the guard holds the turn until the variables are restored.
+    struct HubEnv {
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _turn: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    static HUB_ENV_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    impl HubEnv {
+        async fn set(home: &Path, endpoint: &str) -> Self {
+            let turn = HUB_ENV_TURN.lock().await;
+            let previous = ["HF_HOME", "HF_ENDPOINT"]
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect();
+            std::env::set_var("HF_HOME", home);
+            std::env::set_var("HF_ENDPOINT", endpoint);
+            Self {
+                previous,
+                _turn: turn,
+            }
+        }
+    }
+
+    impl Drop for HubEnv {
+        fn drop(&mut self) {
+            // The variables go back before the turn is released (the fields
+            // drop after this body).
+            for (name, value) in self.previous.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// A processor config the Hub fails to serve is not guessed: the request
+    /// fails and nothing is cached, so the next request reads the file once
+    /// it is there, while the Hub's 404 (a checkpoint without the file) keeps
+    /// the default, cached as before. No network: the Hub is a loopback
+    /// listener and each checkpoint's `config.json` sits in a local Hub cache.
+    #[tokio::test]
+    async fn registry_get_or_load_does_not_cache_a_default_after_a_failed_fetch() {
+        let home = TempDir::new().unwrap();
+        let status = Arc::new(AtomicU16::new(503));
+        let endpoint = hub_answering(status.clone()).await;
+        let _env = HubEnv::set(home.path(), &endpoint).await;
+        let config_json = r#"{"model_type":"llama"}"#;
+        let reg = MultimodalConfigRegistry::new();
+
+        let snapshot = hub_cache(home.path(), "cell/failing", &[("config.json", config_json)]);
+        let failed = reg
+            .get_or_load("tok-uuid-failed", "cell/failing")
+            .await
+            .expect_err("a 503 on preprocessor_config.json fails the request");
+        assert!(
+            llm_multimodal::hub::HubFetchError::is(&failed),
+            "the failure is the typed one the gateway answers as a 502: {failed:#}"
+        );
+        let failed = format!("{failed:#}");
+        assert!(
+            failed.contains("preprocessor_config.json") && failed.contains("503"),
+            "the error names the file and the Hub's answer: {failed}"
+        );
+        assert!(
+            reg.get("tok-uuid-failed").is_none(),
+            "nothing is cached after a failed fetch"
+        );
+
+        // The Hub is back and the checkpoint turns out to ship the file (it is
+        // in the cache now, the other two answer 404): the next request reads
+        // it instead of a guessed default, and keeps it.
+        fs::write(
+            snapshot.join("preprocessor_config.json"),
+            r#"{"size":{"shortest_edge":448}}"#,
+        )
+        .unwrap();
+        status.store(404, Ordering::SeqCst);
+        let loaded = reg
+            .get_or_load("tok-uuid-failed", "cell/failing")
+            .await
+            .expect("the file is read on the next request");
+        assert_eq!(
+            loaded.preprocessor_config.get_shortest_edge(),
+            Some(448),
+            "the checkpoint's values, not the default"
+        );
+        let again = reg
+            .get_or_load("tok-uuid-failed", "cell/failing")
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&loaded, &again), "cached once it was read");
+
+        // A checkpoint without the file: the Hub's 404 keeps the default, cached.
+        hub_cache(home.path(), "cell/absent", &[("config.json", config_json)]);
+        let absent = reg
+            .get_or_load("tok-uuid-absent", "cell/absent")
+            .await
+            .expect("a 404 is a checkpoint without the file");
+        assert_eq!(absent.preprocessor_config.get_shortest_edge(), None);
+        assert!(
+            reg.get("tok-uuid-absent").is_some(),
+            "an absent file is cached as the default, as before"
+        );
+
+        // config.json itself, on a cold checkpoint: a 503 is the same typed
+        // failure, nothing cached; a 404 is a checkpoint without the file, the
+        // request's error rather than the Hub's.
+        status.store(503, Ordering::SeqCst);
+        let failed = reg
+            .get_or_load("tok-uuid-cold", "cell/cold")
+            .await
+            .expect_err("a 503 on config.json fails the request");
+        assert!(
+            llm_multimodal::hub::HubFetchError::is(&failed),
+            "config.json's 503 is the typed failure: {failed:#}"
+        );
+        let failed = format!("{failed:#}");
+        assert!(
+            failed.contains("download config.json for") && failed.contains("503"),
+            "the error names config.json and the Hub's answer: {failed}"
+        );
+        assert!(reg.get("tok-uuid-cold").is_none(), "nothing is cached");
+        status.store(404, Ordering::SeqCst);
+        let missing = reg
+            .get_or_load("tok-uuid-missing", "cell/missing")
+            .await
+            .expect_err("a checkpoint without config.json fails the request");
+        assert!(
+            !llm_multimodal::hub::HubFetchError::is(&missing),
+            "config.json's 404 is not a failure of the Hub: {missing:#}"
+        );
+        assert!(
+            format!("{missing:#}").contains("config.json"),
+            "the error names the file: {missing:#}"
+        );
+        assert!(reg.get("tok-uuid-missing").is_none(), "nothing is cached");
+
+        // Without a token the Hub answers a repository that does not exist
+        // with a 401: the same plain error, not a failure of the Hub.
+        status.store(401, Ordering::SeqCst);
+        let refused = reg
+            .get_or_load("tok-uuid-refused", "cell/refused")
+            .await
+            .expect_err("a 401 on config.json fails the request");
+        assert!(
+            !llm_multimodal::hub::HubFetchError::is(&refused),
+            "config.json's 401 is not a failure of the Hub: {refused:#}"
+        );
+        assert!(reg.get("tok-uuid-refused").is_none(), "nothing is cached");
+
+        // A processor config of a gated checkpoint whose config.json is a
+        // cache hit, without access: the same plain error, nothing cached,
+        // and no default in place of a file that may exist.
+        hub_cache(home.path(), "cell/gated", &[("config.json", config_json)]);
+        let gated = reg
+            .get_or_load("tok-uuid-gated", "cell/gated")
+            .await
+            .expect_err("a 401 on a processor config fails the request");
+        assert!(
+            !llm_multimodal::hub::HubFetchError::is(&gated),
+            "a processor config's 401 is not a failure of the Hub: {gated:#}"
+        );
+        let gated = format!("{gated:#}");
+        assert!(
+            gated.contains("preprocessor_config.json") && gated.contains("401"),
+            "the error names the file and the Hub's answer: {gated}"
+        );
+        assert!(reg.get("tok-uuid-gated").is_none(), "nothing is cached");
+    }
+
+    /// A Hub that takes the connection and never answers holds a fetch only
+    /// for its bound, a processor config's on a warm checkpoint and
+    /// `config.json`'s on a cold one: the request fails within it as the typed
+    /// error naming the file and the elapsed bound, and nothing is cached. The
+    /// clock is paused, so the bound elapses as soon as the runtime idles on
+    /// the answer that never comes.
+    #[tokio::test(start_paused = true)]
+    async fn registry_get_or_load_gives_up_on_a_hub_that_never_answers() {
+        let home = TempDir::new().unwrap();
+        // Bound and never accepted: the connection completes into the backlog
+        // and the request waits for an answer that never comes.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", silent.local_addr().unwrap());
+        let _env = HubEnv::set(home.path(), &endpoint).await;
+        hub_cache(
+            home.path(),
+            "cell/silent",
+            &[("config.json", r#"{"model_type":"llama"}"#)],
+        );
+        let reg = MultimodalConfigRegistry::new();
+
+        let failed = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            reg.get_or_load("tok-uuid-silent", "cell/silent"),
+        )
+        .await
+        .expect("the fetch's own bound ends the wait, long before this one")
+        .expect_err("a fetch with no answer fails within its bound");
+        assert!(
+            llm_multimodal::hub::HubFetchError::is(&failed),
+            "{failed:#}"
+        );
+        let failed = format!("{failed:#}");
+        assert!(
+            failed.contains("preprocessor_config.json") && failed.contains("no answer within"),
+            "the error names the file and the elapsed bound: {failed}"
+        );
+        assert!(
+            reg.get("tok-uuid-silent").is_none(),
+            "nothing is cached after a fetch that ran out of its bound"
+        );
+
+        // A cold checkpoint: `config.json` itself is the first fetch, and the
+        // bound covers it the same way.
+        let failed = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            reg.get_or_load("tok-uuid-silent-cold", "cell/silent-cold"),
+        )
+        .await
+        .expect("the fetch's own bound ends the wait, long before this one")
+        .expect_err("a fetch with no answer fails within its bound");
+        assert!(
+            llm_multimodal::hub::HubFetchError::is(&failed),
+            "{failed:#}"
+        );
+        let failed = format!("{failed:#}");
+        assert!(
+            failed.contains("download config.json for") && failed.contains("no answer within"),
+            "the error names config.json and the elapsed bound: {failed}"
+        );
+        assert!(
+            reg.get("tok-uuid-silent-cold").is_none(),
+            "nothing is cached after a fetch that ran out of its bound"
+        );
+        drop(silent);
     }
 
     #[test]
@@ -706,6 +1136,106 @@ mod tests {
         );
     }
 
+    fn native_policy() -> serde_json::Value {
+        serde_json::json!({
+            "patch_size":40,
+            "temporal_patch_size":2,
+            "include_extra_column":false,
+            "rescale_image_frac":null,
+            "rescale_image_max_upscaled_long_edge":null,
+            "stretch_to_padded_grid":false,
+            "overlay_rgba_images_on_checkerboard":true,
+            "requires_image_grid_thw":true
+        })
+    }
+
+    #[tokio::test]
+    async fn registry_loads_native_image_preprocessing_policy() {
+        use llm_multimodal::vision::processors::Inkling2ImageProcessor;
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("config.json"),
+            r#"{"model_type":"inkling2"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("image_preprocessing.json"),
+            native_policy().to_string(),
+        )
+        .unwrap();
+        // The native file must win over a generic processor policy.
+        fs::write(
+            tmp.path().join("preprocessor_config.json"),
+            r#"{"do_resize":true}"#,
+        )
+        .unwrap();
+        let registry = MultimodalConfigRegistry::new();
+        let loaded = registry
+            .get_or_load("native-policy", tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        Inkling2ImageProcessor::validate_config(&loaded.preprocessor_config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn registry_loads_released_processor_config_section() {
+        use llm_multimodal::vision::processors::Inkling2ImageProcessor;
+
+        // The released checkpoint ships only processor_config.json.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("config.json"),
+            r#"{"model_type":"inkling2"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            serde_json::json!({
+                "image_processor": {
+                    "do_convert_rgb": true,
+                    "do_normalize": true,
+                    "do_rescale": true,
+                    "image_mean": [0.5, 0.5, 0.5],
+                    "image_processor_type": "Inkling2ImageProcessor",
+                    "image_std": [0.5, 0.5, 0.5],
+                    "rescale_factor": 0.00392156862745098,
+                    "size": {"height": 40, "width": 40}
+                },
+                "image_token": "<|unused_200054|>",
+                "processor_class": "Inkling2Processor"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let registry = MultimodalConfigRegistry::new();
+        let loaded = registry
+            .get_or_load("released-policy", tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        Inkling2ImageProcessor::validate_config(&loaded.preprocessor_config).unwrap();
+    }
+
+    #[test]
+    fn missing_or_malformed_native_policy_cannot_use_generic_defaults() {
+        use llm_multimodal::vision::processors::Inkling2ImageProcessor;
+
+        let tmp = TempDir::new().unwrap();
+        let generic = tmp.path().join("preprocessor_config.json");
+        fs::write(&generic, r#"{"do_resize":true}"#).unwrap();
+        let missing = load_image_preprocessor_config(tmp.path()).unwrap();
+        assert!(Inkling2ImageProcessor::validate_config(&missing).is_err());
+        let native = tmp.path().join("image_preprocessing.json");
+        fs::write(&native, "{malformed").unwrap();
+        assert!(load_image_preprocessor_config(tmp.path()).is_none());
+        assert!(Inkling2ImageProcessor::validate_config(&PreProcessorConfig::default()).is_err());
+        let mut policy = native_policy();
+        policy["patch_size"] = serde_json::json!(39);
+        fs::write(&native, policy.to_string()).unwrap();
+        let wrong = load_image_preprocessor_config(tmp.path()).unwrap();
+        assert!(Inkling2ImageProcessor::validate_config(&wrong).is_err());
+    }
+
     #[tokio::test]
     async fn registry_remove_drops_cached_entry() {
         let reg = MultimodalConfigRegistry::new();
@@ -807,7 +1337,7 @@ mod tests {
         .unwrap();
         let connector = &components.media_connector;
         for modality in ["image", "audio", "video"] {
-            let source = MediaSource::Url(url.clone());
+            let source = MediaSource::Url(url.to_string().into());
             let fetch = async {
                 match modality {
                     "image" => connector

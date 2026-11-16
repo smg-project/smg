@@ -59,10 +59,10 @@ mod tests {
             function: Function {
                 name: "play".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "artist": {"type": "string"},
                     "n": {"type": "integer"},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },

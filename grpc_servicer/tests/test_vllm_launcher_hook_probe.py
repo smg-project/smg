@@ -93,11 +93,16 @@ def test_a_launcher_without_the_hook_is_refused_by_name(vllm_package, monkeypatc
         launcher_switch.require_launcher_hook()
     line = str(raised.value)
     assert "\n" not in line
-    assert line.startswith("--servicer-impl rust (SMG_VLLM_SERVICER_IMPL=rust) refused")
+    assert line.startswith(
+        "the Rust servicer (the default; --servicer-impl rust / SMG_VLLM_SERVICER_IMPL=rust) refused"
+    )
     assert f"vLLM 0.29.1: its gRPC launcher {LAUNCHER} defines no serve_grpc" in line
     assert "vllm.entrypoints.grpc_server (0.28 and 0.29)" in line
     assert "run as __main__ by `python -m`" in line
-    assert "select --servicer-impl python (or unset SMG_VLLM_SERVICER_IMPL)" in line
+    assert (
+        "select --servicer-impl python (SMG_VLLM_SERVICER_IMPL=python) for the deprecated Python servicer"
+        in line
+    )
 
 
 @pytest.mark.parametrize("name", [LAUNCHER, OLD_LAUNCHER])
@@ -279,7 +284,7 @@ def test_the_plugins_parse_step_refuses_before_the_engine(vllm_package, monkeypa
     with pytest.raises(SystemExit) as raised:
         plugin.check_servicer_impl(parser, argparse.Namespace(grpc=True, servicer_impl="rust"))
     assert raised.value.code == rust_lifecycle.CONFIG_ERROR_EXIT_CODE
-    assert "servicer configuration error: --servicer-impl rust" in caplog.text
+    assert "servicer configuration error: the Rust servicer (the default" in caplog.text
     assert f"{LAUNCHER} defines no serve_grpc" in caplog.text
     # The environment form is the same selection; the stock launcher's own
     # parser has no --grpc (gRPC is all it serves).

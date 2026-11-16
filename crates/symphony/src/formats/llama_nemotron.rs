@@ -42,7 +42,7 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, FinishReason, MalformedReason, Text},
-        testing::{arguments_of, bytes, calls, content, drive, finish, reasoning},
+        testing::{arguments_of, bytes, calls, content, drive, finish, malformed_texts, reasoning},
         Declared,
     };
 
@@ -65,16 +65,6 @@ mod tests {
                     text,
                     why: DropReason::Wrapper,
                 } => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -127,6 +117,33 @@ mod tests {
         );
         assert_eq!(finish(&events), (FinishReason::Stop, 3));
         assert!(dropped(&events).contains(&", "));
+    }
+
+    /// A marker the table ignores is dropped inside a call's object too where markers frame the
+    /// list, as it is between the objects: the list reader keeps such a marker as the call's
+    /// text only for a list with no markers around it. No table of the registry that reads a
+    /// list between markers ignores one, so the case builds its own.
+    #[test]
+    fn a_marker_the_table_ignores_is_dropped_inside_a_call_of_the_list_between_markers() {
+        let format = llama_nemotron().ignores("pad", "<pad>");
+        format.validate().unwrap_or_else(|why| panic!("{why}"));
+        let events = drive(
+            &mut Engine::new(format, Declared::default()),
+            PROMPT,
+            &[
+                "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Pa<pad>ris\"}}]\
+                 </TOOLCALL>",
+            ],
+        );
+        assert_eq!(
+            calls(&events),
+            [(
+                "get_weather".to_string(),
+                "{\"city\": \"Paris\"}".to_string()
+            )]
+        );
+        assert_eq!(content(&events), "");
+        assert!(dropped(&events).contains(&"<pad>"), "{events:?}");
     }
 
     #[test]
@@ -209,7 +226,7 @@ mod tests {
     fn text_in_place_of_the_list_is_malformed_and_the_block_still_closes() {
         // Between the markers prose has no place: the template writes the list and nothing else.
         let events = run(PROMPT, "<TOOLCALL>not a list</TOOLCALL>Done.");
-        assert_eq!(malformed(&events), ["not a list"]);
+        assert_eq!(malformed_texts(&events), ["not a list"]);
         assert_eq!(content(&events), "Done.");
         assert!(calls(&events).is_empty());
         assert_eq!(finish(&events), (FinishReason::Stop, 0));
@@ -220,7 +237,7 @@ mod tests {
         assert_eq!(calls(&events).len(), 1);
         // The text after the list takes the whitespace before it: once text follows, every byte
         // after the `]` is the model's.
-        assert_eq!(malformed(&events), [" tail"]);
+        assert_eq!(malformed_texts(&events), [" tail"]);
         assert_eq!(dropped(&events), ["<TOOLCALL>", "[", "]", "</TOOLCALL>"]);
     }
 
@@ -306,7 +323,7 @@ mod tests {
                 "{\"game\": \"chess\"}".to_string()
             )]
         );
-        assert_eq!(malformed(&events), ["]}]"]);
+        assert_eq!(malformed_texts(&events), ["]}]"]);
         assert!(events.iter().any(|event| matches!(
             event,
             Event::Malformed {

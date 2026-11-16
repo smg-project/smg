@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::{body::Body, http::StatusCode};
 use http_body_util::BodyExt;
-use openai_protocol::chat::ChatCompletionRequest;
+use openai_protocol::{chat::ChatCompletionRequest, profile::ProviderProfile};
 use tokio::{sync::oneshot, time::timeout};
 
 use super::{
@@ -87,7 +87,10 @@ async fn content_deltas_around_the_park(model: &str) -> (Vec<String>, Vec<String
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
     let response = Arc::new(processor(false))
         .process_streaming_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec_for(model),
             dispatch,
             Arc::new(CharacterTokenizer::default()),

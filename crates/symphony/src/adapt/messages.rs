@@ -155,6 +155,9 @@ pub struct Stream {
     /// partial JSON reader closes into the value its complete members make, as the fold does for
     /// the call ([`input`]).
     refused: bool,
+    /// The request's `thinking.display` is `omitted`: the thinking blocks open and close as the
+    /// public API's do and carry no text.
+    thinking_text_withheld: bool,
 }
 
 /// The kind of block that is open.
@@ -172,6 +175,13 @@ impl Stream {
     /// A machine with no block open; the first block gets index zero.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The machine of a request whose `thinking.display` is `omitted`: a thinking block opens,
+    /// carries one empty `thinking_delta` before its signature, and closes; its text is withheld.
+    pub fn withholding_thinking_text(mut self) -> Self {
+        self.thinking_text_withheld = true;
+        self
     }
 
     /// Appends the stream events `event` produces to `out`, in order. Returns the stop reason when
@@ -231,17 +241,25 @@ impl Stream {
         self.held.clear();
     }
 
-    /// Stops the open block, if any, so that the next block gets the next index.
+    /// Stops the open block, if any, so that the next block gets the next index; a thinking block
+    /// closes with its signature first ([`MessageStreamEvent::thinking_block_close`]).
     fn stop_open(&mut self, out: &mut Vec<MessageStreamEvent>) {
-        if self.open.take().is_some() {
-            out.push(MessageStreamEvent::ContentBlockStop { index: self.index });
-            self.index += 1;
-            self.refused = false;
+        match self.open.take() {
+            None => return,
+            Some(Block::Thinking) => out.extend(MessageStreamEvent::thinking_block_close(
+                self.index,
+                self.thinking_text_withheld,
+            )),
+            Some(Block::Text | Block::ToolUse { .. }) => {
+                out.push(MessageStreamEvent::ContentBlockStop { index: self.index });
+            }
         }
+        self.index += 1;
+        self.refused = false;
     }
 
     /// Reasoning text into the open thinking block, opened first when another kind of block or none
-    /// is open.
+    /// is open; under a withheld display the block opens and the text stays out.
     fn reasoning(&mut self, text: &str, out: &mut Vec<MessageStreamEvent>) {
         if text.is_empty() {
             return;
@@ -254,6 +272,9 @@ impl Stream {
             },
             out,
         );
+        if self.thinking_text_withheld {
+            return;
+        }
         out.push(MessageStreamEvent::ContentBlockDelta {
             index: self.index,
             delta: ContentBlockDelta::ThinkingDelta {
@@ -315,6 +336,17 @@ impl Stream {
                 text: text_with_held,
             },
         });
+    }
+
+    /// The index of the open text block when `text` would go into it as exactly one `text_delta`
+    /// with its bytes unchanged and nothing else: the text block is open, no whitespace is held and
+    /// `text` is not empty. [`Self::feed`] of that content changes no state of the machine, so a
+    /// caller that writes the delta itself from the borrowed text (the gateway's Messages stream
+    /// writes the frame) skips `feed` for it and loses nothing. `None` in every other state: a
+    /// block to open or close, held whitespace to lead the text, or nothing to send; `feed` runs.
+    pub fn direct_text_index(&self, text: &str) -> Option<u32> {
+        (self.open == Some(Block::Text) && self.held.is_empty() && !text.is_empty())
+            .then_some(self.index)
     }
 
     /// Makes `block` the open block: nothing when it already is, otherwise the open block is closed
@@ -396,40 +428,9 @@ mod tests {
         event::{DropReason, MalformedReason, Text},
         formats::qwen3,
         ids::is_minted,
+        testing::events::{arguments, call, end, finish},
         CallSyntax, Declared, Engine, EngineFinish, Events, Input, Parser,
     };
-
-    fn call(index: u32, name: &str) -> Event<'static> {
-        Event::ToolCallStart {
-            index,
-            id: format!("call_{index}"),
-            name: name.into(),
-            source: Text::default(),
-        }
-    }
-
-    fn arguments(index: u32, json: &str) -> Event<'static> {
-        Event::ToolCallArguments {
-            index,
-            json: json.to_owned().into(),
-            source: Text::default(),
-        }
-    }
-
-    fn end(index: u32) -> Event<'static> {
-        Event::ToolCallEnd {
-            index,
-            source: Text::default(),
-        }
-    }
-
-    fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
-        Event::Finish {
-            reason,
-            tool_calls,
-            reasoning_tokens: 0,
-        }
-    }
 
     fn wire(blocks: &[ContentBlock]) -> Value {
         serde_json::to_value(blocks).expect("serializable")
@@ -857,6 +858,8 @@ mod tests {
                  "delta": {"type": "thinking_delta", "thinking": "plan "}},
                 {"type": "content_block_delta", "index": 0,
                  "delta": {"type": "thinking_delta", "thinking": "more"}},
+                {"type": "content_block_delta", "index": 0,
+                 "delta": {"type": "signature_delta", "signature": ""}},
                 {"type": "content_block_stop", "index": 0},
                 {"type": "content_block_start", "index": 1,
                  "content_block": {"type": "text", "text": ""}},
@@ -910,6 +913,7 @@ mod tests {
                 "stop 0",
                 "start 1 thinking",
                 "delta 1",
+                "delta 1",
                 "stop 1",
                 "start 2 text",
                 "delta 2",
@@ -918,6 +922,69 @@ mod tests {
                 "stop 3",
                 "start 4 text",
                 "delta 4",
+            ]
+        );
+    }
+
+    /// A thinking block closes as the public API closes one: a `signature_delta` just before its
+    /// stop; with the text withheld (`thinking.display: omitted`) the block carries one empty
+    /// `thinking_delta` before the signature and none of its text.
+    #[test]
+    fn a_thinking_block_closes_with_its_signature_and_a_withheld_one_with_an_empty_delta_first() {
+        let events = [
+            Event::Reasoning(Text::uncounted("plan ")),
+            Event::Reasoning(Text::uncounted("more")),
+            Event::ReasoningEnd,
+            Event::Content(Text::uncounted("ok")),
+            finish(FinishReason::Stop, 0),
+        ];
+        let summary = |machine: Stream| {
+            let mut machine = machine;
+            let mut out = Vec::new();
+            for event in &events {
+                machine.feed(event, &mut out);
+            }
+            out.iter()
+                .map(|event| match event {
+                    MessageStreamEvent::ContentBlockStart { index, .. } => format!("start {index}"),
+                    MessageStreamEvent::ContentBlockDelta { index, delta } => match delta {
+                        ContentBlockDelta::ThinkingDelta { thinking } => {
+                            format!("thinking {index} {thinking:?}")
+                        }
+                        ContentBlockDelta::SignatureDelta { signature } => {
+                            format!("signature {index} {signature:?}")
+                        }
+                        ContentBlockDelta::TextDelta { text } => format!("text {index} {text}"),
+                        other => format!("{other:?}"),
+                    },
+                    MessageStreamEvent::ContentBlockStop { index } => format!("stop {index}"),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            summary(Stream::new()),
+            [
+                "start 0",
+                "thinking 0 \"plan \"",
+                "thinking 0 \"more\"",
+                "signature 0 \"\"",
+                "stop 0",
+                "start 1",
+                "text 1 ok",
+                "stop 1",
+            ]
+        );
+        assert_eq!(
+            summary(Stream::new().withholding_thinking_text()),
+            [
+                "start 0",
+                "thinking 0 \"\"",
+                "signature 0 \"\"",
+                "stop 0",
+                "start 1",
+                "text 1 ok",
+                "stop 1",
             ]
         );
     }
@@ -1058,12 +1125,13 @@ mod tests {
                 {"type": "content_block_start", "index": 0,
                  "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
                 {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "x"}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": ""}},
                 {"type": "content_block_stop", "index": 0},
             ])
         );
         machine.feed(&Event::Content(Text::uncounted("y")), &mut out);
         assert_eq!(
-            stream_wire(&out)[3]["index"],
+            stream_wire(&out)[4]["index"],
             json!(1),
             "the next block takes the next index"
         );
@@ -1092,11 +1160,12 @@ mod tests {
             [
                 json!(["content_block_start", 0]),
                 json!(["content_block_delta", 0]),
+                json!(["content_block_delta", 0]),
                 json!(["content_block_stop", 0]),
                 json!(["content_block_start", 1]),
                 json!(["content_block_stop", 1]),
             ],
-            "the separators open no text block"
+            "the separators open no text block (the thinking block closes with its signature delta)"
         );
 
         let led_by_whitespace = [
@@ -1167,7 +1236,14 @@ mod tests {
                         ContentBlockDelta::InputJsonDelta { partial_json } => {
                             last.push_str(partial_json);
                         }
-                        other => panic!("unexpected delta {other:?}"),
+                        ContentBlockDelta::SignatureDelta { signature } => {
+                            let text = block["signature"].as_str().unwrap_or_default().to_string()
+                                + signature;
+                            block["signature"] = json!(text);
+                        }
+                        ContentBlockDelta::CitationsDelta { .. } => {
+                            panic!("unexpected delta {delta:?}")
+                        }
                     }
                 }
                 MessageStreamEvent::ContentBlockStop { .. } => {}
@@ -1369,5 +1445,64 @@ mod tests {
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), 4, "{seen:?}");
+    }
+
+    /// `direct_text_index` is `Some` exactly in the state where feeding the content pushes one
+    /// `text_delta` with the text unchanged and nothing else, in every state the machine takes:
+    /// nothing open, whitespace held with nothing open, a thinking block open, a `tool_use` block
+    /// open, a text block open; for a text, a whitespace-only text and the empty text.
+    #[test]
+    fn direct_text_index_agrees_with_feed_in_every_state() {
+        fn one_text_delta(out: &[MessageStreamEvent], text: &str) -> Option<u32> {
+            match out {
+                [MessageStreamEvent::ContentBlockDelta {
+                    index,
+                    delta: ContentBlockDelta::TextDelta { text: sent },
+                }] if sent == text => Some(*index),
+                _ => None,
+            }
+        }
+        let states: [(&str, Vec<Event<'static>>); 6] = [
+            ("nothing open", vec![]),
+            (
+                "whitespace held, nothing open",
+                vec![Event::Content(Text::uncounted("  \n"))],
+            ),
+            (
+                "thinking open",
+                vec![
+                    Event::ReasoningStart,
+                    Event::Reasoning(Text::uncounted("plan")),
+                ],
+            ),
+            (
+                "tool_use open",
+                vec![call(0, "get_weather"), arguments(0, "{\"city\":")],
+            ),
+            ("text open", vec![Event::Content(Text::uncounted("Hello"))]),
+            (
+                "text open after a thinking block",
+                vec![
+                    Event::ReasoningStart,
+                    Event::Reasoning(Text::uncounted("plan")),
+                    Event::ReasoningEnd,
+                    Event::Content(Text::uncounted("Hello")),
+                ],
+            ),
+        ];
+        for (state, prefix) in states {
+            let mut machine = Stream::new();
+            let mut out = Vec::new();
+            for event in &prefix {
+                machine.feed(event, &mut out);
+            }
+            for text in [" world", " ", "", "caf\u{e9}"] {
+                let direct = machine.direct_text_index(text);
+                let mut probe = machine.clone();
+                let mut out = Vec::new();
+                probe.feed(&Event::Content(Text::uncounted(text)), &mut out);
+                assert_eq!(direct, one_text_delta(&out, text), "{state}, text {text:?}");
+            }
+        }
     }
 }

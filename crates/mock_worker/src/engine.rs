@@ -23,7 +23,7 @@
 //! which makes it deterministically unit-testable with no real timers.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{hash_map::Entry, BTreeSet, HashMap, VecDeque},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -34,7 +34,7 @@ use std::{
 
 use futures::{stream, Stream, StreamExt};
 use smg_grpc_client::common_proto as common;
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tonic::Status;
 
 // ---------------------------------------------------------------------------
@@ -402,11 +402,13 @@ pub struct EngineParams {
     pub max_running: usize,
     /// KV cache capacity in tokens (`num_blocks × block_size`).
     pub kv_capacity_tokens: u64,
-    /// The KV capacity the decode cost was calibrated against. When set, a
-    /// decode step's utilisation is the decoding context over this reference,
-    /// not over the configured pool, so shrinking the pool (`--kv-blocks`)
-    /// changes how much fits, not how long a step takes: the engine's step
-    /// time depends on the tokens it attends to, not on the pool size.
+    /// The KV capacity the decode cost was calibrated against, or, for a
+    /// worker given a pool of its own (`--worker-kv-tokens`), the fleet's
+    /// pool when no calibration set it. When set, a decode step's utilisation
+    /// is the decoding context over this reference, not over the configured
+    /// pool, so shrinking the pool (`--kv-blocks`) changes how much fits, not
+    /// how long a step takes: the engine's step time depends on the tokens it
+    /// attends to, not on the pool size.
     pub decode_reference_tokens: Option<u64>,
     /// Cache block (page) size in tokens.
     pub block_size: u32,
@@ -422,8 +424,6 @@ pub struct EngineParams {
     /// vLLM's `full_sequence_must_fit`). Off, the gate is skipped (the older,
     /// over-admitting behaviour).
     pub reserve_full_isl: bool,
-    /// Output tokens to generate when a request does not specify `max_new_tokens`.
-    pub max_new_default: u32,
     /// Identity used for synthetic output. Cancellation IDs and prompt-block cache keys
     /// stay unchanged; decode-block keys follow the generated output.
     pub output_seed: OutputSeed,
@@ -443,6 +443,112 @@ pub struct EngineParams {
     /// (`KvEventBatch.dp_rank`): 0 for a single-rank engine, the rank's index
     /// for one of a gRPC worker's `--grpc-dp-size` ranks.
     pub dp_rank: i32,
+    /// The KV cache groups the engine publishes, exactly one of them its
+    /// main-attention group, at any index (one group of full attention by
+    /// default). A hybrid engine names more: every group's events carry its
+    /// index, kind and window ([`KvCacheGroup`]); the main group's index is
+    /// [`KvCacheGroup::main_index`].
+    pub kv_cache_groups: Vec<KvCacheGroup>,
+    /// Every pass takes this many times the timing model's duration: above
+    /// 1 an engine slower than its peers, below 1 a faster one
+    /// (`--worker-pass-time-scale`); 1 by default.
+    pub pass_time_scale: f64,
+    /// Capacity in blocks of the process-wide shared KV tier (a 3FS- or
+    /// Mooncake-style store every engine of the process writes its completed
+    /// blocks to and restores prefixes from, `--global-l3-blocks`); 0, the
+    /// default, turns it off.
+    pub global_l3_blocks: u64,
+    /// What restoring one token from the shared tier adds to the pass, in ms
+    /// (`--global-l3-ms-per-token`): the load stalls the pass, as a
+    /// synchronous load would. 0 by default.
+    pub global_l3_ms_per_token: f64,
+}
+
+/// One KV cache group of a hybrid engine, as vLLM's hybrid KV-cache manager
+/// has them: an attention kind (`full_attention`, `mla_attention`,
+/// `sliding_window`, `sliding_window_mla`, `mamba`, ...) and, for a window
+/// group, its window in tokens.
+///
+/// Every group shares the block size and the block hashes (vLLM hashes a
+/// block without its group; the group is a field of the event). What differs
+/// is which blocks a group keeps, and the mock follows vLLM 0.31.0's default
+/// retention: the main group keeps every full block; a sliding-window group
+/// keeps only the `ceil((window - 1) / block_size)` blocks ending at the
+/// prompt's aligned replay boundary (what a later request can resume from);
+/// a Mamba group keeps the one state block ending there. vLLM writes a
+/// sparse group's store with the step's whole token span and the kept hashes
+/// only; so does the mock's vLLM wire (`Published::spans`). The gRPC stream
+/// carries every group's events unfiltered, the kept blocks with their own
+/// tokens: a servicer's relay forwards every group (a sparse group's store
+/// as its hashes), the gateway indexes the main group and keeps the other
+/// groups' blocks in a per-worker view that bounds its overlap the way the
+/// engine does. The mock's own prefix hit and `cached_tokens` are that
+/// engine rule: the fixed point over its groups (`hit_over_groups`).
+///
+/// The kinds the flag takes are [`KvCacheGroup::KINDS_HELP`]: the dense
+/// main-attention kinds and `mamba` take no window, the window kinds need one,
+/// and at most one group is a main-attention kind ([`KvCacheGroup::MAIN_KINDS`]),
+/// at any index: an engine may publish its main group behind its window groups,
+/// and a model without one starts with a window group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvCacheGroup {
+    pub kind: String,
+    pub sliding_window: u32,
+}
+
+impl KvCacheGroup {
+    /// The main-attention kinds, the gateway's list: exactly one group is one
+    /// of them, at any index, the dense group every block is stored in (the
+    /// pool's default mask of an unrecorded block is that group alone).
+    pub const MAIN_KINDS: [&'static str; 3] =
+        ["full_attention", "mla_attention", "sink_full_attention"];
+    /// The kinds whose stores keep a window tail; a window in tokens is required.
+    pub const WINDOW_KINDS: [&'static str; 2] = ["sliding_window", "sliding_window_mla"];
+    /// The kinds without a window: the dense main-attention kinds and the Mamba state group.
+    pub const UNWINDOWED_KINDS: [&'static str; 4] = [
+        "full_attention",
+        "mla_attention",
+        "sink_full_attention",
+        "mamba",
+    ];
+    /// The accepted specs, as the flag's help and errors list them.
+    pub const KINDS_HELP: &'static str = "full_attention, mla_attention, sink_full_attention, \
+                                          sliding_window:<tokens>, sliding_window_mla:<tokens>, mamba";
+
+    /// The main-attention group every engine has.
+    pub fn full_attention() -> Self {
+        Self {
+            kind: "full_attention".to_string(),
+            sliding_window: 0,
+        }
+    }
+
+    /// The index of the main-attention group among `groups`: the one group of
+    /// a main-attention kind, wherever the engine publishes it (the flag
+    /// allows at most one); 0 for a list that names none, which a caller
+    /// reads only after `unrecorded_mask` or the kinds said there is one.
+    pub fn main_index(groups: &[KvCacheGroup]) -> usize {
+        groups
+            .iter()
+            .position(|group| Self::MAIN_KINDS.contains(&group.kind.as_str()))
+            .unwrap_or(0)
+    }
+
+    /// Whether this group keeps the block at `index` of a request whose
+    /// prompt's aligned replay boundary (the last block boundary at or before
+    /// its last prompt token) starts block `boundary_block`: a retained tail
+    /// ends at block `boundary_block - 1`.
+    fn retains(&self, index: usize, boundary_block: usize, block_size: usize) -> bool {
+        match self.kind.as_str() {
+            "sliding_window" | "sliding_window_mla" => {
+                let window = self.sliding_window.max(1) as usize;
+                let need = (window - 1).div_ceil(block_size.max(1)).max(1);
+                index < boundary_block && index + need >= boundary_block
+            }
+            "mamba" => index + 1 == boundary_block,
+            _ => true,
+        }
+    }
 }
 
 impl Default for EngineParams {
@@ -457,13 +563,16 @@ impl Default for EngineParams {
             prefix_cache: true,
             prefill_first: false,
             reserve_full_isl: true,
-            max_new_default: 128,
             output_seed: OutputSeed::default(),
             request_overhead_ms: 0.0,
             kv_broadcast_capacity: 1024,
             kv_replay_capacity: 4096,
             output_prefix: Vec::new(),
             dp_rank: 0,
+            kv_cache_groups: vec![KvCacheGroup::full_attention()],
+            pass_time_scale: 1.0,
+            global_l3_blocks: 0,
+            global_l3_ms_per_token: 0.0,
         }
     }
 }
@@ -486,8 +595,12 @@ pub struct NewRequest {
     /// The prompt's token ids (gRPC supplies real ids from the gateway's
     /// tokenizer; HTTP supplies synthetic ids derived from the prompt text).
     pub prompt_token_ids: Vec<u32>,
-    /// Requested output length; 0 means "use the engine default".
+    /// Requested output length. A zero generates nothing (a prefill-only
+    /// request); an omitted limit is resolved by the lane before it submits.
     pub max_new: u32,
+    /// The choice this request samples, 0 for a single one: admission salts
+    /// the output seed with it, so the n choices of one request differ.
+    pub choice: u32,
     /// Sink for this request's generation events.
     pub events: mpsc::UnboundedSender<GenEvent>,
 }
@@ -522,6 +635,14 @@ pub struct LoadSnapshot {
     pub max_running_requests: i32,
     pub token_usage: f64,
     pub gen_throughput: f64,
+    /// Computed prompt tokens per second over the recent prefill passes
+    /// (the timing model's prefill cost per pass); `None` before the first
+    /// pass that prefilled anything and again once the last one is a minute
+    /// old (`PREFILL_RATE_TTL`, applied where the engine's snapshot is read,
+    /// so an idle engine expires it too), as the servicers' trackers report
+    /// it (they want two samples within the minute, the mock reports from
+    /// its first).
+    pub prefill_throughput: Option<f64>,
     pub cache_hit_rate: f64,
     /// Cached blocks (referenced or idle) in the KV pool.
     pub num_cached_blocks: i32,
@@ -537,7 +658,7 @@ pub struct LoadSnapshot {
 
 /// Shared state readable from the transport handlers while the actor runs.
 struct EngineShared {
-    snapshot: RwLock<LoadSnapshot>,
+    snapshot: RwLock<PublishedLoad>,
     /// Every published batch, as the publisher task releases it.
     kv_tx: broadcast::Sender<Published>,
     /// Hands batches from the actor to the publisher task with their release time.
@@ -548,12 +669,17 @@ struct EngineShared {
     kv_replay: Mutex<VecDeque<common::KvEventBatch>>,
     prefix_cache: bool,
     block_size: u32,
+    /// The engine's KV cache groups, for the prefix hit over the mirror.
+    kv_cache_groups: Vec<KvCacheGroup>,
+    /// Whether the engine restores from the shared tier.
+    global_l3: bool,
     /// Worker name for records and the admin API (`grpc:<port>` / `http:<port>`).
     name: String,
-    /// Mirror of the actor's cache block keys, so sibling engines and the
-    /// admin API can read it without entering the actor: the fleet oracle
-    /// ("which worker holds the most of this prompt") is a read over these.
-    cache_mirror: RwLock<HashSet<u64>>,
+    /// Mirror of the actor's cache block keys with the groups that keep each
+    /// (one bit per group index), so sibling engines and the admin API can
+    /// read it without entering the actor: the fleet oracle ("which worker
+    /// holds the most of this prompt") is a read over these.
+    cache_mirror: RwLock<HashMap<u64, u8>>,
     /// Fault hooks, switched on through the admin API.
     faults: Faults,
     /// Wakes a paused actor.
@@ -572,6 +698,34 @@ impl EngineShared {
     fn note_output(&self) {
         let millis = u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_output_ms.store(millis, Ordering::Relaxed);
+    }
+
+    /// Publish the actor's snapshot with the time of its last prefill pass.
+    fn publish(&self, state: &SchedulerState, snapshot: LoadSnapshot) {
+        *self.snapshot.write().unwrap_or_else(|p| p.into_inner()) = PublishedLoad {
+            snapshot,
+            prefill_at: state.prefill_at(),
+        };
+    }
+}
+
+/// The actor's last snapshot and when its last prefill pass ended. The actor
+/// publishes a snapshot at the end of a pass and once more when it goes
+/// idle, then builds none until its next message; the rate's expiry is
+/// applied where the snapshot is read ([`Engine::load`]), so an idle or
+/// paused engine stops reporting the rate a minute after that pass, as a
+/// servicer's tracker does once its samples expired.
+struct PublishedLoad {
+    snapshot: LoadSnapshot,
+    prefill_at: Option<Instant>,
+}
+
+impl PublishedLoad {
+    fn idle(p: &EngineParams) -> Self {
+        Self {
+            snapshot: LoadSnapshot::idle(p),
+            prefill_at: None,
+        }
     }
 }
 
@@ -680,6 +834,8 @@ pub(crate) struct FaultStatus {
 pub(crate) struct CacheTruth {
     pub cached_tokens: u32,
     pub cached_blocks: u32,
+    /// Of `cached_tokens`, those the shared tier would restore.
+    pub restored_tokens: u32,
     pub block_size: u32,
 }
 
@@ -687,6 +843,12 @@ pub(crate) struct CacheTruth {
 #[derive(Clone, Debug)]
 pub(crate) struct Published {
     pub batch: common::KvEventBatch,
+    /// The whole token span of each sparse cache-group store in `batch`, by
+    /// event index: what the engine's `cache_full_blocks` writes as a
+    /// masked group's `token_ids` (the step's full range) while the store's
+    /// hashes name only the blocks the group retains. The vLLM wire writes
+    /// it; the gRPC stream, the relay's output, carries the blocks alone.
+    pub spans: Vec<(usize, Vec<u32>)>,
     /// Lost on the wire by a drop hook: not delivered live, kept for replay.
     pub dropped: bool,
     /// The publisher generation the batch belongs to.
@@ -702,7 +864,7 @@ enum EngineMsg {
     Reset,
     /// The publisher restarts: sequence numbers start over, the replay
     /// buffer is emptied, the cache is kept. Acknowledged once applied.
-    RestartPublisher(tokio::sync::oneshot::Sender<()>),
+    RestartPublisher(oneshot::Sender<()>),
 }
 
 /// One admitted request as seen by the engine: the ground truth for routing
@@ -715,6 +877,8 @@ pub(crate) struct RequestRecord {
     pub worker: String,
     pub prompt_tokens: u32,
     pub cached_tokens: u32,
+    /// Of `cached_tokens`, those restored from the shared tier.
+    pub restored_tokens: u32,
     pub oracle_tokens: u32,
     pub queued_ms: f64,
     pub running_at_admit: u32,
@@ -735,6 +899,112 @@ fn records() -> &'static Mutex<(u64, VecDeque<RequestRecord>)> {
 }
 
 const RECORD_CAPACITY: usize = 500_000;
+
+/// How long the last prefill pass keeps the snapshot's measured input
+/// capacity: the servicers' load trackers drop their samples after a minute,
+/// and a worker idle that long is priced by the fallback again.
+const PREFILL_RATE_TTL: Duration = Duration::from_secs(60);
+
+/// The process-wide shared KV tier (`--global-l3-blocks`): block keys in LRU
+/// order. A pass writes the blocks it completed once its time has passed
+/// ([`publish_to_global_l3`]), tail-first, so the head of a chain one pass
+/// completes outlives its tail, as in the engine's own pool (a chain
+/// completed over several passes ages from its first pass's blocks);
+/// admission restores the run of blocks that continues a prompt's local
+/// prefix hit.
+#[derive(Default)]
+struct GlobalL3 {
+    tick_of: HashMap<u64, u64>,
+    lru: BTreeSet<(u64, u64)>,
+    tick: u64,
+    /// Tokens restored from the tier, process-wide.
+    restored_tokens: u64,
+}
+
+impl GlobalL3 {
+    fn touch(&mut self, h: u64) {
+        if let Some(t) = self.tick_of.get(&h) {
+            self.lru.remove(&(*t, h));
+        }
+        self.tick += 1;
+        self.tick_of.insert(h, self.tick);
+        self.lru.insert((self.tick, h));
+    }
+
+    /// Write `keys` tail-first, then evict the least recently written down to
+    /// `capacity`.
+    fn insert(&mut self, keys: &[u64], capacity: u64) {
+        for &h in keys.iter().rev() {
+            self.touch(h);
+        }
+        while self.tick_of.len() as u64 > capacity {
+            let Some(&(t, h)) = self.lru.iter().next() else {
+                break;
+            };
+            self.lru.remove(&(t, h));
+            self.tick_of.remove(&h);
+        }
+    }
+
+    /// Number of consecutive blocks from the start of `keys` the tier holds.
+    /// A look leaves the LRU as it is: the blocks a pass restores are written
+    /// back when it publishes.
+    fn match_prefix(&self, keys: &[u64]) -> usize {
+        keys.iter()
+            .take_while(|k| self.tick_of.contains_key(k))
+            .count()
+    }
+}
+
+/// The process-wide shared KV tier every engine writes to and restores from.
+fn global_l3() -> &'static Mutex<GlobalL3> {
+    static L3: OnceLock<Mutex<GlobalL3>> = OnceLock::new();
+    L3.get_or_init(|| Mutex::new(GlobalL3::default()))
+}
+
+/// Blocks held and tokens restored by the shared tier so far.
+pub(crate) fn global_l3_stats() -> (usize, u64) {
+    let l3 = global_l3().lock().unwrap_or_else(|p| p.into_inner());
+    (l3.tick_of.len(), l3.restored_tokens)
+}
+
+/// What a pass leaves in the shared tier once its time has passed (`run`
+/// calls this after the pass's sleep, before it publishes the pass's other
+/// outputs): the blocks it completed, written, and the tokens it restored,
+/// counted. Nothing while the tier is off.
+fn publish_to_global_l3(p: &EngineParams, inserted: &[(u64, u8)], restored_tokens: u32) {
+    if !(p.prefix_cache && p.global_l3_blocks > 0) {
+        return;
+    }
+    let keys: Vec<u64> = inserted.iter().map(|(key, _)| *key).collect();
+    let mut l3 = global_l3().lock().unwrap_or_else(|p| p.into_inner());
+    l3.restored_tokens += u64::from(restored_tokens);
+    l3.insert(&keys, p.global_l3_blocks);
+}
+
+/// Blocks the shared tier would restore for a prompt of `prompt_len` tokens
+/// whose first `cached_blocks` of `keys` the engine holds: the run the tier
+/// holds next, one fewer when the two cover the prompt whole (its last block
+/// is computed, as at admission). 0 while the tier is off.
+fn restorable_blocks(
+    keys: &[u64],
+    cached_blocks: usize,
+    prompt_len: u32,
+    p: &EngineParams,
+) -> usize {
+    if !(p.prefix_cache && p.global_l3_blocks > 0) {
+        return 0;
+    }
+    let held = global_l3()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .match_prefix(&keys[cached_blocks..]);
+    if held > 0 && (cached_blocks + held) as u32 * p.block_size.max(1) >= prompt_len {
+        held - 1
+    } else {
+        held
+    }
+}
 
 /// All engines registered in this process.
 pub(crate) fn fleet_engines() -> Vec<Engine> {
@@ -809,15 +1079,17 @@ impl Engine {
         let (publish_tx, publish_rx) = mpsc::unbounded_channel();
         let (deliver_tx, deliver_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(EngineShared {
-            snapshot: RwLock::new(LoadSnapshot::idle(&params)),
+            snapshot: RwLock::new(PublishedLoad::idle(&params)),
             kv_tx: kv_tx.clone(),
             publish_tx,
             deliver_tx,
             kv_replay: Mutex::new(VecDeque::new()),
             prefix_cache: params.prefix_cache,
             block_size: params.block_size,
+            kv_cache_groups: params.kv_cache_groups.clone(),
+            global_l3: params.prefix_cache && params.global_l3_blocks > 0,
             name,
-            cache_mirror: RwLock::new(HashSet::new()),
+            cache_mirror: RwLock::new(HashMap::new()),
             faults: Faults::default(),
             resume: Notify::new(),
             output_clock: Instant::now(),
@@ -921,12 +1193,41 @@ impl Engine {
         tokio::time::sleep_until(slot.into()).await;
     }
 
+    /// The fault and admission hooks for a side that serves no tokens (a
+    /// prefill worker's prompt side, an encode worker's completion), as the
+    /// regular path counts them: the stall, a status before admission (a
+    /// failure, or a cut when it names a token count), then the admission
+    /// delay and rate. `Ok(true)` when the fault asks for a `finish=error`
+    /// completion, counted as a cut; `Err` is the status to answer. The
+    /// engine never runs the prompt: nothing is admitted, no record is left.
+    pub(crate) async fn admit_without_tokens(&self) -> Result<bool, u16> {
+        let mut finish_error = false;
+        if let Some(fault) = self.inject() {
+            if !fault.stall.is_zero() {
+                tokio::time::sleep(fault.stall).await;
+            }
+            if fault.finish_error {
+                self.cut_counter().fetch_add(1, Ordering::Relaxed);
+                finish_error = true;
+            } else if fault.status != 0 {
+                if fault.after_tokens.is_some() {
+                    self.cut_counter().fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.record_failure();
+                }
+                return Err(fault.status);
+            }
+        }
+        self.admit().await;
+        Ok(finish_error)
+    }
+
     /// Restart the publisher: sequence numbers start over, the replay buffer
     /// is emptied, the cache is kept. Returns once the actor has applied it
     /// (after its current pass, at most), so a status read right after sees
     /// the new generation.
     pub(crate) async fn restart_publisher(&self) {
-        let (ack, applied) = tokio::sync::oneshot::channel();
+        let (ack, applied) = oneshot::channel();
         if self.tx.send(EngineMsg::RestartPublisher(ack)).is_ok() {
             let _ = tokio::time::timeout(Duration::from_secs(2), applied).await;
         }
@@ -1050,18 +1351,30 @@ impl Engine {
     }
 
     /// What this engine would serve from cache for `token_ids` right now:
-    /// its own prefix match over the mirror, last block recomputed, as
-    /// admission would compute it.
+    /// its own prefix match over the mirror and, with the shared tier on, the
+    /// run the tier holds after it, last block recomputed, as admission would
+    /// compute it.
     pub(crate) fn cached_tokens_for(&self, token_ids: &[u32]) -> CacheTruth {
         let bs = self.shared.block_size.max(1);
         let keys = prompt_blocks(token_ids, bs as usize).0;
-        let mut matched = self.match_prefix(&keys) as u32;
-        if matched > 0 && matched * bs >= token_ids.len() as u32 {
+        let local = self.match_prefix(&keys);
+        let mut matched = local as u32;
+        let mut restored = if self.shared.global_l3 {
+            let l3 = global_l3().lock().unwrap_or_else(|p| p.into_inner());
+            l3.match_prefix(&keys[local..]) as u32
+        } else {
+            0
+        };
+        let prompt_len = token_ids.len() as u32;
+        if restored > 0 && (matched + restored) * bs >= prompt_len {
+            restored -= 1;
+        } else if matched > 0 && matched * bs >= prompt_len {
             matched -= 1;
         }
         CacheTruth {
-            cached_tokens: matched * bs,
-            cached_blocks: matched,
+            cached_tokens: (matched + restored) * bs,
+            cached_blocks: matched + restored,
+            restored_tokens: restored * bs,
             block_size: bs,
         }
     }
@@ -1086,14 +1399,23 @@ impl Engine {
         &self.shared.name
     }
 
-    /// Number of consecutive blocks from the start of `keys` this engine holds.
+    /// Blocks from the start of `keys` this engine would serve from cache:
+    /// the engine's hit over its KV cache groups ([`hit_over_groups`]).
     fn match_prefix(&self, keys: &[u64]) -> usize {
         let mirror = self
             .shared
             .cache_mirror
             .read()
             .unwrap_or_else(|p| p.into_inner());
-        keys.iter().take_while(|k| mirror.contains(k)).count()
+        let main = keys.iter().take_while(|k| mirror.contains_key(k)).count();
+        let unrecorded = unrecorded_mask(&self.shared.kv_cache_groups);
+        hit_over_groups(
+            main,
+            keys,
+            &self.shared.kv_cache_groups,
+            self.shared.block_size.max(1) as usize,
+            |key| mirror.get(&key).copied().unwrap_or(unrecorded),
+        )
     }
 
     /// A copy of the cached block keys.
@@ -1102,9 +1424,18 @@ impl Engine {
             .cache_mirror
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .iter()
+            .keys()
             .copied()
             .collect()
+    }
+
+    /// The number of cached blocks, read without copying the keys.
+    pub fn cache_len(&self) -> usize {
+        self.shared
+            .cache_mirror
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 
     /// Block keys of a prompt, exactly as the engine computes them.
@@ -1112,13 +1443,30 @@ impl Engine {
         prompt_blocks(prompt_token_ids, block_size).0
     }
 
-    /// Current load snapshot.
+    /// Current load snapshot. The measured input capacity expires here, at
+    /// the read: an idle engine builds no new snapshot, and the one it
+    /// published when its last pass ended would carry that pass's rate for
+    /// as long as the engine sits idle (a paused one too), where a servicer's
+    /// tracker drops its samples after a minute (`PREFILL_RATE_TTL`).
     pub fn load(&self) -> LoadSnapshot {
-        self.shared
+        self.load_at(Instant::now())
+    }
+
+    /// [`Self::load`] as read at `now` (a test reads a minute ahead).
+    fn load_at(&self, now: Instant) -> LoadSnapshot {
+        let published = self
+            .shared
             .snapshot
             .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut snapshot = published.snapshot.clone();
+        let expired = published
+            .prefill_at
+            .is_none_or(|at| now.saturating_duration_since(at) > PREFILL_RATE_TTL);
+        if expired {
+            snapshot.prefill_throughput = None;
+        }
+        snapshot
     }
 
     /// Whether this engine emits KV-cache events.
@@ -1176,7 +1524,7 @@ async fn run(
         // When there is nothing to do, publish an idle snapshot and block on the
         // request channel — an idle engine consumes no CPU.
         if state.is_idle() {
-            *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) = state.snapshot(&params);
+            shared.publish(&state, state.snapshot(&params));
             match rx.recv().await {
                 Some(msg) => handle_msg(&mut state, &shared, &params, msg),
                 None => return, // all handles dropped
@@ -1193,7 +1541,7 @@ async fn run(
         // them (`Engine::output_silence`).
         while shared.faults.paused.load(Ordering::Relaxed) {
             tokio::select! {
-                _ = shared.resume.notified() => {}
+                () = shared.resume.notified() => {}
                 msg = rx.recv() => match msg {
                     Some(msg) => handle_msg(&mut state, &shared, &params, msg),
                     None => return,
@@ -1213,6 +1561,9 @@ async fn run(
         if step.duration > Duration::ZERO {
             tokio::time::sleep(step.duration).await;
         }
+        // The pass's blocks reach the shared tier before its tokens reach the
+        // streams, so nothing a finished stream sets off can miss them.
+        publish_to_global_l3(&params, &step.inserted, step.restored_tokens);
         // The step's outputs become observable only after its simulated time,
         // plus the fixed per-request overhead when one is calibrated (every
         // event of a stream shifts by the same amount, so order is kept).
@@ -1247,6 +1598,7 @@ async fn run(
                 worker: shared.name.clone(),
                 prompt_tokens: admitted.prompt_tokens,
                 cached_tokens: admitted.cached_tokens,
+                restored_tokens: admitted.restored_tokens,
                 oracle_tokens: admitted.oracle_tokens,
                 queued_ms: admitted.enqueued_at.elapsed().as_secs_f64() * 1000.0,
                 running_at_admit: admitted.running_at_admit,
@@ -1265,7 +1617,7 @@ async fn run(
             let faults = &shared.faults;
             let dropped = faults
                 .drop_batches
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                 .is_ok();
             if dropped {
                 faults.dropped_total.fetch_add(1, Ordering::Relaxed);
@@ -1274,6 +1626,7 @@ async fn run(
                 Instant::now() + Duration::from_millis(faults.delay_ms.load(Ordering::Relaxed));
             let item = Published {
                 batch,
+                spans: step.spans,
                 dropped,
                 generation: faults.generation.load(Ordering::Relaxed),
             };
@@ -1281,7 +1634,7 @@ async fn run(
         }
         shared.note_output();
         shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
-        *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) = step.snapshot;
+        shared.publish(&state, step.snapshot);
     }
 }
 
@@ -1329,10 +1682,28 @@ fn handle_msg(
                         .cache_mirror
                         .read()
                         .unwrap_or_else(|p| p.into_inner());
-                    keys.iter().take_while(|k| own.contains(k)).count()
+                    let main = keys.iter().take_while(|k| own.contains_key(k)).count();
+                    let unrecorded = unrecorded_mask(&params.kv_cache_groups);
+                    hit_over_groups(
+                        main,
+                        &keys,
+                        &params.kv_cache_groups,
+                        params.block_size.max(1) as usize,
+                        |key| own.get(&key).copied().unwrap_or(unrecorded),
+                    )
                 };
-                (fleet_best.max(own_best) as u32 * params.block_size)
-                    .min(req.prompt_token_ids.len() as u32)
+                let best_hit = fleet_best.max(own_best);
+                // With the shared tier on, a worker would also restore the run
+                // the tier holds after its own hit. That run ends at the first
+                // block past the hit the tier lacks, which never comes earlier
+                // for a longer hit, so the longest hit gives the best.
+                let best = if params.global_l3_blocks > 0 {
+                    let l3 = global_l3().lock().unwrap_or_else(|p| p.into_inner());
+                    best_hit + l3.match_prefix(&keys[best_hit..])
+                } else {
+                    best_hit
+                };
+                (best as u32 * params.block_size).min(req.prompt_token_ids.len() as u32)
             } else {
                 0
             };
@@ -1345,10 +1716,12 @@ fn handle_msg(
             shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
         }
         EngineMsg::Abort(request_id) => {
-            if let Some((tx, event)) = state.abort(&request_id, params) {
+            let aborted = state.abort(&request_id, params);
+            if !aborted.is_empty() {
                 shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
-                *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) =
-                    state.snapshot(params);
+                shared.publish(state, state.snapshot(params));
+            }
+            for (tx, event) in aborted {
                 if params.request_overhead_ms > 0.0 {
                     // Keep the terminal event behind tokens awaiting delivery.
                     let _ = shared.deliver_tx.send((Instant::now(), tx, event));
@@ -1408,6 +1781,16 @@ struct RunningReq {
     rolling_hash: u64,
     /// Output identity selected at first admission and preserved over preemption.
     token_seed: u32,
+    /// The choice this request samples (0 for a single one), carried over preemption.
+    choice: u32,
+}
+
+/// The pass that finishes a prefill samples the request's first token,
+/// unless the limit is zero: a prefill-only request finishes instead, with
+/// no output token and no slot reserved for one. Every arm that finishes a
+/// prefill asks this, and so does the admission that reserves for it.
+fn samples_first_token(max_new: u32) -> bool {
+    max_new > 0
 }
 
 impl RunningReq {
@@ -1445,7 +1828,8 @@ struct WaitingReq {
     rolling_hash: u64,
     /// Prompt tokens as reported on the stream (the original prompt).
     prompt_tokens: u32,
-    /// Uncached prompt tokens at enqueue time (the queued token-work it adds).
+    /// Prompt tokens at enqueue time neither cached nor restorable from the
+    /// shared tier (the queued token-work it adds).
     uncached_tokens: u32,
     /// Best cached prefix any fleet worker held at arrival (ground truth).
     oracle_tokens: u32,
@@ -1459,6 +1843,7 @@ struct Admitted {
     request_id: String,
     prompt_tokens: u32,
     cached_tokens: u32,
+    restored_tokens: u32,
     oracle_tokens: u32,
     running_at_admit: u32,
     waiting_at_admit: u32,
@@ -1476,6 +1861,9 @@ struct BlockPool {
     free_lru: BTreeSet<(u64, u64)>,
     tick: u64,
     allocated: u64,
+    /// The KV cache groups that stored each cached block, one bit per group
+    /// index, so an eviction is published once per group as vLLM does.
+    groups: HashMap<u64, u8>,
 }
 
 impl BlockPool {
@@ -1483,11 +1871,33 @@ impl BlockPool {
         self.refs.len()
     }
 
-    /// Number of consecutive cached blocks from the start of `keys`.
-    fn match_prefix(&self, keys: &[u64]) -> usize {
-        keys.iter()
+    /// Blocks running requests hold: every allocated block but the idle
+    /// cached ones, so a block several requests reference counts once.
+    fn referenced(&self) -> u64 {
+        let idle = self.free_lru.len() as u64;
+        debug_assert!(
+            self.allocated >= idle,
+            "idle cached blocks are allocated blocks"
+        );
+        self.allocated.saturating_sub(idle)
+    }
+
+    /// Blocks from the start of `keys` the engine serves from cache: the
+    /// main group's leading run of cached blocks, bounded by what the other
+    /// groups keep ([`hit_over_groups`]).
+    fn match_prefix(&self, keys: &[u64], p: &EngineParams) -> usize {
+        let main = keys
+            .iter()
             .take_while(|k| self.refs.contains_key(k))
-            .count()
+            .count();
+        let unrecorded = unrecorded_mask(&p.kv_cache_groups);
+        hit_over_groups(
+            main,
+            keys,
+            &p.kv_cache_groups,
+            p.block_size.max(1) as usize,
+            |key| self.groups.get(&key).copied().unwrap_or(unrecorded),
+        )
     }
 
     /// Reserve `n` anonymous blocks, evicting idle cached blocks (LRU first)
@@ -1541,12 +1951,12 @@ impl BlockPool {
     /// already exists the anonymous block is given back and a reference taken.
     fn register(&mut self, h: u64) -> bool {
         match self.refs.entry(h) {
-            std::collections::hash_map::Entry::Occupied(_) => {
+            Entry::Occupied(_) => {
                 self.hit(h);
                 self.release_anonymous(1);
                 false
             }
-            std::collections::hash_map::Entry::Vacant(slot) => {
+            Entry::Vacant(slot) => {
                 slot.insert(1);
                 true
             }
@@ -1597,6 +2007,9 @@ struct SchedulerState {
     kv_seq: u64,
     kv_event_id: u64,
     gen_tp_ewma: f64,
+    /// Computed prompt tokens per second of the recent prefill passes and
+    /// when the last of them ran; `None` until a pass prefilled anything.
+    prefill_tp: Option<(Instant, f64)>,
     cache_hit_ewma: f64,
     preemptions: u64,
     /// A reset was requested; the next pass clears the cache and says so.
@@ -1611,12 +2024,18 @@ struct Step {
     duration: Duration,
     sends: Vec<(mpsc::UnboundedSender<GenEvent>, GenEvent)>,
     batch: Option<common::KvEventBatch>,
+    /// The whole token span of each sparse cache-group store of `batch`, by
+    /// event index (see `Published::spans`).
+    spans: Vec<(usize, Vec<u32>)>,
     snapshot: LoadSnapshot,
-    /// Cache deltas this pass, for the actor's mirror.
-    inserted: Vec<u64>,
+    /// Cache deltas this pass, for the actor's mirror: the inserted keys with
+    /// the groups that keep them.
+    inserted: Vec<(u64, u8)>,
     evicted: Vec<u64>,
     cleared: bool,
     admitted: Vec<Admitted>,
+    /// Tokens this pass restored from the shared tier.
+    restored_tokens: u32,
 }
 
 /// A block a request completed this pass: its position in the request's
@@ -1625,6 +2044,14 @@ struct Completed {
     index: usize,
     key: u64,
     tokens: Vec<u32>,
+}
+
+/// A contiguous run of blocks a request completed in one pass, with the
+/// block before the run's first (the chain parent of its stored event) and
+/// each block's index in the request's sequence.
+struct CompletedRun {
+    parent: Option<u64>,
+    blocks: Vec<(usize, common::KvBlock)>,
 }
 
 /// Making room for a running request's next tokens preempted the request
@@ -1644,6 +2071,7 @@ impl SchedulerState {
             kv_seq: 0,
             kv_event_id: 0,
             gen_tp_ewma: 0.0,
+            prefill_tp: None,
             cache_hit_ewma: 0.0,
             preemptions: 0,
             reset_pending: false,
@@ -1655,10 +2083,12 @@ impl SchedulerState {
     /// pass has run and the cold-shape hook is set to `hold_ms`: the new
     /// longest counts as run from here on, so the hold is paid once per new
     /// longest prompt, and the shapes run while the hook was off are run.
+    /// A queued prompt whose client has gone is not read: the pass drops it.
     fn cold_shape_hold(&mut self, hold_ms: u64) -> Option<Duration> {
         let longest_queued = self
             .waiting
             .iter()
+            .filter(|w| !w.req.events.is_closed())
             .map(|w| w.prompt_tokens)
             .max()
             .unwrap_or(0);
@@ -1688,35 +2118,53 @@ impl SchedulerState {
         self.running.len() + self.waiting.len()
     }
 
+    /// Remove every running or queued entry carrying `request_id` (the `n`
+    /// choices of one request share it), releasing the blocks of the running
+    /// ones, and return each entry's event sink with its `abort` completion;
+    /// empty when the engine holds none.
     fn abort(
         &mut self,
         request_id: &str,
         p: &EngineParams,
-    ) -> Option<(mpsc::UnboundedSender<GenEvent>, GenEvent)> {
-        let (events, prompt_tokens, completion_tokens, cached_tokens) = if let Some(index) =
-            self.running.iter().position(|r| r.request_id == request_id)
-        {
+    ) -> Vec<(mpsc::UnboundedSender<GenEvent>, GenEvent)> {
+        let mut gone = Vec::new();
+        let mut index = 0;
+        while index < self.running.len() {
+            if self.running[index].request_id != request_id {
+                index += 1;
+                continue;
+            }
             let r = self.running.remove(index);
             self.release(&r, p);
-            (r.events, r.prompt_tokens, r.generated, r.cached_tokens)
-        } else {
-            let index = self
-                .waiting
-                .iter()
-                .position(|w| w.req.request_id == request_id)?;
-            let w = self.waiting.remove(index)?;
+            gone.push((r.events, r.prompt_tokens, r.generated, r.cached_tokens));
+        }
+        let mut index = 0;
+        while index < self.waiting.len() {
+            if self.waiting[index].req.request_id != request_id {
+                index += 1;
+                continue;
+            }
+            let Some(w) = self.waiting.remove(index) else {
+                break;
+            };
             let (generated, cached) = w.resume.map_or((0, 0), |r| (r.generated, r.cached_tokens));
-            (w.req.events, w.prompt_tokens, generated, cached)
-        };
-        Some((
-            events,
-            GenEvent::Done {
-                finish_reason: "abort",
-                prompt_tokens,
-                completion_tokens,
-                cached_tokens,
-            },
-        ))
+            gone.push((w.req.events, w.prompt_tokens, generated, cached));
+        }
+        gone.into_iter()
+            .map(
+                |(events, prompt_tokens, completion_tokens, cached_tokens)| {
+                    (
+                        events,
+                        GenEvent::Done {
+                            finish_reason: "abort",
+                            prompt_tokens,
+                            completion_tokens,
+                            cached_tokens,
+                        },
+                    )
+                },
+            )
+            .collect()
     }
 
     /// Queue a request with no oracle information (tests).
@@ -1732,11 +2180,13 @@ impl SchedulerState {
         let prompt_tokens = req.prompt_token_ids.len() as u32;
         let (keys, rolling_hash, _) = prompt_blocks(&req.prompt_token_ids, p.block_size as usize);
         let cached_blocks = if p.prefix_cache {
-            self.pool.match_prefix(&keys)
+            self.pool.match_prefix(&keys, p)
         } else {
             0
         };
-        let cached = (cached_blocks as u32 * p.block_size).min(prompt_tokens);
+        // What the shared tier would restore is loaded, not computed.
+        let restored_blocks = restorable_blocks(&keys, cached_blocks, prompt_tokens, p);
+        let cached = ((cached_blocks + restored_blocks) as u32 * p.block_size).min(prompt_tokens);
         self.waiting.push_back(WaitingReq {
             req,
             keys,
@@ -1749,14 +2199,31 @@ impl SchedulerState {
         });
     }
 
-    /// Tokens of running sequences resident in KV (what `token_usage` reports;
-    /// idle cached blocks are evictable and not counted, as in SGLang).
-    fn active_tokens(&self) -> u64 {
-        self.running.iter().map(|r| u64::from(r.seq_len())).sum()
+    /// Tokens of KV the running sequences hold (what `token_usage` reports):
+    /// the pool's referenced blocks, so a block several of them reference
+    /// counts once, as SGLang and vLLM count a shared prefix. Idle cached
+    /// blocks are evictable and not counted. The pool models one attention
+    /// group and merges any blocks of equal content, which an engine may
+    /// keep apart.
+    fn active_tokens(&self, p: &EngineParams) -> u64 {
+        self.pool.referenced() * u64::from(p.block_size)
+    }
+
+    /// The measured input capacity while the last prefill pass is within
+    /// [`PREFILL_RATE_TTL`]: `None` before the first and after a minute idle,
+    /// as the servicers' trackers report it once their samples expired.
+    fn prefill_throughput(&self) -> Option<f64> {
+        let (at, rate) = self.prefill_tp?;
+        (Instant::now().saturating_duration_since(at) <= PREFILL_RATE_TTL).then_some(rate)
+    }
+
+    /// When the last pass that prefilled ended (the published snapshot's stamp).
+    fn prefill_at(&self) -> Option<Instant> {
+        self.prefill_tp.map(|(at, _)| at)
     }
 
     fn snapshot(&self, p: &EngineParams) -> LoadSnapshot {
-        let used = self.active_tokens();
+        let used = self.active_tokens(p);
         let waiting_uncached: i64 = self
             .waiting
             .iter()
@@ -1771,6 +2238,7 @@ impl SchedulerState {
             max_running_requests: p.max_running.min(i32::MAX as usize) as i32,
             token_usage: (used as f64 / p.kv_capacity_tokens.max(1) as f64).clamp(0.0, 1.0),
             gen_throughput: self.gen_tp_ewma,
+            prefill_throughput: self.prefill_throughput(),
             cache_hit_rate: self.cache_hit_ewma,
             num_cached_blocks: self.pool.cached().min(i32::MAX as usize) as i32,
             num_preemptions: self.preemptions.min(i64::MAX as u64) as i64,
@@ -1785,9 +2253,11 @@ impl SchedulerState {
     /// KV room last. Per request, KV events are the blocks evicted for its
     /// allocation (`Removed`) followed by the blocks it completed (`Stored`,
     /// contiguous, chained to a parent). The caller makes every event of the
-    /// pass visible at its end.
+    /// pass visible at its end, the blocks it writes to the shared tier
+    /// included; admission only reads the tier.
     fn step(&mut self, p: &EngineParams) -> Step {
         let mut kv: Vec<common::KvCacheEvent> = Vec::new();
+        let mut spans: Vec<(usize, Vec<u32>)> = Vec::new();
         let mut inserted: Vec<u64> = Vec::new();
         let mut evicted: Vec<u64> = Vec::new();
         let mut sends: Vec<(mpsc::UnboundedSender<GenEvent>, GenEvent)> = Vec::new();
@@ -1818,6 +2288,7 @@ impl SchedulerState {
         let mut num_decode = 0usize;
         let mut decode_tokens = 0u32;
         let mut decode_ctx = 0u64;
+        let mut restored_tokens = 0u32;
 
         // ---- 1. Running requests: a prefill chunk or one decode token each ----
         let mut i = 0;
@@ -1835,7 +2306,8 @@ impl SchedulerState {
                 let completes = chunk == remaining;
                 // The chunk's blocks, plus the first output token's slot when
                 // this chunk finishes the prompt.
-                let add = chunk + u32::from(completes);
+                let add =
+                    chunk + u32::from(completes && samples_first_token(self.running[i].max_new));
                 let mut freed = Vec::new();
                 if self.ensure(i, add, p, &mut freed).is_err() {
                     continue;
@@ -1847,13 +2319,13 @@ impl SchedulerState {
                 largest_chunk = largest_chunk.max(chunk);
                 budget -= chunk;
                 let mut completed = stored;
-                if completes {
+                if completes && samples_first_token(self.running[i].max_new) {
                     // The pass that finishes a prefill samples its first token;
                     // that token adds no decode time to the pass.
                     completed.extend(self.emit_token(i, &mut sends, p));
                 }
                 inserted.extend(completed.iter().map(|c| c.key));
-                self.push_stored(&mut kv, i, completed, p);
+                self.push_stored(&mut kv, &mut spans, i, completed, p);
             } else if !p.prefill_first {
                 let mut freed = Vec::new();
                 if self.ensure(i, 1, p, &mut freed).is_err() {
@@ -1867,31 +2339,55 @@ impl SchedulerState {
                 decode_tokens += 1;
                 budget -= 1;
                 inserted.extend(completed.iter().map(|c| c.key));
-                self.push_stored(&mut kv, i, completed, p);
+                self.push_stored(&mut kv, &mut spans, i, completed, p);
             }
             i += 1;
         }
 
         // ---- 2. FCFS admission while the budget and KV room last ----
+        // A queued request whose client has gone (its receiver dropped, the
+        // signal the running loop reads) leaves the queue here, without a
+        // prefill: its output would go nowhere, and this pass's load report
+        // must not count it. A request preempted above whose client left
+        // while it ran goes the same way.
+        self.waiting.retain(|w| !w.req.events.is_closed());
         while budget > 0 && self.running.len() < p.max_running {
             let Some(front) = self.waiting.front() else {
                 break;
             };
             let prompt_len = front.req.prompt_token_ids.len() as u32;
             let mut cached_blocks = if p.prefix_cache {
-                self.pool.match_prefix(&front.keys)
+                self.pool.match_prefix(&front.keys, p)
+            } else {
+                0
+            };
+            // The shared tier continues the local hit; its blocks are loaded
+            // rather than computed, so they take KV room but no token budget.
+            let mut restored_blocks = if p.prefix_cache && p.global_l3_blocks > 0 {
+                global_l3()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .match_prefix(&front.keys[cached_blocks..])
             } else {
                 0
             };
             // A fully cached prompt still recomputes its last block.
-            if cached_blocks > 0 && cached_blocks as u32 * bs >= prompt_len {
+            if restored_blocks > 0 && (cached_blocks + restored_blocks) as u32 * bs >= prompt_len {
+                restored_blocks -= 1;
+            } else if cached_blocks > 0 && cached_blocks as u32 * bs >= prompt_len {
                 cached_blocks -= 1;
             }
             let cached = cached_blocks as u32 * bs;
+            let restored = restored_blocks as u32 * bs;
             let remaining = prompt_len - cached;
-            let chunk = remaining.min(budget);
+            let computed_part = (remaining - restored).min(budget);
+            let chunk = restored + computed_part;
             let completes = chunk == remaining;
-            let add = chunk + u32::from(completes);
+            // The slot of the first output token comes with the chunk that
+            // finishes the prompt, for a request that samples one; a zero
+            // limit reserves none, so nothing is left behind at its release.
+            let first = u32::from(samples_first_token(front.req.max_new));
+            let add = chunk + u32::from(completes) * first;
             // This pass's chunk is what gets allocated. Under full-ISL
             // admission the whole prompt (plus the first output token's slot)
             // must also fit in the free and evictable blocks right now: vLLM's
@@ -1899,7 +2395,7 @@ impl SchedulerState {
             // reservation, so an admitted prompt holds no more than it has
             // computed and the next chunks allocate (evict, preempt) as they run.
             let need = blocks_for(cached + add, bs) - cached_blocks as u64;
-            let need_full = blocks_for(cached + remaining + 1, bs) - cached_blocks as u64;
+            let need_full = blocks_for(cached + remaining + first, bs) - cached_blocks as u64;
             // Reference the cached prefix before making room, so the eviction
             // cannot take the very blocks this request is about to reuse.
             for k in &front.keys[..cached_blocks] {
@@ -1923,11 +2419,14 @@ impl SchedulerState {
             }
             let running_at_admit = self.running.len() as u32;
             let waiting_at_admit = self.waiting.len() as u32;
-            let w = self.waiting.pop_front().expect("front exists");
+            let Some(w) = self.waiting.pop_front() else {
+                break;
+            };
             let NewRequest {
                 request_id,
                 prompt_token_ids,
                 max_new,
+                choice,
                 events,
             } = w.req;
             let (reported_cached, generated, resumed_output, output_ids, token_seed) =
@@ -1943,14 +2442,15 @@ impl SchedulerState {
                         admitted.push(Admitted {
                             request_id: request_id.clone(),
                             prompt_tokens: w.prompt_tokens,
-                            cached_tokens: cached,
-                            oracle_tokens: w.oracle_tokens.max(cached),
+                            cached_tokens: cached + restored,
+                            restored_tokens: restored,
+                            oracle_tokens: w.oracle_tokens.max(cached + restored),
                             running_at_admit,
                             waiting_at_admit,
                             enqueued_at: w.enqueued_at,
                         });
                         let sample = if w.prompt_tokens > 0 {
-                            f64::from(cached) / f64::from(w.prompt_tokens)
+                            f64::from(cached + restored) / f64::from(w.prompt_tokens)
                         } else {
                             0.0
                         };
@@ -1961,14 +2461,16 @@ impl SchedulerState {
                             // and is independent of block size and the transport request ID.
                             OutputSeed::Prompt => w.rolling_hash,
                         };
-                        (cached, 0, 0, Vec::new(), seed as u32)
+                        // A second and later choice of one request differs by its
+                        // index; the first keeps the seed as it was.
+                        let seed = if choice == 0 {
+                            seed
+                        } else {
+                            fnv_step(seed, choice)
+                        };
+                        (cached + restored, 0, 0, Vec::new(), seed as u32)
                     }
                 };
-            let resolved_max_new = if max_new == 0 {
-                p.max_new_default
-            } else {
-                max_new
-            };
             self.running.push(RunningReq {
                 request_id,
                 events,
@@ -1977,7 +2479,7 @@ impl SchedulerState {
                 prompt_tokens: w.prompt_tokens,
                 cached_tokens: reported_cached,
                 computed: cached,
-                max_new: resolved_max_new,
+                max_new,
                 generated,
                 resumed_output,
                 output_ids,
@@ -1986,20 +2488,22 @@ impl SchedulerState {
                 pending: Vec::new(),
                 rolling_hash: w.rolling_hash,
                 token_seed,
+                choice,
             });
             let idx = self.running.len() - 1;
             self.running[idx].held = self.running[idx].seq_keys[..cached_blocks].to_vec();
             evicted.extend(freed.iter().copied());
             self.push_removed(&mut kv, freed, p);
             let mut completed = self.apply_prefill(idx, chunk, p);
-            prefill_tokens += chunk;
-            largest_chunk = largest_chunk.max(chunk);
-            budget -= chunk;
-            if completes {
+            prefill_tokens += computed_part;
+            largest_chunk = largest_chunk.max(computed_part);
+            restored_tokens += restored;
+            budget -= computed_part;
+            if completes && samples_first_token(self.running[idx].max_new) {
                 completed.extend(self.emit_token(idx, &mut sends, p));
             }
             inserted.extend(completed.iter().map(|c| c.key));
-            self.push_stored(&mut kv, idx, completed, p);
+            self.push_stored(&mut kv, &mut spans, idx, completed, p);
         }
 
         // ---- 3. Prefill-first engines decode only in passes without prefill ----
@@ -2026,7 +2530,7 @@ impl SchedulerState {
                 decode_tokens += 1;
                 budget -= 1;
                 inserted.extend(completed.iter().map(|c| c.key));
-                self.push_stored(&mut kv, i, completed, p);
+                self.push_stored(&mut kv, &mut spans, i, completed, p);
                 i += 1;
             }
         }
@@ -2054,22 +2558,47 @@ impl SchedulerState {
         self.running = still;
 
         // ---- 5. Timing + bookkeeping ----
-        let prefill_ms = p.timing.prefill_pass_ms(prefill_tokens, largest_chunk);
+        // A slower or faster engine's scale stretches both parts, so the
+        // rates it reports below are its own.
+        let prefill_ms =
+            p.timing.prefill_pass_ms(prefill_tokens, largest_chunk) * p.pass_time_scale;
         let decode_ms = p.timing.decode_ms(
             num_decode,
             decode_ctx,
             p.decode_reference_tokens.unwrap_or(p.kv_capacity_tokens),
-        );
-        let mut secs = (prefill_ms + decode_ms) / 1000.0;
+        ) * p.pass_time_scale;
+        let restore_ms = f64::from(restored_tokens) * p.global_l3_ms_per_token;
+        let mut secs = (prefill_ms + decode_ms + restore_ms) / 1000.0;
         if secs <= 0.0 && !self.is_idle() {
             secs = 0.001; // never busy-spin while work remains
         }
+        let duration = Duration::from_secs_f64(secs.max(0.0));
         let throughput_sample = if secs > 0.0 && decode_tokens > 0 {
             f64::from(decode_tokens) / secs
         } else {
             0.0
         };
         self.gen_tp_ewma = ewma(self.gen_tp_ewma, throughput_sample, 0.3);
+        // The pass's prefill rate: what it computed over what the timing
+        // model charged for it (a pass that prefilled nothing is no sample);
+        // an expired rate is gone, as the trackers' samples are, and the new
+        // sample starts over. The sample is stamped at the pass's end, when
+        // `run` has slept the pass's duration and publishes it: stamped at
+        // its start, a pass longer than the ttl would expire as it ended.
+        // The previous sample is judged at that same end: a pass that
+        // outlasts its remaining ttl publishes its own rate alone, as a read
+        // at publication would have found the previous one expired.
+        if prefill_tokens > 0 && prefill_ms > 0.0 {
+            let sample = f64::from(prefill_tokens) / (prefill_ms / 1000.0);
+            let end = Instant::now() + duration;
+            let rate = match self.prefill_tp {
+                Some((at, prev)) if end.saturating_duration_since(at) <= PREFILL_RATE_TTL => {
+                    ewma(prev, sample, 0.3)
+                }
+                _ => sample,
+            };
+            self.prefill_tp = Some((end, rate));
+        }
 
         let batch = if kv.is_empty() {
             None
@@ -2087,15 +2616,27 @@ impl SchedulerState {
             })
         };
 
+        let unrecorded = unrecorded_mask(&p.kv_cache_groups);
+        let inserted = inserted
+            .into_iter()
+            .map(|key| {
+                (
+                    key,
+                    self.pool.groups.get(&key).copied().unwrap_or(unrecorded),
+                )
+            })
+            .collect();
         Step {
-            duration: Duration::from_secs_f64(secs.max(0.0)),
+            duration,
             sends,
             batch,
+            spans,
             snapshot: self.snapshot(p),
             inserted,
             evicted,
             cleared,
             admitted,
+            restored_tokens,
         }
     }
 
@@ -2147,16 +2688,19 @@ impl SchedulerState {
         seq.extend_from_slice(&r.output_ids[r.resumed_output as usize..]);
         let (keys, rolling_hash, _) = prompt_blocks(&seq, p.block_size.max(1) as usize);
         let len = seq.len() as u32;
-        let cached = if p.prefix_cache {
-            (self.pool.match_prefix(&keys) as u32 * p.block_size).min(len)
+        let cached_blocks = if p.prefix_cache {
+            self.pool.match_prefix(&keys, p)
         } else {
             0
         };
+        let restored_blocks = restorable_blocks(&keys, cached_blocks, len, p);
+        let cached = ((cached_blocks + restored_blocks) as u32 * p.block_size).min(len);
         self.waiting.push_front(WaitingReq {
             req: NewRequest {
                 request_id: r.request_id,
                 prompt_token_ids: seq,
                 max_new: r.max_new,
+                choice: r.choice,
                 events: r.events,
             },
             keys,
@@ -2258,6 +2802,9 @@ impl SchedulerState {
         stored
     }
 
+    /// `Removed` events for evicted blocks: one per KV cache group that
+    /// stored them, in group order, as vLLM publishes an eviction per hash
+    /// and group.
     fn push_removed(
         &mut self,
         kv: &mut Vec<common::KvCacheEvent>,
@@ -2267,24 +2814,48 @@ impl SchedulerState {
         if freed.is_empty() || !p.prefix_cache {
             return;
         }
-        self.kv_event_id += 1;
-        kv.push(common::KvCacheEvent {
-            event_id: self.kv_event_id,
-            data: Some(common::kv_cache_event::Data::Removed(
-                common::KvBlocksRemoved {
-                    block_hashes: freed.into_iter().map(|k| k as i64).collect(),
-                    cache_level: None,
-                    ..Default::default()
-                },
-            )),
-        });
+        let group_count = p.kv_cache_groups.len().clamp(1, 8);
+        let unrecorded = unrecorded_mask(&p.kv_cache_groups);
+        let mut per_group: Vec<Vec<i64>> = vec![Vec::new(); group_count];
+        for key in freed {
+            // A block without a recorded mask was stored by the main-attention
+            // group alone, which keeps every block, at whatever index the
+            // engine publishes it; an engine without one never stored it
+            // ([`unrecorded_mask`]).
+            let mask = self.pool.groups.remove(&key).unwrap_or(unrecorded);
+            for (group, hashes) in per_group.iter_mut().enumerate() {
+                if mask & (1u8 << group) != 0 {
+                    hashes.push(key as i64);
+                }
+            }
+        }
+        for (group, block_hashes) in per_group.into_iter().enumerate() {
+            if block_hashes.is_empty() {
+                continue;
+            }
+            self.kv_event_id += 1;
+            kv.push(common::KvCacheEvent {
+                event_id: self.kv_event_id,
+                data: Some(common::kv_cache_event::Data::Removed(
+                    common::KvBlocksRemoved {
+                        block_hashes,
+                        cache_level: None,
+                        group_idx: Some(group as u32),
+                        ..Default::default()
+                    },
+                )),
+            });
+        }
     }
 
     /// `Stored` events for the blocks `running[idx]` completed this pass: one
-    /// per contiguous run, chained to the block before the run's first.
+    /// per contiguous run and KV cache group, chained to the block before the
+    /// run's first; a group other than the main one names only the blocks it
+    /// retains ([`KvCacheGroup::retains`]).
     fn push_stored(
         &mut self,
         kv: &mut Vec<common::KvCacheEvent>,
+        spans: &mut Vec<(usize, Vec<u32>)>,
         idx: usize,
         completed: Vec<Completed>,
         p: &EngineParams,
@@ -2292,40 +2863,79 @@ impl SchedulerState {
         if completed.is_empty() || !p.prefix_cache {
             return;
         }
-        let held = &self.running[idx].held;
-        let mut runs: Vec<(Option<u64>, Vec<common::KvBlock>)> = Vec::new();
+        let block_size = p.block_size.max(1) as usize;
+        let request = &self.running[idx];
+        let held = &request.held;
+        // The prompt's aligned replay boundary, in blocks: the position a
+        // later request replaying this prompt resumes at, which is where the
+        // sparse groups keep their state.
+        let boundary_block = (request.prompt_tokens.max(1) as usize - 1) / block_size;
+        let mut runs: Vec<CompletedRun> = Vec::new();
         let mut last_index: Option<usize> = None;
         for c in completed {
             let contiguous = last_index.is_some_and(|prev| prev + 1 == c.index);
             if !contiguous || runs.is_empty() {
                 let parent = c.index.checked_sub(1).map(|pos| held[pos]);
-                runs.push((parent, Vec::new()));
+                runs.push(CompletedRun {
+                    parent,
+                    blocks: Vec::new(),
+                });
             }
             last_index = Some(c.index);
-            runs.last_mut()
-                .expect("run exists")
-                .1
-                .push(common::KvBlock {
-                    block_hash: c.key as i64,
-                    token_ids: c.tokens,
-                    block_size: p.block_size as i32,
-                    lora_id: None,
-                    cache_level: None,
-                    ..Default::default()
-                });
-        }
-        for (parent, blocks) in runs {
-            self.kv_event_id += 1;
-            kv.push(common::KvCacheEvent {
-                event_id: self.kv_event_id,
-                data: Some(common::kv_cache_event::Data::Stored(
-                    common::KvBlocksStored {
-                        blocks,
-                        parent_block_hash: parent.map(|k| k as i64),
+            if let Some(run) = runs.last_mut() {
+                run.blocks.push((
+                    c.index,
+                    common::KvBlock {
+                        block_hash: c.key as i64,
+                        token_ids: c.tokens,
+                        block_size: p.block_size as i32,
+                        lora_id: None,
+                        cache_level: None,
                         ..Default::default()
                     },
-                )),
-            });
+                ));
+            }
+        }
+        let groups = p.kv_cache_groups.iter().take(8).enumerate();
+        for CompletedRun { parent, blocks } in runs {
+            for (group_idx, group) in groups.clone() {
+                let kept: Vec<common::KvBlock> = blocks
+                    .iter()
+                    .filter(|(index, _)| group.retains(*index, boundary_block, block_size))
+                    .map(|(_, block)| block.clone())
+                    .collect();
+                if kept.is_empty() {
+                    continue;
+                }
+                for block in &kept {
+                    *self.pool.groups.entry(block.block_hash as u64).or_insert(0) |=
+                        1u8 << group_idx;
+                }
+                if kept.len() < blocks.len() {
+                    // The engine writes a masked group's store with the
+                    // step's whole token range and the retained hashes only.
+                    let span = blocks
+                        .iter()
+                        .flat_map(|(_, block)| block.token_ids.iter().copied())
+                        .collect();
+                    spans.push((kv.len(), span));
+                }
+                self.kv_event_id += 1;
+                kv.push(common::KvCacheEvent {
+                    event_id: self.kv_event_id,
+                    data: Some(common::kv_cache_event::Data::Stored(
+                        common::KvBlocksStored {
+                            blocks: kept,
+                            parent_block_hash: parent.map(|k| k as i64),
+                            group_idx: Some(group_idx as u32),
+                            kv_cache_spec_kind: Some(group.kind.clone()),
+                            kv_cache_spec_sliding_window: (group.sliding_window > 0)
+                                .then_some(group.sliding_window),
+                            ..Default::default()
+                        },
+                    )),
+                });
+            }
         }
     }
 }
@@ -2382,6 +2992,7 @@ impl LoadSnapshot {
             max_running_requests: p.max_running.min(i32::MAX as usize) as i32,
             token_usage: 0.0,
             gen_throughput: 0.0,
+            prefill_throughput: None,
             cache_hit_rate: 0.0,
             num_cached_blocks: 0,
             num_preemptions: 0,
@@ -2412,6 +3023,84 @@ fn fnv_hash_str(s: &str) -> u64 {
         h = h.wrapping_mul(FNV_PRIME);
     }
     h
+}
+
+/// The mask of a cached block without a recorded one: the main-attention
+/// group alone, at whatever index the engine publishes it, since it stores
+/// every block; nothing when the engine has no main group, since a window or
+/// state group records what it keeps and a block it did not is not kept by
+/// anyone.
+fn unrecorded_mask(groups: &[KvCacheGroup]) -> u8 {
+    groups
+        .iter()
+        .position(|group| KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str()))
+        .map_or(0, |index| 1u8 << index)
+}
+
+/// The engine's prefix hit over its KV cache groups, vLLM's fixed point over
+/// its single-type managers: `main` leading blocks of `keys` are cached in
+/// the main group; every other group shrinks the candidate to what it keeps
+/// (`mask_of` a key: one bit per group index), and the rule repeats until
+/// nothing moves. A sliding-window group needs `ceil((window - 1) /
+/// block_size)` contiguous kept blocks ending at the hit, searched from the
+/// candidate down, else the leading run of kept blocks from the first; a
+/// Mamba group needs the rightmost kept block at or below the candidate. A
+/// kind without a rule (the main-attention kinds) leaves the candidate. An
+/// engine without a main-attention group (its first group is a window or
+/// state group) has no leading run to start from: the candidate is the
+/// whole prompt and the groups' rules alone decide, as the engine's own
+/// managers do for such a model.
+fn hit_over_groups(
+    main: usize,
+    keys: &[u64],
+    groups: &[KvCacheGroup],
+    block_size: usize,
+    mask_of: impl Fn(u64) -> u8,
+) -> usize {
+    let no_main_group = !groups
+        .iter()
+        .any(|group| KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str()));
+    let mut cur = if no_main_group {
+        keys.len()
+    } else {
+        main.min(keys.len())
+    };
+    if cur == 0 || (!no_main_group && groups.len() <= 1) {
+        return cur;
+    }
+    loop {
+        let start = cur;
+        for (index, group) in groups.iter().enumerate().take(8) {
+            let bit = 1u8 << index;
+            let kept = |at: usize| mask_of(keys[at]) & bit != 0;
+            let hit = match group.kind.as_str() {
+                "sliding_window" | "sliding_window_mla" => {
+                    let window = group.sliding_window.max(1) as usize;
+                    let need = (window - 1).div_ceil(block_size.max(1)).max(1);
+                    let mut run = 0usize;
+                    let mut found = None;
+                    for at in (0..cur).rev() {
+                        if kept(at) {
+                            run += 1;
+                            if run >= need {
+                                found = Some(at + run);
+                                break;
+                            }
+                        } else {
+                            run = 0;
+                        }
+                    }
+                    found.unwrap_or(run)
+                }
+                "mamba" => (0..cur).rev().find(|&at| kept(at)).map_or(0, |at| at + 1),
+                _ => cur,
+            };
+            cur = cur.min(hit);
+        }
+        if cur == start || cur == 0 {
+            return cur;
+        }
+    }
 }
 
 /// Chunk `ids` into `block_size`-token blocks, returning each full block's
@@ -2467,6 +3156,7 @@ mod tests {
                 request_id: id.to_string(),
                 prompt_token_ids: prompt,
                 max_new,
+                choice: 0,
                 events: tx,
             },
             rx,
@@ -2556,6 +3246,553 @@ mod tests {
         );
     }
 
+    /// A pass longer than the previous sample's remaining ttl publishes its
+    /// own rate alone: by its end the previous sample has expired, as a read
+    /// at that moment would have found, so nothing stale is averaged in.
+    #[test]
+    fn a_pass_that_outlasts_the_previous_sample_s_ttl_starts_the_rate_over() {
+        let p = EngineParams::default();
+        let mut st = SchedulerState::new();
+        let (r, _rx) = req("first", vec![7; 256], 4);
+        st.enqueue(r, &p);
+        st.step(&p);
+        let first = st
+            .snapshot(&p)
+            .prefill_throughput
+            .expect("one pass prefilled");
+        let mut slow = p.clone();
+        slow.timing = TimingModel::Linear {
+            prefill_tps: 1.0,
+            decode_base_ms: 0.0,
+            decode_per_req_ms: 0.0,
+        };
+        let (r, _rx) = req("slow", vec![9; 128], 4);
+        st.enqueue(r, &slow);
+        let step = st.step(&slow);
+        assert!(
+            step.duration > PREFILL_RATE_TTL,
+            "the pass outlasts the ttl: {:?}",
+            step.duration
+        );
+        let rate = st
+            .snapshot(&slow)
+            .prefill_throughput
+            .expect("the slow pass prefilled");
+        let own = 128.0 / (slow.timing.prefill_pass_ms(128, 128) / 1000.0);
+        assert!(
+            (rate - own).abs() < 1e-6,
+            "{rate} vs the pass's own {own}: the first pass's {first} expired by the end"
+        );
+    }
+
+    /// The snapshot's prefill rate: none before any pass prefilled, then
+    /// the computed tokens over the timing model's cost of the pass (what a
+    /// servicer measures of its engine), unmoved by a pass that decodes
+    /// alone, gone once the last prefill pass is a minute old, and started
+    /// over (not averaged with the stale figure) by the next.
+    #[test]
+    fn the_snapshot_reports_the_prefill_rate_of_the_passes_it_ran() {
+        let p = EngineParams::default();
+        let mut st = SchedulerState::new();
+        assert_eq!(st.snapshot(&p).prefill_throughput, None, "no pass yet");
+        let (r, _rx) = req("prefill", vec![7; 256], 4);
+        st.enqueue(r, &p);
+        let before = Instant::now();
+        let step = st.step(&p);
+        assert!(
+            st.prefill_at().expect("a stamp") >= before + step.duration,
+            "the sample is stamped at the pass's end, not its start"
+        );
+        let rate = st
+            .snapshot(&p)
+            .prefill_throughput
+            .expect("one pass prefilled");
+        let expected = 256.0 / (p.timing.prefill_pass_ms(256, 256) / 1000.0);
+        assert!((rate - expected).abs() < 1e-6, "{rate} vs {expected}");
+        st.step(&p);
+        assert_eq!(
+            st.snapshot(&p).prefill_throughput,
+            Some(rate),
+            "a decode-only pass is no prefill sample"
+        );
+        let stale = Instant::now()
+            .checked_sub(PREFILL_RATE_TTL + Duration::from_secs(1))
+            .expect("a clock older than the ttl");
+        st.prefill_tp = st.prefill_tp.map(|(_, rate)| (stale, rate));
+        assert_eq!(st.snapshot(&p).prefill_throughput, None, "a minute idle");
+        let (r, _rx) = req("again", vec![9; 128], 4);
+        st.enqueue(r, &p);
+        st.step(&p);
+        let restarted = st
+            .snapshot(&p)
+            .prefill_throughput
+            .expect("the next pass that prefilled");
+        let expected = 128.0 / (p.timing.prefill_pass_ms(128, 128) / 1000.0);
+        assert!(
+            (restarted - expected).abs() < 1e-6,
+            "{restarted} vs {expected}: not averaged with the stale rate"
+        );
+    }
+
+    /// A pass-time scale stretches every pass, prefill and decode alike, and
+    /// the engine reports its own rate: half its peer's prefill rate at twice
+    /// its pass time.
+    #[test]
+    fn a_pass_time_scale_stretches_every_pass_and_the_rate_reported() {
+        let peer = EngineParams::default();
+        let slow = EngineParams {
+            pass_time_scale: 2.0,
+            ..peer.clone()
+        };
+        let run = |p: &EngineParams| {
+            let mut st = SchedulerState::new();
+            let (r, _rx) = req("scaled", vec![7; 256], 4);
+            st.enqueue(r, p);
+            let prefill = st.step(p).duration.as_secs_f64();
+            let decode = st.step(p).duration.as_secs_f64();
+            let rate = st
+                .snapshot(p)
+                .prefill_throughput
+                .expect("the first pass prefilled");
+            (prefill, decode, rate)
+        };
+        let (peer_prefill, peer_decode, peer_rate) = run(&peer);
+        let (slow_prefill, slow_decode, slow_rate) = run(&slow);
+        assert!(
+            (slow_prefill / peer_prefill - 2.0).abs() < 1e-6,
+            "{slow_prefill} vs {peer_prefill}"
+        );
+        assert!(
+            (slow_decode / peer_decode - 2.0).abs() < 1e-6,
+            "{slow_decode} vs {peer_decode}"
+        );
+        assert!(
+            (slow_rate * 2.0 - peer_rate).abs() < 1e-6,
+            "{slow_rate} vs {peer_rate}"
+        );
+    }
+
+    /// A zero limit is a prefill-only request: the pass that finishes its
+    /// prefill finishes the request, with no output token, `length` as the
+    /// finish reason and a zero completion count. It is not a request for
+    /// the worker's default length; that default belongs to an omitted
+    /// limit, which every submitter resolves before the engine sees it.
+    #[test]
+    fn a_zero_limit_finishes_after_the_prefill_with_no_output_token() {
+        let params = EngineParams::default();
+        let mut state = SchedulerState::new();
+        let (request, mut rx) = req("score", vec![1; 16], 0);
+        state.enqueue(request, &params);
+        for _ in 0..100 {
+            for (tx, event) in state.step(&params).sends {
+                tx.send(event).expect("the receiver is alive");
+            }
+            if let Ok(event) = rx.try_recv() {
+                match event {
+                    GenEvent::Token { token_id, .. } => {
+                        panic!("a zero limit generated token {token_id}")
+                    }
+                    GenEvent::Done {
+                        finish_reason,
+                        prompt_tokens,
+                        completion_tokens,
+                        ..
+                    } => {
+                        assert_eq!(finish_reason, "length");
+                        assert_eq!(prompt_tokens, 16);
+                        assert_eq!(completion_tokens, 0);
+                        assert!(state.running.is_empty(), "the request is released");
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("the zero-limit request did not finish");
+    }
+
+    /// A zero-limit prompt longer than the pass budget finishes its prefill
+    /// in a later pass, in the arm that continues a chunked prefill; that arm
+    /// samples no first token for it either: no `Token` event, `length`, a
+    /// zero completion count, in the pass that finishes the prompt.
+    #[test]
+    fn a_zero_limit_prompt_longer_than_the_budget_finishes_with_no_output_token() {
+        let p = EngineParams {
+            max_batched_tokens: 1000,
+            prefix_cache: false,
+            ..Default::default()
+        };
+        let mut st = SchedulerState::new();
+        let (r, mut rx) = req("long-score", vec![7; 2500], 0);
+        st.enqueue(r, &p);
+        for pass in 1..100 {
+            for (tx, event) in st.step(&p).sends {
+                tx.send(event).expect("the receiver is alive");
+            }
+            if let Ok(event) = rx.try_recv() {
+                match event {
+                    GenEvent::Token { token_id, .. } => {
+                        panic!("a zero limit generated token {token_id} in pass {pass}")
+                    }
+                    GenEvent::Done {
+                        finish_reason,
+                        prompt_tokens,
+                        completion_tokens,
+                        ..
+                    } => {
+                        assert_eq!(finish_reason, "length");
+                        assert_eq!(prompt_tokens, 2500);
+                        assert_eq!(completion_tokens, 0);
+                        assert_eq!(
+                            pass, 3,
+                            "2500 tokens at a 1000-token budget finish in the third pass"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("the long zero-limit request did not finish");
+    }
+
+    /// A zero-limit request reserves no slot for a first output token it
+    /// never samples, so after it completes the pool holds nothing of it:
+    /// a block-aligned prompt and one with a partial tail, with and without
+    /// the prefix cache.
+    #[test]
+    fn a_zero_limit_request_leaves_the_pool_as_it_found_it() {
+        for prefix_cache in [false, true] {
+            for prompt_len in [16, 12] {
+                let p = EngineParams {
+                    block_size: 16,
+                    kv_capacity_tokens: 64,
+                    prefix_cache,
+                    ..EngineParams::default()
+                };
+                let mut st = SchedulerState::new();
+                let (r, mut rx) = req("score", vec![7; prompt_len], 0);
+                st.enqueue(r, &p);
+                let mut done = false;
+                for _ in 0..200 {
+                    for (tx, event) in st.step(&p).sends {
+                        tx.send(event).expect("the receiver is alive");
+                    }
+                    match rx.try_recv() {
+                        Ok(GenEvent::Token { token_id, .. }) => {
+                            panic!("a zero limit generated token {token_id}")
+                        }
+                        Ok(GenEvent::Done {
+                            completion_tokens, ..
+                        }) => {
+                            assert_eq!(completion_tokens, 0);
+                            done = true;
+                            break;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                let case = format!("prefix_cache={prefix_cache} prompt_len={prompt_len}");
+                assert!(done, "{case}: the zero-limit request finished");
+                assert!(st.is_idle(), "{case}");
+                assert_eq!(st.snapshot(&p).num_used_tokens, 0, "{case}");
+                assert_eq!(
+                    st.pool.allocated,
+                    st.pool.free_lru.len() as u64,
+                    "{case}: every block of the request is back in the free list"
+                );
+                assert!(
+                    st.pool.fits(p.capacity_blocks(), p.capacity_blocks()),
+                    "{case}: the whole capacity is available again"
+                );
+            }
+        }
+    }
+
+    /// A second engine restores the prefix the first one computed once the
+    /// first engine's pass is published, not before: the restoring pass
+    /// computes the tail alone and pays the restore's price, and its
+    /// admission reports the restored tokens as cached; with the tier off
+    /// nothing is restored.
+    #[test]
+    fn the_shared_tier_restores_a_prefix_once_the_pass_that_computed_it_is_published() {
+        let params = EngineParams {
+            block_size: 4,
+            global_l3_blocks: 1024,
+            global_l3_ms_per_token: 0.01,
+            ..Default::default()
+        };
+        // Tokens no other test uses: the tier is process-wide.
+        let prompt: Vec<u32> = (90_001..90_018).collect();
+        let admit = |p: &EngineParams, id: &str| {
+            let mut st = SchedulerState::new();
+            let (r, rx) = req(id, prompt.clone(), 8);
+            st.enqueue(r, p);
+            let step = st.step(p);
+            (st, step, rx)
+        };
+        let (_first, computing, _rx_first) = admit(&params, "computes");
+        let (_early, early, _rx_early) = admit(&params, "before-the-pass-ends");
+        assert_eq!(
+            early.admitted[0].restored_tokens, 0,
+            "the pass is still running"
+        );
+        publish_to_global_l3(&params, &computing.inserted, computing.restored_tokens);
+        let (later, restoring, _rx_later) = admit(&params, "after-the-pass-ends");
+        let admitted = &restoring.admitted[0];
+        assert_eq!((admitted.cached_tokens, admitted.restored_tokens), (16, 16));
+        assert_eq!(restoring.restored_tokens, 16);
+        // Four full blocks restored, the one-token tail computed.
+        let pass_ms = restoring.duration.as_secs_f64() * 1000.0;
+        let expected = params.timing.prefill_pass_ms(1, 1) + 16.0 * params.global_l3_ms_per_token;
+        assert!((pass_ms - expected).abs() < 1e-3, "{pass_ms} vs {expected}");
+        let keys = Engine::block_keys(&prompt, 4);
+        assert_eq!(later.pool.match_prefix(&keys, &params), 4);
+        let off = EngineParams {
+            global_l3_blocks: 0,
+            ..params
+        };
+        let (_off, without, _rx_off) = admit(&off, "tier-off");
+        assert_eq!(without.admitted[0].restored_tokens, 0);
+    }
+
+    /// A block-aligned prompt the tier holds whole still computes its last
+    /// block, and restored blocks take no token budget: with a budget of 6
+    /// tokens a pass restores the four blocks it can and computes 6 tokens
+    /// more.
+    #[test]
+    fn the_tier_leaves_the_last_block_to_compute_and_takes_no_budget() {
+        let params = EngineParams {
+            block_size: 4,
+            global_l3_blocks: 1024,
+            ..Default::default()
+        };
+        // Tokens no other test uses: the tier is process-wide.
+        let aligned: Vec<u32> = (91_001..91_017).collect();
+        let mut first = SchedulerState::new();
+        let (r, _rx_first) = req("aligned", aligned.clone(), 8);
+        first.enqueue(r, &params);
+        let computing = first.step(&params);
+        publish_to_global_l3(&params, &computing.inserted, computing.restored_tokens);
+        let mut whole = SchedulerState::new();
+        let (r, _rx_whole) = req("aligned-again", aligned.clone(), 8);
+        whole.enqueue(r, &params);
+        let step = whole.step(&params);
+        assert_eq!(
+            (
+                step.admitted[0].cached_tokens,
+                step.admitted[0].restored_tokens
+            ),
+            (12, 12),
+            "the last of the four blocks is computed"
+        );
+        let tight = EngineParams {
+            max_batched_tokens: 6,
+            ..params.clone()
+        };
+        let longer: Vec<u32> = aligned.iter().copied().chain(92_001..92_015).collect();
+        let mut chunked = SchedulerState::new();
+        let (r, _rx_chunked) = req("longer", longer, 8);
+        chunked.enqueue(r, &tight);
+        let step = chunked.step(&tight);
+        assert_eq!(step.admitted[0].restored_tokens, 16);
+        assert_eq!(
+            chunked.running[0].computed,
+            16 + 6,
+            "the restore and a full budget"
+        );
+        let pass_ms = step.duration.as_secs_f64() * 1000.0;
+        let expected = tight.timing.prefill_pass_ms(6, 6);
+        assert!((pass_ms - expected).abs() < 1e-3, "{pass_ms} vs {expected}");
+    }
+
+    /// A queued request's work leaves out what the shared tier would restore,
+    /// last block computed as at admission: a 16-token prompt the tier holds
+    /// whole queues 4 tokens of work, and 16 with the tier off.
+    #[test]
+    fn a_queued_request_counts_no_work_for_what_the_tier_would_restore() {
+        let params = EngineParams {
+            block_size: 4,
+            global_l3_blocks: 1024,
+            ..Default::default()
+        };
+        // Tokens no other test uses: the tier is process-wide.
+        let prompt: Vec<u32> = (95_001..95_017).collect();
+        let mut source = SchedulerState::new();
+        let (r, _rx_source) = req("queued-source", prompt.clone(), 8);
+        source.enqueue(r, &params);
+        let computing = source.step(&params);
+        publish_to_global_l3(&params, &computing.inserted, computing.restored_tokens);
+        let queued = |p: &EngineParams| {
+            let mut st = SchedulerState::new();
+            let (r, _rx) = req("queued", prompt.clone(), 8);
+            st.enqueue(r, p);
+            st.snapshot(p).num_waiting_uncached_tokens
+        };
+        assert_eq!(queued(&params), 4, "the last of the four blocks is work");
+        let off = EngineParams {
+            global_l3_blocks: 0,
+            ..params.clone()
+        };
+        assert_eq!(queued(&off), 16);
+    }
+
+    /// A request preempted mid-prefill comes back counting no work for what
+    /// the tier holds past its own computed blocks: it computed one block of
+    /// a 40-token prompt, the tier holds the nine blocks after it, and the
+    /// requeued request queues only the last block.
+    #[test]
+    fn a_requeued_request_counts_no_work_for_what_the_tier_would_restore() {
+        let params = EngineParams {
+            block_size: 4,
+            global_l3_blocks: 1024,
+            max_batched_tokens: 6,
+            ..Default::default()
+        };
+        let prompt: Vec<u32> = (96_001..96_041).collect();
+        let mut st = SchedulerState::new();
+        let (r, _rx) = req("requeued", prompt.clone(), 8);
+        st.enqueue(r, &params);
+        st.step(&params);
+        assert_eq!(st.running[0].computed, 6, "one block and part of the next");
+        // The tier holds only the blocks after the engine's own, so the
+        // requeue has to join its local hit and the tier's run.
+        let keys = prompt_blocks(&prompt, 4).0;
+        global_l3()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(&keys[1..], params.global_l3_blocks);
+        st.preempt_last(&params);
+        assert_eq!(
+            st.snapshot(&params).num_waiting_uncached_tokens,
+            4,
+            "one block its own, eight restorable, the last one work"
+        );
+    }
+
+    /// The tier evicts the least recently written blocks down to its
+    /// capacity. It writes a chain tail-first, so a chain's head is the last
+    /// of it to go, and a look refreshes nothing.
+    #[test]
+    fn the_tier_evicts_the_least_recently_written_and_keeps_a_chains_head() {
+        let mut tier = GlobalL3::default();
+        tier.insert(&[1, 2, 3], 4);
+        tier.insert(&[10, 11], 4);
+        assert_eq!(
+            tier.match_prefix(&[1, 2, 3]),
+            2,
+            "the chain's tail went first"
+        );
+        assert_eq!(tier.match_prefix(&[10, 11]), 2);
+        tier.insert(&[20], 4);
+        assert_eq!(tier.match_prefix(&[1, 2]), 1, "the looks left 2 the oldest");
+        assert_eq!(tier.tick_of.len(), 4);
+    }
+
+    /// A live engine writes a pass's blocks to the tier when the pass's time
+    /// has passed, not when the pass starts: while the half-second pass that
+    /// computes a prompt runs, another engine would restore none of it.
+    #[tokio::test]
+    async fn a_live_pass_writes_the_tier_only_once_its_time_has_passed() {
+        let params = EngineParams {
+            timing: TimingModel::Polynomial {
+                prefill: [500.0, 0.0, 0.0],
+                decode: TimingModel::POLY_DECODE,
+            },
+            global_l3_blocks: 1024,
+            ..Default::default()
+        };
+        // Tokens no other test uses: the tier is process-wide.
+        let prompt: Vec<u32> = (94_001..94_065).collect();
+        let computing = Engine::spawn(params.clone());
+        let restoring = Engine::spawn(params);
+        let mut rx = submit(&computing, "tier-pass-end", prompt.clone());
+        // The actor takes the request and starts its pass in one poll, so once
+        // its in-flight count shows the request the pass is running.
+        let mut polls = 0;
+        while computing.shared.in_flight.load(Ordering::Relaxed) == 0 {
+            polls += 1;
+            assert!(polls < 100_000, "the engine never took the request");
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            restoring.cached_tokens_for(&prompt).restored_tokens,
+            0,
+            "the pass is still running"
+        );
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("events")
+        {
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        assert_eq!(restoring.cached_tokens_for(&prompt).restored_tokens, 48);
+        drop((computing, restoring));
+    }
+
+    /// With the tier on, the arrival oracle and the truth endpoint count what
+    /// a worker would restore: an aligned prompt only the tier holds is
+    /// served with its last block computed, under an oracle of the whole
+    /// prompt.
+    #[tokio::test]
+    async fn the_oracle_and_the_truth_count_what_the_tier_would_restore() {
+        let params = EngineParams {
+            global_l3_blocks: 1024,
+            ..Default::default()
+        };
+        // Tokens no other test uses: the tier is process-wide. The engine
+        // that computes the prompt is no member of the fleet, so no worker
+        // the oracle reads holds it: only the tier does.
+        let prompt: Vec<u32> = (93_001..93_065).collect();
+        let computing = Engine::spawn(params.clone());
+        let mut rx = submit(&computing, "tier-oracle-computes", prompt.clone());
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("events")
+        {
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        let restoring = Engine::spawn(params);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let truth = loop {
+            let truth = restoring.cached_tokens_for(&prompt);
+            if truth.restored_tokens > 0 || Instant::now() > deadline {
+                break truth;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!((truth.cached_tokens, truth.restored_tokens), (48, 48));
+        let restored_before = global_l3_stats().1;
+        let mut rx = submit(&restoring, "tier-oracle-restores", prompt);
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("events")
+        {
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        // The record lands after the pass's tokens are sent.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let record = loop {
+            let found = records_since(0, usize::MAX)
+                .into_iter()
+                .find(|r| r.request_id == "tier-oracle-restores");
+            match found {
+                Some(record) => break record,
+                None if Instant::now() > deadline => panic!("no record of the restoring request"),
+                None => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+        assert_eq!((record.cached_tokens, record.restored_tokens), (48, 48));
+        assert_eq!(record.oracle_tokens, 64, "the whole prompt is in the tier");
+        // Other tests add to the process-wide count too, never take from it.
+        assert!(global_l3_stats().1 >= restored_before + 48);
+        drop((computing, restoring));
+    }
+
     #[test]
     fn default_output_still_depends_on_transport_id() {
         let params = EngineParams::default();
@@ -2585,9 +3822,10 @@ mod tests {
                 assert_eq!(st.pool.allocated, 2, "a full block and a partial tail");
                 let cached = st.pool.cached();
 
-                let (_, event) = st.abort("cancelled", &p).expect("the request exists");
+                let aborted = st.abort("cancelled", &p);
+                assert_eq!(aborted.len(), 1, "the request exists");
                 assert!(matches!(
-                    event,
+                    aborted[0].1,
                     GenEvent::Done {
                         finish_reason: "abort",
                         ..
@@ -2598,9 +3836,49 @@ mod tests {
                 assert_eq!(st.pool.cached(), cached, "cached prefixes remain reusable");
                 assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
                 assert!(st.pool.fits(p.capacity_blocks(), p.capacity_blocks()));
-                assert!(st.abort("cancelled", &p).is_none());
+                assert!(st.abort("cancelled", &p).is_empty());
             }
         }
+    }
+
+    #[test]
+    fn a_block_two_running_sequences_share_counts_once_in_the_reported_usage() {
+        let p = EngineParams {
+            block_size: 4,
+            kv_capacity_tokens: 64,
+            prefix_cache: true,
+            ..EngineParams::default()
+        };
+        let mut st = SchedulerState::new();
+        // Two full blocks both prompts start with, then one full block of each one's own.
+        let shared: Vec<u32> = (70_001..70_009).collect();
+        let prompt = |own: u32| {
+            shared
+                .iter()
+                .copied()
+                .chain(own..own + 4)
+                .collect::<Vec<u32>>()
+        };
+        let (a, _a) = req("a", prompt(71_001), 100);
+        st.enqueue(a, &p);
+        st.step(&p);
+        let (b, _b) = req("b", prompt(72_001), 100);
+        st.enqueue(b, &p);
+        st.step(&p);
+        assert_eq!(st.running.len(), 2);
+        assert!(st.running.iter().all(|r| !r.prefilling()));
+
+        // Each sequence's blocks past the shared two are its own, a partial tail included.
+        let own_blocks: u32 = st.running.iter().map(|r| r.seq_len().div_ceil(4) - 2).sum();
+        let lengths: u32 = st.running.iter().map(RunningReq::seq_len).sum();
+        let snapshot = st.snapshot(&p);
+        let used = u32::try_from(snapshot.num_used_tokens).expect("usage is not negative");
+        assert_eq!(used, 4 * (2 + own_blocks), "the shared blocks count once");
+        assert!(
+            used < lengths,
+            "{used} is below the summed lengths {lengths}"
+        );
+        assert_eq!(snapshot.token_usage, f64::from(used) / 64.0);
     }
 
     #[test]
@@ -2611,9 +3889,10 @@ mod tests {
         st.enqueue(r, &p);
         st.step(&p);
         st.preempt_last(&p);
-        let (_, event) = st.abort("preempted", &p).expect("the request is queued");
+        let aborted = st.abort("preempted", &p);
+        assert_eq!(aborted.len(), 1, "the request is queued");
         assert!(matches!(
-            event,
+            aborted[0].1,
             GenEvent::Done {
                 finish_reason: "abort",
                 prompt_tokens: 64,
@@ -2621,6 +3900,50 @@ mod tests {
                 ..
             }
         ));
+        assert!(st.is_idle());
+        assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
+    }
+
+    /// The `n` choices of one request share its id: an abort removes every
+    /// entry carrying it, running or queued, each with its own completion,
+    /// and leaves another request's entry alone.
+    #[test]
+    fn abort_removes_every_entry_with_the_request_id() {
+        let p = EngineParams {
+            block_size: 4,
+            max_batched_tokens: 4,
+            kv_capacity_tokens: 32,
+            ..EngineParams::default()
+        };
+        let mut st = SchedulerState::new();
+        let mut receivers = Vec::new();
+        for choice in 0..2 {
+            let (mut r, rx) = req("fanned", vec![7; 4], 100);
+            r.choice = choice;
+            st.enqueue(r, &p);
+            receivers.push(rx);
+        }
+        let (other, _rx) = req("other", vec![9; 4], 100);
+        st.enqueue(other, &p);
+        st.step(&p);
+        assert_eq!(
+            (st.running.len(), st.waiting.len()),
+            (1, 2),
+            "the budget admits one prompt per pass"
+        );
+
+        let aborted = st.abort("fanned", &p);
+        assert_eq!(aborted.len(), 2, "the running choice and the queued one");
+        assert!(aborted.iter().all(|(_, event)| matches!(
+            event,
+            GenEvent::Done {
+                finish_reason: "abort",
+                ..
+            }
+        )));
+        assert_eq!(st.in_flight(), 1, "the other request stays");
+        assert!(st.abort("fanned", &p).is_empty());
+        assert_eq!(st.abort("other", &p).len(), 1);
         assert!(st.is_idle());
         assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
     }
@@ -2767,6 +4090,80 @@ mod tests {
             "the oracle is never below what the worker actually served"
         );
         drop((rx1, rx2));
+    }
+
+    #[test]
+    fn a_queued_request_whose_client_left_leaves_the_queue_at_the_next_pass_without_a_prefill() {
+        let p = EngineParams {
+            max_running: 1,
+            ..Default::default()
+        };
+        let mut st = SchedulerState::new();
+        let (first, rx_first) = req("first", vec![1; 64], 8);
+        st.enqueue(first, &p);
+        let second_prompt = vec![2; 64];
+        let (second, rx_second) = req("second", second_prompt.clone(), 2);
+        st.enqueue(second, &p);
+        // One slot: the first request runs, the second waits behind it.
+        let step = st.step(&p);
+        assert_eq!(step.admitted.len(), 1);
+        assert_eq!(step.snapshot.num_waiting_reqs, 1);
+        // The waiting request's client goes away while it is queued.
+        drop(rx_second);
+
+        // The cold-shape hook reads the queue before the pass: a prompt whose
+        // client has gone buys no hold and moves no high-water mark.
+        assert_eq!(
+            st.cold_shape_hold(10),
+            None,
+            "a queued request whose client left buys no cold-shape hold"
+        );
+        assert_eq!(st.longest_run, 0);
+
+        // The next pass drops it while the slot is still taken: the load
+        // report no longer counts it, and nothing of it is admitted.
+        let step = st.step(&p);
+        assert!(
+            step.admitted.is_empty(),
+            "the pass admitted {:?}",
+            step.admitted
+                .iter()
+                .map(|a| &a.request_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            step.snapshot.num_running_reqs, 1,
+            "the first request still runs"
+        );
+        assert_eq!(
+            step.snapshot.num_waiting_reqs, 0,
+            "a queued request whose client left no longer counts as waiting"
+        );
+        assert_eq!(st.in_flight(), 1);
+
+        let mut admitted_later = Vec::new();
+        for _ in 0..16 {
+            let step = st.step(&p);
+            admitted_later.extend(step.admitted.into_iter().map(|a| a.request_id));
+            if st.is_idle() {
+                break;
+            }
+        }
+        assert!(
+            st.is_idle(),
+            "the engine drains once the first request finishes"
+        );
+        assert!(
+            admitted_later.is_empty(),
+            "a queued request whose client left is never admitted: {admitted_later:?}"
+        );
+        let (keys, _, _) = prompt_blocks(&second_prompt, p.block_size as usize);
+        assert_eq!(
+            st.pool.match_prefix(&keys, &p),
+            0,
+            "nothing of the dropped request's prompt was computed"
+        );
+        drop(rx_first);
     }
 
     #[test]
@@ -3124,6 +4521,7 @@ mod tests {
             max_running_requests: 128,
             token_usage: 0.59,
             gen_throughput: 3_000.0,
+            prefill_throughput: Some(20_000.0),
             cache_hit_rate: 0.4,
             num_cached_blocks: 42_000,
             num_preemptions: 0,
@@ -3143,6 +4541,11 @@ mod tests {
             "no queued token-work or used-token count"
         );
         assert_eq!((v.gen_throughput, v.cache_hit_rate), (0.0, 0.0));
+        assert_eq!(
+            v.prefill_throughput,
+            Some(20_000.0),
+            "the measured prefill capacity is reported on every shape"
+        );
         assert_eq!("vllm".parse::<LoadsLike>(), Ok(LoadsLike::Vllm));
         assert!("other".parse::<LoadsLike>().is_err());
     }
@@ -3260,6 +4663,112 @@ mod tests {
         );
     }
 
+    /// The engine's hit over its groups, block 4: cells of the sliding-window
+    /// and Mamba rules the gateway's view mirrors, read right to left.
+    #[test]
+    fn the_hit_is_the_fixed_point_over_the_groups() {
+        let groups = vec![
+            KvCacheGroup::full_attention(),
+            KvCacheGroup {
+                kind: "sliding_window".to_string(),
+                sliding_window: 8,
+            },
+            KvCacheGroup {
+                kind: "mamba".to_string(),
+                sliding_window: 0,
+            },
+        ];
+        let keys: Vec<u64> = (0..10).collect();
+        // (window blocks, state blocks, main hit) -> hit
+        type Cell<'a> = (&'a [u64], &'a [u64], usize, usize, &'a str);
+        let cells: [Cell; 8] = [
+            (
+                &[8, 9],
+                &[9],
+                10,
+                10,
+                "the tail and the state end at the depth",
+            ),
+            (
+                &[8, 9],
+                &[9],
+                9,
+                0,
+                "a depth below the tail: no tail at or below it, no state",
+            ),
+            (
+                &[4, 5],
+                &[5],
+                10,
+                6,
+                "the rightmost tail below the depth, the state there",
+            ),
+            (
+                &[4, 5],
+                &[9],
+                10,
+                0,
+                "the state at 9 is out of reach once the window says 6",
+            ),
+            (
+                &[0, 1, 2],
+                &[2],
+                10,
+                3,
+                "a leading run, the state at its end",
+            ),
+            (&[0], &[0], 10, 1, "one leading block"),
+            (&[9], &[9], 10, 0, "one block is no tail and not leading"),
+            (&[], &[], 10, 0, "nothing kept by the sparse groups"),
+        ];
+        for (window, state, main, want, note) in cells {
+            let mask = |key: u64| {
+                1u8 | u8::from(window.contains(&key)) << 1 | u8::from(state.contains(&key)) << 2
+            };
+            assert_eq!(
+                hit_over_groups(main, &keys, &groups, 4, mask),
+                want,
+                "{note}"
+            );
+        }
+        let plain = vec![KvCacheGroup::full_attention()];
+        assert_eq!(hit_over_groups(7, &keys, &plain, 4, |_| 1), 7);
+        assert_eq!(hit_over_groups(12, &keys, &plain, 4, |_| 1), 10);
+    }
+
+    /// An engine whose only group is a sliding window (no main-attention
+    /// group): the hit is the window rule from the prompt's end, whatever
+    /// leading run the caller measured; a window of 13 tokens at block 4
+    /// needs three kept blocks ending at the hit, else the leading run of
+    /// kept blocks from the first.
+    #[test]
+    fn a_window_only_engines_hit_is_the_window_rule_from_the_prompts_end() {
+        let keys: Vec<u64> = (0..10).collect();
+        let window_only = vec![KvCacheGroup {
+            kind: "sliding_window".to_string(),
+            sliding_window: 13,
+        }];
+        let cells: &[(&[u64], usize, &str)] = &[
+            (&[7, 8, 9], 10, "the tail kept: the whole prompt"),
+            (&[6, 7, 8], 9, "a run ending one block early"),
+            (&[2, 3, 4], 5, "a run in the middle: up to its end"),
+            (&[0, 1, 2], 3, "the leading run"),
+            (&[8, 9], 0, "two blocks are no tail"),
+            (&[0, 1], 2, "two leading blocks: the leading run"),
+            (&[], 0, "nothing kept"),
+        ];
+        for (kept, want, note) in cells {
+            let mask = |key: u64| u8::from(kept.contains(&key));
+            for main in [0usize, 3, 10] {
+                assert_eq!(
+                    hit_over_groups(main, &keys, &window_only, 4, mask),
+                    *want,
+                    "{note} (main {main})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn prompt_blocks_emit_one_chained_stored_event() {
         let p = EngineParams {
@@ -3293,6 +4802,184 @@ mod tests {
         assert_eq!(stored[0].blocks.len(), 1, "only the third block is new");
         let second_key = Engine::block_keys(&(0..8).collect::<Vec<_>>(), 4)[1];
         assert_eq!(stored[0].parent_block_hash, Some(second_key as i64));
+    }
+
+    /// A hybrid engine's step stores one event per group, each naming the
+    /// index the engine declared its group at: the main group sits behind the
+    /// window group here, as an engine may publish it, and every store is
+    /// read by its kind, never by its position.
+    #[test]
+    fn a_hybrid_engine_stores_the_window_tail_and_the_state_block_beside_full_attention() {
+        let p = EngineParams {
+            block_size: 4,
+            kv_cache_groups: vec![
+                KvCacheGroup {
+                    kind: "sliding_window".to_string(),
+                    sliding_window: 8,
+                },
+                KvCacheGroup::full_attention(),
+                KvCacheGroup {
+                    kind: "mamba".to_string(),
+                    sliding_window: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(KvCacheGroup::main_index(&p.kv_cache_groups), 1);
+        let mut st = SchedulerState::new();
+        // 25 prompt tokens: six full blocks; the aligned replay boundary (24)
+        // ends block 5.
+        let (r, _rx) = req("x", (0..25).collect(), 1);
+        st.enqueue(r, &p);
+        let step = st.step(&p);
+        let batch = step.batch.expect("stored events expected");
+        let stored = stored_events(&batch);
+        assert_eq!(stored.len(), 3, "one store per group");
+        let keys = Engine::block_keys(&(0..24).collect::<Vec<_>>(), 4);
+        let by_kind = |kind: &str| {
+            stored
+                .iter()
+                .find(|s| s.kv_cache_spec_kind.as_deref() == Some(kind))
+                .unwrap_or_else(|| panic!("a {kind} store"))
+        };
+        let (window, full, state) = (
+            by_kind("sliding_window"),
+            by_kind("full_attention"),
+            by_kind("mamba"),
+        );
+        assert_eq!(
+            (window.group_idx, full.group_idx, state.group_idx),
+            (Some(0), Some(1), Some(2)),
+            "each store names the index the engine declared its group at"
+        );
+        assert_eq!(full.blocks.len(), 6, "full attention keeps every block");
+        assert_eq!(window.kv_cache_spec_sliding_window, Some(8));
+        assert_eq!(
+            window
+                .blocks
+                .iter()
+                .map(|b| b.block_hash)
+                .collect::<Vec<_>>(),
+            vec![keys[4] as i64, keys[5] as i64],
+            "a window of 8 over blocks of 4 keeps the two blocks ending at the boundary"
+        );
+        assert_eq!(
+            window.parent_block_hash, full.parent_block_hash,
+            "the step's chain parent, as the engine publishes it"
+        );
+        assert_eq!(state.kv_cache_spec_sliding_window, None);
+        assert_eq!(
+            state
+                .blocks
+                .iter()
+                .map(|b| b.block_hash)
+                .collect::<Vec<_>>(),
+            vec![keys[5] as i64],
+            "the state block ending at the boundary"
+        );
+        assert_eq!(
+            step.spans
+                .iter()
+                .map(|(at, span)| (*at, span.len()))
+                .collect::<Vec<_>>(),
+            vec![(0, 24), (2, 24)],
+            "the two sparse stores carry the step's whole span for the vLLM wire"
+        );
+        assert_eq!(step.spans[0].1, (0..24).collect::<Vec<u32>>());
+    }
+
+    /// A block the pool holds no mask for is evicted from the main-attention
+    /// group alone, at the index the engine declared it: behind a window
+    /// group here, not group 0.
+    #[test]
+    fn an_unrecorded_block_is_evicted_from_the_main_group_at_its_declared_index() {
+        let p = EngineParams {
+            block_size: 4,
+            prefix_cache: true,
+            kv_cache_groups: vec![
+                KvCacheGroup {
+                    kind: "sliding_window".to_string(),
+                    sliding_window: 8,
+                },
+                KvCacheGroup::full_attention(),
+            ],
+            ..Default::default()
+        };
+        let mut st = SchedulerState::new();
+        let mut kv = Vec::new();
+        st.push_removed(&mut kv, vec![42], &p);
+        let groups: Vec<Option<u32>> = kv
+            .iter()
+            .filter_map(|e| match &e.data {
+                Some(common::kv_cache_event::Data::Removed(r)) => Some(r.group_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(groups, [Some(1)], "the main group's eviction alone: {kv:?}");
+    }
+
+    #[test]
+    fn an_evicted_block_is_removed_from_every_group_that_stored_it() {
+        // 8 blocks of 4 tokens; each prompt takes 3 full blocks plus a tail.
+        let p = EngineParams {
+            block_size: 4,
+            kv_capacity_tokens: 32,
+            max_running: 64,
+            // The main group last, as an engine may publish it: the removals
+            // are read by the index the engine declared, never by position.
+            kv_cache_groups: vec![
+                KvCacheGroup {
+                    kind: "mamba".to_string(),
+                    sliding_window: 0,
+                },
+                KvCacheGroup::full_attention(),
+            ],
+            ..Default::default()
+        };
+        let main_idx = Some(KvCacheGroup::main_index(&p.kv_cache_groups) as u32);
+        assert_eq!(main_idx, Some(1), "the main group is the second one here");
+        let mut st = SchedulerState::new();
+        let mut rxs = Vec::new();
+        let mut removed: Vec<(Option<u32>, Vec<i64>)> = Vec::new();
+        for i in 0..6 {
+            let base = (i as u32) * 1000;
+            let (r, rx) = req(&format!("r{i}"), (base..base + 13).collect(), 1);
+            st.enqueue(r, &p);
+            rxs.push(rx);
+            for _ in 0..4 {
+                if let Some(batch) = st.step(&p).batch {
+                    for event in &batch.events {
+                        if let Some(common::kv_cache_event::Data::Removed(r)) = &event.data {
+                            removed.push((r.group_idx, r.block_hashes.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        let main: Vec<i64> = removed
+            .iter()
+            .filter(|(g, _)| *g == main_idx)
+            .flat_map(|(_, h)| h.clone())
+            .collect();
+        let state: Vec<i64> = removed
+            .iter()
+            .filter(|(g, _)| *g == Some(0))
+            .flat_map(|(_, h)| h.clone())
+            .collect();
+        assert!(!main.is_empty(), "the main group's evictions: {removed:?}");
+        assert!(
+            !state.is_empty(),
+            "the state group's eviction of its boundary block: {removed:?}"
+        );
+        assert!(
+            state.iter().all(|h| main.contains(h)),
+            "a state block is a main block too"
+        );
+        assert!(
+            removed.iter().all(|(g, _)| g.is_some()),
+            "every removal names its group"
+        );
+        drop(rxs);
     }
 
     #[test]
@@ -3524,6 +5211,50 @@ mod tests {
             .ok()
             .flatten()
             .and_then(Result::ok)
+    }
+
+    /// The published rate expires at the read: an idle engine builds no new
+    /// snapshot after the one it published when its last pass ended, so the
+    /// poll (`Engine::load`, what `GetLoads`, `/v1/loads` and the pushed
+    /// record read) applies the ttl itself, as the trackers' expiry would.
+    #[tokio::test]
+    async fn an_idle_engine_stops_reporting_its_prefill_rate_at_the_read() {
+        let engine = live();
+        let mut rx = submit(&engine, "one", vec![7; 256]);
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("events")
+        {
+            if matches!(event, GenEvent::Done { .. }) {
+                break;
+            }
+        }
+        // The pass's snapshot is published after its events are sent.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let rate = loop {
+            if let Some(rate) = engine.load().prefill_throughput {
+                break rate;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pass's rate was never published"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(rate > 0.0, "{rate}");
+        let within = Instant::now() + PREFILL_RATE_TTL - Duration::from_secs(1);
+        assert_eq!(
+            engine.load_at(within).prefill_throughput,
+            Some(rate),
+            "within the minute the published rate stands"
+        );
+        let later = Instant::now() + PREFILL_RATE_TTL + Duration::from_secs(1);
+        assert_eq!(
+            engine.load_at(later).prefill_throughput,
+            None,
+            "a minute idle, with no new snapshot, reads none"
+        );
+        assert_eq!(engine.load().num_running_reqs, 0, "the engine is idle");
     }
 
     #[tokio::test]

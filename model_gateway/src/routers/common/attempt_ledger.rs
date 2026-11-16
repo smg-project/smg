@@ -31,7 +31,7 @@ use axum::{http::StatusCode, response::Response};
 use parking_lot::Mutex;
 
 use crate::{
-    routers::common::retry::mark_non_retryable,
+    routers::common::{placement::CandidateFilter, retry::mark_non_retryable},
     worker::{Worker, WorkerType},
 };
 
@@ -113,6 +113,29 @@ impl AttemptLedger {
             .any(|url| url == worker.base_url())
     }
 
+    /// Runs `select` with the candidate filter the request's next attempt
+    /// needs. Until a worker answered the request definitively there is
+    /// none, and nothing is asked of each candidate here: a first attempt
+    /// places over the pool as drawn, and a retry after transient failures
+    /// alone does too, but for the engines it tried, which the selection
+    /// steps past by itself while another candidate is left. After that the
+    /// filter is [`Self::admits`].
+    ///
+    /// The check and the selection are two critical sections. That stands on
+    /// a request's attempts running one after another: no answer is recorded
+    /// between the two.
+    pub(crate) fn with_candidate_filter<R>(
+        &self,
+        select: impl FnOnce(Option<CandidateFilter<'_>>) -> R,
+    ) -> R {
+        let nobody_answered = self.inner.lock().answered.is_empty();
+        if nobody_answered {
+            return select(None);
+        }
+        let admits = |worker: &dyn Worker| self.admits(worker);
+        select(Some(&admits))
+    }
+
     /// Close the retry window on a definitive failure. The workers that gave
     /// the answer take no further attempt of this request; when no available
     /// worker in `pool` is left to take one, the answer is marked terminal and
@@ -164,8 +187,8 @@ mod tests {
     use crate::{
         routers::common::retry::is_retryable_response,
         worker::{
-            circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            test_support::no_health_check,
+            health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            test_support::{no_health_check, worker_of},
             BasicWorkerBuilder,
         },
     };
@@ -263,13 +286,83 @@ mod tests {
         assert!(is_retryable_response(&transport));
     }
 
-    fn worker_of(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(worker_type)
-                .health_config(no_health_check())
-                .build(),
-        )
+    #[test]
+    fn a_candidate_filter_is_handed_only_after_a_definitive_answer() {
+        let w1 = worker("http://w1:8080", 5);
+        let w2 = worker("http://w2:8080", 5);
+        let pool = [Arc::clone(&w1), Arc::clone(&w2)];
+        let ledger = AttemptLedger::default();
+
+        assert!(
+            ledger.with_candidate_filter(|filter| filter.is_none()),
+            "a first attempt asks nothing of a candidate"
+        );
+
+        // A transient failure charges the breaker and answers nothing.
+        ledger.record_outcome(w1.as_ref(), 503);
+        let mut busy = answered(StatusCode::SERVICE_UNAVAILABLE);
+        ledger.settle(&mut busy, [&w1], pool.iter());
+        assert!(
+            ledger.with_candidate_filter(|filter| filter.is_none()),
+            "a retry after transient failures alone asks nothing either"
+        );
+
+        let mut failed = answered(StatusCode::INTERNAL_SERVER_ERROR);
+        ledger.settle(&mut failed, [&w1], pool.iter());
+        let (admits_w1, admits_w2) = ledger.with_candidate_filter(|filter| {
+            let admits = filter.expect("a definitive answer hands the filter");
+            (admits(w1.as_ref()), admits(w2.as_ref()))
+        });
+        assert!(
+            !admits_w1,
+            "the worker that answered takes no later attempt"
+        );
+        assert!(admits_w2, "the other worker still can");
+
+        // A second engine's answer keeps the filter in hand, and it now
+        // refuses both.
+        let mut failed_again = answered(StatusCode::INTERNAL_SERVER_ERROR);
+        ledger.settle(&mut failed_again, [&w2], pool.iter());
+        let (admits_w1, admits_w2) = ledger.with_candidate_filter(|filter| {
+            let admits = filter.expect("a second definitive answer keeps the filter");
+            (admits(w1.as_ref()), admits(w2.as_ref()))
+        });
+        assert!(
+            !admits_w1 && !admits_w2,
+            "neither worker that answered takes a later attempt"
+        );
+    }
+
+    #[test]
+    fn a_ranks_answer_stands_for_its_engine() {
+        // One engine's ranks share a base address, and the ledger keeps an
+        // answer by it: a definitive answer from one rank takes its sibling
+        // out of the request's later attempts too, and no other engine.
+        let rank = |rank: usize| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new("http://engine:8080")
+                    .dp_config(rank, 2)
+                    .health_config(no_health_check())
+                    .build(),
+            )
+        };
+        let (first, sibling) = (rank(0), rank(1));
+        let other = worker("http://other:8080", 5);
+        let pool = [Arc::clone(&first), Arc::clone(&sibling), Arc::clone(&other)];
+        let ledger = AttemptLedger::default();
+
+        let mut failed = answered(StatusCode::INTERNAL_SERVER_ERROR);
+        ledger.settle(&mut failed, [&first], pool.iter());
+        assert!(!ledger.admits(first.as_ref()));
+        assert!(
+            !ledger.admits(sibling.as_ref()),
+            "the sibling rank is the same engine"
+        );
+        assert!(ledger.admits(other.as_ref()));
+        assert!(
+            is_retryable_response(&failed),
+            "another engine can still take the request"
+        );
     }
 
     #[test]

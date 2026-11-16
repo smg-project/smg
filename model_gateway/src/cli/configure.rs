@@ -9,31 +9,37 @@ use std::collections::HashMap;
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        bind_socket_addr, validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig,
-        ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,
-        HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode,
-        MemoryConfig, MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig,
-        PolicyConfig, PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig,
+        bind_socket_addr,
+        secrets::{parse_control_plane_api_key, parse_tenant_api_key},
+        validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
+        ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig,
+        HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig,
+        MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
+        PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig,
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, SlurmDiscoveryConfig,
         TokenizerCacheConfig, TraceConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh::discovery::MeshDiscoveryConfig,
     observability::metrics::PrometheusConfig,
     policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
-    server::{posture::SecretSources, ServerConfig},
+    secrets::SecretFiles,
+    server::{
+        posture::{SecretSource, SecretSources},
+        ServerConfig,
+    },
     service_discovery::RuntimeDiscoveryConfig,
     version,
-    worker::{ConnectionMode, RuntimeType},
+    worker::{identity::endpoint::Endpoint, ConnectionMode, RuntimeType},
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
 
 use super::{
     secrets::{
-        EnvLookup, API_KEY_SETTING, POSTGRES_DB_URL_SETTING, REDIS_URL_SETTING,
-        TENANT_API_KEYS_SETTING,
+        EnvLookup, API_KEY_SETTING, CONTROL_PLANE_API_KEYS_SETTING, POSTGRES_DB_URL_SETTING,
+        REDIS_URL_SETTING, TENANT_API_KEYS_SETTING,
     },
-    value::{parse_control_plane_api_key, parse_role_mapping, parse_tenant_api_key},
+    value::parse_role_mapping,
 };
 use crate::{Backend, CliArgs, DiscoveryProvider};
 
@@ -53,6 +59,8 @@ impl CliArgs {
     /// parameter so a test need not touch the process environment.
     pub(crate) fn resolve_secret_sources(&mut self, env: EnvLookup<'_>) -> ConfigResult<()> {
         let mut sources = SecretSources::default();
+        let mut files = SecretFiles::default();
+        let from_file = SecretSource::File;
         if let Some((value, source)) = API_KEY_SETTING.resolve_value(
             self.integrations.api_key.as_deref(),
             self.integrations.api_key_file.as_deref(),
@@ -60,6 +68,10 @@ impl CliArgs {
         )? {
             self.integrations.api_key = Some(value);
             sources.api_key = Some(source);
+            if source == from_file {
+                files.api_key =
+                    API_KEY_SETTING.file(self.integrations.api_key_file.as_deref(), env)?;
+            }
         }
         if let Some((entries, source)) = TENANT_API_KEYS_SETTING.resolve_entries(
             &self.integrations.tenant_api_keys,
@@ -68,6 +80,24 @@ impl CliArgs {
         )? {
             sources.tenant_api_keys = Some((source, entries.len()));
             self.integrations.tenant_api_keys = entries;
+            if source == from_file {
+                files.tenant_api_keys = TENANT_API_KEYS_SETTING
+                    .file(self.integrations.tenant_api_keys_file.as_deref(), env)?;
+            }
+        }
+        if let Some((entries, source)) = CONTROL_PLANE_API_KEYS_SETTING.resolve_entries(
+            &self.integrations.control_plane_api_keys,
+            self.integrations.control_plane_api_keys_file.as_deref(),
+            env,
+        )? {
+            sources.control_plane_api_keys = Some((source, entries.len()));
+            self.integrations.control_plane_api_keys = entries;
+            if source == from_file {
+                files.control_plane_api_keys = CONTROL_PLANE_API_KEYS_SETTING.file(
+                    self.integrations.control_plane_api_keys_file.as_deref(),
+                    env,
+                )?;
+            }
         }
         if self.model.history_backend == "postgres" {
             if let Some((value, source)) = POSTGRES_DB_URL_SETTING.resolve_value(
@@ -90,6 +120,7 @@ impl CliArgs {
             }
         }
         self.integrations.secret_sources = sources;
+        self.integrations.secret_files = files;
         Ok(())
     }
 }
@@ -210,6 +241,21 @@ impl CliArgs {
         enable
     }
 
+    /// The `key=value` entries of a discovery label selector as a map. One
+    /// argument may carry several entries separated by whitespace, the form
+    /// a quoted chart value or an operator passes, as the launcher reads it;
+    /// every token has passed `validate_flag_formats`.
+    fn parse_label_selector(selector_list: &[String]) -> HashMap<String, String> {
+        let tokens: Vec<String> = selector_list
+            .iter()
+            .flat_map(|entry| entry.split_whitespace())
+            .map(str::to_string)
+            .collect();
+        Self::parse_selector(&tokens)
+    }
+
+    /// The `key=value` entries of a list as a map. Every list this reads has
+    /// passed `validate_flag_formats`, so no entry lacks a `=`.
     fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for item in selector_list {
@@ -258,10 +304,10 @@ impl CliArgs {
             format!("Mesh_{random_string}")
         };
 
-        let peer = self
+        let init_peers = self
             .integrations
             .mesh_peer_urls
-            .first()
+            .iter()
             .map(|url| {
                 url.parse::<std::net::SocketAddr>()
                     .map_err(|e| ConfigError::InvalidValue {
@@ -270,7 +316,7 @@ impl CliArgs {
                         reason: format!("invalid socket address: {e}"),
                     })
             })
-            .transpose()?;
+            .collect::<ConfigResult<Vec<_>>>()?;
 
         // Port 0 parses fine as a socket address, but it is meaningless as an
         // advertised one: peers gossip this port and cannot dial an ephemeral
@@ -319,7 +365,7 @@ impl CliArgs {
             self_name,
             bind_addr,
             advertise_addr,
-            init_peer: peer,
+            init_peers,
             mtls_config: self.mesh_mtls_config()?,
         }))
     }
@@ -387,7 +433,6 @@ impl CliArgs {
                 kv_pressure_weight: self.routing.least_load_kv_pressure_weight,
                 mean_prefill_tokens: self.routing.least_load_mean_prefill_tokens,
                 default_throughput: self.routing.least_load_default_throughput,
-                max_waiting_requests: self.routing.least_load_max_waiting_requests,
             },
             "bucket" => PolicyConfig::Bucket {
                 balance_abs_threshold: self.routing.balance_abs_threshold,
@@ -488,7 +533,10 @@ impl CliArgs {
     }
 
     /// Build Oracle storage settings after validating authentication and pool bounds.
-    fn build_oracle_config(&self, schema: Option<SchemaConfig>) -> ConfigResult<OracleConfig> {
+    pub(crate) fn build_oracle_config(
+        &self,
+        schema: Option<SchemaConfig>,
+    ) -> ConfigResult<OracleConfig> {
         let (wallet_path, connect_descriptor) = match self.resolve_oracle_connect_details()? {
             OracleConnectSource::Dsn { descriptor } => (None, descriptor),
             OracleConnectSource::Wallet { path, alias } => (Some(path), alias),
@@ -546,7 +594,7 @@ impl CliArgs {
             .oracle_pool_timeout_secs
             .unwrap_or_else(OracleConfig::default_pool_timeout_secs);
 
-        Ok(OracleConfig {
+        let ocf = OracleConfig {
             wallet_path,
             connect_descriptor,
             external_auth: self.integrations.oracle_external_auth,
@@ -555,8 +603,15 @@ impl CliArgs {
             pool_min,
             pool_max,
             pool_timeout_secs,
+            op_timeout_secs: self
+                .integrations
+                .oracle_op_timeout_secs
+                .unwrap_or_else(OracleConfig::default_op_timeout_secs),
             schema,
-        })
+        };
+        ocf.validate_bounds()
+            .map_err(|e| ConfigError::ValidationFailed { reason: e })?;
+        Ok(ocf)
     }
 
     /// Build PostgreSQL storage settings, requiring a URL and valid pool bounds.
@@ -644,21 +699,7 @@ impl CliArgs {
         // header names and an empty API key are checked by the shared
         // `ConfigValidator`, which every construction path runs (this CLI
         // through `builder.build()`).
-        let buckets = &self.serving.prometheus_duration_buckets;
-        if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
-            return Err(invalid(
-                "prometheus_duration_buckets",
-                &bad.to_string(),
-                "every bucket bound must be a finite number above 0",
-            ));
-        }
-        if let Some(pair) = buckets.windows(2).find(|w| w[1] <= w[0]) {
-            return Err(invalid(
-                "prometheus_duration_buckets",
-                &format!("{} {}", pair[0], pair[1]),
-                "bucket bounds must ascend strictly",
-            ));
-        }
+        PrometheusConfig::validate_duration_buckets(&self.serving.prometheus_duration_buckets)?;
         for entry in &self.serving.storage_context_headers {
             if !entry.contains('=') {
                 return Err(invalid(
@@ -666,6 +707,31 @@ impl CliArgs {
                     entry,
                     "expected 'header-name=context-key'",
                 ));
+            }
+        }
+        // A selector entry without `=` or without a key used to be dropped,
+        // and the selector that remained matched more pods than the line said.
+        for (field, entries) in [
+            ("selector", &self.discovery.selector),
+            ("encode_selector", &self.discovery.encode_selector),
+            ("prefill_selector", &self.discovery.prefill_selector),
+            ("decode_selector", &self.discovery.decode_selector),
+            ("router_selector", &self.discovery.router_selector),
+        ] {
+            for entry in entries {
+                // One argument may carry several entries separated by
+                // whitespace; each token is one `key=value`, as the launcher
+                // reads it, and the refusal names the token.
+                let mut tokens = entry.split_whitespace().peekable();
+                if tokens.peek().is_none() {
+                    return Err(invalid(field, entry, "expected 'key=value'"));
+                }
+                for token in tokens {
+                    match token.split_once('=') {
+                        Some((key, _)) if !key.is_empty() => {}
+                        _ => return Err(invalid(field, token, "expected 'key=value'")),
+                    }
+                }
             }
         }
         for mapping in &self.integrations.jwt_role_mapping {
@@ -706,10 +772,9 @@ impl CliArgs {
         let kubernetes = provider == Some(DiscoveryProvider::Kubernetes);
         let selectors = match provider {
             None => "without --service-discovery".to_string(),
-            Some(provider) => format!(
-                "under --discovery-provider {}: it selects Kubernetes pods",
-                provider.flag_value()
-            ),
+            Some(provider) => {
+                format!("under --discovery-provider {provider}: it selects Kubernetes pods")
+            }
         };
         // Two worker sources are both honoured, which is worth a line of its
         // own, naming the source as it was given.
@@ -717,7 +782,7 @@ impl CliArgs {
             "--service-discovery".to_string()
         } else {
             provider.map_or_else(String::new, |provider| {
-                format!("--discovery-provider {}", provider.flag_value())
+                format!("--discovery-provider {provider}")
             })
         };
         let ignored = |flag: &str, needs: &str| format!("{flag} is ignored {needs}");
@@ -773,6 +838,14 @@ impl CliArgs {
                 ignored(
                     "--priority-scheduler-config",
                     "without --priority-scheduler-enabled",
+                ),
+            ),
+            (
+                self.serving.tenant_rate_limit_config.is_some()
+                    && !self.serving.tenant_rate_limit_enabled,
+                ignored(
+                    "--tenant-rate-limit-config",
+                    "without --tenant-rate-limit-enabled",
                 ),
             ),
         ];
@@ -876,15 +949,15 @@ impl CliArgs {
                     namespace: self.discovery.service_discovery_namespace.clone(),
                     port: self.discovery.service_discovery_port,
                     check_interval_secs: interval,
-                    selector: Self::parse_selector(&self.discovery.selector),
-                    encode_selector: Self::parse_selector(&self.discovery.encode_selector),
-                    prefill_selector: Self::parse_selector(&self.discovery.prefill_selector),
-                    decode_selector: Self::parse_selector(&self.discovery.decode_selector),
+                    selector: Self::parse_label_selector(&self.discovery.selector),
+                    encode_selector: Self::parse_label_selector(&self.discovery.encode_selector),
+                    prefill_selector: Self::parse_label_selector(&self.discovery.prefill_selector),
+                    decode_selector: Self::parse_label_selector(&self.discovery.decode_selector),
                     bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                     worker_ports_annotation: "smg.ai/worker-ports".to_string(),
                     kv_connector_annotation: self.discovery.kv_connector_annotation.clone(),
                     kv_engine_id_annotation: self.discovery.kv_engine_id_annotation.clone(),
-                    router_selector: Self::parse_selector(&self.discovery.router_selector),
+                    router_selector: Self::parse_label_selector(&self.discovery.router_selector),
                     router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                     model_id_source: self.discovery.model_id_from.clone(),
                 }))
@@ -1097,13 +1170,14 @@ impl CliArgs {
             .header_read_timeout_secs(self.serving.header_read_timeout_secs)
             .idle_connection_timeout_secs(self.serving.idle_connection_timeout_secs)
             .max_connections(self.serving.max_connections)
+            .admin_max_connections(self.serving.admin_max_connections)
             .request_timeout_secs(self.serving.request_timeout_secs)
             .grpc_request_timeout_secs(self.serving.grpc_request_timeout_secs)
             .sse_keepalive_secs(self.serving.sse_keepalive_secs)
             .upstream_pool_idle_timeout_secs(self.serving.upstream_pool_idle_timeout_secs)
-            .worker_startup_timeout_secs(self.workers.worker_startup_timeout_secs)
-            .worker_startup_delay_secs(self.workers.worker_startup_delay)
-            .worker_startup_check_interval_secs(self.workers.worker_startup_check_interval)
+            .worker_startup_timeout_secs(self.routing.worker_startup_timeout_secs)
+            .worker_startup_delay_secs(self.routing.worker_startup_delay)
+            .worker_startup_check_interval_secs(self.routing.worker_startup_check_interval)
             .job_queue_capacity(self.routing.job_queue_capacity)
             .job_queue_concurrency(self.routing.job_queue_concurrency)
             .load_monitor_interval_secs(self.workers.load_monitor_interval)
@@ -1237,6 +1311,7 @@ impl CliArgs {
             .pd_pairing_mode(
                 PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
             )
+            .grouped_dp_sticky(self.routing.grouped_dp_sticky)
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing.routing_key_override,
                 eviction_interval_secs: self.routing.eviction_interval,
@@ -1311,24 +1386,13 @@ impl CliArgs {
         let mesh_server_config = self.build_mesh_server_config()?;
 
         Ok(ServerConfig {
-            host: self.routing.host.clone(),
-            port: self.routing.port,
-            health_check_port: self.routing.health_check_port,
-            runtime_worker_threads: self.integrations.runtime_worker_threads,
             router_config,
-            max_payload_size: self.serving.max_payload_size,
             log_dir: self.serving.log_dir.clone(),
             log_level: Some(self.serving.log_level.clone()),
             log_json: self.serving.log_json,
             service_discovery_config,
             mesh_discovery_config,
             prometheus_config,
-            request_timeout_secs: self.serving.request_timeout_secs,
-            request_id_headers: if self.serving.request_id_headers.is_empty() {
-                None
-            } else {
-                Some(self.serving.request_id_headers.clone())
-            },
             shutdown_grace_period_secs: self.serving.shutdown_grace_period_secs,
             shutdown_settle_secs: self.serving.shutdown_settle_secs,
             control_plane_auth,
@@ -1336,6 +1400,8 @@ impl CliArgs {
             webrtc_bind_addr: self.integrations.webrtc_bind_addr,
             webrtc_stun_server: self.integrations.webrtc_stun_server.clone(),
             secret_sources: self.integrations.secret_sources,
+            secret_files: self.integrations.secret_files.clone(),
+            secrets_auto_reload: self.integrations.secrets_auto_reload,
         })
     }
 
@@ -1383,27 +1449,59 @@ impl CliArgs {
             return;
         }
         println!("Policy: {}", self.routing.policy);
-        if self.workers.pd_disaggregation && !prefill_urls.is_empty() {
-            println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", self.workers.decode);
-        }
-        if self.workers.epd_disaggregation {
-            println!("Encode nodes: {encode_urls:?}");
-            println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", self.workers.decode);
+        for line in self.node_lines(prefill_urls, encode_urls) {
+            println!("{line}");
         }
     }
 
-    /// Phase 3, configure: the router configuration, validated, wrapped in
-    /// the server configuration. Every refusal is a [`ConfigError`] naming
-    /// the flag; nothing has been bound or spawned when one is raised.
+    /// The banner's lines that name the worker nodes of the two
+    /// disaggregated modes. Each address is written through
+    /// [`Endpoint::redacted_url`]: one with no userinfo, query or fragment
+    /// reads as it was given, byte for byte, a userinfo is masked whole and a
+    /// query or fragment is cut, and one the address parser refuses reads as
+    /// its marker. An address on the command line may carry a credential;
+    /// what every start prints may not.
+    pub(crate) fn node_lines(
+        &self,
+        prefill_urls: &[(String, Option<u16>)],
+        encode_urls: &[(String, Option<u16>)],
+    ) -> Vec<String> {
+        let shown = |nodes: &[(String, Option<u16>)]| -> Vec<(String, Option<u16>)> {
+            nodes
+                .iter()
+                .map(|(url, port)| (Endpoint::redacted_url(url), *port))
+                .collect()
+        };
+        let decode: Vec<String> = self
+            .workers
+            .decode
+            .iter()
+            .map(|url| Endpoint::redacted_url(url))
+            .collect();
+        let mut lines = Vec::new();
+        if self.workers.pd_disaggregation && !prefill_urls.is_empty() {
+            lines.push(format!("Prefill nodes: {:?}", shown(prefill_urls)));
+            lines.push(format!("Decode nodes: {decode:?}"));
+        }
+        if self.workers.epd_disaggregation {
+            lines.push(format!("Encode nodes: {:?}", shown(encode_urls)));
+            lines.push(format!("Prefill nodes: {:?}", shown(prefill_urls)));
+            lines.push(format!("Decode nodes: {decode:?}"));
+        }
+        lines
+    }
+
+    /// Phase 3, configure: the router configuration, validated once by the
+    /// builder's `build()`, wrapped in the server configuration. Every
+    /// refusal is a [`ConfigError`] naming the flag; nothing has been bound
+    /// or spawned when one is raised. (`startup` validates once more, for a
+    /// library caller that never went through the builder.)
     pub(crate) fn configure(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
         encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<ServerConfig> {
         let router_config = self.to_router_config(prefill_urls, encode_urls)?;
-        router_config.validate()?;
         self.to_server_config(router_config)
     }
 }

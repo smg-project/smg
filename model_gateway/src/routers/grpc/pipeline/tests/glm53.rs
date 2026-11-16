@@ -1,10 +1,39 @@
-//! GLM-5.3 media reminders through the normal gRPC pipelines.
+//! GLM-5.3 checkpoint rendering through the normal gRPC pipelines.
 
 use super::*;
-use crate::worker::test_support::no_health_check;
+use crate::{
+    routers::grpc::common::stages::selection_context_length, worker::test_support::no_health_check,
+};
 
 /// Build a checkpoint-backed tokenizer without any multimodal components.
 async fn glm53_components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
+    let components = glm53_checkpoint_components(
+        worker_registry,
+        serde_json::json!({"model_type": "glm_moe_dsa", "architectures": ["GlmMoeDsaForCausalLM"]}),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crates/tokenizer/tests/fixtures/glm53/chat_template.jinja"
+        )),
+    )
+    .await;
+    assert_eq!(
+        components
+            .tokenizer_registry
+            .get(MODEL)
+            .unwrap()
+            .renderer_capabilities()
+            .media_handling,
+        llm_tokenizer::traits::MediaHandling::TemplateText
+    );
+    components
+}
+
+/// Load a minimal tokenizer with the selected GLM checkpoint's config and template.
+async fn glm53_checkpoint_components(
+    worker_registry: Arc<WorkerRegistry>,
+    config: serde_json::Value,
+    template: &str,
+) -> Arc<SharedComponents> {
     let components = components(worker_registry).await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tokenizer.json");
@@ -20,31 +49,13 @@ async fn glm53_components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedCom
         .to_string(),
     )
     .unwrap();
-    std::fs::write(
-        dir.path().join("config.json"),
-        serde_json::json!({
-            "model_type": "glm_moe_dsa", "architectures": ["GlmMoeDsaForCausalLM"]
-        })
-        .to_string(),
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("chat_template.jinja"),
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../crates/tokenizer/tests/fixtures/glm53/chat_template.jinja"
-        )),
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+    std::fs::write(dir.path().join("chat_template.jinja"), template).unwrap();
     let tokenizer = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(llm_tokenizer::CachedTokenizer::new(
         Arc::new(tokenizer),
         Default::default(),
     ));
-    assert_eq!(
-        tokenizer.renderer_capabilities().media_handling,
-        llm_tokenizer::traits::MediaHandling::TemplateText
-    );
     components.tokenizer_registry.remove_by_id("tokenizer-id");
     components
         .tokenizer_registry
@@ -134,9 +145,12 @@ async fn glm53_media_returns_normal_completion_and_stream_without_media_processi
 async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
     use crate::routers::grpc::{
         backend_client::BackendClient, client::GrpcClient, proto_wrapper::ProtoGenerateRequest,
+        spec::ResponseSpec,
     };
     // A transport listener is enough: construction never calls an engine RPC.
     let port = spawn_stub(GatedScheduler::default()).await;
+    // The window the fixture's prefill and decode workers advertise.
+    const WINDOW: u32 = 8_192;
     for endpoint in [Endpoint::Chat, Endpoint::Messages] {
         let registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type) in [
@@ -147,7 +161,7 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
                 .worker_type(worker_type)
                 .connection_mode(ConnectionMode::Grpc)
                 .runtime_type(RuntimeType::Sglang)
-                .model(ModelCard::new(MODEL))
+                .model(ModelCard::new(MODEL).with_context_length(WINDOW))
                 .label(SUPPORTS_VISION_LABEL, "false")
                 .health_config(no_health_check())
                 .build();
@@ -185,6 +199,7 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
                 tokenizer.as_ref(),
                 &request.messages,
                 false,
+                false,
             )
             .await
             .unwrap();
@@ -201,7 +216,12 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
                 .await
                 .unwrap(),
             );
-            RequestContext::for_messages(Arc::new(request), None, MODEL.into(), components)
+            RequestContext::for_messages_carrying_its_tools(
+                Arc::new(request),
+                None,
+                MODEL.into(),
+                components,
+            )
         };
         pipeline.stages.preparation.execute(&mut ctx).await.unwrap();
         assert!(ctx.state.multimodal_intermediate.is_none());
@@ -268,6 +288,22 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
             .await
             .unwrap();
         assert!(matches!(built.plan, ExecutionPlan::PrefillDecode(_)));
+        if let ResponseSpec::Messages(spec) = &built.spec {
+            assert_eq!(
+                spec.prompt_tokens as usize,
+                token_ids.len(),
+                "the Messages spec carries the rendered prompt's count"
+            );
+            let window = selection_context_length(
+                ctx.state.workers.as_ref().expect("selected workers"),
+                &ctx.input.model_id,
+            );
+            assert_eq!(window, Some(WINDOW), "the pair advertises its window");
+            assert_eq!(
+                spec.context_window, window,
+                "the Messages spec carries the selected workers' window"
+            );
+        }
         for request in built.plan.generate_requests_mut() {
             let ProtoGenerateRequest::Sglang(request) = request else {
                 panic!("SGLang proto")
@@ -318,6 +354,7 @@ fn glm53_media_is_recorded_before_the_template_renders_it_as_text() {
                 tokenizer.as_ref(),
                 &request.messages,
                 true,
+                false,
             )
             .await
             .unwrap();
@@ -345,4 +382,184 @@ fn glm53_media_is_recorded_before_the_template_renders_it_as_text() {
         Some(1.0),
         "{body}"
     );
+}
+
+/// Chat preparation renders a `medium` effort on a GLM-5.3 model as
+/// `High`, the level z.ai maps it to (issue #5181).
+#[tokio::test]
+async fn glm53_medium_effort_is_rendered_as_high() {
+    use openai_protocol::validated::Normalizable;
+
+    let port = spawn_stub(GatedScheduler::default()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    register_worker_with_labels(&registry, port, WorkerType::Regular, LANGUAGE_MODEL_ONLY);
+    let deps = PipelineDeps::pair(
+        registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    );
+    let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).unwrap();
+    let components = glm53_components(registry).await;
+    let mut request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "zai-org/GLM-5.3",
+        "max_tokens": 8,
+        "reasoning_effort": "medium",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+    request.normalize();
+    assert_eq!(request.reasoning_effort.as_deref(), Some("high"));
+    let mut ctx = RequestContext::for_chat(Arc::new(request), None, MODEL.into(), components);
+    pipeline.stages.preparation.execute(&mut ctx).await.unwrap();
+    let Some(PreparationOutput::Chat {
+        processed_messages, ..
+    }) = ctx.state.preparation.as_ref()
+    else {
+        panic!("chat preparation")
+    };
+    let prompt = &processed_messages.text;
+    assert!(prompt.contains("Reasoning Effort: High"), "{prompt}");
+}
+
+/// Chat preparation expands a Flash tool reference to its declared function schema.
+#[tokio::test]
+async fn glm53_flash_tool_reference_reaches_the_prompt() {
+    use axum::{body::Body, extract::FromRequest, http::Request};
+    use openai_protocol::{profile::ProviderProfile, validated::ValidatedJson};
+    use serde_json::json;
+
+    const MODEL_ID: &str = "zai-org/GLM-5.3-Flash";
+    const ALIAS: &str = "weather-reference-test-alias";
+    const TEXT_ALIAS: &str = "weather-reference-text-test-alias";
+    ProviderProfile::register_model_aliases([(ALIAS, MODEL_ID), (TEXT_ALIAS, "glm-5.3")]);
+    let registry = Arc::new(WorkerRegistry::new());
+    let deps = PipelineDeps::pair(
+        registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    );
+    let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).unwrap();
+    let components = glm53_checkpoint_components(
+        registry,
+        json!({"model_type": "glm5_next", "architectures": ["Glm5NextForConditionalGeneration"]}),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crates/tokenizer/tests/fixtures/glm53/chat_template_flash.jinja"
+        )),
+    )
+    .await;
+
+    let reference = json!({"type": "tool_reference", "name": "weather"});
+    let request = json!({
+        "messages": [
+            {"role": "user", "content": "Find a weather tool"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "call_search", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_search", "content": [reference]}
+        ],
+        "tools": [
+            {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "weather", "parameters": {"type": "object"}}}
+        ]
+    });
+    let undeclared = json!({"type": "tool_reference", "name": "undeclared"});
+    let missing_name = json!({"type": "tool_reference"});
+    let text = json!({"type": "text", "text": "extra"});
+    let cases = [
+        (MODEL_ID, "tool", json!([reference]), true),
+        ("glm-5.3-flash", "tool", json!([reference]), true),
+        ("GLM-5.3-Flash-BF16", "tool", json!([reference]), true),
+        (ALIAS, "tool", json!([reference]), true),
+        (TEXT_ALIAS, "tool", json!([reference]), false),
+        ("glm-5.3", "tool", json!([reference]), false),
+        ("glm-5.3-flashlight", "tool", json!([reference]), false),
+        ("local-model", "tool", json!([reference]), false),
+        (MODEL_ID, "user", json!([reference]), false),
+        (MODEL_ID, "tool", json!([undeclared]), false),
+        (MODEL_ID, "tool", json!([missing_name]), false),
+        (
+            MODEL_ID,
+            "tool",
+            json!([{"type": "tool_reference", "name": 42}]),
+            false,
+        ),
+        (MODEL_ID, "tool", json!([reference, text]), false),
+        (MODEL_ID, "tool", json!([text, reference]), false),
+    ];
+    let filtered_cases = ["weather", "search"].map(|name| {
+        (
+            MODEL_ID,
+            "tool",
+            json!([reference]),
+            name == "weather",
+            json!({"type": "allowed_tools", "mode": "auto",
+                "tools": [{"type": "function", "name": name}]}),
+        )
+    });
+    for (model, role, content, accepted, tool_choice) in cases
+        .into_iter()
+        .map(|(model, role, content, accepted)| (model, role, content, accepted, json!(null)))
+        .chain(filtered_cases)
+    {
+        let mut wire = request.clone();
+        wire["model"] = json!(model);
+        wire["tool_choice"] = tool_choice;
+        wire["messages"][2]["role"] = json!(role);
+        wire["messages"][2]["content"] = content;
+        let http_request = Request::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(wire.to_string()))
+            .unwrap();
+        let ValidatedJson(request) =
+            ValidatedJson::<ChatCompletionRequest>::from_request(http_request, &())
+                .await
+                .unwrap();
+        let mut ctx = RequestContext::for_chat(
+            Arc::new(request),
+            None,
+            MODEL.into(),
+            Arc::clone(&components),
+        );
+        let result = pipeline.stages.preparation.execute(&mut ctx).await;
+        if accepted {
+            if let Err(response) = result {
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                panic!("{model}: {}", String::from_utf8_lossy(&body));
+            }
+            let Some(PreparationOutput::Chat {
+                processed_messages, ..
+            }) = ctx.state.preparation.as_ref()
+            else {
+                panic!("chat preparation");
+            };
+            // Observation and generation suffix from the official template at 84c6a6a.
+            assert!(
+                processed_messages.text.ends_with(concat!(
+                    "<|observation|><tool_response><tools>\n",
+                    "{\"name\": \"weather\", \"parameters\": {\"type\": \"object\"}}\n",
+                    "</tools></tool_response><|assistant|><think>"
+                )),
+                "{model}: {}",
+                processed_messages.text
+            );
+        } else {
+            let response = result.unwrap_err();
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body["error"]["code"], "unsupported_content_part",
+                "{model}: {body}"
+            );
+        }
+    }
 }

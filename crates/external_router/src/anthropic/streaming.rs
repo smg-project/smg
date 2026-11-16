@@ -357,16 +357,10 @@ mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     use super::*;
-    use crate::anthropic::worker::probe::{counted_failure, series_line};
-
-    fn answer(status: u16) -> reqwest::Response {
-        reqwest::Response::from(
-            http::Response::builder()
-                .status(status)
-                .body(reqwest::Body::from("{}"))
-                .expect("a response"),
-        )
-    }
+    use crate::{
+        anthropic::worker::probe::{counted_failure, series_line},
+        test_support::upstream,
+    };
 
     /// An upstream error status ends the iteration with the error the client
     /// is told and one error counted against the model under `backend_error`
@@ -378,7 +372,7 @@ mod tests {
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
 
-        let refused = upstream_answer(answer(503), "loop-refused", Instant::now())
+        let refused = upstream_answer(upstream(503, None, "{}"), "loop-refused", Instant::now())
             .expect_err("an error status ends the iteration");
         assert_eq!(
             refused,
@@ -394,8 +388,8 @@ mod tests {
             )
         );
 
-        let passed =
-            upstream_answer(answer(200), "loop-ok", Instant::now()).expect("a success passes");
+        let passed = upstream_answer(upstream(200, None, "{}"), "loop-ok", Instant::now())
+            .expect("a success passes");
         assert_eq!(passed.status(), StatusCode::OK);
         assert!(series_line(&handle, "smg_router_request_errors_total", "loop-ok").is_none());
     }

@@ -86,6 +86,33 @@ class TestLoadConversion:
         assert load.HasField("active_token_usage")
         assert load.active_token_usage == 0.25
 
+    def test_resident_tokens_reach_the_poll_and_the_pushed_record(self, loads_mod):
+        def snapshot(**resident):
+            return SimpleNamespace(
+                dp_rank=0,
+                num_running_reqs=3,
+                num_waiting_reqs=0,
+                num_active_pages=4,
+                num_used_pages=8,
+                max_total_pages=16,
+                **resident,
+            )
+
+        counted = snapshot(num_resident_tokens=210_000)
+        load = loads_mod.convert_snapshot_to_protobuf(
+            counted, max_total_num_tokens=16384, max_running_requests=16
+        )
+        record = loads_mod.load_record(
+            [counted], 0, max_total_num_tokens=16384, max_running_requests=16
+        )
+        assert load.num_resident_tokens == 210_000
+        assert record.num_resident_tokens == 210_000
+        # An engine that does not count them leaves them absent, not zero.
+        record = loads_mod.load_record(
+            [snapshot()], 0, max_total_num_tokens=16384, max_running_requests=16
+        )
+        assert not record.HasField("num_resident_tokens")
+
     def test_window_and_derived_counters_reach_the_protobuf(self, loads_mod):
         load_output = SimpleNamespace(dp_rank=1, num_reqs=5, num_waiting_reqs=2, num_pages=8)
 

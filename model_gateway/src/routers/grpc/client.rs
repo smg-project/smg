@@ -10,8 +10,9 @@ use openai_protocol::{
     worker::{ConstrainedDecoding, WorkerLoadResponse},
 };
 use smg_grpc_client::{
-    common_proto, mlx_proto, sglang_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle,
-    tokenspeed_proto, trtllm_proto, vllm_proto, BoxedTraceInjector, MlxEngineClient,
+    common_proto, media_identity::sglang as media_contract, mlx_proto, sglang_proto,
+    tokenizer_bundle, tokenizer_bundle::StreamBundle, tokenspeed_proto, trtllm_proto, vllm_proto,
+    BoxedTraceInjector, FormatSetAside, MlxEngineClient, OutputConstraint,
     SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
     TrtllmServiceClient, VllmEngineClient,
 };
@@ -21,7 +22,8 @@ use crate::{
     observability::otel_trace::OtelTraceInjector,
     routers::grpc::{
         proto_wrapper::{
-            cleanup_mm_shm_handles, collect_tokenspeed_generate_request_shm_handles,
+            cleanup_generate_request_shm, cleanup_mm_shm_handles,
+            collect_tokenspeed_generate_request_shm_handles,
             collect_vllm_generate_request_shm_handles, finish_tokenspeed_request,
             finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
             ProtoStream,
@@ -59,6 +61,11 @@ pub enum GrpcClient {
 pub struct GenerateRequestBuildOptions {
     pub multimodal_inputs: Option<MultimodalData>,
     pub tool_constraints: Option<(String, String)>,
+    /// Which of a chat body's own format fields `tool_constraints` answers (a
+    /// table's tag for a JSON `response_format`; the whole turn's grammar for
+    /// the `regex` and the `ebnf` too): the builders read them as absent, so
+    /// the engine's request carries the constraint alone.
+    pub format_set_aside: FormatSetAside,
     pub require_reasoning: bool,
     /// `tool_constraints` was led with the model's thought and its close for
     /// a worker whose engine starts the grammar at the first generated token:
@@ -71,44 +78,13 @@ pub struct GenerateRequestBuildOptions {
 impl GrpcClient {
     #[expect(
         clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang_mut(&mut self) -> &mut SglangSchedulerClient {
-        match self {
-            Self::Sglang(client) => client,
-            _ => panic!("Expected SGLang client"),
-        }
-    }
-
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
-    pub fn is_vllm(&self) -> bool {
-        matches!(self, Self::Vllm(_))
-    }
-
-    pub fn is_trtllm(&self) -> bool {
-        matches!(self, Self::Trtllm(_))
-    }
-
-    pub fn is_mlx(&self) -> bool {
-        matches!(self, Self::Mlx(_))
-    }
-
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_tokenspeed() check"
+        reason = "typed accessor: the caller guarantees the variant"
     )]
     pub fn as_tokenspeed(&self) -> &TokenSpeedSchedulerClient {
         match self {
             Self::TokenSpeed(client) => client,
             _ => panic!("Expected TokenSpeed client"),
         }
-    }
-
-    pub fn is_tokenspeed(&self) -> bool {
-        matches!(self, Self::TokenSpeed(_))
     }
 
     /// Runtime type backing this client. Lets shared logic (e.g. the multimodal
@@ -208,11 +184,8 @@ impl GrpcClient {
     /// Get the full load response from the backend.
     /// Returns `Unimplemented` for backends without scheduler load metrics.
     pub async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
-        // Optional sections beyond `core` (disagg/queues/memory) are dropped by
-        // engines that do not report them, so requesting them is always safe and
-        // leaves routing consumers, which only read `core`, unaffected.
         let include = || {
-            ["core", "disagg", "queues", "memory"]
+            smg_grpc_client::engine_load::LOAD_SECTIONS
                 .into_iter()
                 .map(String::from)
                 .collect::<Vec<_>>()
@@ -230,7 +203,11 @@ impl GrpcClient {
                 let resp = client.get_loads(include()).await?;
                 Ok(WorkerLoadResponse::from(resp))
             }
-            _ => Err(tonic::Status::unimplemented(
+            Self::Trtllm(client) => {
+                let resp = client.get_loads(include()).await?;
+                Ok(WorkerLoadResponse::from(resp))
+            }
+            Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "GetLoads RPC not supported for this backend",
             )),
         }
@@ -318,6 +295,25 @@ impl GrpcClient {
         }
     }
 
+    /// The servicer's load records alone, no events (`SubscribeKvEvents`
+    /// with `loads_only`): what a worker streams when routing reads its load
+    /// and keeps no KV index. A servicer that predates the field streams its
+    /// events too; the subscriber drops them. `Unimplemented` on backends
+    /// without the stream.
+    pub async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        match self {
+            Self::Sglang(client) => client.subscribe_load_records().await,
+            Self::Vllm(client) => client.subscribe_load_records().await,
+            Self::Trtllm(client) => client.subscribe_load_records().await,
+            Self::TokenSpeed(client) => client.subscribe_load_records().await,
+            Self::Mlx(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents RPC not supported for MLX backend",
+            )),
+        }
+    }
+
     pub async fn get_server_info(&self) -> Result<ServerInfo, tonic::Status> {
         match self {
             Self::Sglang(client) => Ok(ServerInfo::Sglang(Box::new(
@@ -358,18 +354,21 @@ impl GrpcClient {
     ///
     /// Dispatches to the appropriate backend client and wraps the result in ProtoStream.
     /// Returns `tonic::Status` on error so callers can inspect the gRPC status code directly.
+    /// A request in another runtime's message type than the client's is
+    /// answered `UNIMPLEMENTED` with both runtimes named, as an RPC absent
+    /// on a backend's wire is.
     pub async fn generate(
         &mut self,
         req: ProtoGenerateRequest,
     ) -> Result<ProtoStream, tonic::Status> {
         match (self, req) {
             (Self::Sglang(client), ProtoGenerateRequest::Sglang(boxed_req)) => {
-                let stream = client.generate(*boxed_req).await?;
+                let stream = client.generate_framed(*boxed_req).await?;
                 Ok(ProtoStream::Sglang(stream))
             }
             (Self::Vllm(client), ProtoGenerateRequest::Vllm(boxed_req)) => {
                 let shm_handles = collect_vllm_generate_request_shm_handles(&boxed_req);
-                match client.generate(*boxed_req).await {
+                match client.generate_framed(*boxed_req).await {
                     Ok(stream) => Ok(ProtoStream::Vllm(stream)),
                     Err(error) => {
                         cleanup_mm_shm_handles(&shm_handles);
@@ -387,7 +386,7 @@ impl GrpcClient {
             }
             (Self::TokenSpeed(client), ProtoGenerateRequest::TokenSpeed(boxed_req)) => {
                 let shm_handles = collect_tokenspeed_generate_request_shm_handles(&boxed_req);
-                match client.generate(*boxed_req).await {
+                match client.generate_framed(*boxed_req).await {
                     Ok(stream) => Ok(ProtoStream::TokenSpeed(stream)),
                     Err(error) => {
                         cleanup_mm_shm_handles(&shm_handles);
@@ -395,18 +394,27 @@ impl GrpcClient {
                     }
                 }
             }
-            #[expect(
-                clippy::panic,
-                reason = "client and request types are always matched by construction in the pipeline"
-            )]
-            _ => panic!("Mismatched client and request types"),
+            // A request in another runtime's message type than this client's.
+            // The pair index keeps known runtimes apart on this wire and a
+            // single placement builds its request with the client that sends
+            // it, so nothing is known to reach this arm. A pair that did is
+            // one this wire has no call for: the status is the caller's to
+            // answer, where a panic ended the request's task with no answer.
+            // No worker receives the request, so its shared-memory segments
+            // are unlinked here, as the arms above unlink theirs on a send
+            // error.
+            (client, req) => {
+                cleanup_generate_request_shm(&req);
+                Err(tonic::Status::unimplemented(format!(
+                    "a {} request cannot be sent to a {} worker",
+                    req.runtime_type(),
+                    client.runtime_type()
+                )))
+            }
         }
     }
 
-    pub async fn embed(
-        &mut self,
-        req: ProtoEmbedRequest,
-    ) -> Result<ProtoEmbedComplete, tonic::Status> {
+    pub async fn embed(&self, req: ProtoEmbedRequest) -> Result<ProtoEmbedComplete, tonic::Status> {
         match (self, req) {
             (Self::Sglang(client), ProtoEmbedRequest::Sglang(boxed_req)) => {
                 let resp = client.embed(*boxed_req).await?;
@@ -422,11 +430,16 @@ impl GrpcClient {
             (Self::Mlx(_), _) => Err(tonic::Status::unimplemented(
                 "MLX backend does not support embedding",
             )),
-            #[expect(
-                clippy::panic,
-                reason = "client and request types are always matched by construction in the pipeline"
-            )]
-            _ => panic!("Mismatched client and request types or unsupported embedding backend"),
+            // A request in another runtime's message type than this client's,
+            // or a backend with no embedding call. The embedding stage builds
+            // each request with the client that sends it, so nothing is known
+            // to reach this arm; one that did is answered as the generate
+            // dispatch answers it.
+            (client, req) => Err(tonic::Status::unimplemented(format!(
+                "a {} embedding request cannot be sent to a {} worker",
+                req.runtime_type(),
+                client.runtime_type()
+            ))),
         }
     }
 
@@ -543,9 +556,14 @@ impl GrpcClient {
         let GenerateRequestBuildOptions {
             multimodal_inputs,
             tool_constraints,
+            format_set_aside,
             require_reasoning,
             first_token_grammar,
         } = options;
+        let constraint = OutputConstraint {
+            tool: tool_constraints,
+            set_aside: format_set_aside,
+        };
         let EngineBuilders {
             sglang,
             vllm,
@@ -556,10 +574,12 @@ impl GrpcClient {
         let mut request = match self {
             Self::Sglang(client) => {
                 let sglang_mm = engine_multimodal(multimodal_inputs, |mm| match mm {
-                    MultimodalData::Sglang(data) => Some(data.into_proto()),
+                    MultimodalData::Sglang(data) => Some(data.into_protos()),
                     _ => None,
                 });
-                let req = sglang(
+                let (sglang_mm, extras) =
+                    sglang_mm.map_or((None, Vec::new()), |(first, extras)| (Some(first), extras));
+                let mut req = sglang(
                     client,
                     request_id,
                     body,
@@ -567,10 +587,12 @@ impl GrpcClient {
                     token_ids,
                     SglangGenerateRequestOptions {
                         multimodal_inputs: sglang_mm,
-                        tool_call_constraint: tool_constraints,
+                        tool_call_constraint: constraint.tool,
+                        format_set_aside: constraint.set_aside,
                         require_reasoning,
                     },
                 )?;
+                req.extra_mm_inputs = extras;
                 Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
             }
             Self::Vllm(_) => {
@@ -579,14 +601,7 @@ impl GrpcClient {
                     _ => None,
                 });
                 finish_vllm_request(vllm_mm, |mm| {
-                    vllm(
-                        request_id,
-                        body,
-                        processed_text,
-                        token_ids,
-                        mm,
-                        tool_constraints,
-                    )
+                    vllm(request_id, body, processed_text, token_ids, mm, constraint)
                 })
             }
             Self::Trtllm(client) => {
@@ -601,7 +616,7 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     trtllm_mm,
-                    tool_constraints,
+                    constraint,
                 )?;
                 Ok(ProtoGenerateRequest::Trtllm(Box::new(req)))
             }
@@ -613,7 +628,7 @@ impl GrpcClient {
                     body,
                     processed_text,
                     token_ids,
-                    tool_constraints,
+                    constraint,
                 )?;
                 Ok(ProtoGenerateRequest::Mlx(Box::new(req)))
             }
@@ -623,14 +638,7 @@ impl GrpcClient {
                     _ => None,
                 });
                 finish_tokenspeed_request(tokenspeed_mm, |mm| {
-                    tokenspeed(
-                        request_id,
-                        body,
-                        processed_text,
-                        token_ids,
-                        mm,
-                        tool_constraints,
-                    )
+                    tokenspeed(request_id, body, processed_text, token_ids, mm, constraint)
                 })
             }
         }?;
@@ -684,7 +692,7 @@ pub(crate) type VllmMmBuilder<B> = fn(
     String,
     Vec<u32>,
     Option<vllm_proto::MultimodalInputs>,
-    Option<(String, String)>,
+    OutputConstraint,
 ) -> Result<vllm_proto::GenerateRequest, String>;
 
 /// The TokenSpeed counterpart of [`VllmMmBuilder`].
@@ -694,7 +702,7 @@ pub(crate) type TokenSpeedMmBuilder<B> = fn(
     String,
     Vec<u32>,
     Option<tokenspeed_proto::MultimodalInputs>,
-    Option<(String, String)>,
+    OutputConstraint,
 ) -> Result<tokenspeed_proto::GenerateRequest, String>;
 
 /// The SGLang counterpart of [`VllmMmBuilder`] on the connected client; its
@@ -716,7 +724,7 @@ type TrtllmClientMmBuilder<B> = fn(
     String,
     Vec<u32>,
     Option<trtllm_proto::MultimodalInput>,
-    Option<(String, String)>,
+    OutputConstraint,
 ) -> Result<trtllm_proto::GenerateRequest, String>;
 
 /// The MLX counterpart of [`VllmMmBuilder`] on the connected client; MLX
@@ -727,7 +735,7 @@ type MlxClientMmBuilder<B> = fn(
     &B,
     String,
     Vec<u32>,
-    Option<(String, String)>,
+    OutputConstraint,
 ) -> Result<mlx_proto::GenerateRequest, String>;
 
 /// A vLLM builder for a request kind with neither multimodal inputs nor tool
@@ -941,7 +949,8 @@ impl ServerInfo {
 
 /// Keys worth extracting from SGLang gRPC `server_args` (which contains the full config).
 const SGLANG_GRPC_KEYS: &[&str] = &[
-    smg_grpc_client::sglang_media_identity::LABEL,
+    "multimodal_encoder_dtype",
+    media_contract::LABEL,
     "mm_processor",
     "mm_media_ref_schemes",
     "model_path",
@@ -1133,6 +1142,20 @@ mod tests {
     use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
 
     use super::{trtllm_status_healthy, ModelInfo, ServerInfo, SUPPORTS_VISION_LABEL};
+
+    /// EC compatibility fields survive discovery as routing labels.
+    #[test]
+    fn vllm_ec_capabilities_flatten_into_labels() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            supports_ec_transfer: true,
+            ec_connector: "ECCPUConnector".into(),
+            ec_role: "ec_producer".into(),
+            ..Default::default()
+        }));
+        let labels = info.to_labels();
+        assert_eq!(labels["ec_connector"], "ECCPUConnector");
+        assert_eq!(labels["ec_role"], "ec_producer");
+    }
 
     /// A vLLM worker's `GetServerInfo` fields flatten into labels as they
     /// are: the engine's per-prompt media limits arrive as `mm_item_limits`
@@ -1628,6 +1651,7 @@ mod tests {
         assert!(!silent.contains_key("reasoning_parser"));
     }
 
+    /// SGLang server facts expose routing capabilities while filtering secrets.
     #[test]
     fn server_info_to_labels_sglang_picks_curated_keys_and_version() {
         let info = ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
@@ -1657,6 +1681,10 @@ mod tests {
                         "mm_item_limits".to_string(),
                         string_value("image=1,video=1"),
                     ),
+                    (
+                        "multimodal_encoder_dtype".to_string(),
+                        string_value("bfloat16"),
+                    ),
                     // Not in SGLANG_GRPC_KEYS — must not become a label.
                     ("api_key".to_string(), string_value("secret")),
                 ]),
@@ -1679,6 +1707,10 @@ mod tests {
         );
         assert_eq!(labels.get("version").map(String::as_str), Some("0.4.0"));
         assert!(!labels.contains_key("api_key"));
+        assert_eq!(
+            labels.get("multimodal_encoder_dtype").map(String::as_str),
+            Some("bfloat16")
+        );
         // The pairing-protocol facts survive: transport, bootstrap port, KV layout.
         assert_eq!(
             labels

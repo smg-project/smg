@@ -205,18 +205,11 @@ impl<const N: usize> GaugeHistogramVec<N> {
         let mut gauges = Vec::with_capacity(bucket_count);
 
         for i in 0..bucket_count {
-            // Build gt/le labels for this bucket
-            let gt_str = if i == 0 {
-                "0".to_string()
-            } else {
-                self.bounds.bounds[i - 1].to_string()
-            };
-
-            let le_str = if i < N {
-                self.bounds.bounds[i].to_string()
-            } else {
-                "+Inf".to_string()
-            };
+            let gt_str = self.bounds.lower_bound(i).to_string();
+            let le_str = self
+                .bounds
+                .upper_bound(i)
+                .map_or_else(|| "+Inf".to_string(), |bound| bound.to_string());
 
             // Build complete label set
             let mut all_labels: Vec<Label> = Vec::with_capacity(labels.len() + 2);

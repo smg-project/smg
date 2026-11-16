@@ -6,6 +6,11 @@
 //! attempt is lost to the socket under the call, and the client is answered
 //! as for every other way the worker's transport fails, on the last attempt
 //! as on the ones before it.
+//!
+//! Unix alone: the engine's port is kept across its lives by a shared
+//! reservation (`RefusedAddress::reserve_shared`), a Unix socket option.
+
+#![cfg(unix)]
 
 use std::{
     sync::{
@@ -27,14 +32,17 @@ use smg::{
     routers::{RouterFactory, RouterTrait},
     tenant::TenantKey,
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        manager::{WorkerManager, WorkerManagerConfig},
+        health::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            manager::{WorkerManager, WorkerManagerConfig},
+        },
+        test_support::RefusedAddress,
         BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
     },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::oneshot,
     task::JoinHandle,
 };
@@ -45,15 +53,19 @@ const MODEL: &str = "restart-test-model";
 
 /// The probes' cadence: a demotion or a promotion is one probe away.
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// A probe's bound, and the gap the schedule puts between a demoted worker's
+/// passing probe and its next read.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Far longer than the test: the breaker's own timeout must play no part.
 const BREAKER_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long after the restart a request must have succeeded: a few probe
 /// intervals, a small fraction of the breaker's timeout.
 const RECOVERY_BOUND: Duration = Duration::from_secs(10);
 
-/// An in-process mock engine on a fixed port that can be stopped: the stop
-/// closes its listener and its connections, which is what a killed engine
-/// process looks like to the gateway, and the port is free for a restart.
+/// An in-process mock engine on the case's reserved address that can be
+/// stopped: the stop closes its listener and its connections, which is what a
+/// killed engine process looks like to the gateway, and the reservation keeps
+/// the port, refused, for the restart.
 struct MockEngine {
     stop: oneshot::Sender<()>,
     served: JoinHandle<()>,
@@ -65,8 +77,9 @@ impl MockEngine {
         reason = "test helper: the mock engine's serve task ends with its stop signal, \
                   which the test sends before it returns"
     )]
-    async fn start(port: u16) -> Self {
-        let listener = bind(port).await;
+    fn start(address: &RefusedAddress) -> Self {
+        let listener = address.listen_shared();
+        let port = address.port();
         let cfg = Arc::new(mock_worker::config::Config {
             admin_port: None,
             context_length: 32768,
@@ -101,46 +114,6 @@ impl MockEngine {
     async fn kill(self) {
         let _ = self.stop.send(());
         let _ = self.served.await;
-    }
-}
-
-/// Bind the engine's fixed port; a restart may find the address still being
-/// released by the kernel, so the bind is retried for a moment.
-async fn bind(port: u16) -> TcpListener {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match TcpListener::bind(("127.0.0.1", port)).await {
-            Ok(listener) => return listener,
-            Err(err) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "bind 127.0.0.1:{port} for the mock engine: {err}"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test helper: a port the OS cannot hand out fails the fixture"
-)]
-async fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("ephemeral port address")
-        .port()
-}
-
-/// Wait for `done`, within `bound`.
-async fn wait_until(what: &str, bound: Duration, mut done: impl FnMut() -> bool) {
-    let started = Instant::now();
-    while !done() {
-        assert!(started.elapsed() < bound, "{what}: not within {bound:?}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -222,7 +195,7 @@ async fn build_router_with(
             .runtime_type(RuntimeType::TokenSpeed)
             .model(ModelCard::new(MODEL))
             .health_config(HealthCheckConfig {
-                timeout_secs: 1,
+                timeout_secs: PROBE_TIMEOUT.as_secs(),
                 check_interval_secs: probe_interval.as_secs(),
                 success_threshold,
                 failure_threshold: 1,
@@ -261,28 +234,46 @@ async fn build_router_with(
 /// breaker on trial instead of leaving it to its timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
-    let port = free_port().await;
-    let engine = MockEngine::start(port).await;
+    let address = RefusedAddress::reserve_shared();
+    let port = address.port();
+    let engine = MockEngine::start(&address);
     let (router, worker, mut manager) = build_router(port, 1, None).await;
 
     // Pending until the first probe passes; then it serves.
-    wait_until("the worker's first promotion", RECOVERY_BOUND, || {
+    common::wait_until("the worker's first promotion", RECOVERY_BOUND, || {
         worker.status() == WorkerStatus::Ready
     })
     .await;
     assert_eq!(request_status(router.as_ref()).await, 200);
 
-    // The engine dies: the next request fails and opens the breaker, the
-    // next probe demotes the worker, and requests are refused.
+    // The engine dies, and two things can find it first. A request: it
+    // fails and opens the breaker, and the next probe demotes the worker. Or
+    // a probe: the worker is demoted, its requests are refused before the
+    // worker is tried, and the breaker never sees a failure. Either way the
+    // worker stops being routable: one that stays ready with a closed
+    // breaker through twenty requests fails here.
     engine.kill().await;
     for _ in 0..20 {
-        if worker.circuit_breaker_state() == CircuitState::Open {
+        if worker.circuit_breaker_state() == CircuitState::Open
+            || worker.status() != WorkerStatus::Ready
+        {
             break;
         }
         let _ = request_status(router.as_ref()).await;
     }
+    if worker.circuit_breaker_state() != CircuitState::Open {
+        assert_ne!(
+            worker.status(),
+            WorkerStatus::Ready,
+            "twenty requests to a dead engine left the worker ready and its breaker closed"
+        );
+        // The probe came first. The case is about a worker that returns with
+        // its breaker open, so the failure a request would have recorded is
+        // recorded here.
+        worker.record_circuit_breaker_outcome(false);
+    }
     assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
-    wait_until("the worker's demotion", RECOVERY_BOUND, || {
+    common::wait_until("the worker's demotion", RECOVERY_BOUND, || {
         worker.status() != WorkerStatus::Ready
     })
     .await;
@@ -290,7 +281,7 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
 
     // The engine comes back on the same address.
     let restarted = Instant::now();
-    let engine = MockEngine::start(port).await;
+    let engine = MockEngine::start(&address);
     let mut first_success = None;
     while restarted.elapsed() < RECOVERY_BOUND {
         if request_status(router.as_ref()).await == 200 {
@@ -327,18 +318,23 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
 /// restart plus a probe timeout, not two intervals: the probe that passes
 /// short of the threshold brings the next one to a timeout from now. Nothing
 /// contacts the worker while it is out (round robin opens no stream and a
-/// demoted worker is not load-polled), so its probes alone see the return;
-/// the engine comes back right after the probe that demoted the worker, so
-/// the first passing probe is a whole interval away.
+/// demoted worker is not load-polled), so its probes alone see the return,
+/// and every contact the worker records after the restart is a passing
+/// probe: the test reads the probes off the worker's contact clock and
+/// measures the rule between the two reads it is about, so a probe the host
+/// loses or a stall before the pair moves the pair, not the verdict. The
+/// engine comes back right after the probe that demoted the worker, so the
+/// first passing probe is a whole interval away.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_two() {
     const INTERVAL: Duration = Duration::from_secs(3);
-    let port = free_port().await;
-    let engine = MockEngine::start(port).await;
+    let address = RefusedAddress::reserve_shared();
+    let port = address.port();
+    let engine = MockEngine::start(&address);
     let (router, worker, mut manager) = build_router_with(port, 1, None, 2, INTERVAL).await;
 
     // Two passing probes an interval apart: the registration's promotion.
-    wait_until("the worker's first promotion", RECOVERY_BOUND, || {
+    common::wait_until("the worker's first promotion", RECOVERY_BOUND, || {
         worker.status() == WorkerStatus::Ready
     })
     .await;
@@ -347,35 +343,69 @@ async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_
     // The engine dies; the next probe demotes the worker, and the engine is
     // back right after it.
     engine.kill().await;
-    wait_until("the worker's demotion", RECOVERY_BOUND, || {
+    common::wait_until("the worker's demotion", RECOVERY_BOUND, || {
         worker.status() != WorkerStatus::Ready
     })
     .await;
     let restarted = Instant::now();
-    let engine = MockEngine::start(port).await;
+    let engine = MockEngine::start(&address);
 
-    let mut first_success = None;
-    while restarted.elapsed() < RECOVERY_BOUND {
-        if request_status(router.as_ref()).await == 200 {
-            first_success = Some(restarted.elapsed());
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let first_success = first_success.unwrap_or_else(|| {
-        panic!(
-            "no request succeeded within {RECOVERY_BOUND:?} of the restart (worker {:?})",
+    // The passing probes since the restart as offsets from it, the promoting
+    // one last, stamped by the worker's contact clock (a contact older than
+    // the restart is the engine's first life). The status is read first: a
+    // probe stamps its contact before it promotes, so a read of Ready orders
+    // the contact read after the promoting pass. The contact is read between
+    // two reads of the restart's clock: a poll descheduled between them reads
+    // the pass early by as long as it was out, so a reading whose clock reads
+    // are more than a tenth of a timeout apart is skipped and taken again on
+    // the next poll. A reading within a fifth of a timeout of the last one is
+    // the same pass again (the two clocks round to different milliseconds);
+    // the later reading is kept.
+    let mut passes: Vec<Duration> = Vec::new();
+    common::wait_until("the worker's promotion", RECOVERY_BOUND, || {
+        assert!(
+            restarted.elapsed() < RECOVERY_BOUND,
+            "no promotion within {RECOVERY_BOUND:?} of the restart (worker {:?}): {passes:?}",
             worker.status()
-        )
-    });
+        );
+        let ready = worker.status() == WorkerStatus::Ready;
+        let from = restarted.elapsed();
+        let age = worker
+            .runtime_state()
+            .expect("a gateway worker keeps its state")
+            .contact_age();
+        if restarted.elapsed() - from > PROBE_TIMEOUT / 10 {
+            return false;
+        }
+        if let Some(at) = from.checked_sub(age) {
+            match passes.last_mut() {
+                Some(last) if at < *last + PROBE_TIMEOUT / 5 => *last = (*last).max(at),
+                _ => passes.push(at),
+            }
+        }
+        ready
+    })
+    .await;
+    assert_eq!(request_status(router.as_ref()).await, 200);
+
+    let &[.., before, promoting] = passes.as_slice() else {
+        panic!("the promotion took one read, not the threshold's two: {passes:?}")
+    };
     assert!(
-        first_success >= INTERVAL - Duration::from_millis(500),
-        "the first passing probe is the scheduled one, an interval after the demotion: {first_success:?}"
+        promoting >= INTERVAL - Duration::from_millis(500),
+        "the first passing probe is the scheduled one, an interval after the probe that demoted \
+         the worker, so the promotion comes no sooner than that: {passes:?}"
+    );
+    let gap = promoting - before;
+    assert!(
+        gap >= PROBE_TIMEOUT / 2,
+        "two passing probes closer than the probe timeout: something other than the probes \
+         contacts the worker: {passes:?}"
     );
     assert!(
-        first_success < INTERVAL + Duration::from_secs(2),
-        "the second read follows the first a probe timeout (one second) later, not an interval \
-         later: {first_success:?}"
+        gap < PROBE_TIMEOUT + Duration::from_secs(1),
+        "the promoting read follows the passing read before it a probe timeout later, not an \
+         interval later: {passes:?}"
     );
 
     engine.kill().await;
@@ -398,8 +428,8 @@ impl ResettingPeer {
         clippy::disallowed_methods,
         reason = "test helper: the peer's accept loop is aborted by the test before it returns"
     )]
-    async fn start(port: u16) -> Self {
-        let listener = bind(port).await;
+    fn start(address: &RefusedAddress) -> Self {
+        let listener = address.listen_shared();
         let connections = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&connections);
         let served = tokio::spawn(async move {
@@ -476,8 +506,9 @@ async fn read_the_request(stream: &mut TcpStream) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_transport_reset_on_the_last_attempt_is_answered_like_the_attempts_before_it() {
     const ATTEMPTS: u32 = 3;
-    let port = free_port().await;
-    let engine = MockEngine::start(port).await;
+    let address = RefusedAddress::reserve_shared();
+    let port = address.port();
+    let engine = MockEngine::start(&address);
     // The breaker outlasts the attempts: every one of them reaches the worker.
     let (router, worker, mut manager) = build_router(
         port,
@@ -491,7 +522,7 @@ async fn a_transport_reset_on_the_last_attempt_is_answered_like_the_attempts_bef
         }),
     )
     .await;
-    wait_until("the worker's first promotion", RECOVERY_BOUND, || {
+    common::wait_until("the worker's first promotion", RECOVERY_BOUND, || {
         worker.status() == WorkerStatus::Ready
     })
     .await;
@@ -501,7 +532,7 @@ async fn a_transport_reset_on_the_last_attempt_is_answered_like_the_attempts_bef
     manager.shutdown().await;
 
     engine.kill().await;
-    let peer = ResettingPeer::start(port).await;
+    let peer = ResettingPeer::start(&address);
     let response = request(router.as_ref()).await;
     let status = response.status().as_u16();
     let body = to_bytes(response.into_body(), 64 * 1024)

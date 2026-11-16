@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 
+use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
 
 use super::*;
-use crate::worker::{
-    circuit_breaker::{CircuitBreakerConfig, CircuitState},
-    test_support::no_health_check,
-    BasicWorkerBuilder, WorkerLoadGuard,
+use crate::{
+    observability::worker_metrics::{self, WorkerSeriesRecorder},
+    worker::{
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        test_support::no_health_check,
+        BasicWorker, BasicWorkerBuilder, WorkerLoadGuard,
+    },
 };
 
 /// A worker whose breaker opens on one failed request and would stay
@@ -382,6 +386,385 @@ fn origin_tracks_local_and_mesh_registrations() {
     assert_eq!(registry.origin_of(&mesh_id), Some(WorkerOrigin::Mesh));
 }
 
+#[test]
+fn a_model_is_served_locally_only_by_a_worker_this_node_owns() {
+    let registry = WorkerRegistry::new();
+    assert!(!registry.serves_model_locally("llama-3"));
+
+    registry.on_remote_worker_state(&remote_state("peer-w1", "http://remote:8080", true, vec![]));
+    assert!(!registry.serves_model_locally("llama-3"));
+
+    let local: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://local:8080")
+            .model(ModelCard::new("llama-3"))
+            .build(),
+    );
+    registry.register(local).unwrap();
+    assert!(registry.serves_model_locally("llama-3"));
+    registry.remove_by_url("http://local:8080");
+    assert!(!registry.serves_model_locally("llama-3"));
+}
+
+#[test]
+fn a_worker_serves_locally_the_models_it_lists_now() {
+    // A refresh of an endpoint's model list rewrites the worker's models and
+    // leaves the model index as the registration wrote it. Its primary model,
+    // the first card, counts no more than the others once left out.
+    let registry = WorkerRegistry::new();
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("qwen"), ModelCard::new("llama")])
+            .build(),
+    );
+    registry.register(Arc::clone(&endpoint)).unwrap();
+    assert!(registry.serves_model_locally("qwen"));
+    assert!(registry.serves_model_locally("llama"));
+
+    endpoint.set_models(vec![ModelCard::new("llama")]);
+    assert!(!registry.serves_model_locally("qwen"));
+    assert!(registry.serves_model_locally("llama"));
+}
+
+#[test]
+fn a_worker_registered_without_model_cards_serves_its_primary_model() {
+    // Indexed under its primary model alone, the `model_id` label or the
+    // wildcard id: a model list it discovers later leaves that out, and it
+    // still counts for it.
+    let registry = WorkerRegistry::new();
+    let labelled: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://labelled:8080")
+            .label("model_id", "llama")
+            .build(),
+    );
+    let unlabelled: Arc<dyn Worker> =
+        Arc::new(BasicWorkerBuilder::new("http://unlabelled:8080").build());
+    registry.register(Arc::clone(&labelled)).unwrap();
+    registry.register(Arc::clone(&unlabelled)).unwrap();
+    assert!(registry.serves_model_locally("llama"));
+    assert!(registry.serves_model_locally(unlabelled.model_id()));
+
+    labelled.set_models(vec![ModelCard::new("qwen")]);
+    unlabelled.set_models(vec![ModelCard::new("qwen")]);
+    assert!(registry.serves_model_locally("llama"));
+    assert!(registry.serves_model_locally(unlabelled.model_id()));
+}
+
+#[test]
+fn an_alias_is_not_a_model_served_locally() {
+    // Policies are keyed by canonical ids, which the routers resolve every
+    // alias to first.
+    let registry = WorkerRegistry::new();
+    registry
+        .register(worker_with_model_aliases(
+            "http://w1:8080",
+            "llama",
+            &["llama-latest"],
+            WorkerType::Regular,
+        ))
+        .unwrap();
+    assert!(registry.serves_model_locally("llama"));
+    assert!(!registry.serves_model_locally("llama-latest"));
+}
+
+#[test]
+fn a_worker_keeps_the_policy_of_every_model_it_serves_and_of_its_primary_model() {
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("qwen"), ModelCard::new("llama")])
+            .build(),
+    );
+    assert_eq!(
+        WorkerRegistry::policy_model_ids(&endpoint),
+        ["qwen", "llama"]
+    );
+    // A refresh of its model list leaves llama in the model index, and its
+    // removal asks after llama all the same.
+    endpoint.set_models(vec![ModelCard::new("qwen"), ModelCard::new("mistral")]);
+    assert_eq!(
+        WorkerRegistry::policy_model_ids(&endpoint),
+        ["qwen", "mistral", "llama"]
+    );
+
+    // A worker registered before its models were known names its policy by
+    // its primary model, which the models it discovers later leave out.
+    let lazy: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://lazy:8080").build());
+    let primary = lazy.model_id().to_string();
+    lazy.set_models(vec![ModelCard::new("qwen")]);
+    assert_eq!(
+        WorkerRegistry::policy_model_ids(&lazy),
+        vec!["qwen".to_string(), primary]
+    );
+}
+
+/// A gRPC worker of `model` whose card names `window` as its context
+/// window.
+fn worker_with_a_window(url: &str, model: &str, window: u32) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .models(vec![ModelCard::new(model).with_context_length(window)])
+            .build(),
+    )
+}
+
+/// The floor of a regular pool whose narrowest window is `window`.
+fn a_regular_floor_of(window: u32) -> WindowFloor {
+    WindowFloor {
+        budget: Some(window),
+        prefill: None,
+    }
+}
+
+/// A reader of a pool's floor for `model_id`: the narrowest window any
+/// worker names, as the budget's. The pipeline's own rule is its context
+/// check's to hold; these cases hold what the snapshot keeps of a reading.
+fn the_narrowest_window(model_id: &str) -> impl Fn(&[Arc<dyn Worker>]) -> WindowFloor + '_ {
+    move |workers| WindowFloor {
+        budget: workers
+            .iter()
+            .filter_map(|worker| worker.context_length(model_id))
+            .min(),
+        prefill: None,
+    }
+}
+
+/// Whether a worker of the list names `window` for qwen: an answer read
+/// from the cards, as a snapshot keeps them.
+fn a_worker_names(window: u32) -> impl Fn(&[Arc<dyn Worker>]) -> bool {
+    move |workers| {
+        workers
+            .iter()
+            .any(|worker| worker.context_length("qwen") == Some(window))
+    }
+}
+
+#[test]
+fn a_refresh_that_changes_a_card_is_read_by_the_next_kept_answer() {
+    let registry = WorkerRegistry::new();
+    let worker = worker_with_a_window("grpc://127.0.0.1:8401", "qwen", 8_192);
+    registry.register(Arc::clone(&worker)).unwrap();
+    let floor = |snapshot: &ModelWorkerSnapshot| {
+        snapshot.window_floor(
+            RoutingPool::GrpcPipelineRegular,
+            "qwen",
+            the_narrowest_window("qwen"),
+        )
+    };
+    let model = registry.model_routing_snapshot("qwen").unwrap();
+    let global = registry.current_global_routing_snapshot();
+    assert_eq!(floor(&model), Some(a_regular_floor_of(8_192)));
+    assert_eq!(floor(&global), Some(a_regular_floor_of(8_192)));
+    assert!(!model.harmony(a_worker_names(4_096)));
+
+    assert!(registry.refresh_models(
+        &worker,
+        vec![ModelCard::new("qwen").with_context_length(4_096)],
+    ));
+    // The snapshots drawn before the refresh keep what they answered; the
+    // ones a request draws now read the cards again.
+    assert_eq!(floor(&model), Some(a_regular_floor_of(8_192)));
+    assert_eq!(floor(&global), Some(a_regular_floor_of(8_192)));
+    assert!(!model.harmony(a_worker_names(4_096)));
+    let model = registry.model_routing_snapshot("qwen").unwrap();
+    assert_eq!(floor(&model), Some(a_regular_floor_of(4_096)));
+    assert_eq!(
+        floor(&registry.current_global_routing_snapshot()),
+        Some(a_regular_floor_of(4_096))
+    );
+    assert!(model.harmony(a_worker_names(4_096)));
+}
+
+#[test]
+fn a_refresh_publishes_the_snapshot_of_every_model_that_holds_the_worker() {
+    let registry = WorkerRegistry::new();
+    let cards = |window| {
+        vec![
+            ModelCard::new("qwen").with_context_length(window),
+            ModelCard::new("llama").with_context_length(window),
+        ]
+    };
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://127.0.0.1:8401")
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .models(cards(8_192))
+            .build(),
+    );
+    registry.register(Arc::clone(&worker)).unwrap();
+    let floor = |model_id: &str| {
+        registry
+            .model_routing_snapshot(model_id)
+            .unwrap()
+            .window_floor(
+                RoutingPool::GrpcPipelineRegular,
+                model_id,
+                the_narrowest_window(model_id),
+            )
+    };
+    for model_id in ["qwen", "llama"] {
+        assert_eq!(floor(model_id), Some(a_regular_floor_of(8_192)));
+    }
+
+    assert!(registry.refresh_models(&worker, cards(4_096)));
+    // One worker under two models: each model's snapshot is published
+    // again, so the next answer of each is read from the new cards.
+    for model_id in ["qwen", "llama"] {
+        assert_eq!(
+            floor(model_id),
+            Some(a_regular_floor_of(4_096)),
+            "{model_id}"
+        );
+    }
+}
+
+#[test]
+fn a_pools_window_floor_is_kept_with_the_spelling_it_was_read_for() {
+    let registry = WorkerRegistry::new();
+    let card = |window| {
+        ModelCard::new("qwen")
+            .with_alias("qwen-latest")
+            .with_context_length(window)
+    };
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://127.0.0.1:8401")
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .models(vec![card(8_192)])
+            .build(),
+    );
+    registry.register(Arc::clone(&worker)).unwrap();
+    let snapshot = registry.model_routing_snapshot("qwen").unwrap();
+    let pool = RoutingPool::GrpcPipelineRegular;
+    assert_eq!(
+        snapshot.window_floor(pool, "qwen", the_narrowest_window("qwen")),
+        Some(a_regular_floor_of(8_192))
+    );
+    // Another spelling of the model is not answered from the kept figure,
+    // and takes no place: the first spelling stays.
+    assert_eq!(
+        snapshot.window_floor(pool, "qwen-latest", the_narrowest_window("qwen-latest")),
+        None
+    );
+    assert_eq!(
+        snapshot.window_floor(pool, "qwen", the_narrowest_window("qwen")),
+        Some(a_regular_floor_of(8_192))
+    );
+    // Kept, not read again: cards written past the registry leave this
+    // snapshot's figure as it was read.
+    worker.set_models(vec![card(4_096)]);
+    assert_eq!(worker.context_length("qwen"), Some(4_096));
+    assert_eq!(
+        snapshot.window_floor(pool, "qwen", the_narrowest_window("qwen")),
+        Some(a_regular_floor_of(8_192))
+    );
+    // A pool with no worker binds nothing under any spelling, and keeps none.
+    for spelling in ["qwen", "qwen-latest"] {
+        assert_eq!(
+            snapshot.window_floor(
+                RoutingPool::GrpcDecode,
+                spelling,
+                the_narrowest_window(spelling)
+            ),
+            Some(WindowFloor::default())
+        );
+    }
+}
+
+#[test]
+fn a_refresh_that_repeats_the_cards_publishes_nothing() {
+    let registry = WorkerRegistry::new();
+    let worker = worker_with_a_window("grpc://127.0.0.1:8401", "qwen", 8_192);
+    registry.register(Arc::clone(&worker)).unwrap();
+    let model = registry.model_routing_snapshot("qwen").unwrap();
+    let global = registry.current_global_routing_snapshot();
+
+    // The cards of its registration, then the cards of an earlier refresh.
+    for window in [8_192, 4_096, 4_096] {
+        let changed = worker.context_length("qwen") != Some(window);
+        let model = registry.model_routing_snapshot("qwen").unwrap();
+        let global = registry.current_global_routing_snapshot();
+        assert_eq!(
+            registry.refresh_models(
+                &worker,
+                vec![ModelCard::new("qwen").with_context_length(window)],
+            ),
+            changed
+        );
+        assert_eq!(
+            Arc::ptr_eq(&model, &registry.model_routing_snapshot("qwen").unwrap()),
+            !changed
+        );
+        assert_eq!(
+            Arc::ptr_eq(&global, &registry.current_global_routing_snapshot()),
+            !changed
+        );
+    }
+    assert!(!Arc::ptr_eq(
+        &model,
+        &registry.model_routing_snapshot("qwen").unwrap()
+    ));
+    assert!(!Arc::ptr_eq(
+        &global,
+        &registry.current_global_routing_snapshot()
+    ));
+}
+
+#[test]
+fn a_refresh_keeps_the_list_its_order_and_its_handles() {
+    let registry = WorkerRegistry::new();
+    let workers = [
+        "grpc://127.0.0.1:8401",
+        "grpc://127.0.0.1:8402",
+        "grpc://127.0.0.1:8403",
+    ]
+    .map(|url| worker_with_a_window(url, "qwen", 8_192));
+    for worker in &workers {
+        registry.register(Arc::clone(worker)).unwrap();
+    }
+    let list = registry.get_by_model("qwen");
+    let fleet = registry.get_routing_workers();
+
+    // The first and the middle worker: neither moves to the list's end. The
+    // second refresh renames the model: the worker stays where its
+    // registration indexed it and is found there by its handle.
+    for (refreshed, card) in [
+        (
+            &workers[1],
+            ModelCard::new("qwen").with_context_length(4_096),
+        ),
+        (
+            &workers[0],
+            ModelCard::new("llama").with_context_length(4_096),
+        ),
+    ] {
+        let before = registry.model_routing_snapshot("qwen").unwrap();
+        assert!(registry.refresh_models(refreshed, vec![card]));
+        let after = registry.model_routing_snapshot("qwen").unwrap();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(Arc::ptr_eq(&list, &registry.get_by_model("qwen")));
+        assert!(registry.get_by_model("llama").is_empty());
+        let fleet_now = registry.get_routing_workers();
+        assert_eq!(fleet.len(), fleet_now.len());
+        assert!(fleet
+            .iter()
+            .zip(fleet_now.iter())
+            .all(|(before, after)| Arc::ptr_eq(before, after)));
+    }
+    assert!(list
+        .iter()
+        .zip(&workers)
+        .all(|(listed, registered)| Arc::ptr_eq(listed, registered)));
+}
+
+/// The record a rebuild from a decoded spec is for.
+fn record(version: u64) -> ImportRecord {
+    ImportRecord {
+        version,
+        from_spec: true,
+    }
+}
+
 fn remote_state(worker_id: &str, url: &str, health: bool, spec: Vec<u8>) -> smg_mesh::WorkerState {
     smg_mesh::WorkerState {
         worker_id: worker_id.to_string(),
@@ -393,6 +776,173 @@ fn remote_state(worker_id: &str, url: &str, health: bool, spec: Vec<u8>) -> smg_
         spec,
         owner: "peer".to_string(),
     }
+}
+
+/// The address a masked-line case registers: a password in its userinfo.
+const ADDRESS_WITH_A_PASSWORD: &str = "http://user:s3cret@remote:8080";
+
+/// Every captured line that says one of `messages` names the address masked,
+/// each message is said at least once, and the password is in no line.
+fn assert_the_lines_name_the_address_masked(
+    lines: &[&str],
+    messages: &[&str],
+) -> Result<(), String> {
+    if let Some(line) = lines.iter().find(|line| line.contains("s3cret")) {
+        return Err(format!("a line carries the password: {line}"));
+    }
+    for message in messages {
+        let mut said = lines
+            .iter()
+            .filter(|line| line.contains(message))
+            .peekable();
+        if said.peek().is_none() {
+            return Err(format!("no line says: {message}"));
+        }
+        if let Some(line) = said.find(|line| !line.contains("://***@remote:8080")) {
+            return Err(format!("a line does not name the address masked: {line}"));
+        }
+    }
+    Ok(())
+}
+
+/// A mesh import's lines name the address masked, at every level: each
+/// branch of the import that names the address is taken once with a state
+/// whose address carries a password.
+#[test]
+#[tracing_test::traced_test]
+fn a_mesh_imports_lines_name_the_address_masked() {
+    let url = ADDRESS_WITH_A_PASSWORD;
+    let spec = |model: &str| spec_bytes(url, model, WorkerType::Regular);
+    let undecodable = || b"not a worker spec".to_vec();
+    let state = |version: u64, health: bool, spec: Vec<u8>| smg_mesh::WorkerState {
+        version,
+        ..remote_state("peer-w1", url, health, spec)
+    };
+
+    // A first import from a spec, its health hint, its owner's replacement,
+    // and a replacement whose spec does not decode here.
+    let registry = WorkerRegistry::new();
+    registry.on_remote_worker_state(&state(1, false, spec("llama-3")));
+    registry.on_remote_worker_state(&state(1, true, spec("llama-3")));
+    registry.on_remote_worker_state(&state(2, true, spec("llama-4")));
+    registry.on_remote_worker_state(&state(3, true, undecodable()));
+
+    // A first import whose spec does not decode, and its owner's
+    // replacement with no spec at all.
+    let registry = WorkerRegistry::new();
+    registry.on_remote_worker_state(&state(1, true, undecodable()));
+    registry.on_remote_worker_state(&state(2, true, Vec::new()));
+
+    // A spec that declares the same-host transport.
+    let registry = WorkerRegistry::new();
+    let same_host = serde_json::json!({ "url": url, "connection_mode": "zmq" });
+    registry.on_remote_worker_state(&state(1, true, serde_json::to_vec(&same_host).unwrap()));
+
+    // An address of the same-host transport itself.
+    let registry = WorkerRegistry::new();
+    let same_host_address = "tcp://user:s3cret@remote:8080";
+    registry.on_remote_worker_state(&remote_state(
+        "peer-w2",
+        same_host_address,
+        true,
+        Vec::new(),
+    ));
+
+    // A peer's echo of a worker this node owns.
+    let registry = WorkerRegistry::new();
+    let local: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("m"))
+            .build(),
+    );
+    registry.register(local).unwrap();
+    registry.on_remote_worker_state(&state(1, false, Vec::new()));
+
+    logs_assert(|lines: &[&str]| {
+        assert_the_lines_name_the_address_masked(
+            lines,
+            &[
+                "Registered mesh-synced worker into local registry",
+                "Updated health for existing mesh-synced worker",
+                "Rebuilt mesh-synced worker from its owner's replacement",
+                "carries a spec this node cannot decode",
+                "undecodable WorkerSpec in mesh state; importing minimal worker",
+                "Rebuilt the minimal mesh-synced worker from its owner's replacement",
+                "Ignoring mesh state for host-local ZMQ worker",
+                "Ignoring mesh state for locally-owned worker",
+            ],
+        )?;
+        if lines
+            .iter()
+            .any(|line| line.contains("url=tcp://***@remote:8080"))
+        {
+            Ok(())
+        } else {
+            Err("no line names the same-host address masked".to_string())
+        }
+    });
+}
+
+/// The lines of a refused replacement and of divergent sampling defaults
+/// name the address masked.
+#[test]
+#[tracing_test::traced_test]
+fn a_replacements_lines_name_the_address_masked() {
+    let url = ADDRESS_WITH_A_PASSWORD;
+    let at = |url: &str| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .build(),
+        )
+    };
+    let registry = WorkerRegistry::new();
+    let id = registry.register(at(url)).unwrap();
+    let revision = registry.get(&id).unwrap().revision();
+    assert!(
+        !registry.replace_claiming_local(&id, at(url), revision + 1),
+        "a replacement at a revision the worker is not at is refused"
+    );
+    assert!(
+        !registry.replace(&id, at("http://user:s3cret@remote:8081")),
+        "a replacement at another address is refused"
+    );
+
+    // Two gRPC workers of one routing group whose sampling defaults differ.
+    let registry = WorkerRegistry::new();
+    for (url, defaults) in [
+        (url, r#"{"temperature":0.1}"#),
+        ("grpc://user:s3cret@remote:8081", r#"{"temperature":0.9}"#),
+    ] {
+        registry.register(worker_with_sampling_defaults(
+            url,
+            "m",
+            WorkerType::Regular,
+            ConnectionMode::Grpc,
+            Some(defaults),
+        ));
+    }
+
+    logs_assert(|lines: &[&str]| {
+        if let Some(line) = lines.iter().find(|line| line.contains("s3cret")) {
+            return Err(format!("a line carries the password: {line}"));
+        }
+        for message in [
+            "Aborting replacement: worker was replaced before the lock was acquired",
+            "replace() does not support URL changes",
+            "Divergent default sampling params reported by workers in the same routing group",
+        ] {
+            let said = lines.iter().find(|line| line.contains(message));
+            match said {
+                None => return Err(format!("no line says: {message}")),
+                Some(line) if !line.contains("://***@remote:808") => {
+                    return Err(format!("a line does not name the address masked: {line}"));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    });
 }
 
 #[test]
@@ -750,6 +1300,378 @@ fn register_or_replace_promotes_mesh_origin_to_local() {
     );
 }
 
+/// The spec a publisher's state carries, as the outbound sync encodes it.
+fn spec_bytes(url: &str, model: &str, worker_type: WorkerType) -> Vec<u8> {
+    let worker = BasicWorkerBuilder::new(url)
+        .model(ModelCard::new(model))
+        .worker_type(worker_type)
+        .build();
+    serde_json::to_vec(&worker.metadata().spec).unwrap()
+}
+
+#[test]
+fn a_newer_state_on_the_imports_own_key_rebuilds_the_import_from_its_spec() {
+    // The owner replaced the worker in place (a new model and role under the
+    // same address) and published the replacement under the same key with a
+    // higher version. Before, such a state refreshed the import's health
+    // only, and the import kept the specification it was first built from.
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    let mut state = remote_state(
+        "peer-w1",
+        url,
+        true,
+        spec_bytes(url, "m1", WorkerType::Regular),
+    );
+    state.version = 3;
+    registry.on_remote_worker_state(&state);
+    let id = registry.get_id_by_url(url).unwrap();
+    let import = registry.get(&id).unwrap();
+    assert_eq!(import.model_id(), "m1");
+    let built = import.revision();
+
+    let mut replaced = remote_state(
+        "peer-w1",
+        url,
+        true,
+        spec_bytes(url, "m2", WorkerType::Decode),
+    );
+    replaced.version = 4;
+    registry.on_remote_worker_state(&replaced);
+    let rebuilt = registry.get(&id).expect("the import keeps its id");
+    assert_eq!(
+        rebuilt.model_id(),
+        "m2",
+        "the import follows the owner's new model"
+    );
+    assert_eq!(
+        *rebuilt.worker_type(),
+        WorkerType::Decode,
+        "and its new role"
+    );
+    assert_eq!(
+        registry.origin_of(&id),
+        Some(WorkerOrigin::Mesh),
+        "a rebuilt import is still an import"
+    );
+    assert!(
+        rebuilt.revision() > built,
+        "the rebuild went through the replacement path"
+    );
+    assert_eq!(
+        registry.get_id_by_url(url),
+        Some(id.clone()),
+        "under the same id, so the owner's tombstone still resolves"
+    );
+
+    // The reconcile pass replays the key's current state every interval:
+    // the same version is a health hint, not another rebuild.
+    let rebuilt_at = rebuilt.revision();
+    registry.on_remote_worker_state(&replaced);
+    assert_eq!(
+        registry.get(&id).unwrap().revision(),
+        rebuilt_at,
+        "a replay of the version the import has rebuilds nothing"
+    );
+
+    // The health hint still reaches the rebuilt import.
+    replaced.health = false;
+    registry.on_remote_worker_state(&replaced);
+    assert_eq!(
+        registry.get(&id).unwrap().status(),
+        WorkerStatus::NotReady,
+        "an unhealthy state demotes the rebuilt import"
+    );
+}
+
+#[test]
+fn a_rebuild_aborts_when_the_import_was_claimed_before_the_lock() {
+    // The rebuild decides on the origin before the per-worker lock and can
+    // lose the race to a local claim (`register_or_replace`, a PUT) that
+    // promotes the worker in between; the origin is read again under the
+    // lock and the replacement aborts, as a removal does.
+    let registry = WorkerRegistry::new();
+    let url = "http://w:8080";
+    registry.on_remote_worker_state(&remote_state("peer-w1", url, true, vec![]));
+    let id = registry.get_id_by_url(url).unwrap();
+    let mine: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("mine"))
+            .build(),
+    );
+    assert_eq!(registry.register_or_replace(mine), id);
+
+    // Models the late rebuild, to a publication at version 2: expecting an
+    // import, finding a local worker.
+    let late: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("theirs"))
+            .build(),
+    );
+    assert!(
+        !registry.replace_inner(&id, late, None, None, Some(record(2))),
+        "the replacement must abort when the worker is no longer an import"
+    );
+    assert_eq!(
+        registry.get(&id).unwrap().model_id(),
+        "mine",
+        "the claimed worker keeps the operator's specification"
+    );
+}
+
+#[test]
+fn a_rebuild_to_a_version_the_import_already_passed_aborts_under_the_lock() {
+    // Two publications of one key on two tasks (the subscription with the
+    // newer one, a reconcile pass with a state it read just before): both
+    // pass the check outside the lock with the record as it was. Whichever
+    // takes the lock second finds the record at or past its version and
+    // aborts, so the import never ends on the older specification with the
+    // newer version recorded.
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    let mut state = remote_state(
+        "peer-w1",
+        url,
+        true,
+        spec_bytes(url, "m1", WorkerType::Regular),
+    );
+    state.version = 3;
+    registry.on_remote_worker_state(&state);
+    let id = registry.get_id_by_url(url).unwrap();
+    let mut newest = remote_state(
+        "peer-w1",
+        url,
+        true,
+        spec_bytes(url, "m5", WorkerType::Regular),
+    );
+    newest.version = 5;
+    registry.on_remote_worker_state(&newest);
+    assert_eq!(registry.get(&id).unwrap().model_id(), "m5");
+
+    // Models the slower task, whose check passed with the record at 3.
+    let late: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("m4"))
+            .build(),
+    );
+    assert!(
+        !registry.replace_inner(&id, late, None, None, Some(record(4))),
+        "a publication the record already passed rebuilds nothing"
+    );
+    assert_eq!(
+        registry.get(&id).unwrap().model_id(),
+        "m5",
+        "the import keeps the newer specification"
+    );
+    assert_eq!(
+        registry
+            .import_records
+            .get(&id)
+            .map(|built_from| built_from.version),
+        Some(5),
+        "and its record"
+    );
+}
+
+#[test]
+fn a_rebuild_that_finds_no_record_under_the_lock_aborts() {
+    // The import was removed and imported again from the live key between
+    // a task's check outside the lock and its rebuild: the fresh import is
+    // registered first and its record inserted after, so under the lock the
+    // worker is an import with no record. The late rebuild aborts; it must
+    // not write its older state over the fresh import and leave the record
+    // the other task inserts describing a worker that is not there.
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    let mut fresh = remote_state(
+        "peer-w1",
+        url,
+        true,
+        spec_bytes(url, "m3", WorkerType::Regular),
+    );
+    fresh.version = 3;
+    registry.on_remote_worker_state(&fresh);
+    let id = registry.get_id_by_url(url).unwrap();
+    registry.import_records.remove(&id);
+
+    let late: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("m2"))
+            .build(),
+    );
+    assert!(
+        !registry.replace_inner(&id, late, None, None, Some(record(2))),
+        "a rebuild that finds no record under the lock must abort"
+    );
+    assert_eq!(
+        registry.get(&id).unwrap().model_id(),
+        "m3",
+        "the fresh import keeps its specification"
+    );
+    assert!(
+        registry.import_records.get(&id).is_none(),
+        "the aborted rebuild wrote a record of its own"
+    );
+}
+
+#[test]
+fn a_newer_state_whose_spec_does_not_decode_here_keeps_the_import_as_built() {
+    // A rolling upgrade: the owner's replacement carries a spec this build
+    // cannot decode. The minimal fallback is right for a brand-new import
+    // (there is nothing better) and a downgrade for an existing one: the
+    // import keeps its specification, the health hint still applies, and
+    // the version is recorded (the bytes never decode later on this node,
+    // and the owner's next replacement carries a higher version), so a
+    // replay reads nothing again and a later decodable publication still
+    // rebuilds the import.
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    let mut state = remote_state(
+        "peer-w1",
+        url,
+        true,
+        spec_bytes(url, "m1", WorkerType::Decode),
+    );
+    state.version = 1;
+    registry.on_remote_worker_state(&state);
+    let id = registry.get_id_by_url(url).unwrap();
+    let built = registry.get(&id).unwrap().revision();
+
+    let mut undecodable = remote_state("peer-w1", url, false, b"{not a spec".to_vec());
+    undecodable.version = 2;
+    registry.on_remote_worker_state(&undecodable);
+    let kept = registry.get(&id).unwrap();
+    assert_eq!(kept.model_id(), "m1", "the import keeps its model");
+    assert_eq!(*kept.worker_type(), WorkerType::Decode, "and its role");
+    assert_eq!(kept.revision(), built, "nothing was rebuilt");
+    assert_eq!(
+        kept.status(),
+        WorkerStatus::NotReady,
+        "the health hint of the undecodable state still applied"
+    );
+    assert_eq!(
+        registry
+            .import_records
+            .get(&id)
+            .map(|built_from| built_from.version),
+        Some(2),
+        "the undecodable publication's version is recorded"
+    );
+
+    let mut decodable = remote_state(
+        "peer-w1",
+        url,
+        true,
+        spec_bytes(url, "m2", WorkerType::Decode),
+    );
+    decodable.version = 3;
+    registry.on_remote_worker_state(&decodable);
+    assert_eq!(
+        registry.get(&id).unwrap().model_id(),
+        "m2",
+        "a later publication that decodes rebuilds the import"
+    );
+}
+
+#[test]
+fn a_newer_state_without_a_usable_spec_rebuilds_a_minimal_import() {
+    // The import is the minimal worker already (the first state this node
+    // saw carried no spec): a replacement without a usable spec rebuilds it
+    // all the same, so it follows the owner's new model; a minimal-to-minimal
+    // rebuild loses nothing. Only an import built from a spec keeps its
+    // specification (the test above).
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    let mut state = remote_state("peer-w1", url, true, vec![]);
+    state.model_id = "m1".to_string();
+    state.version = 1;
+    registry.on_remote_worker_state(&state);
+    let id = registry.get_id_by_url(url).unwrap();
+    let import = registry.get(&id).unwrap();
+    assert_eq!(import.model_id(), "m1");
+    let built = import.revision();
+
+    let mut undecodable = remote_state("peer-w1", url, true, b"{not a spec".to_vec());
+    undecodable.model_id = "m2".to_string();
+    undecodable.version = 2;
+    registry.on_remote_worker_state(&undecodable);
+    let rebuilt = registry.get(&id).expect("the import keeps its id");
+    assert_eq!(
+        rebuilt.model_id(),
+        "m2",
+        "a minimal import follows the owner's new model past a spec it cannot decode"
+    );
+    assert!(
+        rebuilt.revision() > built,
+        "the rebuild went through the replacement path"
+    );
+    assert_eq!(
+        registry.origin_of(&id),
+        Some(WorkerOrigin::Mesh),
+        "a rebuilt import is still an import"
+    );
+    assert!(
+        registry.get_by_model("m1").is_empty(),
+        "the old model no longer routes to it"
+    );
+    assert_eq!(registry.get_by_model("m2").len(), 1, "the new one does");
+    assert_eq!(
+        registry
+            .import_records
+            .get(&id)
+            .map(|built_from| (built_from.version, built_from.from_spec)),
+        Some((2, false)),
+        "the record says minimal, at the new version"
+    );
+
+    let mut absent = remote_state("peer-w1", url, true, vec![]);
+    absent.model_id = "m3".to_string();
+    absent.version = 3;
+    registry.on_remote_worker_state(&absent);
+    assert_eq!(
+        registry.get(&id).unwrap().model_id(),
+        "m3",
+        "and past a publication with no spec at all"
+    );
+}
+
+#[test]
+fn a_state_from_another_key_for_an_imports_address_stays_a_health_hint() {
+    // Only the import's own key rebuilds it: a state under another id for
+    // the same address (a second publisher of the endpoint, or an orphan
+    // key of the owner's earlier life) carries a version from another
+    // sequence, and is read as it always was, for its health alone.
+    let registry = WorkerRegistry::new();
+    let url = "http://remote:8080";
+    let mut state = remote_state(
+        "peer-w1",
+        url,
+        true,
+        spec_bytes(url, "m1", WorkerType::Regular),
+    );
+    state.version = 1;
+    registry.on_remote_worker_state(&state);
+    let id = registry.get_id_by_url(url).unwrap();
+    let built = registry.get(&id).unwrap().revision();
+
+    let mut other = remote_state(
+        "peer-w2",
+        url,
+        false,
+        spec_bytes(url, "m2", WorkerType::Decode),
+    );
+    other.version = 9;
+    registry.on_remote_worker_state(&other);
+    let import = registry.get(&id).expect("the import stays");
+    assert_eq!(import.model_id(), "m1", "another key's spec is not applied");
+    assert_eq!(import.revision(), built, "and nothing was rebuilt");
+    assert_eq!(
+        import.status(),
+        WorkerStatus::NotReady,
+        "its health hint applied, as before"
+    );
+}
+
 #[test]
 fn remove_inner_aborts_when_origin_changed_before_lock() {
     // The TOCTOU guard: remove_remote's pre-check can observe Mesh,
@@ -766,7 +1688,7 @@ fn remove_inner_aborts_when_origin_changed_before_lock() {
     // Models the post-promotion state: expecting Mesh, finding Local.
     assert!(
         registry
-            .remove_inner(&id, Some(WorkerOrigin::Mesh))
+            .remove_inner(&id, Some(WorkerOrigin::Mesh), None)
             .is_none(),
         "removal must abort when the origin no longer matches"
     );
@@ -1087,7 +2009,7 @@ fn global_snapshot_never_publishes_a_torn_generation() {
                     continue;
                 }
                 assert!(
-                    generation(&prefill) >= generation(&decode),
+                    generation(prefill) >= generation(decode),
                     "torn snapshot: decode generation passed prefill"
                 );
             }
@@ -1254,9 +2176,9 @@ fn routing_pool_alias_reuses_canonical_snapshot() {
     assert!(Arc::ptr_eq(&canonical, &alias));
 }
 
-// Health-checker integration tests moved to worker/manager.rs along with
+// Health-checker integration tests moved to worker/health/manager.rs along with
 // the loop itself. The registry is now a pure collection — see
-// `worker::manager::WorkerManager` tests.
+// `worker::health::manager::WorkerManager` tests.
 
 #[test]
 fn test_transition_status_emits_event_and_changes_status() {
@@ -2139,8 +3061,6 @@ fn test_builder_status_override_on_replace() {
 #[test]
 fn test_replace_preserves_runtime_state_and_circuit_breaker() {
     let registry = WorkerRegistry::new();
-    let mut headers = http::HeaderMap::new();
-    headers.insert("x-smg-routing-key", "sticky-key".parse().unwrap());
 
     let first: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://worker:8080")
@@ -2153,7 +3073,7 @@ fn test_replace_preserves_runtime_state_and_circuit_breaker() {
 
     first.set_status(WorkerStatus::NotReady);
     first.increment_processed();
-    let load_guard = WorkerLoadGuard::new(first.clone(), Some(&headers));
+    let load_guard = WorkerLoadGuard::with_key(first.clone(), Some("sticky-key"));
 
     for _ in 0..5 {
         first.record_outcome(503);
@@ -2797,7 +3717,7 @@ fn test_wildcard_hash_ring_follows_removals() {
 /// port: the port derived from a temporary ipc path is a hash into a band
 /// other listeners on the host may hold, and a collision there fails the
 /// handshake bind after the data-plane sockets are already bound.
-async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<crate::worker::BasicWorker> {
+fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<BasicWorker> {
     let worker = Arc::new(
         BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
             .connection_mode(ConnectionMode::Zmq)
@@ -2806,7 +3726,7 @@ async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<crate::worker::Basi
             .build(),
     );
     assert!(
-        !worker.zmq_health_check().await.unwrap(),
+        !worker.zmq_health_check(),
         "worker is not ready until the handshake lands"
     );
     assert!(
@@ -2823,7 +3743,7 @@ async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<crate::worker::Basi
 async fn remove_aborts_the_zmq_handshake_driver() {
     let dir = tempfile::tempdir().unwrap();
     let registry = WorkerRegistry::new();
-    let worker = connecting_zmq_worker(dir.path()).await;
+    let worker = connecting_zmq_worker(dir.path());
 
     let id = registry
         .register(worker.clone() as Arc<dyn Worker>)
@@ -2842,7 +3762,7 @@ async fn remove_aborts_the_zmq_handshake_driver() {
 async fn replace_aborts_the_replaced_workers_zmq_handshake_driver() {
     let dir = tempfile::tempdir().unwrap();
     let registry = WorkerRegistry::new();
-    let worker = connecting_zmq_worker(dir.path()).await;
+    let worker = connecting_zmq_worker(dir.path());
     let url = worker.url().to_string();
 
     let id = registry
@@ -3052,4 +3972,139 @@ fn clear_all_overload_flags_resets_every_model() {
     assert!(!b.is_overloaded());
     assert_eq!(registry.overloaded_worker_count("m1"), 0);
     assert_eq!(registry.overloaded_worker_count("m2"), 0);
+}
+
+/// A removed worker's address stays retired in the series store while a
+/// handle to the worker lives (a late write of that handle lands nowhere),
+/// and the store's upkeep forgets it once the last handle is gone: the
+/// registry hands the store the removed worker's own witness.
+#[test]
+fn a_removed_workers_address_is_retired_until_its_last_handle_is_gone() {
+    let series = worker_metrics::installed_or_default();
+    let registry = WorkerRegistry::new();
+    let url = "http://retired-seam:8080";
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("m"))
+            .health_config(no_health_check())
+            .build(),
+    );
+    let held = Arc::clone(&worker);
+    let id = registry.register(worker).unwrap();
+    assert!(!series.is_retired(url), "a registered address is live");
+
+    registry.remove(&id);
+    assert!(series.is_retired(url), "the removal retires the address");
+    series.run_upkeep();
+    assert!(
+        series.is_retired(url),
+        "a held worker keeps its address retired through the upkeep"
+    );
+
+    drop(held);
+    series.run_upkeep();
+    assert!(
+        !series.is_retired(url),
+        "the upkeep forgets the address once the removed worker is gone"
+    );
+}
+
+/// A worker replaced at its URL stays alive in the handles taken before the
+/// replacement (a load guard) and writes under the URL when they go: the
+/// registry hands the store its witness at the replacement, so once the URL
+/// is removed the upkeep keeps the address retired until that instance is
+/// gone too, and the guard's release lands nowhere.
+#[test]
+fn a_replaced_workers_guard_keeps_the_removed_address_retired_until_it_drops() {
+    let series = worker_metrics::installed_or_default();
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(series),
+    );
+    let url = "http://replaced-seam:8080";
+    let worker = || -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let listed = || {
+        let mut rendered = String::new();
+        series.render_into(&mut rendered);
+        rendered.lines().any(|line| {
+            line.starts_with("smg_worker_requests_active{")
+                && line.contains("worker=\"http://replaced-seam:8080\"")
+        })
+    };
+    metrics::with_local_recorder(&recorder, || {
+        let registry = WorkerRegistry::new();
+        let first = worker();
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        let guard = WorkerLoadGuard::with_key(first, None);
+        assert!(
+            listed(),
+            "the guard's load is a series of the registered address"
+        );
+        assert!(registry.replace(&id, worker()), "a same-URL replacement");
+
+        registry.remove(&id);
+        assert!(series.is_retired(url), "the removal retires the address");
+        series.run_upkeep();
+        assert!(
+            series.is_retired(url),
+            "the replaced instance in its guard keeps the address retired"
+        );
+
+        drop(guard);
+        assert!(
+            !listed(),
+            "the guard's release after the removal lands nowhere"
+        );
+        series.run_upkeep();
+        assert!(
+            !series.is_retired(url),
+            "the upkeep forgets the address once the replaced instance is gone"
+        );
+    });
+}
+
+/// `remove_if` reads its condition of the worker as it stands and removes
+/// the worker in the same step under its lock: a condition that reads false
+/// leaves the worker, one that reads true takes it, and a worker gone reads
+/// `None`.
+#[test]
+fn remove_if_removes_the_worker_only_while_its_condition_holds() {
+    let registry = WorkerRegistry::new();
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://w1:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build(),
+    );
+    let id = registry
+        .register(Arc::clone(&worker))
+        .expect("the worker registers");
+    let revision = worker.revision();
+
+    assert!(
+        registry
+            .remove_if(&id, |w| w.revision() == revision + 1)
+            .is_none(),
+        "a condition that reads false leaves the worker"
+    );
+    assert!(registry.get(&id).is_some(), "the worker stands");
+    let removed = registry
+        .remove_if(&id, |w| w.revision() == revision)
+        .expect("a condition that reads true takes the worker");
+    assert!(
+        Arc::ptr_eq(&removed, &worker),
+        "the worker removed is the one registered"
+    );
+    assert!(registry.get(&id).is_none(), "the worker is gone");
+    assert!(
+        registry.remove_if(&id, |_| true).is_none(),
+        "a worker gone reads None"
+    );
 }

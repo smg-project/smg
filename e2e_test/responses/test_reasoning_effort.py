@@ -8,7 +8,7 @@ before any handler ran while the same values worked on Chat Completions
 produce a normal response on gpt-oss.
 
 Usage:
-    E2E_RUNTIME=sglang pytest e2e_test/responses/test_reasoning_effort.py -v
+    E2E_RUNTIME=sglang E2E_ENGINE=sglang pytest e2e_test/responses/test_reasoning_effort.py -v
 """
 
 from __future__ import annotations

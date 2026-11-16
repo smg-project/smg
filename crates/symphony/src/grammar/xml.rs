@@ -46,7 +46,7 @@ use serde_json::Value;
 
 use super::{
     schema::{has_local_reference, keyword, kind, sent_bytes, shape, string_enum, Definitions},
-    CallMarkers, Count, Grammar, Tag,
+    words, CallMarkers, Count, Grammar, Tag,
 };
 
 /// The words the assembler reads as a boolean.
@@ -199,7 +199,13 @@ pub(super) fn calls(
     };
     let invokes = tools
         .iter()
-        .map(|tool| writer.invoke(markers, &tool.function.name, &tool.function.parameters))
+        .map(|tool| {
+            writer.invoke(
+                markers,
+                &tool.function.name,
+                tool.function.parameters_schema(),
+            )
+        })
         .collect();
     // The block holds at least one invoke whether or not the request asks for a call: an empty
     // block is no answer.
@@ -430,16 +436,6 @@ impl Writer<'_> {
         }
         Grammar::AnyText { excludes }
     }
-}
-
-/// One of the words.
-fn words(words: &[&str]) -> Grammar {
-    Grammar::Or(
-        words
-            .iter()
-            .map(|word| Grammar::ConstString(word.to_string()))
-            .collect(),
-    )
 }
 
 #[cfg(test)]

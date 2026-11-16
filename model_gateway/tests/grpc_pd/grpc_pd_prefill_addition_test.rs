@@ -8,9 +8,7 @@
 use std::{sync::Arc, time::Duration};
 
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
-use openai_protocol::{
-    completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
-};
+use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use smg::{
     app_context::AppContext,
     config::{PolicyConfig, RouterConfig, RoutingMode},
@@ -21,6 +19,7 @@ use smg::{
 };
 use tokio::net::TcpListener;
 
+use super::prefill_worker_for;
 use crate::common;
 
 const MODEL: &str = "pd-prefill-addition-test-model";
@@ -199,62 +198,8 @@ async fn build_bed(prefill_ports: &[u16], decode_port: u16) -> Bed {
     }
 }
 
-#[expect(
-    clippy::unwrap_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-fn completion_request(words: usize) -> CompletionRequest {
-    serde_json::from_value(serde_json::json!({
-        "model": MODEL,
-        "prompt": "test ".repeat(words),
-        "max_tokens": 8,
-        "stream": false,
-    }))
-    .unwrap()
-}
-
 fn tenant() -> TenantRequestMeta {
     TenantRequestMeta::new(TenantKey::new("pd-prefill-addition-test-tenant"))
-}
-
-/// Route one completion of `words` tokens, asking for its decision record,
-/// and return the prefill worker the bucket policy chose for it.
-#[expect(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-async fn prefill_worker_for(bed: &Bed, words: usize) -> String {
-    let mut headers = http::HeaderMap::new();
-    headers.insert("x-smg-cache-trace", http::HeaderValue::from_static("1"));
-    let response = bed
-        .router
-        .route_completion(Some(&headers), &tenant(), completion_request(words), MODEL)
-        .await;
-    let status = response.status();
-    let trace = response
-        .headers()
-        .get("x-smg-cache-trace")
-        .map(|value| value.to_str().unwrap().to_owned());
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-        .await
-        .expect("response body");
-    assert_eq!(
-        status,
-        http::StatusCode::OK,
-        "{words} tokens: {}",
-        String::from_utf8_lossy(&bytes)
-    );
-    let trace: serde_json::Value =
-        serde_json::from_str(&trace.expect("the request asked for its decision record")).unwrap();
-    trace["selections"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|selection| selection["policy"] == "bucket")
-        .and_then(|selection| selection["worker"].as_str())
-        .map(str::to_owned)
-        .expect("the record names the prefill worker the bucket policy chose")
 }
 
 /// Which prefill worker took each of `rounds` requests of every size, as
@@ -263,7 +208,10 @@ async fn placements(bed: &Bed, rounds: usize) -> Vec<(usize, String)> {
     let mut placements = Vec::new();
     for _ in 0..rounds {
         for words in [SMALL, MID, LARGE] {
-            placements.push((words, prefill_worker_for(bed, words).await));
+            placements.push((
+                words,
+                prefill_worker_for(bed.router.as_ref(), &tenant(), MODEL, words).await,
+            ));
         }
     }
     placements

@@ -1,7 +1,7 @@
 //! Compiles a validated [`RateLimitYaml`] into an immutable, cheap-to-look-up
 //! policy set.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use super::config::{ModelMatcherSpec, RateLimitConfigError, RateLimitYaml, TenantPolicySpec};
 use crate::tenant::TenantKey;
@@ -14,7 +14,9 @@ pub struct ScopeLimits {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledModelRule {
-    pub rule_id: String,
+    /// Shared, so every reservation the rule scopes names its bucket by
+    /// this id without a copy.
+    pub rule_id: Arc<str>,
     pub limits: ScopeLimits,
 }
 
@@ -51,13 +53,23 @@ impl CompiledTenantPolicy {
             .map(|r| &r.rule)
     }
 
+    /// The rule with `rule_id`, if the policy still has it: a bucket is
+    /// keyed by its rule's id, and a replacement of the policy looks the
+    /// bucket's rule up by that id to learn its new limits.
+    pub(crate) fn rule_by_id(&self, rule_id: &str) -> Option<&CompiledModelRule> {
+        self.exact_model_rules
+            .values()
+            .chain(self.prefix_model_rules.iter().map(|r| &r.rule))
+            .find(|rule| &*rule.rule_id == rule_id)
+    }
+
     fn compile(spec: &TenantPolicySpec) -> Self {
         let mut exact_model_rules = HashMap::new();
         let mut prefix_model_rules = Vec::new();
 
         for r in &spec.model_rules {
             let rule = CompiledModelRule {
-                rule_id: r.rule_id.clone(),
+                rule_id: Arc::from(r.rule_id.as_str()),
                 limits: ScopeLimits {
                     tokens_per_minute: r.tokens_per_minute,
                     requests_per_minute: r.requests_per_minute,
@@ -194,7 +206,7 @@ mod tests {
         let compiled = CompiledPolicySet::compile(&yaml).unwrap();
         let policy = compiled.policy_for(&TenantKey::new("anonymous"));
         let matched = policy.matching_rule("gpt-4").unwrap();
-        assert_eq!(matched.rule_id, "exact");
+        assert_eq!(&*matched.rule_id, "exact");
     }
 
     #[test]
@@ -220,7 +232,7 @@ mod tests {
         let compiled = CompiledPolicySet::compile(&yaml).unwrap();
         let policy = compiled.policy_for(&TenantKey::new("anonymous"));
         let matched = policy.matching_rule("gpt-4-turbo").unwrap();
-        assert_eq!(matched.rule_id, "long");
+        assert_eq!(&*matched.rule_id, "long");
     }
 
     #[test]

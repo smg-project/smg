@@ -1,6 +1,6 @@
 [package]
 name = "openai-protocol"
-version = "1.17.0"
+version = "1.18.0"
 edition = "2021"
 description = "OpenAI-compatible API protocol definitions and types"
 license = "Apache-2.0"
@@ -15,11 +15,10 @@ categories = ["api-bindings", "data-structures"]
 
 [features]
 default = []
-axum = ["dep:axum", "axum/multipart"]
+axum = ["dep:axum", "axum/multipart", "smg-worker/axum"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
-bitflags.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 indexmap = { version = "2", features = ["serde"] }
@@ -27,6 +26,7 @@ rand.workspace = true
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_with.workspace = true
+smg-worker.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 schemars.workspace = true

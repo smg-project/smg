@@ -18,11 +18,13 @@
 //!    [`ReadinessSnapshot`] behind an [`ArcSwap`]. Probe handlers load the
 //!    snapshot (one atomic pointer load) and never touch the registry. The
 //!    maintainer recomputes on every `WorkerEvent` (bursts coalesced) and on
-//!    a short checkpoint interval. The checkpoint covers the status
-//!    mutations that bypass the registry broadcast — `set_status()` called
-//!    directly by `ActivateWorkersStep`, the mesh inbound health refresh in
-//!    `WorkerRegistry::on_remote_worker_state`, FFI bindings — and tokenizer
-//!    registrations, which emit no worker event at all.
+//!    a short checkpoint interval. Every status write on a registered worker
+//!    goes through `WorkerRegistry::transition_under_lock` and emits
+//!    `StatusChanged` (`ActivateWorkersStep`, the worker manager's health
+//!    state machine, the mesh inbound refresh in
+//!    `WorkerRegistry::on_remote_worker_state`), so the checkpoint covers
+//!    what no event carries: tokenizer registrations and removals. (A
+//!    lagged broadcast recomputes in the event arm itself.)
 //!
 //! 2. **Dedicated probe listener.** When `--health-check-port` (config
 //!    `health_check_port`) is set, `/liveness`, `/readiness`, and `/health`
@@ -50,6 +52,11 @@
 //! while `/liveness` and `/health` keep returning `200`, so the load balancer
 //! or orchestrator stops routing new connections during the
 //! endpoint-propagation window without restarting the process.
+//!
+//! A listener's failure with no shutdown signal takes the gateway down and
+//! sets the same flag. From then on only the dedicated probe listener still
+//! accepts connections, so a new probe is answered there alone:
+//! `/readiness` with the same `503`, until the process exits.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -75,19 +82,18 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    config::{ReadinessRoleConfig, RouterConfig, RoutingMode},
+    config::{bind_socket_addr, ReadinessRoleConfig, RouterConfig, RoutingMode},
     middleware::ProbeResponse,
     observability::inflight_tracker::InFlightRequestTracker,
     routers::grpc::multimodal::{mm_settings, models_without_media_processing},
-    worker::{event::WorkerEvent, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
+    worker::{registry::event::WorkerEvent, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
 /// How often the maintainer re-derives readiness from the registry even
-/// without worker events. This bounds the staleness of mutations that
-/// bypass the `WorkerRegistry` broadcast (direct `set_status()` callers,
-/// tokenizer registrations) and is deliberately shorter than the metrics
-/// collectors' 3s checkpoint: readiness gates traffic, so a flip should
-/// land within one probe interval.
+/// without worker events. This bounds the staleness of what no event
+/// carries (tokenizer registrations and removals) and is deliberately
+/// shorter than the metrics collectors' 3s checkpoint: readiness gates
+/// traffic, so a flip should land within one probe interval.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Result of one readiness evaluation. Field semantics are identical to the
@@ -305,6 +311,13 @@ impl ProbeState {
     /// Core of [`Self::recompute`] with the tokenizer lookup and the media
     /// placement injected, so tests can exercise the gating logic without
     /// loading real tokenizers or seeding the process-wide settings.
+    ///
+    /// The workers come from the registry's immutable membership snapshot
+    /// (the one the routing paths and the liveness sweep read): one pointer
+    /// load while the fleet is stable, so the one-second checkpoint does not
+    /// walk the worker map, lock its shards and clone every worker out of it
+    /// when nothing has changed. Health and status are read live from each
+    /// worker, as before.
     fn recompute_with(
         &self,
         worker_registry: &WorkerRegistry,
@@ -312,7 +325,7 @@ impl ProbeState {
         tokenizer_registered: impl Fn(&str) -> bool,
         mm_processing: MmProcessingMode,
     ) {
-        let workers = worker_registry.get_all();
+        let workers = worker_registry.get_routing_workers();
         let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
 
         let role_snapshot = |worker_type: WorkerType, threshold: ReadinessRoleConfig| {
@@ -526,11 +539,11 @@ fn mark_probe(mut response: Response) -> Response {
 
 /// Spawn the readiness maintainer: recomputes the snapshot on every
 /// `WorkerRegistry` event (bursts coalesced into one recompute) and on a
-/// checkpoint interval that catches broadcast-bypassing mutations and
-/// tokenizer registrations. The loop runs on the caller's runtime — if that
-/// runtime is starved the snapshot goes stale but probes still answer in
-/// O(1), which is the failure mode we want (stale-but-served, never timed
-/// out).
+/// checkpoint interval that catches what no event carries: tokenizer
+/// registrations and removals (a lagged broadcast recomputes in the event
+/// arm itself). The loop runs on the caller's runtime — if that runtime is
+/// starved the snapshot goes stale but probes still answer in O(1), which
+/// is the failure mode we want (stale-but-served, never timed out).
 ///
 /// The initial snapshot is computed synchronously, after subscribing (so no
 /// event can fall between snapshot and subscription): workers registered
@@ -592,8 +605,8 @@ pub fn spawn_readiness_maintainer(
                     }
                 }
                 _ = checkpoint.tick() => {
-                    // Catch changes that bypass the broadcast channel and
-                    // tokenizer registrations (which emit no worker event).
+                    // Catch what no event carries: tokenizer registrations
+                    // and removals.
                 }
             }
 
@@ -669,8 +682,7 @@ pub fn start_probe_listener(
     // 0.0.0.0 (which would hide a config typo and widen exposure). `port` may
     // be 0 here on purpose — the ephemeral-port tests bind through this path;
     // the config-sourced value is rejected for 0 at the validation layer.
-    let addr = crate::config::bind_socket_addr(host, port)
-        .map_err(|err| format!("probe listener: {err}"))?;
+    let addr = bind_socket_addr(host, port).map_err(|err| format!("probe listener: {err}"))?;
 
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|err| format!("failed to bind probe listener on {addr}: {err}"))?;
@@ -726,6 +738,8 @@ mod tests {
     use super::*;
     use crate::{
         config::PdReadinessConfig,
+        middleware::test_support::json_of,
+        server::http_client,
         worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker},
     };
 
@@ -1240,12 +1254,6 @@ mod tests {
             }
             Arc::new(builder.build())
         }
-        async fn body_of(response: Response) -> serde_json::Value {
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            serde_json::from_slice(&bytes).unwrap()
-        }
 
         let state = probe_state();
         let registry = WorkerRegistry::new();
@@ -1269,7 +1277,7 @@ mod tests {
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.extensions().get::<ProbeResponse>().is_some());
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["status"], "ready");
         assert_eq!(body["healthy_workers"], 1);
         assert_eq!(body["models_without_media_processing"], json!(["qwen-vl"]));
@@ -1278,7 +1286,7 @@ mod tests {
         for placement in [MmProcessingMode::Auto, MmProcessingMode::Router] {
             state.recompute_with(&registry, &router_config, |_| true, placement);
             assert!(state.readiness().models_without_media_processing.is_empty());
-            let body = body_of(state.readiness_response()).await;
+            let body = json_of(state.readiness_response()).await;
             assert_eq!(body["status"], "ready");
             assert!(body.get("models_without_media_processing").is_none());
         }
@@ -1299,7 +1307,7 @@ mod tests {
         assert!(state.readiness().models_without_media_processing.is_empty());
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["healthy_workers"], 2);
         assert!(body.get("models_without_media_processing").is_none());
 
@@ -1308,7 +1316,7 @@ mod tests {
         state.recompute_with(&empty, &router_config, |_| true, MmProcessingMode::Worker);
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["reason"], "insufficient healthy workers");
         assert!(body.get("models_without_media_processing").is_none());
     }
@@ -1319,12 +1327,6 @@ mod tests {
     /// whose last worker left is no longer listed.
     #[tokio::test]
     async fn readiness_names_each_served_model_with_a_reason() {
-        async fn body_of(response: Response) -> serde_json::Value {
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            serde_json::from_slice(&bytes).unwrap()
-        }
         let state = probe_state();
         let registry = WorkerRegistry::new();
         let router_config = regular_config();
@@ -1357,7 +1359,7 @@ mod tests {
         );
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["status"], "ready");
         assert_eq!(
             body["models"],
@@ -1380,7 +1382,7 @@ mod tests {
         );
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["reason"], "tokenizer not yet registered");
         assert_eq!(body["models"][0]["ready"], true);
         assert_eq!(
@@ -1391,7 +1393,7 @@ mod tests {
 
         // The tokenizer lands: every model ready, no reason anywhere.
         state.recompute_with(&registry, &router_config, |_| true, MmProcessingMode::Auto);
-        let body = body_of(state.readiness_response()).await;
+        let body = json_of(state.readiness_response()).await;
         assert_eq!(body["status"], "ready");
         let models = body["models"].as_array().unwrap();
         assert_eq!(models.len(), 2);
@@ -1404,7 +1406,7 @@ mod tests {
         state.recompute_with(&registry, &router_config, |_| true, MmProcessingMode::Auto);
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["models"][1]["reason"], "draining");
         assert_eq!(body["models"][1]["healthy_workers"], 0);
 
@@ -1412,7 +1414,7 @@ mod tests {
         // longer listed.
         registry.remove(&m2);
         state.recompute_with(&registry, &router_config, |_| true, MmProcessingMode::Auto);
-        let body = body_of(state.readiness_response()).await;
+        let body = json_of(state.readiness_response()).await;
         assert_eq!(
             body["models"],
             json!([{"model": "m1", "ready": true, "healthy_workers": 1, "total_workers": 1}])
@@ -1423,7 +1425,7 @@ mod tests {
         state.recompute_with(&registry, &router_config, |_| true, MmProcessingMode::Auto);
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["reason"], "insufficient healthy workers");
         assert_eq!(body["models"], json!([]));
     }
@@ -1433,12 +1435,6 @@ mod tests {
     /// own answer reads the fleet-level thresholds.
     #[tokio::test]
     async fn pd_readiness_names_the_role_a_model_lacks() {
-        async fn body_of(response: Response) -> serde_json::Value {
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            serde_json::from_slice(&bytes).unwrap()
-        }
         let state = probe_state();
         let registry = WorkerRegistry::new();
         let router_config = config(RoutingMode::PrefillDecode {
@@ -1465,7 +1461,7 @@ mod tests {
         recompute(&state, &registry, &router_config);
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["roles"]["decode"]["healthy"], 1);
         assert_eq!(
             body["models"],
@@ -1483,12 +1479,6 @@ mod tests {
     /// it. The entry's roles follow the workers the model has, not the mode.
     #[tokio::test]
     async fn epd_readiness_asks_encode_of_a_model_with_an_encode_worker() {
-        async fn body_of(response: Response) -> serde_json::Value {
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            serde_json::from_slice(&bytes).unwrap()
-        }
         let state = probe_state();
         let registry = WorkerRegistry::new();
         let router_config = config(RoutingMode::EncodePrefillDecode {
@@ -1542,7 +1532,7 @@ mod tests {
                 .unwrap();
         }
         recompute(&state, &registry, &router_config);
-        let body = body_of(state.readiness_response()).await;
+        let body = json_of(state.readiness_response()).await;
         assert_eq!(
             body["models"],
             json!([
@@ -1691,7 +1681,7 @@ mod tests {
         let addr = start_probe_listener("127.0.0.1", 0, state.clone()).unwrap();
         let base = format!("http://{addr}");
 
-        let client = crate::clients::http_client();
+        let client = http_client();
         let resp = client.get(format!("{base}/liveness")).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "OK");
@@ -1762,6 +1752,38 @@ mod tests {
         assert!(
             became_ready.is_ok(),
             "maintainer did not pick up the Registered event"
+        );
+
+        handle.abort();
+    }
+
+    /// The checkpoint also catches a status set on the worker itself, which
+    /// emits no event: the next checkpoint still re-derives readiness from
+    /// the live workers.
+    #[tokio::test(start_paused = true)]
+    async fn maintainer_checkpoint_sees_a_status_set_on_the_worker_itself() {
+        let state = probe_state();
+        let registry = Arc::new(WorkerRegistry::new());
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        let worker = http_worker("http://w1:8080", WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+
+        let handle = spawn_readiness_maintainer(
+            state.clone(),
+            registry.clone(),
+            tokenizer_registry.clone(),
+            regular_config(),
+        );
+        assert!(
+            state.readiness().workers_ready,
+            "the initial recompute sees the Ready worker"
+        );
+
+        worker.set_status(WorkerStatus::NotReady);
+        tokio::time::sleep(CHECKPOINT_INTERVAL + Duration::from_millis(1)).await;
+        assert!(
+            !state.readiness().workers_ready,
+            "the checkpoint re-derived readiness without a worker event"
         );
 
         handle.abort();

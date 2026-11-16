@@ -165,7 +165,7 @@ fn images_match_the_reference_tiler() {
                 .expect("fixture image decodes"),
             ),
         };
-        let out = processor.preprocess(&[image]).expect("image preprocesses");
+        let out = processor.preprocess(&[&image]).expect("image preprocesses");
         assert_eq!(
             out.feature_token_counts,
             vec![case.tokens],
@@ -245,11 +245,12 @@ fn audio_matches_the_reference_extractor() {
     let processor = ParakeetAudioProcessor::default();
     for case in &golden.audios {
         let name = format!("{}s x{}", case.seconds, case.gain);
+        let decoded = DecodedAudio {
+            samples: audio_pcm(case.seconds, case.gain),
+            sample_rate: 16000,
+        };
         let out = processor
-            .preprocess_decoded_clips(vec![DecodedAudio {
-                samples: audio_pcm(case.seconds, case.gain),
-                sample_rate: 16000,
-            }])
+            .preprocess_decoded_clips(&[&decoded])
             .expect("audio preprocesses");
         assert_eq!(
             out.feature_token_counts,

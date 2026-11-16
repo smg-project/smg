@@ -4,7 +4,7 @@ use axum::{http::StatusCode, response::Response};
 use rand::RngExt;
 use tracing::debug;
 
-use crate::RetryConfig;
+use crate::{error::gateway_timeout, RetryConfig};
 
 /// Check if an HTTP status code indicates a retryable error
 pub fn is_retryable_status(status: StatusCode) -> bool {
@@ -79,7 +79,7 @@ pub fn is_request_timeout(error: &reqwest::Error) -> bool {
 /// worker: a replay would run the work again on another worker and hold the
 /// client for a second timeout.
 pub fn request_timeout_response(message: impl Into<String>) -> Response {
-    let mut response = crate::error::gateway_timeout(REQUEST_TIMEOUT_CODE, message);
+    let mut response = gateway_timeout(REQUEST_TIMEOUT_CODE, message);
     mark_non_retryable(&mut response);
     response
 }
@@ -240,6 +240,7 @@ mod tests {
     use axum::{http::StatusCode, response::IntoResponse};
 
     use super::*;
+    use crate::error::extract_error_code_from_response;
 
     fn base_retry_config() -> RetryConfig {
         RetryConfig {
@@ -308,7 +309,7 @@ mod tests {
                 let remaining = remaining.clone();
                 async move {
                     if remaining
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
                         .is_ok()
                     {
                         Err(())
@@ -350,7 +351,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
-            crate::error::extract_error_code_from_response(&response),
+            extract_error_code_from_response(&response),
             REQUEST_TIMEOUT_CODE
         );
         assert!(is_retryable_status(response.status()));
@@ -375,7 +376,7 @@ mod tests {
                     let remaining = remaining.clone();
                     async move {
                         if remaining
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+                            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
                             .is_ok()
                         {
                             (StatusCode::SERVICE_UNAVAILABLE, "fail").into_response()

@@ -13,6 +13,8 @@ use std::collections::BTreeSet;
 
 use smg::observability::{metrics::Metrics, metrics_server::start_metrics_server};
 
+use crate::metrics::recorder;
+
 /// Names of the `smg_` families announced by `# <marker> <name> ...` lines.
 fn families(body: &str, marker: &str) -> BTreeSet<String> {
     body.lines()
@@ -25,7 +27,7 @@ fn families(body: &str, marker: &str) -> BTreeSet<String> {
 
 #[tokio::test]
 async fn every_smg_family_has_help_text() {
-    let handle = crate::metrics::recorder();
+    let handle = recorder();
     let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");
@@ -51,7 +53,7 @@ async fn every_smg_family_has_help_text() {
     // A worker of its own: the lag histogram test counts the samples on the workers it names.
     Metrics::record_kv_event_lag("grpc://worker-help:50051", 0.004);
 
-    let body = smg::clients::http_client()
+    let body = smg::server::http_client()
         .get(format!("http://{addr}/metrics"))
         .send()
         .await

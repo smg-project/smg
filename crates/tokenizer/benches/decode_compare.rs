@@ -193,7 +193,7 @@ fn real_model(name: &str, root: &Path, duration: Duration, check: bool) {
             "hash":blake3::hash(&bytes).to_hex().to_string(), "reference_load_ms":reference_ms,
             "wrapper_load_ms":start.elapsed().as_secs_f64()*1000.0,
             "feature":cfg!(feature="tokenizers-v1"),
-            "byte_table_decode":cfg!(feature="tokenizers-v1") && matches!(hf.get_decoder(), Some(DecoderWrapper::ByteLevel(_)))
+            "byte_table_decode":matches!(hf.get_decoder(), Some(DecoderWrapper::ByteLevel(_)))
         })
     );
     let ids = hf

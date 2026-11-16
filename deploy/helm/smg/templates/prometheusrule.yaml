@@ -23,24 +23,39 @@ spec:
           annotations:
             summary: "A gateway stopped answering its metrics scrape, or has no scrape target"
             description: "The scrape target {{ `{{ $labels.instance }}` }} has been down for {{ $a.scrapeMissingFor }}, or no target matches the release's job selector at all: the pod is gone, not ready, unreachable on its metrics port, or the selector names no Service."
+        {{- /* smg_worker_health is a per-worker series that leaves the scrape with its registration, so a gateway with no worker at all (none registered yet, or every one removed: a pod deleted, scaled away or no longer published) has no series and an empty sum, which `== 0` does not match. The absent() leg covers it while the gateway's own scrape is up; a gateway that is down is SmgGatewayDown's. */}}
         - alert: SmgNoHealthyWorker
-          expr: sum by (namespace, job) (max by (namespace, job, worker) (smg_worker_health{ {{ $job }} })) == 0
+          expr: |
+            sum by (namespace, job) (max by (namespace, job, worker) (smg_worker_health{ {{ $job }} })) == 0
+              or (absent(smg_worker_health{ {{ $job }} }) and on () (up{ {{ $job }} } == 1))
           for: {{ $a.noHealthyWorkerFor }}
           labels:
             severity: critical
           annotations:
             summary: "No healthy worker behind the gateway"
-            description: "Every worker registered with {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} has failed its health probes for {{ $a.noHealthyWorkerFor }}; requests are refused until one returns."
+            description: "Every worker registered with {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} has failed its health probes, or none is registered at all, for {{ $a.noHealthyWorkerFor }}; requests are refused until a healthy one is registered."
+        {{- /* The ratio reads client traffic alone: the probe routes (/health, /readiness, /liveness) are the kubelet's polls, answered 503 for the whole of an engine's bring-up with no client in sight, and 200 every few seconds once the fleet serves, where they would dilute the share of failing client responses. The access log demotes the same three routes. */}}
         - alert: SmgHighErrorRatio
           expr: |
-            sum by (namespace, job) (rate(smg_http_responses_total{ {{ $job }}, status_code=~"5.." }[5m]))
-              / sum by (namespace, job) (rate(smg_http_responses_total{ {{ $job }} }[5m])) > {{ $a.errorRatio }}
+            sum by (namespace, job) (rate(smg_http_responses_total{ {{ $job }}, path!~"/health|/readiness|/liveness", status_code=~"5.." }[5m]))
+              / sum by (namespace, job) (rate(smg_http_responses_total{ {{ $job }}, path!~"/health|/readiness|/liveness" }[5m])) > {{ $a.errorRatio }}
           for: {{ $a.errorRatioFor }}
           labels:
             severity: critical
           annotations:
             summary: "Too many responses are server errors"
-            description: "{{ `{{ $value | humanizePercentage }}` }} of the responses of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} were 5xx over the last 5 minutes (threshold {{ $a.errorRatio }})."
+            description: "{{ `{{ $value | humanizePercentage }}` }} of the responses of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }}, the probe routes excluded, were 5xx over the last 5 minutes (threshold {{ $a.errorRatio }})."
+        {{- /* The edge family counts a response once, by its head: a stream that fails after its first token (an engine that died mid-generation, a worker whose connection broke, an output the reader could not parse) is a 200 there, with no error code, and the ratio above never sees it. The router families count the request and its failure whatever the point of failure, so a wave of failed streams reads here. The refusals the client earned stay out of the numerator: a malformed request (validation_error), a model nobody serves, or whose every worker is unavailable (no_workers, SmgNoHealthyWorker's case), a tenant over its limit (rate_limit_error) and a grammar of the client's own (constraint_error). */}}
+        - alert: SmgHighRouterErrorRatio
+          expr: |
+            sum by (namespace, job) (rate(smg_router_request_errors_total{ {{ $job }}, error_type!~"validation_error|no_workers|rate_limit_error|constraint_error" }[5m]))
+              / sum by (namespace, job) (rate(smg_router_requests_total{ {{ $job }} }[5m])) > {{ $a.errorRatio }}
+          for: {{ $a.errorRatioFor }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "Too many routed requests fail"
+            description: "{{ `{{ $value | humanizePercentage }}` }} of the requests routed by {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} failed server-side over the last 5 minutes (threshold {{ $a.errorRatio }}), streams that failed after their first token included; the edge's response families count those as 200s, and the client's own refusals are not counted."
         - alert: SmgTtftP99High
           expr: |
             histogram_quantile(0.99, sum by (le, namespace, job) (rate(smg_router_ttft_seconds_bucket{ {{ $job }} }[5m]))) > {{ $a.ttftP99Seconds }}
@@ -48,8 +63,8 @@ spec:
           labels:
             severity: critical
           annotations:
-            summary: "Time to first token p99 is over the SLO"
-            description: "p99 TTFT of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} is {{ `{{ $value | humanizeDuration }}` }} (threshold {{ $a.ttftP99Seconds }}s) for {{ $a.ttftP99For }}: queues are building in front of the engines."
+            summary: "Time to first token p99 of streamed answers is over the SLO"
+            description: "p99 TTFT of the streamed answers of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} is {{ `{{ $value | humanizeDuration }}` }} (threshold {{ $a.ttftP99Seconds }}s) for {{ $a.ttftP99For }}: queues are building in front of the engines. A collected answer records no first token, so the p99 is over the streamed share alone."
         - alert: SmgKvUsageNearCapacity
           expr: max by (namespace, job, worker) (smg_engine_token_usage{ {{ $job }} }) > {{ $a.kvUsage }}
           for: {{ $a.kvUsageFor }}
@@ -66,14 +81,19 @@ spec:
           annotations:
             summary: "A worker's circuit breaker is open or half-open"
             description: "The circuit breaker of worker {{ `{{ $labels.worker }}` }} of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} has been open or half-open for {{ $a.circuitBreakerOpenFor }}: the worker fails requests although it may still pass its health probes."
+        {{- /* One limiter is live at a time: the concurrency limit (smg_admission_queue_rejected_total by reason; its counter also takes the multimodal bounds and a selection timeout under either mode) or the opt-in priority scheduler (smg_scheduler_admit_total by class and outcome, the rejected_* outcomes). The union reads whichever is live; the two label sets never coincide, so `or` drops nothing. */}}
         - alert: SmgAdmissionRejections
-          expr: sum by (namespace, job) (rate(smg_admission_queue_rejected_total{ {{ $job }} }[5m])) > 0
+          expr: |
+            sum by (namespace, job) (
+              rate(smg_admission_queue_rejected_total{ {{ $job }} }[5m])
+                or rate(smg_scheduler_admit_total{ {{ $job }}, outcome=~"rejected_.*" }[5m])
+            ) > 0
           for: {{ $a.admissionRejectionsFor }}
           labels:
             severity: warning
           annotations:
             summary: "The gateway is rejecting requests at admission"
-            description: "{{ `{{ $value | humanize }}` }} requests per second have been rejected at the admission queue of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} for {{ $a.admissionRejectionsFor }}: the concurrency limit is reached."
+            description: "{{ `{{ $value | humanize }}` }} requests per second have been rejected at admission by {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} for {{ $a.admissionRejectionsFor }}: the concurrency limit, or the priority scheduler's queue bound or wait, is reached."
         - alert: SmgEventLoopStalls
           expr: sum by (namespace, job) (increase(smg_tokio_event_loop_stalls_total{ {{ $job }} }[10m])) > {{ $a.eventLoopStalls }}
           labels:

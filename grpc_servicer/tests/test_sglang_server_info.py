@@ -99,8 +99,10 @@ class _WindowServerArgs(msgspec.Struct):
 
 
 def _servicer(servicer_mod, server_args, **request_manager):
+    """Construct the RPC fixture with resolved model precision and scheduler state."""
     servicer = servicer_mod.SGLangSchedulerServicer.__new__(servicer_mod.SGLangSchedulerServicer)
     servicer.server_args = server_args
+    servicer.model_config = SimpleNamespace(dtype="torch.bfloat16")
     servicer.scheduler_info = {}
     servicer.start_time = 0.0
     servicer.request_manager = SimpleNamespace(
@@ -262,3 +264,12 @@ def test_server_info_carries_where_the_engine_starts_a_grammar(servicer_mod, mon
     older = _server_info(servicer_mod, _OlderServerArgs()).server_args
     assert "constrained_decoding_start" not in older and "engine_reasoning_parser" not in older
     assert older["model_path"] == "org/model", "the other server args are reported as before"
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16", "float32", "float8_e4m3fn"])
+def test_server_info_advertises_effective_encoder_dtype(servicer_mod, dtype):
+    """Publish the effective dtype, falling back for unsupported engine types."""
+    servicer = _servicer(servicer_mod, _OlderServerArgs())
+    servicer.model_config.dtype = "torch." + dtype
+    expected = "float32" if dtype == "float8_e4m3fn" else dtype
+    assert _info(servicer).server_args["multimodal_encoder_dtype"] == expected

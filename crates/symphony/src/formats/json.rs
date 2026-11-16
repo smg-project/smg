@@ -13,6 +13,9 @@
 //! on the unit tests, which hold a model's output verbatim.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
+use openai_protocol::common::Tool;
+use serde_json::{json, Map, Value};
+
 use crate::format::{CallSyntax, Emits, Format};
 
 /// The token Llama 3.1's template reserves for a tool call, which its models write before the
@@ -24,6 +27,52 @@ pub fn json() -> Format {
     Format::new("json")
         .state("calls", Emits::Arguments)
         .calls(CallSyntax::JsonAlone(Some(PYTHON_TAG)))
+}
+
+/// The JSON schema the engine writes a required call under, which this table then reads: a list
+/// of at least one `{"name": …, "parameters": …}` object, each naming one of `tools` with its
+/// `parameters` schema, as the gateway builds it where the model's own table has no tag for the
+/// calls. The tools' `$defs` are gathered at the list's root, where a `$ref` inside a tool's
+/// schema resolves; two tools that define one name differently are refused, since one list can
+/// hold one definition of it.
+pub fn required_calls_schema(tools: &[Tool]) -> Result<Value, String> {
+    let mut any_of = Vec::with_capacity(tools.len());
+    let mut defs = Map::new();
+    for tool in tools {
+        let parameters = tool.function.parameters_schema();
+        any_of.push(json!({
+            "properties": {
+                "name": {"type": "string", "enum": [tool.function.name]},
+                "parameters": parameters
+            },
+            "required": ["name", "parameters"]
+        }));
+        let Some(Value::Object(tool_defs)) = parameters.get("$defs") else {
+            continue;
+        };
+        for (name, schema) in tool_defs {
+            match defs.get(name) {
+                Some(kept) if kept != schema => {
+                    return Err(format!(
+                        "Tool definition '{name}' has multiple conflicting schemas"
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    defs.insert(name.clone(), schema.clone());
+                }
+            }
+        }
+    }
+    let mut schema = json!({
+        "type": "array",
+        "minItems": 1,
+        "items": {"type": "object", "anyOf": any_of}
+    });
+    if !defs.is_empty() {
+        schema["$defs"] = Value::Object(defs);
+    }
+    Ok(schema)
 }
 
 #[cfg(test)]
@@ -575,7 +624,7 @@ mod tests {
 
     #[test]
     fn a_forced_call_is_written_as_the_list() {
-        let tool: openai_protocol::common::Tool = serde_json::from_value(serde_json::json!({
+        let tool: Tool = serde_json::from_value(json!({
             "type": "function",
             "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}
         }))

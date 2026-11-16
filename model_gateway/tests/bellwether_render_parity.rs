@@ -164,48 +164,38 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
-        "deepseek-v3.2-exp/render/no-generation-prompt",
-        "the native renderer writes the generation header whatever `add_generation_prompt` \
-         says, as the engine's own encoder for this family does (it reads neither that flag \
-         nor `continue_final_message`); the recorded template run leaves the conversation \
-         closed",
+        "deepseek-v3.2-exp/render/continue-final-message",
+        "the engine's copy of this checkpoint's encoder, which the gateway ports, reads no \
+         `continue_final_message` (its per-message `wo_eos` route is never set from a chat \
+         request): the vendor-code reference renders the final assistant message closed, with \
+         the end token; the gateway continues it, the message's text after the generation \
+         header, as the serving engine's prefix append does (smg-project/smg#2434, the rule \
+         of smg-project/smg#4280)",
     ),
     (
-        "deepseek-v3.2-exp/render/text-developer-role",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the serving engine does for this architecture, which renders a \
-         developer message as a user turn under a heading; the reference is the run of the \
-         Jinja template the checkpoint ships, handed the developer message as a system one; \
-         the entry goes when the group is re-recorded under the engine's rule",
+        "deepseek-v3.2/render/continue-final-message",
+        "the checkpoint's own prompt encoder, which the gateway ports (smg-project/smg#1373), \
+         reads no `continue_final_message`: the vendor-code reference renders the final \
+         assistant message closed (the thought's closer, the response, the end of the \
+         message), while the gateway appends the prefill after the generation prompt as the \
+         serving engine's prefill path does; the same class as kimi-k3's entry",
     ),
     (
-        "deepseek-v3.2-exp/render/text-system-after-user",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the engines do, where the reference is the run of the Jinja \
-         template the checkpoint ships, which renders no tools block and places a system \
-         message after a user turn otherwise",
+        "deepseek-v4-flash/render/continue-final-message",
+        "the engine's copy of this checkpoint's encoder, which the gateway ports, reads no \
+         `continue_final_message` (its per-message `wo_eos` route is never set from a chat \
+         request): the vendor-code reference renders the final assistant message closed (an \
+         empty thought, the text, the end token); the gateway continues it, the message's \
+         text after the generation header, as the serving engine's prefix append does \
+         (smg-project/smg#2434, the rule of smg-project/smg#4280)",
     ),
     (
-        "deepseek-v3.2-exp/render/thinking-kwarg-on",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the serving engine does for this architecture, and switches thinking on \
-         from the `enable_thinking` alias as the engine's wrapper does; the reference is the \
-         run of the Jinja template the checkpoint ships, which reads no alias and leaves the \
-         thought closed; the entry goes when the group is re-recorded under the engine's rule",
-    ),
-    (
-        "deepseek-v3.2-exp/render/tools-declared-user-asks",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the engines do, where the reference is the run of the Jinja \
-         template the checkpoint ships, which renders no tools block and places a system \
-         message after a user turn otherwise",
-    ),
-    (
-        "deepseek-v3.2-exp/render/tools-schema-with-defs",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the engines do, where the reference is the run of the Jinja \
-         template the checkpoint ships, which renders no tools block and places a system \
-         message after a user turn otherwise",
+        "deepseek-v4.1-flash/render/continue-final-message",
+        "the engine's copy of this checkpoint's encoder, which the gateway ports, reads no \
+         `continue_final_message`: the vendor-code reference renders the final assistant \
+         message closed, with the end token; the gateway's port continues it through the \
+         encoder's own `wo_eos` route (no end token, no header; smg-project/smg#2524), the \
+         shape the template-oracle record of this case rendered",
     ),
     (
         "deepseek-v4.1-flash/render/hermes-func-calling-*",
@@ -224,30 +214,11 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          a call history, not the encoder's (the cases without a call history match)",
     ),
     (
-        "deepseek-v4.1-flash/render/no-generation-prompt",
-        "the native renderer writes the generation header whatever `add_generation_prompt` \
-         says, as the engine's own encoder for this family does (it reads neither that flag \
-         nor `continue_final_message`); the recorded template run leaves the conversation \
-         closed",
-    ),
-    (
-        "deepseek-v4.1-flash/render/text-developer-role",
-        "the gateway renders this checkpoint through its port of the checkpoint's own \
-         encoder, as the serving engine does for this architecture, which drops a developer \
-         message before the last user turn with the thinking (and writes a trailing one as a \
-         user turn); the reference is the run of the Jinja template the checkpoint ships, \
-         handed the developer message as a system one; the entry goes when the group is \
-         re-recorded under the engine's rule",
-    ),
-    (
-        "falcon-h1-3b-instruct/render/glaive-v2-24087-0",
-        "a declared tool without parameters: the gateway renders its parameters as an empty \
-         object where the template reference writes null (2 cases of glaive-v2-15)",
-    ),
-    (
-        "falcon-h1-3b-instruct/render/glaive-v2-24087-2",
-        "a declared tool without parameters: the gateway renders its parameters as an empty \
-         object where the template reference writes null (2 cases of glaive-v2-15)",
+        "granite-4.1-3b-llmon-preview/render/*",
+        "the checkpoint's template draws a two-character nonce after every role with Jinja's \
+         `random` filter; the reference holds one unseeded draw (112 distinct nonces across \
+         the 24 cases), so no render reproduces it byte for byte (the gateway's renderer \
+         draws afresh too, as the reference did)",
     ),
     (
         "hermes-4-14b/render/hermes-func-calling-*",
@@ -270,20 +241,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          prefix append does (smg-project/smg#2434)",
     ),
     (
-        "llama-3-1-nemotron-ultra-253b-cpt-v1/render/glaive-v2-*",
-        "the gateway parses a history call's arguments into an object before rendering, which \
-         the template, writing the string as recorded, renders otherwise: a benchmark set in \
-         the tree's sample, every case with a call in the history (1,500 of the 4,012 cases \
-         of glaive-v2-44)",
-    ),
-    (
-        "llama-3.1-nemotron-8b-ultralong-2m-instruct/render/glaive-v2-*",
-        "the gateway parses a history call's arguments into an object before rendering, which \
-         the template, writing the string as recorded, renders otherwise: a benchmark set in \
-         the tree's sample, every case with a call in the history (1,405 of the 3,975 cases \
-         of glaive-v2-57)",
-    ),
-    (
         "llama-xlam-2-8b-fc-r/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
@@ -296,27 +253,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          differently (smg-project/smg#2783)",
     ),
     (
-        "llava-critic-r1-7b-llama32v/render/glaive-v2-*",
-        "the template writes today's date into the system header: the reference was recorded \
-         on 13 Oct 2026 and the job renders at SOURCE_DATE_EPOCH's 14 Oct 2026, so every case \
-         of the set differs by that one line (4,046 of 4,046 cases of glaive-v2-27; a \
-         recording-date class, nothing of the gateway's)",
-    ),
-    (
-        "mimo-v2.6-distill-qwen-9b/render/glaive-v2-*",
-        "a history call's arguments: the gateway hands them to the template as an object, \
-         which its tool-call branch writes as parameter tags, where the template reference, \
-         given the string as recorded, writes the JSON text inside the function tag (1,482 of \
-         the 4,144 cases of glaive-v2-19; the arguments-object class in this template's form)",
-    ),
-    (
-        "nanollama/render/swehero-*",
-        "the set's reference encodes a space piece after BOS (`<s> [INST]`, the legacy Llama \
-         tokenizer form) where the checkpoint's fast tokenizer, the engine and the crate \
-         write `<s>[INST]`: every case of the set differs from its second id on with the text \
-         equal, and the model's hand-written sets match (a recording-era class on the \
-         reference side; a re-record of the set removes this entry; 2,500 of 2,500 cases of \
-         swehero-0)",
+        "nvidia-nemotronlabs-ai-for-media-sports-basketball/render/thinking-history-with-reasoning-content",
+        "both sides hand this template the assistant turn's text as a parts list; its \
+         reasoning-content branch joins the list to the thought with `~`, which Jinja2 \
+         writes as Python's repr and minijinja in its own spelling, the operator the \
+         gateway's Python spelling cannot hook (crates/tokenizer/src/chat_template.rs); \
+         the cases that print the list through `string` match",
     ),
     (
         "nvidia-nemotronlabs-ai-for-media-sports-tennis/render/*",
@@ -347,25 +289,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
          differently (smg-project/smg#2783)",
-    ),
-    (
-        "scithinker-30b/render/tau2-o4-mini-2025-04-16-retail-default-287-16",
-        "a non-ASCII character inside a history call's arguments: the gateway writes the \
-         character itself, the template's JSON filter escapes it as a JSON unicode escape (a \
-         backslash, u and four hex digits) (2 cases of the 5,635 of the set)",
-    ),
-    (
-        "scithinker-30b/render/tau2-o4-mini-2025-04-16-retail-default-382-22",
-        "a non-ASCII character inside a history call's arguments: the gateway writes the \
-         character itself, the template's JSON filter escapes it as a JSON unicode escape (a \
-         backslash, u and four hex digits) (2 cases of the 5,635 of the set)",
-    ),
-    (
-        "swerankllm-small/render/tau2-gpt-4-1-mini-2025-04-14-telecom-base-*",
-        "the gateway parses a history call's arguments into an object before rendering, which \
-         the template, writing the string as recorded, renders otherwise: a benchmark set in \
-         the tree's sample, every case with a call in the history (12,357 of the 12,673 cases \
-         of the set)",
     ),
 ];
 /// Models whose tokenizer is known not to load, with the reason and where it
@@ -1652,7 +1575,7 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     }
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     download(
         &client,
         HUB,
@@ -2687,7 +2610,7 @@ fn loopback(replies: &'static [Reply]) -> io::Result<(String, Arc<AtomicUsize>)>
 fn a_rate_limited_get_is_sent_again_after_the_retry_after_wait() {
     const LIMITED: Reply = Reply::Head("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0");
     const LIMITED_EVERY_TIME: &[Reply] = &[LIMITED; RATE_LIMITED_TRIES as usize];
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let (url, served) = loopback(&[LIMITED, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
     let answer = fetch(
         &client,
@@ -2762,7 +2685,7 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
     let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
     let failed = std::thread::spawn({
         let path = path.clone();
-        move || cached_download(&smg::clients::blocking_http_client(), &url, &path, 2)
+        move || cached_download(&smg::server::blocking_http_client(), &url, &path, 2)
     })
     .join();
     assert!(
@@ -2772,10 +2695,10 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
     assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
     assert!(!path.exists(), "a failed download leaves no file");
     let (url, served) = loopback(&[LIMITED, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
-    cached_download(&smg::clients::blocking_http_client(), &url, &path, 2);
+    cached_download(&smg::server::blocking_http_client(), &url, &path, 2);
     assert_eq!(fs::read(&path).unwrap(), b"ok");
     assert_eq!(served.load(Ordering::SeqCst), 2);
-    cached_download(&smg::clients::blocking_http_client(), &url, &path, 2);
+    cached_download(&smg::server::blocking_http_client(), &url, &path, 2);
     assert_eq!(
         served.load(Ordering::SeqCst),
         2,
@@ -2783,13 +2706,13 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
     );
 }
 
-/// The gateway's test harness and the tokenizer crate's tests carry the same
-/// `hub_fetch.rs`, so a fix to the retry or the download lock in one reaches
+/// The gateway and the tokenizer crate's tests carry the same `hub_fetch.rs`,
+/// so a fix to the retry or the download lock in one reaches
 /// the other: the two files are checked byte for byte.
 #[test]
 fn the_hub_fetch_module_is_the_tokenizer_crate_s_copy() {
     assert_eq!(
-        include_str!("../test_harness/src/hub_fetch.rs"),
+        include_str!("../src/routers/grpc/tokenizer_cache/hub_fetch.rs"),
         include_str!("../../crates/tokenizer/tests/common/hub_fetch.rs"),
         "the two hub_fetch.rs copies have drifted"
     );
@@ -2799,7 +2722,7 @@ fn the_hub_fetch_module_is_the_tokenizer_crate_s_copy() {
 /// name, and the next run reads it without a request.
 #[test]
 fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let (url, served) = loopback(&[Reply::Head("HTTP/1.1 404 Not Found")]).unwrap();
     let dir = tempfile::tempdir().unwrap();
     for _ in 0..2 {
@@ -2818,7 +2741,7 @@ fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
     reason = "the requests counted and the times measured are test diagnostic output"
 )]
 fn a_download_whose_body_breaks_is_sent_again_and_lands_on_the_second_try() {
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let dir = tempfile::tempdir().unwrap();
     let (url, served) = loopback(&[Reply::CutBody, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
     let started = Instant::now();
@@ -2878,7 +2801,7 @@ fn a_broken_body_reads_as_answered_and_no_answer_does_not() {
         Reply::NoAnswer,
     ];
     assert_eq!(CUT_EVERY_TIME.len(), TRANSPORT_ERROR_RETRIES as usize + 1);
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let fetch_error = |replies: &'static [Reply]| {
         let (url, served) = loopback(replies).unwrap();
         let error = fetch(&client, &format!("{url}/org/m/resolve/r/tokenizer.json")).unwrap_err();
@@ -2918,7 +2841,7 @@ fn a_download_that_breaks_at_every_try_fails_after_the_bounded_retries() {
         BROKEN_EVERY_TIME.len(),
         TRANSPORT_ERROR_RETRIES as usize + 1
     );
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let dir = tempfile::tempdir().unwrap();
     let (url, served) = loopback(BROKEN_EVERY_TIME).unwrap();
     let started = Instant::now();

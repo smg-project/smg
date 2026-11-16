@@ -89,7 +89,7 @@ pub(super) fn calls(
     let tags = tools
         .iter()
         .map(|tool| {
-            let parameters = &tool.function.parameters;
+            let parameters = tool.function.parameters_schema();
             Tag::new(
                 format!("{}call:{}{{", markers.call_open, tool.function.name),
                 ends.members(parameters, Definitions::of(parameters), &mut Walk::new()),

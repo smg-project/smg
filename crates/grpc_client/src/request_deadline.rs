@@ -30,8 +30,15 @@ impl RequestDeadline {
     /// The deadline `timeout` from now; one the clock cannot add never passes.
     #[must_use]
     pub fn after(timeout: Duration) -> Self {
-        let now = Instant::now();
-        let at = now.checked_add(timeout).unwrap_or_else(far_future);
+        Self::after_from(Instant::now(), timeout)
+    }
+
+    /// The deadline `timeout` after `dispatched`, an instant the caller read
+    /// once for the dispatch and its other stamps; one the clock cannot add
+    /// never passes.
+    #[must_use]
+    pub fn after_from(dispatched: Instant, timeout: Duration) -> Self {
+        let at = dispatched.checked_add(timeout).unwrap_or_else(far_future);
         Self { at, timeout }
     }
 
@@ -96,6 +103,14 @@ mod tests {
             "engine scheduling deadline exceeded"
         )));
         assert!(!is_request_timeout(&Status::cancelled("Timeout expired")));
+    }
+
+    #[tokio::test]
+    async fn a_deadline_runs_from_the_dispatch_instant_it_is_given() {
+        let dispatched = Instant::now();
+        let deadline = RequestDeadline::after_from(dispatched, Duration::from_secs(15));
+        assert_eq!(deadline.at(), dispatched + Duration::from_secs(15));
+        assert_eq!(deadline.timeout(), Duration::from_secs(15));
     }
 
     #[tokio::test]

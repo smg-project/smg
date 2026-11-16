@@ -1,23 +1,40 @@
 //! Test support of the gRPC router: the `AppContext` a test constructs its
 //! router over, with the components `GrpcRouter::new` needs (the parser
 //! factories always; an initialized MCP orchestrator, which the Responses
-//! contexts of the regular and the disaggregated modes read).
+//! contexts of the regular and the disaggregated modes read), and the
+//! labelled worker selection the stages' tests read a decode worker's
+//! labels from, and the forced call a thinking prompt takes under a parser,
+//! which the restamp and the parser-utility tests shape a constraint from,
+//! and the model directory a media test registers its tokenizer from, so
+//! that the model's config is not looked up on the model hub.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, Mutex, OnceLock},
+    thread::{self, ThreadId},
+};
 
-use llm_tokenizer::registry::TokenizerRegistry;
+use llm_tokenizer::{
+    registry::TokenizerRegistry,
+    traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer},
+    MockTokenizer,
+};
+use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use serde_json::{json, Value};
 use smg_data_connector::{
-    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    ConversationItemStorage, ConversationStorage, MemoryConversationItemStorage,
+    MemoryConversationStorage, MemoryResponseStorage, ResponseStorage,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
-use tool_parser::ParserFactory as ToolParserFactory;
+use tool_parser::{ParserFactory as ToolParserFactory, ToolConstraint};
 
 use crate::{
     app_context::AppContext,
     config::{ParserChoice, PolicyConfig, RouterConfig, RouterConfigBuilder, RoutingMode},
     policies::PolicyRegistry,
-    worker::WorkerRegistry,
+    routers::grpc::context::WorkerSelection,
+    server::http_client,
+    worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
 };
 
 /// Minimal `AppContext` for constructing a gRPC router in `mode`. Regular and
@@ -80,22 +97,187 @@ pub(crate) fn grpc_ctx_from(
     config: &RouterConfig,
     mcp_orchestrator: Arc<OnceLock<Arc<McpOrchestrator>>>,
 ) -> Arc<AppContext> {
+    grpc_ctx_over_stores(
+        config,
+        mcp_orchestrator,
+        Arc::new(MemoryResponseStorage::new()),
+        Arc::new(MemoryConversationStorage::new()),
+        Arc::new(MemoryConversationItemStorage::new()),
+    )
+}
+
+/// [`grpc_ctx_from`] over the given stores: a test that reads what reaches
+/// the store hands in its own (hooked) ones.
+pub(crate) fn grpc_ctx_over_stores(
+    config: &RouterConfig,
+    mcp_orchestrator: Arc<OnceLock<Arc<McpOrchestrator>>>,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
+) -> Arc<AppContext> {
     Arc::new(
         AppContext::builder()
             .router_config(config.clone())
-            .client(crate::clients::http_client())
+            .client(http_client())
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
             .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
             .tool_parser_factory(Some(ToolParserFactory::new()))
             .worker_registry(Arc::new(WorkerRegistry::new()))
             .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))
-            .response_storage(Arc::new(MemoryResponseStorage::new()))
-            .conversation_storage(Arc::new(MemoryConversationStorage::new()))
-            .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
             .worker_job_queue(Arc::new(OnceLock::new()))
             .workflow_engines(Arc::new(OnceLock::new()))
             .mcp_orchestrator(mcp_orchestrator)
             .build()
             .expect("app context"),
     )
+}
+
+/// One regular gRPC worker carrying `labels`, as the selection a stage or a
+/// parser utility reads the decode worker's labels from.
+pub(crate) fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
+    let mut builder =
+        BasicWorkerBuilder::new("grpc://engine:50051").worker_type(WorkerType::Regular);
+    for (key, value) in labels {
+        builder = builder.label(*key, *value);
+    }
+    WorkerSelection::Single {
+        worker: Arc::new(builder.build()),
+    }
+}
+
+/// The forced call a thinking prompt takes under `parser`: the constraint's
+/// kind and the structural tag the registry builds for one `get_weather` tool
+/// under `tool_choice: required`, with the reasoning prefix armed.
+pub(crate) fn forced_call_on_a_thinking_prompt(
+    factory: &ToolParserFactory,
+    parser: &str,
+) -> (String, String) {
+    let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
+        "type": "function",
+        "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
+    }]))
+    .unwrap();
+    let required = ToolChoice::Value(ToolChoiceValue::Required);
+    match factory
+        .registry()
+        .generate_tool_constraint(Some(parser), &tools, &required, true)
+        .unwrap()
+    {
+        Some(ToolConstraint::StructuralTag(tag)) => ("structural_tag".to_string(), tag),
+        other => panic!("expected a structural tag, got {other:?}"),
+    }
+}
+
+/// A chat tool declaration named `name`, with an empty object schema: what
+/// the tool-reading tests put in a request's or a message's `tools`.
+pub(crate) fn tool(name: &str) -> Value {
+    json!({
+        "type": "function",
+        "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
+    })
+}
+
+/// The threads a [`ThreadRecordingTokenizer`]'s encodes and decodes ran on,
+/// in order.
+pub(crate) type ThreadRecord = Arc<Mutex<Vec<ThreadId>>>;
+
+/// The mock tokenizer behind a record of the thread each of its encodes and
+/// decodes ran on: the probe of the offload policy, under which an input
+/// below the bound runs on the calling thread and one at or above it on the
+/// blocking pool.
+pub(crate) struct ThreadRecordingTokenizer {
+    inner: MockTokenizer,
+    ran_on: ThreadRecord,
+}
+
+/// A [`ThreadRecordingTokenizer`] over the plain mock, with its record.
+pub(crate) fn thread_recording_tokenizer() -> (Arc<dyn Tokenizer>, ThreadRecord) {
+    let ran_on: ThreadRecord = Arc::new(Mutex::new(Vec::new()));
+    let tokenizer = Arc::new(ThreadRecordingTokenizer {
+        inner: MockTokenizer::new(),
+        ran_on: ran_on.clone(),
+    });
+    (tokenizer, ran_on)
+}
+
+impl ThreadRecordingTokenizer {
+    fn record(&self) {
+        self.ran_on.lock().unwrap().push(thread::current().id());
+    }
+}
+
+impl Encoder for ThreadRecordingTokenizer {
+    fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+        self.record();
+        self.inner.encode(input, add_special_tokens)
+    }
+
+    fn encode_batch(
+        &self,
+        inputs: &[&str],
+        add_special_tokens: bool,
+    ) -> anyhow::Result<Vec<Encoding>> {
+        self.record();
+        self.inner.encode_batch(inputs, add_special_tokens)
+    }
+}
+
+impl Decoder for ThreadRecordingTokenizer {
+    fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+        self.record();
+        self.inner.decode(token_ids, skip_special_tokens)
+    }
+}
+
+impl Tokenizer for ThreadRecordingTokenizer {
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    fn get_special_tokens(&self) -> &SpecialTokens {
+        self.inner.get_special_tokens()
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Bytes the current thread allocated while `f` ran: the allocator's own
+/// per-thread counter, read before and after (frees do not subtract). The
+/// lib's test binary runs under that allocator (`lib.rs`) wherever the
+/// executable does.
+#[cfg(all(
+    feature = "jemalloc-stats",
+    not(target_env = "msvc"),
+    not(target_env = "musl")
+))]
+pub(crate) fn bytes_allocated_during(f: impl FnOnce()) -> u64 {
+    let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().expect("thread.allocatedp");
+    let before = allocated.get();
+    f();
+    allocated.get() - before
+}
+
+/// A model directory whose `config.json` is no JSON. A tokenizer registered
+/// from it keeps the media path's lookup of the model's config on this
+/// disk, where it fails as an unreadable checkpoint does; a source with no
+/// `config.json` in it is looked up on the model hub instead, and the test's
+/// answer follows the hub's. The directory is gone once dropped: a test
+/// holds it while its requests run.
+pub(crate) fn unreadable_model_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("config.json"), "no model configuration").expect("config.json");
+    dir
 }

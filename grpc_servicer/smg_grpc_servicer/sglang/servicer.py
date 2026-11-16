@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator
 from contextlib import aclosing
 from datetime import datetime, timezone
 from pathlib import Path
+from traceback import format_exc as get_exception_traceback
 
 import grpc
 import msgspec
@@ -25,7 +26,6 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.kv_events import (
     KVEventsConfig,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     ProfileReq,
@@ -33,21 +33,19 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.engine_status import abort_for_constraint_failure
 from smg_grpc_servicer.health_probe import await_probe
+from smg_grpc_servicer.sglang.compat import (
+    get_disaggregation_types,
+    get_multimodal_types,
+    get_tokenizer,
+)
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.hidden_states import (
@@ -61,6 +59,7 @@ from smg_grpc_servicer.sglang.loads import (
     load_record,
     ranks_with_a_window,
 )
+from smg_grpc_servicer.sglang.lora import PreloadedLoras
 from smg_grpc_servicer.sglang.request_manager import (
     GrpcRequestManager,
     _validate_token_ids_logprobs,
@@ -82,6 +81,10 @@ from ..constrained_decoding import (
 )
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
+
+DisaggregationMode, FAKE_BOOTSTRAP_HOST = get_disaggregation_types()
+
+Modality, MultimodalDataItem, MultimodalProcessorOutput = get_multimodal_types()
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -174,6 +177,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.scheduler_info = scheduler_info
         self.start_time = time.time()
         self.health_servicer = health_servicer
+        self.loras = PreloadedLoras(server_args)
         # SamplingParams.normalize requires a tokenizer whenever string stops
         # are used; the scheduler matches them with its own tokenizer.
         if server_args.skip_tokenizer_init:
@@ -219,6 +223,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         logger.info("gRPC scheduler servicer initialized")
 
+    async def ListLoadedLoRAAdapters(
+        self,
+        request: sglang_scheduler_pb2.ListLoadedLoRAAdaptersRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.ListLoadedLoRAAdaptersResponse:
+        return sglang_scheduler_pb2.ListLoadedLoRAAdaptersResponse(
+            loaded_adapters=self.loras.adapters
+        )
+
     async def Generate(
         self,
         request: sglang_scheduler_pb2.GenerateRequest,
@@ -227,6 +240,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Handle generation requests with streaming responses."""
         logger.info(f"Receive generation request: {request.request_id}")
 
+        response_generator = None
         try:
             # Convert gRPC request to internal format
             tokenized_req = self._convert_generate_request(request)
@@ -311,6 +325,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 f"{get_exception_traceback()}"
             )
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        finally:
+            if response_generator is not None:
+                await response_generator.aclose()
 
     async def Embed(
         self,
@@ -586,6 +603,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 return str(obj)
 
         serializable_args = make_serializable(server_args_dict)
+        from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
+
+        serializable_args["multimodal_encoder_dtype"] = encoder_dtype(
+            None, lambda: self.model_config.dtype
+        )
         # The operator's PD pairing protocol rides with the server args, so
         # the gateway reads it as the worker's `pairing_protocol` label.
         pairing_protocol = pairing_protocol_from_env()
@@ -941,6 +963,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> TokenizedGenerateReqInput:
         """Convert gRPC GenerateRequest to internal format."""
 
+        # Older proto packages remain usable for text and single-modality requests.
+        extra_mm_inputs = getattr(grpc_req, "extra_mm_inputs", ())
+        if extra_mm_inputs and not (
+            grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values")
+        ):
+            raise ValueError("SGLang extra_mm_inputs requires primary preprocessed inputs")
+
         # Extract tokenized input
         if not grpc_req.HasField("tokenized"):
             raise ValueError("Tokenized input must be provided")
@@ -975,7 +1004,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Parse multimodal inputs if present
         mm_inputs = None
         if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values"):
-            mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs)
+            mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs, extra_mm_inputs, len(input_ids))
 
         # Create request
         require_reasoning = bool(grpc_req.require_reasoning)
@@ -999,7 +1028,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ),
             top_logprobs_num=grpc_req.top_logprobs_num or 0,
             stream=grpc_req.stream or False,
-            lora_id=grpc_req.lora_id if grpc_req.lora_id else None,
+            lora_id=self.loras.resolve(grpc_req.lora_id) if grpc_req.lora_id else None,
             token_ids_logprob=(
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
             ),
@@ -1014,38 +1043,62 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Decode a proto TensorData message into a torch.Tensor."""
         return tensor_from_parts(tensor_data.data, tensor_data.shape, tensor_data.dtype)
 
-    def _parse_mm_inputs(self, mm_proto) -> MultimodalProcessorOutput:
+    def _parse_mm_inputs(self, mm_proto, extra_mm_inputs, prompt_len) -> MultimodalProcessorOutput:
         """Parse proto MultimodalInputs into a MultimodalProcessorOutput for the scheduler."""
-        # Decode pixel_values from typed TensorData field
-        pixel_values = self._decode_tensor_data(mm_proto.pixel_values)
-
-        # Decode model-specific tensors
-        model_specific_data = {}
-        for key, tensor_data in mm_proto.model_specific_tensors.items():
-            model_specific_data[key] = self._decode_tensor_data(tensor_data)
-
-        # Convert placeholder ranges to offsets: list of (start, end_inclusive)
-        offsets = [(p.offset, p.offset + p.length - 1) for p in mm_proto.mm_placeholders]
-        if not offsets:
-            logger.warning(
-                "No mm_placeholders from Rust gateway — token expansion may have "
-                "failed to find the placeholder token in input_ids. "
-                "Check that placeholder_token_id matches the tokenized image token."
+        mm_items = []
+        im_token_id = video_token_id = None
+        seen = set()
+        for batch in (mm_proto, *extra_mm_inputs):
+            labels = set(batch.modalities)
+            if not labels or labels == {"image"}:
+                modality = Modality.IMAGE
+            elif labels == {"video"}:
+                modality = Modality.VIDEO
+            else:
+                raise ValueError(f"Unsupported SGLang tensor modalities: {labels}")
+            if modality in seen:
+                raise ValueError("SGLang requires one batch per modality")
+            seen.add(modality)
+            token = batch.im_token_id if batch.HasField("im_token_id") else None
+            if modality == Modality.VIDEO:
+                if token is None:
+                    raise ValueError("SGLang video tensors require a placeholder token id")
+                video_token_id = token
+            else:
+                im_token_id = token
+            offsets = []
+            for placeholder in batch.mm_placeholders:
+                start, length = placeholder.offset, placeholder.length
+                if length == 0:
+                    raise ValueError(f"multimodal placeholder at offset {start} has zero length")
+                end = start + length - 1
+                if end >= prompt_len:
+                    raise ValueError(
+                        f"multimodal placeholder {start}..={end} lies outside the prompt "
+                        f"of {prompt_len} tokens"
+                    )
+                offsets.append((start, end))
+            if not offsets:
+                logger.warning(
+                    "No mm_placeholders from Rust gateway — token expansion may have "
+                    "failed to find the placeholder token in input_ids. "
+                    "Check that placeholder_token_id matches the tokenized image token."
+                )
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=modality,
+                    feature=self._decode_tensor_data(batch.pixel_values),
+                    model_specific_data={
+                        key: self._decode_tensor_data(value)
+                        for key, value in batch.model_specific_tensors.items()
+                    },
+                    offsets=offsets or None,
+                )
             )
-            offsets = None
-
-        mm_item = MultimodalDataItem(
-            modality=Modality.IMAGE,
-            feature=pixel_values,
-            model_specific_data=model_specific_data,
-            offsets=offsets,
-        )
-
-        im_token_id = mm_proto.im_token_id if mm_proto.HasField("im_token_id") else None
-
         return MultimodalProcessorOutput(
-            mm_items=[mm_item],
-            im_token_id=im_token_id,
+            mm_items=mm_items,
+            im_token_id=im_token_id if Modality.IMAGE in seen else video_token_id,
+            video_token_id=video_token_id,
         )
 
     def _convert_embed_request(

@@ -222,7 +222,7 @@ impl StreamParser {
                     self.schema = tools
                         .iter()
                         .find(|t| t.function.name == self.name)
-                        .and_then(|t| t.function.parameters.get("properties"))
+                        .and_then(|t| t.function.parameters_schema().get("properties"))
                         .and_then(|p| p.get(&self.key))
                         .cloned();
                     let ts = types(self.schema.as_ref());

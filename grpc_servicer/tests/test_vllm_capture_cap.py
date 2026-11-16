@@ -452,6 +452,14 @@ def _main_module(spec_name: str | None) -> types.ModuleType:
     return main
 
 
+@pytest.fixture(autouse=True)
+def python_servicer(monkeypatch):
+    """These parses derive the Python servicer's capture cap: since the Rust
+    servicer became the default, the Python one is an explicit choice (a test
+    that sets the flag to rust still does so on its namespace)."""
+    monkeypatch.setenv("SMG_VLLM_SERVICER_IMPL", "python")
+
+
 @pytest.fixture
 def parser_class(monkeypatch):
     """vLLM's parser class as the plugin wraps it, in a process without vLLM;
@@ -723,7 +731,11 @@ def test_the_decision_logged_at_a_parse_before_vllm_configures_logging_comes_out
         _vllm_configures_logging(stream)
         _the_launcher_runs_serve_grpc(parsed, monkeypatch)
         lines = stream.getvalue().splitlines()
-    assert len(lines) == 1
+    # The switch's own start-up line (the implementation and its origin) comes
+    # out through the same handlers; the held capture-cap line comes out once.
+    announced = [line for line in lines if "Servicer implementation:" in line]
+    lines = [line for line in lines if "Servicer implementation:" not in line]
+    assert len(announced) == 1 and len(lines) == 1
     assert lines[0].startswith("INFO [capture_cap.py:")
     assert (
         "CUDA-graph capture cap: 512, derived from the admission step (--max-num-batched-tokens 16384"
@@ -745,7 +757,10 @@ def test_the_decision_prints_at_the_parse_where_vllm_configured_logging_before_i
         _the_launcher_runs_serve_grpc(parsed, monkeypatch)
         lines = stream.getvalue().splitlines()
     assert len(at_the_parse) == 1 and "512, derived" in at_the_parse[0]
-    assert lines == at_the_parse
+    # The switch adds its start-up line (the implementation and its origin)
+    # and replays nothing else.
+    assert [line for line in lines if "Servicer implementation:" not in line] == at_the_parse
+    assert sum("Servicer implementation:" in line for line in lines) == 1
 
 
 def test_the_python_path_ends_a_hold_nothing_released_before_the_launchers_coroutine(
@@ -771,4 +786,11 @@ def test_the_python_path_ends_a_hold_nothing_released_before_the_launchers_corou
         result = asyncio.run(launcher_switch.with_servicer_switch(serve_grpc)(parsed))
         assert result == "python ran"
         assert pkg_logger.handlers == []
-    assert capsys.readouterr().err == "from the launcher's coroutine\n"
+    # The explicit python choice is announced as deprecated (a warning, so it
+    # reaches stderr like the coroutine's error); the held INFO line does not.
+    from smg_grpc_servicer import rust_lifecycle
+
+    assert capsys.readouterr().err.splitlines() == [
+        rust_lifecycle.DEPRECATION_LINE % rust.SERVICER_IMPL_ENV,
+        "from the launcher's coroutine",
+    ]

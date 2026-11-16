@@ -7,12 +7,16 @@ use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{common::InputIds, generate::GenerateRequest};
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        context::{PreparationOutput, RequestContext},
-        utils,
+use crate::{
+    routers::{
+        error,
+        grpc::{
+            context::{PreparationOutput, RequestContext},
+            regular::stages::token_ids::{reject_unknown_token_id, reported_embedding_rows},
+            utils,
+        },
     },
+    worker::WorkerRegistry,
 };
 
 /// Generate preparation stage
@@ -20,6 +24,8 @@ use crate::routers::{
 /// Extracts generate-specific preparation logic from the old unified PreparationStage.
 /// This is a direct extraction without architectural changes.
 pub(crate) struct GeneratePreparationStage;
+
+const FUNCTION: &str = "GeneratePreparationStage::prepare_generate";
 
 impl GeneratePreparationStage {
     /// The stage's work. The chat+generate dispatcher calls this directly, so
@@ -38,17 +44,39 @@ impl GeneratePreparationStage {
         ctx: &mut RequestContext,
         request: &GenerateRequest,
     ) -> Result<(), Response> {
+        // The route declares media fields, and the paths that forward the
+        // body as given carry them to the engine; this pipeline sends text
+        // and token ids only. A request that names media is refused as the
+        // chat route refuses media no worker takes, instead of being served
+        // without it.
+        let media = request.media_fields();
+        if !media.is_empty() {
+            return Err(error::bad_request(
+                "multimodal_not_supported",
+                format!(
+                    "media input ({}) is not supported on the generate route over the gateway's \
+                     gRPC path: the route carries text and token ids to the engine, no media; send \
+                     media through the chat route",
+                    media.join(", ")
+                ),
+            ));
+        }
+
         // Resolve tokenizer from registry (cached for reuse in response processing)
-        let tokenizer = utils::resolve_tokenizer(ctx, "GeneratePreparationStage::prepare_generate")
-            .map_err(|e| *e)?;
+        let tokenizer = utils::resolve_tokenizer(ctx, FUNCTION).map_err(|e| *e)?;
 
         let (original_text, token_ids) = match self
-            .resolve_generate_input(request, &tokenizer)
+            .resolve_generate_input(
+                request,
+                &tokenizer,
+                &ctx.components.worker_registry,
+                &ctx.input.model_id,
+            )
             .await
         {
             Ok(res) => res,
             Err(msg) => {
-                error!(function = "GeneratePreparationStage::execute", error = %msg, "Failed to resolve generate input");
+                error!(function = FUNCTION, error = %msg, "Failed to resolve generate input");
                 return Err(error::bad_request("resolve_input_failed", msg));
             }
         };
@@ -79,27 +107,37 @@ impl GeneratePreparationStage {
         &self,
         request: &GenerateRequest,
         tokenizer: &Arc<dyn Tokenizer>,
+        worker_registry: &WorkerRegistry,
+        model_id: &str,
     ) -> Result<(Option<String>, Vec<u32>), String> {
+        // The engine's order: the ids before the text, so a body that carries
+        // both is served from the ids as the engine serves it (the text rode
+        // along for the client's own reading); a text-first read dropped the
+        // ids without a word.
+        if let Some(input_ids) = &request.input_ids {
+            return match input_ids {
+                InputIds::Single(ids) => {
+                    let converted = ids
+                        .iter()
+                        .map(|&id| u32::try_from(id))
+                        .collect::<Result<Vec<u32>, _>>()
+                        .map_err(|_| "input_ids must be non-negative".to_string())?;
+                    reject_unknown_token_id(tokenizer.as_ref(), &converted, "input_ids", || {
+                        reported_embedding_rows(worker_registry, model_id)
+                    })?;
+                    Ok((None, converted))
+                }
+                InputIds::Batch(_) => {
+                    Err("Batch input_ids are not supported over gRPC generate yet".to_string())
+                }
+            };
+        }
+
         if let Some(text) = &request.text {
             return self
                 .tokenize_single_text(tokenizer, text)
                 .await
                 .map(|(original, ids)| (Some(original), ids));
-        }
-
-        // Handle input_ids - validate and convert
-        if let Some(input_ids) = &request.input_ids {
-            return match input_ids {
-                InputIds::Single(ids) => ids
-                    .iter()
-                    .map(|&id| u32::try_from(id))
-                    .collect::<Result<Vec<u32>, _>>()
-                    .map(|converted| (None, converted))
-                    .map_err(|_| "input_ids must be non-negative".to_string()),
-                InputIds::Batch(_) => {
-                    Err("Batch input_ids are not supported over gRPC generate yet".to_string())
-                }
-            };
         }
 
         Err("Either `text` or `input_ids` must be provided".to_string())
@@ -111,9 +149,9 @@ impl GeneratePreparationStage {
         text: &str,
     ) -> Result<(String, Vec<u32>), String> {
         // Don't add special tokens - raw text generation uses text as-is
-        let encoding = utils::encode_blocking(tokenizer.clone(), text.to_string(), false)
+        let encoding = utils::encode_blocking(tokenizer.clone(), text, false)
             .await
             .map_err(|e| format!("Tokenization failed: {e}"))?;
-        Ok((text.to_string(), encoding.token_ids().to_vec()))
+        Ok((text.to_string(), encoding.into_token_ids()))
     }
 }

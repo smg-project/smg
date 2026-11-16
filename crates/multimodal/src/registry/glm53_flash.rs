@@ -6,8 +6,8 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
     registry::{
-        MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
-        RegistryResult,
+        layouts::grid_patch_fields, MediaItemInfo, MediaPartOrder, ModelMetadata,
+        ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{
         FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId, VideoSamplingInfo,
@@ -27,8 +27,11 @@ const END: &str = "<|end_of_image|>";
 /// clip costs on this path what it costs on the engine's own server only
 /// when the frames are the same.
 const LOADER_MAX_FRAMES: usize = 2048;
-/// The rate the family's loader samples at, which is also the reference
-/// video processor's (`Glm5NextVideoProcessor`) `fps`.
+/// The rate the family's loader samples at: the default of its sampling
+/// kwargs, which the servicer refuses to override for this family, never a
+/// rate the processor config states (the reference video processor's own
+/// `fps`, 2 on the released checkpoints, reaches only its own re-sample of a
+/// clip the loader kept whole).
 const LOADER_FPS: f64 = 2.0;
 /// Frames per temporal group: the engine's timestamps take every second
 /// sampled frame, whatever the configured temporal patch size; the loader's
@@ -39,12 +42,7 @@ pub(super) struct Glm53FlashSpec;
 
 impl Glm53FlashSpec {
     fn image_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["image_token_id"])
-            .map(|id| id as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "image_token_id".to_string(),
-            })
+        metadata.config_token_id("image_token_id")
     }
 
     /// The timestamp the engine's own server writes before each temporal
@@ -336,33 +334,14 @@ impl ModelProcessorSpec for Glm53FlashSpec {
         }
     }
 
-    /// The rate the family's loader samples at, the reference video
-    /// processor's `fps`.
+    /// The rate the family's loader samples at, whatever rate the processor
+    /// config states.
     fn default_video_sample_fps(&self) -> Option<f64> {
         Some(LOADER_FPS)
     }
 
-    fn default_video_sample_fps_with(&self, config: Option<&PreProcessorConfig>) -> Option<f64> {
-        Some(
-            config
-                .and_then(|config| config.get_extra::<f64>("fps"))
-                .filter(|fps| fps.is_finite() && *fps > 0.0)
-                .unwrap_or(LOADER_FPS),
-        )
-    }
-
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("image_grid_thw".to_string(), FieldLayout::Batched),
-            ("video_grid_thw".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-            ("patches_per_video".to_string(), FieldLayout::Batched),
-            ("video_second_per_grid".to_string(), FieldLayout::Batched),
-        ])
+        grid_patch_fields()
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {
@@ -375,7 +354,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::registry::{test_helpers::*, ModelRegistry};
+    use crate::registry::{layouts::grid_patch_fields, test_helpers::*, ModelRegistry};
 
     const IMAGE_ID: u32 = 154854;
     const BEGIN_ID: u32 = 154830;
@@ -407,12 +386,16 @@ mod tests {
                 temporal_patch_size: FRAMES_PER_GROUP,
             }
         );
+        // The processor config's rate does not move the loader's walk.
         let video_config = PreProcessorConfig::from_value(json!({"fps": 1})).unwrap();
         assert_eq!(
-            spec.default_video_sample_fps_with(Some(&video_config)),
-            Some(1.0)
+            spec.default_video_sample_fps_with(&video_config),
+            Some(LOADER_FPS)
         );
-        assert_eq!(spec.default_video_sample_fps_with(None), Some(LOADER_FPS));
+        assert_eq!(
+            spec.default_video_sample_fps_with(&PreProcessorConfig::default()),
+            Some(LOADER_FPS)
+        );
 
         // Four temporal groups of two tokens each, from eight frames the
         // loader picked at 30 fps: the groups start at frames 0, 17, 35, 53.
@@ -661,5 +644,56 @@ mod tests {
         assert!(spec.worker_expandable(Modality::Image));
         assert!(!spec.worker_expandable(Modality::Video));
         assert!(!spec.worker_expandable(Modality::Audio));
+    }
+
+    /// The entry's legacy field map is the grid-patch table: the pixels flat
+    /// over `patches_per_image`, the image and video grids, counts and frame
+    /// spacing one row per item. The engine slices a batch by this map, so an
+    /// emptied map or another tower's table reads here, key for key against
+    /// the shared table and against the rows themselves.
+    #[test]
+    fn the_field_map_is_the_grid_patch_table() {
+        let fields = Glm53FlashSpec.field_layouts();
+        assert_eq!(fields, grid_patch_fields());
+        let mut keys: Vec<&str> = fields.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "image_grid_thw",
+                "patches_per_image",
+                "patches_per_video",
+                "pixel_values",
+                "video_grid_thw",
+                "video_second_per_grid"
+            ]
+        );
+        assert_eq!(
+            fields["pixel_values"],
+            FieldLayout::flat("patches_per_image")
+        );
+        assert!(fields
+            .iter()
+            .filter(|(key, _)| *key != "pixel_values")
+            .all(|(_, layout)| *layout == FieldLayout::Batched));
+    }
+
+    /// The entry has no per-modality override, so a video batch takes the
+    /// legacy map through `from_legacy_fields` too: its pixels are sliced by
+    /// `patches_per_image`, the count the video processor writes beside
+    /// `patches_per_video`. A tidy of either side that forgets the pair fails
+    /// every clip at assembly; this pin and the processor's read it first.
+    #[test]
+    fn a_video_batch_is_sliced_by_the_image_patch_count() {
+        let layouts = Glm53FlashSpec.encoder_field_layouts_for(Modality::Video);
+        assert_eq!(
+            layouts.encoder_input,
+            FieldLayout::flat("patches_per_image")
+        );
+        assert_eq!(
+            layouts.model_specific.get("patches_per_image"),
+            Some(&FieldLayout::Batched)
+        );
+        assert!(!layouts.model_specific.contains_key("pixel_values"));
     }
 }

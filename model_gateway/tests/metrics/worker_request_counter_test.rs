@@ -13,12 +13,11 @@
 
 #![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     clippy::disallowed_methods,
     reason = "test failures should panic; the upstream tasks live for the test process"
 )]
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -41,25 +40,17 @@ use smg::{
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
-use crate::common::{
-    grpc_harness::{
-        build_grpc_router, grpc_router_config, health_checks_off, serve_canned_worker, Canned,
+use crate::{
+    common::{
+        grpc_harness::{
+            build_grpc_router, grpc_router_config, health_checks_off, serve_canned_worker, Canned,
+        },
+        test_app::{create_test_app_context, create_test_app_with_context, scrape},
     },
-    test_app::{create_test_app_context, create_test_app_with_context},
+    metrics::recorder,
 };
 
 const MODEL: &str = "counter-test-model";
-
-async fn scrape(addr: SocketAddr) -> String {
-    smg::clients::http_client()
-        .get(format!("http://{addr}/metrics"))
-        .send()
-        .await
-        .expect("metrics endpoint reachable")
-        .text()
-        .await
-        .expect("metrics body")
-}
 
 /// The value of the worker's request counter in a scrape, if the series exists.
 ///
@@ -159,7 +150,7 @@ fn completion() -> CompletionRequest {
 
 #[tokio::test]
 async fn every_dispatch_moves_the_worker_request_counter() {
-    let handle = crate::metrics::recorder();
+    let handle = recorder();
     let (metrics_addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");

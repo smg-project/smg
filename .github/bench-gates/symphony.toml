@@ -1,0 +1,103 @@
+# Regression gate for `cargo bench -p smg-symphony --bench throughput`, run by
+# .github/workflows/benchmark-symphony.yml on pull requests through scripts/bench_gate.py.
+#
+# The gate runs the rows that need no fixtures: `parse/{whole,pieces8}/<table>` (one turn with a
+# thought, an answer and two calls, fed whole and in pieces of eight bytes), `prose/{whole,pieces8}/
+# <table>` (text with no marker in it, the common streaming case), `setup/{table,engine}/<table>`
+# and `setup/declared` (the parser's per-request construction): 57 ids. The `setup/validate` rows
+# are 17 - 24 ns each, where the spread is the timer's and not the code's, and the `slice` and
+# `adapt` groups read the bellwether tree and run where it is unpacked, not on this runner; a push
+# to main keeps running the whole file at criterion's default times.
+#
+# The gated run shortens criterion's warm-up and measurement time per id (bench_args below): at the
+# defaults (3 s and 5 s) the 57 ids took about nine minutes a run on the hosted runner and six runs
+# overran the 40-minute step; the radix bench sets 0.5 s and 2 s in code and runs its 72 ids there
+# in under four minutes a run.
+#
+# Threshold (the method is described in tokenizer.toml). The identical-build spread was first
+# measured on a shared build host at loads of 15 to 480 (9 - 59 % and 14 - 76 % over the gated ids,
+# numbers that described the host, not the benchmark) and the gate opened at a provisional 25 %.
+# The hosted runner's own null case (the gate pull request's run of 2026-11-04: two builds of the
+# same source, three interleaved runs a side, 57 ids, 0 failed, 0 suspect) read, per group, as the
+# median and the largest per-id spread of a side's three runs, and the largest change of medians
+# between the two builds:
+#
+#   group             identical build   across builds   threshold
+#   parse/whole       1.3 - 2.9 %       1.7 %           10 %
+#   parse/pieces8     2.0 - 3.0 %       1.2 %           10 %
+#   prose/pieces8     2.2 - 2.4 %       0.9 %           10 %
+#   prose/whole       7.6 - 7.8 %       0.7 %           20 %
+#   setup/engine      4.1 - 8.1 %       5.4 %           20 %
+#   setup/declared    9.3 %             1.3 %           20 %
+#   setup/table       6.5 - 10.3 %      5.8 %           25 %
+#
+# The thresholds are the tokenizer rule's: the smallest multiple of 5 % that is at least twice the
+# identical-build spread and 1.5 x the across-build change, never under 10 %. Every job uploads
+# bench-gate/results.json with the raw per-run medians of both sides; a second null case can
+# tighten the setup rows further. The last entry catches a row added later at the provisional 25 %.
+#
+# Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
+# run's, with every function on a 64-byte boundary (RUSTFLAGS: `-C
+# llvm-args=-align-all-functions=6`, beside the outliner flag of .cargo/config.toml). Without it the
+# prose/whole rows of six marker tables (gemma4, glm, kimi_k3, lfm2.5, qwen3, qwen3_tagged) have two
+# states, about 540 and 790 ns, chosen by where the unchanged scanner code lands: the same bytes
+# linked 32 bytes later read +46 to +48 % on all six and flat elsewhere, linked 16 or 48 bytes later
+# they read flat, and a pull request whose code size moved the unchanged functions by 16 bytes
+# modulo 64 failed this gate at +45 to +47 % on the hosted runner while its parser code was
+# byte-identical. With functions aligned that pull request's pair reads -0.7 to +0.3 % on the six
+# rows with both arms in the 540 ns state, and the same-bytes floor reads 0 failed with the
+# prose/whole rows inside 1 %. An inserted regression of one dependent multiply-add per 32 bytes of
+# every delta reads +16 to +22 % on the six rows under the aligned build: five of them fail and
+# lfm2.5 passes at +16.3 %, prose/whole/json (+21.2 %) and prose/whole/plain (+38.2 %) fail beside
+# them, 7 of 57 ids. The default build in its 540 ns state reads the same regression at +22 to +23 %
+# on all six, json passing at +16.5 %, 7 of 57 as well. Aligning loops too (`-align-loops=64`) or
+# every block without fall-through parks both arms in the 790 ns state, where the six read +14 to
+# +15 % and none fails (1 and 2 of 57): functions only keeps the failed count and five of the six
+# rows. A regression of this size sits at the edge of the 20 % threshold on the six rows under
+# either build: the threshold comes from the null-case rule above, not from this regression. The hot
+# code's own placement still follows its function's body, so a change to the scanner itself is
+# measured at the placement its own code produces, as any code change is.
+
+repeats = 3
+filter = "^((parse|prose)/|setup/(table|engine)/|setup/declared$)"
+bench_args = ["--warm-up-time", "0.5", "--measurement-time", "2"]
+
+# The files that feed this binary beyond the measured crate. The base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining: on 2026-11-08 a bench-file-only change read the six
+# prose/whole rows +32 % on the hosted runner (+47 % on a build host, the prose iteration closures
+# compiled to other sizes under the one-unit thin-LTO link) with the parser byte-identical. A new
+# row goes to a bench target of its own, as benches/grammar.rs is.
+sources = ["crates/symphony/benches/throughput.rs", "crates/symphony/tests/common/slices.rs"]
+
+[[gate]]
+pattern = "^parse/(whole|pieces8)/"
+threshold = 0.10
+note = "runner null case: identical build 1.3 - 3.0 %, across builds 1.2 - 1.7 %"
+
+[[gate]]
+pattern = "^prose/pieces8/"
+threshold = 0.10
+note = "runner null case: identical build 2.2 - 2.4 %, across builds 0.9 %"
+
+[[gate]]
+pattern = "^prose/whole/"
+threshold = 0.20
+note = "runner null case: identical build 7.6 - 7.8 %, across builds 0.7 %"
+
+[[gate]]
+pattern = "^setup/(engine/|declared$)"
+threshold = 0.20
+note = "runner null case: identical build 4.1 - 9.3 %, across builds 1.3 - 5.4 %"
+
+[[gate]]
+pattern = "^setup/table/"
+threshold = 0.25
+note = "runner null case: identical build 6.5 - 10.3 %, across builds 5.8 %"
+
+# Last, so the first match above wins: a row the filter admits that no entry names (one added after
+# the null case) is gated at the provisional level instead of running report-only in silence.
+[[gate]]
+pattern = "^(parse|prose|setup)/"
+threshold = 0.25
+note = "fallback for a row added after the 2026-11-04 null case; measure it and give it its own entry"

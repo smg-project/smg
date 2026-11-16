@@ -45,10 +45,11 @@ pub struct ServicerConfig {
     /// [`DEFAULT_ENGINE_STARTUP_CEILING`].
     pub engine_startup_ceiling: Option<Duration>,
     /// Bound on the connected engine's silence: how long it may hold requests
-    /// in flight, in total since its last output, with nothing pending
-    /// prefill, before the servicer treats it as dead and fails them. The
-    /// prompt tokens pending prefill extend it at `engine_prefill_tokens_per_sec`.
-    /// See [`DEFAULT_ENGINE_SILENCE_TIMEOUT`].
+    /// in flight, in total since its last output or other sign of progress
+    /// (a KV-event batch its publisher sent, read live by the relay), with
+    /// nothing pending prefill, before the servicer treats it as dead and
+    /// fails them. The prompt tokens pending prefill extend it at
+    /// `engine_prefill_tokens_per_sec`. See [`DEFAULT_ENGINE_SILENCE_TIMEOUT`].
     pub engine_silence_timeout: Duration,
     /// The prefill rate the silence bound allows the engine: the prompt tokens
     /// of the in-flight requests without a first output yet extend the bound
@@ -59,6 +60,13 @@ pub struct ServicerConfig {
     /// an ephemeral one); `None` exposes no metrics. The listener binds
     /// beside the gRPC one, before the engine connects, on its own thread.
     pub metrics_bind_address: Option<String>,
+    /// The mark the lifecycle owner's own request ids carry while it holds
+    /// readiness for its planned warm-up: with `Some(nonce)` the hold admits
+    /// `smg-warmup-<nonce>-<ordinal>` and nothing else, so a client's own
+    /// `rid` cannot spell its way in; `None` admits the bare
+    /// `smg-warmup-<ordinal>`, the form of a launcher that draws no nonce.
+    /// ASCII letters and digits.
+    pub warmup_nonce: Option<String>,
 }
 
 impl ServicerConfig {
@@ -84,6 +92,7 @@ impl ServicerConfig {
             engine_silence_timeout: DEFAULT_ENGINE_SILENCE_TIMEOUT,
             engine_prefill_tokens_per_sec: DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
             metrics_bind_address: None,
+            warmup_nonce: None,
         }
     }
 
@@ -138,6 +147,11 @@ impl ServicerConfig {
                     "metrics_bind_address must differ from bind_address",
                 ));
             }
+        }
+        if self.warmup_nonce.as_deref().is_some_and(|nonce| {
+            nonce.is_empty() || !nonce.bytes().all(|b| b.is_ascii_alphanumeric())
+        }) {
+            return Err(invalid("warmup_nonce must be ASCII letters and digits"));
         }
         Ok(())
     }
@@ -301,6 +315,14 @@ mod tests {
                 config.metrics_bind_address = Some("127.0.0.1:50051".to_string());
             })),
             "metrics_bind_address must differ from bind_address"
+        );
+        assert_eq!(
+            refusal(with(|config| config.warmup_nonce = Some(String::new()))),
+            "warmup_nonce must be ASCII letters and digits"
+        );
+        assert_eq!(
+            refusal(with(|config| config.warmup_nonce = Some("a-b".to_string()))),
+            "warmup_nonce must be ASCII letters and digits"
         );
     }
 }

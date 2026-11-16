@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use llm_multimodal::Modality;
 use llm_tokenizer::traits::{PromptEncoding, Tokenizer};
 use tracing::{debug, error};
 
@@ -59,7 +60,7 @@ pub(crate) async fn prepare_rendered_prompt(
             }
         };
 
-    let mut token_ids = encoding.token_ids().to_vec();
+    let mut token_ids = encoding.into_token_ids();
 
     if let Some(media) = media.as_ref() {
         multimodal::validate_rendered_media_anchors(
@@ -109,6 +110,11 @@ pub(crate) async fn prepare_rendered_prompt(
             // plan (see `resolve_mm_processing` and `PipelinePin`).
             ctx.state.media_refs_pipeline =
                 multimodal::media_refs_pipeline_pin(&media_plan, &placeholders);
+            if media_plan.modalities() == [Modality::Image] {
+                ctx.state.image_anchor = placeholders
+                    .get(Modality::Image)
+                    .and_then(|anchor| tokenizer.token_to_id(anchor));
+            }
             multimodal_refs = Some(media_plan);
         } else {
             // The dtype every worker the selection can pick reads image
@@ -119,6 +125,16 @@ pub(crate) async fn prepare_rendered_prompt(
             // pipeline's mode, the pools the pixels can reach, as the
             // selection draws them.
             let image_wire_dtype = multimodal::mm_shared_image_wire_dtype_over(
+                &ctx.components.worker_registry,
+                model_id,
+                wire_pools,
+            );
+            // The byte bound the pixels must fit before any image is decoded,
+            // where every worker the selection can pick takes them inline in
+            // the gateway's own Generate message; none where any may take
+            // them beside it (an SHM handle, the RDMA lane, a TRT-LLM
+            // worker's file bytes, a ZMQ wire), and the framing itself answers.
+            let image_wire_cap = multimodal::mm_image_wire_cap_over(
                 &ctx.components.worker_registry,
                 model_id,
                 wire_pools,
@@ -143,6 +159,7 @@ pub(crate) async fn prepare_rendered_prompt(
                 &tokenizer_id,
                 &tokenizer_source,
                 image_wire_dtype,
+                image_wire_cap,
                 transparency,
                 encoder_budget,
             )
@@ -160,7 +177,7 @@ pub(crate) async fn prepare_rendered_prompt(
                 Err(e) => {
                     error!(
                         function = stage,
-                        error = %multimodal::processing_failed_message(&e),
+                        error = %format!("{e:#}"),
                         "Multimodal processing failed"
                     );
                     return Err(multimodal::processing_failed_response(&e));
@@ -235,7 +252,7 @@ mod tests {
     fn media(mode: MmProcessingMode, placeholders: PlaceholderTokens) -> MediaContext {
         media_for(
             MediaPlan::new([MediaContentPart::ImageUrl {
-                url: "https://a/1.png".to_string(),
+                url: "https://a/1.png".to_string().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
@@ -312,7 +329,7 @@ mod tests {
         let placeholders = PlaceholderTokens::worker_only();
         let media = media_for(
             MediaPlan::new([MediaContentPart::AudioUrl {
-                url: "https://a/1.wav".to_string(),
+                url: "https://a/1.wav".to_string().into(),
                 uuid: None,
             }]),
             MmProcessingMode::Worker,

@@ -312,7 +312,7 @@ impl VisionPreProcessor for DeepseekV41Processor {
     )]
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -492,7 +492,7 @@ mod tests {
         let white = Rgb([255, 255, 255]);
         let fill_values = |w: u32, h: u32| -> Vec<f32> {
             let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(w, h, white));
-            let out = processor.preprocess(std::slice::from_ref(&image)).unwrap();
+            let out = processor.preprocess(&[&image]).unwrap();
             out.encoder_input.as_f32().iter().copied().collect()
         };
         for (w, h) in [(300, 100), (200, 100)] {
@@ -543,12 +543,12 @@ mod tests {
         let processor = DeepseekV41Processor::new();
         let tall = DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 50_000, Rgb([0, 0, 0])));
         assert!(matches!(
-            processor.preprocess(std::slice::from_ref(&tall)),
+            processor.preprocess(&[&tall]),
             Err(TransformError::ShapeError(_))
         ));
         let wide = DynamicImage::ImageRgb8(RgbImage::from_pixel(100_000, 1, Rgb([0, 0, 0])));
         assert!(matches!(
-            processor.preprocess(std::slice::from_ref(&wide)),
+            processor.preprocess(&[&wide]),
             Err(TransformError::ShapeError(_))
         ));
     }
@@ -557,7 +557,7 @@ mod tests {
     fn preprocess_emits_engine_contract() {
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(64, 48, Rgb([10, 200, 30])));
         let processor = DeepseekV41Processor::new();
-        let out = processor.preprocess(std::slice::from_ref(&image)).unwrap();
+        let out = processor.preprocess(&[&image]).unwrap();
 
         let plan = processor.plan_image_grid(64, 48);
         assert_eq!((plan.best_width, plan.best_height), (630, 476));

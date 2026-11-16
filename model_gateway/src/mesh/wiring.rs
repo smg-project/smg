@@ -19,10 +19,10 @@ use super::adapters::{
         PeerList, RepairEntry, TreeRepairPage, TreeSyncAdapter, REPAIR_PAGE_PREFIX,
         REPAIR_REQUEST_PREFIX, TENANT_DELTA_PREFIX,
     },
-    RateLimitSyncAdapter, WorkerSyncAdapter,
+    WorkerSyncAdapter,
 };
 use crate::{
-    policies::{CacheAwarePolicy, PolicyRegistry, TreeHandle, TreeKind},
+    policies::{as_cache_aware, CacheAwarePolicy, PolicyRegistry, TreeHandle, TreeKind},
     worker::WorkerRegistry,
 };
 
@@ -49,16 +49,15 @@ const REPAIR_PAGE_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Debug)]
 pub struct MeshAdapters {
     worker: Arc<WorkerSyncAdapter>,
-    rate_limit: Arc<RateLimitSyncAdapter>,
     tree: Arc<TreeSyncAdapter>,
 }
 
 impl MeshAdapters {
-    /// Register the `worker:` (last-writer-wins) and `rl:` (epoch-max-wins)
-    /// CRDT namespaces plus the `td:` / `tree:req:` / `tree:page:` stream
-    /// namespaces, construct the adapters, and start their inbound sync
-    /// loops. One call because the adapters' `start` methods are not
-    /// idempotent (each call spawns another subscription task).
+    /// Register the `worker:` (last-writer-wins) CRDT namespace plus the
+    /// `td:` / `tree:req:` / `tree:page:` stream namespaces, construct the
+    /// adapters, and start their inbound sync loops. One call because the
+    /// adapters' `start` methods are not idempotent (each call spawns another
+    /// subscription task).
     ///
     /// MUST be called before `MeshServer::start` spawns gossip: a remote op
     /// arriving for an unregistered prefix would merge through the default
@@ -66,7 +65,7 @@ impl MeshAdapters {
     /// delta arriving before the tree adapter subscribes would be dropped.
     ///
     /// After construction the tree adapter is attached to `policy_registry`,
-    /// which propagates it (and flips `populate_hash_index` on) to every
+    /// which propagates it (and raises the mesh flag) to every
     /// existing and future [`CacheAwarePolicy`] instance.
     ///
     /// # Panics
@@ -74,9 +73,7 @@ impl MeshAdapters {
     /// Panics if any adapter's `start` invariants are violated — the
     /// concrete sources are a double `start` call on the same [`MeshKV`]
     /// (each adapter registers exactly one drain per prefix) and an
-    /// empty `node_name` (asserted by every adapter); the rate-limit
-    /// adapter additionally rejects a `node_name` containing `':'`
-    /// because it is the shard-key separator.
+    /// empty `node_name` (asserted by every adapter).
     pub fn start(
         mesh_kv: &MeshKV,
         node_name: String,
@@ -85,7 +82,6 @@ impl MeshAdapters {
         policy_registry: Arc<PolicyRegistry>,
     ) -> Arc<Self> {
         let worker_ns = mesh_kv.configure_crdt_prefix("worker:", MergeStrategy::LastWriterWins);
-        let rl_ns = mesh_kv.configure_crdt_prefix("rl:", MergeStrategy::EpochMaxWins);
         let td_ns = mesh_kv.configure_stream_prefix(
             TENANT_DELTA_PREFIX,
             StreamConfig {
@@ -113,7 +109,6 @@ impl MeshAdapters {
             node_name.clone(),
             cluster_state.clone(),
         );
-        let rate_limit = RateLimitSyncAdapter::new(rl_ns, node_name.clone());
         let peers: Arc<dyn PeerList> =
             Arc::new(ClusterStatePeerList::new(cluster_state, node_name.clone()));
         let tree_handle: Arc<dyn TreeHandle> =
@@ -127,27 +122,17 @@ impl MeshAdapters {
             node_name,
         );
         worker.start();
-        rate_limit.start();
         tree.start();
         // Only after the adapter is subscribed to the `td:` stream do we
         // let policies start writing to it — otherwise the very first
         // hot-path delta races the subscription setup and is dropped.
         policy_registry.set_mesh_tree_sync(Some(tree.clone()));
-        Arc::new(Self {
-            worker,
-            rate_limit,
-            tree,
-        })
+        Arc::new(Self { worker, tree })
     }
 
     /// Worker sync adapter.
     pub fn worker(&self) -> &Arc<WorkerSyncAdapter> {
         &self.worker
-    }
-
-    /// Rate-limit sync adapter.
-    pub fn rate_limit(&self) -> &Arc<RateLimitSyncAdapter> {
-        &self.rate_limit
     }
 
     /// Tree sync adapter (cache-aware tenant deltas + repair).
@@ -218,7 +203,7 @@ impl PolicyRegistryTreeHandle {
         let policies = self.registry.policies_for_model(model_id);
         let mut hit = false;
         for policy in &policies {
-            if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+            if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
                 hit = true;
                 f(cache_aware);
             }
@@ -308,7 +293,9 @@ mod tests {
     use crate::{
         config::types::PolicyConfig,
         policies::SelectWorkerInfo,
-        worker::{test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType},
+        worker::{
+            test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType, UNKNOWN_MODEL_ID,
+        },
     };
 
     fn empty_cluster_state() -> ClusterState {
@@ -362,19 +349,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rl_namespace_uses_epoch_max_wins() {
-        let mesh = MeshKV::new("node-a".into());
-        let adapters = started(&mesh);
-
-        // Under EpochMaxWins a lower-epoch write cannot rewind the shard;
-        // under a mis-registered LWW engine the later write would win and
-        // the aggregate would read 100.
-        adapters.rate_limit().sync_counter("global", 2, 5);
-        adapters.rate_limit().sync_counter("global", 1, 100);
-        assert_eq!(adapters.rate_limit().get_aggregate("global"), 5);
-    }
-
-    #[tokio::test]
     async fn tree_adapter_registers_and_flips_populate_flag() {
         let mesh = MeshKV::new("node-a".into());
         let policy_registry = Arc::new(PolicyRegistry::new(cache_aware_policy_config()));
@@ -389,13 +363,10 @@ mod tests {
         // A fresh model → policy created on demand should inherit the
         // adapter + populate flag from the registry.
         let policy = policy_registry.get_policy_or_default("llama-3");
-        let cache_aware = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("cache_aware default policy");
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("cache_aware default policy");
         assert!(
-            cache_aware.should_populate_hash_index_for_test(),
-            "wiring must flip populate_hash_index when the adapter is attached",
+            cache_aware.mesh_attached_for_test(),
+            "wiring must raise the mesh flag when the adapter is attached",
         );
     }
 
@@ -445,19 +416,6 @@ mod tests {
         let _again = started(&mesh);
     }
 
-    #[tokio::test]
-    #[should_panic(expected = "must not contain ':'")]
-    async fn start_panics_on_colon_node_name() {
-        let mesh = MeshKV::new("node-a".into());
-        let _ = MeshAdapters::start(
-            &mesh,
-            "node:a".into(),
-            Arc::new(WorkerRegistry::new()),
-            empty_cluster_state(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-        );
-    }
-
     fn cache_aware_policy_config() -> PolicyConfig {
         PolicyConfig::cache_aware(0.5, 32, 1.5, 60, 128)
     }
@@ -471,13 +429,10 @@ mod tests {
         // Create a per-model cache-aware policy BEFORE wiring runs, so
         // it lives in `model_policies` at attach time.
         let preexisting = policy_registry.get_policy_or_default("qwen2");
-        let cache_aware = preexisting
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("cache_aware model policy");
+        let cache_aware = as_cache_aware(preexisting.as_ref()).expect("cache_aware model policy");
         assert!(
-            !cache_aware.should_populate_hash_index_for_test(),
-            "populate flag defaults off before wiring",
+            !cache_aware.mesh_attached_for_test(),
+            "the mesh flag defaults off before wiring",
         );
 
         let mesh = MeshKV::new("node-a".into());
@@ -490,7 +445,7 @@ mod tests {
         );
 
         assert!(
-            cache_aware.should_populate_hash_index_for_test(),
+            cache_aware.mesh_attached_for_test(),
             "wiring must propagate the adapter to already-existing model policies",
         );
     }
@@ -510,16 +465,13 @@ mod tests {
             policy_registry.clone(),
         );
         let policy = policy_registry.get_policy_or_default("llama-3");
-        let cache_aware = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("cache_aware default policy");
-        assert!(cache_aware.should_populate_hash_index_for_test());
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("cache_aware default policy");
+        assert!(cache_aware.mesh_attached_for_test());
 
         policy_registry.set_mesh_tree_sync(None);
         assert!(
-            !cache_aware.should_populate_hash_index_for_test(),
-            "detach must clear the populate flag",
+            !cache_aware.mesh_attached_for_test(),
+            "detach must lower the mesh flag",
         );
     }
 
@@ -530,8 +482,6 @@ mod tests {
     /// exercised branch), which is the regression guard we lacked.
     #[tokio::test]
     async fn producer_hook_publishes_delta_on_select_worker() {
-        use crate::worker::UNKNOWN_MODEL_ID;
-
         let policy_registry = Arc::new(PolicyRegistry::new(cache_aware_policy_config()));
         let mesh = MeshKV::new("node-a".into());
         let adapters = MeshAdapters::start(
@@ -561,10 +511,7 @@ mod tests {
         ];
 
         let policy = policy_registry.get_policy_or_default(UNKNOWN_MODEL_ID);
-        let cache_aware = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("cache_aware policy");
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("cache_aware policy");
         cache_aware.init_workers(&workers);
         assert_eq!(
             adapters
@@ -657,32 +604,36 @@ mod tests {
     async fn bridge_dispatches_through_default_policy() {
         use kv_index::hash_node_path;
 
-        use crate::mesh::adapters::tree_sync::TreeRepairPage;
+        use crate::mesh::adapters::tree_sync::{RepairEntry, TreeRepairPage};
 
         let policy_registry = Arc::new(PolicyRegistry::new(cache_aware_policy_config()));
         // Do NOT touch `get_policy_or_default("m")` — we want the
-        // default policy path, not a per-model entry. Manually seed
-        // the default policy's hash_index so `apply_known_remote_insert`
-        // has something to resolve.
+        // default policy path, not a per-model entry. Seed the default
+        // policy's string tree through a repair page (the path with its
+        // hash) so `apply_known_remote_insert` has something to resolve.
         let default_policy = policy_registry.get_default_policy();
-        let cache_aware = default_policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("default policy is cache-aware");
-        cache_aware.set_populate_hash_index_for_test_true();
+        let cache_aware =
+            as_cache_aware(default_policy.as_ref()).expect("default policy is cache-aware");
         let text = "hello world";
         let path_hash = hash_node_path(text);
-        cache_aware.seed_hash_index_for_test(
-            crate::worker::UNKNOWN_MODEL_ID,
-            TreeKind::String,
-            path_hash,
-            text,
-        );
+        let seed = TreeRepairPage {
+            session_id: uuid::Uuid::nil(),
+            model_id: UNKNOWN_MODEL_ID.into(),
+            tree_kind: TreeKind::String,
+            page_index: 0,
+            entries: vec![RepairEntry::String {
+                path: text.to_string(),
+                tenants: vec![(Arc::from("http://w0:8000"), 1)],
+            }],
+            next_cursor: None,
+            is_last: true,
+        };
+        assert_eq!(cache_aware.apply_repair_page(&seed), 1);
 
         let handle = PolicyRegistryTreeHandle::new(policy_registry);
         assert!(
             handle.apply_known_remote_insert(
-                crate::worker::UNKNOWN_MODEL_ID,
+                UNKNOWN_MODEL_ID,
                 TreeKind::String,
                 path_hash,
                 "http://w1:8000",
@@ -696,7 +647,7 @@ mod tests {
         // proves the chain walked.
         let page = TreeRepairPage {
             session_id: uuid::Uuid::nil(),
-            model_id: crate::worker::UNKNOWN_MODEL_ID.into(),
+            model_id: UNKNOWN_MODEL_ID.into(),
             tree_kind: TreeKind::String,
             page_index: 0,
             entries: Vec::new(),

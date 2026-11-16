@@ -60,7 +60,7 @@ async fn request_log_lines_and_the_response_carry_the_trace_id() {
     let worker_url = mock_worker.start().await.expect("mock worker");
 
     let mut router_config = RouterConfig::builder()
-        .regular_mode(vec![worker_url])
+        .regular_mode(vec![worker_url.clone()])
         .random_policy()
         .host("127.0.0.1")
         .port(0)
@@ -82,7 +82,7 @@ async fn request_log_lines_and_the_response_carry_the_trace_id() {
         })
         .await
         .expect("worker init job");
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    common::wait_for_worker_registration(&app_context, &worker_url, Duration::from_secs(10)).await;
     let router = RouterFactory::create_router(&app_context)
         .await
         .expect("router");

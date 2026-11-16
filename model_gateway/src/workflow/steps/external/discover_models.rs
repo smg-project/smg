@@ -13,7 +13,8 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use crate::{
     routers::provider_support,
-    worker::endpoint::Endpoint,
+    server::http_client_builder,
+    worker::identity::endpoint::Endpoint,
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
 
@@ -23,7 +24,7 @@ use crate::{
     reason = "Lazy static initialization — reqwest::Client::build() only fails on TLS backend misconfiguration which is unrecoverable"
 )]
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
-    crate::clients::http_client_builder()
+    http_client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .expect("Failed to create HTTP client")
@@ -239,7 +240,7 @@ async fn fetch_models(
     let response = req
         .send()
         .await
-        .map_err(|e| format!("Failed to connect to {shown}: {e}"))?;
+        .map_err(|e| format!("Failed to connect to {shown}: {}", e.without_url()))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -248,10 +249,12 @@ async fn fetch_models(
         ));
     }
 
-    let models_response: ModelsResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse models response: {e}"))?;
+    let models_response: ModelsResponse = response.json().await.map_err(|e| {
+        format!(
+            "Failed to parse models response from {shown}: {}",
+            e.without_url()
+        )
+    })?;
 
     debug!(
         "Fetched {} raw models from {}",
@@ -347,7 +350,9 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
                 message: format!(
                     "every model discovered from {} needs the {} router, which this build does \
                      not carry; rebuild with the `{}` Cargo feature",
-                    config.url, missing.label, missing.feature
+                    Endpoint::redacted_str(&config.url),
+                    missing.label,
+                    missing.feature
                 ),
             });
         }
@@ -364,5 +369,61 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fetch_models;
+    use crate::worker::test_support::RefusedAddress;
+
+    /// An address registered with a query, at a port nobody listens on: the
+    /// failure does not repeat the query. The HTTP client's own error text
+    /// ends with the request URL, the query kept.
+    #[tokio::test]
+    async fn a_refused_connection_goes_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}?token=s3cret", refused.http_url());
+
+        let err = fetch_models(&url, None, None)
+            .await
+            .expect_err("nothing listens at the address");
+
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    /// An address registered with a query that answers a body that is no
+    /// JSON: the failure names the address masked and does not repeat the
+    /// query. The HTTP client's text of a failed body read ends with the
+    /// request URL too.
+    #[tokio::test]
+    async fn an_unparsed_answer_goes_without_the_clients_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only server answering no JSON; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|| async { "not json" }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let err = fetch_models(&format!("http://127.0.0.1:{port}?token=s3cret"), None, None)
+            .await
+            .expect_err("a body that is no JSON is a failure");
+        server.abort();
+
+        assert!(
+            err.contains(&format!(
+                "Failed to parse models response from http://127.0.0.1:{port}: "
+            )),
+            "{err}"
+        );
+        assert!(!err.contains("s3cret"), "{err}");
     }
 }

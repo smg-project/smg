@@ -118,6 +118,26 @@ pub enum MediaConnectorError {
         limit: usize,
         knob: &'static str,
     },
+    /// The pixel tensors the request's images would put on the wire are
+    /// longer than one gRPC message carries (its four-byte length prefix): a
+    /// size refusal, the request's own ([`MediaFault::Client`],
+    /// [`MediaErrorCode::TooLarge`]), answered by fewer or smaller images.
+    #[error(
+        "the request's images would be {bytes} bytes of pixel tensors on the wire, over the {limit}-byte message cap; send fewer or smaller images"
+    )]
+    PixelsOverWireCap { bytes: usize, limit: usize },
+    /// The list of a video's picks would be longer than the decoder's
+    /// process can be given in one argument: a size refusal, the request's
+    /// own ([`MediaFault::Client`], [`MediaErrorCode::TooLarge`]), answered
+    /// by another sampling rate or a shorter clip.
+    #[error(
+        "the clip's {picks} picks at this sampling rate need a frame list of {bytes} bytes, over the decoder's bound of {limit}; use another rate or a shorter clip"
+    )]
+    FrameListTooLong {
+        picks: usize,
+        bytes: usize,
+        limit: usize,
+    },
     #[error("media decode task failed: {0}")]
     Blocking(#[from] tokio::task::JoinError),
     /// This process's own I/O after the bytes arrived: the scratch file a
@@ -192,18 +212,33 @@ pub enum MediaFault {
 /// media code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaErrorCode {
-    /// `media_fetch_failed`: the media could not be fetched or read: a URL
-    /// that cannot be parsed or is not allowed, a host that cannot be
-    /// resolved or does not deliver within the fetch budget, an origin that
-    /// refuses or fails, a transfer that broke, a payload that is not the
-    /// media it claims to be, a media parameter out of range.
+    /// `invalid_multimodal_request`: the request's media is refused as the
+    /// request sent it, under the code the media stage already answers a
+    /// modality the model does not take: a data URL that is malformed or not
+    /// base64, a payload that is not the media it claims to be, a URL that
+    /// does not parse or names no host, a host the policy refuses by name or
+    /// by the address it resolves to, a local path outside the allow list, a
+    /// media parameter out of range (`fps`, `max_long_side_pixel`), a decode
+    /// over the work bound (`SMG_VIDEO_MAX_DECODE_PIXELS`) or over the
+    /// decoder's time budget. Not a host's trouble: the request itself is
+    /// what to fix; a video's message says what fits (a shorter clip, a
+    /// smaller frame budget). How long a decode takes also depends on this
+    /// side's load, so the code is not a promise that a retry can never help.
+    InvalidRequest,
+    /// `media_fetch_failed`: a fetch or read that was attempted failed: a
+    /// host that cannot be resolved or does not deliver within the fetch
+    /// budget, an origin that refuses or fails, a transfer that broke, a
+    /// redirect the policy refuses or too many of them, a local file the
+    /// request names that could not be read.
     FetchFailed,
     /// `media_too_large`: the media is over a size cap: its input bytes
     /// ([`MediaConnectorError::PayloadTooLarge`]), the bytes it would decode
     /// to ([`MediaConnectorError::DecodedTooLarge`]: a video's frames, an
-    /// audio clip's samples), or the image decoder's own limits. A bound on
-    /// decode work rather than on size (`SMG_VIDEO_MAX_DECODE_PIXELS`) is
-    /// not one: a clip over it is a fetch failure.
+    /// audio clip's samples), the frame list a video's picks would need
+    /// ([`MediaConnectorError::FrameListTooLong`]), or the image decoder's
+    /// own limits. A bound on decode work rather than on size
+    /// (`SMG_VIDEO_MAX_DECODE_PIXELS`) is not one: a clip over it is refused
+    /// as sent, `invalid_multimodal_request`.
     TooLarge,
 }
 
@@ -211,6 +246,7 @@ impl MediaErrorCode {
     /// The code as the envelope spells it.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::InvalidRequest => "invalid_multimodal_request",
             Self::FetchFailed => "media_fetch_failed",
             Self::TooLarge => "media_too_large",
         }
@@ -218,7 +254,7 @@ impl MediaErrorCode {
 
     /// The code spelled `code`, if it is one.
     pub fn parse(code: &str) -> Option<Self> {
-        [Self::FetchFailed, Self::TooLarge]
+        [Self::InvalidRequest, Self::FetchFailed, Self::TooLarge]
             .into_iter()
             .find(|candidate| candidate.as_str() == code)
     }
@@ -227,12 +263,20 @@ impl MediaErrorCode {
 impl MediaConnectorError {
     /// How the public API names this error; see [`MediaErrorCode`]. A size
     /// refusal is told apart from every other failure of the media, so a
-    /// client can tell what to shrink from what to re-host.
+    /// client can tell what to shrink from what to re-host; media refused as
+    /// the request sent it (a malformed reference or payload, a host the
+    /// policy refuses, a parameter out of range) is told apart from a fetch
+    /// that was attempted and failed, so a client can tell what to fix in
+    /// the request from what to retry. A failure of this process's own
+    /// ([`MediaFault::Internal`]) is answered with no media code; its value
+    /// here is not read.
     pub fn code(&self) -> MediaErrorCode {
         match self {
             Self::PixelBudgetExceeded { .. }
             | Self::PayloadTooLarge { .. }
             | Self::DecodedTooLarge { .. }
+            | Self::PixelsOverWireCap { .. }
+            | Self::FrameListTooLong { .. }
             | Self::Image(image::ImageError::Limits(_)) => MediaErrorCode::TooLarge,
             Self::InvalidImageLongSideCap { .. }
             | Self::InvalidSglangLongSideCap { .. }
@@ -243,20 +287,20 @@ impl MediaConnectorError {
             | Self::InvalidUrl(_)
             | Self::DisallowedDomain(_)
             | Self::DisallowedAddress { .. }
-            | Self::UnresolvableHost { .. }
-            | Self::DisallowedRedirect { .. }
-            | Self::TooManyRedirects { .. }
             | Self::DisallowedLocalPath(_)
-            | Self::Http(_)
-            | Self::Io(_)
             | Self::Base64Decode(_)
             | Self::DataUrl(_)
+            | Self::Image(_)
+            | Self::AudioDecode(_)
+            | Self::VideoDecode(_) => MediaErrorCode::InvalidRequest,
+            Self::UnresolvableHost { .. }
+            | Self::DisallowedRedirect { .. }
+            | Self::TooManyRedirects { .. }
+            | Self::Http(_)
+            | Self::Io(_)
             | Self::Blocking(_)
             | Self::DecodeIo(_)
             | Self::DecoderUnavailable(_)
-            | Self::Image(_)
-            | Self::AudioDecode(_)
-            | Self::VideoDecode(_)
             | Self::Timeout { .. } => MediaErrorCode::FetchFailed,
         }
     }
@@ -292,6 +336,8 @@ impl MediaConnectorError {
             | Self::PixelBudgetExceeded { .. }
             | Self::PayloadTooLarge { .. }
             | Self::DecodedTooLarge { .. }
+            | Self::PixelsOverWireCap { .. }
+            | Self::FrameListTooLong { .. }
             | Self::Image(_)
             | Self::AudioDecode(_)
             | Self::VideoDecode(_) => MediaFault::Client,
@@ -318,9 +364,9 @@ impl MediaConnectorError {
     /// task keeps the error this process's ([`Self::DecodeIo`]); two decoders
     /// that could not start leave it unavailable, so a decode that runs this
     /// one as its fallback reads it the same way. A verdict that refused the
-    /// clip for its size ([`Self::DecodedTooLarge`]) stands as it is: it
-    /// names the cap itself, and the words of the decoder that ran before it
-    /// add nothing a client can act on.
+    /// clip for its size ([`Self::DecodedTooLarge`], [`Self::FrameListTooLong`])
+    /// stands as it is: it names the cap itself, and the words of the decoder
+    /// that ran before it add nothing a client can act on.
     pub fn fallback_failed(
         first: Self,
         fallback: Self,
@@ -336,7 +382,7 @@ impl MediaConnectorError {
                 Self::DecoderUnavailable(std::io::Error::new(io.kind(), message))
             }
             Self::DecodeIo(io) => Self::DecodeIo(std::io::Error::new(io.kind(), message)),
-            verdict @ Self::DecodedTooLarge { .. } => verdict,
+            verdict @ (Self::DecodedTooLarge { .. } | Self::FrameListTooLong { .. }) => verdict,
             verdict if verdict.fault() == MediaFault::Internal => {
                 Self::DecodeIo(std::io::Error::other(message))
             }
@@ -410,6 +456,11 @@ mod tests {
                 limit: 1_073_741_824,
                 knob: "SMG_VIDEO_MAX_DECODED_BYTES",
             },
+            MediaConnectorError::FrameListTooLong {
+                picks: 40_001,
+                bytes: 552_613,
+                limit: 130_048,
+            },
             MediaConnectorError::Image(image::ImageError::Decoding(
                 image::error::DecodingError::new(
                     image::error::ImageFormatHint::Unknown,
@@ -424,9 +475,10 @@ mod tests {
     }
 
     /// A size refusal has a code of its own, whatever stage refused: the
-    /// input bytes, the bytes the clip would decode to, the image decoder's
-    /// limits. Every other failure of the media is a fetch failure to the
-    /// client, and the codes spell and parse the same.
+    /// input bytes, the bytes the clip would decode to, the frame list its
+    /// picks would need, the image decoder's limits. Every other failure of
+    /// the media is a fetch failure to the client, and the codes spell and
+    /// parse the same.
     #[test]
     fn a_size_refusal_has_its_own_code() {
         for error in [
@@ -446,6 +498,11 @@ mod tests {
                 limit: 8,
                 knob: "SMG_AUDIO_MAX_DECODED_BYTES",
             },
+            MediaConnectorError::FrameListTooLong {
+                picks: 40_001,
+                bytes: 552_613,
+                limit: 130_048,
+            },
             MediaConnectorError::Image(image::ImageError::Limits(
                 image::error::LimitError::from_kind(
                     image::error::LimitErrorKind::InsufficientMemory,
@@ -464,17 +521,104 @@ mod tests {
                 host: "media.invalid".to_string(),
                 source: std::io::Error::from(std::io::ErrorKind::NotFound),
             },
-            MediaConnectorError::VideoDecode("not a video".to_string()),
             MediaConnectorError::DecodeIo(std::io::Error::other("no space left on device")),
         ] {
             assert_eq!(error.code(), MediaErrorCode::FetchFailed, "{error}");
         }
-        for code in [MediaErrorCode::FetchFailed, MediaErrorCode::TooLarge] {
+        for code in [
+            MediaErrorCode::InvalidRequest,
+            MediaErrorCode::FetchFailed,
+            MediaErrorCode::TooLarge,
+        ] {
             assert_eq!(MediaErrorCode::parse(code.as_str()), Some(code));
         }
         assert_eq!(MediaErrorCode::FetchFailed.as_str(), "media_fetch_failed");
         assert_eq!(MediaErrorCode::TooLarge.as_str(), "media_too_large");
         assert_eq!(MediaErrorCode::parse("media_ref_too_large"), None);
+    }
+
+    /// Media refused as the request sent it (a malformed data URL or
+    /// payload, a reference that does not parse or names a host the policy
+    /// refuses, a media parameter out of range) is the request's own fault
+    /// under the media stage's `invalid_multimodal_request`, apart from a
+    /// fetch or read that was attempted and failed (`media_fetch_failed`),
+    /// so a client can tell what to fix in the request from what to retry
+    /// or re-host.
+    #[test]
+    fn media_refused_as_sent_has_the_media_stages_code() {
+        for error in [
+            MediaConnectorError::InvalidMaxLongSidePixel {
+                value: 0,
+                factor: 28,
+            },
+            MediaConnectorError::InvalidSampleFps {
+                value: -1.0,
+                min: 0.2,
+                max: 5.0,
+            },
+            MediaConnectorError::InvalidImageLongSideCap { value: 0 },
+            MediaConnectorError::InvalidVideoLongSideCap {
+                value: 100,
+                factor: 28,
+                min: 150,
+                max: 3584,
+            },
+            MediaConnectorError::InvalidUrl("not a url".to_string()),
+            MediaConnectorError::DisallowedDomain("other.example".to_string()),
+            MediaConnectorError::DisallowedAddress {
+                host: "127.0.0.1".to_string(),
+                address: IpAddr::from([127, 0, 0, 1]),
+                class: "loopback",
+            },
+            MediaConnectorError::DisallowedLocalPath("/etc/hostname".to_string()),
+            MediaConnectorError::Base64Decode(base64::DecodeError::InvalidByte(0, b'!')),
+            MediaConnectorError::DataUrl("missing comma in data url".to_string()),
+            MediaConnectorError::Image(image::ImageError::Decoding(
+                image::error::DecodingError::new(
+                    image::error::ImageFormatHint::Unknown,
+                    "the image format could not be determined",
+                ),
+            )),
+            MediaConnectorError::AudioDecode("not audio".to_string()),
+            MediaConnectorError::VideoDecode("not a video".to_string()),
+            // The decode-work bound and the decoder's time budget ride the
+            // same catch-all variants: refused as sent, on purpose.
+            MediaConnectorError::VideoDecode(
+                "video decode work 1200000000 pixels exceeds SMG_VIDEO_MAX_DECODE_PIXELS 400000000; \
+                 a shorter clip or a smaller frame budget fits it"
+                    .to_string(),
+            ),
+            MediaConnectorError::AudioDecode("ffmpeg timed out after 30 seconds".to_string()),
+        ] {
+            assert_eq!(error.code(), MediaErrorCode::InvalidRequest, "{error}");
+            assert_eq!(error.fault(), MediaFault::Client, "{error}");
+        }
+        for error in [
+            MediaConnectorError::UnresolvableHost {
+                host: "media.invalid".to_string(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+            MediaConnectorError::DisallowedRedirect {
+                url: "http://media.example/a.png".to_string(),
+                target: "http://10.0.0.5/a.png".to_string(),
+                reason: "private".to_string(),
+            },
+            MediaConnectorError::TooManyRedirects {
+                url: "http://media.example/a.png".to_string(),
+                limit: 10,
+            },
+            MediaConnectorError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            MediaConnectorError::Timeout {
+                url: "https://media.example/clip.mp4".to_string(),
+                budget: Duration::from_secs(30),
+            },
+        ] {
+            assert_eq!(error.code(), MediaErrorCode::FetchFailed, "{error}");
+        }
+        assert_eq!(
+            MediaErrorCode::InvalidRequest.as_str(),
+            "invalid_multimodal_request"
+        );
     }
 
     /// A decode task that never answers is this process's fault.
@@ -597,6 +741,20 @@ mod tests {
                 "{refused}"
             );
             assert_eq!(refused.code(), MediaErrorCode::TooLarge);
+            // So does a frame list past the decoder's bound: the fallback's
+            // refusal keeps its code through the first decoder's failure.
+            let list_too_long = || MediaConnectorError::FrameListTooLong {
+                picks: 40_001,
+                bytes: 552_613,
+                limit: 130_048,
+            };
+            let refused = compose(bad_clip(), list_too_long(), media);
+            assert!(
+                matches!(refused, MediaConnectorError::FrameListTooLong { .. }),
+                "{refused}"
+            );
+            assert_eq!(refused.code(), MediaErrorCode::TooLarge);
+            assert_eq!(refused.fault(), MediaFault::Client);
         }
     }
 }

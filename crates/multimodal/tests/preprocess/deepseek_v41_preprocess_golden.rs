@@ -110,7 +110,7 @@ fn preprocess_matches_the_reference_fingerprints() {
         );
 
         let out = processor
-            .preprocess(std::slice::from_ref(&image))
+            .preprocess(&[&image])
             .unwrap_or_else(|e| panic!("{}: preprocess failed: {e}", case.name));
 
         assert_eq!(

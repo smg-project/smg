@@ -189,13 +189,7 @@ mod jemalloc {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    async fn body(response: Response) -> String {
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("response body");
-        String::from_utf8(bytes.to_vec()).expect("utf-8 body")
-    }
+    use crate::middleware::test_support::text_of;
 
     /// Each refusal names its remedy: the feature, the flag, the conf.
     #[tokio::test]
@@ -220,7 +214,7 @@ mod tests {
         ] {
             let response = outcome.into_response();
             assert_eq!(response.status(), status);
-            let text = body(response).await;
+            let text = text_of(response).await;
             assert!(text.contains(remedy), "{status}: {text}");
         }
     }

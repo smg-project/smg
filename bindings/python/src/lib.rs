@@ -21,7 +21,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
     reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
 )]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 72] = observability::metrics::SERVER_MALLOC_CONF;
+pub static MALLOC_CONF: &[u8; 100] = observability::metrics::SERVER_MALLOC_CONF;
 use smg::*;
 use smg_auth as auth;
 
@@ -30,6 +30,9 @@ use servicer::{
     init_servicer_tracing, PySglangGrpcServer, PyTokenSpeedGrpcServer, PyTrtllmGrpcServer,
     PyVllmGrpcServer,
 };
+
+mod tokenizer;
+use tokenizer::PyTokenizer;
 
 // Define the enums with PyO3 bindings
 #[pyclass(eq, from_py_object)]
@@ -59,6 +62,50 @@ pub enum BackendType {
     /// TokenSpeed engine. Routing behaves like the default; over ZMQ this pins
     /// the startup workers' wire protocol to TokenSpeed.
     Tokenspeed,
+    /// TensorRT-LLM engine, as the CLI's `--backend trtllm`: routing behaves
+    /// like the default and no wire is pinned (its servicer speaks gRPC).
+    Trtllm,
+    /// The Gemini provider route (`RoutingMode::Gemini`), as the CLI's
+    /// `--backend gemini`.
+    Gemini,
+}
+
+impl BackendType {
+    /// The routing mode of a provider backend, with the URLs it is given: a
+    /// provider backend is a mode of its own and wins over the disaggregation
+    /// flags, as the CLI's `--backend` does. `None` for an engine backend,
+    /// whose mode those flags select.
+    fn provider_mode(&self, worker_urls: &[String]) -> Option<config::RoutingMode> {
+        use config::RoutingMode;
+
+        let mode = match self {
+            Self::Openai => RoutingMode::OpenAI {
+                worker_urls: worker_urls.to_vec(),
+            },
+            Self::Anthropic => RoutingMode::Anthropic {
+                worker_urls: worker_urls.to_vec(),
+            },
+            Self::Gemini => RoutingMode::Gemini {
+                worker_urls: worker_urls.to_vec(),
+            },
+            Self::Sglang | Self::Vllm | Self::Tokenspeed | Self::Trtllm => return None,
+        };
+        Some(mode)
+    }
+
+    /// The wire a startup worker over ZMQ speaks when this backend names its
+    /// engine. The shared EngineCore handshake carries no engine identity, so
+    /// the wire cannot be probed; a provider or TensorRT-LLM pins none, and
+    /// without a backend the detection step decides, as it does for the CLI
+    /// without `--backend`.
+    fn startup_worker_runtime(&self) -> Option<worker::RuntimeType> {
+        match self {
+            Self::Vllm => Some(worker::RuntimeType::Vllm),
+            Self::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
+            Self::Sglang => Some(worker::RuntimeType::Sglang),
+            Self::Openai | Self::Anthropic | Self::Trtllm | Self::Gemini => None,
+        }
+    }
 }
 
 #[pyclass(eq, from_py_object)]
@@ -84,6 +131,14 @@ impl PyRole {
         match self {
             PyRole::Admin => auth::Role::Admin,
             PyRole::User => auth::Role::User,
+        }
+    }
+
+    /// The role as the gateway's parser read it from a key file's entry.
+    fn from_auth_role(role: auth::Role) -> Self {
+        match role {
+            auth::Role::Admin => PyRole::Admin,
+            auth::Role::User => PyRole::User,
         }
     }
 }
@@ -119,6 +174,15 @@ impl PyApiKeyEntry {
     pub fn to_auth_api_key_entry(&self) -> auth::ApiKeyEntry {
         auth::ApiKeyEntry::new(&self.id, &self.name, &self.key, self.role.to_auth_role())
     }
+}
+
+/// The keys of a start once the key files are read (`Router::read_key_files`):
+/// each one the value given, or its file's.
+#[derive(Debug)]
+struct KeysRead {
+    api_key: Option<String>,
+    tenant_api_keys: Vec<(String, String)>,
+    control_plane_auth: Option<PyControlPlaneAuthConfig>,
 }
 
 #[pyclass(from_py_object)]
@@ -166,7 +230,7 @@ impl PyJwtConfig {
 }
 
 impl PyJwtConfig {
-    pub fn to_auth_jwt_config(&self) -> auth::JwtConfig {
+    pub fn to_auth_jwt_config(&self) -> config::ConfigResult<auth::JwtConfig> {
         let mut config = auth::JwtConfig::new(&self.issuer, &self.audience);
         config.role_claim.clone_from(&self.role_claim);
 
@@ -175,16 +239,30 @@ impl PyJwtConfig {
             config = config.with_jwks_uri(uri);
         }
 
-        // Add role mappings
+        // A gateway role that is neither admin nor user is refused, as the
+        // CLI refuses it: mapped to user in silence, the operator who meant
+        // admin is locked out of the admin routes with nothing to read. An
+        // empty IdP role is refused with it, as the CLI refuses `=admin`: no
+        // claim ever matches it.
         for (idp_role, gateway_role) in &self.role_mapping {
-            let role = match gateway_role.to_lowercase().as_str() {
-                "admin" => auth::Role::Admin,
-                _ => auth::Role::User,
-            };
+            if idp_role.is_empty() {
+                return Err(config::ConfigError::invalid_value(
+                    "role_mapping",
+                    format!("={gateway_role}"),
+                    "the IdP role must not be empty",
+                ));
+            }
+            let role: auth::Role = gateway_role.parse().map_err(|_: String| {
+                config::ConfigError::invalid_value(
+                    "role_mapping",
+                    format!("{idp_role}={gateway_role}"),
+                    "the gateway role must be 'admin' or 'user'",
+                )
+            })?;
             config = config.with_role_mapping(idp_role, role);
         }
 
-        config
+        Ok(config)
     }
 }
 
@@ -217,16 +295,22 @@ impl PyControlPlaneAuthConfig {
 }
 
 impl PyControlPlaneAuthConfig {
-    pub fn to_auth_control_plane_config(&self) -> auth::ControlPlaneAuthConfig {
-        auth::ControlPlaneAuthConfig {
-            jwt: self.jwt.as_ref().map(|j| j.to_auth_jwt_config()),
+    pub fn to_auth_control_plane_config(
+        &self,
+    ) -> config::ConfigResult<auth::ControlPlaneAuthConfig> {
+        Ok(auth::ControlPlaneAuthConfig {
+            jwt: self
+                .jwt
+                .as_ref()
+                .map(|j| j.to_auth_jwt_config())
+                .transpose()?,
             api_keys: self
                 .api_keys
                 .iter()
                 .map(|k| k.to_auth_api_key_entry())
                 .collect(),
             audit_enabled: self.audit_enabled,
-        }
+        })
     }
 }
 
@@ -249,6 +333,9 @@ pub struct PyOracleConfig {
     pub pool_max: usize,
     #[pyo3(get, set)]
     pub pool_timeout_secs: u64,
+    /// Bound in seconds on each call to the store (default 5).
+    #[pyo3(get, set)]
+    pub op_timeout_secs: u64,
 }
 
 impl std::fmt::Debug for PyOracleConfig {
@@ -262,6 +349,7 @@ impl std::fmt::Debug for PyOracleConfig {
             .field("pool_min", &self.pool_min)
             .field("pool_max", &self.pool_max)
             .field("pool_timeout_secs", &self.pool_timeout_secs)
+            .field("op_timeout_secs", &self.op_timeout_secs)
             .finish()
     }
 }
@@ -279,6 +367,7 @@ impl PyOracleConfig {
         pool_min = 1,
         pool_max = 16,
         pool_timeout_secs = 30,
+        op_timeout_secs = 5,
     ))]
     fn new(
         password: Option<String>,
@@ -289,6 +378,7 @@ impl PyOracleConfig {
         pool_min: usize,
         pool_max: usize,
         pool_timeout_secs: u64,
+        op_timeout_secs: u64,
     ) -> PyResult<Self> {
         if pool_min == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -310,6 +400,7 @@ impl PyOracleConfig {
             pool_min,
             pool_max,
             pool_timeout_secs,
+            op_timeout_secs,
         })
     }
 }
@@ -325,6 +416,7 @@ impl PyOracleConfig {
             pool_min: self.pool_min,
             pool_max: self.pool_max,
             pool_timeout_secs: self.pool_timeout_secs,
+            op_timeout_secs: self.op_timeout_secs,
             schema: None,
         }
     }
@@ -436,10 +528,12 @@ struct Router {
     /// The optional fields of the access-log record.
     access_log_fields: Vec<String>,
     admin_host: Option<String>,
+    admin_max_connections: usize,
     admin_port: Option<u16>,
     api_key: Option<String>,
+    api_key_file: Option<String>,
     assignment_mode: Option<String>,
-    backend: BackendType,
+    backend: Option<BackendType>,
     balance_abs_threshold: usize,
     balance_prefix_margin_tokens: u32,
     balance_rel_threshold: f32,
@@ -460,6 +554,7 @@ struct Router {
     chat_template: Option<String>,
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
+    control_plane_api_keys_file: Option<String>,
     control_plane_auth: Option<PyControlPlaneAuthConfig>,
     cors_allowed_origins: Vec<String>,
     decode_expected_workers: Option<usize>,
@@ -493,6 +588,7 @@ struct Router {
     engine_metrics: bool,
     epd_disaggregation: bool,
     eviction_interval_secs: u64,
+    grouped_dp_sticky: String,
     grpc_request_timeout_secs: u64,
     header_read_timeout_secs: u64,
     health_check_endpoint: String,
@@ -513,7 +609,6 @@ struct Router {
     kv_engine_id_annotation: String,
     least_load_default_throughput: f64,
     least_load_kv_pressure_weight: f64,
-    least_load_max_waiting_requests: u32,
     least_load_mean_prefill_tokens: u32,
     load_monitor_interval: u64,
     log_dir: Option<String>,
@@ -605,6 +700,7 @@ struct Router {
     routing_key_override: bool,
     runtime_worker_threads: Option<usize>,
     schema_config: Option<String>,
+    secrets_auto_reload: bool,
     selection_accounting_ttl_ms: u64,
     selection_policy: String,
     selection_temperature: f32,
@@ -623,6 +719,7 @@ struct Router {
     /// Per-tenant data-plane keys as `(tenant_id, key)` pairs; each resolves
     /// to its own tenant identity (`auth:<tenant_id>`) on top of `api_key`.
     tenant_api_keys: Vec<(String, String)>,
+    tenant_api_keys_file: Option<String>,
     tenant_header_name: String,
     tenant_rate_limit_config: Option<String>,
     tenant_rate_limit_enabled: bool,
@@ -735,6 +832,174 @@ impl Router {
         }))
     }
 
+    /// The files the keys were read from, where a file was the source: the
+    /// targets of the key reload. A key given as a value came from the
+    /// launcher's flag or environment, which the binding does not see, so
+    /// it has no file.
+    fn secret_files(
+        api_key_file: Option<&str>,
+        tenant_api_keys_file: Option<&str>,
+        control_plane_api_keys_file: Option<&str>,
+    ) -> secrets::SecretFiles {
+        let path = |file: Option<&str>| file.map(std::path::PathBuf::from);
+        secrets::SecretFiles {
+            api_key: path(api_key_file),
+            tenant_api_keys: path(tenant_api_keys_file),
+            control_plane_api_keys: path(control_plane_api_keys_file),
+        }
+    }
+
+    /// The sources record: each file with the entries the binding read
+    /// from it; a key given as a value, or the selected history backend's
+    /// store URL, is the launcher's, from its flag or its environment, which
+    /// the binding does not tell apart; a secret neither given nor filed is
+    /// unnamed.
+    fn secret_sources(
+        files: &secrets::SecretFiles,
+        api_key_given: bool,
+        tenant_entries: usize,
+        control_plane_entries: usize,
+        postgres_db_url_given: bool,
+        redis_url_given: bool,
+    ) -> server::posture::SecretSources {
+        use smg::server::posture::SecretSource;
+        let source = |file: Option<&std::path::PathBuf>, given: bool| match (file, given) {
+            (Some(_), _) => Some(SecretSource::File),
+            (None, true) => Some(SecretSource::Launcher),
+            (None, false) => None,
+        };
+        server::posture::SecretSources {
+            api_key: source(files.api_key.as_ref(), api_key_given),
+            tenant_api_keys: source(files.tenant_api_keys.as_ref(), tenant_entries > 0)
+                .map(|source| (source, tenant_entries)),
+            control_plane_api_keys: source(
+                files.control_plane_api_keys.as_ref(),
+                control_plane_entries > 0,
+            )
+            .map(|source| (source, control_plane_entries)),
+            postgres_db_url: postgres_db_url_given.then_some(SecretSource::Launcher),
+            redis_url: redis_url_given.then_some(SecretSource::Launcher),
+        }
+    }
+
+    /// The keys a key file gives, read here as the CLI reads them: the
+    /// shared key as the one line of its file, the tenant and control-plane
+    /// keys as one entry per line (blank and `#` lines skipped), through the
+    /// gateway's readers and entry parsers. A value and a file for one key
+    /// are refused as given twice: ranking them would honour a stale secret
+    /// in silence. A refusal names the keywords, or the file's setting and
+    /// its path, never a value. The control-plane entries join the auth
+    /// config the launcher built, or one with its defaults when it built
+    /// none.
+    fn read_key_files(
+        api_key: Option<String>,
+        api_key_file: Option<&str>,
+        tenant_api_keys: Vec<(String, String)>,
+        tenant_api_keys_file: Option<&str>,
+        control_plane_auth: Option<PyControlPlaneAuthConfig>,
+        control_plane_api_keys_file: Option<&str>,
+    ) -> Result<KeysRead, String> {
+        use config::secrets::{
+            control_plane_api_key_parts, parse_tenant_api_key, API_KEY_FILE,
+            CONTROL_PLANE_API_KEYS_FILE, TENANT_API_KEYS_FILE,
+        };
+        let given_twice =
+            |value: &str, file: &str| format!("{value} and {file} are both given; give one source");
+        let api_key = match (api_key, api_key_file) {
+            (Some(_), Some(_)) => return Err(given_twice("api_key", "api_key_file")),
+            (None, Some(path)) => Some(
+                API_KEY_FILE
+                    .value(std::path::Path::new(path))
+                    .map_err(|error| error.to_string())?,
+            ),
+            (value, None) => value,
+        };
+        let tenant_api_keys = match (tenant_api_keys.is_empty(), tenant_api_keys_file) {
+            (false, Some(_)) => {
+                return Err(given_twice("tenant_api_keys", "tenant_api_keys_file"));
+            }
+            (true, Some(path)) => Self::key_file_entries(&TENANT_API_KEYS_FILE, path, |entry| {
+                parse_tenant_api_key(entry).map(|entry| (entry.tenant_id, entry.key))
+            })?,
+            (_, None) => tenant_api_keys,
+        };
+        let control_plane_auth = match (control_plane_auth, control_plane_api_keys_file) {
+            (Some(auth), Some(_)) if !auth.api_keys.is_empty() => {
+                return Err(given_twice(
+                    "control_plane_auth.api_keys",
+                    "control_plane_api_keys_file",
+                ));
+            }
+            (auth, Some(path)) => {
+                let api_keys =
+                    Self::key_file_entries(&CONTROL_PLANE_API_KEYS_FILE, path, |entry| {
+                        control_plane_api_key_parts(entry).map(|parts| PyApiKeyEntry {
+                            id: parts.id.to_string(),
+                            name: parts.name.to_string(),
+                            key: parts.key.to_string(),
+                            role: PyRole::from_auth_role(parts.role),
+                        })
+                    })?;
+                Some(PyControlPlaneAuthConfig {
+                    api_keys,
+                    ..auth.unwrap_or_default()
+                })
+            }
+            (auth, None) => auth,
+        };
+        Ok(KeysRead {
+            api_key,
+            tenant_api_keys,
+            control_plane_auth,
+        })
+    }
+
+    /// The entries of a key file, each read by `parse`; a bad entry is
+    /// refused under the file's setting and path, as a reload refuses it.
+    fn key_file_entries<T>(
+        file: &config::secrets::SecretFile,
+        path: &str,
+        parse: impl Fn(&str) -> config::ConfigResult<T>,
+    ) -> Result<Vec<T>, String> {
+        let path = std::path::Path::new(path);
+        file.entries(path)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|entry| {
+                parse(entry).map_err(|error| {
+                    file.bad_file(path, &secrets::entry_refusal(error))
+                        .to_string()
+                })
+            })
+            .collect()
+    }
+
+    /// The join peers of `mesh_peer_urls`, each an `ip:port`. The binary's
+    /// flag takes the entries space- or comma-separated (clap splits the
+    /// list); the Python launcher hands each argument through as typed, so
+    /// the comma list is split here for both. An empty entry (an empty
+    /// string, a trailing comma) is refused like any other bad one: dropped
+    /// in silence, it would leave the gateway outside the mesh it was
+    /// configured to join. The error is the message the binding raises as a
+    /// `ValueError`: a plain string, so the unit test needs no interpreter
+    /// (the extension module's test binary links none).
+    fn parse_mesh_peer_urls(entries: &[String]) -> Result<Vec<std::net::SocketAddr>, String> {
+        entries
+            .iter()
+            .flat_map(|entry| entry.split(','))
+            .map(|url| {
+                if url.trim().is_empty() {
+                    return Err(String::from(
+                        "Invalid mesh peer URL '': an entry of mesh_peer_urls is empty; \
+                         every entry is an ip:port",
+                    ));
+                }
+                url.parse::<std::net::SocketAddr>()
+                    .map_err(|e| format!("Invalid mesh peer URL '{url}': {e}"))
+            })
+            .collect()
+    }
+
     fn parse_mesh_socket_addr(
         host: &str,
         port: u16,
@@ -770,6 +1035,18 @@ impl Router {
                 reason: "expected 'off', 'lenient', or 'strict'".to_string(),
             }
         })
+    }
+
+    /// The grouped data-parallel pinning by its CLI spelling, read as the
+    /// CLI's value parser reads it; anything else is refused by name.
+    fn parse_grouped_dp_sticky(&self) -> Result<config::GroupedDpSticky, config::ConfigError> {
+        self.grouped_dp_sticky
+            .parse()
+            .map_err(|reason| config::ConfigError::InvalidValue {
+                field: "grouped_dp_sticky".to_string(),
+                value: self.grouped_dp_sticky.clone(),
+                reason,
+            })
     }
 
     fn parse_assignment_mode(
@@ -885,7 +1162,9 @@ impl Router {
         .ok_or_else(|| config::ConfigError::InvalidValue {
             field: "power_of_two_load_metric".to_string(),
             value: self.power_of_two_load_metric.clone(),
-            reason: "expected expected_wait, requests or least_requests".to_string(),
+            reason: "expected expected_wait, requests, least_requests or \
+                     resident_tokens:<request_tokens>"
+                .to_string(),
         })?;
 
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
@@ -920,7 +1199,6 @@ impl Router {
                     kv_pressure_weight: self.least_load_kv_pressure_weight,
                     mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                     default_throughput: self.least_load_default_throughput,
-                    max_waiting_requests: self.least_load_max_waiting_requests,
                 },
                 PolicyType::Bucket => ConfigPolicyConfig::Bucket {
                     balance_abs_threshold: self.balance_abs_threshold,
@@ -943,26 +1221,34 @@ impl Router {
             })
         };
 
-        // IGW does not override backend or disaggregated modes; IGW-only keeps
-        // the Python binding's existing empty startup-worker behavior.
-        let mode = if matches!(self.backend, BackendType::Openai) {
-            RoutingMode::OpenAI {
-                worker_urls: self.worker_urls.clone(),
-            }
-        } else if matches!(self.backend, BackendType::Anthropic) {
-            RoutingMode::Anthropic {
-                worker_urls: self.worker_urls.clone(),
-            }
+        // The encode side takes the three policies the CLI's `--encode-policy`
+        // takes; the shared validator holds the one list and reads the encode
+        // policy in EPD mode. It is asked here before anything binds, for an
+        // encode policy given outside EPD as well. Converted once: the EPD branch
+        // below takes this value.
+        let encode_policy = self
+            .encode_policy
+            .as_ref()
+            .map(convert_policy)
+            .transpose()?;
+        if let Some(policy) = &encode_policy {
+            config::validate_encode_policy(policy)?;
+        }
+
+        // IGW selects routers per request; it does not change which configured
+        // workers are registered at startup, or override backend/disaggregated modes.
+        let provider = self
+            .backend
+            .as_ref()
+            .and_then(|backend| backend.provider_mode(&self.worker_urls));
+        let mode = if let Some(provider) = provider {
+            provider
         } else if self.epd_disaggregation {
             RoutingMode::EncodePrefillDecode {
                 encode_urls: self.encode_urls.clone().unwrap_or_default(),
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
-                encode_policy: self
-                    .encode_policy
-                    .as_ref()
-                    .map(convert_policy)
-                    .transpose()?,
+                encode_policy,
                 prefill_policy: self
                     .prefill_policy
                     .as_ref()
@@ -991,11 +1277,7 @@ impl Router {
             }
         } else {
             RoutingMode::Regular {
-                worker_urls: if self.enable_igw {
-                    vec![]
-                } else {
-                    self.worker_urls.clone()
-                },
+                worker_urls: self.worker_urls.clone(),
             }
         };
 
@@ -1099,24 +1381,21 @@ impl Router {
             None
         };
 
-        // `backend` normally only steers the routing mode. Over ZMQ it
-        // additionally pins the startup workers' runtime: the shared EngineCore
-        // handshake carries no engine identity, so the wire protocol cannot be
-        // probed. HTTP/gRPC keep auto-detection (None). Mirrors
+        // `backend` normally only steers the routing mode. Over ZMQ an engine
+        // backend additionally pins the startup workers' runtime. HTTP/gRPC,
+        // and ZMQ without a backend, keep auto-detection (None). Mirrors
         // `to_router_config` in model_gateway/src/cli/configure.rs.
         let startup_worker_runtime_type =
             if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
-                match self.backend {
-                    BackendType::Vllm => Some(worker::RuntimeType::Vllm),
-                    BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
-                    BackendType::Sglang => Some(worker::RuntimeType::Sglang),
-                    _ => None,
-                }
+                self.backend
+                    .as_ref()
+                    .and_then(BackendType::startup_worker_runtime)
             } else {
                 None
             };
 
         let pd_pairing_mode = self.parse_pd_pairing_mode()?;
+        let grouped_dp_sticky = self.parse_grouped_dp_sticky()?;
 
         config::RouterConfig::builder()
             .mode(mode)
@@ -1252,6 +1531,7 @@ impl Router {
             .dp_aware(self.dp_aware)
             .engine_metrics(self.engine_metrics)
             .pd_pairing_mode(pd_pairing_mode)
+            .grouped_dp_sticky(grouped_dp_sticky)
             .runtime_worker_threads(self.runtime_worker_threads)
             .upstream_http2(self.upstream_http2)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
@@ -1260,6 +1540,7 @@ impl Router {
             .header_read_timeout_secs(self.header_read_timeout_secs)
             .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
             .max_connections(self.max_connections)
+            .admin_max_connections(self.admin_max_connections)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
@@ -1311,18 +1592,20 @@ impl Router {
     #[new]
     #[pyo3(signature = (
         worker_urls,
-        policy = PolicyType::RoundRobin,
+        policy = PolicyType::CacheAware,
         host = String::from("0.0.0.0"),
-        port = 3001,
+        port = 30000,
         // Every other parameter is keyword-only, in alphabetical order (the struct's
         // note says where a new one goes).
         *,
         access_log_fields = vec![],
         admin_host = None,
+        admin_max_connections = 0,
         admin_port = None,
         api_key = None,
+        api_key_file = None,
         assignment_mode = None,
-        backend = BackendType::Sglang,
+        backend = None,
         balance_abs_threshold = 64,
         balance_prefix_margin_tokens = 0,
         balance_rel_threshold = 1.5,
@@ -1343,6 +1626,7 @@ impl Router {
         chat_template = None,
         client_cert_path = None,
         client_key_path = None,
+        control_plane_api_keys_file = None,
         control_plane_auth = None,
         cors_allowed_origins = vec![],
         decode_expected_workers = None,
@@ -1372,6 +1656,7 @@ impl Router {
         engine_metrics = false,
         epd_disaggregation = false,
         eviction_interval_secs = 120,
+        grouped_dp_sticky = String::from("off"),
         grpc_request_timeout_secs = 0,
         header_read_timeout_secs = 30,
         health_check_endpoint = String::from("/health"),
@@ -1392,7 +1677,6 @@ impl Router {
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
         least_load_default_throughput = 2000.0,
         least_load_kv_pressure_weight = 0.15,
-        least_load_max_waiting_requests = 0,
         least_load_mean_prefill_tokens = 1024,
         load_monitor_interval = 10,
         log_dir = None,
@@ -1481,6 +1765,7 @@ impl Router {
         routing_key_override = false,
         runtime_worker_threads = None,
         schema_config = None,
+        secrets_auto_reload = false,
         selection_accounting_ttl_ms = 0,
         selection_policy = String::from("cache-aware-default"),
         selection_temperature = 0.0,
@@ -1497,6 +1782,7 @@ impl Router {
         storage_hook_wasm_path = None,
         stream_body_stall_timeout_secs = 300,
         tenant_api_keys = vec![],
+        tenant_api_keys_file = None,
         tenant_header_name = String::from("x-smg-tenant-id"),
         tenant_rate_limit_config = None,
         tenant_rate_limit_enabled = false,
@@ -1521,7 +1807,7 @@ impl Router {
         worker_stall_secs = 2,
         worker_startup_check_interval = 30,
         worker_startup_delay = 0,
-        worker_startup_timeout_secs = 600,
+        worker_startup_timeout_secs = 1800,
         worker_warmup_blocks = 1024,
         worker_warmup_divert_every = 8,
         worker_warmup_secs = 60,
@@ -1541,10 +1827,12 @@ impl Router {
         // Keyword-only, in the signature's order (pyo3 wants the two orders to agree).
         access_log_fields: Vec<String>,
         admin_host: Option<String>,
+        admin_max_connections: usize,
         admin_port: Option<u16>,
         api_key: Option<String>,
+        api_key_file: Option<String>,
         assignment_mode: Option<String>,
-        backend: BackendType,
+        backend: Option<BackendType>,
         balance_abs_threshold: usize,
         balance_prefix_margin_tokens: u32,
         balance_rel_threshold: f32,
@@ -1565,6 +1853,7 @@ impl Router {
         chat_template: Option<String>,
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
+        control_plane_api_keys_file: Option<String>,
         control_plane_auth: Option<PyControlPlaneAuthConfig>,
         cors_allowed_origins: Vec<String>,
         decode_expected_workers: Option<usize>,
@@ -1594,6 +1883,7 @@ impl Router {
         engine_metrics: bool,
         epd_disaggregation: bool,
         eviction_interval_secs: u64,
+        grouped_dp_sticky: String,
         grpc_request_timeout_secs: u64,
         header_read_timeout_secs: u64,
         health_check_endpoint: String,
@@ -1614,7 +1904,6 @@ impl Router {
         kv_engine_id_annotation: String,
         least_load_default_throughput: f64,
         least_load_kv_pressure_weight: f64,
-        least_load_max_waiting_requests: u32,
         least_load_mean_prefill_tokens: u32,
         load_monitor_interval: u64,
         log_dir: Option<String>,
@@ -1703,6 +1992,7 @@ impl Router {
         routing_key_override: bool,
         runtime_worker_threads: Option<usize>,
         schema_config: Option<String>,
+        secrets_auto_reload: bool,
         selection_accounting_ttl_ms: u64,
         selection_policy: String,
         selection_temperature: f32,
@@ -1719,6 +2009,7 @@ impl Router {
         storage_hook_wasm_path: Option<String>,
         stream_body_stall_timeout_secs: u64,
         tenant_api_keys: Vec<(String, String)>,
+        tenant_api_keys_file: Option<String>,
         tenant_header_name: String,
         tenant_rate_limit_config: Option<String>,
         tenant_rate_limit_enabled: bool,
@@ -1766,6 +2057,21 @@ impl Router {
                  a discovery mapping takes check_interval_secs",
             ));
         }
+        // A key file keyword names a file this binding reads, as the CLI
+        // reads its own: the key, or the refusal, is the file's.
+        let KeysRead {
+            api_key,
+            tenant_api_keys,
+            control_plane_auth,
+        } = Self::read_key_files(
+            api_key,
+            api_key_file.as_deref(),
+            tenant_api_keys,
+            tenant_api_keys_file.as_deref(),
+            control_plane_auth,
+            control_plane_api_keys_file.as_deref(),
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
         let discovery = discovery
             .as_ref()
             .map(parse_discovery)
@@ -1799,8 +2105,10 @@ impl Router {
             port,
             access_log_fields,
             admin_host,
+            admin_max_connections,
             admin_port,
             api_key,
+            api_key_file,
             assignment_mode,
             backend,
             balance_abs_threshold,
@@ -1823,6 +2131,7 @@ impl Router {
             chat_template,
             client_cert_path,
             client_key_path,
+            control_plane_api_keys_file,
             control_plane_auth,
             cors_allowed_origins,
             decode_expected_workers,
@@ -1852,6 +2161,7 @@ impl Router {
             engine_metrics,
             epd_disaggregation,
             eviction_interval_secs,
+            grouped_dp_sticky,
             grpc_request_timeout_secs,
             header_read_timeout_secs,
             health_check_endpoint,
@@ -1872,7 +2182,6 @@ impl Router {
             kv_engine_id_annotation,
             least_load_default_throughput,
             least_load_kv_pressure_weight,
-            least_load_max_waiting_requests,
             least_load_mean_prefill_tokens,
             load_monitor_interval,
             log_dir,
@@ -1961,6 +2270,7 @@ impl Router {
             routing_key_override,
             runtime_worker_threads,
             schema_config,
+            secrets_auto_reload,
             selection_accounting_ttl_ms,
             selection_policy,
             selection_temperature,
@@ -1977,6 +2287,7 @@ impl Router {
             storage_hook_wasm_path,
             stream_body_stall_timeout_secs,
             tenant_api_keys,
+            tenant_api_keys_file,
             tenant_header_name,
             tenant_rate_limit_config,
             tenant_rate_limit_enabled,
@@ -2018,12 +2329,18 @@ impl Router {
     fn start(&self, py: Python<'_>) -> PyResult<()> {
         use observability::metrics::PrometheusConfig;
 
+        // Refused before the runtime exists, as the CLI refuses it at parse time.
+        if let Some(buckets) = &self.prometheus_duration_buckets {
+            PrometheusConfig::validate_duration_buckets(buckets).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
+            })?;
+        }
+
+        // Validated once, by the builder's `build()` inside `to_router_config`;
+        // `startup` validates once more for a library caller that never went
+        // through the builder.
         let router_config = self.to_router_config().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
-        })?;
-
-        router_config.validate().map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Configuration validation failed: {e}"))
         })?;
 
         let service_discovery_config = router_config
@@ -2064,8 +2381,9 @@ impl Router {
             .transpose()?;
 
         // The runtime's default size unless a thread count is given (the
-        // validation above refused 0), as the CLI's `serve` builds it.
-        let runtime = match self.runtime_worker_threads {
+        // validation above refused 0), read from the validated config as the
+        // CLI's `serve` reads it.
+        let runtime = match router_config.runtime_worker_threads {
             Some(threads) => tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(threads)
                 .enable_all()
@@ -2077,27 +2395,34 @@ impl Router {
         // Release the GIL while the server runs so Python threads can make progress.
         py.detach(|| {
             runtime.block_on(async move {
+            // The launcher hands over the key files' paths alone; the binding
+            // read them at construction: the record names those files, and
+            // the reload reads them again.
+            let secret_files = Self::secret_files(
+                self.api_key_file.as_deref(),
+                self.tenant_api_keys_file.as_deref(),
+                self.control_plane_api_keys_file.as_deref(),
+            );
             Box::pin(server::startup(server::ServerConfig {
-                host: self.host.clone(),
-                port: self.port,
-                health_check_port: self.health_check_port,
-                runtime_worker_threads: self.runtime_worker_threads,
                 router_config,
-                max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
                 log_level: self.log_level.clone(),
                 log_json: self.log_json,
                 service_discovery_config,
                 mesh_discovery_config,
                 prometheus_config,
-                request_timeout_secs: self.request_timeout_secs,
-                request_id_headers: self.request_id_headers.clone(),
                 shutdown_grace_period_secs: self.shutdown_grace_period_secs,
                 shutdown_settle_secs: self.shutdown_settle_secs,
                 control_plane_auth: self
                     .control_plane_auth
                     .as_ref()
-                    .map(|c| c.to_auth_control_plane_config()),
+                    .map(|c| c.to_auth_control_plane_config())
+                    .transpose()
+                    .map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "Configuration error: {e}"
+                        ))
+                    })?,
                 mesh_server_config: if self.enable_mesh {
                     let self_name = self.mesh_server_name.clone().unwrap_or_else(|| {
                         use rand::{distr::Alphanumeric, RngExt};
@@ -2106,17 +2431,8 @@ impl Router {
                             .collect();
                         format!("Mesh_{random_string}")
                     });
-                    let peer = self
-                        .mesh_peer_urls
-                        .first()
-                        .map(|url| {
-                            url.parse::<std::net::SocketAddr>().map_err(|e| {
-                                pyo3::exceptions::PyValueError::new_err(format!(
-                                    "Invalid mesh peer URL '{url}': {e}"
-                                ))
-                            })
-                        })
-                        .transpose()?;
+                    let init_peers = Self::parse_mesh_peer_urls(&self.mesh_peer_urls)
+                        .map_err(pyo3::exceptions::PyValueError::new_err)?;
                     // Mirrors the CLI check in `cli/configure.rs`: port 0 parses as a
                     // socket address but is undialable once gossiped to peers,
                     // and reaches router discovery as the fallback mesh port
@@ -2149,7 +2465,7 @@ impl Router {
                         self_name,
                         bind_addr,
                         advertise_addr,
-                        init_peer: peer,
+                        init_peers,
                         mtls_config: self.mesh_mtls_config()?,
                     })
                 } else {
@@ -2157,9 +2473,23 @@ impl Router {
                 },
                 webrtc_bind_addr,
                 webrtc_stun_server: self.webrtc_stun_server.clone(),
-                // The launcher resolved the secrets' sources in Python; the
-                // record is the CLI's.
-                secret_sources: Default::default(),
+                secret_sources: Self::secret_sources(
+                    &secret_files,
+                    self.api_key.is_some(),
+                    self.tenant_api_keys.len(),
+                    self.control_plane_auth
+                        .as_ref()
+                        .map_or(0, |auth| auth.api_keys.len()),
+                    matches!(self.history_backend, HistoryBackendType::Postgres)
+                        && self
+                            .postgres_config
+                            .as_ref()
+                            .is_some_and(|config| config.db_url.is_some()),
+                    matches!(self.history_backend, HistoryBackendType::Redis)
+                        && self.redis_config.is_some(),
+                ),
+                secret_files,
+                secrets_auto_reload: self.secrets_auto_reload,
             }))
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
@@ -2241,7 +2571,7 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The process-level TLS crypto provider, installed once when the module
     // is imported: every HTTP client a binding builds takes it, whether or
     // not a router is started in this process.
-    clients::install_crypto_provider();
+    server::install_crypto_provider();
 
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;
@@ -2258,6 +2588,7 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTokenSpeedGrpcServer>()?;
     m.add_class::<PySglangGrpcServer>()?;
     m.add_class::<PyTrtllmGrpcServer>()?;
+    m.add_class::<PyTokenizer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;
@@ -2265,4 +2596,343 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_available_reasoning_parsers, m)?)?;
     m.add_function(wrap_pyfunction!(init_servicer_tracing, m)?)?;
     Ok(())
+}
+
+// `cargo test -p smg-python --lib` runs these without an interpreter: the
+// tests reach pure-Rust code only, so the linker drops the module's Python
+// references with the code nothing here calls (the crate's features change
+// nothing about that: pyo3's `extension-module` is on either way).
+#[cfg(test)]
+mod tests {
+    use config::RoutingMode;
+
+    use super::*;
+
+    #[test]
+    fn a_provider_backend_is_its_routing_mode_and_an_engine_backend_is_none() {
+        let urls = vec!["https://provider.example".to_string()];
+        let provider = |backend: BackendType| backend.provider_mode(&urls);
+
+        assert!(matches!(
+            provider(BackendType::Openai),
+            Some(RoutingMode::OpenAI { worker_urls }) if worker_urls == urls
+        ));
+        assert!(matches!(
+            provider(BackendType::Anthropic),
+            Some(RoutingMode::Anthropic { worker_urls }) if worker_urls == urls
+        ));
+        assert!(matches!(
+            provider(BackendType::Gemini),
+            Some(RoutingMode::Gemini { worker_urls }) if worker_urls == urls
+        ));
+        for engine in [
+            BackendType::Sglang,
+            BackendType::Vllm,
+            BackendType::Tokenspeed,
+            BackendType::Trtllm,
+        ] {
+            assert!(
+                engine.provider_mode(&urls).is_none(),
+                "{engine:?} is an engine backend: the disaggregation flags select its mode"
+            );
+        }
+    }
+
+    /// An engine backend pins the wire its startup workers speak over ZMQ; no
+    /// backend, a provider and TensorRT-LLM leave the choice to the detection
+    /// step, as the CLI does without `--backend`.
+    #[test]
+    fn an_engine_backend_pins_its_wire_and_no_backend_pins_none() {
+        use worker::RuntimeType;
+        let pin = |backend: Option<BackendType>| {
+            backend
+                .as_ref()
+                .and_then(BackendType::startup_worker_runtime)
+        };
+        assert_eq!(pin(None), None);
+        assert_eq!(pin(Some(BackendType::Vllm)), Some(RuntimeType::Vllm));
+        assert_eq!(
+            pin(Some(BackendType::Tokenspeed)),
+            Some(RuntimeType::TokenSpeed)
+        );
+        assert_eq!(pin(Some(BackendType::Sglang)), Some(RuntimeType::Sglang));
+        for unpinned in [
+            BackendType::Openai,
+            BackendType::Anthropic,
+            BackendType::Trtllm,
+            BackendType::Gemini,
+        ] {
+            assert_eq!(unpinned.startup_worker_runtime(), None, "{unpinned:?}");
+        }
+    }
+
+    /// Each key file the binding read reaches the gateway under its own
+    /// name, and a key given as a value has no file.
+    #[test]
+    fn secret_files_keep_each_file_under_its_own_name() {
+        let files = Router::secret_files(Some("/run/keys/api"), None, Some("/run/keys/control"));
+        assert_eq!(
+            files.api_key.as_deref(),
+            Some(std::path::Path::new("/run/keys/api"))
+        );
+        assert!(files.tenant_api_keys.is_none(), "given as a value: no file");
+        assert_eq!(
+            files.control_plane_api_keys.as_deref(),
+            Some(std::path::Path::new("/run/keys/control"))
+        );
+        let none = Router::secret_files(None, None, None);
+        assert_eq!(none, secrets::SecretFiles::default());
+    }
+
+    /// The sources record names a file for each key a file gave, with the
+    /// entries read from it; a count without a file or a value names nothing.
+    #[test]
+    fn secret_sources_name_the_files_with_their_own_entry_counts() {
+        use smg::server::posture::SecretSource;
+        let files =
+            Router::secret_files(None, Some("/run/keys/tenants"), Some("/run/keys/control"));
+        let sources = Router::secret_sources(&files, false, 3, 2, false, false);
+        assert!(
+            sources.api_key.is_none(),
+            "neither given nor filed: unnamed"
+        );
+        assert_eq!(sources.tenant_api_keys, Some((SecretSource::File, 3)));
+        assert_eq!(
+            sources.control_plane_api_keys,
+            Some((SecretSource::File, 2))
+        );
+        assert!(sources.postgres_db_url.is_none() && sources.redis_url.is_none());
+
+        let serving_only = Router::secret_files(Some("/run/keys/api"), None, None);
+        let sources = Router::secret_sources(&serving_only, true, 0, 0, false, false);
+        assert_eq!(sources.api_key, Some(SecretSource::File));
+        assert!(
+            sources.tenant_api_keys.is_none(),
+            "neither given nor filed names nothing"
+        );
+        assert!(sources.control_plane_api_keys.is_none());
+    }
+
+    /// A key given as a value and no file is the launcher's in the record,
+    /// with its entry count, and so is the selected backend's store URL; the
+    /// binding does not tell flag from environment.
+    #[test]
+    fn secret_sources_name_a_value_given_key_as_the_launchers() {
+        use smg::server::posture::SecretSource;
+        let none = Router::secret_files(None, None, None);
+        let sources = Router::secret_sources(&none, true, 3, 2, true, false);
+        assert_eq!(sources.api_key, Some(SecretSource::Launcher));
+        assert_eq!(sources.postgres_db_url, Some(SecretSource::Launcher));
+        assert!(
+            sources.redis_url.is_none(),
+            "the other backend's URL is not given"
+        );
+        assert_eq!(sources.tenant_api_keys, Some((SecretSource::Launcher, 3)));
+        assert_eq!(
+            sources.control_plane_api_keys,
+            Some((SecretSource::Launcher, 2))
+        );
+        assert!(Router::secret_sources(&none, false, 0, 0, false, false)
+            .api_key
+            .is_none());
+    }
+
+    /// A path written under a temporary directory, for the key-file tests.
+    fn key_file(dir: &tempfile::TempDir, name: &str, content: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).expect("the file written");
+        path.display().to_string()
+    }
+
+    /// A key file keyword alone is read: the shared key as its file's one
+    /// line, the tenant and control-plane keys as entries with blank and
+    /// comment lines skipped; the control-plane entries join the launcher's
+    /// auth config, or one with its defaults. Without a file the values
+    /// pass as given.
+    #[test]
+    fn key_files_are_read_by_the_binding() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let api_key = key_file(&dir, "api-key", "file-shared-key\n");
+        let tenants = key_file(
+            &dir,
+            "tenants",
+            "# the tenants\n\nred:file-red\n  blue : file-blue  \n",
+        );
+        let operators = key_file(
+            &dir,
+            "control-plane-keys",
+            "ops:Ops:admin:file-ops-key\nro:Read:user:file-ro-key\n",
+        );
+        let read = Router::read_key_files(
+            None,
+            Some(api_key.as_str()),
+            vec![],
+            Some(tenants.as_str()),
+            None,
+            Some(operators.as_str()),
+        )
+        .expect("the files read");
+        assert_eq!(read.api_key.as_deref(), Some("file-shared-key"));
+        assert_eq!(
+            read.tenant_api_keys,
+            vec![
+                ("red".to_string(), "file-red".to_string()),
+                ("blue".to_string(), "file-blue".to_string()),
+            ]
+        );
+        let auth = read
+            .control_plane_auth
+            .expect("an auth config from the file alone");
+        assert_eq!(auth.api_keys.len(), 2);
+        assert_eq!(
+            (
+                auth.api_keys[0].id.as_str(),
+                auth.api_keys[0].name.as_str(),
+                auth.api_keys[0].key.as_str(),
+                auth.api_keys[0].role.clone(),
+            ),
+            ("ops", "Ops", "file-ops-key", PyRole::Admin)
+        );
+        assert_eq!(auth.api_keys[1].role, PyRole::User);
+        assert!(
+            !auth.audit_enabled,
+            "the defaults when the launcher built none"
+        );
+
+        let launcher = PyControlPlaneAuthConfig {
+            jwt: None,
+            api_keys: vec![],
+            audit_enabled: true,
+        };
+        let read = Router::read_key_files(
+            None,
+            None,
+            vec![],
+            None,
+            Some(launcher),
+            Some(operators.as_str()),
+        )
+        .expect("the file read into the launcher's config");
+        let auth = read.control_plane_auth.expect("kept");
+        assert!(auth.audit_enabled, "the launcher's setting stands");
+        assert_eq!(auth.api_keys.len(), 2);
+
+        let read = Router::read_key_files(
+            Some("k".to_string()),
+            None,
+            vec![("t".to_string(), "k2".to_string())],
+            None,
+            None,
+            None,
+        )
+        .expect("no file");
+        assert_eq!(read.api_key.as_deref(), Some("k"));
+        assert_eq!(read.tenant_api_keys.len(), 1);
+        assert!(read.control_plane_auth.is_none());
+    }
+
+    /// A value and a file for one key are refused as given twice; a file
+    /// the reader refuses, or a bad entry, is refused under the file's
+    /// setting and path; no refusal carries a key.
+    #[test]
+    fn a_key_given_twice_or_a_bad_key_file_is_refused() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let api_key = key_file(&dir, "api-key", "file-shared-key\n");
+        let err = Router::read_key_files(
+            Some("k".to_string()),
+            Some(api_key.as_str()),
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .expect_err("given twice");
+        assert_eq!(
+            err,
+            "api_key and api_key_file are both given; give one source"
+        );
+        let err = Router::read_key_files(
+            None,
+            None,
+            vec![("t".to_string(), "k".to_string())],
+            Some(api_key.as_str()),
+            None,
+            None,
+        )
+        .expect_err("given twice");
+        assert!(
+            err.starts_with("tenant_api_keys and tenant_api_keys_file"),
+            "{err}"
+        );
+        let launcher = PyControlPlaneAuthConfig {
+            jwt: None,
+            api_keys: vec![PyApiKeyEntry {
+                id: "a".to_string(),
+                name: "A".to_string(),
+                key: "k".to_string(),
+                role: PyRole::Admin,
+            }],
+            audit_enabled: false,
+        };
+        let err = Router::read_key_files(
+            None,
+            None,
+            vec![],
+            None,
+            Some(launcher),
+            Some(api_key.as_str()),
+        )
+        .expect_err("given twice");
+        assert!(
+            err.starts_with("control_plane_auth.api_keys and control_plane_api_keys_file"),
+            "{err}"
+        );
+
+        let empty = key_file(&dir, "empty", "");
+        let err = Router::read_key_files(None, Some(empty.as_str()), vec![], None, None, None)
+            .expect_err("an empty file");
+        assert!(
+            err.contains("api-key-file")
+                && err.contains(&empty)
+                && err.contains("the file is empty"),
+            "{err}"
+        );
+        let bad = key_file(&dir, "operators", "ops:Ops:owner:file-ops-key\n");
+        let err = Router::read_key_files(None, None, vec![], None, None, Some(bad.as_str()))
+            .expect_err("a bad role");
+        assert!(
+            err.contains("control-plane-api-keys-file")
+                && err.contains(&bad)
+                && err.contains("the role must be 'admin' or 'user'"),
+            "{err}"
+        );
+        assert!(!err.contains("file-ops-key"), "{err}");
+    }
+
+    /// The join peers parse the same from a comma list and from separate
+    /// values, and an empty entry is refused rather than dropped.
+    #[test]
+    fn mesh_peer_urls_split_on_commas_and_refuse_an_empty_entry() {
+        let separate =
+            Router::parse_mesh_peer_urls(&["10.0.0.1:1".to_string(), "10.0.0.2:2".to_string()])
+                .expect("two entries");
+        let comma = Router::parse_mesh_peer_urls(&["10.0.0.1:1,10.0.0.2:2".to_string()])
+            .expect("a comma list");
+        assert_eq!(separate, comma);
+        assert_eq!(separate.len(), 2);
+        for bad in [
+            vec![String::new()],
+            vec!["10.0.0.1:1,".to_string()],
+            vec!["10.0.0.1:1".to_string(), " ".to_string()],
+        ] {
+            let err = Router::parse_mesh_peer_urls(&bad).expect_err("an empty entry is refused");
+            assert!(err.contains("is empty"), "{bad:?}: {err}");
+        }
+        let err = Router::parse_mesh_peer_urls(&["not-an-address".to_string()])
+            .expect_err("a bad entry is refused");
+        assert!(
+            err.contains("Invalid mesh peer URL 'not-an-address'"),
+            "{err}"
+        );
+    }
 }

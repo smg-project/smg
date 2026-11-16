@@ -11,11 +11,16 @@ use llm_tokenizer::{
 use openai_protocol::{
     chat::{ChatChoice, ChatCompletionRequest},
     common::{ChatLogProbs, StringOrArray},
+    messages::CreateMessageRequest,
+    profile::ProviderProfile,
 };
 use serde_json::{json, Value};
 use smg_grpc_client::{tokenspeed_proto::GenerateComplete, vllm_engine::proto};
 use symphony::{
-    formats::{deepseek_v4, deepseek_v4_1, gemma4, glm, glm4, llama4, plain, qwen3},
+    formats::{
+        deepseek_v4, deepseek_v4_1, gemma4, glm, glm4, kimi_k3, llama4, plain, qwen3, Table,
+    },
+    grammar::GrammarStart,
     CallSyntax, Format,
 };
 
@@ -23,7 +28,7 @@ use super::{
     super::*,
     eof::{
         chat_spec, chat_text, chunk, chunk_with_logprobs, collect_events, complete, dispatch,
-        logprob_carriers, processor, scripted_stream, CharacterTokenizer,
+        logprob_carriers, named_processor, processor, scripted_stream, CharacterTokenizer,
     },
 };
 use crate::{
@@ -32,7 +37,12 @@ use crate::{
         proto_wrapper::ProtoGenerateComplete,
         regular::{
             processor::ResponseProcessor,
-            symphony::{assign, template::Templates, testing::Refusing, Asks, Assignment},
+            symphony::{
+                assign, assign_for, telemetry,
+                template::Templates,
+                testing::{tools, Refusing},
+                Asks, Assignment, Reading,
+            },
         },
         utils::ModelNames,
     },
@@ -49,6 +59,12 @@ pub(super) fn assigned(
         prompt: prompt.to_string(),
         forbids_calls: false,
         past_the_end: false,
+        forcing: None,
+        opener: None,
+        forced_ids: None,
+        json_answer: false,
+        span: Span::none(),
+        marked: Arc::default(),
     });
     spec
 }
@@ -78,9 +94,19 @@ async fn stream_events_through(
     with_tools: bool,
     spec: ChatResponseSpec,
 ) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
+    stream_events_by(processor(with_tools), tokenizer, responses, spec).await
+}
+
+/// The events of `responses` streamed by `processor` under `spec`, decoding through `tokenizer`.
+async fn stream_events_by(
+    processor: StreamingProcessor,
+    tokenizer: Arc<dyn Tokenizer>,
+    responses: Vec<proto::GenerateResponse>,
+    spec: ChatResponseSpec,
+) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
     let (stream, server) = scripted_stream(responses, "0").await;
     let (tx, rx) = sse_channel();
-    let result = processor(with_tools)
+    let result = processor
         .process_streaming_chunks(
             stream,
             dispatch(),
@@ -524,6 +550,69 @@ const CUT_CALL_TAILS: [(&str, &str); 2] = [
     ),
 ];
 
+/// A streamed call the token limit cut: the stream finishes `length` with the call's name and
+/// `arguments`, its bytes as the model wrote them, and nothing of the call as content; the
+/// arguments as streamed, for a check of their shape.
+async fn streamed_cut_call_keeps_its_bytes(
+    responses: Vec<proto::GenerateResponse>,
+    spec: ChatResponseSpec,
+    output: &str,
+    arguments: &str,
+) -> String {
+    let (result, events) = stream_events(responses, true, spec).await;
+    assert!(result.is_ok(), "{output:?}: {result:?}");
+    let calls = tool_call_deltas(&events);
+    assert_eq!(
+        calls[0]["function"]["name"], "lookup",
+        "{output:?}: {events:#?}"
+    );
+    let streamed: String = calls
+        .iter()
+        .filter_map(|call| call["function"]["arguments"].as_str())
+        .collect();
+    assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
+    assert_eq!(
+        chat_text(&events, 0, "content"),
+        "",
+        "nothing of the call is content: {output:?}: {events:#?}"
+    );
+    let finish = events
+        .iter()
+        .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+        .expect("a finish chunk");
+    assert_eq!(finish, "length", "{output:?}");
+    streamed
+}
+
+/// A whole call the token limit cut, folded over `format` after `prompt`: the choice finishes
+/// `length` with the call's name and `arguments`, its bytes as the model wrote them, and nothing
+/// of the call as content.
+async fn whole_cut_call_keeps_its_bytes(
+    output: &str,
+    arguments: &str,
+    format: Format,
+    prompt: &str,
+) {
+    let (choice, _) = fold_finished(output, format, prompt, "length").await;
+    let calls = choice.message.tool_calls.as_ref().expect("the call");
+    assert_eq!(calls.len(), 1, "{output:?}");
+    assert_eq!(calls[0].function.name, "lookup");
+    assert_eq!(
+        calls[0].function.arguments.as_deref(),
+        Some(arguments),
+        "{output:?}: {choice:?}"
+    );
+    assert_eq!(
+        choice.message.content, None,
+        "nothing of the call is content: {output:?}: {choice:?}"
+    );
+    assert_eq!(
+        choice.finish_reason.as_deref(),
+        Some("length"),
+        "{output:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_streamed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
     for (tail, arguments) in CUT_CALL_TAILS {
@@ -538,28 +627,7 @@ async fn a_streamed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_fin
             chunk(0, &output[inside..]),
             complete(0, "length"),
         ];
-        let (result, events) = stream_events(responses, true, spec).await;
-        assert!(result.is_ok(), "{tail:?}: {result:?}");
-        let calls = tool_call_deltas(&events);
-        assert_eq!(
-            calls[0]["function"]["name"], "lookup",
-            "{tail:?}: {events:#?}"
-        );
-        let streamed: String = calls
-            .iter()
-            .filter_map(|call| call["function"]["arguments"].as_str())
-            .collect();
-        assert_eq!(streamed, arguments, "{tail:?}: {events:#?}");
-        assert_eq!(
-            chat_text(&events, 0, "content"),
-            "",
-            "nothing of the call is content: {tail:?}: {events:#?}"
-        );
-        let finish = events
-            .iter()
-            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
-            .expect("a finish chunk");
-        assert_eq!(finish, "length", "{tail:?}");
+        streamed_cut_call_keeps_its_bytes(responses, spec, &output, arguments).await;
     }
 }
 
@@ -567,20 +635,7 @@ async fn a_streamed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_fin
 async fn a_whole_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
     for (tail, arguments) in CUT_CALL_TAILS {
         let output = format!("{CUT_CALL_PREFIX}{tail}");
-        let (choice, _) = fold_finished(&output, deepseek_v4_1(), "<think>", "length").await;
-        let calls = choice.message.tool_calls.as_ref().expect("the call");
-        assert_eq!(calls.len(), 1, "{tail:?}");
-        assert_eq!(calls[0].function.name, "lookup");
-        assert_eq!(
-            calls[0].function.arguments.as_deref(),
-            Some(arguments),
-            "{tail:?}: {choice:?}"
-        );
-        assert_eq!(
-            choice.message.content, None,
-            "nothing of the call is content: {tail:?}: {choice:?}"
-        );
-        assert_eq!(choice.finish_reason.as_deref(), Some("length"), "{tail:?}");
+        whole_cut_call_keeps_its_bytes(&output, arguments, deepseek_v4_1(), "<think>").await;
     }
 }
 
@@ -666,16 +721,6 @@ async fn malformed_call_text_is_content_and_keeps_its_logprobs() {
     assert_eq!(kept_logprob_tokens(&choice), output);
 }
 
-/// The `lookup` tool the outputs call.
-fn lookup_tools() -> Vec<Tool> {
-    serde_json::from_value(json!([{
-        "type": "function", "function": {
-            "name": "lookup", "parameters": {"type": "object", "properties": {}}
-        }
-    }]))
-    .expect("tools")
-}
-
 /// A Messages spec with Symphony assigned `format`, replaying `prompt`, with the `lookup` tool.
 pub(super) fn assigned_message(
     format: Format,
@@ -683,6 +728,9 @@ pub(super) fn assigned_message(
     thinking: bool,
 ) -> MessagesResponseSpec {
     MessagesResponseSpec {
+        prompt_tokens: 0,
+        max_tokens: 4096,
+        context_window: None,
         first_tool_call_only: false,
         thinking_requested: thinking,
         thinking_text_returned: true,
@@ -690,13 +738,19 @@ pub(super) fn assigned_message(
         tool_choice: None,
         has_tools: true,
         history_tool_calls_count: 0,
-        chat_tools: lookup_tools().into(),
+        chat_tools: tools().into(),
         stop_sequences: None,
         symphony: Some(Assignment {
             format: Arc::new(format),
             prompt: prompt.to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            opener: None,
+            forced_ids: None,
+            json_answer: false,
+            span: Span::none(),
+            marked: Arc::default(),
         }),
         parser_names: None,
     }
@@ -879,13 +933,22 @@ async fn two_symphony_messages_never_share_a_tool_use_id() {
 
 #[tokio::test]
 async fn symphony_message_stop_reasons_follow_the_finish_and_the_matched_stop() {
-    // The token limit.
-    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    // The token limit: the five tokens are the whole budget.
+    let mut spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    spec.max_tokens = 5;
     let (result, events) =
         message_events(vec![chunk(0, "Hello"), complete(0, "length")], spec, None).await;
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(message_blocks(&events)[0].2, "Hello");
     assert_eq!(message_stop_reason(&events), "max_tokens");
+    // The same cut short of the budget: the window was filled.
+    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    let (_, events) =
+        message_events(vec![chunk(0, "Hello"), complete(0, "length")], spec, None).await;
+    assert_eq!(
+        message_stop_reason(&events),
+        "model_context_window_exceeded"
+    );
     // The turn's end.
     let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
     let (_, events) =
@@ -1027,7 +1090,10 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
             utils::ParserResolver::disabled(),
         )
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec(),
             dispatch(),
             tokenizer,
@@ -1093,9 +1159,71 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
     assert!(!scrape.contains("smg_symphony_refused_total"), "{scrape}");
 }
 
+/// A call whose arguments are a whole value of another kind than an object (a double-encoded
+/// string here) reaches the client as a `tool_use` block whose `input` is `{}`, as on the older
+/// path, through the real reader: nothing refused, nothing counted as refused, the output's own
+/// count clean. (The unit test beside `object_inputs` pins the rule; this one pins its wiring in
+/// `read_messages_with_symphony`.)
+#[tokio::test]
+async fn a_message_whose_tool_use_input_is_a_string_carries_an_empty_object() {
+    let output =
+        "<tool_call>\n{\"name\": \"lookup\", \"arguments\": \"\\\"Paris\\\"\"}\n</tool_call>";
+    let spec = || assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    let mut frame = complete(0, "stop");
+    if let Some(proto::generate_response::Response::Complete(complete)) = &mut frame.response {
+        complete.output_ids = output.chars().map(u32::from).collect();
+        complete.completion_tokens = complete.output_ids.len() as u32;
+    }
+    let (stream, server) = scripted_stream(vec![frame], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
+    let (result, scrape) = scraped(
+        ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        )
+        .process_non_streaming_messages_response(
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
+            spec(),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+        ),
+    )
+    .await;
+    server.abort();
+    let (message, _) = match result {
+        Ok(message) => message,
+        Err(response) => panic!("the message was refused with {}", response.status()),
+    };
+    let blocks = serde_json::to_value(&message.content).expect("the blocks");
+    assert_eq!(blocks.as_array().map(Vec::len), Some(1), "{blocks}");
+    assert_eq!(blocks[0]["type"], "tool_use", "{blocks}");
+    assert_eq!(blocks[0]["name"], "lookup", "{blocks}");
+    assert_eq!(
+        blocks[0]["input"],
+        json!({}),
+        "a string input leaves as an empty object: {blocks}"
+    );
+    assert!(!scrape.contains("smg_symphony_refused_total"), "{scrape}");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"clean\""],
+    )
+    .expect("the clean count");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+}
+
 /// The scrape of a recorder of this test's own after `read` ran on this thread (the test
-/// runtime is single-threaded, so the local recorder sees every record of the future).
-pub(super) async fn scraped<F: std::future::Future>(read: F) -> (F::Output, String) {
+/// runtime is single-threaded, so the local recorder sees every record of the future), the
+/// Symphony series it read being this test's own too (`telemetry::own_series`).
+pub(super) async fn scraped<F: Future>(read: F) -> (F::Output, String) {
+    let _own = telemetry::own_series();
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let guard = metrics::set_default_local_recorder(&recorder);
@@ -1268,7 +1396,10 @@ async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value
             utils::ParserResolver::disabled(),
         )
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec(),
             dispatch(),
             tokenizer,
@@ -1363,6 +1494,61 @@ async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value
         arguments.starts_with(&partial),
         "{arguments:?} vs {partial:?}"
     );
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn scraped_takes_its_lines_from_series_of_its_own() {
+    // Forty malformed outputs read under one scrape drain the table's bucket; the output read
+    // under the next scrape still writes its line, and counts none of the flow's suppressed
+    // lines: the series are the scrape's own. The flow's written count is read after it, so the
+    // pin does not lean on the bucket's burst size.
+    let flow = 40;
+    let written = |lines: &[&str]| {
+        lines
+            .iter()
+            .filter(|line| line.contains("did not read the whole output"))
+            .count()
+    };
+    scraped(async {
+        for _ in 0..flow {
+            fold("Hello <tool_call>\nnot a call\n</tool_call>").await;
+        }
+    })
+    .await;
+    let after_the_flow = std::cell::Cell::new(0);
+    logs_assert(|lines: &[&str]| {
+        let count = written(lines);
+        after_the_flow.set(count);
+        if count < flow {
+            Ok(())
+        } else {
+            Err(format!(
+                "no line of the flow was suppressed: {count} written"
+            ))
+        }
+    });
+    scraped(fold("Hello <tool_call>\nnot a call\n</tool_call>")).await;
+    logs_assert(|lines: &[&str]| {
+        let count = written(lines);
+        let last = lines
+            .iter()
+            .rev()
+            .find(|line| line.contains("did not read the whole output"));
+        match last {
+            Some(line)
+                if count == after_the_flow.get() + 1 && line.contains("suppressed_lines=0") =>
+            {
+                Ok(())
+            }
+            Some(line) => Err(format!(
+                "the line after the flow is missing or counts the flow's suppressed lines \
+                 ({count} written after {}): {line}",
+                after_the_flow.get()
+            )),
+            None => Err("no line at all".to_string()),
+        }
+    });
 }
 
 #[tracing_test::traced_test]
@@ -1925,7 +2111,10 @@ async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_messages_p
             utils::ParserResolver::disabled(),
         )
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec(),
             dispatch(),
             tokenizer,
@@ -1995,28 +2184,7 @@ async fn a_streamed_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_cal
             chunk(0, &output[output.len() - 2..]),
             complete(0, "length"),
         ];
-        let (result, events) = stream_events(responses, true, spec).await;
-        assert!(result.is_ok(), "{output:?}: {result:?}");
-        let calls = tool_call_deltas(&events);
-        assert_eq!(
-            calls[0]["function"]["name"], "lookup",
-            "{output:?}: {events:#?}"
-        );
-        let streamed: String = calls
-            .iter()
-            .filter_map(|call| call["function"]["arguments"].as_str())
-            .collect();
-        assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
-        assert_eq!(
-            chat_text(&events, 0, "content"),
-            "",
-            "nothing of the call is content: {output:?}: {events:#?}"
-        );
-        let finish = events
-            .iter()
-            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
-            .expect("a finish chunk");
-        assert_eq!(finish, "length", "{output:?}");
+        streamed_cut_call_keeps_its_bytes(responses, spec, output, arguments).await;
     }
 }
 
@@ -2024,24 +2192,7 @@ async fn a_streamed_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_cal
 async fn a_whole_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length()
 {
     for (output, arguments) in PYTHONIC_CUT_CALLS {
-        let (choice, _) = fold_finished(output, llama4(), PYTHONIC_PROMPT, "length").await;
-        let calls = choice.message.tool_calls.as_ref().expect("the call");
-        assert_eq!(calls.len(), 1, "{output:?}");
-        assert_eq!(calls[0].function.name, "lookup");
-        assert_eq!(
-            calls[0].function.arguments.as_deref(),
-            Some(arguments),
-            "{output:?}: {choice:?}"
-        );
-        assert_eq!(
-            choice.message.content, None,
-            "nothing of the call is content: {output:?}: {choice:?}"
-        );
-        assert_eq!(
-            choice.finish_reason.as_deref(),
-            Some("length"),
-            "{output:?}"
-        );
+        whole_cut_call_keeps_its_bytes(output, arguments, llama4(), PYTHONIC_PROMPT).await;
     }
 }
 
@@ -2075,56 +2226,18 @@ async fn a_streamed_gemma_call_the_token_limit_cut_keeps_its_bytes_in_the_call_a
             chunk(0, &output[output.len() - 1..]),
             complete(0, "length"),
         ];
-        let (result, events) = stream_events(responses, true, spec).await;
-        assert!(result.is_ok(), "{output:?}: {result:?}");
-        let calls = tool_call_deltas(&events);
-        assert_eq!(
-            calls[0]["function"]["name"], "lookup",
-            "{output:?}: {events:#?}"
-        );
-        let streamed: String = calls
-            .iter()
-            .filter_map(|call| call["function"]["arguments"].as_str())
-            .collect();
-        assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
+        let streamed = streamed_cut_call_keeps_its_bytes(responses, spec, output, arguments).await;
         assert!(
             serde_json::from_str::<Value>(&streamed).is_err(),
             "the arguments stay cut: {streamed:?}"
         );
-        assert_eq!(
-            chat_text(&events, 0, "content"),
-            "",
-            "nothing of the call is content: {output:?}: {events:#?}"
-        );
-        let finish = events
-            .iter()
-            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
-            .expect("a finish chunk");
-        assert_eq!(finish, "length", "{output:?}");
     }
 }
 
 #[tokio::test]
 async fn a_whole_gemma_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
     for (output, arguments) in GEMMA_CUT_CALLS {
-        let (choice, _) = fold_finished(output, gemma4(), GEMMA_PROMPT, "length").await;
-        let calls = choice.message.tool_calls.as_ref().expect("the call");
-        assert_eq!(calls.len(), 1, "{output:?}");
-        assert_eq!(calls[0].function.name, "lookup");
-        assert_eq!(
-            calls[0].function.arguments.as_deref(),
-            Some(arguments),
-            "{output:?}: {choice:?}"
-        );
-        assert_eq!(
-            choice.message.content, None,
-            "nothing of the call is content: {output:?}: {choice:?}"
-        );
-        assert_eq!(
-            choice.finish_reason.as_deref(),
-            Some("length"),
-            "{output:?}"
-        );
+        whole_cut_call_keeps_its_bytes(output, arguments, gemma4(), GEMMA_PROMPT).await;
     }
 }
 
@@ -2161,51 +2274,1275 @@ async fn a_streamed_keyed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_a
             chunk(0, &output[output.len() - 2..]),
             complete(0, "length"),
         ];
-        let (result, events) = stream_events(responses, true, spec).await;
-        assert!(result.is_ok(), "{output:?}: {result:?}");
-        let calls = tool_call_deltas(&events);
-        assert_eq!(
-            calls[0]["function"]["name"], "lookup",
-            "{output:?}: {events:#?}"
-        );
-        let streamed: String = calls
-            .iter()
-            .filter_map(|call| call["function"]["arguments"].as_str())
-            .collect();
-        assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
-        assert_eq!(
-            chat_text(&events, 0, "content"),
-            "",
-            "nothing of the call is content: {output:?}: {events:#?}"
-        );
-        let finish = events
-            .iter()
-            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
-            .expect("a finish chunk");
-        assert_eq!(finish, "length", "{output:?}");
+        streamed_cut_call_keeps_its_bytes(responses, spec, output, arguments).await;
     }
 }
 
 #[tokio::test]
 async fn a_whole_keyed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
     for (output, arguments) in KEYED_CUT_CALLS {
-        let (choice, _) = fold_finished(output, glm4(), KEYED_PROMPT, "length").await;
-        let calls = choice.message.tool_calls.as_ref().expect("the call");
-        assert_eq!(calls.len(), 1, "{output:?}");
+        whole_cut_call_keeps_its_bytes(output, arguments, glm4(), KEYED_PROMPT).await;
+    }
+}
+
+/// The Kimi K3 generation prompt's tail with thinking on: the assistant's message opened and its
+/// thought.
+const KIMI_K3_THINKING_PROMPT: &str =
+    "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>";
+
+/// A Kimi K3 reply written straight into the prefilled thought and closed by the answer's closer
+/// and the end of the turn, never by the thought's closer (seen on about 1 % of very long turns),
+/// one marker a token as the engine streams them.
+const KIMI_K3_SKIPPED_THOUGHT: [&str; 8] = [
+    "The answer",
+    " is 42.",
+    "<|close|>",
+    "response",
+    "<|sep|>",
+    "<|close|>",
+    "message",
+    "<|sep|>",
+];
+
+/// Every text a client reads from `events`: a chat delta's content and reasoning, a Messages
+/// delta's text and thinking.
+fn client_text(events: &[Value]) -> String {
+    events
+        .iter()
+        .flat_map(|event| {
+            let delta = if event["choices"].is_array() {
+                &event["choices"][0]["delta"]
+            } else {
+                &event["delta"]
+            };
+            ["content", "reasoning_content", "text", "thinking"]
+                .into_iter()
+                .filter_map(move |field| delta[field].as_str())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_kimi_k3_thought_closed_by_the_answers_closer_reaches_the_client_once_without_the_marker()
+{
+    let output = KIMI_K3_SKIPPED_THOUGHT.concat();
+    let frames = || -> Vec<proto::GenerateResponse> {
+        let mut frames: Vec<_> = KIMI_K3_SKIPPED_THOUGHT
+            .iter()
+            .map(|token| chunk(0, token))
+            .collect();
+        frames.push(complete(0, "stop"));
+        frames
+    };
+
+    // The chat stream: the reply once, as the thought it was streamed as; no content, and the
+    // closer never in the text.
+    let spec = assigned(chat_spec(false), kimi_k3(), KIMI_K3_THINKING_PROMPT);
+    let (result, events) = stream_events(frames(), false, spec).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        chat_text(&events, 0, "reasoning_content"),
+        "The answer is 42.",
+        "{events:#?}"
+    );
+    assert_eq!(chat_text(&events, 0, "content"), "", "{events:#?}");
+    assert!(
+        !client_text(&events).contains("<|close|>"),
+        "a marker reached the client: {events:#?}"
+    );
+
+    // The whole chat message: the same reading.
+    let (choice, _) = fold_with(&output, kimi_k3(), KIMI_K3_THINKING_PROMPT).await;
+    assert_eq!(
+        choice.message.reasoning_content.as_deref(),
+        Some("The answer is 42."),
+        "{choice:?}"
+    );
+    assert_eq!(choice.message.content, None, "{choice:?}");
+    assert_eq!(choice.finish_reason.as_deref(), Some("stop"), "{choice:?}");
+
+    // The Messages stream: one thinking block with the reply, no text block, no marker.
+    let spec = || assigned_message(kimi_k3(), KIMI_K3_THINKING_PROMPT, true);
+    let (result, events) = message_events(frames(), spec(), None).await;
+    assert!(result.is_ok(), "{result:?}");
+    let blocks = message_blocks(&events);
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert_eq!(blocks[0].0, "thinking", "{blocks:?}");
+    assert_eq!(blocks[0].2, "The answer is 42.", "{blocks:?}");
+    assert_eq!(message_stop_reason(&events), "end_turn");
+    assert!(
+        !client_text(&events).contains("<|close|>"),
+        "a marker reached the client: {events:#?}"
+    );
+
+    // The whole Messages answer: the thinking block and nothing else.
+    let mut frame = complete(0, "stop");
+    if let Some(proto::generate_response::Response::Complete(complete)) = &mut frame.response {
+        complete.output_ids = output.chars().map(u32::from).collect();
+        complete.completion_tokens = complete.output_ids.len() as u32;
+    }
+    let (stream, server) = scripted_stream(vec![frame], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
+    let result = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::disabled(),
+    )
+    .process_non_streaming_messages_response(
+        context::ExecutionResult::Single {
+            stream,
+            dispatch_start: Instant::now(),
+        },
+        spec(),
+        dispatch(),
+        tokenizer,
+        &mut decoder,
+    )
+    .await;
+    server.abort();
+    let (message, _) = match result {
+        Ok(message) => message,
+        Err(response) => panic!("the message was refused with {}", response.status()),
+    };
+    let blocks = serde_json::to_value(&message.content).expect("the blocks");
+    assert_eq!(blocks.as_array().map(Vec::len), Some(1), "{blocks}");
+    assert_eq!(blocks[0]["type"], "thinking", "{blocks}");
+    assert_eq!(blocks[0]["thinking"], "The answer is 42.", "{blocks}");
+    assert_eq!(
+        serde_json::to_value(message.stop_reason).expect("the stop reason"),
+        "end_turn"
+    );
+}
+
+/// A chat request to the Qwen3 model that offers `lookup` under `tool_choice` and separates the
+/// reasoning.
+fn forced_request(tool_choice: &Value) -> ChatCompletionRequest {
+    forced_request_keeping(tool_choice, true)
+}
+
+/// [`forced_request`] with the reasoning separated, or kept in the content.
+fn forced_request_keeping(tool_choice: &Value, separate_reasoning: bool) -> ChatCompletionRequest {
+    serde_json::from_value(json!({
+        "model": "Qwen/Qwen3-8B", "messages": [], "stream": true,
+        "separate_reasoning": separate_reasoning, "tool_choice": tool_choice,
+        "tools": [{"type": "function", "function": {"name": "lookup",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}}]
+    }))
+    .expect("a chat request")
+}
+
+/// The spec of [`forced_request`] as the gateway's JSON schema makes `table` read the response
+/// after `prompt`, for workers that do not say where they start a grammar.
+fn forced_spec(table: Table, tool_choice: &Value, prompt: &str) -> ChatResponseSpec {
+    spec_under_the_schema(
+        table,
+        &forced_request(tool_choice),
+        prompt,
+        GrammarStart::Unknown,
+    )
+}
+
+/// The spec of `request` as the gateway's JSON schema makes `table` read the response after
+/// `prompt`, for a model whose workers start a grammar at `start` together. The schema is the
+/// older registry's over the tools the request's choice calls, as request building passes it.
+fn spec_under_the_schema(
+    table: Table,
+    request: &ChatCompletionRequest,
+    prompt: &str,
+    start: GrammarStart,
+) -> ChatResponseSpec {
+    let declared = request.tools.as_deref().unwrap_or_default();
+    let choice = request.tool_choice.as_ref().expect("a choice");
+    let callable = choice
+        .narrow_tools(declared)
+        .unwrap_or_else(|| declared.to_vec());
+    let schema = ToolParserFactory::new()
+        .registry()
+        .generate_tool_constraint(None, &callable, choice, false)
+        .expect("a constraint")
+        .expect("the older registry's schema")
+        .to_tuple();
+    assert_eq!(schema.0, "json_schema", "{} reads", table.name());
+    let mut spec = ChatResponseSpec::from(request);
+    spec.symphony = assign_for(
+        Reading::Table(table.shared(), false),
+        Asks::Chat(request),
+        Some(&schema),
+        prompt,
+        ProviderProfile::for_model(&request.model),
+        || start,
+    );
+    assert!(spec.symphony.is_some(), "{} reads", table.name());
+    spec
+}
+
+/// `output` read whole under `spec` and ended with the engine's `finish_reason`: the choice.
+async fn forced_whole(spec: &ChatResponseSpec, output: &str, finish_reason: &str) -> ChatChoice {
+    whole_choice(spec, output, finish_reason, None).await
+}
+
+/// [`forced_whole`]; with `reasoning`, a spec without a table is read as the older arm reads it
+/// behind the reasoning parser of that name, the `json` parser named for the calls.
+async fn whole_choice(
+    spec: &ChatResponseSpec,
+    output: &str,
+    finish_reason: &str,
+    reasoning: Option<&str>,
+) -> ChatChoice {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let whole = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+        output_ids: output.chars().map(u32::from).collect(),
+        finish_reason: finish_reason.to_string(),
+        ..Default::default()
+    });
+    let mut decoder =
+        StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), false);
+    let (choice, _) = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::disabled(),
+    )
+    .process_single_choice(
+        "test-request",
+        &whole,
+        0,
+        spec,
+        "Qwen/Qwen3-8B",
+        &tokenizer,
+        &mut decoder,
+        0,
+        reasoning.is_some(),
+        reasoning.is_some(),
+        reasoning,
+        reasoning.map(|_| "json"),
+    )
+    .await
+    .expect("a choice");
+    choice
+}
+
+/// What `output` says under `spec`, streamed one character at a time and collected. A spec with
+/// no table is read by the older arm, behind the reasoning parser `older` names.
+async fn said_both_ways(
+    spec: &ChatResponseSpec,
+    output: &str,
+    older: Option<&str>,
+) -> (Said, Said) {
+    let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
+    frames.push(complete(0, "stop"));
+    let (result, events) = stream_events_by(
+        named_processor("json", older.unwrap_or("qwen3")),
+        Arc::new(CharacterTokenizer::default()),
+        frames,
+        spec.clone(),
+    )
+    .await;
+    assert!(result.is_ok(), "{output}: {result:?}");
+    let whole = whole_choice(spec, output, "stop", older).await;
+    (stream_said(&events), whole_said(&whole))
+}
+
+/// What a reader said of choice 0: the calls by name with their arguments as written, the
+/// reasoning, the content and the finish reason.
+type Said = (Vec<(String, String)>, String, String, String);
+
+/// What a stream said of choice 0.
+fn stream_said(events: &[Value]) -> Said {
+    (
+        streamed_calls(events),
+        chat_text(events, 0, "reasoning_content"),
+        chat_text(events, 0, "content"),
+        streamed_finish(events).to_string(),
+    )
+}
+
+/// What a collected choice said.
+fn whole_said(choice: &ChatChoice) -> Said {
+    let calls = choice
+        .message
+        .tool_calls
+        .iter()
+        .flatten()
+        .map(|call| {
+            (
+                call.function.name.clone(),
+                call.function.arguments.clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    (
+        calls,
+        choice.message.reasoning_content.clone().unwrap_or_default(),
+        choice.message.content.clone().unwrap_or_default(),
+        choice.finish_reason.clone().unwrap_or_default(),
+    )
+}
+
+/// What a stream said of choice 0's calls: each call's name and its arguments as the deltas
+/// spell them, by the call's index.
+fn streamed_calls(events: &[Value]) -> Vec<(String, String)> {
+    let mut calls: Vec<(String, String)> = Vec::new();
+    for delta in tool_call_deltas(events) {
+        let index = delta["index"].as_u64().expect("a call's index") as usize;
+        if calls.len() <= index {
+            calls.resize(index + 1, (String::new(), String::new()));
+        }
+        let function = &delta["function"];
+        calls[index]
+            .0
+            .push_str(function["name"].as_str().unwrap_or_default());
+        calls[index]
+            .1
+            .push_str(function["arguments"].as_str().unwrap_or_default());
+    }
+    calls
+}
+
+/// The finish reason of choice 0's stream.
+fn streamed_finish(events: &[Value]) -> &str {
+    events
+        .iter()
+        .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+        .expect("a finish chunk")
+}
+
+/// A call the gateway's JSON schema forces, on a prompt that opened the thought, streamed one
+/// character at a time and then collected: the thought is reasoning, and the JSON after its
+/// close is the call, the arguments alone for the function the request names and the list for a
+/// required call. The model's table reads both with its forced call; no legacy parser reads.
+#[tokio::test]
+async fn symphony_reads_the_thought_and_then_the_call_a_json_schema_forces() {
+    let schema = ("json_schema".to_string(), "{}".to_string());
+    for (tool_choice, output) in [
+        (
+            json!("required"),
+            r#"plan</think>[{"name":"lookup","parameters":{"q":"Paris"}}]"#,
+        ),
+        (
+            json!({"type": "function", "function": {"name": "lookup"}}),
+            r#"plan</think>{"q":"Paris"}"#,
+        ),
+    ] {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen3-8B", "messages": [], "stream": true,
+            "separate_reasoning": true, "tool_choice": tool_choice,
+            "tools": [{"type": "function", "function": {"name": "lookup",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}}]
+        }))
+        .expect("a chat request");
+        let spec = || {
+            let mut spec = ChatResponseSpec::from(&request);
+            spec.symphony = assign(
+                ParserChoice::Symphony,
+                &ModelNames::default(),
+                Asks::Chat(&request),
+                Some(&schema),
+                "<|im_start|>assistant\n<think>\n",
+                &Templates::new(Arc::new(TokenizerRegistry::new())),
+            )
+            .expect("no template named");
+            assert_eq!(
+                spec.symphony.as_ref().map(Assignment::table),
+                Some("qwen3"),
+                "the model's table reads the forced call"
+            );
+            spec
+        };
+        let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
+        frames.push(complete(0, "stop"));
+        let (result, events) = stream_events(frames, true, spec()).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
+        assert_eq!(chat_text(&events, 0, "content"), "");
+        let calls = tool_call_deltas(&events);
+        assert!(
+            calls
+                .iter()
+                .any(|call| call["function"]["name"] == "lookup"),
+            "{events:#?}"
+        );
+        let arguments: String = calls
+            .iter()
+            .filter_map(|call| call["function"]["arguments"].as_str())
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).expect("the arguments as JSON"),
+            json!({"q": "Paris"})
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["choices"][0]["finish_reason"] == "tool_calls"),
+            "{events:#?}"
+        );
+
+        // The same output collected: the message holds the thought and the one call.
+        let choice = forced_whole(&spec(), output, "stop").await;
+        assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
+        assert_eq!(choice.message.content.as_deref().unwrap_or_default(), "");
+        let calls = choice.message.tool_calls.as_ref().expect("tool calls");
+        assert_eq!(calls.len(), 1, "{calls:?}");
         assert_eq!(calls[0].function.name, "lookup");
         assert_eq!(
-            calls[0].function.arguments.as_deref(),
-            Some(arguments),
-            "{output:?}: {choice:?}"
+            serde_json::from_str::<Value>(
+                calls[0].function.arguments.as_deref().expect("arguments")
+            )
+            .expect("the arguments as JSON"),
+            json!({"q": "Paris"})
+        );
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+    }
+}
+
+/// A forced call the token limit cut keeps the bytes that arrived, and its stream ends with the
+/// engine's `length`, never `tool_calls`. What a required call's list still held at the cut is
+/// no content: behind a whole call the comma after an item and the next item cut before its
+/// arguments began, behind an item's whole arguments the rest of its object (the whitespace an
+/// indented list writes before the closing brace, a name written after the parameters). A list
+/// cut inside its first item made no call: the reader releases the output's own bytes from the
+/// bracket, as it releases any call block the table refused in an answer that made no call. A
+/// required call's item without parameters is a call with an empty object. The stream and the
+/// collected message agree on every call byte for byte.
+#[tokio::test]
+async fn a_forced_call_cut_short_or_without_parameters_reads_the_same_streamed_and_whole() {
+    let named = json!({"type": "function", "function": {"name": "lookup"}});
+    let required = json!("required");
+    for (tool_choice, output, engine_finish, arguments, content, finish) in [
+        // The limit cut the arguments of the function the request names.
+        (
+            &named,
+            r#"plan</think>{"q":"Par"#,
+            "length",
+            vec![r#"{"q":"Par"#],
+            "",
+            "length",
+        ),
+        // The limit cut a required call's list inside its second item.
+        (
+            &required,
+            r#"plan</think>[{"name":"lookup","parameters":{"q":"a"}},{"name":"lookup","parameters":{"q":"Par"#,
+            "length",
+            vec![r#"{"q":"a"}"#, r#"{"q":"Par"#],
+            "",
+            "length",
+        ),
+        // The limit cut a required call's list between two items: the comma is no content.
+        (
+            &required,
+            r#"plan</think>[{"name":"lookup","parameters":{"q":"a"}},"#,
+            "length",
+            vec![r#"{"q":"a"}"#],
+            "",
+            "length",
+        ),
+        // The limit cut the list's second item before its arguments began.
+        (
+            &required,
+            r#"plan</think>[{"name":"lookup","parameters":{"q":"a"}}, {"name":"loo"#,
+            "length",
+            vec![r#"{"q":"a"}"#],
+            "",
+            "length",
+        ),
+        // The limit cut an indented list behind an item's whole arguments, before the item's
+        // closing brace: the newline and the indent are no content, streamed or whole.
+        (
+            &required,
+            "plan</think>[\n  {\"name\":\"lookup\",\"parameters\":{\"q\":\"a\"}\n  ",
+            "length",
+            vec![r#"{"q":"a"}"#],
+            "",
+            "length",
+        ),
+        // The same cut behind a name written after the parameters.
+        (
+            &required,
+            r#"plan</think>[{"parameters":{"q":"a"},"name":"lookup""#,
+            "length",
+            vec![r#"{"q":"a"}"#],
+            "",
+            "length",
+        ),
+        // The limit cut the list's first item before its arguments began: no call was made,
+        // so the reader releases the output's own bytes from the bracket.
+        (
+            &required,
+            r#"plan</think>[{"name":"loo"#,
+            "length",
+            vec![],
+            r#"[{"name":"loo"#,
+            "length",
+        ),
+        // A required call's item without parameters.
+        (
+            &required,
+            r#"plan</think>[{"name":"lookup"}]"#,
+            "stop",
+            vec!["{}"],
+            "",
+            "tool_calls",
+        ),
+    ] {
+        let spec = forced_spec(
+            Table::Qwen3,
+            tool_choice,
+            "<|im_start|>assistant\n<think>\n",
+        );
+        let expected: Vec<(String, String)> = arguments
+            .iter()
+            .map(|arguments| ("lookup".to_string(), (*arguments).to_string()))
+            .collect();
+        let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
+        frames.push(complete(0, engine_finish));
+        let (result, events) = stream_events(frames, true, spec.clone()).await;
+        assert!(result.is_ok(), "{output}: {result:?}");
+        assert_eq!(streamed_calls(&events), expected, "{output}: {events:#?}");
+        assert_eq!(
+            chat_text(&events, 0, "reasoning_content"),
+            "plan",
+            "{output}"
+        );
+        assert_eq!(chat_text(&events, 0, "content"), content, "{output}");
+        assert_eq!(streamed_finish(&events), finish, "{output}");
+
+        let choice = forced_whole(&spec, output, engine_finish).await;
+        let whole: Vec<(String, String)> = choice
+            .message
+            .tool_calls
+            .iter()
+            .flatten()
+            .map(|call| {
+                (
+                    call.function.name.clone(),
+                    call.function.arguments.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(whole, expected, "{output}: {choice:?}");
+        assert_eq!(
+            choice.message.reasoning_content.as_deref(),
+            Some("plan"),
+            "{output}"
         );
         assert_eq!(
-            choice.message.content, None,
-            "nothing of the call is content: {output:?}: {choice:?}"
+            choice.message.content.as_deref().unwrap_or_default(),
+            content,
+            "{output}"
+        );
+        assert_eq!(choice.finish_reason.as_deref(), Some(finish), "{output}");
+    }
+}
+
+/// The stream of a call the JSON schema forces reads through a table as through the older arm:
+/// the same calls by name and by JSON value, no content and the same finish reason, at every
+/// split of the output into two frames, for the function the request names and for a required
+/// call's list. A list of two calls arrives whole through a table however the frames fall. The
+/// older arm reads the end of one call per frame, so it stands as the reference only where the
+/// first frame holds the whole first call; elsewhere it loses the second call, which the table
+/// keeps. Five tables stand for the registry here: `plain`, which reads no thought, and four
+/// that read one (`qwen3`, `inkling`, `kimi_k3`, `deepseek_v4`). The reader's own tests read
+/// every table at every cut against the older arm's whole answer
+/// (`every_table_reads_the_json_a_schema_forces_as_the_older_arm_does`).
+#[tokio::test]
+async fn a_forced_calls_stream_reads_through_a_table_as_through_the_older_arm_at_every_split() {
+    /// A stream's calls by name and JSON value, its content and its finish reason.
+    fn said(events: &[Value]) -> (Vec<(String, Value)>, String, String) {
+        let calls = streamed_calls(events)
+            .into_iter()
+            .map(|(name, arguments)| {
+                let arguments = serde_json::from_str(&arguments).expect("the arguments as JSON");
+                (name, arguments)
+            })
+            .collect();
+        (
+            calls,
+            chat_text(events, 0, "content"),
+            streamed_finish(events).to_string(),
+        )
+    }
+    let named = json!({"type": "function", "function": {"name": "lookup"}});
+    let required = json!("required");
+    let two_calls =
+        r#"[{"name":"lookup","parameters":{"q":1}},{"name":"lookup","parameters":{"q":"b"}}]"#;
+    // Where the list's first call ends: the older arm reads both calls from this split on.
+    let first_call = two_calls.find("},{").expect("two calls") + 1;
+    for (tool_choice, output, older_from, calls) in [
+        (
+            &required,
+            r#"[{"name":"lookup","parameters":{"q":1}}]"#,
+            1,
+            vec![json!({"q": 1})],
+        ),
+        (
+            &required,
+            two_calls,
+            first_call,
+            vec![json!({"q": 1}), json!({"q": "b"})],
+        ),
+        (
+            &named,
+            r#"{"q":"P","n":[1,{"d":null}]}"#,
+            1,
+            vec![json!({"q": "P", "n": [1, {"d": null}]})],
+        ),
+    ] {
+        let expected = (
+            calls
+                .into_iter()
+                .map(|arguments| ("lookup".to_string(), arguments))
+                .collect::<Vec<_>>(),
+            String::new(),
+            "tool_calls".to_string(),
+        );
+        for split in output.char_indices().map(|(at, _)| at).skip(1) {
+            let frames = || {
+                vec![
+                    chunk(0, &output[..split]),
+                    chunk(0, &output[split..]),
+                    complete(0, "stop"),
+                ]
+            };
+            if split >= older_from {
+                // The older arm: the same request with no table assigned.
+                let older = ChatResponseSpec::from(&forced_request(tool_choice));
+                let (result, events) = stream_events(frames(), true, older).await;
+                assert!(result.is_ok(), "split {split}: {result:?}");
+                assert_eq!(
+                    said(&events),
+                    expected,
+                    "the older arm, split {split}: {events:#?}"
+                );
+            }
+            for table in [
+                Table::Plain,
+                Table::Qwen3,
+                Table::Inkling,
+                Table::KimiK3,
+                Table::DeepSeekV4,
+            ] {
+                let spec = forced_spec(table, tool_choice, "");
+                let (result, events) = stream_events(frames(), true, spec).await;
+                let case = format!("{} split {split}", table.name());
+                assert!(result.is_ok(), "{case}: {result:?}");
+                assert_eq!(said(&events), expected, "{case}: {events:#?}");
+            }
+        }
+    }
+}
+
+/// A Messages request whose `tool_choice` names a tool takes the same JSON schema, and the
+/// model's table reads its response the same way: the thought is a thinking block and the JSON
+/// after its close is the tool's input, with the stop reason of a tool use.
+#[tokio::test]
+async fn a_message_reads_the_thought_and_then_the_tool_a_json_schema_forces() {
+    let request: CreateMessageRequest = serde_json::from_value(json!({
+        "model": "Qwen/Qwen3-8B", "max_tokens": 64, "messages": [],
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "tool_choice": {"type": "tool", "name": "lookup"},
+        "tools": [{"name": "lookup", "input_schema": {
+            "type": "object", "properties": {"q": {"type": "string"}}}}]
+    }))
+    .expect("a Messages request");
+    let schema = ("json_schema".to_string(), "{}".to_string());
+    let mut spec = MessagesResponseSpec::from(&request);
+    spec.symphony = assign_for(
+        Reading::Table(Table::Qwen3.shared(), false),
+        Asks::for_messages(&request, false),
+        Some(&schema),
+        "<|im_start|>assistant\n<think>\n",
+        ProviderProfile::for_model(&request.model),
+        || GrammarStart::Unknown,
+    );
+    assert_eq!(
+        spec.symphony
+            .as_ref()
+            .and_then(|assignment| assignment.forcing.as_deref()),
+        Some("lookup"),
+        "the table reads the forced tool"
+    );
+    let output = r#"plan</think>{"q":"Paris"}"#;
+    let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
+    frames.push(complete(0, "stop"));
+    let (result, events) = message_events(frames, spec, None).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        message_blocks(&events),
+        vec![
+            ("thinking".to_string(), String::new(), json!("plan")),
+            (
+                "tool_use".to_string(),
+                "lookup".to_string(),
+                json!({"q": "Paris"})
+            ),
+        ]
+    );
+    assert_eq!(message_stop_reason(&events), "tool_use");
+}
+
+/// A message whose `tool_choice` asks for any tool reads the list the JSON schema forces, and
+/// what that list still held when the token limit cut it (the comma after a tool, the next
+/// tool cut before its input began, a tool's name written after its input) opens no text block
+/// beside the tool's: the message is the thought and the tool, and its stop reason the limit's.
+#[tokio::test]
+async fn a_message_whose_required_tools_the_token_limit_cut_has_no_text_block() {
+    let request: CreateMessageRequest = serde_json::from_value(json!({
+        "model": "Qwen/Qwen3-8B", "max_tokens": 64, "messages": [],
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "tool_choice": {"type": "any"},
+        "tools": [{"name": "lookup", "input_schema": {
+            "type": "object", "properties": {"q": {"type": "string"}}}}]
+    }))
+    .expect("a Messages request");
+    let schema = ("json_schema".to_string(), "{}".to_string());
+    for output in [
+        r#"plan</think>[{"name":"lookup","parameters":{"q":"Paris"}},"#,
+        r#"plan</think>[{"name":"lookup","parameters":{"q":"Paris"}}, {"name":"loo"#,
+        r#"plan</think>[{"parameters":{"q":"Paris"},"name":"lookup""#,
+    ] {
+        let mut spec = MessagesResponseSpec::from(&request);
+        spec.symphony = assign_for(
+            Reading::Table(Table::Qwen3.shared(), false),
+            Asks::for_messages(&request, false),
+            Some(&schema),
+            "<|im_start|>assistant\n<think>\n",
+            ProviderProfile::for_model(&request.model),
+            || GrammarStart::Unknown,
         );
         assert_eq!(
-            choice.finish_reason.as_deref(),
-            Some("length"),
-            "{output:?}"
+            spec.symphony.as_ref().map(Assignment::table),
+            Some("qwen3"),
+            "the model's table reads the required tools"
         );
+        let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
+        frames.push(complete(0, "length"));
+        let (result, events) = message_events(frames, spec, None).await;
+        assert!(result.is_ok(), "{output}: {result:?}");
+        assert_eq!(
+            message_blocks(&events),
+            vec![
+                ("thinking".to_string(), String::new(), json!("plan")),
+                (
+                    "tool_use".to_string(),
+                    "lookup".to_string(),
+                    json!({"q": "Paris"})
+                ),
+            ],
+            "{output}"
+        );
+        // Which of the limit's two reasons it is reads the budget against the window: the
+        // truncation cases' subject.
+        let stop = message_stop_reason(&events);
+        assert!(
+            stop == "max_tokens" || stop == "model_context_window_exceeded",
+            "{output}: {stop}"
+        );
+    }
+}
+
+/// Two calls a required choice forces arrive when one frame ends the first call and holds the
+/// second: the frame shape at which the older arm's stream delivered the first call alone. The
+/// reader is the one the gateway's own assignment gives the request, so the case is red where
+/// the assignment leaves the response to the older arm.
+#[tokio::test]
+async fn a_frame_that_ends_one_forced_call_and_holds_the_next_delivers_both() {
+    let request = forced_request(&json!("required"));
+    let schema = ("json_schema".to_string(), "{}".to_string());
+    let mut spec = ChatResponseSpec::from(&request);
+    spec.symphony = assign_for(
+        Reading::Table(Table::Qwen3.shared(), false),
+        Asks::Chat(&request),
+        Some(&schema),
+        "",
+        ProviderProfile::for_model(&request.model),
+        || GrammarStart::Unknown,
+    );
+    let frames = vec![
+        chunk(0, r#"[{"name":"lookup","parameters":{"q":"a"#),
+        chunk(0, r#""}},{"name":"lookup","parameters":{"q":"b"}}]"#),
+        complete(0, "stop"),
+    ];
+    let (result, events) = stream_events(frames, true, spec).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        streamed_calls(&events),
+        [
+            ("lookup".to_string(), r#"{"q":"a"}"#.to_string()),
+            ("lookup".to_string(), r#"{"q":"b"}"#.to_string()),
+        ],
+        "{events:#?}"
+    );
+    assert_eq!(chat_text(&events, 0, "content"), "");
+    assert_eq!(streamed_finish(&events), "tool_calls");
+}
+
+/// One reading: the calls by their arguments as written (each a call of `lookup`), the reasoning,
+/// the content and the finish reason.
+fn said(calls: &[&str], reasoning: &str, content: &str, finish: &str) -> Said {
+    (
+        calls
+            .iter()
+            .map(|arguments| ("lookup".to_string(), (*arguments).to_string()))
+            .collect(),
+        reasoning.to_string(),
+        content.to_string(),
+        finish.to_string(),
+    )
+}
+
+/// A forced call under the gateway's JSON schema after a prompt that opened the thought, cell by
+/// cell: where the model's workers start a grammar (at the first token, once the thought is
+/// over, without saying, at both places), the reasoning separated or kept in the content, the
+/// JSON alone or after the thought and its close, the function named or a call required, each
+/// streamed one character at a time and collected. The reader starts where the grammar starts:
+///
+/// - at the first token the schema holds the output before the model writes anything, so the
+///   reader starts in the call and the JSON alone is the call;
+/// - once the thought is over the thought comes first, so the prompt's replay stands: the
+///   thought is reasoning, or content where the request keeps it there, and the JSON after its
+///   close is the call;
+/// - workers that do not say, or that start at both places, leave the shape to the output, and
+///   its first bytes say which: the JSON's opener and then a byte the JSON writes after it make
+///   the output the call from the opener, and any other output is read where the prompt's
+///   replay leaves the reader.
+///
+/// An output the workers' start cannot produce reads as that start reads it: the thought first
+/// where the reader starts in the call is the call's bytes or, for a list, content, and the JSON
+/// alone where the replay stands is the thought's text. Workers that do not say produce either
+/// shape, and both read as the call with the thought where the request asks for it. The older
+/// arm reads the same whatever the workers say, here behind the `qwen3` reasoning parser; its
+/// stream and its collected answer disagree where the thought is kept in the content and
+/// written first.
+#[tokio::test]
+async fn a_forced_calls_reader_starts_where_the_workers_start_a_grammar() {
+    const OPENED: &str = "<|im_start|>assistant\n<think>\n";
+    let named = json!({"type": "function", "function": {"name": "lookup"}});
+    let required = json!("required");
+    let arguments = r#"{"q":"Paris"}"#;
+    let list = r#"[{"name":"lookup","parameters":{"q":"Paris"}}]"#;
+    let call = said(&[arguments], "", "", "tool_calls");
+    for (tool_choice, json_alone) in [(&named, arguments), (&required, list)] {
+        let by_name = tool_choice.is_object();
+        let thought_first = format!("plan</think>{json_alone}");
+        let thought_first = thought_first.as_str();
+        for separated in [true, false] {
+            let request = forced_request_keeping(tool_choice, separated);
+            for output in [json_alone, thought_first] {
+                let alone = output == json_alone;
+                let case = format!("separated {separated}, {output}");
+                // The older arm: no table assigned, the open thought recorded on the spec.
+                let mut older = ChatResponseSpec::from(&request);
+                older.reasoning_in_prefill = true;
+                let expected = match (separated, alone) {
+                    (true, true) => {
+                        let thought = said(&[], json_alone, "", "stop");
+                        (thought.clone(), thought)
+                    }
+                    (true, false) => {
+                        let read = said(&[arguments], "plan", "", "tool_calls");
+                        (read.clone(), read)
+                    }
+                    (false, true) => (call.clone(), call.clone()),
+                    // Its stream reads the thought into a named call's arguments and as content
+                    // ahead of a required call; its collected answer is content and no call.
+                    (false, false) => (
+                        if by_name {
+                            said(&[thought_first], "", "", "tool_calls")
+                        } else {
+                            said(&[arguments], "", "plan</think>", "tool_calls")
+                        },
+                        said(&[], "", thought_first, "stop"),
+                    ),
+                };
+                assert_eq!(
+                    said_both_ways(&older, output, Some("qwen3")).await,
+                    expected,
+                    "the older arm, {case}"
+                );
+                for start in [
+                    GrammarStart::FirstToken,
+                    GrammarStart::AfterReasoning,
+                    GrammarStart::Unknown,
+                    GrammarStart::Either,
+                ] {
+                    // In the call, after the prompt's replay, or where the output's first bytes
+                    // say: in the call for the JSON alone, after the replay for the thought.
+                    let in_the_call = match start {
+                        GrammarStart::FirstToken => true,
+                        GrammarStart::AfterReasoning => false,
+                        GrammarStart::Unknown | GrammarStart::Either => alone,
+                    };
+                    let expected = match (in_the_call, alone) {
+                        (true, true) => call.clone(),
+                        (true, false) if by_name => said(&[thought_first], "", "", "tool_calls"),
+                        (true, false) => said(&[], "", thought_first, "stop"),
+                        (false, false) if separated => said(&[arguments], "plan", "", "tool_calls"),
+                        (false, false) => said(&[arguments], "", "plan", "tool_calls"),
+                        (false, true) if separated => said(&[], json_alone, "", "stop"),
+                        (false, true) => said(&[], "", json_alone, "stop"),
+                    };
+                    let table = spec_under_the_schema(Table::Qwen3, &request, OPENED, start);
+                    assert_eq!(
+                        said_both_ways(&table, output, None).await,
+                        (expected.clone(), expected),
+                        "{start:?}, {case}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The one place a thinking table of the registry has no tag for a forced call: the prompt's
+/// thought open, on workers that start a grammar at the first token. Where no tool-call parser
+/// is named the call takes the JSON schema there and the output is the JSON alone: the table
+/// reads the call, streamed and collected, the reasoning separated or kept in the content. The
+/// older arm, behind the reasoning parser that answers to the table's name, reads a separated
+/// request's stream as the thought and no call, and its collected answer as the call.
+#[tokio::test]
+async fn a_forced_call_the_schema_holds_from_the_first_token_is_the_call_on_a_thinking_table() {
+    const THINKING: &str = "<|message_model|><|content_thinking|>";
+    let named = json!({"type": "function", "function": {"name": "lookup"}});
+    let output = r#"{"q":"Paris"}"#;
+    let call = said(&[output], "", "", "tool_calls");
+    for separated in [true, false] {
+        let request = forced_request_keeping(&named, separated);
+        let table =
+            spec_under_the_schema(Table::Inkling, &request, THINKING, GrammarStart::FirstToken);
+        assert_eq!(
+            said_both_ways(&table, output, None).await,
+            (call.clone(), call.clone()),
+            "separated {separated}"
+        );
+        let mut older = ChatResponseSpec::from(&request);
+        older.reasoning_in_prefill = true;
+        let streamed = if separated {
+            said(&[], output, "", "stop")
+        } else {
+            call.clone()
+        };
+        assert_eq!(
+            said_both_ways(&older, output, Some("inkling")).await,
+            (streamed, call.clone()),
+            "the older arm, separated {separated}"
+        );
+    }
+}
+
+/// The output's first bytes decide on a table whose unopened turn starts inside the thought
+/// too: after a prompt that opened the thought and after one with no turn opener, the JSON alone
+/// is the call, with nothing of the prompt replayed, and the thought first is read where the
+/// replay leaves the reader, its text in the content as the request keeps it there. The workers
+/// do not say where they start a grammar.
+#[tokio::test]
+async fn a_forced_calls_first_bytes_decide_on_a_table_with_an_unopened_turn() {
+    let named = json!({"type": "function", "function": {"name": "lookup"}});
+    let request = forced_request_keeping(&named, false);
+    let output = r#"{"q":"Paris"}"#;
+    let call = said(&[output], "", "", "tool_calls");
+    let thought_first = format!("plan</think>{output}");
+    let thought_then_call = said(&[output], "", "plan", "tool_calls");
+    for prompt in ["<｜User｜>hi<｜Assistant｜><think>", "<｜User｜>hi"] {
+        let spec =
+            spec_under_the_schema(Table::DeepSeekV4, &request, prompt, GrammarStart::Unknown);
+        assert_eq!(
+            said_both_ways(&spec, output, None).await,
+            (call.clone(), call.clone()),
+            "{prompt}"
+        );
+        assert_eq!(
+            said_both_ways(&spec, &thought_first, None).await,
+            (thought_then_call.clone(), thought_then_call.clone()),
+            "{prompt}, the thought first"
+        );
+    }
+}
+
+/// A thought that begins with the forced JSON's own opener, on workers that do not say or that
+/// start at both places: the byte after the opener is none the JSON writes there, so the output
+/// is read where the prompt's replay leaves the reader: the thought, as reasoning or kept in the
+/// content, and then the call, streamed one character at a time and collected. A table whose own
+/// markers begin with the bracket closes an empty thought ahead of a required call's list with
+/// that byte, and the list is the call there too.
+#[tokio::test]
+async fn a_thought_that_begins_with_the_forced_jsons_opener_is_the_thought_and_then_the_call() {
+    const OPENED: &str = "<|im_start|>assistant\n<think>\n";
+    let named = json!({"type": "function", "function": {"name": "lookup"}});
+    let required = json!("required");
+    let arguments = r#"{"q":"Paris"}"#;
+    let list = r#"[{"name":"lookup","parameters":{"q":"Paris"}}]"#;
+    for (tool_choice, json_alone, thought) in [
+        (&named, arguments, "{ plan"),
+        (&named, arguments, "{thinking} plan"),
+        (&required, list, "[ plan"),
+        (&required, list, "[analysis] plan"),
+    ] {
+        let output = format!("{thought}</think>{json_alone}");
+        for separated in [true, false] {
+            let request = forced_request_keeping(tool_choice, separated);
+            let expected = if separated {
+                said(&[arguments], thought, "", "tool_calls")
+            } else {
+                said(&[arguments], "", thought, "tool_calls")
+            };
+            for start in [GrammarStart::Unknown, GrammarStart::Either] {
+                let table = spec_under_the_schema(Table::Qwen3, &request, OPENED, start);
+                assert_eq!(
+                    said_both_ways(&table, &output, None).await,
+                    (expected.clone(), expected.clone()),
+                    "{start:?}, separated {separated}, {output}"
+                );
+            }
+        }
+    }
+    // The close of an empty thought begins with the list's own opener.
+    let closed_at_once = format!("[/THINK]{list}");
+    let call = said(&[arguments], "", "", "tool_calls");
+    for separated in [true, false] {
+        let request = forced_request_keeping(&required, separated);
+        for start in [GrammarStart::Unknown, GrammarStart::Either] {
+            let table = spec_under_the_schema(Table::MistralV13, &request, "[/INST][THINK]", start);
+            assert_eq!(
+                said_both_ways(&table, &closed_at_once, None).await,
+                (call.clone(), call.clone()),
+                "{start:?}, separated {separated}, {closed_at_once}"
+            );
+        }
+    }
+}
+
+/// Whitespace is the forced JSON's until a byte says otherwise, on workers that do not say or
+/// that start at both places: a run of it that fills the output's 64 deciding bytes, ahead of
+/// the opener or behind it, starts the reader in the call, so the JSON behind it is the call,
+/// streamed one character at a time and collected. One byte short of them the next byte still
+/// decides, and a thought there is the thought and then the call. A thought behind a run that
+/// fills them is the stated limit: it reads as workers that hold the output to the schema from
+/// the first token read it, and so does the run alone, to the output's end.
+#[tokio::test]
+async fn whitespace_that_fills_a_forced_calls_deciding_bytes_is_the_calls() {
+    const OPENED: &str = "<|im_start|>assistant\n<think>\n";
+    const DECIDING_BYTES: usize = 64;
+    let named = json!({"type": "function", "function": {"name": "lookup"}});
+    let required = json!("required");
+    let arguments = r#"{"q":"Paris"}"#;
+    let list = r#"[{"name":"lookup","parameters":{"q":"Paris"}}]"#;
+    let filled = " ".repeat(DECIDING_BYTES);
+    let short = &filled[1..];
+    // Behind the opener, itself the first of the deciding bytes.
+    let (opened_filled, opened_short) = (&filled[1..], &filled[2..]);
+    for (tool_choice, json_alone) in [(&named, arguments), (&required, list)] {
+        let (opener, rest) = json_alone.split_at(1);
+        let thought_first = format!("plan</think>{json_alone}");
+        for separated in [true, false] {
+            let request = forced_request_keeping(tool_choice, separated);
+            let known = |start| spec_under_the_schema(Table::Qwen3, &request, OPENED, start);
+            let (in_the_call, after_the_replay) = (
+                known(GrammarStart::FirstToken),
+                known(GrammarStart::AfterReasoning),
+            );
+            for (output, reads_as, the_call) in [
+                (format!("{filled}{json_alone}"), &in_the_call, true),
+                (format!("{short}{json_alone}"), &in_the_call, true),
+                (format!("{opener}{opened_filled}{rest}"), &in_the_call, true),
+                (format!("{short}{thought_first}"), &after_the_replay, true),
+                (
+                    format!("{opener}{opened_short}{thought_first}"),
+                    &after_the_replay,
+                    true,
+                ),
+                // The stated limit.
+                (format!("{filled}{thought_first}"), &in_the_call, false),
+                (
+                    format!("{opener}{opened_filled}{thought_first}"),
+                    &in_the_call,
+                    false,
+                ),
+            ] {
+                let expected = said_both_ways(reads_as, &output, None).await;
+                let whole_call = |said: &Said| {
+                    matches!(said.0.as_slice(), [(name, written)] if name == "lookup"
+                        && serde_json::from_str::<Value>(written).ok()
+                            == Some(json!({"q": "Paris"})))
+                };
+                assert_eq!(
+                    (whole_call(&expected.0), whole_call(&expected.1)),
+                    (the_call, the_call),
+                    "{output:?}: {expected:?}"
+                );
+                for start in [GrammarStart::Unknown, GrammarStart::Either] {
+                    let table = spec_under_the_schema(Table::Qwen3, &request, OPENED, start);
+                    assert_eq!(
+                        said_both_ways(&table, &output, None).await,
+                        expected,
+                        "{start:?}, separated {separated}, {output:?}"
+                    );
+                }
+            }
+            // The run alone, to the output's end: a call cut short, as on first-token workers.
+            let run = format!("{opener}{}", " ".repeat(4 * DECIDING_BYTES));
+            let table =
+                spec_under_the_schema(Table::Qwen3, &request, OPENED, GrammarStart::Unknown);
+            assert_eq!(
+                said_both_ways(&table, &run, None).await,
+                said_both_ways(&in_the_call, &run, None).await,
+                "separated {separated}, the run alone"
+            );
+        }
+    }
+}
+
+/// A named function whose arguments the schema does not hold to an object, on workers that do
+/// not say or that start at both places, with the reasoning kept in the content and the prompt's
+/// thought open: the JSON alone is the call whatever byte it opens with, as the older arm reads
+/// it, streamed one character at a time and collected. No opener is named for it: read after
+/// the prompt's replay, a string, a number or a list alone would be content and no call.
+#[tokio::test]
+async fn a_named_call_not_held_to_an_object_is_the_call_where_the_thought_is_kept() {
+    const OPENED: &str = "<|im_assistant|>assistant<|im_middle|><think>";
+    for (parameters, arguments) in [
+        (json!({"type": "string"}), json!("Paris")),
+        (json!({"type": "integer"}), json!(7)),
+        (
+            json!({"type": "array", "items": {"type": "string"}}),
+            json!(["Paris"]),
+        ),
+        (json!({}), json!(null)),
+        (json!({}), json!({"city": "Paris"})),
+    ] {
+        let written = arguments.to_string();
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen3-8B", "messages": [], "stream": true,
+            "separate_reasoning": false,
+            "tool_choice": {"type": "function", "function": {"name": "look up"}},
+            "tools": [{"type": "function",
+                "function": {"name": "look up", "parameters": parameters}}]
+        }))
+        .expect("a chat request");
+        let call: Said = (
+            vec![("look up".to_string(), written.clone())],
+            String::new(),
+            String::new(),
+            "tool_calls".to_string(),
+        );
+        let mut older = ChatResponseSpec::from(&request);
+        older.reasoning_in_prefill = true;
+        assert_eq!(
+            said_both_ways(&older, &written, Some("kimi_k25")).await,
+            (call.clone(), call.clone()),
+            "the older arm, {written}"
+        );
+        for start in [GrammarStart::Unknown, GrammarStart::Either] {
+            let spec = spec_under_the_schema(Table::KimiK2, &request, OPENED, start);
+            assert_eq!(
+                said_both_ways(&spec, &written, None).await,
+                (call.clone(), call.clone()),
+                "{start:?}, {written}"
+            );
+        }
+    }
+}
+
+/// The rows of workers that do not say, and of a pool of both kinds, for the tools a table's
+/// syntax writes and for the ones it cannot write, where a forced call takes the gateway's JSON
+/// schema on that table: a tool with no name; on `kimi_k2` a name with a space, a newline, or a
+/// quote and a bracket; on `muse_spark` a name or a required key with a quote and a bracket, and
+/// an empty required key. After the prompt's tail, the JSON alone is the call, and the thought
+/// first is the thought, as reasoning or kept in the content, and then the call: the function
+/// named and a call required, streamed one character at a time and collected.
+#[tokio::test]
+async fn a_forced_call_on_workers_that_do_not_say_reads_the_call_for_every_tool_shape() {
+    // A table, the prompt's tail, and the thought as the model writes it up to the JSON.
+    const QWEN: (&str, &str, &str) = ("qwen3", "<|im_start|>assistant\n<think>\n", "plan</think>");
+    const KIMI: (&str, &str, &str) = (
+        "kimi_k2",
+        "<|im_assistant|>assistant<|im_middle|><think>",
+        "plan</think>",
+    );
+    const MUSE: (&str, &str, &str) = (
+        "muse_spark",
+        "<|start|>assistant",
+        " to=self<|message|>plan<|eom|>",
+    );
+    let city = json!({"type": "object", "properties": {"city": {"type": "string"}}});
+    let keyed = |key: &str| json!({"type": "object", "properties": {key: {"type": "string"}}, "required": [key]});
+    let paris = json!({"city": "Paris"});
+    // The tool's name, its parameters, and the arguments the model writes.
+    let shapes = [
+        (QWEN, "lookup", city.clone(), paris.clone()),
+        (QWEN, "", city.clone(), paris.clone()),
+        (KIMI, "lookup", city.clone(), paris.clone()),
+        (KIMI, "look up", city.clone(), paris.clone()),
+        (KIMI, "look\nup", city.clone(), paris.clone()),
+        (KIMI, "look\"up<", city.clone(), paris.clone()),
+        (MUSE, "lookup", city.clone(), paris.clone()),
+        (MUSE, "look\"up<", city.clone(), paris.clone()),
+        (
+            MUSE,
+            "lookup",
+            keyed("ci\"ty<"),
+            json!({"ci\"ty<": "Paris"}),
+        ),
+        (MUSE, "lookup", keyed(""), json!({"": "Paris"})),
+    ];
+    for ((table, prompt, thought), name, parameters, arguments) in &shapes {
+        let table = Table::ALL
+            .into_iter()
+            .find(|listed| listed.name() == *table)
+            .expect("a table of the registry");
+        let written = arguments.to_string();
+        // One call of the tool with the arguments as written, after `reasoning` and `content`.
+        let call = |reasoning: &str, content: &str| -> Said {
+            (
+                vec![((*name).to_string(), written.clone())],
+                reasoning.to_string(),
+                content.to_string(),
+                "tool_calls".to_string(),
+            )
+        };
+        for by_name in [true, false] {
+            let (tool_choice, json_alone) = if by_name {
+                (
+                    json!({"type": "function", "function": {"name": name}}),
+                    written.clone(),
+                )
+            } else {
+                (
+                    json!("required"),
+                    json!([{"name": name, "parameters": arguments}]).to_string(),
+                )
+            };
+            let thought_first = format!("{thought}{json_alone}");
+            for separated in [true, false] {
+                let request: ChatCompletionRequest = serde_json::from_value(json!({
+                    "model": "Qwen/Qwen3-8B", "messages": [], "stream": true,
+                    "separate_reasoning": separated, "tool_choice": tool_choice,
+                    "tools": [{"type": "function",
+                        "function": {"name": name, "parameters": parameters}}]
+                }))
+                .expect("a chat request");
+                let after_the_thought = if separated {
+                    call("plan", "")
+                } else {
+                    call("", "plan")
+                };
+                for start in [GrammarStart::Unknown, GrammarStart::Either] {
+                    let case = format!(
+                        "{}, {name:?}, named {by_name}, separated {separated}, {start:?}",
+                        table.name()
+                    );
+                    let spec = spec_under_the_schema(table, &request, prompt, start);
+                    assert_eq!(
+                        said_both_ways(&spec, &json_alone, None).await,
+                        (call("", ""), call("", "")),
+                        "{case}: the JSON alone"
+                    );
+                    assert_eq!(
+                        said_both_ways(&spec, &thought_first, None).await,
+                        (after_the_thought.clone(), after_the_thought.clone()),
+                        "{case}: the thought first"
+                    );
+                }
+            }
+        }
     }
 }

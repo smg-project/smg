@@ -5,7 +5,8 @@ use serde_json::Value;
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{
-        MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
+        kimi_k25::MEDIA_PAD_TOKEN, layouts::grid_thws_patch_fields, MediaPartOrder, ModelMetadata,
+        ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{processors::KimiK3Processor, PreProcessorConfig, VisionPreProcessor},
@@ -33,12 +34,7 @@ pub(super) struct KimiK3VisionSpec;
 impl KimiK3VisionSpec {
     /// The repeated pad token (`<|media_pad|>`) — `media_placeholder_token_id` in config.
     fn pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        metadata
-            .config_u32(&["media_placeholder_token_id"])
-            .map(|v| v as TokenId)
-            .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "media_placeholder_token_id".to_string(),
-            })
+        metadata.config_token_id("media_placeholder_token_id")
     }
 }
 
@@ -52,7 +48,7 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
         id.contains("kimi") && id.contains("k3")
             || metadata
                 .config_model_type()
-                .is_some_and(|mt| mt == "kimi_k3")
+                .is_some_and(|mt| mt == "kimi_k3" || mt == "kimi_k31")
     }
 
     /// The reference renders content parts positionally, so a string
@@ -65,18 +61,24 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
-        Ok("<|media_pad|>".to_string())
+        Ok(MEDIA_PAD_TOKEN.to_string())
     }
 
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {
         Self::pad_token_id(metadata)
     }
 
+    /// The family has no per-request image count of its own: neither the
+    /// checkpoint nor its reference serving stack bounds one, the context
+    /// length does. Images stay declared (an undeclared modality is refused
+    /// as unsupported) without a bound of the spec's, so the effective limit
+    /// is the engine's advertised one, else the deployment's
+    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`.
     fn modality_limits(
         &self,
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
-        Ok(HashMap::from([(Modality::Image, 10)]))
+        Ok(HashMap::from([(Modality::Image, usize::MAX)]))
     }
 
     fn vision_processor(
@@ -141,14 +143,7 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
         // MoonViT patchification, same transport layout as K2.5:
         // encoder_input is [total_patches, patch_features], split by patches_per_image.
         // grid_thws is [num_images, 3] with (temporal, height, width) grid dimensions.
-        HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("patches_per_image"),
-            ),
-            ("grid_thws".to_string(), FieldLayout::Batched),
-            ("patches_per_image".to_string(), FieldLayout::Batched),
-        ])
+        grid_thws_patch_fields()
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {
@@ -235,6 +230,24 @@ mod tests {
             registry.lookup(&metadata_by_type).expect("k3 spec").name(),
             "kimi_k3"
         );
+
+        // Kimi-K3.1 ships the K3 vision processor: by its id and by its model_type.
+        let k31_config = json!({
+            "model_type": "kimi_k31",
+            "media_placeholder_token_id": MEDIA_PAD_ID,
+        });
+        for model_id in ["moonshotai/Kimi-K3.1-Pro", "internal/checkpoint-final"] {
+            let metadata = ModelMetadata {
+                model_id,
+                tokenizer: &tokenizer,
+                config: &k31_config,
+            };
+            assert_eq!(
+                registry.lookup(&metadata).expect("k3.1 spec").name(),
+                "kimi_k3",
+                "{model_id}"
+            );
+        }
     }
 
     #[test]
@@ -284,6 +297,55 @@ mod tests {
             super::KimiK3VisionSpec.media_part_order(),
             MediaPartOrder::Authored
         );
+    }
+
+    /// The family bounds its images by context, not by count: the spec
+    /// declares the modality without a limit of its own (the ten copied from
+    /// the K2.5 spec refused an eleventh image as "the model spec"), so a
+    /// deployment knob is the only router-side bound and the other
+    /// modalities stay unsupported.
+    #[test]
+    fn kimi_k3_declares_images_without_a_count_of_its_own() {
+        use std::collections::HashMap;
+
+        use crate::registry::{ModelProcessorSpec, ModelRegistryError};
+
+        let tokenizer = k3_tokenizer();
+        let config = k3_config();
+        let metadata = ModelMetadata {
+            model_id: "moonshotai/Kimi-K3",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = super::KimiK3VisionSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([(Modality::Image, usize::MAX)])
+        );
+        for count in [11, 1_000] {
+            spec.validate_media_request(&metadata, &[(Modality::Image, count)])
+                .unwrap_or_else(|error| panic!("{count} images: {error}"));
+        }
+        // A deployment's own cap (the flag, else the environment override)
+        // still binds.
+        let capped = HashMap::from([(Modality::Image, 10)]);
+        assert_eq!(
+            spec.validate_media_request_with_limits(&metadata, &[(Modality::Image, 11)], &capped),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "kimi_k3",
+                modality: Modality::Image,
+                limit: 10,
+                requested: 11,
+            })
+        );
+        assert!(matches!(
+            spec.validate_media_request(&metadata, &[(Modality::Video, 1)]),
+            Err(ModelRegistryError::UnsupportedModality {
+                modality: Modality::Video,
+                ..
+            })
+        ));
     }
 
     #[test]

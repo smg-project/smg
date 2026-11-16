@@ -117,6 +117,7 @@ def load_model(args):
                 # TOKENIZER_GLOBS selection.
                 "tiktoken.model",
                 "*.tiktoken",
+                "tekken.json",
             ],
         )
 

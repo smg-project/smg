@@ -1,8 +1,8 @@
-// SGLang's tokenized generate request — the scheduler's own
-// `TokenizedGenerateReqInput` from `io_struct.py`, a tagged
-// `msgspec.Struct(array_like=True)`: on the wire a positional msgpack array
-// with the class-name tag string as element 0. **Field order is the wire
-// contract** — do not reorder.
+//! SGLang's tokenized generate request — the scheduler's own
+//! `TokenizedGenerateReqInput` from `io_struct.py`, a tagged
+//! `msgspec.Struct(array_like=True)`: on the wire a positional msgpack array
+//! with the class-name tag string as element 0. **Field order is the wire
+//! contract** — do not reorder.
 
 use std::collections::BTreeMap;
 
@@ -143,9 +143,10 @@ impl SglangRequestType {
 /// `return_logprob`, `logprob_start_len`, `top_logprobs_num`,
 /// `token_ids_logprob`, `stream`, then the 19 defaulted fields up to
 /// `require_reasoning`, of which this side fills `return_hidden_states`, the
-/// LoRA id, the logit processor, the prefill/decode bootstrap triple and the
-/// routed data-parallel rank (the session and routing-key slots stay at the
-/// scheduler's defaults), so that flag lands in its slot. The encoder emits
+/// LoRA id, the logit processor, the prefill/decode bootstrap triple, the
+/// routed data-parallel rank and the prefill rank a request names (the
+/// session and routing-key slots stay at the scheduler's defaults), so that
+/// flag lands in its slot. The encoder emits
 /// the shortest valid prefix: 14 elements (tag + 13 fields) through
 /// `stream`, or 34 when a later field is set; every field after the prefix
 /// keeps its `msgspec` default. Token ids go as a plain integer array; the
@@ -202,6 +203,11 @@ pub struct TokenizedGenerateReqInput {
     /// scheduler's record of the request matches its frontend's. `None`
     /// leaves the placement to the least-loaded selection.
     pub routed_dp_rank: Option<u32>,
+    /// The prefill rank a disaggregated request names, in the scheduler's
+    /// own `disagg_prefill_dp_rank` slot: a prefill scheduler's KV sender
+    /// given one neither tests the placement (its attention-DP rank against
+    /// the room's residue) nor registers a rank for the room.
+    pub disagg_prefill_dp_rank: Option<u32>,
     /// Hybrid-reasoning request: the scheduler tracks the reasoning phase and
     /// accounts its tokens separately.
     pub require_reasoning: bool,
@@ -277,6 +283,7 @@ impl TokenizedGenerateReqInput {
             || self.bootstrap_port.is_some()
             || self.bootstrap_room.is_some()
             || self.routed_dp_rank.is_some()
+            || self.disagg_prefill_dp_rank.is_some()
             || self.needs_encode_slots()
     }
 
@@ -309,6 +316,7 @@ impl Default for TokenizedGenerateReqInput {
             bootstrap_port: None,
             bootstrap_room: None,
             routed_dp_rank: None,
+            disagg_prefill_dp_rank: None,
             require_reasoning: false,
             need_wait_for_mm_inputs: None,
             num_items_assigned: None,
@@ -327,9 +335,9 @@ impl Serialize for TokenizedGenerateReqInput {
         const NIL: Option<()> = None;
         // The shortest valid prefix: through `stream` unless a later field
         // (`return_hidden_states`, `lora_id`, `custom_logit_processor`, the bootstrap triple,
-        // `routed_dp_rank`, `require_reasoning`) has to reach its slot past the
-        // defaulted ones; through `encoder_urls` when the encode dispatch set
-        // its slots.
+        // `routed_dp_rank`, `disagg_prefill_dp_rank`, `require_reasoning`) has to
+        // reach its slot past the defaulted ones; through `encoder_urls` when
+        // the encode dispatch set its slots.
         let len = if self.needs_encode_slots() {
             GENERATE_WIRE_FIELDS.len() + 1
         } else if self.needs_extended_form() {
@@ -354,7 +362,7 @@ impl Serialize for TokenizedGenerateReqInput {
         tuple.serialize_element(&self.stream)?;
         if self.needs_extended_form() {
             // The fields between `stream` and `require_reasoning`, at the
-            // scheduler's own defaults except the seven this wire carries:
+            // scheduler's own defaults except the eight this wire carries:
             // return_sampling_mask, return_flat_raw_top_logprobs,
             // return_hidden_states, return_routed_experts,
             // routed_experts_start_len, return_indexer_topk, session_id,
@@ -380,7 +388,7 @@ impl Serialize for TokenizedGenerateReqInput {
             tuple.serialize_element(&NIL)?; // bootstrap_pair_key
             tuple.serialize_element(&NIL)?; // decode_tp_size
             tuple.serialize_element(&self.routed_dp_rank)?;
-            tuple.serialize_element(&NIL)?; // disagg_prefill_dp_rank
+            tuple.serialize_element(&self.disagg_prefill_dp_rank)?;
             tuple.serialize_element(&NIL)?; // routing_key
             tuple.serialize_element(&self.require_reasoning)?;
             if self.needs_encode_slots() {
@@ -466,9 +474,9 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                 // `return_hidden_states`, five more defaulted slots, then
                 // `lora_id` and `custom_logit_processor`,
                 // `positional_embed_overrides`, the bootstrap triple, 2
-                // defaulted ones, `routed_dp_rank`, 2 more defaulted ones, then
-                // `require_reasoning`. A shorter array (a frontend that stopped
-                // at `stream`) leaves them all unset.
+                // defaulted ones, `routed_dp_rank`, `disagg_prefill_dp_rank`, 1
+                // more defaulted one, then `require_reasoning`. A shorter array
+                // (a frontend that stopped at `stream`) leaves them all unset.
                 let mut tail = Tail {
                     seq: &mut seq,
                     ended: false,
@@ -486,7 +494,8 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                 let bootstrap_room = tail.next::<i64>()?;
                 tail.skip(2)?;
                 let routed_dp_rank = tail.next::<u32>()?;
-                tail.skip(2)?;
+                let disagg_prefill_dp_rank = tail.next::<u32>()?;
+                tail.skip(1)?;
                 let require_reasoning = tail.next::<bool>()?.unwrap_or(false);
                 // priority, extra_key, no_logs, return_bytes, return_entropy,
                 // then the encode dispatch's three slots.
@@ -513,6 +522,7 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     bootstrap_port,
                     bootstrap_room,
                     routed_dp_rank,
+                    disagg_prefill_dp_rank,
                     require_reasoning,
                     need_wait_for_mm_inputs,
                     num_items_assigned,
@@ -751,6 +761,14 @@ impl SglangRequest {
             Self::Embed(request) => &request.rid,
         }
     }
+
+    /// The prompt's token ids.
+    pub fn input_ids(&self) -> &[u32] {
+        match self {
+            Self::Generate(request) => &request.input_ids,
+            Self::Embed(request) => &request.input_ids,
+        }
+    }
 }
 
 impl From<TokenizedGenerateReqInput> for SglangRequest {
@@ -895,7 +913,7 @@ mod tests {
 
     use super::{recorded::*, *};
     use crate::{
-        codec::{decode_msgpack, encode_msgpack},
+        codec::{decode_msgpack, encode_msgpack, hex},
         protocol::sglang::sampling::{
             recorded::PYTHON_PINNED_0_5_22, WIRE_FIELDS as SAMPLING_WIRE_FIELDS,
         },
@@ -908,13 +926,6 @@ mod tests {
     /// `require_reasoning=True`, the 19 defaulted fields between them at
     /// their defaults.
     const PYTHON_REQUEST: &str = "dc0022b9546f6b656e697a656447656e6572617465526571496e707574a27231c0c093010203c0c0c0dc002008c0c0c0cb3ff0000000000000cb3ff000000000000001cb0000000000000000cb0000000000000000cb0000000000000000cb3ff00000000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c0c00000c2c2c2ff00c0c3c2c2c2c200c2c0c0c0c0c0c0c0c0c0c0c0c0c0c3";
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
 
     #[test]
     fn encodes_the_prefix_through_require_reasoning_with_the_tag_first() {
@@ -1420,6 +1431,44 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(SglangProtocol::data_parallel_rank(&embed), None);
+    }
+
+    #[test]
+    fn a_named_prefill_rank_fills_the_disagg_prefill_dp_rank_slot() {
+        let named = TokenizedGenerateReqInput {
+            rid: "pd".into(),
+            input_ids: vec![1, 2],
+            bootstrap_room: Some(7),
+            routed_dp_rank: Some(1),
+            disagg_prefill_dp_rank: Some(1),
+            ..Default::default()
+        };
+        let encoded = encode_msgpack(&named).unwrap();
+        let array: Vec<Value> = decode_msgpack(&encoded).unwrap();
+        assert_eq!(
+            array.len(),
+            34,
+            "the extended form through require_reasoning"
+        );
+        assert_eq!(array[30].as_u64(), Some(1), "routed_dp_rank at 30");
+        assert_eq!(array[31].as_u64(), Some(1), "disagg_prefill_dp_rank at 31");
+        assert!(array[32].is_nil(), "routing_key nil");
+        let back: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(back, named);
+        assert_eq!(GENERATE_WIRE_FIELDS[30], "disagg_prefill_dp_rank");
+        for release in [&GENERATE_FIELDS_0_5_21[..], &GENERATE_FIELDS_0_5_22[..]] {
+            assert_eq!(release[30], "disagg_prefill_dp_rank");
+        }
+
+        let alone = TokenizedGenerateReqInput {
+            rid: "pd".into(),
+            input_ids: vec![1, 2],
+            disagg_prefill_dp_rank: Some(0),
+            ..Default::default()
+        };
+        let array: Vec<Value> = decode_msgpack(&encode_msgpack(&alone).unwrap()).unwrap();
+        assert_eq!(array.len(), 34);
+        assert_eq!(array[31].as_u64(), Some(0));
     }
 
     #[test]

@@ -1,6 +1,6 @@
-// The control reply shared by the slim wires: a tagged positional msgpack
-// array `[tag, call_id, success, message, engine_index]`. **Field order is
-// the wire contract** — do not reorder.
+//! The control reply shared by the slim wires: a tagged positional msgpack
+//! array `[tag, call_id, success, message, engine_index]`. **Field order is
+//! the wire contract**: do not reorder.
 
 use serde::{
     de::{SeqAccess, Visitor},

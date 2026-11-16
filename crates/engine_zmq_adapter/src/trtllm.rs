@@ -22,7 +22,10 @@ use crate::{
     context_window::admit_prompt,
     fanout::fan_out_n,
     sglang::normalize_finish_reason,
-    stream::{map_slim_output, matched_stop_of, poll_mapped, MappedGenerateStream, StreamState},
+    stream::{
+        finish, map_slim_output, matched_stop_of, poll_mapped, FinishParts, MappedGenerateStream,
+        StreamState,
+    },
     structured_outputs::ConstraintRef,
 };
 
@@ -54,6 +57,11 @@ impl TrtllmGenerateStream {
         }
     }
 
+    /// The choice index this stream stamps on its responses.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
     /// The engine-side id of this choice's request.
     pub fn request_id(&self) -> &str {
         self.inner.request_id()
@@ -64,38 +72,20 @@ impl TrtllmGenerateStream {
     pub fn engine_index(&self) -> Option<u32> {
         self.inner.engine_index()
     }
+}
 
-    /// Whether the engine already finished this choice and its terminal
-    /// `Complete` is parked behind the chunk just yielded (the finish tick
-    /// carried new tokens).
-    pub fn has_parked_complete(&self) -> bool {
-        self.pending.is_some()
+impl finish::Parts for TrtllmGenerateStream {
+    fn parked(&self) -> Option<&vllm::GenerateResponse> {
+        self.pending.as_ref()
     }
 
-    /// End this choice as aborted: the engine's own parked `Complete` when it
-    /// already finished, else a terminal `Complete` with `finish_reason =
-    /// "abort"` and the output so far. The engine-side request is aborted
-    /// when the stream is dropped, so the caller drops it next.
-    pub fn complete_aborted(&mut self) -> vllm::GenerateResponse {
-        if let Some(parked) = self.pending.take() {
-            return parked;
+    fn finish_parts(&mut self) -> FinishParts<'_> {
+        FinishParts {
+            state: &mut self.state,
+            index: self.index,
+            pending: &mut self.pending,
+            input_logprobs_emitted: &mut self.input_logprobs_emitted,
         }
-        let mut pending = None;
-        // No new tokens on a frontend finish, so `emit_tick` yields the
-        // `Complete` directly and parks nothing.
-        let mut response = self.state.emit_tick(
-            self.index,
-            Vec::new(),
-            None,
-            Some(("abort".to_string(), None)),
-            &mut pending,
-        );
-        self.state.attach_input_logprobs(
-            &mut self.pending,
-            &mut self.input_logprobs_emitted,
-            &mut response,
-        );
-        response
     }
 }
 
@@ -413,15 +403,11 @@ pub(crate) fn translate_request_trtllm(
             Some((kind.to_string(), guided.guide))
         }
     };
+    // The request's raw image files are `Bytes` already: they ride behind
+    // the request as they are.
     let images: Vec<bytes::Bytes> = req
         .multimodal_input
-        .map(|input| {
-            input
-                .image_data
-                .into_iter()
-                .map(bytes::Bytes::from)
-                .collect()
-        })
+        .map(|input| input.image_data)
         .unwrap_or_default();
     Ok(TrtllmGenerateReqInput {
         rid: req.request_id,
@@ -574,7 +560,7 @@ mod tests {
             config_json: None,
         });
         req.multimodal_input = Some(trtllm::MultimodalInput {
-            image_data: vec![b"img".to_vec()],
+            image_data: vec![bytes::Bytes::from_static(b"img")],
         });
         req.cache_salt_id = Some(99);
         req.disaggregated_params = Some(trtllm::DisaggregatedParams {
@@ -617,6 +603,33 @@ mod tests {
                 first_gen_token_id: Some(11),
             })
         );
+    }
+
+    /// A chat request's `min_tokens` survives the whole path to the engine:
+    /// the gateway's chat builder writes it to the proto, the translation
+    /// copies it, and the request decoded from the wire's bytes carries it.
+    #[test]
+    fn a_chat_requests_min_tokens_survive_the_wire() {
+        use openai_protocol::chat::ChatCompletionRequest;
+        use smg_grpc_client::TrtllmServiceClient;
+
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "min_tokens": 30, "max_tokens": 40
+        }))
+        .expect("a chat request");
+        let proto = TrtllmServiceClient::build_generate_request_from_chat_parts(
+            "r1".to_string(),
+            &chat,
+            "hi".to_string(),
+            vec![1, 2, 3],
+            None,
+            Default::default(),
+        )
+        .expect("the chat builder");
+        let wire = translate(proto).expect("the translation");
+        let back: TrtllmGenerateReqInput = decode_msgpack(&encode_msgpack(&wire).unwrap()).unwrap();
+        assert_eq!(back.sampling.min_tokens, Some(30));
     }
 
     /// A generation phase's first token crosses as sent, id 0 included (the
@@ -888,7 +901,7 @@ mod tests {
 
         let mut req = request("r1");
         req.multimodal_input = Some(trtllm::MultimodalInput {
-            image_data: vec![b"img".to_vec()],
+            image_data: vec![bytes::Bytes::from_static(b"img")],
         });
         let mut stream = client.generate_trtllm(req).await.unwrap();
         let first = stream.next().await.unwrap().unwrap();

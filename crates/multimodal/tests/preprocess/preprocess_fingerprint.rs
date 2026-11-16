@@ -55,7 +55,7 @@ const EXPECTED: &[u64] = &[0x776d46f52782791d, 0x12257fb9b357d2d1, 0xcfe5dc6b412
 
 fn fingerprint(w: u32, h: u32) -> (u64, usize) {
     let proc = Qwen3VLProcessor::from_config_for(&config(), Modality::Image);
-    let res = proc.preprocess(&[make(w, h)]).unwrap();
+    let res = proc.preprocess(&[&make(w, h)]).unwrap();
     let flat = res.encoder_input_flat();
     (fnv1a_f32(flat.as_ref()), flat.len())
 }

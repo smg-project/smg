@@ -44,7 +44,7 @@ impl HyV4Parser {
         let props = tools
             .iter()
             .find(|t| t.function.name == name)
-            .and_then(|t| t.function.parameters.get("properties"));
+            .and_then(|t| t.function.parameters_schema().get("properties"));
         let mut args = Map::new();
         while !rest.trim().is_empty() {
             rest = rest.trim_start().strip_prefix(&key_start)?;
@@ -181,7 +181,7 @@ impl HyV4Parser {
                     "begin": format!("<tool_call>{}", tool.function.name),
                     "content": {
                         "type": "json_schema",
-                        "json_schema": tool.function.parameters,
+                        "json_schema": tool.function.parameters_schema(),
                         "style": "glm_xml",
                     },
                     "end": "</tool_call>",

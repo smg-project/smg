@@ -15,16 +15,25 @@
 //! function schemas), `responses` (the Responses API with `store: true`,
 //! `--chain` requests per session linked by `previous_response_id`) and
 //! `image` (`--image <file>` inline as a data URL, `--images-per-request`
-//! copies, before the text), `messages` (the Messages API, one user message)
-//! and `embeddings` (the prompt as the input). `--json-schema` asks a chat
-//! request for a JSON answer under a fixed schema. `--tenants N` spreads the
-//! requests over N tenant ids sent in `--tenant-header`.
+//! copies, before the text), `messages` (the Messages API, one user message),
+//! `embeddings` (the prompt as the input), `generate` (the engine-native
+//! `/generate` route, the prompt as its `text`) and `completion`
+//! (`/v1/completions`, the prompt as its `prompt`). `--json-schema` asks a
+//! chat request for a JSON answer under a fixed schema. `--tenants N` spreads
+//! the requests over N tenant ids sent in `--tenant-header`.
 //!
 //! Prompts are deterministic from `--seed`: `--distinct` distinct prompts of
 //! about `--prompt-tokens` words (one token each for a large-vocabulary BPE),
 //! each a shared head from a pool of `--prefix-pool` fixed texts
 //! (`--prefix-ratio` of the prompt) followed by a unique tail, so cache-aware
 //! routing sees shared prefixes and unique remainders as in production.
+
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a command-line tool reports on its standard streams"
+)]
+
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -87,12 +96,18 @@ enum Mode {
     Messages,
     /// `POST /v1/embeddings` with the prompt as the input.
     Embeddings,
+    /// `POST /generate` (the engine-native route) with the prompt as its
+    /// `text`; a streamed answer repeats the whole text so far in every frame.
+    Generate,
+    /// `POST /v1/completions` with the prompt as its `prompt`; a streamed
+    /// answer is one `text` delta per frame.
+    Completion,
 }
 
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "stress_load",
-    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image, messages, embeddings)"
+    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image, messages, embeddings, generate, completion)"
 )]
 struct Args {
     /// Gateway base URL.
@@ -121,6 +136,10 @@ struct Args {
     /// Prompt length in words (about one token each).
     #[arg(long, default_value_t = 64)]
     prompt_tokens: usize,
+    /// Maximum text content parts per chat user message (0: one string).
+    /// Splits on word boundaries without dropping text; other modes are unchanged.
+    #[arg(long, default_value_t = 0)]
+    text_parts: usize,
     /// Number of fixed shared heads the prompts cycle through.
     #[arg(long, default_value_t = 16)]
     prefix_pool: usize,
@@ -137,6 +156,10 @@ struct Args {
     /// (`response_format: json_schema`).
     #[arg(long, default_value_t = false)]
     json_schema: bool,
+    /// Chat requests ask for logprobs: the sampled token's and this many
+    /// alternatives per token (`logprobs: true, top_logprobs: N`).
+    #[arg(long)]
+    logprobs: Option<u32>,
     /// Spread the requests over this many tenant ids (0: no tenant header).
     #[arg(long, default_value_t = 0)]
     tenants: usize,
@@ -233,6 +256,23 @@ fn prompt(args: &Args, i: usize) -> String {
     let head = words(args.seed ^ 0x5EED_0000 ^ (i % pool) as u64, head_words);
     let tail = words(args.seed ^ 0x7A11_0000 ^ ((i as u64) << 20), tail_words);
     format!("{head} [session {i}] {tail}")
+}
+
+/// Builds a chat user message as a string (zero parts) or text content blocks.
+/// Splits after ASCII spaces, retaining every byte and emitting at most the
+/// requested number of parts; empty text produces an empty array. This controls
+/// request shape, not token equivalence across model chat templates.
+fn chat_user(text: String, text_parts: usize) -> Value {
+    if text_parts == 0 {
+        return user(text);
+    }
+    let words: Vec<_> = text.split_inclusive(' ').collect();
+    let per_part = words.len().div_ceil(text_parts).max(1);
+    let parts: Vec<_> = words
+        .chunks(per_part)
+        .map(|words| json!({"type": "text", "text": words.concat()}))
+        .collect();
+    json!({"role": "user", "content": parts})
 }
 
 fn user(text: impl Into<String>) -> Value {
@@ -383,19 +423,26 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
     if args.json_schema && args.mode != Mode::Chat {
         anyhow::bail!("--json-schema applies to --mode chat only");
     }
+    if args.logprobs.is_some() && args.mode != Mode::Chat {
+        anyhow::bail!("--logprobs applies to --mode chat only");
+    }
     let mut bodies = Vec::with_capacity(distinct);
     for i in 0..distinct {
         let body = match args.mode {
             Mode::Chat => {
                 let mut body = json!({
                     "model": args.model,
-                    "messages": [user(prompt(args, i))],
+                    "messages": [chat_user(prompt(args, i), args.text_parts)],
                     "max_tokens": args.max_tokens,
                     "stream": args.stream,
                     "stream_options": if args.stream { json!({"include_usage": true}) } else { Value::Null },
                 });
                 if args.json_schema {
                     body["response_format"] = answer_schema();
+                }
+                if let Some(top_logprobs) = args.logprobs {
+                    body["logprobs"] = json!(true);
+                    body["top_logprobs"] = json!(top_logprobs);
                 }
                 body
             }
@@ -408,6 +455,19 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
             Mode::Embeddings => json!({
                 "model": args.model,
                 "input": prompt(args, i),
+            }),
+            Mode::Generate => json!({
+                "model": args.model,
+                "text": prompt(args, i),
+                "sampling_params": {"max_new_tokens": args.max_tokens},
+                "stream": args.stream,
+            }),
+            Mode::Completion => json!({
+                "model": args.model,
+                "prompt": prompt(args, i),
+                "max_tokens": args.max_tokens,
+                "stream": args.stream,
+                "stream_options": if args.stream { json!({"include_usage": true}) } else { Value::Null },
             }),
             Mode::Tools => json!({
                 "model": args.model,
@@ -998,6 +1058,8 @@ async fn run(args: Args) -> Result<Summary> {
         Mode::Responses => "/v1/responses",
         Mode::Messages => "/v1/messages",
         Mode::Embeddings => "/v1/embeddings",
+        Mode::Generate => "/generate",
+        Mode::Completion => "/v1/completions",
         _ => "/v1/chat/completions",
     };
     let url = format!("{}{}", args.gateway.trim_end_matches('/'), path);
@@ -1100,6 +1162,111 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Text blocks preserve whitespace and Unicode, including boundary inputs.
+    #[test]
+    fn chat_text_parts_keep_every_byte_and_default_string_shape() {
+        for text in ["", "hello", "hello 世界  again ", "one two three four five"] {
+            assert_eq!(chat_user(text.to_owned(), 0), user(text));
+            for count in [1, 2, 16, usize::MAX] {
+                let body = chat_user(text.to_owned(), count);
+                let parts = body["content"].as_array().unwrap();
+                assert!(parts.len() <= count);
+                let joined: String = parts
+                    .iter()
+                    .map(|part| {
+                        assert_eq!(part["type"], "text");
+                        part["text"].as_str().unwrap()
+                    })
+                    .collect();
+                assert_eq!(joined, text);
+            }
+        }
+    }
+
+    /// Multiple parts are produced in order, with spaces retained at boundaries.
+    #[test]
+    fn chat_text_parts_split_at_word_boundaries() {
+        for (count, expected) in [
+            (1, vec!["one two three four five"]),
+            (2, vec!["one two three ", "four five"]),
+            (usize::MAX, vec!["one ", "two ", "three ", "four ", "five"]),
+        ] {
+            let actual = chat_user("one two three four five".to_owned(), count);
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|text| json!({"type": "text", "text": text}))
+                .collect();
+            assert_eq!(actual, json!({"role": "user", "content": expected}));
+        }
+        assert_eq!(chat_user(String::new(), 1)["content"], json!([]));
+    }
+
+    /// The CLI option reaches serialized chat bodies without changing other fields.
+    #[test]
+    fn chat_text_parts_are_wired_into_request_bodies() {
+        let mut options = Args::parse_from([
+            "stress_load",
+            "--mode",
+            "chat",
+            "--text-parts",
+            "4",
+            "--distinct",
+            "3",
+            "--stream",
+            "--json-schema",
+            "--logprobs",
+            "2",
+        ]);
+        let multipart = build_bodies(&options).unwrap();
+        options.text_parts = 0;
+        let strings = build_bodies(&options).unwrap();
+        assert_eq!(args(Mode::Chat).text_parts, 0);
+        assert_eq!(multipart.len(), strings.len());
+        for (parts, string) in multipart.iter().zip(&strings) {
+            let mut parts: Value = serde_json::from_slice(parts).unwrap();
+            let string: Value = serde_json::from_slice(string).unwrap();
+            let content = parts["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(content.len(), 4);
+            let joined: String = content
+                .iter()
+                .map(|part| {
+                    assert_eq!(part["type"], "text");
+                    part["text"].as_str().unwrap()
+                })
+                .collect();
+            assert_eq!(
+                Some(joined.as_str()),
+                string["messages"][0]["content"].as_str()
+            );
+            parts["messages"][0]["content"] = Value::String(joined);
+            assert_eq!(parts, string);
+        }
+    }
+
+    /// Text partitioning is limited to chat, leaving every other mode unchanged.
+    #[test]
+    fn chat_text_parts_leave_other_modes_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("image.png");
+        std::fs::write(&image, b"image fixture").unwrap();
+        for &mode in Mode::value_variants() {
+            if mode == Mode::Chat {
+                continue;
+            }
+            let mut options = args(mode);
+            if mode == Mode::Image {
+                options.image = vec![image.clone()];
+            }
+            let baseline = build_bodies(&options).unwrap();
+            let response = responses_body(&options, 3, Some("resp_1"));
+            options.text_parts = 4;
+            assert_eq!(build_bodies(&options).unwrap(), baseline, "{mode:?}");
+            if mode == Mode::Responses {
+                assert_eq!(responses_body(&options, 3, Some("resp_1")), response);
+            }
+        }
+    }
+
     fn args(mode: Mode) -> Args {
         Args::parse_from([
             "stress_load",
@@ -1175,6 +1342,28 @@ mod tests {
         let v: Value = serde_json::from_slice(&e[1]).unwrap();
         assert!(v["input"].as_str().unwrap().contains("[session 1]"));
         assert!(v.get("messages").is_none());
+
+        let mut g = args(Mode::Generate);
+        g.stream = true;
+        let g = build_bodies(&g).unwrap();
+        let v: Value = serde_json::from_slice(&g[2]).unwrap();
+        assert!(v["text"].as_str().unwrap().contains("[session 2]"));
+        assert_eq!(v["sampling_params"]["max_new_tokens"], 8);
+        assert_eq!(v["stream"], true);
+        assert!(v.get("messages").is_none());
+
+        let mut c = args(Mode::Completion);
+        c.stream = true;
+        let c = build_bodies(&c).unwrap();
+        let v: Value = serde_json::from_slice(&c[3]).unwrap();
+        assert!(v["prompt"].as_str().unwrap().contains("[session 3]"));
+        assert_eq!(v["max_tokens"], 8);
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["stream_options"]["include_usage"], true);
+        assert!(v.get("messages").is_none());
+        let v: Value =
+            serde_json::from_slice(&build_bodies(&args(Mode::Completion)).unwrap()[0]).unwrap();
+        assert!(v["stream_options"].is_null());
 
         let mut c = args(Mode::Chat);
         c.json_schema = true;

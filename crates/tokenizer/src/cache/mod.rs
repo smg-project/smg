@@ -18,6 +18,7 @@ mod activity;
 mod fingerprint;
 mod l0;
 mod l1;
+mod sampler;
 #[cfg(test)]
 mod test_encoders;
 
@@ -37,8 +38,8 @@ use crate::{
         ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
     },
     traits::{
-        ChatTemplateOutput, DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder,
-        SpecialTokens, TokenIdType, Tokenizer,
+        AppendedStep, ChatTemplateOutput, DecodeStep, Decoder, Encoder, Encoding,
+        IncrementalDecoder, RendererCapabilities, SpecialTokens, TokenIdType, Tokenizer,
     },
 };
 
@@ -439,6 +440,27 @@ impl Decoder for CachedTokenizer {
         )
     }
 
+    fn decode_step_into(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+        out: &mut String,
+    ) -> Result<AppendedStep> {
+        self.inner.decode_step_into(
+            token_id,
+            ids,
+            prefix,
+            prefix_index,
+            skip_special_tokens,
+            eager,
+            out,
+        )
+    }
+
     fn finish_decode(
         &self,
         ids: &mut Vec<TokenIdType>,
@@ -507,6 +529,17 @@ impl Tokenizer for CachedTokenizer {
             .apply_chat_template_with_encoding(messages, params, assistant_prefix)
     }
 
+    fn apply_chat_template_with_encoding_owned(
+        &self,
+        messages: Vec<serde_json::Value>,
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        // Forwarded for the same reason as the borrowed entry.
+        self.inner
+            .apply_chat_template_with_encoding_owned(messages, params, assistant_prefix)
+    }
+
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
         self.inner.chat_template_content_format()
     }
@@ -543,7 +576,7 @@ impl Tokenizer for CachedTokenizer {
         self.inner.prefill_opens_think_block()
     }
 
-    fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
+    fn renderer_capabilities(&self) -> RendererCapabilities {
         self.inner.renderer_capabilities()
     }
 
@@ -553,6 +586,10 @@ impl Tokenizer for CachedTokenizer {
         thinking: Option<bool>,
     ) -> Option<bool> {
         self.inner.native_thinking_mode(template_kwargs, thinking)
+    }
+
+    fn template_reads(&self, name: &str) -> bool {
+        self.inner.template_reads(name)
     }
 
     fn eos_token_ids(&self) -> &[TokenIdType] {

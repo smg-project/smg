@@ -124,7 +124,13 @@ the output, where anything but a list is prose; `Framed` (Llama Nemotron) is the
 markers, where text in place of it is malformed; `ObjectOrList` (the `json` table) also reads a
 `{` at the first byte as one call alone and every further object after it, behind a `;` or behind
 whitespace alone, as another call, and carries the family's call marker the output may open with
-(Llama 3.1's `<|python_tag|>`), dropped as the template's wrapping where it does. The stages
+(Llama 3.1's `<|python_tag|>`), dropped as the template's wrapping where it does; `Forced` (a
+required call's list under the request's JSON schema) reads as `ObjectOrList` with no marker and
+differs at the end of the stream alone, where the engine held the output to the list and no byte of
+an open one is prose: the separators held after a call, an object cut before its arguments began and
+what a started call's object held behind its arguments are refused (`tagged::refuse`: an event of no
+bytes counts each run and the bytes are `Dropped`), where every other framing returns them as
+`Malformed`. The stages
 (deciding at the first byte that is not whitespace, inside the marker, between objects, inside one,
 after the `]` or the lone object) and what they say of the bytes around the objects (the brackets,
 the commas, the `;` and the wrapping whitespace `Dropped`; text between objects `Malformed`, one run
@@ -160,8 +166,16 @@ as well, a tolerance to judge with adversarial fixtures rather than port).
 
 Two endings. `Assembler::close` is for a block the model ended before `</function>` (its own closing
 marker came, or the next call began): the call is over as far as the model is concerned, so after
-the last value the object is closed, and a value held for its close is refused, its member never
-written. A streamed string the close finds open, a byte of whose value went out, is
+the last value the object is closed, when the syntax read the call whole, and a value held for its
+close is refused, its member never written. A call inside which the syntax refused bytes gets no
+close, at its own `</function>` as at the block's end: a word between tags, a tag out of its place,
+cut short or written twice, an empty name, a key or a value held for its close that the end cut
+(the attributed assembler's rule, its section below): the model put something in the call that the
+client will not get, so the call is no whole call; the fragments stand, a strict JSON prefix, the
+whitespace carried before the close leaves as wrapping, and the refusal's own event stands inside
+the call. One refusal costs the call nothing: a bare `</parameter>` between parameters is refused
+and counted like the rest, but it carries no member the client could lose, so the call stays
+whole. A streamed string the close finds open, a byte of whose value went out, is
 closed first, as the stop closes one (the third ending, below): the model ended the call, so the
 value's bytes are the value whole, the start of a tag held is its text since no tag followed, the
 newline held as the template's framing is the closing quote's source, and one `Malformed {
@@ -217,9 +231,10 @@ string the stop closed under any table, and for the call itself where the table 
 since there the template writes the closing marker the model skipped (under the row the stop
 stands for that marker, and a call open at it is the expected shape; `docs/engine.md`). A value
 held for its close (a number, an object, a string that may still be null) and a string the model
-opened without writing a byte of it keep the marker's path: refused, the member never
-written, or, where its opening fragment went out with the parameter tag (the Qwen assembler), left
-open and said as the block's end leaves it; nothing made up. The two differ by what the client has
+opened without writing a byte of it keep the marker's path: refused, the member never written and
+no close made up for the call, or, where its opening fragment went out with the parameter tag (the
+Qwen assembler), left open and said as the block's end leaves it; nothing made up. The two differ by
+what the client has
 seen: a streamed string's fragments already reached it, so closing the string adds the quote alone,
 while a held value's bytes reached nobody and its close is a tag the model never wrote, so the stop
 writes no member of it; a held scalar that reads whole as its declared kind (`1.5` under `number`)
@@ -264,9 +279,12 @@ What the syntax says, and what the assembler does with it:
   directly between its tags.
 - **Inside a value only `</arg_value>` is a tag**; the other three there are the value's text.
 - **Two endings.** `Assembler::close` is the call's closing marker, or the block's end before
-  it: after the last value it names the call if it has not, closes the object and pushes
-  `ToolCallEnd` with the marker's bytes; inside a value held for its close it refuses what was
-  held and closes the object without that member; inside a streamed string it closes the string
+  it: after the last value it names the call if it has not, closes the object when the syntax
+  read the call whole and pushes `ToolCallEnd` with the marker's bytes; inside a key or a value
+  held for its close it refuses what was held, its member never written; a call inside which the
+  syntax refused bytes, there or earlier, gets no close (the attributed assembler's rule, its
+  section below): the fragments stand, a strict JSON prefix, and the whitespace carried leaves as
+  wrapping; inside a streamed string it closes the string
   first, the start of a tag held as its text, under one `Malformed { OpenAtTheMarker }` event of
   no bytes before the closing quote (`tagged::left_open`), since the model ended the
   call and the value's bytes are complete, then the object. `Assembler::finish` is a stream that was cut, by the token
@@ -290,7 +308,8 @@ What the syntax says, and what the assembler does with it:
   `Assembler::stop` is the stream's stop, the model's own end: the call ends as the marker
   would end it, a call not yet named is named from its text, a streamed string still open is
   closed first, with the start of a tag held as its text, and the one `Malformed {
-  OpenAtTheStop }` event says so (the third ending of the Qwen assembler, above).
+  OpenAtTheStop }` event says so for a call read whole (the third ending of the Qwen assembler,
+  above); a call the syntax refused bytes in gets no close and no such word.
 - **Nothing the syntax cannot read is content** (`tagged::refuse`). The block's markers and its
   four tags are the format's own tokens, and the text between them where the syntax has no place
   for text (a value whose key never opened, a tag written twice, a name that is prose, Python or
@@ -301,14 +320,19 @@ What the syntax says, and what the assembler does with it:
   its offset, and the bytes leave as `Dropped { MalformedCall }`, never as content (at a cut
   call's end the bytes held come first and the one event of no bytes stands after them, before
   `ToolCallEnd`, as `tagged::end_cut_call` has it); a call that started keeps the pairs it read
-  (`{}` when none), and a block that named no call has every byte refused, the marker that
-  closed it included. The attributed assembler (`tagged::attributed`: DSML, XTML, `<parameter
-  name="…">`) refuses the same way everything inside an invoke its syntax cannot read: a word
-  between tags, a tag out of its place or cut short, a tail a tag has no place for, an invoke
-  that named no call (whole, its closing tag included); a call that started keeps the members it
-  read. (A parameter tag written without its `<` and a call's arguments written as JSON and
-  closed with a region of the model's own, both seen live, reached the client as content with
-  the format's tokens in it before.)
+  and gets no close (nothing at all when it read none, where `{}` closed before), except after
+  a bare `</arg_key>` or `</arg_value>` between pairs, which is refused and counted like the
+  rest but carries no member the client could lose, so the call stays whole (a recorded output
+  writes the last value's close twice); a tag the block's end cut short between pairs is the
+  member the model had begun, refused as cut short, and the call gets no close; and a block
+  that named no call has every byte refused, the marker that closed it included. The attributed
+  assembler (`tagged::attributed`: DSML, XTML, `<parameter name="…">`) refuses the same way
+  everything inside an invoke its syntax cannot read: a word between tags, a tag out of its place
+  or cut short, a tail a tag has no place for, an invoke that named no call (whole, its closing
+  tag included); a call that started keeps the members it read and gets no close, as here (its
+  section below). (A parameter tag written without its
+  `<` and a call's arguments written as JSON and closed with a region of the model's own, both
+  seen live, reached the client as content with the format's tokens in it before.)
 - **Every byte of the call lands in exactly one event**, with the Qwen assembler's accounting:
   the name's bytes in `ToolCallStart`, each tag's and value's bytes in the fragments they
   produce, the whitespace the template writes between tags as `Dropped { Wrapper }`, and what
@@ -365,6 +389,23 @@ What the syntax says, and what the assembler does with it:
   its arguments are no whole value (`tagged::end_cut_call`), and an invoke the cut found before
   it named a call is refused whole as `UnterminatedRegion`, as the keyed one is, so that the
   reader's release of a refused output that made no call takes the whole slice.
+- **A call inside which the syntax refused bytes gets no close.** A word between tags, a tag out
+  of its place, cut short or with a tail, a value held for its close that the invoke's end cut:
+  each is refused as above, and the model's call had something in it the client will not get, so
+  the call is no whole call. At `close` the object is then not closed: the fragments stand (the
+  pairs the syntax read, a strict JSON prefix; none when it read no pair) and are no whole
+  value, which is how a client that reads the arguments as JSON is told, as a cut call tells it;
+  the whitespace carried before the close leaves as wrapping; the refusal's own event of no
+  bytes stands inside the call, as the contract asks of a call that ends without whole
+  arguments. The engine's own parser hands such a call out whole with the members its reader
+  matched, `{}` when none, under `tool_calls`, and so did this assembler: a client read a
+  well-formed call with no word that the model's call had failed (a fleet verifier saw a
+  two-parameter call come back as `{}` once in several hundred answers to one prompt, the
+  parameter tags written without their `<`). The keyed, Qwen tagged and XML assemblers apply the
+  same rule (their sections): no assembler of this module closes a call its syntax refused bytes
+  in, with one reading of their own: a bare closing tag between members carries no member the
+  client could lose, so there it is refused and counted but costs the call nothing, where this
+  assembler reads it as any tag out of its place.
 - **Every byte of the call lands in exactly one event.**
 
 ## The XML assembler (`tagged::xml`)
@@ -383,13 +424,15 @@ What the syntax says, and what the assembler does with it:
   do, up to the nesting the JSON reader allows every syntax (`PartialJson::DEFAULT_MAX_DEPTH`
   containers, the arguments object counted): the tag that would make an element the container
   past that bound is refused with every byte from the element's own tag to the call's end, as
-  one `Malformed { InvalidArguments }`, nothing of that member is written, and the containers
-  open close whole at the end, so the arguments stay a value a strict reader takes and the
-  element stack never grows past the bound; a leaf whose own JSON (a list or an object its
+  one `Malformed { InvalidArguments }`, nothing of that member is written, and nothing closes
+  after it, since the call is no whole call once its syntax refused bytes in it (the endings
+  below): the containers open stand as the fragments wrote them, a prefix a strict reader takes
+  and no whole value, and the element stack never grows past the bound; a leaf whose own JSON (a
+  list or an object its
   text spells) would nest past the bound, and an empty element the tool declares a container
   at the bound, are refused the same way, so the bound holds for the value the client reads,
   not only for the tags. Whitespace right after an opening tag is held
-  until the element's next byte says what it is: a leaf's text when text or the closing tag
+  until the element's next byte says what it is: a leaf's text when text or its own closing tag
   follows (a value that is one space is one space), the template's when a child tag follows.
 - **A value's type comes from the request's tools at every depth** (`Declared::kind_at`:
   below an object a key selects a property, below an array any element selects its items). A
@@ -399,6 +442,16 @@ What the syntax says, and what the assembler does with it:
   array or an object there, `null` when nothing is declared and it is a list's item, and `""`
   everywhere else: the template writes `None` inside a list as an empty element, skips a
   mapping's `None` member, and leaves a top-level argument that is `None` out altogether.
+  An element declared an array or an object that the model opens, leaves empty (whitespace at
+  most) and never closes, the closing tag of the element directly around it following, is
+  written `[]` or `{}` too: a closing tag is no value of a list or an object, so only the
+  element's own close is missing. Whitespace it held is dropped there, though under the
+  element's own closing tag it is the element's text. One `Malformed { TagCutShort }` event
+  of no bytes stands before its fragment, nothing is refused, and the call stays whole.
+  The tag stays the
+  element's text under a declared string or integer, under an element with no declaration,
+  under a declared container that holds text already or whose empty value would nest past the
+  bound, and when it names an element further out; the call's own end closes no element so.
   Nothing is taken from a value: the template writes it directly between the tags, with no
   escaping.
 - **A top-level null is never written.** The template leaves an argument whose value is `None`
@@ -419,9 +472,18 @@ What the syntax says, and what the assembler does with it:
   fragment's source, so every event's bytes stay in the output's order.
 - **Two endings.** `Assembler::close` is the invoke's closing tag (`INVOKE_CLOSE`, the one
   terminal a started call's end carries), or the next invoke's opening or the block's close,
-  which end the call with no bytes of their own: every open container is closed, a tag the
-  end cut short, a leaf never written and an element without a child are refused, and the
-  arguments object is closed; a streamed string innermost is closed first,
+  which end the call with no bytes of their own: every open container and the arguments object
+  are closed when the syntax read the call whole; a leaf never written and an element without a
+  child are refused, as is a tag the end cut short between elements, and a call inside which
+  the syntax refused bytes, there or earlier (a tail after the name's quote, text where it has
+  tags, a tag out of its place or cut short, the nesting past the bound; not a closing tag that
+  names nothing open, which is refused and counted but carries no member the client could
+  lose, so it costs the call nothing, where one that names an open element further out, an
+  inner close left out, is out of its place, since what follows it would land in the wrong
+  container), gets no close, its open containers included (the attributed assembler's rule):
+  the
+  fragments stand, a strict JSON prefix and no whole value, the whitespace carried leaves as
+  wrapping, and the stop announces no close for it; a streamed string innermost is closed first,
   the start of a tag held as its text, under one `Malformed { OpenAtTheMarker }` event of no
   bytes before its quote (`tagged::left_open`), since the model ended the call and the
   value's bytes are complete, then the containers above it. An invoke that
@@ -475,10 +537,17 @@ The rules, in the order `json` applies them:
 
 A value read as JSON keeps the model's own bytes: `[1, 2.5]` stays spaced as written, and
 `9007199254740993` keeps every digit. JSON here means what `serde_json` reads into a value from
-inside the arguments object, because that is how the adapters read a call's arguments back. Text it
-refuses there, such as a lone surrogate escape or nesting that reaches its depth limit once the
-object is around it, is a string like any other text, so one odd value never costs a call its other
-arguments.
+inside the arguments object, because that is how the adapters read a call's arguments back, nesting
+no deeper than the crate's own JSON reader allows a call's arguments (`PartialJson::DEFAULT_MAX_DEPTH`
+containers, the arguments object counted), because that is the prefix every syntax's fragments are
+held to. Text either refuses, a lone surrogate escape, nesting past the bound, is a string like any
+other text, so one odd value never costs a call its other arguments; a value the end of the stream
+cut stands as written only where `serde_json` and the crate's own judge of a JSON prefix
+(`json::Prefix`) both take it, and opens a string holding it otherwise. The two differ in two
+places: nesting past the bound, which `serde_json` follows, and a `\u` escape short of its four
+hex digits before the quote that ends its string (`"\u1"`), which `serde_json` reads four bytes of
+blindly and then asks for more bytes rather than refuse, and which the judge refuses from the
+escape's backslash, whatever follows the quote; no continuation makes such a text JSON.
 
 Ported from `safe_val` and `coerce_value` in `crates/tool_parser/src/parsers/qwen_xml.rs` and from
 `coerce_by_schema_type` and `param_types_for_function` in that crate's `helpers.rs`. Three things

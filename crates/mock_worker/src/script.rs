@@ -84,6 +84,16 @@ pub struct Answer {
     /// The sampled token's logprob per output token, sent when the request
     /// asks for logprobs.
     pub logprobs: Option<Vec<f32>>,
+    /// `"logprobs": "sampled"`: the logprobs are made up, one per output id,
+    /// once the ids are known (the encode of a text answer), so a scripted
+    /// text can answer a request that asks for logprobs on a token wire.
+    pub sampled_logprobs: bool,
+    /// The logprob of each token id the request asks a score for
+    /// (`token_ids_logprob` on the SGLang wire), in the request's order: the
+    /// answer of a prefill-only scoring request, whose output is empty. The
+    /// request asks for logprobs too, as the engine computes the row only
+    /// then; one that does not is refused.
+    pub token_id_logprobs: Option<Vec<f32>>,
     /// The pause before every frame but the first.
     pub delay: Duration,
     /// Tokens per frame.
@@ -163,7 +173,7 @@ impl Answer {
     ///  "output_ids": [...], "output_text": "..." | ["piece", ...],
     ///  "finish_reason": "stop", "matched_stop": 2 | "</s>",
     ///  "cached_tokens": 0, "prompt_tokens": 12, "logprobs": [-0.1, ...],
-    ///  "delay_ms": 0, "chunk_tokens": 1}
+    ///  "token_id_logprobs": [-0.2, ...], "delay_ms": 0, "chunk_tokens": 1}
     /// ```
     ///
     /// Everything is optional but one of `output_ids` and `output_text`;
@@ -174,6 +184,8 @@ impl Answer {
     /// `output_text` without `output_ids` is an answer of no tokens: the
     /// completion alone, as an engine answers a request it may not generate
     /// for. Beside ids, an empty string is one whole-text piece like any other.
+    /// `token_id_logprobs` scores the token ids a request asks for, in the
+    /// request's order: the answer of a prefill-only scoring request.
     pub fn parse(value: &Value) -> Result<Scripted, String> {
         let object = value.as_object().ok_or("an answer is a JSON object")?;
         let known = [
@@ -187,6 +199,7 @@ impl Answer {
             "cached_tokens",
             "prompt_tokens",
             "logprobs",
+            "token_id_logprobs",
             "delay_ms",
             "chunk_tokens",
         ];
@@ -303,8 +316,13 @@ impl Answer {
         let prompt_tokens = count("prompt_tokens")?
             .map(|n| to_u32("prompt_tokens", n))
             .transpose()?;
+        let mut sampled_logprobs = false;
         let logprobs = match object.get("logprobs") {
             None | Some(Value::Null) => None,
+            Some(Value::String(mode)) if mode == "sampled" => {
+                sampled_logprobs = true;
+                None
+            }
             Some(Value::Array(values)) => {
                 let logprobs = values
                     .iter()
@@ -328,7 +346,28 @@ impl Answer {
                 }
                 Some(logprobs)
             }
-            Some(other) => return Err(format!("logprobs: expected an array, got {other}")),
+            Some(other) => {
+                return Err(format!(
+                    "logprobs: expected an array or \"sampled\", got {other}"
+                ))
+            }
+        };
+        let token_id_logprobs = match object.get("token_id_logprobs") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(values)) => Some(
+                values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_f64()
+                            .map(|v| v as f32)
+                            .ok_or_else(|| format!("token_id_logprobs: {value} is not a number"))
+                    })
+                    .collect::<Result<Vec<f32>, String>>()?,
+            ),
+            Some(other) => {
+                return Err(format!("token_id_logprobs: expected an array, got {other}"))
+            }
         };
         let delay = Duration::from_millis(count("delay_ms")?.unwrap_or(0));
         let chunk_tokens = match count("chunk_tokens")? {
@@ -349,6 +388,8 @@ impl Answer {
                 cached_tokens,
                 prompt_tokens,
                 logprobs,
+                sampled_logprobs,
+                token_id_logprobs,
                 delay,
                 chunk_tokens,
             },
@@ -361,6 +402,7 @@ impl Answer {
     /// answer with ids, or without text, is returned as it is.
     pub fn encoded_with(mut self, tokenizer: &dyn Tokenizer) -> Result<Self, String> {
         if !self.output_ids.is_empty() {
+            self.synthesize_logprobs();
             return Ok(self);
         }
         let Some(pieces) = &self.output_text else {
@@ -371,6 +413,7 @@ impl Answer {
             .encode(&text, false)
             .map_err(|e| format!("encoding the scripted text: {e}"))?;
         self.output_ids = encoding.token_ids().to_vec();
+        self.synthesize_logprobs();
         // Per-piece logprobs align with the ids only when the pieces were
         // tokens, which the encode does not promise: an answer that wants
         // logprobs on a token wire gives ids.
@@ -436,6 +479,19 @@ impl Answer {
             self.output_ids.len()
         };
         u32::try_from(units).unwrap_or(u32::MAX)
+    }
+
+    /// The made-up logprobs of a `"logprobs": "sampled"` answer, one per
+    /// output id: eight values from -0.125 to -1.0, repeating, so a top-`k`
+    /// reading finds alternatives among the answer's tokens.
+    fn synthesize_logprobs(&mut self) {
+        if self.sampled_logprobs && self.logprobs.is_none() {
+            self.logprobs = Some(
+                (0..self.output_ids.len())
+                    .map(|i| -0.125 * ((i % 8) as f32 + 1.0))
+                    .collect(),
+            );
+        }
     }
 
     /// The whole output text, for a non-streaming HTTP answer.
@@ -779,6 +835,17 @@ impl Store {
             self.marked.remove(worker);
         }
     }
+
+    /// A worker starts under `worker`: the name is known to the admin
+    /// routes, with nothing queued or filed for it and its counters at
+    /// zero, whatever a worker of that name left before.
+    fn start(&mut self, worker: &str) {
+        self.queues.remove(worker);
+        self.marked.remove(worker);
+        self.hits.remove(worker);
+        self.misses.remove(worker);
+        self.workers.insert(worker.to_string());
+    }
 }
 
 static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
@@ -802,9 +869,24 @@ pub fn active() -> bool {
 }
 
 /// A worker that started, by name (`grpc:<port>`, `http:<port>`,
-/// `zmq:<index>`): the admin routes accept it from then on.
+/// `zmq:<index>`): the admin routes accept it from then on. The name starts
+/// clean: a port a stopped worker of this process had, bound again, hands
+/// its successor no queued or filed answers and no hits or misses. The name
+/// must be one live worker's: a port is, as the bind precedes the start, and
+/// a ZMQ rank's index is the caller's to keep unique, since a second live
+/// rank of one index would start the first rank's entry clean while it
+/// still serves.
 pub fn register(worker: &str) {
-    store().workers.insert(worker.to_string());
+    store().start(worker);
+}
+
+/// The workers that started in this process, by name, sorted: every listener
+/// on every wire, canned or realistic. The admin fleet list walks them and
+/// joins the engines a realistic worker spawned.
+pub fn registered() -> Vec<String> {
+    let mut names: Vec<String> = store().workers.iter().cloned().collect();
+    names.sort();
+    names
 }
 
 type LoadedTokenizer = Result<Arc<dyn Tokenizer>, String>;
@@ -894,9 +976,12 @@ pub fn take_ids(cfg: &Config, worker: &str, prompt_ids: &[u32]) -> Result<Option
 }
 
 /// `answer` with its ids for a token wire: a text-only answer encoded with
-/// the worker's tokenizer, any other as it is.
-fn encode_for_wire(cfg: &Config, worker: &str, answer: Answer) -> Result<Answer, String> {
-    if !answer.output_ids.is_empty() || answer.output_text.is_none() {
+/// the worker's tokenizer, any other as it is (an answer of no tokens, a
+/// scoring answer's, needs none), its sampled logprobs made up once the ids
+/// are known either way.
+fn encode_for_wire(cfg: &Config, worker: &str, mut answer: Answer) -> Result<Answer, String> {
+    if !answer.output_ids.is_empty() || answer.output_text.as_ref().is_none_or(Vec::is_empty) {
+        answer.synthesize_logprobs();
         return Ok(answer);
     }
     tokenizer(cfg)
@@ -1108,7 +1193,7 @@ mod tests {
             r#"{"output_ids": [1], "matched_stop": true}"#,
             r#"{"output_ids": [1], "delay": 5}"#,
             r#"{"output_ids": ["x"]}"#,
-            r#"[1]"#,
+            r"[1]",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
@@ -1242,6 +1327,118 @@ mod tests {
         );
     }
 
+    /// A worker's port, bound again by a later worker of the same process,
+    /// names the same entry: the new worker starts it clean, so the counts
+    /// it reports are its own (two filed answers served and one miss read as
+    /// two hits and one miss, not the predecessor's hit on top).
+    #[test]
+    fn a_name_bound_again_starts_with_nothing_of_its_predecessor() {
+        let mut store = Store::default();
+        let worker = "grpc:19002";
+        let marked = |text: &str, id: u32| {
+            parse(&format!(
+                r#"{{"prompt_contains": "{text}", "output_ids": [{id}]}}"#
+            ))
+            .expect("an answer filed under a text")
+        };
+        let key = script_key(&[9]);
+        store.start(worker);
+        store.enqueue(
+            worker,
+            vec![
+                parse(r#"{"output_ids": [1]}"#).expect("queued"),
+                marked("quince", 4),
+            ],
+        );
+        assert!(
+            store.take(worker, &key, None).is_some(),
+            "the queued answer"
+        );
+        assert!(store.take(worker, &key, None).is_none(), "a miss");
+        let before = store.status(worker);
+        assert_eq!(
+            (
+                before["hits"].as_u64(),
+                before["misses"].as_u64(),
+                before["marked"].as_u64()
+            ),
+            (Some(1), Some(1), Some(1)),
+            "{before}"
+        );
+
+        store.start(worker);
+        let after = store.status(worker);
+        assert!(store.knows(worker), "still a worker of the process");
+        assert_eq!(
+            (after["queued"].as_u64(), after["marked"].as_u64()),
+            (Some(0), Some(0)),
+            "{after}"
+        );
+        assert_eq!(
+            (after["hits"].as_u64(), after["misses"].as_u64()),
+            (Some(0), Some(0)),
+            "{after}"
+        );
+
+        store.enqueue(worker, vec![marked("apricot", 20), marked("bramble", 30)]);
+        let ids = |answer: Option<Answer>| answer.map(|a| a.output_ids);
+        assert_eq!(
+            ids(store.take(worker, &key, Some("say bramble"))),
+            Some(vec![30])
+        );
+        assert_eq!(
+            ids(store.take(worker, &key, Some("say apricot"))),
+            Some(vec![20])
+        );
+        assert!(
+            store.take(worker, &key, Some("say say")).is_none(),
+            "a miss"
+        );
+        let state = store.status(worker);
+        assert_eq!(
+            (
+                state["marked"].as_u64(),
+                state["hits"].as_u64(),
+                state["misses"].as_u64()
+            ),
+            (Some(0), Some(2), Some(1)),
+            "{state}"
+        );
+    }
+
+    /// The seam the workers use: `register` starts the name clean on the
+    /// process-wide store, whatever a worker of that name left.
+    #[test]
+    fn registering_a_name_again_starts_it_clean_on_the_process_store() {
+        let worker = "grpc:19003";
+        register(worker);
+        enqueue(
+            worker,
+            vec![parse(r#"{"output_ids": [1]}"#).expect("queued")],
+        )
+        .expect("a known worker");
+        assert!(take(worker, &[9]).is_some(), "the queued answer");
+        assert!(take(worker, &[9]).is_none(), "a miss");
+        let before = status(worker).expect("a known worker");
+        assert_eq!(
+            (before["hits"].as_u64(), before["misses"].as_u64()),
+            (Some(1), Some(1)),
+            "{before}"
+        );
+
+        register(worker);
+        let after = status(worker).expect("still a known worker");
+        assert_eq!(
+            (
+                after["queued"].as_u64(),
+                after["hits"].as_u64(),
+                after["misses"].as_u64()
+            ),
+            (Some(0), Some(0), Some(0)),
+            "{after}"
+        );
+    }
+
     #[test]
     fn an_answer_filed_under_a_text_serves_the_first_prompt_that_holds_it_once() {
         let mut store = Store::default();
@@ -1362,6 +1559,48 @@ mod tests {
             .load(&path)
             .expect_err("a script line is keyed by its prompt, never by a text")
             .contains("needs key or input_ids"));
+    }
+
+    #[test]
+    fn sampled_logprobs_are_made_up_once_the_ids_are_known() {
+        use llm_tokenizer::MockTokenizer;
+        let tokenizer = MockTokenizer::new();
+        let answer = parse(r#"{"output_text": "hello world", "logprobs": "sampled"}"#)
+            .expect("answer")
+            .answer;
+        assert_eq!(answer.logprobs, None, "nothing before the encode");
+        let encoded = answer.encoded_with(&tokenizer).expect("encoded");
+        let logprobs = encoded.logprobs.expect("one logprob per id");
+        assert_eq!(logprobs.len(), encoded.output_ids.len());
+        assert!(logprobs.iter().all(|lp| *lp < 0.0));
+        let with_ids = parse(r#"{"output_ids": [4, 5], "logprobs": "sampled"}"#)
+            .expect("answer")
+            .answer
+            .encoded_with(&tokenizer)
+            .expect("encoded");
+        assert_eq!(with_ids.logprobs, Some(vec![-0.125, -0.25]));
+        assert_eq!(with_ids.token_frames().len(), 2, "one logprob per frame");
+        assert!(parse(r#"{"output_text": "x", "logprobs": "random"}"#).is_err());
+    }
+
+    #[test]
+    fn an_answer_scripted_with_ids_gets_its_sampled_logprobs_on_the_wire() {
+        // Through `take_ids`, the token wires' path: an answer that carries
+        // ids skips the encode, and its sampled logprobs are made up all the
+        // same, so a request that asks for logprobs is answered with them.
+        let worker = "zmq:sampled-logprobs";
+        register(worker);
+        let scripted = parse(
+            r#"{"input_ids": [4101, 4102, 4103], "output_ids": [4, 5], "logprobs": "sampled"}"#,
+        )
+        .expect("answer");
+        assert!(enqueue(worker, vec![scripted]).is_some());
+        let answer = take_ids(&Config::default(), worker, &[4101, 4102, 4103])
+            .expect("nothing to encode, so no tokenizer is needed")
+            .expect("the scripted answer");
+        assert_eq!(answer.output_ids, vec![4, 5]);
+        assert_eq!(answer.logprobs, Some(vec![-0.125, -0.25]));
+        assert_eq!(answer.token_frames().len(), 2, "one logprob per frame");
     }
 
     #[test]

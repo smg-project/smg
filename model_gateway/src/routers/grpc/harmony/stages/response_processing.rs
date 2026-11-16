@@ -13,7 +13,7 @@ use crate::{
         error,
         grpc::{
             common::stages::{ProcessStage, RateLimitCell},
-            context::{DispatchContext, FinalResponse},
+            context::{wrong_response_spec, DispatchContext, FinalResponse},
             spec::{HarmonyResponseSpec, ResponseSpec},
             utils::StreamSource,
         },
@@ -54,13 +54,8 @@ impl ProcessStage for HarmonyResponseProcessingStage {
         spec: ResponseSpec,
     ) -> Result<Option<Response>, Response> {
         let ResponseSpec::Harmony(harmony_spec) = spec else {
-            error!(
-                function = "HarmonyResponseProcessingStage::process",
-                "Wrong response spec"
-            );
-            return Err(error::internal_error(
-                "wrong_response_spec",
-                "Wrong response spec",
+            return Err(wrong_response_spec(
+                "HarmonyResponseProcessingStage::process",
             ));
         };
 
@@ -143,8 +138,9 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                 Ok(None)
             }
             HarmonyResponseSpec::Responses(responses_request) => {
-                // For streaming Responses API, leave execution_result in context
-                // for external streaming processor (serve_harmony_responses_stream)
+                // For streaming Responses API, leave execution_result (and the
+                // router's stop obligations beside it) in context for the
+                // external streaming processor (serve_harmony_responses_stream)
                 if is_streaming {
                     // Don't take execution_result - let the caller handle it
                     return Ok(None);
@@ -171,10 +167,15 @@ impl ProcessStage for HarmonyResponseProcessingStage {
 
                 let (iteration_result, counts) = self
                     .processor
-                    .process_responses_iteration(execution_result, responses_request, dispatch)
+                    .process_responses_iteration(
+                        execution_result,
+                        responses_request,
+                        dispatch,
+                        &router_stops,
+                    )
                     .await?;
 
-                ctx.response.responses_iteration_result = Some(iteration_result);
+                ctx.response.responses_iteration_result = Some(Box::new(iteration_result));
                 // The engine's counts, for the settlement of the iteration's
                 // reservation, as the chat branch records them.
                 ctx.response.engine_counts = Some(counts);

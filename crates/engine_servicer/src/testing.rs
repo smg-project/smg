@@ -7,15 +7,26 @@ use std::{
     net::{SocketAddr, TcpStream},
     panic::Location,
     path::Path,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{mpsc, Arc, Mutex, OnceLock, PoisonError},
+    thread,
     time::Duration,
 };
 
 use engine_zmq_client::mock_engine::MOCK_DEADLINE;
+use smg_grpc_client::common_proto::KvEventBatch;
 use tokio::time::timeout;
+use tonic::Streaming;
 use tracing_subscriber::EnvFilter;
 
 use crate::{kv_events::KvEventRelay, ServicerConfig};
+
+/// The handshake endpoint of one test: an IPC socket under its own
+/// directory. A probed TCP port is not reserved, so two tests running in
+/// parallel could pick the same one and a mock engine would handshake with
+/// the other test's servicer and wait forever for its INIT.
+pub(crate) fn handshake_address(dir: &Path) -> String {
+    format!("ipc://{}", dir.join("handshake").display())
+}
 
 /// The servicer configuration every servicer test starts from: an ephemeral
 /// port, the engine's data-plane sockets under the test's own directory,
@@ -50,6 +61,30 @@ pub(crate) trait Bounded: Future + Sized {
 }
 
 impl<F: Future> Bounded for F {}
+
+/// The lifecycle owner's reports that the engine process is alive (`report`
+/// on `server`): one at once, then one each 50 ms until the returned sender
+/// drops. The later ones come from a thread of their own, as a launcher's
+/// do: the pace of the test's own thread on a loaded host then leaves no
+/// gap in them for a short silence bound to expire in.
+#[must_use = "the reports stop when this drops"]
+pub(crate) fn reported_alive<S: Send + Sync + 'static>(
+    server: Arc<S>,
+    report: fn(&S),
+) -> mpsc::Sender<()> {
+    // One report before the thread's first turn, which a loaded host can
+    // itself delay past a short silence bound.
+    report(&server);
+    let (until_dropped, dropped) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        while dropped.recv_timeout(Duration::from_millis(50))
+            == Err(mpsc::RecvTimeoutError::Timeout)
+        {
+            report(&server);
+        }
+    });
+    until_dropped
+}
 
 /// `count` publishers bound on consecutive ports from the returned base, as
 /// a data-parallel engine lays its ranks' publishers out (rank `r` on the
@@ -274,6 +309,24 @@ pub(crate) async fn bound_publisher() -> (zeromq::PubSocket, String) {
             .to_string(),
     );
     (publisher, format!("tcp://*:{port}"))
+}
+
+/// The stream's next batch within five seconds (the reads' own deadline, not
+/// the mock engine's): a timeout, a status or a closed stream fails the test
+/// at the reading line.
+#[track_caller]
+pub(crate) fn next_batch(
+    stream: &mut Streaming<KvEventBatch>,
+) -> impl Future<Output = KvEventBatch> + '_ {
+    let caller = Location::caller();
+    async move {
+        match timeout(Duration::from_secs(5), stream.message()).await {
+            Ok(Ok(Some(batch))) => batch,
+            Ok(Ok(None)) => panic!("{caller}: the stream closed before a batch"),
+            Ok(Err(status)) => panic!("{caller}: the stream failed: {status}"),
+            Err(_) => panic!("{caller}: no batch within five seconds"),
+        }
+    }
 }
 
 /// The first two batches of a publisher the relay subscribed to at boot,

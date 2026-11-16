@@ -45,7 +45,7 @@ mod tests {
         event::{DropReason, Event, FinishReason, MalformedReason, Text},
         input::EngineFinish,
         testing::{
-            arguments_of, bytes, content, drive, drive_to, dropped, reasoning,
+            arguments_of, bytes, calls, content, drive, drive_to, dropped, reasoning,
             the_same_at_every_cut,
         },
         Declared,
@@ -57,10 +57,10 @@ mod tests {
             function: Function {
                 name: "ChaDri_change_drink".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "drink_id": {"type": "string"},
                     "new_preferences": {"type": "object"},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -84,7 +84,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },
@@ -479,7 +479,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },
@@ -713,7 +713,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },
@@ -806,15 +806,22 @@ mod tests {
     /// The call blocks a model botched, from the outputs a live cell recorded, and what the table
     /// says of each, whole, character by character and at every two-way cut: the prose before the
     /// blocks is the content, the calls the model wrote whole are the calls, a call whose pair was
-    /// botched keeps the pairs it read, and nothing of a block reaches the content, its tags least
-    /// of all; the failure is counted by malformed events of no bytes, and what was refused is the
-    /// debris the content once carried, byte for byte.
+    /// botched keeps the pairs it read and gets no close (its arguments stay the members read,
+    /// open, or nothing when it read none: no whole call, which is how a client is told), and
+    /// nothing of a block reaches the content, its tags least of all; the failure is counted by
+    /// malformed events of no bytes, and what was refused is the debris the content once carried,
+    /// byte for byte.
     #[test]
     fn a_botched_block_leaves_no_debris_in_the_content_and_is_counted() {
+        /// What a call's arguments read as: a whole value, or nothing, every pair refused.
+        enum Arguments {
+            Whole(serde_json::Value),
+            None,
+        }
         struct Case {
             output: &'static str,
             content: &'static str,
-            calls: Vec<(&'static str, serde_json::Value)>,
+            calls: Vec<(&'static str, Arguments)>,
             first: MalformedReason,
             refused: &'static str,
         }
@@ -822,7 +829,7 @@ mod tests {
             Case {
                 output: RECORDED_STRAY_CLOSE,
                 content: "I'll perform a t-test to check if there's a statistically significant difference between these two datasets.",
-                calls: vec![("t_test", value!({"dataset_A": [12, 24, 36], "dataset_B": [15, 30, 45]}))],
+                calls: vec![("t_test", Arguments::Whole(value!({"dataset_A": [12, 24, 36], "dataset_B": [15, 30, 45]})))],
                 first: MalformedReason::TagOutOfPlace,
                 refused: "</arg_value>",
             },
@@ -830,10 +837,10 @@ mod tests {
                 output: RECORDED_KEY_NEVER_OPENED,
                 content: "I'll look up the presidents and vice presidents for those years. Since these are independent lookups, I'll make all the calls at once:",
                 calls: vec![
-                    ("get_president_and_vp_for_year", value!({"year": 1980})),
-                    ("get_president_and_vp_for_year", value!({"year": 2016})),
-                    ("get_president_and_vp_for_year", value!({})),
-                    ("get_president_and_vp_for_year", value!({})),
+                    ("get_president_and_vp_for_year", Arguments::Whole(value!({"year": 1980}))),
+                    ("get_president_and_vp_for_year", Arguments::Whole(value!({"year": 2016}))),
+                    ("get_president_and_vp_for_year", Arguments::None),
+                    ("get_president_and_vp_for_year", Arguments::None),
                 ],
                 first: MalformedReason::TagOutOfPlace,
                 refused: "</arg_key><arg_value>1975</arg_value></arg_key><arg_value>2011</arg_value>",
@@ -842,8 +849,8 @@ mod tests {
                 output: RECORDED_KEYS_CLOSED_BY_VALUE_CLOSES,
                 content: "I'll retrieve your transaction history and calculate your balance for you.",
                 calls: vec![
-                    ("bank_get_transaction_history", value!({})),
-                    ("bank_calculate_balance", value!({"account": "00125648"})),
+                    ("bank_get_transaction_history", Arguments::None),
+                    ("bank_calculate_balance", Arguments::Whole(value!({"account": "00125648"}))),
                 ],
                 first: MalformedReason::TagCutShort,
                 refused: "<arg_key>account: </arg_value>\"00125648\"</arg_value><arg_key>days: 7</arg_value>",
@@ -861,7 +868,7 @@ mod tests {
             Case {
                 output: RECORDED_PROSE_THEN_A_CALL,
                 content: "",
-                calls: vec![("prediction_evolution", value!({"species": "Homo sapiens", "years": 50}))],
+                calls: vec![("prediction_evolution", Arguments::Whole(value!({"species": "Homo sapiens", "years": 50})))],
                 first: MalformedReason::TextWhereTheNameShouldBe,
                 refused: "modify text with tool call<tool_call>",
             },
@@ -882,15 +889,18 @@ mod tests {
                 let place = || format!("{:?} in {} pieces", &case.output[..40], pieces.len());
                 assert_eq!(bytes(&events), case.output, "{}", place());
                 assert_eq!(content(&events), case.content, "{}", place());
-                assert_eq!(
-                    calls_of(&events),
-                    case.calls
-                        .iter()
-                        .map(|(name, arguments)| (name.to_string(), arguments.clone()))
-                        .collect::<Vec<_>>(),
-                    "{}",
-                    place()
-                );
+                let read = calls(&events);
+                assert_eq!(read.len(), case.calls.len(), "{}: {read:?}", place());
+                for ((name, expected), (read_name, text)) in case.calls.iter().zip(&read) {
+                    assert_eq!(read_name, name, "{}", place());
+                    let value = serde_json::from_str::<serde_json::Value>(text);
+                    match expected {
+                        Arguments::Whole(whole) => {
+                            assert_eq!(value.ok().as_ref(), Some(whole), "{}: {text:?}", place());
+                        }
+                        Arguments::None => assert_eq!(text, "", "{}", place()),
+                    }
+                }
                 let malformed = malformed(&events);
                 assert!(
                     malformed.iter().all(|(_, text)| text.is_empty()),
@@ -914,5 +924,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The draw a fleet verifier once saw on the attributed syntax, on this one: a block that
+    /// names the tool and writes both values without their tag, so the syntax read no pair. The
+    /// call used to close as `{}`, a well-formed call under `tool_calls` with nothing on the wire
+    /// saying it had failed. Now it is no whole call: the syntax writes no close for it, so its
+    /// arguments are no JSON value, which a chat client's own reader refuses and the Responses
+    /// item says (`incomplete`); the refused bytes are counted and never content; the Messages
+    /// block keeps the `{}` a cut call's has, as the adapter's notes say.
+    #[test]
+    fn a_call_whose_every_pair_the_syntax_refused_is_no_whole_call_to_any_client() {
+        use crate::adapt;
+        const OUTPUT: &str = concat!(
+            "</think><tool_call>add_integers<arg_key>a</arg_key>17</arg_value>",
+            "<arg_key>b</arg_key>25</arg_value></tool_call>"
+        );
+        let said = the_same_at_every_cut(|pieces| run(PROMPT, pieces), OUTPUT);
+        assert_eq!(said.content, "");
+        assert_eq!(said.reasoning, "");
+        assert_eq!(said.calls, [("add_integers".to_string(), String::new())]);
+
+        let events = run(PROMPT, &[OUTPUT]);
+        assert_eq!(bytes(&events), OUTPUT);
+        let reasons: Vec<MalformedReason> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, why } => {
+                    assert!(text.text.is_empty(), "{event:?}");
+                    Some(*why)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            reasons.contains(&MalformedReason::TextBetweenTags)
+                && reasons.contains(&MalformedReason::TagOutOfPlace),
+            "{reasons:?}"
+        );
+        let refused: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(&*text.text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            refused.contains("17") && refused.contains("25"),
+            "{refused:?}"
+        );
+
+        // Chat Completions: the call, under `tool_calls`, with arguments a strict reader refuses.
+        let choice = adapt::chat::message(0, &events);
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(choice.message.content, None);
+        let calls = choice.message.tool_calls.as_deref().expect("a call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "add_integers");
+        let arguments = calls[0].function.arguments.as_deref().expect("arguments");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(arguments).is_err(),
+            "{arguments:?} reads as a whole value"
+        );
+
+        // Responses: the item says the call is incomplete.
+        let output = adapt::responses::output("resp", &events);
+        let items = serde_json::to_value(&output.items).expect("wire");
+        assert_eq!(items.as_array().map(Vec::len), Some(1), "{items}");
+        assert_eq!(items[0]["type"], "function_call", "{items}");
+        assert_eq!(items[0]["name"], "add_integers", "{items}");
+        assert_eq!(items[0]["status"], "incomplete", "{items}");
+
+        // Messages: the block carries `{}`, as a cut call's does; the call is not refused.
+        let message = adapt::messages::output(&events);
+        assert!(message.refused.is_empty(), "{:?}", message.refused);
+        let blocks = serde_json::to_value(&message.content).expect("wire");
+        assert_eq!(blocks[0]["type"], "tool_use", "{blocks}");
+        assert_eq!(blocks[0]["input"], serde_json::json!({}), "{blocks}");
     }
 }

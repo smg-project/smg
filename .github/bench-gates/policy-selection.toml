@@ -1,0 +1,72 @@
+# Regression gate for `cargo bench -p smg --bench policy_selection`, run by
+# .github/workflows/benchmark-policy-selection.yml on pull requests through scripts/bench_gate.py.
+#
+# The gate runs the regular placement as the routers' single-worker selection runs it, at 128 and
+# 1,024 workers: under round robin, under cache-aware, under cache-aware as a first attempt places
+# (no ledger filter handed) and under cache-aware with a request's context demand (eight ids, about
+# 80 seconds a run). The other groups of the file are not gated: the pair placement and the
+# filtered retry run 10 to 80 us a placement and have no kept figure to hold yet, the simple
+# policies' picks run 20 ns to 3 us on a pool the gate would have to pin, the several-threads
+# placement needs a core a thread where the gate pins one, and the rest have gates or cells of
+# their own. A push to main keeps running the whole file.
+#
+# The two placement groups start the gateway's metrics recorder, as a serving process has one.
+# Without it the bench timed a form no request runs. Round robin's selection count built its key
+# on every placement: its rows read 276 ns, and 255 ns with the recorder. The cache-aware rows
+# read 1.8 to 1.9 us with nothing to take their counts, and 2.0 to 2.3 us with the recorder.
+# A cell drains the recorder between its timed stretches, as that process's upkeep does.
+#
+# Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) /
+# median of the per-run criterion medians over ten pinned runs of one build through this gate (five
+# "base" and five "pull request" runs of the same executable, the base side a copy with one byte
+# appended), read three times on a shared many-core build host at a load of 24 to 100, the third
+# time with the recorder started:
+#
+#   row                               first reading   second reading   third reading   threshold
+#   round_robin/128                   0.9 %           1.1 %            2.1 %           10 %
+#   round_robin/1024                  2.5 %           1.1 %            1.9 %           10 %
+#   cache_aware/128                   4.1 %           2.9 %            2.9 %           10 %
+#   cache_aware/1024                  5.2 %           2.0 %            4.3 %           10 %
+#   cache_aware_first_attempt/128     2.7 %           4.7 %            2.8 %           10 %
+#   cache_aware_first_attempt/1024    3.4 %           2.9 %            3.8 %           10 %
+#   cache_aware_context/128           3.4 %           1.7 %            1.4 %           10 %
+#   cache_aware_context/1024          14.8 %          3.9 %            6.1 %           10 %
+#
+# A threshold is its row's own: the smallest multiple of 5 % that is at least twice the lowest of
+# the row's readings, never under 10 %. A width that sits in single runs and moves to another
+# row in the next reading is the host's: it is named here and not priced into the gate. The 14.8 %
+# is one run of the first twenty, 2,211 ns where the other nineteen read 1,921 to 2,031 ns. Every
+# reading passes at 10 % (0 failed, 0 suspect of 8 ids). On top of the threshold the gate fails
+# an id only when every pull-request run is slower than every base run (scripts/bench_gate.py),
+# so one slow run cannot fail the job. Every job uploads bench-gate/results.json with the raw
+# per-run medians of both sides. The hosted runner's own reading, taken from those, decides from
+# then on: a row whose spread reads above 5 % there takes 15 %, and a row above 7.5 % in each of
+# its readings is reported and not gated.
+#
+# Placement. The workflow builds its binaries, the gate's pair and the summary run's, with every
+# function on a 64-byte boundary (RUSTFLAGS: `-C llvm-args=-align-all-functions=6`, beside the
+# outliner flag of .cargo/config.toml). symphony.toml records why: identical code sits in one of
+# two speed states chosen by where its unchanged hot functions land modulo 64, and a pull
+# request's code size alone moved them. An inserted pass over the candidates (one availability
+# read a candidate on every placement, never committed) is caught: 8 of 8 ids failed and 0 were
+# suspect, each confirmed by the re-measure round, the cache-aware rows at +124 to +125 % with 128
+# workers and +927 to +941 % with 1,024, the round robin rows at +804 % and +6,451 %. A planted
+# cost of 24 ns a placement passed, as the threshold says: +8.7 and +8.8 % on the round robin
+# rows, +0.7 to +3.4 % on the cache-aware rows. Both were read before the recorder was started,
+# on round robin rows of 276 ns. Those rows read 226 ns now, and the hash ring fetched again for
+# every policy, 29 ns a placement, fails them: +13.4 and +12.4 %, 2 of 8 ids failed and 0
+# suspect.
+
+repeats = 3
+filter = "^regular_placement/(round_robin|cache_aware|cache_aware_first_attempt|cache_aware_context)/"
+
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
+# bench target of its own.
+sources = ["model_gateway/benches/policy_selection.rs"]
+
+[[gate]]
+pattern = "^regular_placement/"
+threshold = 0.10
+note = "identical build 0.9 - 3.9 %, the lowest of three readings a row"

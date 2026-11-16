@@ -51,7 +51,7 @@ impl OutputSpelling {
             .iter()
             .filter(|tool| tool.function.strict == Some(true))
             .find_map(|tool| {
-                let why = self.loose(&tool.function.parameters)?;
+                let why = self.loose(tool.function.parameters_schema())?;
                 Some(format!(
                     "tool '{}' is strict, and this model's calls cannot be held to {why}",
                     tool.function.name

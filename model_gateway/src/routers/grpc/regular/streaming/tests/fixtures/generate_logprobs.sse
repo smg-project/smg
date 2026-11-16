@@ -1,0 +1,6 @@
+data: {"text":"ab","output_ids":[97,98],"meta_info":{"id":"gen-bytes-0","finish_reason":null,"prompt_tokens":0,"weight_version":"default","input_token_logprobs":[[null],[-0.25]],"output_token_logprobs":[[-0.5,97.0],[-0.5,98.0]],"completion_tokens":2,"cached_tokens":0,"reasoning_tokens":0},"index":0}
+
+data: {"text":"abc","output_ids":[99],"meta_info":{"id":"gen-bytes-0","finish_reason":null,"prompt_tokens":0,"weight_version":"default","input_token_logprobs":[[null],[-0.25]],"output_token_logprobs":[[-0.5,97.0],[-0.5,98.0],[-0.5,99.0]],"completion_tokens":3,"cached_tokens":0,"reasoning_tokens":0},"index":0}
+
+data: {"text":"abc","output_ids":[],"meta_info":{"id":"gen-bytes-0","finish_reason":{"type":"stop"},"prompt_tokens":1,"weight_version":"default","input_token_logprobs":[[null],[-0.25]],"output_token_logprobs":[[-0.5,97.0],[-0.5,98.0],[-0.5,99.0]],"completion_tokens":3,"cached_tokens":0,"reasoning_tokens":0,"e2e_latency":0},"index":0}
+

@@ -173,6 +173,23 @@ bytes' length, and mark the request's span; how a gateway surfaces that (metric,
 and whether a request may ask for the reasons on the wire) is the gateway's policy, documented with
 its parse-failure telemetry.
 
+What a failure leaves behind in the gateway this repository ships (its `symphony/telemetry`
+module), for the record: per table, counters of outputs by outcome (`clean`, `malformed`,
+`failed`, `empty`, `unknown_tool`, `panicked`) and of malformed runs by reason; for an output
+that was not clean, one log line at WARN with the request id, the choice, the table, the outcome,
+the first run's reason, its place and length in the output, the bytes released, the engine's
+finish and the calls, bounded per table and reason (a burst of twenty lines, then two a second,
+the lines refused meanwhile counted on the next one written), so a flood of one shape hides no
+other; and the same facts as fields of the request's span (`symphony.table`, `symphony.outcome`,
+`symphony.choice`, `symphony.reason`, `symphony.bytes`, `symphony.malformed_bytes`,
+`symphony.finish`), recorded when the output ends, once per request (the first reading that was
+not clean), so a trace of the request carries the reading as attributes, the sampled line carries
+them with the request id, and a whole response's access-log line says how its output read even
+where the output's line was bounded away; a streamed response's access-log line goes out before
+the reading and carries them only where the stream's end line is written (`access_log_fields` with
+`response_bytes`). A clean output leaves one counter increment and nothing else. Nothing
+of any of this reaches the client: the response is the same bytes whatever was recorded.
+
 ## The seam with a caller
 
 A caller (a gateway, a test harness, a tool) does four things: picks the table (`formats::for_model`

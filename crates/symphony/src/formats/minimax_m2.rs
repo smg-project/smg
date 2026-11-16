@@ -74,12 +74,12 @@ mod tests {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "days": {"type": "integer"},
                     "metric": {"type": "boolean"},
                     "options": {"type": "object"},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },

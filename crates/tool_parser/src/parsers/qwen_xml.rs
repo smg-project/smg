@@ -802,7 +802,7 @@ mod tests {
             function: Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: serde_json::json!({"type": "object", "properties": props}),
+                parameters: Some(serde_json::json!({"type": "object", "properties": props})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -906,13 +906,13 @@ mod tests {
             function: Function {
                 name: "bash".to_string(),
                 description: None,
-                parameters: serde_json::json!({
+                parameters: Some(serde_json::json!({
                     "type": "object",
                     "properties": {
                         "command": {"type": "string"},
                         "timeout": {"type": "integer"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },

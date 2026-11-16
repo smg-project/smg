@@ -1,4 +1,4 @@
-//! A bound on the client connections the HTTP listener holds open at once.
+//! A bound on the client connections an HTTP listener holds open at once.
 //!
 //! The listener accepts without bound: a connection flood, or clients piling
 //! up behind a slow upstream, is bounded by the process's file descriptors
@@ -24,7 +24,10 @@
 //! protects the process, which is not the orchestrator's cue to restart it.
 //! Probes that reach the gateway through the bounded listener are subject to
 //! the bound like every other connection; the dedicated probe listener
-//! (`--health-check-port`) serves them outside it.
+//! (`--health-check-port`) serves them outside it. The data listener's bound
+//! (`--max-connections`) and the admin listener's (`--admin-max-connections`)
+//! are two acceptors over their own permits: the counter is one for both by
+//! design, and the WARN and the refusal name the listener.
 //!
 //! The permit is held by the connection's stream, so it is released when the
 //! connection closes, however it closes: by the client, by a connection
@@ -52,9 +55,42 @@ use tracing::{debug, warn};
 
 use crate::observability::{log_throttle::LogThrottle, metrics::Metrics};
 
+/// The listener a bound belongs to, for the words of its refusals: the
+/// counter `smg_http_connections_rejected_total` is one for both by design,
+/// so the log and the closed connection's error say which listener refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundedListener {
+    /// The data listener, bounded by `--max-connections`.
+    Data,
+    /// The admin listener, bounded by `--admin-max-connections`.
+    Admin,
+}
+
+impl BoundedListener {
+    /// The words of a refusal, the listener and its flag: shared by the
+    /// WARN, the DEBUG line and the closed connection's error.
+    pub(crate) fn limit_reached(self) -> &'static str {
+        match self {
+            Self::Data => "the data listener's connection limit (--max-connections) is reached",
+            Self::Admin => {
+                "the admin listener's connection limit (--admin-max-connections) is reached"
+            }
+        }
+    }
+
+    /// The listener's name, the `listener` field of the log lines.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::Admin => "admin",
+        }
+    }
+}
+
 /// The bound, as a semaphore with one permit per connection.
 #[derive(Debug)]
 struct Bound {
+    listener: BoundedListener,
     max_connections: usize,
     permits: Arc<Semaphore>,
 }
@@ -86,14 +122,15 @@ impl fmt::Debug for ConnectionLimitStats {
 
 impl Default for ConnectionLimitStats {
     fn default() -> Self {
-        Self::new(0)
+        Self::new(BoundedListener::Data, 0)
     }
 }
 
 impl ConnectionLimitStats {
-    fn new(max_connections: usize) -> Self {
+    fn new(listener: BoundedListener, max_connections: usize) -> Self {
         Self {
             bound: (max_connections > 0).then(|| Bound {
+                listener,
                 max_connections,
                 // The runtime refuses more permits than this at construction
                 // (`ConfigValidator` names the bound; a library caller's
@@ -125,36 +162,41 @@ impl ConnectionLimitStats {
         self.rejected.load(Ordering::Relaxed)
     }
 
-    /// A permit for one more connection: `Ok(None)` without a bound,
-    /// `Err(())` at the bound, with the refusal counted and logged.
-    fn admit(&self) -> Result<Option<OwnedSemaphorePermit>, ()> {
+    /// A permit for one more connection: `Ok(None)` without a bound, the
+    /// refusing listener at the bound, with the refusal counted and logged.
+    fn admit(&self) -> Result<Option<OwnedSemaphorePermit>, BoundedListener> {
         let Some(bound) = &self.bound else {
             return Ok(None);
         };
         match Arc::clone(&bound.permits).try_acquire_owned() {
             Ok(permit) => Ok(Some(permit)),
             Err(_) => {
+                let listener = bound.listener;
                 let max_connections = bound.max_connections;
                 let rejected = self.rejected.fetch_add(1, Ordering::Relaxed) + 1;
                 if let Some(admitted) = self.warn_log.admit() {
                     warn!(
+                        listener = listener.name(),
                         max_connections,
                         rejected,
                         suppressed = admitted.suppressed,
-                        "The HTTP connection limit is reached: a connection beyond it is closed \
-                         at once without a response; refusals are counted in \
-                         smg_http_connections_rejected_total and logged here at most once a \
-                         minute (suppressed: the refusals since the last line)"
+                        "{}: a connection beyond it is closed at once without a response; \
+                         refusals are counted in smg_http_connections_rejected_total and \
+                         logged here at most once a minute (suppressed: the refusals since \
+                         the last line)",
+                        listener.limit_reached()
                     );
                 } else {
                     debug!(
+                        listener = listener.name(),
                         max_connections,
                         rejected,
-                        "Connection closed at accept: the HTTP connection limit is reached"
+                        "Connection closed at accept: {}",
+                        listener.limit_reached()
                     );
                 }
                 Metrics::record_http_connection_rejected();
-                Err(())
+                Err(listener)
             }
         }
     }
@@ -172,12 +214,13 @@ pub struct ConnectionLimitAcceptor<A> {
 }
 
 impl<A> ConnectionLimitAcceptor<A> {
-    /// Bounds `inner` to `max_connections` open connections; `0` is no bound
-    /// (every connection passes straight through, uncounted).
-    pub fn new(inner: A, max_connections: usize) -> Self {
+    /// Bounds `inner`, the `listener`'s acceptor, to `max_connections` open
+    /// connections; `0` is no bound (every connection passes straight
+    /// through, uncounted).
+    pub fn new(inner: A, listener: BoundedListener, max_connections: usize) -> Self {
         Self {
             inner,
-            stats: Arc::new(ConnectionLimitStats::new(max_connections)),
+            stats: Arc::new(ConnectionLimitStats::new(listener, max_connections)),
         }
     }
 
@@ -199,13 +242,16 @@ where
     type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
-        let Ok(permit) = self.stats.admit() else {
+        let permit = match self.stats.admit() {
+            Ok(permit) => permit,
             // `stream` goes out of scope here, unread and unwritten: that is
             // the close. The server drops a connection its acceptor refused.
-            return Box::pin(std::future::ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                "the HTTP connection limit is reached",
-            ))));
+            Err(listener) => {
+                return Box::pin(std::future::ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    listener.limit_reached(),
+                ))));
+            }
         };
         let inner = self.inner.accept(stream, service);
         Box::pin(async move {
@@ -320,6 +366,7 @@ mod tests {
         let handle = Handle::new();
         let acceptor = ConnectionLimitAcceptor::new(
             http_acceptor(ConnectionTimeouts::disabled()),
+            BoundedListener::Data,
             max_connections,
         );
         let stats = acceptor.stats();
@@ -441,7 +488,7 @@ mod tests {
     /// window (its boundaries are the throttle's own tests' business).
     #[test]
     fn a_refusal_is_logged_at_warn_once_per_interval() {
-        let stats = ConnectionLimitStats::new(1);
+        let stats = ConnectionLimitStats::new(BoundedListener::Data, 1);
         let start = std::time::Instant::now();
         let admitted = |at: Duration| stats.warn_log.admit_at(start + at).map(|a| a.suppressed);
         assert_eq!(admitted(Duration::ZERO), Some(0), "the first refusal");
@@ -457,6 +504,29 @@ mod tests {
             admitted(WARN_INTERVAL * 2 + Duration::from_secs(1)),
             Some(1)
         );
+    }
+
+    /// A refusal's words name the listener and its flag, per listener, and
+    /// the refusing listener comes back from the bound so the closed
+    /// connection's error carries the same words.
+    #[test]
+    fn a_refusal_names_the_listener_and_its_flag() {
+        assert_eq!(
+            BoundedListener::Data.limit_reached(),
+            "the data listener's connection limit (--max-connections) is reached"
+        );
+        assert_eq!(
+            BoundedListener::Admin.limit_reached(),
+            "the admin listener's connection limit (--admin-max-connections) is reached"
+        );
+        let stats = ConnectionLimitStats::new(BoundedListener::Admin, 1);
+        let held = stats.admit().expect("within the bound");
+        assert_eq!(
+            stats.admit().expect_err("at the bound"),
+            BoundedListener::Admin
+        );
+        drop(held);
+        assert!(stats.admit().is_ok(), "the permit returned");
     }
 
     #[tokio::test]

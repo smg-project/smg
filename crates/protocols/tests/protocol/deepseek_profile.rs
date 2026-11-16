@@ -463,3 +463,96 @@ fn an_opaque_model_under_the_names_of_two_versions_keeps_the_v4_reading() {
         .validate()
         .is_ok());
 }
+
+/// The sampling and length fields leave this profile as the client wrote
+/// them. The family's reference library resolves them for the vendor's own
+/// serving instead: `temperature` 1.0 in thinking mode; `top_p` at least
+/// 0.95 under V4.1 thinking, 0.95 under V4 thinking with tools, 1.0 under V4
+/// thinking without them and under V4.1 outside thinking; an absent
+/// `max_tokens` 8192 outside thinking, 65536 in it and 131072 at `max`
+/// effort, within the context left after the prompt; a `max_tokens` above
+/// 393216 and an `n` other than 1 refused. A self-hosted engine fills an
+/// absent value with its own default, bounds the budget by its own window,
+/// serves `n` choices and honours a value the client wrote, so the request
+/// keeps its fields and the profile adds none.
+#[test]
+fn deepseek_sampling_and_length_fields_leave_the_profile_as_the_client_wrote_them() {
+    let tools = json!([{"type": "function", "function": {"name": "weather",
+        "parameters": {"type": "object", "properties": {}}}}]);
+    for model in ["deepseek-v4-pro", "deepseek-ai/DeepSeek-V4.1-Flash"] {
+        // A value the client wrote stays: in either thinking mode, with or
+        // without tools, below and above the vendor's thinking floor.
+        for (extra, thinking, temperature, top_p, max_tokens) in [
+            (
+                json!({"temperature": 0.2, "top_p": 0.5}),
+                true,
+                Some(0.2),
+                Some(0.5),
+                None,
+            ),
+            (
+                json!({"temperature": 0.2, "top_p": 0.5, "reasoning_effort": "none"}),
+                false,
+                Some(0.2),
+                Some(0.5),
+                None,
+            ),
+            (
+                json!({"temperature": 0.2, "top_p": 0.5, "tools": tools}),
+                true,
+                Some(0.2),
+                Some(0.5),
+                None,
+            ),
+            (json!({"top_p": 0.99}), true, None, Some(0.99), None),
+            (
+                json!({"max_tokens": 4096, "reasoning_effort": "max"}),
+                true,
+                None,
+                None,
+                Some(4096),
+            ),
+            // An absent value stays absent in every mode and effort.
+            (json!({}), true, None, None, None),
+            (json!({"reasoning_effort": "none"}), false, None, None, None),
+            (json!({"reasoning_effort": "max"}), true, None, None, None),
+            (json!({"tools": tools}), true, None, None, None),
+        ] {
+            let mut extra = extra;
+            extra["model"] = json!(model);
+            let req = request(extra.clone());
+            assert!(req.validate().is_ok(), "{extra}");
+            assert_eq!(
+                req.chat_template_kwargs
+                    .as_ref()
+                    .and_then(|kwargs| kwargs.get("thinking")),
+                Some(&json!(thinking)),
+                "{extra}"
+            );
+            assert_eq!(
+                (req.temperature, req.top_p, req.output_token_cap()),
+                (temperature, top_p, max_tokens),
+                "{extra}"
+            );
+        }
+        // The vendor's bound on the budget and its one choice per request
+        // are its own serving limits: the window check and `n` stay the
+        // engine's.
+        for extra in [json!({"max_tokens": 393_217}), json!({"n": 2})] {
+            let mut extra = extra;
+            extra["model"] = json!(model);
+            assert!(request(extra.clone()).validate().is_ok(), "{extra}");
+        }
+        // The ranges both refuse.
+        for extra in [
+            json!({"temperature": 2.5}),
+            json!({"top_p": 1.5}),
+            json!({"top_p": 0.0}),
+            json!({"max_tokens": 0}),
+        ] {
+            let mut extra = extra;
+            extra["model"] = json!(model);
+            assert!(request(extra.clone()).validate().is_err(), "{extra}");
+        }
+    }
+}

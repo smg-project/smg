@@ -1,0 +1,135 @@
+{{- if (.Values.policyController).enabled }}
+{{- /* The standalone policy controller, a Deployment of its own: nothing here
+     points the router at it. With the election on the pod runs under the
+     controller's own service account and mounts its token, for the one
+     Lease; with it off the pod mounts none: the controller then calls no
+     Kubernetes API. */}}
+{{- $controller := .Values.policyController }}
+{{- $elected := include "smg.policyControllerElection" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "smg.policyControllerName" . }}
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: policy-controller
+spec:
+  replicas: {{ $controller.replicas }}
+  {{- if $elected }}
+  {{- /* With the election on, one pod more at a time and none unavailable:
+       the new pod stands by, and the old leader's stop hands the Lease
+       over. Off, no strategy is named, as before the election. */}}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "smg.policyControllerSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with $controller.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "smg.policyControllerSelectorLabels" . | nindent 8 }}
+        {{- with $controller.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $elected }}
+      {{- /* The account by its field and by the field's deprecated alias.
+           The server fills the alias on the live object and reads the name
+           back from it, and an upgrade deletes only what a manifest named:
+           with both named here, turning the election off, or a rollback
+           past it, removes both. */}}
+      serviceAccountName: {{ include "smg.policyControllerName" . }}
+      serviceAccount: {{ include "smg.policyControllerName" . }}
+      automountServiceAccountToken: true
+      {{- else }}
+      automountServiceAccountToken: false
+      {{- end }}
+      terminationGracePeriodSeconds: {{ add (int $controller.shutdownGracePeriodSeconds) (int $controller.terminationGraceMarginSeconds) }}
+      containers:
+        - name: policy-controller
+          image: "{{ include "smg.policyControllerImage" . }}"
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          args:
+            {{- include "smg.policyControllerArgs" . | nindent 12 }}
+          ports:
+            - name: gateway
+              containerPort: {{ $controller.ports.gateway }}
+              protocol: TCP
+            - name: control
+              containerPort: {{ $controller.ports.control }}
+              protocol: TCP
+            - name: replication
+              containerPort: {{ $controller.ports.replication }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ $controller.ports.admin }}
+              protocol: TCP
+          {{- with $controller.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ $controller.livenessProbe.path }}
+              port: admin
+            initialDelaySeconds: {{ $controller.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ $controller.livenessProbe.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: {{ $controller.readinessProbe.path }}
+              port: admin
+            initialDelaySeconds: {{ $controller.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ $controller.readinessProbe.periodSeconds }}
+          {{- with $controller.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if or $elected $controller.extraEnv }}
+          env:
+            {{- if $elected }}
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            {{- end }}
+            {{- with $controller.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+      {{- with $controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $controller.affinity }}
+      affinity:
+        {{- toYaml $controller.affinity | nindent 8 }}
+      {{- else if gt (int $controller.replicas) 1 }}
+      {{- /* No affinity of the operator's and more than one replica: prefer
+           one replica a node. */}}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "smg.policyControllerSelectorLabels" . | nindent 20 }}
+      {{- end }}
+      {{- with $controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

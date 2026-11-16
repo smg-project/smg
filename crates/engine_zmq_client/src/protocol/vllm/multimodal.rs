@@ -1,6 +1,9 @@
 // Ported from the Apache-2.0 reference `vllm-engine-core-client`
 // (vllm-project/vllm): protocol/multimodal.rs.
 
+//! Multimodal inputs on the engine's wire: the feature specs, placeholder ranges and
+//! keyword-argument items a request carries.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

@@ -506,7 +506,7 @@ impl MinimaxM3Parser {
         let params_schema = tools
             .iter()
             .find(|t| t.function.name == name)
-            .map(|t| &t.function.parameters);
+            .map(|t| t.function.parameters_schema());
         let arguments = Self::parse_invoke_params(body, params_schema)?;
         let arguments_str = serde_json::to_string(&arguments).ok()?;
 
@@ -600,7 +600,7 @@ impl MinimaxM3Parser {
         let invokes: Vec<Value> = tools
             .iter()
             .filter(|tool| !tool.function.name.is_empty())
-            .map(|tool| Elements::of(&tool.function.parameters).invoke(&tool.function.name))
+            .map(|tool| Elements::of(tool.function.parameters_schema()).invoke(&tool.function.name))
             .collect();
         // An empty list of invokes is unsatisfiable; with no named tool, admit
         // only an empty block.

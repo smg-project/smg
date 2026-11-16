@@ -245,7 +245,8 @@ def test_floor_fails_below(monkeypatch):
     msg = str(excinfo.value)
     assert "only 1 test selected" in msg  # singular for a one-test selection
     assert "floor of 5" in msg
-    assert "E2E_ENGINE" in msg  # points at the env filter as the likely cause
+    assert "E2E_ENGINE" in msg  # points at the env filter as a likely cause
+    assert "-k/-m" in msg  # and at the command line filter the count follows
 
 
 def test_floor_message_pluralizes_above_one(monkeypatch):
@@ -262,6 +263,68 @@ def test_floor_rejects_non_integer(monkeypatch):
     assert "not an integer" in str(excinfo.value)
 
 
+def test_floor_counts_the_items_left_at_collection_finish(monkeypatch):
+    """The floor reads ``session.items`` after every deselection, pytest's
+    ``-k`` included; the env filter's hook, which runs before ``-k``, applies
+    no floor of its own (it used to, against the count before the filter)."""
+    monkeypatch.setenv("E2E_MIN_SELECTED", "2")
+    config = _FakeConfig()
+    items = [_item("t.py::test_a"), _item("t.py::test_b"), _item("t.py::test_c")]
+    _run(config, items)  # three items pass the env filter: no floor applied here
+    session = SimpleNamespace(items=items[:1], testsfailed=0)  # what -k left
+    with pytest.raises(pytest.exit.Exception) as excinfo:
+        hooks._SelectionReporter().pytest_collection_finish(session)
+    assert "only 1 test selected" in str(excinfo.value)
+    hooks._SelectionReporter().pytest_collection_finish(
+        SimpleNamespace(items=items[:2], testsfailed=0)
+    )
+
+
+def _isolated_session(pytester, monkeypatch, floor: int):
+    """A pytester session that loads only ``fixtures.hooks`` with the floor armed."""
+    for key in list(os.environ):
+        if key.startswith(("PYTEST_", "E2E_")):
+            monkeypatch.delenv(key)
+    hook = Path(__file__).with_name("hooks.py").resolve()
+    monkeypatch.setenv("PYTHONPATH", str(hook.parent.parent))
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    monkeypatch.setenv("E2E_MIN_SELECTED", str(floor))
+    pytester.makeconftest('pytest_plugins = ["fixtures.hooks"]\n')
+    return pytester.makeini("[pytest]\n")
+
+
+@pytest.mark.parametrize(
+    ("keyword", "floor", "exit_code"),
+    [("test_kept", 2, 1), ("test_kept", 1, 0), ("test_", 2, 0)],
+)
+def test_floor_follows_the_k_selection_in_a_real_session(
+    pytester, monkeypatch, keyword, floor, exit_code
+):
+    """A real session: ``-k`` keeps one of two tests, so a floor of two fails
+    the run and a floor of one passes it; without the narrowing both pass."""
+    config = _isolated_session(pytester, monkeypatch, floor)
+    case = pytester.makepyfile(
+        test_case="def test_kept():\n    pass\n\n\ndef test_dropped():\n    pass\n"
+    )
+    result = pytester.runpytest_subprocess(
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "-c",
+        str(config),
+        "--confcutdir",
+        str(pytester.path),
+        "-k",
+        keyword,
+        str(case),
+        timeout=10,
+    )
+    assert result.ret == exit_code, result.stdout.str() + result.stderr.str()
+    floored = "below the E2E_MIN_SELECTED floor" in result.stdout.str() + result.stderr.str()
+    assert floored is (exit_code == 1)
+
+
 def test_floor_rejects_negative(monkeypatch):
     """A negative floor can never trip, so take it as a typo, not "no floor"."""
     monkeypatch.setenv("E2E_MIN_SELECTED", "-1")
@@ -276,14 +339,66 @@ def test_floor_zero_is_armed_but_unbreakable(monkeypatch):
     hooks._enforce_selection_floor(0)
 
 
-def test_floor_enforced_from_collection_hook(monkeypatch):
+def test_floor_steps_aside_when_collection_fails_in_a_real_session(pytester, monkeypatch):
+    """A missing test path fails collection before any item exists. The floor
+    lets that error surface with pytest's usage exit code instead of replacing
+    it with its own message over an empty selection."""
+    config = _isolated_session(pytester, monkeypatch, floor=24)
+    result = pytester.runpytest_subprocess(
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "-c",
+        str(config),
+        "--confcutdir",
+        str(pytester.path),
+        str(pytester.path / "missing_test_file.py"),
+        timeout=10,
+    )
+    output = result.stdout.str() + result.stderr.str()
+    assert result.ret == pytest.ExitCode.USAGE_ERROR, output
+    assert "missing_test_file.py" in output
+    assert "below the E2E_MIN_SELECTED floor" not in output
+
+
+def test_floor_steps_aside_when_a_module_fails_to_import_in_a_real_session(pytester, monkeypatch):
+    """A module that fails to import is a recorded collection error, not an
+    exception in flight. pytest reports it after collection and interrupts the
+    run; the floor leaves that exit code and message in place."""
+    config = _isolated_session(pytester, monkeypatch, floor=24)
+    case = pytester.makepyfile(test_broken="import a_helper_that_was_renamed\n")
+    result = pytester.runpytest_subprocess(
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "-c",
+        str(config),
+        "--confcutdir",
+        str(pytester.path),
+        str(case),
+        timeout=10,
+    )
+    output = result.stdout.str() + result.stderr.str()
+    assert result.ret == pytest.ExitCode.INTERRUPTED, output
+    assert "error during collection" in output
+    assert "below the E2E_MIN_SELECTED floor" not in output
+
+
+def test_floor_is_not_enforced_from_the_collection_hook(monkeypatch):
+    """The env filter's hook runs before pytest's ``-k`` deselection, so it
+    applies no floor; ``_SelectionReporter.pytest_collection_finish`` does,
+    over the items that will run."""
     monkeypatch.setenv("E2E_ENGINE", "sglang")
     monkeypatch.setenv("E2E_MIN_SELECTED", "2")
     match = _item("t.py::test_a", engine=("sglang",))
     wrong = _item("t.py::test_b", engine=("vllm",))
     config = _FakeConfig()
+    items = _run(config, [match, wrong])  # one item left of two: no exit here
+    assert items == [match]
     with pytest.raises(pytest.exit.Exception):
-        hooks.pytest_collection_modifyitems(config, [match, wrong])
+        hooks._SelectionReporter().pytest_collection_finish(
+            SimpleNamespace(items=items, testsfailed=0)
+        )
 
 
 def test_floor_satisfied_from_collection_hook(monkeypatch):

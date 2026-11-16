@@ -6,6 +6,7 @@ including validation of configuration parameters and their interactions.
 """
 
 import inspect
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -607,10 +608,10 @@ class TestControlPlaneAuthHalfJwt:
 
 
 class TestKeywordOnlyParametersOfTheCliFlags:
-    """The parameters behind the CLI's --engine-metrics, --pd-pairing-mode,
-    --runtime-worker-threads, --webrtc-bind-addr and --webrtc-stun-server are
-    keyword-only (no positional slot to keep) with the CLI's defaults, and a value
-    the CLI refuses is refused before anything starts."""
+    """The parameters behind the CLI's --engine-metrics, --grouped-dp-sticky,
+    --pd-pairing-mode, --runtime-worker-threads, --webrtc-bind-addr and
+    --webrtc-stun-server are keyword-only (no positional slot to keep) with the
+    CLI's defaults, and a value the CLI refuses is refused before anything starts."""
 
     def test_keyword_only_with_the_cli_defaults(self):
         import inspect
@@ -618,6 +619,7 @@ class TestKeywordOnlyParametersOfTheCliFlags:
         params = inspect.signature(_Router).parameters
         for name in (
             "engine_metrics",
+            "grouped_dp_sticky",
             "pd_pairing_mode",
             "runtime_worker_threads",
             "webrtc_bind_addr",
@@ -632,6 +634,10 @@ class TestKeywordOnlyParametersOfTheCliFlags:
     def test_an_unknown_pairing_mode_is_refused(self):
         with pytest.raises(ValueError, match="pd_pairing_mode"):
             _Router(worker_urls=["http://w:8000"], pd_pairing_mode="sideways").start()
+
+    def test_an_unknown_grouped_dp_pinning_is_refused(self):
+        with pytest.raises(ValueError, match="grouped_dp_sticky"):
+            _Router(worker_urls=["http://w:8000"], grouped_dp_sticky="round_robin").start()
 
     def test_zero_runtime_threads_is_refused(self):
         with pytest.raises(ValueError, match="runtime_worker_threads"):
@@ -659,3 +665,93 @@ class TestJwtConfigRoleClaim:
         assert build_control_plane_auth_config(issuer).jwt.role_claim == "roles"
         auth = build_control_plane_auth_config({**issuer, "jwt_role_claim": "groups"})
         assert auth.jwt.role_claim == "groups"
+
+
+class TestTheRouterRefusesWhatTheCliRefuses:
+    """The binary refuses these flag shapes at parse time; the Router refuses
+    the same values from ``start()`` with the same words, before anything binds."""
+
+    @staticmethod
+    def router(**kwargs) -> _Router:
+        return _Router(worker_urls=["http://worker:8000"], **kwargs)
+
+    def test_a_bucket_list_that_does_not_ascend_is_refused(self):
+        with pytest.raises(ValueError, match="bucket bounds must ascend strictly"):
+            self.router(prometheus_duration_buckets=[1.0, 0.5]).start()
+
+    @pytest.mark.parametrize("bound", [float("nan"), float("inf"), 0.0, -1.0])
+    def test_a_bucket_bound_that_is_not_a_finite_number_above_zero_is_refused(self, bound):
+        with pytest.raises(ValueError, match="every bucket bound must be a finite number above 0"):
+            self.router(prometheus_duration_buckets=[0.5, bound]).start()
+
+    def test_a_role_mapping_to_an_unknown_gateway_role_is_refused(self):
+        from smg.smg_rs import PyControlPlaneAuthConfig, PyJwtConfig
+
+        jwt = PyJwtConfig("https://issuer.example", "aud", None, {"Gateway.Admin": "administrator"})
+        with pytest.raises(ValueError, match="the gateway role must be 'admin' or 'user'"):
+            self.router(control_plane_auth=PyControlPlaneAuthConfig(jwt=jwt)).start()
+
+    def test_a_role_mapping_from_an_empty_idp_role_is_refused(self):
+        from smg.smg_rs import PyControlPlaneAuthConfig, PyJwtConfig
+
+        jwt = PyJwtConfig("https://issuer.example", "aud", None, {"": "admin"})
+        with pytest.raises(ValueError, match="the IdP role must not be empty"):
+            self.router(control_plane_auth=PyControlPlaneAuthConfig(jwt=jwt)).start()
+
+    # The encode side takes the three names the CLI's --encode-policy takes;
+    # the other seven policies are refused with those names in the message.
+    ENCODE_ACCEPTED = {
+        "random": PolicyType.Random,
+        "round_robin": PolicyType.RoundRobin,
+        "consistent_hashing": PolicyType.ConsistentHashing,
+    }
+    ENCODE_REFUSED = {
+        "passthrough": PolicyType.Passthrough,
+        "cache_aware": PolicyType.CacheAware,
+        "power_of_two": PolicyType.PowerOfTwo,
+        "least_load": PolicyType.LeastLoad,
+        "bucket": PolicyType.Bucket,
+        "manual": PolicyType.Manual,
+        "prefix_hash": PolicyType.PrefixHash,
+    }
+
+    @staticmethod
+    def epd_router(**kwargs) -> _Router:
+        return _Router(
+            worker_urls=[],
+            epd_disaggregation=True,
+            encode_urls=[("http://encode:8000", None)],
+            prefill_urls=[("http://prefill:8000", None)],
+            decode_urls=["http://decode:8000"],
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("name", sorted(ENCODE_REFUSED))
+    def test_an_encode_policy_the_cli_refuses_is_refused(self, name):
+        refusal = (
+            f"Invalid value for field 'encode_policy': {name}"
+            " - expected random, round_robin or consistent_hashing"
+        )
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            self.epd_router(encode_policy=self.ENCODE_REFUSED[name]).start()
+
+    @pytest.mark.parametrize("name", sorted(ENCODE_ACCEPTED))
+    def test_an_encode_policy_the_cli_takes_passes(self, name):
+        # `port=0` is refused by the shared validator after the encode policy
+        # is read: the refusal that arrives shows the policy passed and that
+        # nothing bound.
+        with pytest.raises(ValueError, match=re.escape("Invalid value for field 'port'")) as info:
+            self.epd_router(encode_policy=self.ENCODE_ACCEPTED[name], port=0).start()
+        assert "encode_policy" not in str(info.value)
+
+    def test_an_unsupported_encode_policy_outside_epd_is_refused(self):
+        # The shared validator reads the encode policy in EPD mode only; the
+        # binding asks it before anything binds, so the refusal reads the same
+        # without `epd_disaggregation`. `port=0` is the refusal that would
+        # arrive instead if the encode policy passed, so nothing binds either way.
+        refusal = (
+            "Invalid value for field 'encode_policy': cache_aware"
+            " - expected random, round_robin or consistent_hashing"
+        )
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            self.router(encode_policy=PolicyType.CacheAware, port=0).start()

@@ -8,11 +8,12 @@
 //!   by [`plan_sender_tick`]) and then the CRDT ops the peer has not acked.
 //! - [`next_frame`]: the next inbound frame under [`STREAM_IDLE_TIMEOUT`];
 //!   `None` ends the stream (closed, failed or idle).
-//! - [`handle_frame`]: one inbound frame — a heartbeat is answered with one,
-//!   a stream batch and a CRDT batch are applied to the mesh KV (the CRDT one
-//!   acked back), a CRDT ack advances the send watermark, the retired v1
-//!   message types are ignored; an ack or a nack is handed back as a
-//!   [`Frame`] for the end to log or record.
+//! - [`handle_frame`]: one inbound frame — a heartbeat is handed back for the
+//!   end to answer (the acceptor) or not (the dialer), a stream batch and a
+//!   CRDT batch are applied to the mesh KV (the CRDT one acked back), a CRDT
+//!   ack advances the send watermark, the retired v1 message types are
+//!   ignored; an ack or a nack is handed back as a [`Frame`] for the end to
+//!   log or record.
 //! - [`StreamSink`]: the end's outbound channel; the dialer sends plain
 //!   messages, the acceptor sends `Result`s for tonic.
 //!
@@ -21,7 +22,7 @@
 //! it knows the peer's name (given up front, or learned from the first frame
 //! and held to it) and its connection accounting.
 
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -41,9 +42,7 @@ use crate::{
             wrap_crdt_batch,
         },
         limits::{MAX_STREAM_CHUNK_BYTES, STREAM_IDLE_TIMEOUT},
-        sync_stream::{
-            build_heartbeat, build_peer_stream_batches, dispatch_stream_batch, wrap_stream_batch,
-        },
+        sync_stream::{build_peer_stream_batches, dispatch_stream_batch, wrap_stream_batch},
     },
 };
 
@@ -59,12 +58,10 @@ pub(crate) enum SinkError {
 
 /// One end's outbound channel. The dialer's carries `StreamMessage`s, the
 /// acceptor's carries `Result`s for tonic's response stream; the shared code
-/// only needs to queue a frame or wait for room.
+/// only needs to queue a frame.
 pub(crate) trait StreamSink: Send + Sync + 'static {
     /// Queue `msg` without waiting.
     fn try_send(&self, msg: StreamMessage) -> Result<(), SinkError>;
-    /// Send `msg`, waiting for room; `false` once the channel is closed.
-    fn send(&self, msg: StreamMessage) -> impl Future<Output = bool> + Send;
 }
 
 fn sink_error<T>(err: TrySendError<T>) -> SinkError {
@@ -78,19 +75,11 @@ impl StreamSink for mpsc::Sender<StreamMessage> {
     fn try_send(&self, msg: StreamMessage) -> Result<(), SinkError> {
         mpsc::Sender::try_send(self, msg).map_err(sink_error)
     }
-
-    async fn send(&self, msg: StreamMessage) -> bool {
-        mpsc::Sender::send(self, msg).await.is_ok()
-    }
 }
 
 impl StreamSink for mpsc::Sender<Result<StreamMessage, Status>> {
     fn try_send(&self, msg: StreamMessage) -> Result<(), SinkError> {
         mpsc::Sender::try_send(self, Ok(msg)).map_err(sink_error)
-    }
-
-    async fn send(&self, msg: StreamMessage) -> bool {
-        mpsc::Sender::send(self, Ok(msg)).await.is_ok()
     }
 }
 
@@ -204,6 +193,10 @@ pub(crate) async fn next_frame(
 pub(crate) enum Frame {
     /// Handled here; read the next one.
     Continue,
+    /// The peer sent a heartbeat. The accepting end answers it; the dialing
+    /// end does not, or the two would answer each other's answers for as
+    /// long as the stream lives.
+    Heartbeat,
     /// The peer acked (`success` from its payload when it carried one); the
     /// end logs or records it.
     Ack {
@@ -212,12 +205,10 @@ pub(crate) enum Frame {
     },
     /// The peer nacked; the end logs or records it.
     Nack { sequence: u64 },
-    /// The outbound channel is gone: the stream is over.
-    Closed,
 }
 
 /// One inbound frame from `peer`, the same on both ends: a heartbeat is
-/// answered with one (numbered by `next_sequence`), a stream batch is applied
+/// returned for the end to answer or not, a stream batch is applied
 /// to `mesh_kv`, a CRDT batch is merged and its per-key versions acked back
 /// (the ack may be dropped on a full channel: the peer resends unacked keys
 /// next round), a CRDT ack advances `acked`, the retired v1 message types are
@@ -241,12 +232,7 @@ pub(crate) async fn handle_frame<S: StreamSink>(
     match kind {
         StreamMessageType::Heartbeat => {
             log::trace!(peer = %peer, "Received heartbeat");
-            if sink.send(build_heartbeat(next_sequence(), self_name)).await {
-                Frame::Continue
-            } else {
-                log::warn!(peer = %peer, "Failed to send heartbeat");
-                Frame::Closed
-            }
+            Frame::Heartbeat
         }
         StreamMessageType::Ack => {
             let success = match payload {
@@ -482,6 +468,7 @@ mod tests {
         crdt_kv::{Operation, OperationLog, ReplicaId},
         kv::{StreamConfig, StreamRouting},
         service::gossip::StreamAck,
+        transport::sync_stream::build_heartbeat,
         MergeStrategy,
     };
 
@@ -653,10 +640,6 @@ mod tests {
             }
             StreamSink::try_send(&self.inner, msg)
         }
-
-        async fn send(&self, msg: StreamMessage) -> bool {
-            StreamSink::send(&self.inner, msg).await
-        }
     }
 
     #[test]
@@ -721,47 +704,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_heartbeat_is_answered_with_one() {
-        let (tx, mut rx) = mpsc::channel::<Result<StreamMessage, Status>>(4);
+    async fn a_heartbeat_is_handed_to_the_end_unanswered() {
+        let (tx, mut rx) = mpsc::channel::<StreamMessage>(4);
         let acked = RwLock::new(CrdtWatermark::new());
-        let mut seq = || 42;
         let outcome = handle_frame(
             frame(StreamMessageType::Heartbeat, None, 9),
             "peer",
             "me",
             None,
             &acked,
-            &mut seq,
+            &mut || 42,
             &tx,
         )
         .await;
-        assert_eq!(outcome, Frame::Continue);
-        let reply = rx
-            .try_recv()
-            .expect("a heartbeat goes back")
-            .expect("as a message");
-        assert_eq!(reply.message_type(), StreamMessageType::Heartbeat);
-        assert_eq!(reply.sequence, 42);
-        assert_eq!(reply.peer_id, "me");
-        assert!(reply.payload.is_none());
-    }
-
-    #[tokio::test]
-    async fn a_heartbeat_on_a_closed_sink_ends_the_stream() {
-        let (tx, rx) = mpsc::channel::<StreamMessage>(4);
-        drop(rx);
-        let acked = RwLock::new(CrdtWatermark::new());
-        let outcome = handle_frame(
-            frame(StreamMessageType::Heartbeat, None, 1),
-            "peer",
-            "me",
-            None,
-            &acked,
-            &mut || 1,
-            &tx,
-        )
-        .await;
-        assert_eq!(outcome, Frame::Closed);
+        assert_eq!(outcome, Frame::Heartbeat);
+        assert!(rx.try_recv().is_err(), "the handler sends nothing back");
     }
 
     #[tokio::test]

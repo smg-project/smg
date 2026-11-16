@@ -11,13 +11,17 @@ use std::{collections::HashSet, sync::Arc};
 
 pub use activate::ActivateWorkersStep;
 use openai_protocol::worker::{ConnectionMode, WorkerType};
-pub use register::RegisterWorkersStep;
+#[cfg(test)]
+pub(crate) use register::registration_hold;
+pub(crate) use register::REGISTER_WORKERS_STEP;
+pub use register::{registered_entries, registered_in, RegisterWorkersStep};
+pub(crate) use update_policies::start_kv_stream;
 pub use update_policies::UpdatePoliciesStep;
 
 use crate::{
     observability::metrics::Metrics,
     worker::{
-        basic::{ConnectionModeExt, WorkerTypeExt},
+        identity::basic::{ConnectionModeExt, WorkerTypeExt},
         Worker, WorkerRegistry,
     },
 };

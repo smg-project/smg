@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex thread reply",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["reply", "withdraw"],
+  "properties": {
+    "reply": { "type": "string", "description": "The reply to post in the thread." },
+    "withdraw": {
+      "type": "boolean",
+      "description": "True when the finding no longer stands and the reply says so."
+    }
+  }
+}

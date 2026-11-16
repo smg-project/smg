@@ -6,6 +6,7 @@ use serde_json::{de::Deserializer, Value};
 
 use crate::{
     errors::{ParserError, ParserResult},
+    partial_json::PartialJson,
     types::{StreamingParseResult, ToolCallItem},
 };
 
@@ -21,7 +22,7 @@ pub fn param_types_for_function(tools: &[Tool], func_name: &str) -> HashMap<Stri
     };
     if let Some(props) = tool
         .function
-        .parameters
+        .parameters_schema()
         .get("properties")
         .and_then(Value::as_object)
     {
@@ -257,7 +258,7 @@ pub fn normalize_tool_call_fields(obj: Value) -> Value {
 pub(crate) fn handle_json_tool_streaming(
     current_text: &str,
     start_idx: usize,
-    partial_json: &mut crate::partial_json::PartialJson,
+    partial_json: &mut PartialJson,
     tool_indices: &HashMap<String, usize>,
     buffer: &mut String,
     current_tool_id: &mut i32,

@@ -180,7 +180,7 @@ mod tests {
             function: Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: value!({
+                parameters: Some(value!({
                     "type": "object",
                     "properties": {
                         "s": {"type": "string"},
@@ -189,7 +189,7 @@ mod tests {
                         "r": {"$ref": "#/$defs/Count"},
                     },
                     "$defs": {"Count": {"type": "integer"}},
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },

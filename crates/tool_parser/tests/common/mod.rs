@@ -107,6 +107,24 @@ pub mod streaming_helpers {
     }
 }
 
+/// A function tool of this name and description that takes no parameters.
+#[allow(
+    dead_code,
+    reason = "shared test utility not used by all test binaries"
+)]
+pub fn tool(name: &str, description: &str) -> Tool {
+    Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            parameters: Some(json!({})),
+            strict: None,
+            extra: Default::default(),
+        },
+    }
+}
+
 /// Create a comprehensive set of test tools covering all parser test scenarios
 #[allow(
     dead_code,
@@ -119,12 +137,12 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "search".to_string(),
                 description: Some("Search for information".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -134,7 +152,7 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "get_weather".to_string(),
                 description: Some("Get weather information".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "city": {"type": "string"},
@@ -142,7 +160,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "date": {"type": "string"},
                         "units": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -152,13 +170,13 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "calculate".to_string(),
                 description: Some("Perform calculations".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "x": {"type": "number"},
                         "y": {"type": "number"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -168,14 +186,14 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "translate".to_string(),
                 description: Some("Translate text".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "text": {"type": "string"},
                         "to": {"type": "string"},
                         "target_lang": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -185,13 +203,13 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "get_time".to_string(),
                 description: Some("Get current time".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "timezone": {"type": "string"},
                         "format": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -201,13 +219,13 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "get_current_time".to_string(),
                 description: Some("Get current time".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "timezone": {"type": "string"},
                         "format": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -217,13 +235,13 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "update_settings".to_string(),
                 description: Some("Update settings".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "preferences": {"type": "object"},
                         "notifications": {"type": "boolean"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -233,7 +251,7 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "ping".to_string(),
                 description: Some("Ping service".to_string()),
-                parameters: json!({"type": "object", "properties": {}}),
+                parameters: Some(json!({"type": "object", "properties": {}})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -243,7 +261,7 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "test".to_string(),
                 description: Some("Test function".to_string()),
-                parameters: json!({"type": "object", "properties": {}}),
+                parameters: Some(json!({"type": "object", "properties": {}})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -253,7 +271,7 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "process".to_string(),
                 description: Some("Process data".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "count": {"type": "number"},
@@ -262,7 +280,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "data": {"type": "object"},
                         "text": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -272,14 +290,14 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "web_search".to_string(),
                 description: Some("Search the web".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
                         "num_results": {"type": "number"},
                         "search_type": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -289,12 +307,12 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "get_tourist_attractions".to_string(),
                 description: Some("Get tourist attractions".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "city": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -304,14 +322,14 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "config".to_string(),
                 description: Some("Configuration function".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "debug": {"type": "boolean"},
                         "verbose": {"type": "boolean"},
                         "optional": {"type": "null"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -321,14 +339,14 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "test_func".to_string(),
                 description: Some("Test function".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "bool_true": {"type": "boolean"},
                         "bool_false": {"type": "boolean"},
                         "none_val": {"type": "null"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -338,13 +356,13 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "create".to_string(),
                 description: Some("Create resource".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
                         "email": {"type": "string"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -354,13 +372,13 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "add".to_string(),
                 description: Some("Add operation".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "x": {"type": "number"},
                         "y": {"type": "number"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -370,12 +388,12 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "calc".to_string(),
                 description: Some("Calculate".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "x": {"type": "number"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -385,7 +403,7 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "func1".to_string(),
                 description: Some("Function 1".to_string()),
-                parameters: json!({"type": "object", "properties": {}}),
+                parameters: Some(json!({"type": "object", "properties": {}})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -395,12 +413,12 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "func2".to_string(),
                 description: Some("Function 2".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "y": {"type": "number"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
@@ -410,7 +428,7 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "tool1".to_string(),
                 description: Some("Tool 1".to_string()),
-                parameters: json!({"type": "object", "properties": {}}),
+                parameters: Some(json!({"type": "object", "properties": {}})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -420,15 +438,41 @@ pub fn create_test_tools() -> Vec<Tool> {
             function: Function {
                 name: "tool2".to_string(),
                 description: Some("Tool 2".to_string()),
-                parameters: json!({
+                parameters: Some(json!({
                     "type": "object",
                     "properties": {
                         "y": {"type": "number"}
                     }
-                }),
+                })),
                 strict: None,
                 extra: Default::default(),
             },
         },
     ]
+}
+
+/// One tool, `update_task(taskId: string, subject: string)`: the string-typed arguments whose
+/// values look numeric (the MiniMax M2 report, issue #1743, and the M3 copy of it).
+#[allow(
+    dead_code,
+    reason = "shared test utility not used by all test binaries"
+)]
+pub fn update_task_tools() -> Vec<Tool> {
+    vec![Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "update_task".to_string(),
+            description: None,
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "taskId":  {"type": "string"},
+                    "subject": {"type": "string"}
+                },
+                "required": ["taskId", "subject"]
+            })),
+            strict: None,
+            extra: Default::default(),
+        },
+    }]
 }

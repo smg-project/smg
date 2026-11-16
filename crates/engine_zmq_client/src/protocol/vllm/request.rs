@@ -1,6 +1,9 @@
 // Ported from the Apache-2.0 reference `vllm-engine-core-client`
 // (vllm-project/vllm): protocol/request.rs.
 
+//! The engine's inbound messages: the generate request with its multimodal features and sampling
+//! parameters, the utility call, and the request types that tag them.
+
 use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;

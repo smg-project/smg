@@ -211,7 +211,7 @@ async fn streaming_forwards_unknown_tool_names() {
         function: Function {
             name: "other".to_string(),
             description: None,
-            parameters: json!({"type": "object"}),
+            parameters: Some(json!({"type": "object"})),
             strict: None,
             extra: Default::default(),
         },
@@ -353,7 +353,7 @@ fn structural_tag_mirrors_vllm_forced_grammar() {
         function: Function {
             name: "get_weather".to_string(),
             description: None,
-            parameters: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            parameters: Some(json!({"type": "object", "properties": {"city": {"type": "string"}}})),
             strict: None,
             extra: Default::default(),
         },

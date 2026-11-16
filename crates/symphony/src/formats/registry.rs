@@ -7,12 +7,13 @@
 //! `None` means the registry does not know the model, and the caller reads its output another
 //! way; the gateway keeps its older parsers for such a model.
 //!
-//! The groups are bellwether's: the checkpoints that share a tokenizer and a template, recorded
-//! once by the group's primary. Every group whose table is on main is here, its primary and its
-//! other checkpoints under the primary's organisation, spelled in `groups.json` beside this
-//! module (one group per line; the crate's build script writes the file as the `GROUPS`
-//! constant); `tests/readme.rs` writes the README's models table from the same groups and checks
-//! that the two agree.
+//! The groups are bellwether's: the checkpoints that share a tokenizer and the wire the table
+//! reads (a template too, except for a checkpoint `docs/tables.md` notes as differing only
+//! outside the wire), recorded once by the group's primary. Every group whose table is on main is
+//! here, its primary and its other checkpoints under the primary's organisation, spelled in
+//! `groups.json` beside this module (one group per line; the crate's build script writes the file
+//! as the `GROUPS` constant); `tests/readme.rs` writes the README's models table from the same
+//! groups and checks that the two agree.
 //!
 //! A lookup matches the repository name, the text after the last path separator (either slash),
 //! exactly and without regard to case, under any organisation or path: `Qwen/Qwen3-8B`,
@@ -27,11 +28,13 @@ use std::{
     sync::{Arc, LazyLock, OnceLock},
 };
 
+use rustc_hash::FxBuildHasher;
+
 use super::{
     deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma,
-    gemma4, glm, glm4, hy4, inkling, iquest, json, k2_horizon, kimi_k2, kimi_k3, lfm2_5, ling,
-    llama4, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral, mistral_v13, muse_spark,
-    olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    gemma4, glm, glm4, hy4, hy_v3, inkling, inkling2, iquest, json, k2_horizon, kimi_k2, kimi_k3,
+    lfm2_5, ling, llama4, llama_nemotron, longcat, minicpm5, minimax_m2, minimax_m3, mistral,
+    mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -85,6 +88,8 @@ tables! {
     SeedOss => "seed_oss", seed_oss;
     /// [`hy4()`].
     Hy4 => "hy4", hy4;
+    /// [`hy_v3()`].
+    HyV3 => "hy_v3", hy_v3;
     /// [`ling()`].
     Ling => "ling", ling;
     /// [`iquest()`].
@@ -109,6 +114,8 @@ tables! {
     KimiK3 => "kimi_k3", kimi_k3;
     /// [`inkling()`].
     Inkling => "inkling", inkling;
+    /// [`inkling2()`].
+    Inkling2 => "inkling2", inkling2;
     /// [`minicpm5()`].
     MiniCpm5 => "minicpm5", minicpm5;
     /// [`dots3()`].
@@ -123,6 +130,8 @@ tables! {
     Glm4 => "glm4", glm4;
     /// [`k2_horizon()`].
     K2Horizon => "k2_horizon", k2_horizon;
+    /// [`longcat()`].
+    LongCat => "longcat", longcat;
     /// [`muse_spark()`].
     MuseSpark => "muse_spark", muse_spark;
     /// [`plain()`].
@@ -224,7 +233,7 @@ struct Group {
     /// own: the prompt's replay starts at its last occurrence.
     opener: Option<&'static str>,
     /// What the group's own template writes after the thought's close before the first call,
-    /// when it is not the table's own (the NVIDIA Nemotron 3 groups and Step 3.5 Flash write one
+    /// when it is not the table's own (the NVIDIA Nemotron 3 and 3.5 groups and Step 3.5 Flash write one
     /// newline where the Qwen 3.5 template writes two): the group's tags write it in the table's place
     /// ([`Format::with_thought_after`]).
     after: Option<&'static str>,
@@ -298,15 +307,16 @@ include!(concat!(env!("OUT_DIR"), "/groups.rs"));
 /// regard to ASCII case ([`Caseless`]): worked out once, since a request looks its model up more
 /// than once, and read in constant time whatever the registry's size; a name two groups spell
 /// keeps the first in the registry's order, as the scan it replaces did.
-static REPOSITORIES: LazyLock<HashMap<Caseless<'static>, usize>> = LazyLock::new(|| {
-    let mut map = HashMap::new();
-    for (index, group) in GROUPS.iter().enumerate() {
-        for own in group.repositories() {
-            map.entry(Caseless(own)).or_insert(index);
+static REPOSITORIES: LazyLock<HashMap<Caseless<'static>, usize, FxBuildHasher>> =
+    LazyLock::new(|| {
+        let mut map = HashMap::with_hasher(FxBuildHasher);
+        for (index, group) in GROUPS.iter().enumerate() {
+            for own in group.repositories() {
+                map.entry(Caseless(own)).or_insert(index);
+            }
         }
-    }
-    map
-});
+        map
+    });
 
 /// A repository name as a map key, equal to another spelled in any ASCII case: hashed over its
 /// ASCII-lowercased bytes, compared with `eq_ignore_ascii_case`.
@@ -347,7 +357,7 @@ fn group_for(model: &str) -> Option<(usize, &'static Group)> {
     if repository.is_empty() {
         return None;
     }
-    let repositories: &HashMap<Caseless<'_>, usize> = &REPOSITORIES;
+    let repositories: &HashMap<Caseless<'_>, usize, FxBuildHasher> = &REPOSITORIES;
     repositories
         .get(&Caseless(repository))
         .map(|&index| (index, &GROUPS[index]))
@@ -510,6 +520,14 @@ mod tests {
             Some(Table::Inkling)
         );
         assert_eq!(
+            table_for("thinkingmachines/Inkling-2-Small"),
+            Some(Table::Inkling2)
+        );
+        assert_eq!(
+            table_for("thinkingmachines/Inkling-2-Small-MXFP8"),
+            Some(Table::Inkling2)
+        );
+        assert_eq!(
             table_for("deepseek-ai/DeepSeek-V4.1-Flash-1017"),
             Some(Table::DeepSeekV4_1)
         );
@@ -549,6 +567,61 @@ mod tests {
             "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
         ] {
             assert_eq!(table_for(r1), Some(Table::DeepSeekV3), "{r1}");
+        }
+    }
+
+    /// A checkpoint published under another name or organisation than its group's primary reads
+    /// with the group's table once the group lists it under `also`: names whose template renders
+    /// the same text as the primary's and whose tokenizer files are the primary's or a re-save of
+    /// them.
+    #[test]
+    fn a_checkpoint_a_group_lists_under_also_resolves_to_the_groups_table() {
+        for (model, table) in [
+            ("moonshotai/Kimi-K3.1-Pro", Table::KimiK3),
+            ("nvidia/Kimi-K3.1-Pro-NVFP4", Table::KimiK3),
+            ("kimi-k3.1-pro", Table::KimiK3),
+            ("nvidia/DeepSeek-V4.1-Flash-NVFP4", Table::DeepSeekV4_1),
+            ("nvidia/DeepSeek-V4.1-Flash-1017-NVFP4", Table::DeepSeekV4_1),
+            ("microsoft/UserRepGen-4B", Table::Qwen3Tagged),
+            ("nvidia/Qwen3.8-Flash-Next-FP4-Local", Table::Qwen3Tagged),
+            ("microsoft/AesCode-8B", Table::Qwen3),
+            ("microsoft/AesCode-32B", Table::Qwen3),
+            ("internlm/Visual-ERM", Table::Qwen3),
+            ("tencent/WeVisOne-VL-2B", Table::Qwen3),
+            ("LiquidAI/LFM2.5-24B-A2B-FP8", Table::Lfm2_5),
+            ("tencent/Hy-Memory-30B-A3B-FP8", Table::HyV3),
+            ("mistralai/Mistral-Large-4-1T-A52B-NVFP4", Table::MistralV13),
+            (
+                "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4",
+                Table::Qwen3Tagged,
+            ),
+            (
+                "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-MXFP8",
+                Table::Qwen3Tagged,
+            ),
+            (
+                "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4",
+                Table::Qwen3Tagged,
+            ),
+            ("inclusionAI/Ling-3.1-flash-1019", Table::Ling),
+            ("inclusionAI/Ling-3.0-flash-Sante", Table::Ling),
+            ("ibm-granite/granite-switch-4.1-30b", Table::Qwen2_5),
+            ("h2oai/h2o-lightning-4b-nemotron-nano", Table::Qwen3Tagged),
+            ("inclusionAI/ZoomGain-4B", Table::Qwen3Tagged),
+            ("inclusionAI/ZwZ2-4B", Table::Qwen3Tagged),
+            (
+                "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB",
+                Table::Qwen3Tagged,
+            ),
+            ("openbmb/MiniCPM-V-4.7-1B-GPTQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-Jev-AWQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-Jev-GPTQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-1.0-AWQ", Table::Qwen3Tagged),
+            ("openbmb/MiniCPM-OCR-1.0-GPTQ", Table::Qwen3Tagged),
+            ("XHToken/Spark-X2.6-1.7B", Table::Glm),
+        ] {
+            assert_eq!(table_for(model), Some(table), "{model}");
+            assert!(for_model(model).is_some(), "{model}");
         }
     }
 
@@ -628,6 +701,146 @@ mod tests {
             granite.turn_opener(),
             Some("<|start_of_role|>assistant<|end_of_role|>")
         );
+    }
+
+    /// A checkpoint whose own template is not its family's. It opens every turn with an open
+    /// mark, the role, a separator, a two-character id it draws on each render and a close mark,
+    /// and it writes a call as tagged JSON. Its group names the table that reads what that
+    /// template writes, and the close mark as the turn opener: the last fixed text before the
+    /// model's own, so the id is the template's framing and no text the answer goes on with.
+    /// The first turn below is an assistant turn of that template's recorded render, fed as the
+    /// prompt up to its close mark; the second answer is one such a checkpoint gave a request
+    /// with tools.
+    /// The ends of two more recorded renders pin where the replay starts: a generation prompt
+    /// at its last close mark, a continued final message at the one before its prefill.
+    #[test]
+    fn a_checkpoint_with_its_own_template_reads_with_the_table_that_template_writes() {
+        use crate::{
+            engine::Engine,
+            event::{Event, Events},
+            format::Replay,
+            input::{EngineFinish, Input},
+            parser::Parser,
+            testing::arguments_of,
+            Declared,
+        };
+        let format = for_model("ibm-granite/granite-4.1-3b-llmon-preview").expect("a table");
+        let opened = "<|open|>assistant<|:|>°ü<|close|>";
+        let turns = [
+            (
+                concat!(
+                    r#"<tool_call>{"name": "get_weather", "arguments": "#,
+                    r#"{"city": "Paris", "unit": "celsius"}}</tool_call>"#
+                ),
+                "get_weather",
+                r#"{"city": "Paris", "unit": "celsius"}"#,
+            ),
+            (
+                concat!(
+                    r#"<tool_call>{"name": "get_stock_info", "arguments": "#,
+                    r#"{"company_name": "Apple Inc.", "detail_level": "detailed"}}</tool_call>"#
+                ),
+                "get_stock_info",
+                r#"{"company_name": "Apple Inc.", "detail_level": "detailed"}"#,
+            ),
+        ];
+        for (answer, name, arguments) in turns {
+            let mut parser = Engine::new(format.clone(), Declared::default());
+            let mut out = Events::new();
+            parser
+                .feed(
+                    Input::Prompt {
+                        token_ids: &[],
+                        text: opened,
+                    },
+                    &mut out,
+                )
+                .expect("prompt");
+            parser
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text: answer,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("delta");
+            parser
+                .feed(
+                    Input::End {
+                        finish: EngineFinish::Stop,
+                    },
+                    &mut out,
+                )
+                .expect("end");
+            let events = out.into_owned().drain();
+            let names: Vec<&str> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::ToolCallStart { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(names, [name]);
+            assert_eq!(arguments_of(&events, 0), arguments);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Content(_))),
+                "{name}"
+            );
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
+                "{name}"
+            );
+        }
+        assert_eq!(format.name(), "qwen2.5");
+        assert_eq!(format.turn_opener(), Some("<|close|>"));
+        assert_eq!(format.replayed(opened), Replay::default());
+        // The end of a recorded generation prompt: the frame that names the answer's id holds
+        // the close mark too, as every frame's header does. The replay starts at the last one.
+        let generation = concat!(
+            "<|open|>exec<|.|>output<|close|>assistant<|:|>¶³<|open_end|><|open_end|>",
+            "<|open|>assistant<|:|>¶³<|close|>",
+        );
+        assert_eq!(format.replay(generation), "<|close|>");
+        assert_eq!(format.replayed(generation), Replay::default());
+        // The end of a recorded continued final message: the prefill after the last close mark
+        // is the text the answer goes on with.
+        let prefilled = concat!(
+            "<|open|>exec<|.|>output<|close|>assistant<|:|>¡°<|open_end|><|open_end|>",
+            "<|open|>assistant<|:|>¡°<|close|>The quick brown fox",
+        );
+        assert_eq!(format.replay(prefilled), "<|close|>The quick brown fox");
+        assert_eq!(
+            format.replayed(prefilled),
+            Replay {
+                begun: true,
+                ..Replay::default()
+            }
+        );
+    }
+
+    /// MiniMax-M3.1-Flash is a checkpoint of the MiniMax-M3 group (the
+    /// MiniMax M3 section of `docs/tables.md`: the same tokenizer and wire,
+    /// a template that differs only outside the wire), so the `minimax_m3`
+    /// table reads it by its repository name as it reads the primary's; the
+    /// near-miss `MiniMax-M3.1` stays unknown.
+    #[test]
+    fn the_minimax_m3_1_flash_checkpoint_reads_with_the_m3_table() {
+        let primary = for_model("MiniMaxAI/MiniMax-M3").expect("MiniMax-M3");
+        for model in [
+            "MiniMax-M3.1-Flash",
+            "MiniMaxAI/MiniMax-M3.1-Flash",
+            "minimaxai/minimax-m3.1-flash",
+        ] {
+            let flash = for_model(model).expect(model);
+            assert_eq!(flash.name(), "minimax_m3", "{model}");
+            assert_eq!(flash.name(), primary.name(), "{model}");
+            assert_eq!(flash.turn_opener(), primary.turn_opener(), "{model}");
+        }
+        assert!(for_model("MiniMax-M3.1").is_none());
     }
 
     #[test]
@@ -750,7 +963,9 @@ mod tests {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                parameters: Some(
+                    json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                ),
                 strict: None,
                 extra: Default::default(),
             },

@@ -4,7 +4,12 @@
 //! Engine-agnostic wire primitives: msgpack (de)serialization, numpy dtype
 //! handling, and the zero-copy tensor aux-frame codec.
 
-use std::{any::type_name, fmt, io::Cursor, marker::PhantomData};
+use std::{
+    any::type_name,
+    fmt,
+    io::{self, Cursor, Write},
+    marker::PhantomData,
+};
 
 use rmpv::Value;
 use serde::{
@@ -15,7 +20,10 @@ use serde::{
 use crate::error::{Error, Result};
 
 pub mod dtype;
+pub mod frame_str;
 pub mod tensor;
+
+pub use frame_str::FrameStr;
 
 /// Dynamic msgpack value used for schema positions that are preserved but not
 /// yet strongly typed.
@@ -72,15 +80,80 @@ where
 }
 
 /// Encode a Rust value into msgpack using named fields (map encoding for
-/// structs; positional arrays come from `serde_tuple`-derived types).
+/// structs; positional arrays come from `serde_tuple`-derived types). The
+/// buffer grows from empty; a value whose size is known up front goes
+/// through [`encode_msgpack_with_capacity`].
 pub fn encode_msgpack<T>(value: &T) -> Result<Vec<u8>>
 where
     T: Serialize + fmt::Debug,
 {
-    rmp_serde::to_vec_named(value).map_err(|error| Error::Encode {
+    encode_msgpack_with_capacity(value, 0)
+}
+
+/// [`encode_msgpack`] into a buffer of `capacity` bytes, reserved before the
+/// write: a value that fits costs one allocation, where a buffer grown from
+/// empty costs one per doubling and asks for a third more bytes than it
+/// keeps. A value past the capacity still encodes; its buffer grows as before.
+pub fn encode_msgpack_with_capacity<T>(value: &T, capacity: usize) -> Result<Vec<u8>>
+where
+    T: Serialize + fmt::Debug,
+{
+    let encode_error = |message: String| Error::Encode {
         target_type: type_name::<T>(),
-        message: format!("failed to encode value `{value:?}`: {error}"),
-    })
+        message,
+    };
+    let mut buffer = FallibleBuffer(Vec::new());
+    buffer
+        .0
+        .try_reserve_exact(capacity)
+        .map_err(|error| encode_error(format!("failed to reserve {capacity} bytes: {error}")))?;
+    rmp_serde::encode::write_named(&mut buffer, value)
+        .map_err(|error| encode_error(format!("failed to encode value `{value:?}`: {error}")))?;
+    Ok(buffer.0)
+}
+
+/// The encoder's buffer: a `Vec<u8>` whose growth fails as an I/O error the
+/// encode reports instead of aborting the process. The same writer as the
+/// one `rmp_serde::to_vec_named` uses, which is private and starts from an
+/// empty vector, so a reserved buffer needs its own.
+struct FallibleBuffer(Vec<u8>);
+
+impl Write for FallibleBuffer {
+    // Inlined as the encoder's own writer is: a message is written in many
+    // small pieces, and a call per piece shows in the instructions.
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.0
+            .try_reserve(bytes.len())
+            .map_err(|_| io::ErrorKind::OutOfMemory)?;
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Room for an add-request's fields beside its prompt token ids: the request
+/// id, the sampling parameters, the flags, a structured-output grammar or a
+/// trace context of ordinary size.
+const ADD_REQUEST_ROOM: usize = 1024;
+
+/// The buffer an add-request of `prompt_tokens` ids is encoded into in one
+/// write: msgpack spells a token id in at most five bytes (`uint32`), and the
+/// rest of the request fits `ADD_REQUEST_ROOM`. The frame bytes do not
+/// depend on it; a request past the bound grows its buffer as it used to.
+pub fn add_request_capacity(prompt_tokens: usize) -> usize {
+    prompt_tokens
+        .saturating_mul(5)
+        .saturating_add(ADD_REQUEST_ROOM)
 }
 
 fn decode_value_preview(bytes: &[u8]) -> String {
@@ -123,21 +196,14 @@ pub fn decode_value(bytes: &[u8]) -> Result<Value> {
     Ok(rmpv::decode::read_value(&mut Cursor::new(bytes))?)
 }
 
-/// Golden wire bytes from a hex string (tests only).
+/// The bytes of a hex pin captured from an engine's own encoder; spaces and
+/// line breaks between the digits are ignored (tests only).
 #[cfg(test)]
 pub(crate) fn hex(text: &str) -> Vec<u8> {
-    (0..text.len())
+    let digits: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    (0..digits.len())
         .step_by(2)
-        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
-        .collect()
-}
-
-/// Bytes of a hex string: the golden wire samples captured from vLLM.
-#[cfg(test)]
-pub(crate) fn unhex(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex digit"))
+        .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).expect("a hex digit pair"))
         .collect()
 }
 

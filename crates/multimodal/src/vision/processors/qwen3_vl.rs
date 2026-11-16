@@ -289,6 +289,11 @@ impl VisionPreProcessor for Qwen3VLProcessor {
         true
     }
 
+    /// BF16 patch rows and their metadata are independent between images.
+    fn supports_bf16_batch_cache(&self) -> bool {
+        true
+    }
+
     fn emits_pixel_bytes(&self) -> bool {
         true
     }
@@ -303,14 +308,14 @@ impl VisionPreProcessor for Qwen3VLProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.inner.preprocess(images)
     }
 
     fn preprocess_wire(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         self.inner.preprocess_wire(images, dtype)
@@ -334,6 +339,11 @@ impl VisionPreProcessor for Qwen3VLProcessor {
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         self.inner.calculate_num_tokens(width, height)
+    }
+
+    /// Number of stored patch elements for one image.
+    fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        self.inner.image_input_elements(width, height)
     }
 
     fn model_name(&self) -> &'static str {
@@ -469,7 +479,7 @@ mod tests {
         let processor = Qwen3VLProcessor::from_config_for(&config, Modality::Image);
 
         let image = create_test_image(640, 480, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image]).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         // encoder_input is patchified: [total_patches, patch_features]
         assert_eq!(result.encoder_input.ndim(), 2);
@@ -499,12 +509,14 @@ mod tests {
         };
         let processor = Qwen3VLProcessor::from_config_for(&config, Modality::Image);
 
-        let images = vec![
+        let images = [
             create_test_image(640, 480, Rgb([100, 100, 100])),
             create_test_image(480, 640, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images).unwrap();
+        let result = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
 
         assert_two_image_batch(&result);
     }
@@ -528,11 +540,9 @@ mod tests {
         let image_a = create_test_image(640, 480, Rgb([100, 110, 120]));
         let image_b = create_test_image(420, 560, Rgb([10, 200, 90]));
 
-        let batched = processor
-            .preprocess(&[image_a.clone(), image_b.clone()])
-            .unwrap();
-        let single_a = processor.preprocess(&[image_a]).unwrap();
-        let single_b = processor.preprocess(&[image_b]).unwrap();
+        let batched = processor.preprocess(&[&image_a, &image_b]).unwrap();
+        let single_a = processor.preprocess(&[&image_a]).unwrap();
+        let single_b = processor.preprocess(&[&image_b]).unwrap();
 
         // Feature token counts line up per image.
         assert_eq!(

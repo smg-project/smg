@@ -12,11 +12,11 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument::WithSubscriber, warn, Dispatch, Instrument};
 
 use crate::{
-    audit::{AuditContext, AuditLogger},
-    config::{ControlPlaneAuthConfig, Role},
+    audit::{AuditContext, AuditLogger, AuditResource},
+    config::{ApiKeySet, ControlPlaneAuthConfig, Role},
     jwt::JwtValidator,
     RequestId,
 };
@@ -79,25 +79,73 @@ impl<B> PrincipalExt for http::Request<B> {
 /// State for the control plane authentication middleware.
 #[derive(Clone)]
 pub struct ControlPlaneAuthState {
-    /// Authentication configuration
+    /// Authentication configuration, as the start read it.
     pub config: ControlPlaneAuthConfig,
+
+    /// The API keys in force: the configuration's at start, the key file's
+    /// after a reload.
+    pub keys: ApiKeySet,
 
     /// JWT validator (if JWT auth is configured)
     pub jwt_validator: Option<Arc<JwtValidator>>,
 
     /// Audit logger
     pub audit_logger: AuditLogger,
+
+    /// The paths whose reads the `admin` role alone may make: a view that
+    /// shows what the `user` role's reads do not. The gate refuses a user
+    /// there like any other control-plane 403, denial line included.
+    pub admin_only_reads: &'static [&'static str],
+
+    /// What a recorded mutation's task takes for its lifetime, when the
+    /// gateway hands one out: its in-flight count, so a shutdown drains the
+    /// task of a client that left as it drains a waiting one.
+    pub mutation_hold: Option<Arc<dyn Fn() -> MutationHold + Send + Sync>>,
 }
+
+/// A hold a recorded mutation's task owns until its outcome line is written:
+/// whatever the gateway's shutdown drain waits on, released by its drop.
+pub type MutationHold = Box<dyn std::any::Any + Send>;
 
 impl ControlPlaneAuthState {
     /// Create a new control plane auth state.
     pub fn new(config: ControlPlaneAuthConfig, jwt_validator: Option<Arc<JwtValidator>>) -> Self {
         let audit_logger = AuditLogger::new(config.audit_enabled);
+        let keys = ApiKeySet::new(config.api_keys.clone());
         Self {
             config,
+            keys,
             jwt_validator,
             audit_logger,
+            admin_only_reads: &[],
+            mutation_hold: None,
         }
+    }
+
+    /// The same state with `paths` as the reads the `admin` role alone may
+    /// make; the gateway names them where it attaches the layer.
+    #[must_use]
+    pub fn with_admin_only_reads(mut self, paths: &'static [&'static str]) -> Self {
+        self.admin_only_reads = paths;
+        self
+    }
+
+    /// The same state handing every recorded mutation's task a hold from
+    /// `take` for its lifetime; the gateway passes its in-flight count where
+    /// it attaches the layer, so the shutdown drain waits for a mutation
+    /// whose client left until its outcome line is written.
+    #[must_use]
+    pub fn with_mutation_hold(
+        mut self,
+        take: impl Fn() -> MutationHold + Send + Sync + 'static,
+    ) -> Self {
+        self.mutation_hold = Some(Arc::new(take));
+        self
+    }
+
+    /// Whether a read of `path` needs the `admin` role.
+    fn is_admin_only_read(&self, path: &str) -> bool {
+        self.admin_only_reads.contains(&path)
     }
 
     /// Create from config, initializing JWT validator if needed.
@@ -158,41 +206,17 @@ impl ControlPlaneAuthState {
     }
 }
 
-/// Whether `role` may perform `method` on a control plane route: `admin`
-/// every method, `user` the read-only ones (GET and HEAD).
-fn role_allows(role: Role, method: &str) -> bool {
-    role.is_admin() || matches!(method, "GET" | "HEAD")
+/// Whether `method` reads: the `user` role may use it, and no outcome line
+/// follows its handler.
+fn is_read(method: &str) -> bool {
+    matches!(method, "GET" | "HEAD")
 }
 
-/// Check the role against the request method and log a denial.
-/// Returns Some(Response) if denied, None if allowed.
-fn check_role(
-    principal_id: &str,
-    auth_method: &str,
-    role: Role,
-    method: &str,
-    path: &str,
-    request_id: Option<&str>,
-    audit_logger: &AuditLogger,
-) -> Option<Response> {
-    if role_allows(role, method) {
-        return None;
-    }
-
-    warn!(
-        "{} {} has role {:?} but admin is required for {} {}",
-        auth_method, principal_id, role, method, path
-    );
-    let ctx = AuditContext::new(principal_id, auth_method, role, method, path, request_id);
-    audit_logger.log_denied(&ctx, "Admin role required for this control plane operation");
-
-    Some(
-        (
-            StatusCode::FORBIDDEN,
-            "Admin role required for this control plane operation",
-        )
-            .into_response(),
-    )
+/// Whether `role` may perform `method` on a control plane route: `admin`
+/// every method, `user` the read-only ones (GET and HEAD) unless the route
+/// is one of the admin-only reads (`admin_only`).
+fn role_allows(role: Role, method: &str, admin_only: bool) -> bool {
+    role.is_admin() || (is_read(method) && !admin_only)
 }
 
 /// Log successful authentication.
@@ -238,16 +262,52 @@ pub fn bearer_token(header_value: &str) -> Option<&str> {
 struct Attempt {
     method: String,
     path: String,
+    /// The path is one of the reads the `admin` role alone may make.
+    admin_only: bool,
     request_id: Option<String>,
 }
 
 impl Attempt {
-    fn of(request: &Request<Body>) -> Self {
+    fn of(request: &Request<Body>, auth_state: &ControlPlaneAuthState) -> Self {
+        let path = request.uri().path();
         Self {
             method: request.method().to_string(),
-            path: request.uri().path().to_string(),
+            admin_only: auth_state.is_admin_only_read(path),
+            path: path.to_string(),
             request_id: request.extensions().get::<RequestId>().map(|r| r.0.clone()),
         }
+    }
+
+    /// The role check: `None` when `role` may make this request, else
+    /// the 403 with the denial line written.
+    fn refuse_by_role(
+        &self,
+        principal_id: &str,
+        auth_method: &str,
+        role: Role,
+        audit_logger: &AuditLogger,
+    ) -> Option<Response> {
+        let (method, path, admin_only) =
+            (self.method.as_str(), self.path.as_str(), self.admin_only);
+        let request_id = self.request_id.as_deref();
+        if role_allows(role, method, admin_only) {
+            return None;
+        }
+
+        warn!(
+            "{} {} has role {:?} but admin is required for {} {}",
+            auth_method, principal_id, role, method, path
+        );
+        let ctx = AuditContext::new(principal_id, auth_method, role, method, path, request_id);
+        audit_logger.log_denied(&ctx, "Admin role required for this control plane operation");
+
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                "Admin role required for this control plane operation",
+            )
+                .into_response(),
+        )
     }
 
     /// Refuse the request: the audit line with `reason`, then a 401 whose
@@ -263,25 +323,27 @@ impl Attempt {
     }
 
     /// Admit `principal`, whichever credential proved it: the role check (a
-    /// 403 for a method the role may not use), the audit line, the extension
-    /// the handlers read, then the request itself.
+    /// 403 for a method the role may not use, or for a read kept to the
+    /// `admin` role), the admission line, the extension the handlers read,
+    /// the request itself and, for a request that is not a read, the outcome
+    /// line with the status the handler answered and the resource it named.
+    ///
+    /// A recorded mutation and its outcome line run as one spawned task, so a
+    /// client that leaves before the answer drops the wait and not the
+    /// record. The record owns the hold `take_hold` gives (the gateway's
+    /// in-flight count) and releases it after the line, so a shutdown drains
+    /// the task as it drains a waiting client's request. A task that ends
+    /// without an answer is recorded and answered as a 500.
     async fn admit(
         &self,
         audit_logger: &AuditLogger,
+        take_hold: Option<&(dyn Fn() -> MutationHold + Send + Sync)>,
         principal: Principal,
         mut request: Request<Body>,
         next: Next,
     ) -> Response {
         let kind = principal.auth_method.kind();
-        if let Some(resp) = check_role(
-            &principal.id,
-            kind,
-            principal.role,
-            &self.method,
-            &self.path,
-            self.request_id.as_deref(),
-            audit_logger,
-        ) {
+        if let Some(resp) = self.refuse_by_role(&principal.id, kind, principal.role, audit_logger) {
             return resp;
         }
         log_auth_success(
@@ -292,8 +354,113 @@ impl Attempt {
             self.request_id.as_deref(),
             audit_logger,
         );
+        let outcome = (audit_logger.is_enabled() && !is_read(&self.method))
+            .then(|| (principal.id.clone(), principal.role));
         request.extensions_mut().insert(principal);
-        next.run(request).await
+        let Some((principal_id, role)) = outcome else {
+            return next.run(request).await;
+        };
+        let record = OutcomeRecord::new(
+            OutcomeFacts {
+                principal_id,
+                kind,
+                role,
+                method: self.method.clone(),
+                path: self.path.clone(),
+                request_id: self.request_id.clone(),
+                audit_logger: audit_logger.clone(),
+            },
+            take_hold.map(|take| take()),
+        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the task is the admitted request's own work and ends with the handler's answer; it holds the gateway's in-flight count, so a shutdown drains it before the runtime drops it"
+        )]
+        let mutation = tokio::spawn(
+            async move {
+                let response = next.run(request).await;
+                let resource = response.extensions().get::<AuditResource>();
+                record.answered(response.status(), resource.map(|r| r.0.as_str()));
+                response
+            }
+            .instrument(tracing::Span::current())
+            .with_subscriber(tracing::dispatcher::get_default(Dispatch::clone)),
+        );
+        match mutation.await {
+            Ok(response) => response,
+            Err(error) => {
+                error!(
+                    "{} {} ended without an answer: {}",
+                    self.method, self.path, error
+                );
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        }
+    }
+}
+
+/// What the outcome line of a recorded mutation says besides the status and
+/// the resource.
+struct OutcomeFacts {
+    principal_id: String,
+    kind: &'static str,
+    role: Role,
+    method: String,
+    path: String,
+    request_id: Option<String>,
+    audit_logger: AuditLogger,
+}
+
+impl OutcomeFacts {
+    fn write(&self, status: StatusCode, resource: Option<&str>) {
+        let ctx = AuditContext::new(
+            &self.principal_id,
+            self.kind,
+            self.role,
+            &self.method,
+            &self.path,
+            self.request_id.as_deref(),
+        );
+        self.audit_logger.log_outcome(&ctx, status, resource);
+    }
+}
+
+/// The outcome line the task that runs a recorded mutation owes: written with
+/// the handler's answer, or at 500 with no resource when the handler
+/// panicked (the record is dropped on the unwind, whichever frame drops it).
+/// A record the runtime drops with the mutation in flight writes nothing: no
+/// client was answered a 500 and the handler's blocking work may still
+/// complete, so the admission line stands alone. The task owns it, so a
+/// client that leaves cannot skip it.
+struct OutcomeRecord {
+    facts: OutcomeFacts,
+    written: bool,
+    /// The gateway's hold on its in-flight count, kept for its drop: a field
+    /// drops after `Drop::drop` has run, so the hold goes after the line,
+    /// whichever way the record goes.
+    _hold: Option<MutationHold>,
+}
+
+impl OutcomeRecord {
+    fn new(facts: OutcomeFacts, hold: Option<MutationHold>) -> Self {
+        Self {
+            facts,
+            written: false,
+            _hold: hold,
+        }
+    }
+
+    fn answered(mut self, status: StatusCode, resource: Option<&str>) {
+        self.written = true;
+        self.facts.write(status, resource);
+    }
+}
+
+impl Drop for OutcomeRecord {
+    fn drop(&mut self) {
+        if !self.written && std::thread::panicking() {
+            self.facts.write(StatusCode::INTERNAL_SERVER_ERROR, None);
+        }
     }
 }
 
@@ -304,11 +471,14 @@ impl Attempt {
 /// 2. Attempts JWT validation first (if configured)
 /// 3. Falls back to API key validation (if configured)
 /// 4. Checks the principal's role against the request: `admin` for every
-///    method, `user` for the read-only ones (GET, HEAD)
-/// 5. Logs audit events for control plane access
+///    method, `user` for the read-only ones (GET, HEAD) that are not kept
+///    to the `admin` role ([`ControlPlaneAuthState::with_admin_only_reads`])
+/// 5. Writes the admission audit line and, after the handler of a request
+///    that is not a read, the outcome line with its status and resource
 ///
 /// Returns 401 Unauthorized if authentication fails.
-/// Returns 403 Forbidden if the principal's role does not allow the method.
+/// Returns 403 Forbidden if the principal's role does not allow the method,
+/// or the read is one kept to the `admin` role.
 pub async fn control_plane_auth_middleware(
     State(auth_state): State<ControlPlaneAuthState>,
     request: Request<Body>,
@@ -319,7 +489,7 @@ pub async fn control_plane_auth_middleware(
         return next.run(request).await;
     }
 
-    let attempt = Attempt::of(&request);
+    let attempt = Attempt::of(&request, &auth_state);
     let audit_logger = &auth_state.audit_logger;
 
     // Extract Bearer token from Authorization header
@@ -347,7 +517,15 @@ pub async fn control_plane_auth_middleware(
                     },
                     role: validated_token.role,
                 };
-                return attempt.admit(audit_logger, principal, request, next).await;
+                return attempt
+                    .admit(
+                        audit_logger,
+                        auth_state.mutation_hold.as_deref(),
+                        principal,
+                        request,
+                        next,
+                    )
+                    .await;
             }
             Err(e) => {
                 // 3 dot-separated parts => almost certainly a JWT; fail fast instead of trying API key.
@@ -362,7 +540,7 @@ pub async fn control_plane_auth_middleware(
     }
 
     // Try API key validation
-    if let Some(api_key_entry) = auth_state.config.find_api_key(token) {
+    if let Some(api_key_entry) = auth_state.keys.find(token) {
         let principal = Principal {
             id: api_key_entry.id.clone(),
             name: Some(api_key_entry.name.clone()),
@@ -371,7 +549,15 @@ pub async fn control_plane_auth_middleware(
             },
             role: api_key_entry.role,
         };
-        return attempt.admit(audit_logger, principal, request, next).await;
+        return attempt
+            .admit(
+                audit_logger,
+                auth_state.mutation_hold.as_deref(),
+                principal,
+                request,
+                next,
+            )
+            .await;
     }
 
     // Authentication failed
@@ -481,16 +667,22 @@ mod tests {
     #[test]
     fn admin_may_use_every_method() {
         for method in ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] {
-            assert!(role_allows(Role::Admin, method), "{method}");
+            assert!(role_allows(Role::Admin, method, false), "{method}");
+            assert!(
+                role_allows(Role::Admin, method, true),
+                "{method}, admin-only"
+            );
         }
     }
 
     #[test]
-    fn user_may_only_read() {
-        assert!(role_allows(Role::User, "GET"));
-        assert!(role_allows(Role::User, "HEAD"));
+    fn user_may_only_read_and_not_an_admin_only_read() {
+        assert!(role_allows(Role::User, "GET", false));
+        assert!(role_allows(Role::User, "HEAD", false));
+        assert!(!role_allows(Role::User, "GET", true), "an admin-only read");
+        assert!(!role_allows(Role::User, "HEAD", true), "an admin-only read");
         for method in ["POST", "PUT", "PATCH", "DELETE"] {
-            assert!(!role_allows(Role::User, method), "{method}");
+            assert!(!role_allows(Role::User, method, false), "{method}");
         }
     }
 
@@ -665,5 +857,581 @@ mod tests {
             (status, body),
             (StatusCode::OK, "ops via api_key:ops as Admin".to_string())
         );
+    }
+
+    /// The audit lines one call through the middleware writes, with its
+    /// status: `method` on `/workers` with `key`, carrying the request id the
+    /// gateway's edge layer would have set.
+    async fn audited_call(
+        audit_enabled: bool,
+        method: &str,
+        key: &str,
+    ) -> (StatusCode, Vec<Vec<(String, String)>>) {
+        use axum::{middleware::from_fn_with_state, routing::post, Router};
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::{audit::tests::FieldCapture, config::ApiKeyEntry};
+
+        async fn register() -> Response {
+            AuditResource::name(StatusCode::ACCEPTED.into_response(), "worker-1")
+        }
+        async fn refuse() -> Response {
+            StatusCode::BAD_REQUEST.into_response()
+        }
+        async fn list() -> Response {
+            StatusCode::OK.into_response()
+        }
+        async fn give_up() -> Response {
+            panic!("the handler gave up")
+        }
+        let state = ControlPlaneAuthState::new(
+            ControlPlaneAuthConfig {
+                jwt: None,
+                api_keys: vec![
+                    ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin),
+                    ApiKeyEntry::new("reader", "Reader", "reader-key", Role::User),
+                ],
+                audit_enabled,
+            },
+            None,
+        );
+        let app = Router::new()
+            .route("/workers", post(register).get(list))
+            .route("/refused", post(refuse))
+            .route("/broken", post(give_up))
+            .layer(from_fn_with_state(state, control_plane_auth_middleware));
+        let (path, method) = match method {
+            "REFUSED" => ("/refused", "POST"),
+            "BROKEN" => ("/broken", "POST"),
+            _ => ("/workers", method),
+        };
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(RequestId("req-7".to_string()));
+
+        let capture = Arc::new(FieldCapture::default());
+        let response = app
+            .oneshot(request)
+            .with_subscriber(capture.clone())
+            .await
+            .unwrap();
+        let events = capture.events.lock().unwrap().clone();
+        (response.status(), events)
+    }
+
+    #[tokio::test]
+    async fn a_mutation_writes_an_outcome_line_after_the_admission_line() {
+        use crate::audit::tests::field;
+
+        let (status, events) = audited_call(true, "POST", "admin-key").await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            events.len(),
+            2,
+            "the admission line, then the outcome line: {events:?}"
+        );
+        let (admission, outcome) = (&events[0], &events[1]);
+        assert_eq!(
+            field(admission, "message"),
+            Some("control_plane_audit"),
+            "{admission:?}"
+        );
+        assert_eq!(
+            field(admission, "status"),
+            None,
+            "the admission line is written before the handler: {admission:?}"
+        );
+        assert_eq!(
+            field(outcome, "message"),
+            Some("control_plane_mutation"),
+            "{outcome:?}"
+        );
+        assert_eq!(field(outcome, "status"), Some("202"), "{outcome:?}");
+        assert_eq!(field(outcome, "outcome"), Some("success"), "{outcome:?}");
+        assert_eq!(field(outcome, "resource"), Some("worker-1"), "{outcome:?}");
+        for line in [admission, outcome] {
+            assert_eq!(field(line, "principal"), Some("admin"), "{line:?}");
+            assert_eq!(field(line, "auth_method"), Some("api_key"), "{line:?}");
+            assert_eq!(field(line, "role"), Some("admin"), "{line:?}");
+            assert_eq!(field(line, "method"), Some("POST"), "{line:?}");
+            assert_eq!(field(line, "path"), Some("/workers"), "{line:?}");
+            assert_eq!(
+                field(line, "request_id"),
+                Some("req-7"),
+                "one request id correlates both lines: {line:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mutation_the_handler_refused_is_logged_as_failed_with_its_status() {
+        use crate::audit::tests::field;
+
+        let (status, events) = audited_call(true, "REFUSED", "admin-key").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(events.len(), 2, "{events:?}");
+        let outcome = &events[1];
+        assert_eq!(field(outcome, "status"), Some("400"), "{outcome:?}");
+        assert_eq!(field(outcome, "outcome"), Some("failed"), "{outcome:?}");
+        assert_eq!(
+            field(outcome, "resource"),
+            None,
+            "a refused mutation names no resource: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_writes_the_admission_line_alone() {
+        use crate::audit::tests::field;
+
+        let (status, events) = audited_call(true, "GET", "reader-key").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            field(&events[0], "message"),
+            Some("control_plane_audit"),
+            "{events:?}"
+        );
+    }
+
+    /// The audit lines of a mutation whose client leaves after the first
+    /// poll: `handler` waits at a gate, the middleware's future is polled
+    /// once and dropped, the gate opens, and the lines are read once the
+    /// task has written its outcome (or after a thousand yields).
+    async fn lines_after_the_client_left(
+        handler: axum::routing::MethodRouter<Arc<tokio::sync::Notify>>,
+    ) -> Vec<Vec<(String, String)>> {
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+
+        use axum::{middleware::from_fn_with_state, Router};
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::{audit::tests::FieldCapture, config::ApiKeyEntry};
+
+        let gate = Arc::new(Notify::new());
+        let state = ControlPlaneAuthState::new(
+            ControlPlaneAuthConfig {
+                jwt: None,
+                api_keys: vec![ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin)],
+                audit_enabled: true,
+            },
+            None,
+        );
+        let app = Router::new()
+            .route("/workers", handler)
+            .layer(from_fn_with_state(state, control_plane_auth_middleware))
+            .with_state(Arc::clone(&gate));
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/workers")
+            .header(header::AUTHORIZATION, "Bearer admin-key")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(RequestId("req-7".to_string()));
+        let capture = Arc::new(FieldCapture::default());
+
+        let mut call = Box::pin(app.oneshot(request).with_subscriber(capture.clone()));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            call.as_mut().poll(&mut cx).is_pending(),
+            "the handler waits at its gate"
+        );
+        drop(call);
+        gate.notify_one();
+        for _ in 0..1_000 {
+            if capture.events.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let events = capture.events.lock().unwrap().clone();
+        events
+    }
+
+    /// The client of a mutation leaves after the first poll: the handler's
+    /// gate opens, and the outcome line still reaches the audit log under the
+    /// request's subscriber.
+    #[tokio::test]
+    async fn a_mutation_whose_client_leaves_still_writes_its_outcome_line() {
+        use axum::routing::post;
+        use tokio::sync::Notify;
+
+        use crate::audit::tests::field;
+
+        async fn register(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            AuditResource::name(StatusCode::ACCEPTED.into_response(), "worker-1")
+        }
+        let events = lines_after_the_client_left(post(register)).await;
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the admission line, then the outcome line: {events:?}"
+        );
+        let outcome = &events[1];
+        assert_eq!(
+            field(outcome, "message"),
+            Some("control_plane_mutation"),
+            "{outcome:?}"
+        );
+        assert_eq!(field(outcome, "status"), Some("202"), "{outcome:?}");
+        assert_eq!(field(outcome, "outcome"), Some("success"), "{outcome:?}");
+        assert_eq!(field(outcome, "resource"), Some("worker-1"), "{outcome:?}");
+        assert_eq!(field(outcome, "request_id"), Some("req-7"), "{outcome:?}");
+    }
+
+    /// The client of a mutation leaves after the first poll: the record keeps
+    /// the hold the state hands out until its outcome line is written and
+    /// releases it after the line, whether the handler answers or panics,
+    /// so a shutdown drain that waits on the hold waits for the line.
+    #[tokio::test]
+    async fn a_departed_clients_mutation_keeps_its_hold_until_the_outcome_line() {
+        use std::{
+            future::Future,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Waker},
+        };
+
+        use axum::{middleware::from_fn_with_state, routing::post, Router};
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::{
+            audit::tests::{field, FieldCapture},
+            config::ApiKeyEntry,
+        };
+
+        /// A hold that counts itself while it lives and notes, when it goes,
+        /// how many audit lines the capture held by then.
+        struct Held {
+            count: Arc<AtomicUsize>,
+            lines: Arc<FieldCapture>,
+            lines_at_release: Arc<AtomicUsize>,
+        }
+        impl Drop for Held {
+            fn drop(&mut self) {
+                let lines = self.lines.events.lock().unwrap().len();
+                self.lines_at_release.store(lines, Ordering::Release);
+                self.count.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
+        async fn register(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            AuditResource::name(StatusCode::ACCEPTED.into_response(), "worker-1")
+        }
+        async fn give_up(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            panic!("the handler gave up after the client left")
+        }
+
+        for (handler, status) in [(post(register), "202"), (post(give_up), "500")] {
+            let held = Arc::new(AtomicUsize::new(0));
+            let lines_at_release = Arc::new(AtomicUsize::new(usize::MAX));
+            let capture = Arc::new(FieldCapture::default());
+            let gate = Arc::new(Notify::new());
+            let state = ControlPlaneAuthState::new(
+                ControlPlaneAuthConfig {
+                    jwt: None,
+                    api_keys: vec![ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin)],
+                    audit_enabled: true,
+                },
+                None,
+            )
+            .with_mutation_hold({
+                let (count, lines, lines_at_release) = (
+                    Arc::clone(&held),
+                    Arc::clone(&capture),
+                    Arc::clone(&lines_at_release),
+                );
+                move || {
+                    count.fetch_add(1, Ordering::AcqRel);
+                    Box::new(Held {
+                        count: Arc::clone(&count),
+                        lines: Arc::clone(&lines),
+                        lines_at_release: Arc::clone(&lines_at_release),
+                    })
+                }
+            });
+            let app = Router::new()
+                .route("/workers", handler)
+                .layer(from_fn_with_state(state, control_plane_auth_middleware))
+                .with_state(Arc::clone(&gate));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/workers")
+                .header(header::AUTHORIZATION, "Bearer admin-key")
+                .body(Body::empty())
+                .unwrap();
+
+            let mut call = Box::pin(app.oneshot(request).with_subscriber(capture.clone()));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                call.as_mut().poll(&mut cx).is_pending(),
+                "the handler waits at its gate"
+            );
+            assert_eq!(held.load(Ordering::Acquire), 1, "the record took its hold");
+            // The client leaves; the task runs on to its gate with the hold.
+            drop(call);
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                held.load(Ordering::Acquire),
+                1,
+                "the departed client's record keeps its hold"
+            );
+            gate.notify_one();
+            for _ in 0..1_000 {
+                if held.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                held.load(Ordering::Acquire),
+                0,
+                "the hold goes with the record"
+            );
+            let events = capture.events.lock().unwrap().clone();
+            assert_eq!(
+                events.len(),
+                2,
+                "the admission line, then the outcome line: {events:?}"
+            );
+            assert_eq!(field(&events[1], "status"), Some(status), "{events:?}");
+            assert_eq!(
+                lines_at_release.load(Ordering::Acquire),
+                2,
+                "the outcome line was written before the hold went ({status})"
+            );
+        }
+    }
+
+    /// The client leaves, then the handler panics: the task's record still
+    /// writes the outcome line, at 500 with no resource.
+    #[tokio::test]
+    async fn a_handler_that_panics_after_the_client_left_still_writes_its_outcome_line() {
+        use axum::routing::post;
+        use tokio::sync::Notify;
+
+        use crate::audit::tests::field;
+
+        async fn give_up(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            panic!("the handler gave up after the client left")
+        }
+        let events = lines_after_the_client_left(post(give_up)).await;
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the admission line, then the outcome line: {events:?}"
+        );
+        let outcome = &events[1];
+        assert_eq!(field(outcome, "status"), Some("500"), "{outcome:?}");
+        assert_eq!(field(outcome, "outcome"), Some("failed"), "{outcome:?}");
+        assert_eq!(field(outcome, "resource"), None, "{outcome:?}");
+    }
+
+    /// The runtime drops the task of a mutation in flight (the process stops
+    /// with the handler at work, no panic): the record writes no outcome
+    /// line. No client was answered a 500, so the audit trail keeps the
+    /// admission line alone.
+    #[test]
+    fn a_task_the_runtime_drops_writes_no_outcome_line() {
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+
+        use axum::{middleware::from_fn_with_state, routing::post, Router};
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::{
+            audit::tests::{field, FieldCapture},
+            config::ApiKeyEntry,
+        };
+
+        async fn wait_at_the_gate(State(gate): State<Arc<Notify>>) -> Response {
+            gate.notified().await;
+            StatusCode::ACCEPTED.into_response()
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let capture = Arc::new(FieldCapture::default());
+        let gate = Arc::new(Notify::new());
+        runtime.block_on(async {
+            let state = ControlPlaneAuthState::new(
+                ControlPlaneAuthConfig {
+                    jwt: None,
+                    api_keys: vec![ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin)],
+                    audit_enabled: true,
+                },
+                None,
+            );
+            let app = Router::new()
+                .route("/workers", post(wait_at_the_gate))
+                .layer(from_fn_with_state(state, control_plane_auth_middleware))
+                .with_state(Arc::clone(&gate));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/workers")
+                .header(header::AUTHORIZATION, "Bearer admin-key")
+                .body(Body::empty())
+                .unwrap();
+            let mut call = Box::pin(app.oneshot(request).with_subscriber(capture.clone()));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                call.as_mut().poll(&mut cx).is_pending(),
+                "the handler waits at its gate"
+            );
+            // The client leaves; the task runs on to its gate.
+            drop(call);
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        });
+        // The runtime goes with the task at its gate: the task's future is
+        // dropped on this thread, under the capture, with no panic.
+        tracing::subscriber::with_default(capture.clone(), || drop(runtime));
+
+        let events = capture.events.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "the admission line alone: {events:?}");
+        assert_eq!(
+            field(&events[0], "message"),
+            Some("control_plane_audit"),
+            "{events:?}"
+        );
+    }
+
+    /// A handler that ends without an answer: the request answers 500 and
+    /// the outcome line says so, with no resource.
+    #[tokio::test]
+    async fn a_handler_that_ends_without_an_answer_is_recorded_as_a_500() {
+        use crate::audit::tests::field;
+
+        let (status, events) = audited_call(true, "BROKEN", "admin-key").await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(events.len(), 2, "{events:?}");
+        let outcome = &events[1];
+        assert_eq!(field(outcome, "status"), Some("500"), "{outcome:?}");
+        assert_eq!(field(outcome, "outcome"), Some("failed"), "{outcome:?}");
+        assert_eq!(field(outcome, "resource"), None, "{outcome:?}");
+    }
+
+    /// A read the gateway named admin-only: the `user` role is refused by
+    /// the gate with the denial line and no admission line, as for a
+    /// mutation; the `admin` role reads it with the admission line alone.
+    #[tokio::test]
+    async fn an_admin_only_read_refuses_the_user_role_with_the_denial_line() {
+        use axum::{middleware::from_fn_with_state, routing::get, Router};
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::{
+            audit::tests::{field, FieldCapture},
+            config::ApiKeyEntry,
+        };
+
+        async fn view() -> Response {
+            StatusCode::OK.into_response()
+        }
+        let state = ControlPlaneAuthState::new(
+            ControlPlaneAuthConfig {
+                jwt: None,
+                api_keys: vec![
+                    ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin),
+                    ApiKeyEntry::new("reader", "Reader", "reader-key", Role::User),
+                ],
+                audit_enabled: true,
+            },
+            None,
+        )
+        .with_admin_only_reads(&["/config"]);
+        let app = Router::new()
+            .route("/config", get(view))
+            .route("/workers", get(view))
+            .layer(from_fn_with_state(state, control_plane_auth_middleware));
+
+        let call = |path: &'static str, key: &'static str| {
+            let app = app.clone();
+            async move {
+                let request = Request::builder()
+                    .uri(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap();
+                let capture = Arc::new(FieldCapture::default());
+                let response = app
+                    .oneshot(request)
+                    .with_subscriber(capture.clone())
+                    .await
+                    .unwrap();
+                let events = capture.events.lock().unwrap().clone();
+                (response.status(), events)
+            }
+        };
+
+        let (status, events) = call("/config", "reader-key").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(field(&events[0], "outcome"), Some("denied"), "{events:?}");
+
+        let (status, events) = call("/config", "admin-key").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(field(&events[0], "outcome"), Some("success"), "{events:?}");
+
+        let (status, _) = call("/workers", "reader-key").await;
+        assert_eq!(status, StatusCode::OK, "a plain read stays the user's");
+    }
+
+    #[tokio::test]
+    async fn a_mutation_the_role_may_not_make_writes_the_denial_line_alone() {
+        use crate::audit::tests::field;
+
+        let (status, events) = audited_call(true, "POST", "reader-key").await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(field(&events[0], "outcome"), Some("denied"), "{events:?}");
+        assert_eq!(
+            field(&events[0], "status"),
+            None,
+            "no handler answered: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_audit_logger_writes_neither_line() {
+        let (status, events) = audited_call(false, "POST", "admin-key").await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(events.is_empty(), "{events:?}");
     }
 }

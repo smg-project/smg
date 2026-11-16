@@ -27,6 +27,8 @@ use std::{
 use image::{DynamicImage, RgbImage, RgbaImage};
 use libloading::{Library, Symbol};
 
+use crate::buffer_pool;
+
 /// Cap on the decoded buffer, the `image` crate's default limit, which the
 /// pure-Rust fallback decoder already enforces.
 const MAX_DECODED_BYTES: usize = 512 * 1024 * 1024;
@@ -191,18 +193,21 @@ pub fn decode_webp(bytes: &[u8]) -> Option<DynamicImage> {
     let (wu, hu) = (w as usize, h as usize);
     let channels = if alpha { 4 } else { 3 };
     let nbytes = decoded_buffer_len(wu, hu, channels)?;
-    let mut buf = vec![0_u8; nbytes];
+    let mut buf = buffer_pool::take(nbytes);
     let stride = c_int::try_from(wu.checked_mul(channels)?).ok()?;
     let decode = if alpha {
         lib.decode_rgba
     } else {
         lib.decode_rgb
     };
-    // SAFETY: `buf` is an owned buffer of exactly `w * h * channels` bytes
-    // (overflow-checked from the dimensions the library reported), passed with
-    // its length and a stride of `w * channels`, so the decoder writes at most
-    // `nbytes` bytes; `bytes` is only read. The image is built only after the
-    // call returned the buffer's own pointer, its success signal.
+    // SAFETY: `buf` is an owned buffer whose length is exactly `w * h *
+    // channels` bytes (overflow-checked from the dimensions the library
+    // reported; a pooled buffer's capacity is larger, the length is what
+    // matters), passed with its length and a stride of `w * channels`, so the
+    // decoder writes at most `nbytes` bytes; `bytes` is only read. The image
+    // is built only after the call returned the buffer's own pointer, its
+    // success signal, which means every byte of the buffer was written (its
+    // contents before the call are a previous frame's, not zeros).
     let written = unsafe {
         decode(
             bytes.as_ptr(),
@@ -213,6 +218,8 @@ pub fn decode_webp(bytes: &[u8]) -> Option<DynamicImage> {
         )
     };
     if written.is_null() {
+        // A refused decode hands its buffer back; the next take is warm.
+        buffer_pool::recycle(buf);
         return None;
     }
     if alpha {

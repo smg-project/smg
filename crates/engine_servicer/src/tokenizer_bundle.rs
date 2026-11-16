@@ -24,7 +24,7 @@ use crate::BoxStream;
 pub(crate) const CHUNK_SIZE: usize = 64 * 1024;
 
 /// Exact file names, in bundle order (the Python `TOKENIZER_FILES`).
-const TOKENIZER_FILES: [&str; 13] = [
+const TOKENIZER_FILES: [&str; 14] = [
     "tokenizer.json",
     "tokenizer_config.json",
     "config.json",
@@ -34,6 +34,7 @@ const TOKENIZER_FILES: [&str; 13] = [
     "merges.txt",
     "tokenizer.model",
     "tiktoken.model",
+    "tekken.json",
     "chat_template.json",
     "preprocessor_config.json",
     "processor_config.json",
@@ -192,6 +193,7 @@ mod tests {
             "merges.txt",
             "vocab.json",
             "tokenizer.model",
+            "tekken.json",
             "zeta.jinja",
             "alpha.jinja",
             "cl100k.tiktoken",
@@ -218,6 +220,7 @@ mod tests {
                 "vocab.json",
                 "merges.txt",
                 "tokenizer.model",
+                "tekken.json",
                 "cl100k.tiktoken",
                 "alpha.jinja",
                 "zeta.jinja",

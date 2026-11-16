@@ -4,12 +4,15 @@
 
 use super::*;
 
-/// Hash array capacity class: `8, 16, .., 128` in steps of 8, then four classes per octave
-/// (`160, 192, 224, 256, 320, ..`), so an array wastes at most a quarter of its words to the
-/// class, not half; a run of 140 blocks with its slack lands in 160, not 256.
+/// Hash array capacity class: `8, 12, .., 32` in steps of 4, `40, 48, .., 128` in steps of 8,
+/// then four classes per octave (`160, 192, 224, 256, 320, ..`), so an array wastes at most a
+/// quarter of its words to the class, not half; a run of 140 blocks with its slack lands in 160,
+/// not 256, and a run of 10 (or one grown past 8 a block at a time) in 12, not 16.
 pub(super) fn array_class(capacity: usize) -> usize {
-    if capacity <= 8 * SMALL_ARRAY_CLASSES {
-        capacity.div_ceil(8).max(1) - 1
+    if capacity <= 4 * (FINE_ARRAY_CLASSES + 1) {
+        capacity.div_ceil(4).max(2) - 2
+    } else if capacity <= 8 * (SMALL_ARRAY_CLASSES - FINE_ARRAY_CLASSES + 4) {
+        FINE_ARRAY_CLASSES + capacity.div_ceil(8) - 5
     } else {
         // `capacity` in `(low, 2 * low]` with `low` a power of two from 128 up.
         let bits = usize::BITS - (capacity - 1).leading_zeros();
@@ -20,8 +23,10 @@ pub(super) fn array_class(capacity: usize) -> usize {
 }
 
 pub(super) fn class_capacity(class: usize) -> usize {
-    if class < SMALL_ARRAY_CLASSES {
-        8 * (class + 1)
+    if class < FINE_ARRAY_CLASSES {
+        4 * (class + 2)
+    } else if class < SMALL_ARRAY_CLASSES {
+        8 * (class - FINE_ARRAY_CLASSES + 5)
     } else {
         let above = class - SMALL_ARRAY_CLASSES;
         let low = 1usize << (7 + above / 4);
@@ -38,6 +43,16 @@ pub(super) fn table_class(slots: usize) -> usize {
     (slots.trailing_zeros() as usize).saturating_sub(MIN_TABLE_SLOTS.trailing_zeros() as usize)
 }
 
+/// Slots of a child table for `needed` entries at three-quarters load, from `MIN_TABLE_SLOTS`
+/// up: the size every table is built or rebuilt at.
+pub(super) fn slots_for(needed: usize) -> usize {
+    let mut slots = MIN_TABLE_SLOTS;
+    while needed * 4 > slots * 3 {
+        slots *= 2;
+    }
+    slots
+}
+
 /// Append-only storage of 64-bit words in fixed chunks with free lists per size class. Holds
 /// hash arrays (`used | capacity << 32`, `refs`, then the hashes) and child tables
 /// (`slots | used << 32`, `live`, then `(head hash, run id | generation << 32)` slots). An
@@ -45,9 +60,19 @@ pub(super) fn table_class(slots: usize) -> usize {
 pub(super) struct WordArena {
     pub(super) dir: Box<[OnceLock<Box<[AtomicU64]>>]>,
     pub(super) next: AtomicU64,
+    /// Words one allocation may take: a chunk, since an allocation never crosses one. A table
+    /// or array that would need more is refused (`largest_table_slots`, `array_fits`), which
+    /// the grow paths ask before they allocate; tests lower it to reach the caps in a few stores.
+    pub(super) cap_words: usize,
     pub(super) free_arrays: Vec<SegQueue<u32>>,
     pub(super) free_tables: Vec<SegQueue<u32>>,
     pub(super) free_partials: Vec<SegQueue<u32>>,
+    /// Slots `table_take` probed and the scans it fell back to: a test shows an unlink lands on
+    /// its slot instead of walking the table.
+    #[cfg(test)]
+    pub(super) take_probes: AtomicUsize,
+    #[cfg(test)]
+    pub(super) take_scans: AtomicUsize,
 }
 
 impl WordArena {
@@ -55,9 +80,14 @@ impl WordArena {
         Self {
             dir: (0..WORD_DIR).map(|_| OnceLock::new()).collect(),
             next: AtomicU64::new(1),
+            cap_words: WORD_CHUNK,
             free_arrays: (0..ARRAY_CLASSES).map(|_| SegQueue::new()).collect(),
             free_tables: (0..TABLE_CLASSES).map(|_| SegQueue::new()).collect(),
             free_partials: (0..TABLE_CLASSES).map(|_| SegQueue::new()).collect(),
+            #[cfg(test)]
+            take_probes: AtomicUsize::new(0),
+            #[cfg(test)]
+            take_scans: AtomicUsize::new(0),
         }
     }
 
@@ -110,6 +140,20 @@ impl WordArena {
 
     pub(super) fn used(&self) -> u64 {
         self.next.load(Ordering::Relaxed)
+    }
+
+    /// Whether a hash array of `capacity` words, rounded up to its class, fits one chunk with
+    /// its two header words: the longest array is the largest class two words short of a chunk.
+    pub(super) fn array_fits(&self, capacity: usize) -> bool {
+        class_capacity(array_class(capacity.max(8))) + 2 <= self.cap_words
+    }
+
+    /// The largest child table that fits one chunk with its two header words (2^18 slots at the
+    /// arena's chunk): the one table that cannot grow.
+    #[inline]
+    pub(super) fn largest_table_slots(&self) -> usize {
+        let room = (self.cap_words - 2) / 2;
+        1 << (usize::BITS - 1 - room.leading_zeros())
     }
 
     /// Bytes of chunks taken from the process allocator: what the arena costs in memory.
@@ -228,9 +272,10 @@ impl WordArena {
         self.word(table).load(Ordering::Relaxed) as u32 as usize
     }
 
-    /// The child continuing with `head`, as `(run, generation)`.
+    /// Live entries of a table (`NONE` has none). Every table keeps its live
+    /// count in the word after its header, a window's child table and a run's
+    /// partials table alike, so both kinds are read here.
     #[inline]
-    /// Live entries of a child table (`NONE` has none).
     pub(super) fn table_live(&self, table: u32) -> usize {
         if table == NONE {
             0
@@ -239,6 +284,7 @@ impl WordArena {
         }
     }
 
+    /// The child continuing with `head`, as `(run, generation)`.
     pub(super) fn table_find(&self, table: u32, head: u64) -> Option<(u32, u32)> {
         if table == NONE {
             return None;
@@ -275,6 +321,11 @@ impl WordArena {
         if slots == 0 || !slots.is_power_of_two() {
             return Claim::Full;
         }
+        // The largest table cannot grow, so it takes live entries only up to the three-quarters
+        // load every table is rebuilt at: a claim past that is left to the locked path, which
+        // declines it, and a probe for an absent child still ends at an empty slot.
+        let at_cap =
+            slots == self.largest_table_slots() && (self.table_live(table) + 1) * 4 > slots * 3;
         let words = self.words(table + 2, 2 * slots);
         let mask = slots - 1;
         let mut index = key as usize & mask;
@@ -286,6 +337,9 @@ impl WordArena {
             };
             let mut head = head_word.load(Ordering::Acquire);
             if head == 0 {
+                if at_cap {
+                    return Claim::Full;
+                }
                 match head_word.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire) {
                     Ok(_) => {
                         run_word.store(
@@ -362,47 +416,83 @@ impl WordArena {
         }
     }
 
-    /// Tombstone the entry of `run`; returns the live count left.
-    pub(super) fn table_take(&self, table: u32, run: u32) -> u64 {
+    /// Tombstone the entry of `run`, keyed `key` (its offset under the run and its first content
+    /// hash, the key `table_find` probes by); returns the live count left. The probe meets the
+    /// entry within the slots between the key's home and it: none of them is empty while the
+    /// entry is live, and the table is only rebuilt under the lock the caller holds. The scan of
+    /// every slot behind it is a safety net for an entry the probe does not meet, not the path.
+    pub(super) fn table_take(&self, table: u32, key: u64, run: u32) -> u64 {
         let slots = self.table_slots(table);
         let words = self.words(table + 2, 2 * slots);
+        let mask = slots - 1;
+        let mut index = key as usize & mask;
+        for _ in 0..slots {
+            #[cfg(test)]
+            self.take_probes.fetch_add(1, Ordering::Relaxed);
+            let entry = words[2 * index + 1].load(Ordering::Relaxed);
+            if entry == 0 {
+                break;
+            }
+            if entry != TOMB && entry as u32 == run {
+                return self.table_tombstone(table, &words[2 * index + 1]);
+            }
+            index = (index + 1) & mask;
+        }
+        #[cfg(test)]
+        self.take_scans.fetch_add(1, Ordering::Relaxed);
         for index in 0..slots {
             let entry = words[2 * index + 1].load(Ordering::Relaxed);
             if entry != 0 && entry != TOMB && entry as u32 == run {
-                words[2 * index + 1].store(TOMB, Ordering::Release);
-                return self.word(table + 1).fetch_sub(1, Ordering::Relaxed) - 1;
+                return self.table_tombstone(table, &words[2 * index + 1]);
             }
         }
         self.word(table + 1).load(Ordering::Relaxed)
     }
 
-    /// A new table holding the live entries of `table` plus room for one more.
-    pub(super) fn table_grown(&self, table: u32) -> u32 {
-        let entries = self.table_entries(table);
-        let needed = entries.len() + 1;
-        let mut slots = MIN_TABLE_SLOTS;
-        while needed * 4 > slots * 3 {
-            slots *= 2;
-        }
-        let grown = self.alloc_table(slots);
-        for (head, run, generation) in entries {
-            self.table_put(grown, head, run, generation);
-        }
-        grown
+    /// Tombstone one entry's run word; returns the live count left.
+    fn table_tombstone(&self, table: u32, run_word: &AtomicU64) -> u64 {
+        run_word.store(TOMB, Ordering::Release);
+        self.word(table + 1).fetch_sub(1, Ordering::Relaxed) - 1
     }
 
-    /// A table holding `entries` (`(key, run, generation)`) with room for one more; `NONE` for
-    /// none.
+    /// Whether `table` can take one more live entry in a table that fits a chunk: false at the
+    /// fan-out cap, the largest table at the three-quarters load.
+    pub(super) fn table_can_grow(&self, table: u32) -> bool {
+        slots_for(self.table_live(table) + 1) <= self.largest_table_slots()
+    }
+
+    /// A new table holding the live entries of `table` plus room for one more; `None` when that
+    /// table would not fit a chunk (the run is at the arena's fan-out cap).
+    pub(super) fn table_grown(&self, table: u32) -> Option<u32> {
+        if !self.table_can_grow(table) {
+            return None;
+        }
+        let slots = slots_for(self.table_live(table) + 1);
+        let grown = self.alloc_table(slots);
+        for (head, run, generation) in self.table_entries(table) {
+            self.table_put(grown, head, run, generation);
+        }
+        Some(grown)
+    }
+
+    /// A table of the same size holding only the live entries of `table`: for the largest
+    /// table, whose tombstones no growth will ever take.
+    pub(super) fn table_compacted(&self, table: u32) -> u32 {
+        let compacted = self.alloc_table(self.table_slots(table));
+        for (head, run, generation) in self.table_entries(table) {
+            self.table_put(compacted, head, run, generation);
+        }
+        compacted
+    }
+
+    /// A table holding `entries` (`(key, run, generation)`) with room for one more, the largest
+    /// table when they are already at its load (a split moving the children of a run at the
+    /// fan-out cap); `NONE` for none.
     pub(super) fn table_from(&self, entries: &[(u64, u32, u32)]) -> u32 {
         if entries.is_empty() {
             return NONE;
         }
-        let needed = entries.len() + 1;
-        let mut slots = MIN_TABLE_SLOTS;
-        while needed * 4 > slots * 3 {
-            slots *= 2;
-        }
-        let table = self.alloc_table(slots);
+        let table = self.alloc_table(slots_for(entries.len() + 1).min(self.largest_table_slots()));
         for &(key, run, generation) in entries {
             self.table_put(table, key, run, generation);
         }
@@ -447,14 +537,6 @@ impl WordArena {
     pub(super) fn partials_shape(&self, table: u32) -> (usize, usize) {
         let header = self.word(table).load(Ordering::Relaxed);
         (header as u32 as usize, (header >> 32) as usize)
-    }
-
-    pub(super) fn partials_live(&self, table: u32) -> usize {
-        if table == NONE {
-            0
-        } else {
-            self.word(table + 1).load(Ordering::Relaxed) as usize
-        }
     }
 
     /// Live `(worker, cutoff)` entries, in slot order.

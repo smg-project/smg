@@ -1054,11 +1054,14 @@ mod tests {
     }
 
     /// A parameter written in XML-attribute style, `<parameter name="city">`, which the tagged
-    /// syntax has no tag for: the call is delivered with no arguments, and the model's lines are
-    /// refused, byte for byte, the whitespace between the words included, never the chat
-    /// message's content nor a delta, at every cut alike.
+    /// syntax has no tag for: the call is delivered with no arguments and no close, so its
+    /// arguments are no JSON value (a chat client's own reader refuses them, the Responses item
+    /// says `incomplete`, the Messages block keeps the `{}` a cut call's has) where every client
+    /// read a well-formed `{}` before; the model's lines are refused, byte for byte, the
+    /// whitespace between the words included, never the chat message's content nor a delta, at
+    /// every cut alike.
     #[test]
-    fn an_xml_attribute_parameter_is_refused_never_content() {
+    fn an_xml_attribute_parameter_is_refused_never_content_and_the_call_is_no_whole_call() {
         let output = concat!(
             "<tool_call>\n<function=get_weather>\n<parameter name=\"city\">Paris</parameter>\n",
             "<parameter name=\"days\">three or four days</parameter>\n</function>\n</tool_call>"
@@ -1092,9 +1095,25 @@ mod tests {
         let calls = message.tool_calls.expect("a call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
-        assert_eq!(calls[0].function.arguments.as_deref(), Some("{}"));
+        let arguments = calls[0].function.arguments.as_deref().expect("arguments");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(arguments).is_err(),
+            "{arguments:?} reads as a whole value"
+        );
         assert_eq!(streamed(&whole), "");
         assert_eq!(refused(&whole), lines);
+        use crate::adapt;
+        let response = adapt::responses::output("resp", &whole);
+        let items = serde_json::to_value(&response.items).expect("wire");
+        assert_eq!(items.as_array().map(Vec::len), Some(1), "{items}");
+        assert_eq!(items[0]["type"], "function_call", "{items}");
+        assert_eq!(items[0]["name"], "get_weather", "{items}");
+        assert_eq!(items[0]["status"], "incomplete", "{items}");
+        let messages = adapt::messages::output(&whole);
+        assert!(messages.refused.is_empty(), "{:?}", messages.refused);
+        let blocks = serde_json::to_value(&messages.content).expect("wire");
+        assert_eq!(blocks[0]["type"], "tool_use", "{blocks}");
+        assert_eq!(blocks[0]["input"], serde_json::json!({}), "{blocks}");
         for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
             let events = run_tagged(&[&output[..cut], &output[cut..]], EngineFinish::Stop);
             assert_eq!(content(&events), None, "cut at {cut}");
@@ -1224,7 +1243,7 @@ mod tests {
                 function: Function {
                     name: name.to_string(),
                     description: None,
-                    parameters,
+                    parameters: Some(parameters),
                     strict: None,
                     extra: Default::default(),
                 },
@@ -1601,10 +1620,10 @@ mod tests {
                 function: Function {
                     name: "submit_patch".to_string(),
                     description: None,
-                    parameters: value!({
+                    parameters: Some(value!({
                         "type": "object",
                         "properties": {"patch": {"type": "string"}},
-                    }),
+                    })),
                     strict: None,
                     extra: Default::default(),
                 },
@@ -1753,7 +1772,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict: None,
                 extra: Default::default(),
             },

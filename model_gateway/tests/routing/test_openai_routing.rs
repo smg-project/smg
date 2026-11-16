@@ -18,8 +18,7 @@ use axum::{
 };
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::StringOrArray,
-    completion::CompletionRequest,
+    completion::{CompletionPrompt, CompletionRequest},
     generate::GenerateRequest,
     responses::{ResponseInput, ResponsesRequest},
 };
@@ -32,7 +31,7 @@ use smg::{
         RouterFactory,
     },
     tenant::{RouteRequestMeta, TenantKey},
-    worker::{BasicWorkerBuilder, RuntimeType, Worker, WorkerType},
+    worker::{test_support::RefusedAddress, BasicWorkerBuilder, RuntimeType, Worker, WorkerType},
 };
 use smg_data_connector::{ResponseId, StoredResponse};
 use smg_external_router::{openai::OpenAIRouter, ExternalRouter};
@@ -43,6 +42,7 @@ use tokio::{
 use tower::ServiceExt;
 
 use crate::common::{
+    create_test_context,
     mock_openai_server::MockOpenAIServer,
     test_app::{create_test_app_context, register_external_worker},
 };
@@ -64,7 +64,7 @@ fn create_minimal_chat_request() -> ChatCompletionRequest {
 fn create_minimal_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
-        prompt: StringOrArray::String("Hello".to_string()),
+        prompt: CompletionPrompt::Text("Hello".to_string()),
         suffix: None,
         max_tokens: Some(100),
         temperature: None,
@@ -158,7 +158,7 @@ async fn test_openai_router_models() {
         .body(Body::empty())
         .unwrap();
 
-    let response = list_models(&ctx, req.headers(), "req_test".to_string()).await;
+    let response = list_models(&ctx, req.headers(), None, "req_test".to_string()).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let (_, body) = response.into_parts();
@@ -589,7 +589,7 @@ async fn test_router_factory_openai_mode() {
 
     let router_config = RouterConfig::new(routing_mode, PolicyConfig::Random);
 
-    let app_context = crate::common::create_test_context(router_config).await;
+    let app_context = create_test_context(router_config).await;
 
     let router = RouterFactory::create_router(&app_context).await;
     assert!(
@@ -918,7 +918,7 @@ async fn test_openai_router_circuit_breaker() {
     // A loopback port that refuses connections, held for the whole test.
     // Every attempt fails at connect, with no resolver and no proxy involved,
     // whatever the environment.
-    let refused = smg::test_support::RefusedAddress::reserve();
+    let refused = RefusedAddress::reserve();
     register_external_worker(&ctx, &refused.http_url(), None);
     let router = OpenAIRouter::new(&external_context(&ctx)).await.unwrap();
 
@@ -974,7 +974,7 @@ async fn test_openai_router_models_from_registry() {
         .body(Body::empty())
         .unwrap();
 
-    let response = list_models(&ctx, req.headers(), "req_test".to_string()).await;
+    let response = list_models(&ctx, req.headers(), None, "req_test".to_string()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let (_, body) = response.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
@@ -1019,11 +1019,42 @@ fn oracle_config_validation_accepts_dsn_only() {
             pool_min: 1,
             pool_max: 4,
             pool_timeout_secs: 30,
+            op_timeout_secs: 5,
             schema: None,
         })
         .build_unchecked();
 
     config.validate().expect("dsn-based config should validate");
+}
+
+/// The store-call bound is refused at zero by the validator, as the pool wait
+/// is: a configuration built outside the CLI (the Python bindings, a config
+/// by hand) is refused before the storage factory sees it.
+#[test]
+fn oracle_config_validation_refuses_a_zero_store_call_bound() {
+    let config = RouterConfig::builder()
+        .openai_mode(vec!["https://api.openai.com".to_string()])
+        .oracle_history(OracleConfig {
+            wallet_path: None,
+            connect_descriptor: "tcps://db.example.com:1522/service".to_string(),
+            external_auth: false,
+            username: "scott".to_string(),
+            password: "tiger".to_string(),
+            pool_min: 1,
+            pool_max: 4,
+            pool_timeout_secs: 30,
+            op_timeout_secs: 0,
+            schema: None,
+        })
+        .build_unchecked();
+
+    let err = config
+        .validate()
+        .expect_err("a zero store-call bound is refused, as a zero pool wait is");
+    match err {
+        ConfigError::InvalidValue { field, .. } => assert_eq!(field, "oracle.op_timeout_secs"),
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
@@ -1039,6 +1070,7 @@ fn oracle_config_validation_accepts_wallet_alias() {
             pool_min: 1,
             pool_max: 8,
             pool_timeout_secs: 45,
+            op_timeout_secs: 5,
             schema: None,
         })
         .build_unchecked();
@@ -1061,6 +1093,7 @@ fn oracle_config_validation_for_external_auth() {
             pool_min: 1,
             pool_max: 4,
             pool_timeout_secs: 30,
+            op_timeout_secs: 5,
             schema: None,
         })
         .build_unchecked();
@@ -1080,6 +1113,7 @@ fn oracle_config_validation_for_external_auth() {
             pool_min: 1,
             pool_max: 4,
             pool_timeout_secs: 30,
+            op_timeout_secs: 5,
             schema: None,
         })
         .build_unchecked();

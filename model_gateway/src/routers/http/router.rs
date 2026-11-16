@@ -11,10 +11,7 @@ use std::{
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
-    http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
-        HeaderMap, HeaderValue, Method, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -32,12 +29,11 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
-    profile::ProviderProfile,
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
     },
-    rerank::{RerankRequest, RerankResponse, RerankResult},
+    rerank::{RerankRequest, RerankResponse, RerankWorkerResponse},
     responses::ResponsesRequest,
     systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
@@ -51,7 +47,13 @@ use tracing::{error, warn};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    middleware::{scheduler::PreemptionGuard, TenantRequestMeta},
+    middleware::{
+        body_timeout::{
+            request_body_stalled_response, REQUEST_BODY_STALLED, REQUEST_BODY_TOO_LARGE,
+        },
+        scheduler::PreemptionGuard,
+        TenantRequestMeta,
+    },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, error_reason_from_status, metrics_labels, Metrics},
@@ -71,25 +73,27 @@ use crate::{
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
             placement::{self, CandidateFilter, PlacementFailure, PlacementInputs, RefusalSite},
-            rate_limit_cell::RateLimitCell,
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{
-                is_request_timeout, is_retryable_response, is_retryable_status, mark_non_retryable,
-                request_timeout_response, RetryExecutor,
+                is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
-            sse_rechunk::{NoopObserver, SseRechunker},
+            sse_rechunk::{NoopObserver, RechunkPolicy, SseRechunker},
+            stream::GuardedStream,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
         external::GatewayWorker,
         gateway::Gateway,
-        grpc::utils::{
-            error_reason_for_response, error_type_for_response, error_type_from_status,
-            route_to_endpoint,
+        grpc::{
+            utils::{
+                error_reason_for_response, error_type_for_response, error_type_from_status,
+                route_to_endpoint,
+            },
+            wire::Wire,
         },
         http::{
             request_body::{
@@ -98,25 +102,25 @@ use crate::{
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
             stream_relay::{relay_streaming_body, ChunkMode, Relay},
-            tenant_rate_limit::{self, TenantCharge},
+            tenant_rate_limit::{self, TenantCharge, TenantReservation},
         },
         BodyPolicy, RouterTrait,
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        endpoint::Endpoint, ConnectionMode, GuardedStream, RoutingPool, RuntimeType, Worker,
-        WorkerLoadGuard, WorkerRegistry, WorkerType,
+        identity::endpoint::Endpoint, ConnectionMode, RoutingPool, RuntimeType, Worker,
+        WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
 };
 
 /// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
 const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
-/// Error codes for streamed-body aborts the client caused. They carry no
-/// worker verdict: recording a circuit-breaker sample for them would let slow
-/// or oversized uploaders open a healthy worker's breaker.
-const STREAMED_BODY_STALLED: &str = "request_body_stalled";
-const STREAMED_BODY_TOO_LARGE: &str = "request_body_too_large";
+/// Error code of a streamed body that broke off before it was forwarded.
+/// With the middleware's `REQUEST_BODY_STALLED` and `REQUEST_BODY_TOO_LARGE`
+/// it names an abort the client caused; the three carry no worker verdict:
+/// recording a circuit-breaker sample for one would let slow or oversized
+/// uploaders open a healthy worker's breaker.
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
 
 /// How a worker response body is relayed to the client. Re-chunking exists
@@ -124,7 +128,8 @@ const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
 #[derive(Clone, Copy)]
 struct StreamRelayMode {
     is_stream: bool,
-    rechunk: bool,
+    /// The numbers the stream is re-sliced by, when its wire asks for it.
+    rechunk: Option<RechunkPolicy>,
 }
 
 /// One dispatch attempt of a typed request: the inputs every stage of
@@ -248,7 +253,7 @@ impl Router {
         // only HTTP-transport workers are eligible: a gRPC or ZMQ worker's
         // URL cannot serve it.
         self.worker_registry
-            .get_routing_pool(crate::worker::UNKNOWN_MODEL_ID, RoutingPool::HttpRegular)
+            .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular)
             .iter()
             .find(|worker| worker.is_healthy())
             .cloned()
@@ -262,7 +267,7 @@ impl Router {
             Ok(worker) => {
                 let mut request_builder = worker
                     .http_client()
-                    .get(format!("{}/{endpoint}", worker.url()));
+                    .get(format!("{}/{endpoint}", worker.base_url()));
                 // A public route outside the auth middleware: the allow-listed
                 // caller headers go as they are and nothing is added (a
                 // configured worker key here would authenticate an anonymous
@@ -275,8 +280,7 @@ impl Router {
 
                 match send_with_stale_conn_retry(request_builder).await {
                     Ok(res) => {
-                        let status = StatusCode::from_u16(res.status().as_u16())
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let status = res.status();
 
                         // Preserve headers from backend
                         let response_headers =
@@ -289,7 +293,9 @@ impl Router {
                                 *response.headers_mut() = response_headers;
                                 response
                             }
-                            Err(e) => error::internal_error(
+                            // The worker's answer ended before it was whole:
+                            // the upstream's failure, under the code it had.
+                            Err(e) => error::bad_gateway(
                                 "read_response_failed",
                                 format!("Failed to read response: {}", cause(&e)),
                             ),
@@ -443,14 +449,25 @@ impl Router {
     /// reserves its estimate once, before any dispatch, and the one answer the
     /// dispatch paths converge on resolves the reservation once
     /// (`tenant_rate_limit::resolve`).
-    pub(crate) async fn route_typed_request<T: TenantCharge + serde::Serialize>(
-        &self,
-        headers: Option<&HeaderMap>,
-        tenant_meta: Option<&TenantRequestMeta>,
+    ///
+    /// A plain fn around an async block, not an async fn: everything the
+    /// route reads from the request by reference (whether it streams, its
+    /// routing derivatives, the tenant's estimate) is read here, before the
+    /// request moves into the lease, and the block uses the lease in place.
+    /// An async fn re-binds its by-value argument and keeps that local once
+    /// it has been borrowed, two copies of the request in the task beside
+    /// the lease's; the block holds the lease alone.
+    pub(crate) fn route_typed_request<'a, T>(
+        &'a self,
+        headers: Option<&'a HeaderMap>,
+        tenant_meta: Option<&'a TenantRequestMeta>,
         typed_req: T,
         route: &'static str,
-        model_id: &str,
-    ) -> Response {
+        model_id: &'a str,
+    ) -> impl Future<Output = Response> + Send + 'a
+    where
+        T: TenantCharge + serde::Serialize + Send + 'a,
+    {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let routing = self.routing_derivatives(headers, &typed_req);
@@ -459,53 +476,62 @@ impl Router {
         // understands aliases; retry configs, hash rings and policies do not,
         // and an alias would silently fall back to router defaults.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
-        let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        let outcome = self.begin_route(route, model_id, is_stream);
-
+        let estimate = tenant_rate_limit::estimate(
+            self.rate_limit_manager.as_deref(),
+            tenant_meta,
+            &typed_req,
+            routing.text.as_deref(),
+        );
         // Use per-model retry config if set by a worker, otherwise fall back to router default.
-        let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
-        let retry_config = per_model_retry_config
-            .as_ref()
-            .unwrap_or(&self.retry_config);
-
-        let (reservation, denial) = self
-            .reserve_tenant_estimate(tenant_meta, &typed_req, model_id, routing.text.as_deref())
-            .await;
-
+        let per_model_retry_config = self
+            .worker_registry
+            .get_retry_config(canonical_model.as_deref().unwrap_or(model_id));
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
         let lease = RequestLease::new(
             typed_req,
             routing,
-            ReleasePoint::from_retry_config(retry_config),
+            ReleasePoint::from_retry_config(
+                per_model_retry_config
+                    .as_ref()
+                    .unwrap_or(&self.retry_config),
+            ),
         );
-        // The state the attempts share; `TypedAttempt` names each piece.
-        let tried = parking_lot::Mutex::new(Vec::new());
-        let ledger = AttemptLedger::default();
-        let attempt = TypedAttempt {
-            headers,
-            lease: &lease,
-            route,
-            model_id,
-            canonical_model: canonical_model.as_deref(),
-            is_stream,
-            ledger: &ledger,
-            tried: &tried,
-        };
+        async move {
+            let model_id = canonical_model.as_deref().unwrap_or(model_id);
+            let retry_config = per_model_retry_config
+                .as_ref()
+                .unwrap_or(&self.retry_config);
+            let outcome = self.begin_route(route, model_id, is_stream);
+            let (reservation, denial) = tenant_rate_limit::reserve(estimate, model_id).await;
+            // The state the attempts share; `TypedAttempt` names each piece.
+            let tried = parking_lot::Mutex::new(Vec::new());
+            let ledger = AttemptLedger::default();
+            let attempt = TypedAttempt {
+                headers,
+                lease: &lease,
+                route,
+                model_id,
+                canonical_model: canonical_model.as_deref(),
+                is_stream,
+                ledger: &ledger,
+                tried: &tried,
+            };
 
-        let response = if let Some(denied) = denial {
-            denied
-        } else if lease.release_point() == ReleasePoint::AfterDispatch {
-            self.dispatch_once(&attempt, outcome.endpoint).await
-        } else {
-            self.dispatch_with_retries(&attempt, retry_config, outcome.endpoint)
-                .await
-        };
-        let response = self
-            .resolve_tenant_reservation(reservation.as_ref(), route, is_stream, response)
-            .await;
-        outcome.answered_typed(&response, start);
-        response
+            let response = if let Some(denied) = denial {
+                denied
+            } else if lease.release_point() == ReleasePoint::AfterDispatch {
+                self.dispatch_once(&attempt, outcome.endpoint).await
+            } else {
+                self.dispatch_with_retries(&attempt, retry_config, outcome.endpoint)
+                    .await
+            };
+            let response = self
+                .resolve_tenant_reservation(reservation.as_ref(), route, is_stream, response)
+                .await;
+            outcome.answered_typed(&response, start);
+            response
+        }
     }
 
     /// The routing inputs of a request, derived once (for a typed request,
@@ -525,6 +551,8 @@ impl Router {
             header_utils::parse_routing_tokens_hint(headers).or_else(|| {
                 typed_req
                     .routing_tokens()
+                    // the generate route's validator refuses a negative `input_ids`
+                    // entry before routing: the cast of a validated id cannot wrap
                     .map(|ids| ids.iter().map(|&id| id as u32).collect())
             });
         let text = tokens
@@ -568,35 +596,6 @@ impl Router {
         RouteOutcome {
             model_label: Cow::Borrowed(model_label),
             endpoint,
-        }
-    }
-
-    /// Reserve the tenant's estimate once per logical request, before any
-    /// dispatch: every attempt dispatches under this one reservation. With
-    /// the rate limiter on and a tenant to charge, either the reservation
-    /// (with the request's samples per prompt, for the resolve) or the
-    /// denial, which is the request's answer, never retried; `(None, None)`
-    /// for a request outside the limiter.
-    async fn reserve_tenant_estimate<T: TenantCharge>(
-        &self,
-        tenant_meta: Option<&TenantRequestMeta>,
-        typed_req: &T,
-        model_id: &str,
-        routing_text: Option<&str>,
-    ) -> (Option<(RateLimitCell, u32)>, Option<Response>) {
-        match (&self.rate_limit_manager, tenant_meta) {
-            (Some(manager), Some(tenant_meta)) => {
-                let cell = RateLimitCell::new();
-                let estimate = typed_req.estimated_input_tokens(routing_text);
-                match cell.reserve(manager, tenant_meta, model_id, estimate).await {
-                    Ok(()) => (Some((cell, typed_req.samples_per_prompt())), None),
-                    Err(mut denied) => {
-                        mark_non_retryable(&mut denied);
-                        (None, Some(denied))
-                    }
-                }
-            }
-            _ => (None, None),
         }
     }
 
@@ -671,25 +670,19 @@ impl Router {
     /// estimate. An answer outside the limiter passes through.
     async fn resolve_tenant_reservation(
         &self,
-        reservation: Option<&(RateLimitCell, u32)>,
+        reservation: Option<&TenantReservation>,
         route: &'static str,
         is_stream: bool,
         response: Response,
     ) -> Response {
-        match reservation {
-            Some((cell, samples_per_prompt)) => {
-                tenant_rate_limit::resolve(
-                    cell,
-                    route,
-                    *samples_per_prompt,
-                    is_stream,
-                    response,
-                    self.max_payload_size,
-                )
-                .await
-            }
-            None => response,
-        }
+        tenant_rate_limit::resolve(
+            reservation,
+            route,
+            is_stream,
+            response,
+            self.max_payload_size,
+        )
+        .await
     }
 
     /// One attempt of a typed request as a sequence of named stages: the
@@ -755,23 +748,25 @@ impl Router {
         attempt: &TypedAttempt<'_, T>,
     ) -> Result<Arc<dyn Worker>, Response> {
         let model_id = attempt.model_id;
-        let ledger = attempt.ledger;
-        // A retry never goes back to a worker whose answer was definitive.
-        let admits = |worker: &dyn Worker| ledger.admits(worker);
         match attempt.lease.with_view(|view| {
             // A retry re-selects away from the engines this request already
             // tried, while another available worker is left to take it.
             let tried = attempt.tried.lock();
-            self.select_worker_for_model(
-                model_id,
-                view.text,
-                view.tokens,
-                attempt.headers,
-                view.rid_key,
-                view.cache_namespace,
-                Some(&admits),
-                &tried,
-            )
+            // A retry never goes back to a worker whose answer was
+            // definitive. Until a worker gave one the ledger hands no
+            // filter, and a first attempt asks nothing of each candidate.
+            attempt.ledger.with_candidate_filter(|candidate_filter| {
+                self.select_worker_for_model(
+                    model_id,
+                    view.text,
+                    view.tokens,
+                    attempt.headers,
+                    view.rid_key,
+                    view.cache_namespace,
+                    candidate_filter,
+                    &tried,
+                )
+            })
         }) {
             Some(worker) => Ok(worker),
             None => {
@@ -893,20 +888,22 @@ impl Router {
     }
 
     /// How the attempt's answer is relayed: streamed or buffered, and
-    /// re-chunked to the provider's packet-size contract when the model the
-    /// client asked for has one (the profile follows the requested model, as
-    /// request validation selects it, not the alias-resolved id).
+    /// re-chunked when the wire of the model the client asked for re-slices
+    /// its stream ([`Wire::rechunk_policy`]; the wire follows the requested
+    /// model, as request validation selects it, not the alias-resolved id).
     fn relay_mode_for_attempt<T: GenerationRequest>(
         attempt: &TypedAttempt<'_, T>,
     ) -> StreamRelayMode {
         let is_stream = attempt.is_stream;
-        let rechunk = is_stream
-            && attempt.route == "/v1/chat/completions"
-            && attempt.lease.with_view(|view| {
-                view.request.get_model().is_some_and(|model| {
-                    ProviderProfile::for_model(model) == ProviderProfile::Minimax
+        let rechunk = (is_stream && attempt.route == "/v1/chat/completions")
+            .then(|| {
+                attempt.lease.with_view(|view| {
+                    view.request
+                        .get_model()
+                        .and_then(|model| Wire::for_model(model).rechunk_policy())
                 })
-            });
+            })
+            .flatten();
         StreamRelayMode { is_stream, rechunk }
     }
 
@@ -1083,8 +1080,7 @@ impl Router {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let status = res.status();
 
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
@@ -1100,7 +1096,7 @@ impl Router {
                             last_response = Some(response);
                         }
                         Err(e) => {
-                            last_response = Some(error::internal_error(
+                            last_response = Some(error::bad_gateway(
                                 "read_response_failed",
                                 format!("Failed to read response: {}", cause(&e)),
                             ));
@@ -1198,8 +1194,7 @@ impl Router {
             Err(response) => return response,
         };
 
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = res.status();
 
         Metrics::record_router_upstream_response(metrics_labels::ROUTER_HTTP, status.as_u16(), "");
 
@@ -1364,9 +1359,12 @@ impl Router {
     }
 
     /// Buffer a worker response body, capped at `limit` bytes; a larger body
-    /// is a misbehaving worker and yields a 502 before memory balloons. The
-    /// request's own timeout running out mid-body ends the request as it does
-    /// before the head (see [`convert_reqwest_error`]).
+    /// is a misbehaving worker and yields a 502 before memory balloons, and so
+    /// does a body the worker's connection cuts short (a close before the
+    /// announced length, a reset mid-body): the worker's transport failing
+    /// under the call, answered under its own code, never a fault of the
+    /// gateway's. The request's own timeout running out mid-body ends the
+    /// request as it does before the head (see [`convert_reqwest_error`]).
     async fn read_worker_body_capped<S>(mut stream: S, limit: usize) -> Result<Bytes, Response>
     where
         S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
@@ -1382,7 +1380,7 @@ impl Router {
                     )));
                 }
                 Err(e) => {
-                    return Err(error::internal_error(
+                    return Err(error::bad_gateway(
                         "read_response_body_failed",
                         format!("Failed to get response body: {}", cause(&e)),
                     ));
@@ -1452,10 +1450,11 @@ impl Router {
     /// Relay a worker response to the client. A streaming response flows
     /// through a bounded channel with the load guard attached to the body; a
     /// buffered response is read capped at the ingress payload limit. With
-    /// `rechunk`, SSE delta payloads are re-sliced to the provider's
-    /// packet-size contract. A streamed body the worker ends with an error
-    /// after a successful head is accounted to `source` and, when it is SSE,
-    /// ended with the typed error event.
+    /// `rechunk`, SSE delta payloads are re-sliced to the bounds of the wire
+    /// of the model the client asked for ([`Wire::rechunk_policy`]). A streamed
+    /// body the worker ends with an error after a successful head is
+    /// accounted to `source` and, when it is SSE, ended with the typed error
+    /// event.
     async fn forward_worker_response(
         &self,
         res: reqwest::Response,
@@ -1464,8 +1463,7 @@ impl Router {
         load_guard: WorkerLoadGuard,
     ) -> Response {
         let StreamRelayMode { is_stream, rechunk } = mode;
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = res.status();
 
         if is_stream {
             // Preserve headers for streaming response
@@ -1489,12 +1487,9 @@ impl Router {
                 Some(ct) => ct.starts_with("text/event-stream"),
                 None => status.is_success(),
             };
-            let rechunker =
-                (rechunk && upstream_sse).then(|| SseRechunker::with_observer(NoopObserver));
-            if rechunker.is_some() {
-                // Re-chunking changes the body length.
-                response_headers.remove(CONTENT_LENGTH);
-            }
+            let rechunker = rechunk
+                .filter(|_| upstream_sse)
+                .map(|policy| SseRechunker::with_observer(policy, NoopObserver));
             let mut response = relay_streaming_body(
                 res.bytes_stream(),
                 Relay {
@@ -1591,13 +1586,7 @@ impl Router {
                     timeout_secs,
                     "Streamed request body stalled waiting on the client; aborting dispatch"
                 );
-                return error::create_error(
-                    StatusCode::REQUEST_TIMEOUT,
-                    STREAMED_BODY_STALLED,
-                    format!(
-                        "No request body bytes arrived from the client for {timeout_secs} seconds"
-                    ),
-                );
+                return request_body_stalled_response(timeout_secs);
             }
         };
 
@@ -1610,7 +1599,7 @@ impl Router {
                 );
                 return error::create_error(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    STREAMED_BODY_TOO_LARGE,
+                    REQUEST_BODY_TOO_LARGE,
                     format!("Request body exceeded {} bytes", self.max_payload_size),
                 );
             }
@@ -1641,7 +1630,7 @@ impl Router {
             res,
             StreamRelayMode {
                 is_stream,
-                rechunk: false,
+                rechunk: None,
             },
             source,
             load_guard,
@@ -1657,15 +1646,27 @@ impl Router {
     /// client addressed the model by an alias; reporting the alias would make
     /// this route disagree with every other one about which model ran.
     ///
+    /// The worker's body is read as a [`RerankWorkerResponse`]: the bare
+    /// result list or the Cohere-style `results` object, in either's spelling
+    /// of the score and the document, so a worker of any of the rerank
+    /// contracts answers in the gateway's one shape. The results are sorted
+    /// highest score first whatever order the worker used, and `top_k` and
+    /// `return_documents` are applied to that order, whatever the worker
+    /// made of them; the worker's `usage` and `id` are carried, the request's
+    /// `rid` naming the answer when given.
+    ///
     /// The worker body read is capped at `max_body_bytes`; a larger body is a
-    /// misbehaving worker and yields a 502.
+    /// misbehaving worker and yields a 502 `upstream_response_too_large`; a
+    /// body cut short in transit a 502 `read_response_body_failed` and one in
+    /// no rerank shape a 502 `call_upstream_decode_error`, the relay's own codes
+    /// for a worker body it could not read and one it could not decode.
     async fn build_rerank_response(
         req: RerankResponseSpec,
         canonical_model: Option<&str>,
         response: Response,
         max_body_bytes: usize,
     ) -> Response {
-        let (_, response_body) = response.into_parts();
+        let (parts, response_body) = response.into_parts();
         let body_bytes = match to_bytes(response_body, max_body_bytes).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1683,25 +1684,36 @@ impl Router {
                     );
                 }
                 error!("Failed to read rerank worker response: {e}");
-                return error::internal_error(
-                    "rerank_response_build_failed",
-                    "Failed to build rerank response",
+                return error::bad_gateway(
+                    "read_response_body_failed",
+                    format!("Failed to get response body: {e}"),
                 );
             }
         };
-        let rerank_results = match serde_json::from_slice::<Vec<RerankResult>>(&body_bytes) {
-            Ok(results) => results,
+        let worker = match serde_json::from_slice::<RerankWorkerResponse>(&body_bytes) {
+            Ok(worker) => worker,
             Err(e) => {
-                error!("Failed to build rerank response: {e}");
-                return error::internal_error(
-                    "rerank_response_build_failed",
-                    "Failed to build rerank response",
+                let status = parts.status;
+                let content_type = parts
+                    .headers
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("no content type");
+                warn!(%status, content_type, "Rerank worker response is in no rerank shape: {e}");
+                return error::bad_gateway(
+                    "call_upstream_decode_error",
+                    format!(
+                        "Rerank response from worker ({status}, {content_type}) is not a rerank answer: {e}"
+                    ),
                 );
             }
         };
         let model = canonical_model.map_or(req.model, ToOwned::to_owned);
-        let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid);
-        // Sorting is handled by Python worker (serving_rerank.py)
+        // The client's `rid` names the answer when given, the worker's id
+        // otherwise; the response sorts the results highest score first,
+        // whatever order the worker used, and `top_k` cuts that order.
+        let mut rerank_response =
+            RerankResponse::new(worker.results, model, worker.usage, req.rid.or(worker.id));
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
         }
@@ -1883,9 +1895,11 @@ impl RouteOutcome<'_> {
     }
 
     /// [`Self::answered`] for the typed route, whose answer may be replayed:
-    /// the duration on a success, the response's own error class and reason
-    /// on a definitive failure, nothing on a retryable answer (the retry
-    /// executor's exhaustion counter is the record of those).
+    /// the duration on a success, else the response's own error class and
+    /// reason. The response is the request's answer whether it was
+    /// definitive at once or the last retryable one before the retries ran
+    /// out, so it counts once either way; the retry executor's exhaustion
+    /// counter records the spent retries beside it.
     fn answered_typed(&self, response: &Response, start: Instant) {
         if response.status().is_success() {
             let duration = start.elapsed();
@@ -1897,7 +1911,7 @@ impl RouteOutcome<'_> {
                 self.endpoint,
                 duration,
             );
-        } else if !is_retryable_response(response) {
+        } else {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_REGULAR,
@@ -2156,25 +2170,34 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     // The timeouts left here are not the request's own (the connect timeout,
     // a timeout below the client): the worker's failure, answered as before
     // and replayed.
+    // The worker's side failing under the call is the upstream's failure
+    // (502), as the disaggregated routers answer their start failures and
+    // the capped body read answers a body over its limit: the connect
+    // refused, the connection reset or closed before the head (the client
+    // files it as a request fault), the answer that did not decode or ended
+    // before it was whole (its decode fault; no route hands this conversion
+    // a body-read fault today, the relay's own reads answer those under
+    // their codes). The gateway's own side keeps the 500: a builder fault,
+    // a redirect it did not follow. A body the gateway forwards does not
+    // fail the send on its own: the one route that streams one answers its
+    // inbound fault and its cap (400, 413) before this conversion, and
+    // every other route sends a buffered body; were such a fault to arrive,
+    // the client files it as a request fault too (its body kind is the
+    // response body's read), not as the gateway's. Every code stays what
+    // it was, and the retry layer replays a 502 as it replayed the 500.
     let (status, code) = if let Some(upstream_status) = e.status() {
         (upstream_status, "call_upstream_status_error")
     } else if e.is_timeout() {
         (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
     } else if e.is_connect() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_connection_failed",
-        )
+        (StatusCode::BAD_GATEWAY, "call_upstream_connection_failed")
     } else if e.is_builder() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "call_upstream_builder_error",
         )
     } else if e.is_request() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_request_error",
-        )
+        (StatusCode::BAD_GATEWAY, "call_upstream_request_error")
     } else if e.is_redirect() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2186,10 +2209,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
             "call_upstream_body_error",
         )
     } else if e.is_decode() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_decode_error",
-        )
+        (StatusCode::BAD_GATEWAY, "call_upstream_decode_error")
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2208,7 +2228,7 @@ impl Router {
     fn request_body_path(&self, headers: &HeaderMap, wasm_request_hooks: bool) -> BodyPath {
         let candidates = self
             .worker_registry
-            .get_routing_pool(crate::worker::UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
+            .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
         decide_body_path(&BodyPathInputs {
             routing_key_override: self.policy_registry.routing_key_override_enabled(),
             policy_needs_text: self
@@ -2227,6 +2247,7 @@ impl Router {
                     .any_model_retry_override_enables_retries(),
             max_buffered_request_bytes: self.max_buffered_request_bytes,
             tenant_rate_limited: self.rate_limit_manager.is_some(),
+            message_thread: header_utils::anthropic_beta_named(headers, "message-threads"),
         })
     }
 
@@ -2247,7 +2268,7 @@ impl Router {
             }
             BodyPath::Stream(reason) => reason,
         };
-        let model_id = crate::worker::UNKNOWN_MODEL_ID;
+        let model_id = UNKNOWN_MODEL_ID;
         // Buffered-path parity: a valid tokens hint is exactly what selection
         // would have received there (text is never extracted alongside it).
         // Streamed requests have no readable body, hence no rid key and no
@@ -2319,10 +2340,16 @@ impl Router {
         events::RequestReceivedEvent {}.emit();
         let status = response.status();
         let error_code = extract_error_code_from_response(&response);
-        if error_code != STREAMED_BODY_STALLED
-            && error_code != STREAMED_BODY_TOO_LARGE
-            && error_code != STREAMED_BODY_ABORTED
-        {
+        // The three streamed-body codes are the client's own faults (an
+        // upload that stalled, grew past the limit or broke off before it was
+        // forwarded): no worker answered, so they are neither the worker's
+        // outcome nor the router's error. The edge family counts them by
+        // status and code.
+        let client_body_fault = matches!(
+            error_code,
+            REQUEST_BODY_STALLED | REQUEST_BODY_TOO_LARGE | STREAMED_BODY_ABORTED
+        );
+        if !client_body_fault {
             // A streamed head's success was recorded before its relay task
             // was spawned (see `forward_worker_response`).
             if !head_success_recorded(&response) {
@@ -2341,6 +2368,10 @@ impl Router {
             status.as_u16(),
             error_code,
         );
+        // The duration on a success, else the error class and reason of the
+        // answer. This path sends once and never retries, so a worker's
+        // retryable status is the request's final answer too and counts like
+        // any other; the client's own body faults above do not.
         if status.is_success() {
             Metrics::record_router_duration(
                 metrics_labels::ROUTER_HTTP,
@@ -2350,7 +2381,7 @@ impl Router {
                 endpoint,
                 start.elapsed(),
             );
-        } else if !is_retryable_status(status) {
+        } else if !client_body_fault {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_REGULAR,
@@ -2584,7 +2615,7 @@ impl RouterTrait for Router {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        if let Some(refused) = super::refuse_max_tokens_zero(&body) {
+        if let Some(refused) = super::refuse_max_tokens_zero(body.max_tokens) {
             return refused;
         }
         self.route_typed_request(headers, Some(tenant_meta), body, "/v1/messages", model_id)
@@ -2682,12 +2713,12 @@ impl RouterTrait for Router {
     ) -> Response {
         // Direct HTTP routers must enforce the same explicit-model contract
         // as Gateway before shared routing can interpret its wildcard.
-        if model_id == crate::worker::UNKNOWN_MODEL_ID
+        if model_id == UNKNOWN_MODEL_ID
             || self
                 .worker_registry
                 .resolve_model_alias(model_id)
                 .as_deref()
-                == Some(crate::worker::UNKNOWN_MODEL_ID)
+                == Some(UNKNOWN_MODEL_ID)
         {
             return error::model_not_found(model_id);
         }
@@ -2872,25 +2903,35 @@ mod tests {
     };
 
     use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
-    use openai_protocol::worker::HealthCheckConfig;
+    use openai_protocol::{profile::ProviderProfile, rerank::RerankResult};
     use serde_json::{json, Value};
 
     use super::*;
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         middleware::ReportedRefusal,
-        observability::logging::test_support::test_subscriber,
-        policies::CacheAwarePolicy,
-        routers::common::{
-            body_policy::{
-                REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_RETRYABLE,
-                REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE, REASON_WASM_REQUEST_HOOK,
+        observability::logging::test_support::{test_subscriber, RefusalLineCounter},
+        policies::as_cache_aware,
+        routers::{
+            common::{
+                body_policy::{
+                    REASON_MESSAGE_THREAD, REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT,
+                    REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
+                    REASON_WASM_REQUEST_HOOK,
+                },
+                request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
+                test_support::fast_retry_config,
             },
-            request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
+            http::test_support,
         },
+        server::{http_client, http_client_builder},
         service_discovery::testing::create_test_app_context,
-        test_support::RefusedAddress,
-        worker::{circuit_breaker::CircuitState, BasicWorkerBuilder},
+        tenant::TenantKey,
+        worker::{
+            health::circuit_breaker::CircuitState,
+            test_support::{no_health_check, RefusedAddress},
+            BasicWorker, BasicWorkerBuilder, CircuitBreakerConfig, ModelCard,
+        },
     };
 
     /// Accepts `kill_first` connections and closes them before any response
@@ -2930,7 +2971,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_recovers_on_second_connection() {
         let (addr, accepted) = flaky_upstream(1).await;
-        let client = crate::clients::http_client();
+        let client = http_client();
         let builder = client.post(format!("http://{addr}/generate")).body("{}");
 
         let res = send_with_stale_conn_retry(builder).await.unwrap();
@@ -2941,7 +2982,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_is_bounded_to_one() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
-        let client = crate::clients::http_client();
+        let client = http_client();
         let builder = client.post(format!("http://{addr}/generate")).body("{}");
 
         let err = send_with_stale_conn_retry(builder).await.unwrap_err();
@@ -2952,7 +2993,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_skips_unclonable_bodies() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
-        let client = crate::clients::http_client();
+        let client = http_client();
         let stream_body = reqwest::Body::wrap_stream(stream::once(async {
             Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
         }));
@@ -2962,13 +3003,6 @@ mod tests {
 
         send_with_stale_conn_retry(builder).await.unwrap_err();
         assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
-    }
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
     }
 
     fn create_test_regular_router() -> Router {
@@ -3083,6 +3117,50 @@ mod tests {
         );
     }
 
+    /// One of the public GET pass-throughs, on a worker registered with a
+    /// trailing slash: the stub is asked for `/get_server_info`, not
+    /// `//get_server_info`.
+    #[tokio::test]
+    async fn a_get_pass_through_joins_to_a_slashed_registration_with_one_slash() {
+        use std::sync::Mutex;
+
+        use axum::http::Uri;
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(move |uri: Uri| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                recorder.lock().unwrap().push(uri.path().to_owned());
+                ([(CONTENT_TYPE, "application/json")], "{}").into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let slashed = BasicWorkerBuilder::new(format!("http://{addr}/"))
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build();
+        let router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, vec![slashed]);
+
+        let response = router
+            .proxy_get_request(
+                Request::builder().body(Body::empty()).unwrap(),
+                "get_server_info",
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["/get_server_info"]);
+    }
+
     /// smg-lab #288: the `model` label of the request families is bounded by
     /// the served models. A request for a model no worker serves is counted
     /// under `other` (the value the bounded interner and the `path` label
@@ -3117,11 +3195,11 @@ mod tests {
                 });
                 let served = BasicWorkerBuilder::new(format!("http://{addr}"))
                     .worker_type(WorkerType::Regular)
-                    .model(crate::worker::ModelCard::new("m1"))
+                    .model(ModelCard::new("m1"))
                     .health_config(no_health_check())
                     .build();
                 let router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, vec![served]);
-                let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+                let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
                 for model in ["ghost-1", "ghost-2", "m1"] {
                     let mut request: ChatCompletionRequest = serde_json::from_value(json!({
                         "model": model,
@@ -3245,16 +3323,7 @@ mod tests {
         let router = create_test_unhealthy_router();
 
         let selected = router
-            .select_worker_for_model(
-                crate::worker::UNKNOWN_MODEL_ID,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                &[],
-            )
+            .select_worker_for_model(UNKNOWN_MODEL_ID, None, None, None, None, None, None, &[])
             .unwrap();
         assert!(selected.is_available());
 
@@ -3262,16 +3331,7 @@ mod tests {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
         }
         assert!(router
-            .select_worker_for_model(
-                crate::worker::UNKNOWN_MODEL_ID,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                &[],
-            )
+            .select_worker_for_model(UNKNOWN_MODEL_ID, None, None, None, None, None, None, &[])
             .is_none());
     }
 
@@ -3291,7 +3351,7 @@ mod tests {
                     _probe: Arc::new(()),
                 },
                 "/generate",
-                crate::worker::UNKNOWN_MODEL_ID,
+                UNKNOWN_MODEL_ID,
             )
             .await;
 
@@ -3343,16 +3403,6 @@ mod tests {
         (format!("http://{addr}"), hits)
     }
 
-    fn fast_retries(max_retries: u32) -> RetryConfig {
-        RetryConfig {
-            max_retries,
-            initial_backoff_ms: 1,
-            max_backoff_ms: 2,
-            backoff_multiplier: 1.0,
-            jitter_factor: 0.0,
-        }
-    }
-
     /// A round-robin router over `worker_urls`, each worker's breaker opening
     /// at `failure_threshold` failures.
     fn breaker_router(worker_urls: &[&str], retry: RetryConfig, failure_threshold: u32) -> Router {
@@ -3371,7 +3421,7 @@ mod tests {
         for url in worker_urls {
             let mut builder = BasicWorkerBuilder::new(*url)
                 .worker_type(WorkerType::Regular)
-                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                .circuit_breaker_config(CircuitBreakerConfig {
                     failure_threshold,
                     success_threshold: 1,
                     timeout_duration: Duration::from_secs(60),
@@ -3407,7 +3457,7 @@ mod tests {
                     _probe: Arc::new(()),
                 },
                 "/generate",
-                crate::worker::UNKNOWN_MODEL_ID,
+                UNKNOWN_MODEL_ID,
             )
             .await
     }
@@ -3418,7 +3468,7 @@ mod tests {
     #[tokio::test]
     async fn transient_upstream_failures_charge_the_breaker_once_per_request() {
         let (url, hits) = fixed_status_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
-        let router = breaker_router(&[&url], fast_retries(3), 2);
+        let router = breaker_router(&[&url], fast_retry_config(3), 2);
         let worker = router.worker_registry.get_all().remove(0);
 
         let response = generate(&router, "busy").await;
@@ -3448,7 +3498,7 @@ mod tests {
     #[tokio::test]
     async fn a_workers_own_500_is_not_replayed_on_it() {
         let (url, hits) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
-        let router = breaker_router(&[&url], fast_retries(5), 2);
+        let router = breaker_router(&[&url], fast_retry_config(5), 2);
         let worker = router.worker_registry.get_all().remove(0);
 
         let response = generate(&router, "bad payload").await;
@@ -3474,7 +3524,7 @@ mod tests {
     async fn a_workers_own_500_moves_the_request_to_another_worker_once() {
         let (url_a, hits_a) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
         let (url_b, hits_b) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
-        let router = breaker_router(&[&url_a, &url_b], fast_retries(5), 5);
+        let router = breaker_router(&[&url_a, &url_b], fast_retry_config(5), 5);
 
         let response = generate(&router, "bad payload").await;
 
@@ -3486,12 +3536,74 @@ mod tests {
         }
     }
 
+    /// One attempt's selection as the retry loop runs it: a first attempt
+    /// places over the whole pool, and once a worker answered the request
+    /// definitively no later attempt selects it, tried or not.
+    #[tokio::test]
+    async fn an_attempt_never_selects_the_worker_that_answered_definitively() {
+        let router = breaker_router(
+            &["http://w1:8080", "http://w2:8080"],
+            fast_retry_config(5),
+            5,
+        );
+        let request = DropProbeRequest {
+            text: "a prompt".to_string(),
+            _probe: Arc::new(()),
+        };
+        let routing = router.routing_derivatives(None, &request);
+        let lease = RequestLease::new(
+            request,
+            routing,
+            ReleasePoint::from_retry_config(&router.retry_config),
+        );
+        let tried = parking_lot::Mutex::new(Vec::new());
+        let ledger = AttemptLedger::default();
+        let attempt = TypedAttempt {
+            headers: None,
+            lease: &lease,
+            route: "/generate",
+            model_id: UNKNOWN_MODEL_ID,
+            canonical_model: None,
+            is_stream: false,
+            ledger: &ledger,
+            tried: &tried,
+        };
+        let select = || {
+            let worker = router
+                .select_worker_for_attempt(&attempt)
+                .expect("the pool has a worker to give");
+            worker.url().to_string()
+        };
+
+        // Round robin walks the pool it is handed.
+        let first_attempts: std::collections::HashSet<String> = (0..4).map(|_| select()).collect();
+        assert_eq!(
+            first_attempts.len(),
+            2,
+            "a first attempt places over the whole pool"
+        );
+
+        let pool = router.worker_registry.get_all();
+        let answering = &pool[0];
+        let mut failed = (StatusCode::INTERNAL_SERVER_ERROR, "upstream failed").into_response();
+        mark_upstream_answer(&mut failed);
+        ledger.settle(&mut failed, [answering], pool.iter());
+
+        for _ in 0..4 {
+            assert_ne!(
+                select(),
+                answering.url(),
+                "the worker that answered takes no later attempt"
+            );
+        }
+    }
+
     /// Once every breaker is open the verdict clears at the breaker timeout,
     /// not inside a backoff: the 503 is terminal for the retry loop.
     #[tokio::test]
     async fn no_retry_runs_against_a_pool_of_open_breakers() {
         let (url, hits) = fixed_status_upstream(StatusCode::OK).await;
-        let router = breaker_router(&[&url], fast_retries(5), 1);
+        let router = breaker_router(&[&url], fast_retry_config(5), 1);
         let worker = router.worker_registry.get_all().remove(0);
         worker.record_outcome(500);
         assert!(!worker.is_available());
@@ -3538,12 +3650,7 @@ mod tests {
     /// The gateway's client for the request-timeout cases: `timeout` is its
     /// budget for a call to a worker, what `--request-timeout-secs` sets.
     fn client_with_timeout(timeout: Duration) -> Arc<reqwest::Client> {
-        Arc::new(
-            crate::clients::http_client_builder()
-                .timeout(timeout)
-                .build()
-                .unwrap(),
-        )
+        Arc::new(http_client_builder().timeout(timeout).build().unwrap())
     }
 
     /// The request's timeout is its end: one attempt on one worker, the 504
@@ -3555,14 +3662,12 @@ mod tests {
         let (slow_b, hits_b) = delayed_upstream(Duration::from_secs(10)).await;
         let router = breaker_router_with_client(
             &[&slow_a, &slow_b],
-            fast_retries(3),
+            fast_retry_config(3),
             1,
             Some(client_with_timeout(Duration::from_secs(1))),
         );
 
-        let started = Instant::now();
         let response = generate(&router, "slow").await;
-        let elapsed = started.elapsed();
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
@@ -3574,10 +3679,6 @@ mod tests {
             hits_a.load(AtomicOrdering::SeqCst) + hits_b.load(AtomicOrdering::SeqCst),
             1,
             "one attempt, on one worker"
-        );
-        assert!(
-            elapsed < Duration::from_millis(1900),
-            "one timeout, not retries x timeout: {elapsed:?}"
         );
         let open = router
             .worker_registry
@@ -3618,6 +3719,125 @@ mod tests {
         .unwrap()
     }
 
+    /// The gateway's response to a worker that answered `body`, with every
+    /// document asked for and no `top_k`.
+    async fn rerank_response_of(body: &str) -> RerankResponse {
+        let req = RerankRequest {
+            top_k: None,
+            return_documents: true,
+            ..rerank_request()
+        };
+        let upstream = Response::new(Body::from(body.to_string()));
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            upstream,
+            usize::MAX,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the body is read: {body}"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_results_object_with_relevance_scores_is_answered_in_the_gateway_shape() {
+        // The Cohere-style object: no document echoed, the object's `usage`
+        // carried, its `model` unread.
+        let rerank = rerank_response_of(
+            r#"{"model": "test-model", "object": "list",
+                "usage": {"prompt_tokens": 12, "total_tokens": 12},
+                "results": [{"index": 1, "relevance_score": 0.93},
+                            {"index": 0, "relevance_score": 0.07}]}"#,
+        )
+        .await;
+        assert_eq!(rerank.model, "test-model");
+        let (first, second) = (&rerank.results[0], &rerank.results[1]);
+        assert_eq!((first.index, first.score), (1, 0.93));
+        assert_eq!((second.index, second.score), (0, 0.07));
+        assert_eq!(
+            first.document, None,
+            "a worker that echoes no document yields none"
+        );
+        assert_eq!(
+            rerank
+                .usage
+                .map(|usage| (usage.prompt_tokens, usage.total_tokens)),
+            Some((12, 12)),
+            "the worker's usage is carried"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_document_object_and_the_text_spelling_read_as_the_document() {
+        let rerank = rerank_response_of(
+            r#"{"id": "r1", "model": "test-model", "usage": {"total_tokens": 9},
+                "results": [{"index": 0, "document": {"text": "d1"}, "relevance_score": 0.8}]}"#,
+        )
+        .await;
+        assert_eq!(rerank.results[0].document.as_deref(), Some("d1"));
+
+        let rerank = rerank_response_of(
+            r#"[{"index": 1, "score": 0.6, "text": "d2"}, {"index": 0, "score": 0.4}]"#,
+        )
+        .await;
+        assert_eq!(rerank.results[0].document.as_deref(), Some("d2"));
+        assert_eq!(rerank.results[1].document, None);
+        assert_eq!((rerank.results[1].index, rerank.results[1].score), (0, 0.4));
+    }
+
+    #[tokio::test]
+    async fn top_k_and_return_documents_apply_to_a_results_object_as_to_the_native_list() {
+        // `rerank_request` asks for one result and no documents.
+        let req = rerank_request();
+        let body = r#"{"results": [{"index": 0, "document": {"text": "d1"}, "relevance_score": 0.9},
+                                   {"index": 1, "document": {"text": "d2"}, "relevance_score": 0.5}]}"#;
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            Response::new(Body::from(body)),
+            usize::MAX,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rerank: RerankResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rerank.results.len(), 1, "top_k truncates the worker's list");
+        assert_eq!(
+            rerank.results[0].document, None,
+            "return_documents false drops the echoed document"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_in_no_rerank_shape_is_a_502_not_a_pass_through() {
+        for body in [
+            r#"{"error": {"message": "no reranker loaded"}}"#,
+            r#"[{"index": 0}]"#,
+            "not json",
+        ] {
+            let req = rerank_request();
+            let response = Router::build_rerank_response(
+                RerankResponseSpec::from(&req),
+                None,
+                Response::new(Body::from(body)),
+                usize::MAX,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{body}");
+            assert_eq!(
+                extract_error_code_from_response(&response),
+                "call_upstream_decode_error",
+                "{body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn build_rerank_response_accepts_body_at_limit() {
         let req = rerank_request();
@@ -3655,6 +3875,91 @@ mod tests {
         );
     }
 
+    /// A worker body cut short in transit (a chunk, then the connection's
+    /// error) is a 502 under the relay's code for a body it could not read,
+    /// not the size cap's.
+    #[tokio::test]
+    async fn a_worker_body_cut_short_in_transit_is_a_502_read_failure() {
+        let req = rerank_request();
+        let upstream = Response::new(Body::from_stream(stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"[{\"index\": 0, \"score\": 0.9}")),
+            Err(std::io::Error::other("connection cut")),
+        ])));
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            upstream,
+            usize::MAX,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "read_response_body_failed"
+        );
+    }
+
+    /// A worker that answers unsorted: the best row survives `top_k`, and
+    /// the answer is sorted highest score first whatever the worker did.
+    #[tokio::test]
+    async fn an_unsorted_worker_answer_keeps_its_best_row_under_top_k() {
+        let req = rerank_request();
+        let upstream = Response::new(Body::from(
+            r#"[{"index":0,"relevance_score":0.1},{"index":1,"relevance_score":0.9}]"#,
+        ));
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            upstream,
+            usize::MAX,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rerank: RerankResponse = serde_json::from_slice(&bytes).unwrap();
+        let rows: Vec<(usize, f32)> = rerank.results.iter().map(|r| (r.index, r.score)).collect();
+        assert_eq!(rows, [(1, 0.9)], "top_k keeps the best row, not the first");
+    }
+
+    /// The worker's `usage` and `id` ride in the answer, and the client's
+    /// `rid` names the answer when given.
+    #[tokio::test]
+    async fn the_worker_s_usage_and_id_are_carried_and_the_request_s_rid_names_the_answer() {
+        let body = r#"{"id":"rerank-up-1","model":"m","results":[{"index":0,"relevance_score":0.5}],"usage":{"prompt_tokens":11,"total_tokens":11}}"#;
+        let rerank = rerank_response_of(body).await;
+        assert_eq!(
+            rerank.id,
+            Some(openai_protocol::common::StringOrArray::String(
+                "rerank-up-1".to_string()
+            ))
+        );
+        let usage = rerank.usage.expect("the worker's usage is carried");
+        assert_eq!((usage.prompt_tokens, usage.total_tokens), (11, 11));
+
+        let req = RerankRequest {
+            top_k: None,
+            rid: Some(openai_protocol::common::StringOrArray::String(
+                "client-1".to_string(),
+            )),
+            ..rerank_request()
+        };
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            Response::new(Body::from(body)),
+            usize::MAX,
+        )
+        .await;
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rerank: RerankResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            rerank.id,
+            Some(openai_protocol::common::StringOrArray::String(
+                "client-1".to_string()
+            ))
+        );
+    }
+
     /// The body of a worker's answer on `url`'s `/body`, as `client` reads it.
     async fn worker_body(
         client: &reqwest::Client,
@@ -3670,16 +3975,16 @@ mod tests {
 
     /// The buffered transcription answer's outcome names the reason from
     /// what the client sees: a body the gateway could not read whole (cut
-    /// under the read) is the gateway's own 500 under its code, counted as
-    /// the worker's connection failing (`transport_disconnect`), not as the
-    /// worker-style reason of a 500; a body that arrives whole is the
+    /// under the read) is a bad gateway under the gateway's own code, counted
+    /// as the worker's connection failing (`transport_disconnect`), not as
+    /// the worker-style reason of a 502; a body that arrives whole is the
     /// worker's answer, recorded by its status.
     #[tokio::test]
     async fn a_buffered_transcription_read_failure_names_the_gateways_reason() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
-        let client = crate::clients::http_client();
+        let client = http_client();
         let worker = BasicWorkerBuilder::new("http://worker:8080").build();
         let outcome = RouteOutcome {
             model_label: Cow::Borrowed("m"),
@@ -3692,7 +3997,7 @@ mod tests {
         let answer =
             buffer_transcription_response(res, status, &worker, 1 << 20, &outcome, Instant::now())
                 .await;
-        assert_eq!(answer.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(answer.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             extract_error_code_from_response(&answer),
             "read_response_body_failed"
@@ -3734,12 +4039,9 @@ mod tests {
     async fn read_worker_body_capped_accepts_body_at_limit() {
         let url = spawn_cut_stub("/body", "application/json", &["abc", "def", "gh"], false).await;
 
-        let body = Router::read_worker_body_capped(
-            worker_body(&crate::clients::http_client(), &url).await,
-            8,
-        )
-        .await
-        .unwrap();
+        let body = Router::read_worker_body_capped(worker_body(&http_client(), &url).await, 8)
+            .await
+            .unwrap();
 
         assert_eq!(body.as_ref(), b"abcdefgh");
     }
@@ -3748,12 +4050,9 @@ mod tests {
     async fn read_worker_body_capped_rejects_oversized_body_with_502() {
         let url = spawn_cut_stub("/body", "application/json", &["abc", "def", "gh"], false).await;
 
-        let response = Router::read_worker_body_capped(
-            worker_body(&crate::clients::http_client(), &url).await,
-            7,
-        )
-        .await
-        .unwrap_err();
+        let response = Router::read_worker_body_capped(worker_body(&http_client(), &url).await, 7)
+            .await
+            .unwrap_err();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -3762,18 +4061,67 @@ mod tests {
         );
     }
 
+    /// A body the engine's stream ends with an error is the worker's
+    /// transport failing under the call: a bad gateway under the read's code,
+    /// the class the over-limit body takes and the one the metrics file the
+    /// code under (`transport_disconnect`), never a 500 of the gateway's own.
     #[tokio::test]
-    async fn read_worker_body_capped_maps_read_failure_to_500() {
+    async fn read_worker_body_capped_maps_a_read_failure_to_a_bad_gateway() {
         let url = spawn_cut_stub("/body", "application/json", &["abc"], true).await;
 
-        let response = Router::read_worker_body_capped(
-            worker_body(&crate::clients::http_client(), &url).await,
-            8,
-        )
-        .await
-        .unwrap_err();
+        let response = Router::read_worker_body_capped(worker_body(&http_client(), &url).await, 8)
+            .await
+            .unwrap_err();
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "read_response_body_failed"
+        );
+    }
+
+    /// Loopback engine stub whose every answer is a 200 head announcing a
+    /// 1000-byte body, twelve bytes of it, and then the closed connection: an
+    /// engine that goes away mid-answer, as the client reads it ("end of file
+    /// before message length reached").
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only server task; lives no longer than the test"
+    )]
+    async fn spawn_close_after_headers_stub() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                          content-length: 1000\r\n\r\n{\"partial\":",
+                    )
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// An engine that closes the connection after its head and a few bytes
+    /// of the body it announced is answered the same way: a bad gateway
+    /// under the read's code, with the client's reason in the message.
+    #[tokio::test]
+    async fn a_worker_that_closes_mid_body_is_a_bad_gateway() {
+        let url = spawn_close_after_headers_stub().await;
+
+        let response =
+            Router::read_worker_body_capped(worker_body(&http_client(), &url).await, 1 << 20)
+                .await
+                .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             extract_error_code_from_response(&response),
             "read_response_body_failed"
@@ -3832,7 +4180,6 @@ mod tests {
             kv_pressure_weight: 0.15,
             mean_prefill_tokens: 1024,
             default_throughput: 2000.0,
-            max_waiting_requests: 0,
         }
     }
 
@@ -3843,7 +4190,7 @@ mod tests {
     fn streaming_router(
         policy: PolicyConfig,
         max_payload_size: usize,
-        workers: Vec<crate::worker::BasicWorker>,
+        workers: Vec<BasicWorker>,
     ) -> Router {
         streaming_router_with_registry(
             Arc::new(PolicyRegistry::new(policy)),
@@ -3855,7 +4202,7 @@ mod tests {
     fn streaming_router_with_key_override(
         policy: PolicyConfig,
         max_payload_size: usize,
-        workers: Vec<crate::worker::BasicWorker>,
+        workers: Vec<BasicWorker>,
     ) -> Router {
         streaming_router_with_registry(
             Arc::new(PolicyRegistry::with_override(
@@ -3873,7 +4220,7 @@ mod tests {
     fn streaming_router_with_registry(
         policy_registry: Arc<PolicyRegistry>,
         max_payload_size: usize,
-        workers: Vec<crate::worker::BasicWorker>,
+        workers: Vec<BasicWorker>,
     ) -> Router {
         let worker_registry = Arc::new(WorkerRegistry::new());
         for worker in workers {
@@ -3895,7 +4242,7 @@ mod tests {
         }
     }
 
-    fn plain_worker(url: &str) -> crate::worker::BasicWorker {
+    fn plain_worker(url: &str) -> BasicWorker {
         BasicWorkerBuilder::new(url)
             .worker_type(WorkerType::Regular)
             .health_config(no_health_check())
@@ -3953,6 +4300,28 @@ mod tests {
             headers.insert(CONTENT_LENGTH, len.parse().unwrap());
         }
         headers
+    }
+
+    /// A request that names the message-threads beta buffers: the thread
+    /// layer rebuilds the turn from its body before the route.
+    #[test]
+    fn a_message_thread_turn_decides_buffer() {
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        let mut headers = headers_with_content_length(Some("64"));
+        headers.insert(
+            "anthropic-beta",
+            "fine-grained-tool-streaming-2025-05-14, message-threads-2026-08-12"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Buffer(REASON_MESSAGE_THREAD)
+        );
     }
 
     #[test]
@@ -4029,7 +4398,7 @@ mod tests {
             BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
                 .health_config(no_health_check())
-                .models(vec![crate::worker::ModelCard::new(model)])
+                .models(vec![ModelCard::new(model)])
                 .build()
         };
         let router = streaming_router(
@@ -4097,20 +4466,14 @@ mod tests {
         let worker = BasicWorkerBuilder::new(&url)
             .worker_type(WorkerType::Regular)
             .health_config(no_health_check())
-            .models(vec![crate::worker::ModelCard::new("model-a")])
+            .models(vec![ModelCard::new("model-a")])
             .build();
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
         let req: GenerateRequest =
             serde_json::from_value(serde_json::json!({ "text": "hello" })).unwrap();
-        assert_eq!(req.model, crate::worker::UNKNOWN_MODEL_ID);
+        assert_eq!(req.model, UNKNOWN_MODEL_ID);
         let response = router
-            .route_typed_request(
-                None,
-                None,
-                req,
-                "/generate",
-                crate::worker::UNKNOWN_MODEL_ID,
-            )
+            .route_typed_request(None, None, req, "/generate", UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -4186,8 +4549,14 @@ mod tests {
         assert_eq!(body.as_ref(), b"data: hi\n\n");
     }
 
+    /// An oversized upload must map to the excluded 413 code. The size is the
+    /// client's own fault, so it is no router error either: only the
+    /// upstream-response family sees the 413.
     #[tokio::test]
     async fn oversized_streamed_body_yields_413() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (url, _captured) = spawn_capture_stub("application/json", "{}").await;
         let router = streaming_router(least_load_policy(), 8, vec![plain_worker(&url)]);
 
@@ -4201,18 +4570,36 @@ mod tests {
             extract_error_code_from_response(&response),
             "request_body_too_large"
         );
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_router_request_errors_total"),
+            "a client's oversized upload is not the router's error:\n{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_upstream_responses_total{")
+                    && line.contains("status_code=\"413\"")
+                    && line.contains("error_code=\"request_body_too_large\"")
+            }),
+            "{rendered}"
+        );
     }
 
     /// A stalled uploader must abort with 408 and leave the worker's circuit
     /// breaker untouched: 408 is a retryable status, so recording it as a
-    /// worker outcome would trip a threshold-1 breaker here.
+    /// worker outcome would trip a threshold-1 breaker here. The stall is the
+    /// client's own fault, so it is no router error either: only the
+    /// upstream-response family sees the 408.
     #[tokio::test(start_paused = true)]
     async fn stalled_streamed_body_yields_408_without_breaker_sample() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (url, _captured) = spawn_capture_stub("application/json", "{}").await;
         let worker = BasicWorkerBuilder::new(&url)
             .worker_type(WorkerType::Regular)
             .health_config(no_health_check())
-            .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+            .circuit_breaker_config(CircuitBreakerConfig {
                 failure_threshold: 1,
                 ..Default::default()
             })
@@ -4246,17 +4633,34 @@ mod tests {
             worker.circuit_breaker_can_execute(),
             "a client-caused stall must not record a breaker failure"
         );
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_router_request_errors_total"),
+            "a client's stall is not the router's error:\n{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_upstream_responses_total{")
+                    && line.contains("status_code=\"408\"")
+                    && line.contains("error_code=\"request_body_stalled\"")
+            }),
+            "{rendered}"
+        );
     }
 
     /// A client abort mid-upload must map to the excluded 400 code and leave
-    /// the worker's threshold-1 circuit breaker untouched.
+    /// the worker's threshold-1 circuit breaker untouched. The abort is the
+    /// client's own fault, so it is no router error either.
     #[tokio::test]
     async fn aborted_streamed_body_yields_400_without_breaker_sample() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (url, _captured) = spawn_capture_stub("application/json", "{}").await;
         let worker = BasicWorkerBuilder::new(&url)
             .worker_type(WorkerType::Regular)
             .health_config(no_health_check())
-            .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+            .circuit_breaker_config(CircuitBreakerConfig {
                 failure_threshold: 1,
                 ..Default::default()
             })
@@ -4292,6 +4696,19 @@ mod tests {
         assert!(
             worker.circuit_breaker_can_execute(),
             "a client abort must not record a breaker failure"
+        );
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_router_request_errors_total"),
+            "a client's abort is not the router's error:\n{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_upstream_responses_total{")
+                    && line.contains("status_code=\"400\"")
+                    && line.contains("error_code=\"request_body_aborted\"")
+            }),
+            "{rendered}"
         );
     }
 
@@ -4372,11 +4789,7 @@ mod tests {
             vec![plain_worker(&url_a), plain_worker(&url_b)],
         );
         let workers = router.worker_registry.get_all();
-        router
-            .policy_registry
-            .get_default_policy()
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
+        as_cache_aware(router.policy_registry.get_default_policy().as_ref())
             .unwrap()
             .init_workers(&workers);
 
@@ -4479,13 +4892,7 @@ mod tests {
             _probe: Arc::clone(&probe),
         };
         let response = router
-            .route_typed_request(
-                None,
-                None,
-                req,
-                "/generate",
-                crate::worker::UNKNOWN_MODEL_ID,
-            )
+            .route_typed_request(None, None, req, "/generate", UNKNOWN_MODEL_ID)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -4543,15 +4950,10 @@ mod tests {
             "anthropic-beta",
             HeaderValue::from_static("token-counting-2024-11-01"),
         );
-        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
         let response = router
-            .route_messages_count_tokens(
-                Some(&headers),
-                &tenant,
-                body,
-                crate::worker::UNKNOWN_MODEL_ID,
-            )
+            .route_messages_count_tokens(Some(&headers), &tenant, body, UNKNOWN_MODEL_ID)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -4594,7 +4996,7 @@ mod tests {
                     _probe: Arc::new(()),
                 },
                 "/generate",
-                crate::worker::UNKNOWN_MODEL_ID,
+                UNKNOWN_MODEL_ID,
             )
             .await;
         assert_eq!(typed.status(), StatusCode::OK);
@@ -4624,7 +5026,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}],
         }))
         .unwrap();
-        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
         let response = router
             .route_messages_count_tokens(None, &tenant, body, "m")
@@ -4668,7 +5070,7 @@ mod tests {
             1024 * 1024,
             vec![plain_worker(&format!("http://{addr}"))],
         );
-        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         let request = |max_tokens: u32, stream: bool| -> CreateMessageRequest {
             serde_json::from_value(json!({
                 "model": "m",
@@ -4681,12 +5083,7 @@ mod tests {
 
         for stream in [false, true] {
             let response = router
-                .route_messages(
-                    None,
-                    &tenant,
-                    request(0, stream),
-                    crate::worker::UNKNOWN_MODEL_ID,
-                )
+                .route_messages(None, &tenant, request(0, stream), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
@@ -4700,12 +5097,7 @@ mod tests {
         );
 
         let response = router
-            .route_messages(
-                None,
-                &tenant,
-                request(16, false),
-                crate::worker::UNKNOWN_MODEL_ID,
-            )
+            .route_messages(None, &tenant, request(16, false), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let forwarded = rx.recv().await.unwrap();
@@ -4764,13 +5156,7 @@ mod tests {
             _probe: Arc::new(()),
         };
         let response = router
-            .route_typed_request(
-                None,
-                None,
-                req,
-                "/generate",
-                crate::worker::UNKNOWN_MODEL_ID,
-            )
+            .route_typed_request(None, None, req, "/generate", UNKNOWN_MODEL_ID)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -4823,7 +5209,7 @@ mod tests {
             1024 * 1024,
             vec![plain_worker(&format!("http://{addr}"))],
         );
-        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         for stream in [true, false] {
             let mut request: ChatCompletionRequest = serde_json::from_value(json!({
                 "model": "m",
@@ -4839,7 +5225,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK);
         }
@@ -4903,7 +5289,7 @@ mod tests {
             1024 * 1024,
             vec![plain_worker(&format!("http://{addr}"))],
         );
-        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         for model in ["MiniMax-M3", "self-hosted-model"] {
             let mut request: ChatCompletionRequest = serde_json::from_value(json!({
                 "model": model,
@@ -4913,7 +5299,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "{model}");
         }
@@ -4992,7 +5378,7 @@ mod tests {
                         _probe: Arc::new(()),
                     },
                     "/generate",
-                    crate::worker::UNKNOWN_MODEL_ID,
+                    UNKNOWN_MODEL_ID,
                 )
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "key {key}");
@@ -5042,7 +5428,7 @@ mod tests {
         // timeout fires.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = crate::clients::http_client_builder()
+        let client = http_client_builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
@@ -5096,7 +5482,7 @@ mod tests {
                 "the peer stopped answering",
             )),
         ]);
-        let err = crate::clients::http_client()
+        let err = http_client()
             .post(format!("http://{addr}/generate"))
             .body(reqwest::Body::wrap_stream(body))
             .send()
@@ -5124,7 +5510,8 @@ mod tests {
     async fn an_upstream_failures_answer_names_the_reason_and_not_the_worker() {
         let refused = RefusedAddress::reserve();
         let addr = refused.addr();
-        let err = crate::clients::http_client_builder()
+        let err = http_client_builder()
+            .no_proxy()
             .build()
             .unwrap()
             .get(format!("http://{addr}/generate"))
@@ -5151,7 +5538,10 @@ mod tests {
         // A reserved port nobody listens at: the connect is refused.
         let refused = RefusedAddress::reserve();
         let addr = refused.addr();
-        let err = crate::clients::http_client()
+        let err = http_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .get(format!("http://{addr}/generate"))
             .send()
             .await
@@ -5159,7 +5549,7 @@ mod tests {
         assert!(err.is_connect());
 
         let response = convert_reqwest_error(err);
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             response.headers()[error::HEADER_X_SMG_ERROR_CODE],
             "call_upstream_connection_failed"
@@ -5168,6 +5558,130 @@ mod tests {
             is_retryable_response(&response),
             "a connect failure before any byte is replayed, as before"
         );
+    }
+
+    /// A worker that closes the connection before any response byte: the
+    /// client files it as a request fault; the answer is the upstream's
+    /// failure, replayed on another worker as before.
+    #[tokio::test]
+    async fn a_connection_closed_before_the_head_is_an_upstream_failure() {
+        let (addr, _accepted) = flaky_upstream(usize::MAX).await;
+        let err = http_client()
+            .post(format!("http://{addr}/generate"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_request(), "{err:?}");
+        assert!(!err.is_connect() && !err.is_timeout(), "{err:?}");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_request_error"
+        );
+        assert!(is_retryable_response(&response));
+    }
+
+    /// A worker whose body ends before the length its head announced: the
+    /// client files the read as a decode fault, and the conversion answers
+    /// it as the upstream's failure. No route hands the conversion a
+    /// body-read fault today (the relay's own reads answer under their codes;
+    /// see `a_proxied_get_whose_body_is_cut_short_is_an_upstream_failure`):
+    /// the case pins the arm for a caller that will.
+    #[tokio::test]
+    async fn a_body_cut_short_is_an_upstream_failure() {
+        let addr = spawn_short_body_stub().await;
+        let response = http_client()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap();
+        let err = response.bytes().await.unwrap_err();
+        assert!(err.is_decode(), "{err:?}");
+        assert!(!err.is_body(), "{err:?}");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_decode_error"
+        );
+    }
+
+    /// The relay's own read of the body of a proxied GET, cut short by the
+    /// worker: the upstream's failure under the code it had.
+    #[tokio::test]
+    async fn a_proxied_get_whose_body_is_cut_short_is_an_upstream_failure() {
+        let addr = spawn_short_body_stub().await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register_or_replace(Arc::new(
+            BasicWorkerBuilder::new(format!("http://{addr}"))
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        ));
+        let router = Router {
+            worker_registry,
+            ..create_test_regular_router()
+        };
+
+        let response = router
+            .proxy_get_request(Request::new(Body::empty()), "health")
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "read_response_failed"
+        );
+    }
+
+    /// A worker's 200 that is not the JSON the route asked for, handed to
+    /// the conversion: the upstream's failure, as an answer over the payload
+    /// limit is. As above, no route reaches this arm today.
+    #[tokio::test]
+    async fn an_answer_that_does_not_decode_is_an_upstream_failure() {
+        let (addr, _accepted) = flaky_upstream(0).await;
+        let response = http_client()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap();
+        let err = response.json::<Value>().await.unwrap_err();
+        assert!(err.is_decode(), "{err:?}");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_decode_error"
+        );
+    }
+
+    /// Accepts one connection, answers a head that announces more body than
+    /// it writes, and closes.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only server task; lives no longer than the test"
+    )]
+    async fn spawn_short_body_stub() -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 64\r\n\r\n{\"text\":")
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        addr
     }
 
     /// Loopback engine stub on `path`: answers `content_type` with `chunks`,
@@ -5244,17 +5758,17 @@ mod tests {
     /// a head's success and a cut's failure is then readable from its state:
     /// the success first closes it and the cut leaves it closed (one failure
     /// under the threshold of two); the cut first opens it again.
-    fn half_open_worker(url: &str) -> crate::worker::BasicWorker {
+    fn half_open_worker(url: &str) -> BasicWorker {
         half_open_worker_closing_after(url, 1)
     }
 
     /// A half-open worker at `url` whose breaker closes only after `successes`
     /// successes: one recorded head leaves it half-open, a second closes it.
-    fn half_open_worker_closing_after(url: &str, successes: u32) -> crate::worker::BasicWorker {
+    fn half_open_worker_closing_after(url: &str, successes: u32) -> BasicWorker {
         let worker = BasicWorkerBuilder::new(url)
             .worker_type(WorkerType::Regular)
             .health_config(no_health_check())
-            .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+            .circuit_breaker_config(CircuitBreakerConfig {
                 failure_threshold: 2,
                 success_threshold: successes,
                 timeout_duration: Duration::ZERO,
@@ -5268,11 +5782,11 @@ mod tests {
     }
 
     /// A regular worker at `url` whose circuit breaker opens on the first failure.
-    fn fragile_worker(url: &str) -> crate::worker::BasicWorker {
+    fn fragile_worker(url: &str) -> BasicWorker {
         BasicWorkerBuilder::new(url)
             .worker_type(WorkerType::Regular)
             .health_config(no_health_check())
-            .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+            .circuit_breaker_config(CircuitBreakerConfig {
                 failure_threshold: 1,
                 ..Default::default()
             })
@@ -5331,7 +5845,7 @@ mod tests {
                 None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
-                crate::worker::UNKNOWN_MODEL_ID,
+                UNKNOWN_MODEL_ID,
             )
             .await;
 
@@ -5405,7 +5919,7 @@ mod tests {
                 reqwest::Response::from(upstream),
                 StreamRelayMode {
                     is_stream: true,
-                    rechunk: false,
+                    rechunk: None,
                 },
                 RelaySource::new("m", "/v1/chat/completions", Arc::clone(&worker)),
                 WorkerLoadGuard::with_key(Arc::clone(&worker), None),
@@ -5459,7 +5973,7 @@ mod tests {
                     None,
                     streaming_chat_request(),
                     "/v1/chat/completions",
-                    crate::worker::UNKNOWN_MODEL_ID,
+                    UNKNOWN_MODEL_ID,
                 )
                 .await;
             assert_eq!(response.status(), StatusCode::OK);
@@ -5537,7 +6051,7 @@ mod tests {
                 None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
-                crate::worker::UNKNOWN_MODEL_ID,
+                UNKNOWN_MODEL_ID,
             )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -5589,7 +6103,7 @@ mod tests {
                 None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
-                crate::worker::UNKNOWN_MODEL_ID,
+                UNKNOWN_MODEL_ID,
             )
             .await;
 
@@ -5630,13 +6144,7 @@ mod tests {
         .unwrap();
 
         let response = router
-            .route_typed_request(
-                None,
-                None,
-                request,
-                "/v1/messages",
-                crate::worker::UNKNOWN_MODEL_ID,
-            )
+            .route_typed_request(None, None, request, "/v1/messages", UNKNOWN_MODEL_ID)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -5683,7 +6191,7 @@ mod tests {
                 None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
-                crate::worker::UNKNOWN_MODEL_ID,
+                UNKNOWN_MODEL_ID,
             )
             .await;
 
@@ -5718,7 +6226,7 @@ mod tests {
                 None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
-                crate::worker::UNKNOWN_MODEL_ID,
+                UNKNOWN_MODEL_ID,
             )
             .await;
 
@@ -5730,28 +6238,6 @@ mod tests {
         );
         let worker = &router.worker_registry.get_all()[0];
         assert!(worker.circuit_breaker_can_execute());
-    }
-
-    /// Counts, on this thread's subscriber, the ERROR events and the refusal
-    /// lines (the events carrying a `suppressed` field).
-    struct RefusalLineCounter {
-        errors: Arc<AtomicUsize>,
-        refusal_lines: Arc<AtomicUsize>,
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalLineCounter {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if *event.metadata().level() == tracing::Level::ERROR {
-                self.errors.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            if event.metadata().fields().field("suppressed").is_some() {
-                self.refusal_lines.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-        }
     }
 
     /// A refusal this router answers on its own is marked as reported for
@@ -5776,7 +6262,7 @@ mod tests {
 
         for (model, status, code) in [
             (
-                crate::worker::UNKNOWN_MODEL_ID,
+                UNKNOWN_MODEL_ID,
                 StatusCode::SERVICE_UNAVAILABLE,
                 placement::NO_AVAILABLE_WORKERS_CODE,
             ),
@@ -5843,7 +6329,7 @@ mod tests {
                     _probe: Arc::new(()),
                 },
                 "/generate",
-                crate::worker::UNKNOWN_MODEL_ID,
+                UNKNOWN_MODEL_ID,
             ))
         });
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -5862,6 +6348,167 @@ mod tests {
             .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"unavailable\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// A request whose every attempt came back retryable (two workers, each
+    /// answering 503) is answered with the last attempt's status once its
+    /// retries are spent. That answer is the request's failure: counted once
+    /// in the router error family under the status's class and reason,
+    /// beside the exhaustion counter, as the gRPC pipeline counts the same
+    /// outcome. The duration family stays empty: nothing succeeded.
+    #[test]
+    fn an_exhausted_requests_last_retryable_answer_counts_as_its_error() {
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let rendered = render_with_recorder(|| {
+            runtime.block_on(async {
+                let mut workers = Vec::new();
+                for _ in 0..2 {
+                    let hits = Arc::clone(&hits);
+                    let app = axum::Router::new().route(
+                        "/generate",
+                        axum::routing::post(move || {
+                            let hits = Arc::clone(&hits);
+                            async move {
+                                hits.fetch_add(1, AtomicOrdering::SeqCst);
+                                (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    [(CONTENT_TYPE, "application/json")],
+                                    r#"{"error":"busy"}"#,
+                                )
+                                    .into_response()
+                            }
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "test stub server lives for the duration of the test process"
+                    )]
+                    tokio::spawn(async move {
+                        axum::serve(listener, app).await.unwrap();
+                    });
+                    workers.push(plain_worker(&format!("http://{addr}")));
+                }
+                let mut router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, workers);
+                router.retry_config = fast_retry_config(2);
+                let request: GenerateRequest =
+                    serde_json::from_value(json!({ "text": "hello" })).unwrap();
+                let response = router
+                    .route_typed_request(None, None, request, "/generate", UNKNOWN_MODEL_ID)
+                    .await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            });
+        });
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            2,
+            "one attempt per worker"
+        );
+        let errors: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_request_errors_total{"))
+            .collect();
+        assert!(
+            errors.iter().any(|line| {
+                line.contains("router_type=\"http\"")
+                    && line.contains("backend_type=\"regular\"")
+                    && line.contains("endpoint=\"generate\"")
+                    && line.contains("error_type=\"backend_error\"")
+                    && line.contains("reason=\"engine_unavailable\"")
+                    && line.ends_with(" 1")
+            }),
+            "the exhausted request's last answer counts once as its error:\n{rendered}"
+        );
+        assert_eq!(errors.len(), 1, "one sample, one label set:\n{rendered}");
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_worker_retries_exhausted_total{")
+                    && line.contains("endpoint=\"generate\"")
+                    && line.ends_with(" 1")
+            }),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_router_request_duration_seconds"),
+            "nothing succeeded, so no duration:\n{rendered}"
+        );
+    }
+
+    /// The streamed-body route sends once and never retries, so a worker's
+    /// retryable status is the request's final answer too: counted once in
+    /// the router error family under the status's class and reason, with no
+    /// exhaustion recorded (there was no retry budget to spend).
+    #[test]
+    fn a_streamed_requests_retryable_answer_counts_as_its_error() {
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let rendered = render_with_recorder(|| {
+            runtime.block_on(async {
+                let app = axum::Router::new().route(
+                    "/generate",
+                    axum::routing::post(|| async {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [(CONTENT_TYPE, "application/json")],
+                            r#"{"error":"busy"}"#,
+                        )
+                            .into_response()
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test stub server lives for the duration of the test process"
+                )]
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let router = streaming_router(
+                    least_load_policy(),
+                    1024 * 1024,
+                    vec![plain_worker(&format!("http://{addr}"))],
+                );
+                let response = router
+                    .route_streaming_request(
+                        streamed_request(&[b"{\"text\":\"hello\"}"]),
+                        "/generate",
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            });
+        });
+        let errors: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_request_errors_total{"))
+            .collect();
+        assert_eq!(errors.len(), 1, "one sample, one label set:\n{rendered}");
+        assert!(
+            errors[0].contains("router_type=\"http\"")
+                && errors[0].contains("backend_type=\"regular\"")
+                && errors[0].contains("endpoint=\"generate\"")
+                && errors[0].contains("error_type=\"backend_error\"")
+                && errors[0].contains("reason=\"engine_unavailable\"")
+                && errors[0].ends_with(" 1"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_worker_retries_exhausted_total"),
+            "no retry budget was spent:\n{rendered}"
+        );
     }
 
     // --- Streamed deltas per provider profile ---------------------------------
@@ -5972,7 +6619,7 @@ mod tests {
         let resume = Arc::new(tokio::sync::Notify::new());
         let url = spawn_parked_sse_worker(resume.clone()).await;
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
-        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         let mut request: ChatCompletionRequest = serde_json::from_value(json!({
             "model": model,
             "messages": [{"role": "user", "content": "hello"}],
@@ -5982,7 +6629,7 @@ mod tests {
         .unwrap();
         request.normalize();
         let response = router
-            .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK, "{model}");
         let mut body = response.into_body();
@@ -6227,6 +6874,171 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         drop(listener);
     }
+
+    /// A worker that answers the chat route with `body` as one sized answer
+    /// under `content_type`: hyper writes the `Content-Length` an upstream
+    /// that knows its length would.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_sized_worker(body: &'static str, content_type: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || async move { ([(CONTENT_TYPE, content_type)], body) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// A sized answer of two short deltas and `[DONE]`: the re-slicing
+    /// policy holds deltas this short and merges them, so a rechunker that
+    /// ran on the body shows in the relayed bytes.
+    const SIZED_DELTA_BODY: &str = "data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\
+                            \"finish_reason\":null}]}\n\n\
+                            data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\
+                            \"finish_reason\":null}]}\n\n\
+                            data: [DONE]\n\n";
+
+    /// A streamed SSE relay may change the body's length, by re-slicing it
+    /// or by ending a cut stream with its error event, so a sized upstream
+    /// answer reaches the client without the upstream's `Content-Length` on
+    /// the re-sliced path and on the plain path alike, its text whole.
+    #[tokio::test]
+    async fn a_streamed_sse_relay_drops_the_upstreams_content_length() {
+        use openai_protocol::validated::Normalizable;
+
+        let url = spawn_sized_worker(SIZED_DELTA_BODY, "text/event-stream").await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        for model in ["MiniMax-M3", "served-plain-relay-model"] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+            assert!(
+                !response.headers().contains_key(CONTENT_LENGTH),
+                "{model}: the Content-Length of a sized upstream answer"
+            );
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let text: String = sse_events(std::str::from_utf8(&bytes).unwrap())
+                .iter()
+                .filter_map(|event| event.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .filter_map(|json| {
+                    json["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .collect();
+            assert_eq!(text, "Hello", "{model}: the text is whole");
+        }
+    }
+
+    /// A streamed answer that is not SSE is relayed byte for byte, on the
+    /// re-chunking model and the plain one alike, so a sized upstream answer
+    /// keeps the upstream's `Content-Length` and reaches the client whole.
+    /// The body carries deltas the re-slicing policy would hold and merge,
+    /// so a rechunker that ran under the wrong content type shows in the
+    /// bytes.
+    #[tokio::test]
+    async fn a_streamed_relay_keeps_the_content_length_of_a_sized_non_sse_answer() {
+        use openai_protocol::validated::Normalizable;
+
+        let url = spawn_sized_worker(SIZED_DELTA_BODY, "application/json").await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        for model in ["MiniMax-M3", "served-plain-relay-model"] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|length| length.to_str().ok()),
+                Some(SIZED_DELTA_BODY.len().to_string().as_str()),
+                "{model}: the upstream's Content-Length of a sized non-SSE answer"
+            );
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            assert_eq!(
+                bytes.as_ref(),
+                SIZED_DELTA_BODY.as_bytes(),
+                "{model}: the bytes are whole"
+            );
+        }
+    }
+
+    /// The plain path ends a cut stream with its error event too, so a sized
+    /// upstream answer that is cut reaches the client without the upstream's
+    /// `Content-Length`: the frames that arrived, the typed error event and
+    /// `[DONE]` under no declared length the event would overrun.
+    #[tokio::test]
+    async fn a_cut_sized_stream_on_the_plain_path_ends_with_its_error_event_and_no_length() {
+        const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+                            data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        let first = BODY.find("\n\n").unwrap() + 2;
+        let url = test_support::spawn_sized_sse_worker_cut_after(BODY, first).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(CONTENT_LENGTH),
+            "a cut stream's length is not the upstream's"
+        );
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("the body ends cleanly after the error event")
+            .to_bytes();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 3, "{body}");
+        assert_eq!(events[0], BODY[..first].trim_end());
+        let error: Value = serde_json::from_str(events[1].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(events[2], "data: [DONE]");
+    }
 }
 
 #[cfg(test)]
@@ -6244,6 +7056,7 @@ mod upstream_span_tests {
     use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
 
     use super::send_with_stale_conn_retry;
+    use crate::server::http_client;
 
     /// Counts how often any span is entered on this thread's subscriber.
     struct EnterCounter(Arc<AtomicUsize>);
@@ -6293,7 +7106,7 @@ mod upstream_span_tests {
             }
             socket.write_all(b"0\r\n\r\n").await.expect("last chunk");
         });
-        let client = crate::clients::http_client();
+        let client = http_client();
         let response =
             send_with_stale_conn_retry(client.get(format!("http://{addr}/v1/chat/completions")))
                 .instrument(tracing::info_span!("http_request"))

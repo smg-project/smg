@@ -1,9 +1,10 @@
 /*
     Cache-Aware Load Balancing Router
 
-    When load is balanced, uses cache-aware routing. When imbalanced, uses
-    LeastLoad expected-wait routing. A system is imbalanced when both:
-        (max - min) > abs_threshold  AND  max > rel_threshold * min
+    Routes by cache affinity. Count pressure is judged per candidate, not
+    fleet-wide: an affinity pick loaded well past the pool's mean spills to
+    LeastLoad's expected-wait winner (see "Load Balancing" below), and cache
+    affinity is abandoned fleet-wide only under backend KV pressure.
 
     Three types of cache-aware routing (mutually exclusive, selected by
     worker connection mode and KV event availability):
@@ -12,7 +13,9 @@
     -------------------------------------------
     Uses the KV index's overlap scoring from KvEventMonitor. Routes based
     on actual backend KV cache state. Selects the worker with the highest
-    overlap count; LeastLoad breaks equal-affinity ties atomically.
+    overlap count; LeastLoad breaks equal-affinity ties in one call, the
+    choice and its credit together (from eight candidates up the scores are
+    read without the tally's write guard).
     Falls back to LeastLoad when no cache overlap exists. Over a pool larger
     than 32 workers the decision reads the holders of the request's blocks
     and a sample of 16 others, not the pool (see `FLEET_SAMPLE`).
@@ -42,8 +45,18 @@
 
     Load Balancing (Expected Wait)
     -------------------------------------------
-    When the system is imbalanced, routes to LeastLoad's atomic expected-wait
-    winner regardless of cache affinity.
+    The count-pressure gate is applied per candidate (over_count_pressure_gate,
+    candidate_requires_spill): the selected holder spills when its in-flight
+    count is over balance_rel_threshold times the healthy-fleet mean AND over
+    the mean by the absolute margin (balance_abs_threshold, capped at the
+    larger of the count's natural swing and the held prefix's price; see
+    absolute_margin). A spilled request goes to LeastLoad's expected-wait winner (one call,
+    the choice and its credit; see `select_expected_wait`) among the workers
+    under the same gate, and so does a request with
+    no cache match (ungated_candidates). Cache affinity is abandoned fleet-wide
+    only under backend KV pressure (is_kv_imbalanced: the KV-usage spread or
+    the overload ceiling, both read from backend token usage); without token
+    usage those triggers are inert.
 
     Hash Index Under-Layer (cache_index = hash)
     -------------------------------------------
@@ -82,7 +95,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Weak,
     },
     time::{Duration, Instant},
 };
@@ -95,6 +108,7 @@ use kv_index::{
 };
 use parking_lot::RwLock;
 use rand::RngExt;
+use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
@@ -105,16 +119,17 @@ use super::{
     normalize_model_key,
     prefix_hash::CHARS_PER_TOKEN,
     utils::PeriodicTask,
-    CacheAwareConfig, CacheNamespace, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo,
-    WorkerRole, TEXT_MARKER_LEN,
+    CacheAwareConfig, CacheNamespace, LeastLoadPolicy, LoadBalancingPolicy, NamedList,
+    SelectWorkerInfo, WorkerRole, TEXT_MARKER_LEN,
 };
 use crate::{
     config::CacheIndexKind,
     mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
     observability::{cache_trace, metrics::Metrics},
     worker::{
-        liveness,
-        load_state::{LoadReceiver, LoadSnapshot},
+        health::liveness,
+        identity::endpoint::Endpoint,
+        load::state::{LoadReceiver, LoadSnapshot},
         KvEventMonitor, KvIndex, Worker,
     },
 };
@@ -148,8 +163,14 @@ const FLEET_SAMPLE: usize = 16;
 /// that entered the warm-up window is sliced to within this.
 const POOL_TABLE_REFRESH_MS: u64 = 1_000;
 
-/// Pool tables kept at once: one per routing pool the policy sees (a model's
-/// regular pool, the PD roles' pools); past this the oldest goes.
+/// Pool tables kept at once for the lists no caller named: one per list of
+/// workers the policy is handed and index it reads; past this the oldest
+/// goes. A list its caller names ([`NamedList`]: a model's regular pool, a
+/// PD role's pool, each partner list of a PD fleet) has a table of its own
+/// for as long as the list lives, whatever part of it a request may use, and
+/// is not counted here. What stays unnamed is a retry over the untried
+/// workers and a list narrowed by a candidate filter or a wire pin: eight is
+/// room for those while a lookup reads at most eight tables.
 const POOL_TABLES_KEPT: usize = 8;
 
 /// The floor of the swing-sized absolute margin of the spill gate: with a
@@ -182,8 +203,10 @@ impl PrefixUnit {
 
 /// Cache-aware routing policy
 ///
-/// Routes requests based on cache affinity when load is balanced,
-/// switches to LeastLoad expected-wait routing when load is imbalanced.
+/// Routes requests by cache affinity; a pick on a worker loaded well past
+/// the pool's mean spills to LeastLoad expected-wait routing (the
+/// per-candidate count gate), and backend KV pressure abandons affinity
+/// fleet-wide.
 /// Maintains separate trees per model for multi-model support.
 /// Supports mesh synchronization of tree operations across cluster nodes.
 /// When mesh is not enabled, the policy works independently without synchronization.
@@ -196,19 +219,20 @@ pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     /// Expected-wait selector used after cache affinity has narrowed the
     /// candidate set. It owns backend snapshots and since-poll dispatch credit,
-    /// keeping selection and credit atomic under concurrent arrivals.
+    /// one call chooses and credits the final worker (see `select_expected_wait`
+    /// for what its write guard covers).
     load_scorer: LeastLoadPolicy,
     /// Selection policy run over the per-worker inputs gathered for each
-    /// request (`cost` module); the default reproduces the affinity-group
-    /// decision exactly and the ports of published cost functions replace it.
+    /// request (`cost` module); the default, the one the catalog holds,
+    /// reproduces the affinity-group decision exactly.
     selection: WorkerSelectionPolicy,
     /// Optimistic self-accounting of dispatches the engines have not yet
     /// reported; `None` unless `selection_accounting_ttl_ms > 0`.
     accounting: Option<OptimisticAccounting>,
     /// String-based trees for HTTP connections (text input)
-    string_trees: Arc<DashMap<String, Arc<Tree>>>,
+    string_trees: Arc<DashMap<String, Arc<Tree>, FxBuildHasher>>,
     /// Token-based trees for gRPC connections (pre-tokenized input)
-    token_trees: Arc<DashMap<String, Arc<TokenTree>>>,
+    token_trees: Arc<DashMap<String, Arc<TokenTree>, FxBuildHasher>>,
     _eviction_task: Option<PeriodicTask>,
     /// Event-driven KV cache monitor for overlap scoring (gRPC workers only).
     kv_monitor: RwLock<Option<Arc<KvEventMonitor>>>,
@@ -224,53 +248,41 @@ pub struct CacheAwarePolicy {
     /// shallow one was among them (see [`Self::warmup_divert`]).
     divert_hits: AtomicU64,
     divert_shallow_seen: AtomicBool,
-    /// Each routing pool's workers by KV index id and position, built once
-    /// per pool snapshot (see [`PoolTable`]).
-    pool_tables: ArcSwap<Vec<Arc<PoolTable>>>,
+    /// The tables of the lists nobody named, at most [`POOL_TABLES_KEPT`]
+    /// (see [`PoolTable`]).
+    pool_tables: ArcSwap<Vec<Arc<WorkersTable>>>,
+    /// The tables of the lists their callers named, ascending by
+    /// [`NamedTable::key`]: one a live list and index, built once a refresh
+    /// period whatever part of the list each request may use.
+    named_tables: ArcSwap<Vec<Arc<NamedTable>>>,
+    /// Holders dropped since a named table was last published because a
+    /// named list's candidate was not the list's worker at the position its
+    /// caller gave ([`PoolTable::candidate_at`]): said at the next publish,
+    /// which starts the count again.
+    misplaced: AtomicU64,
     /// Set while one decision rebuilds a pool table so the others keep
     /// serving the one they have.
     pool_table_building: AtomicBool,
-    /// Model-scoped hash indexes for resolving tenant delta hashes.
-    /// Outer key is the normalized model_id; inner maps hold
-    /// `hash → reconstructable prefix/tokens` per tree kind.
-    /// Spec §7.1 mandates model scoping: the same hash can refer
-    /// to different prefixes in different models, so a global
-    /// index mis-routes multi-model deployments. Bounded by
-    /// eviction at `max_tree_size` total entries.
-    ///
-    /// Per-entry value semantics differ by populate site:
-    /// - `select_worker_*` (request hot paths) store the prior
-    ///   shared prefix from a pre-insert match. Bytes/entry is
-    ///   bounded by tree depth, not input size — a 32K-token
-    ///   request costs O(matched-prefix), not O(input).
-    /// - `apply_repair_page` (cold-start replay) stores the full
-    ///   inserted path because the canonical path is required to
-    ///   attach remote tenants at the correct node. This path
-    ///   runs at replay frequency, not request rate.
-    hash_index: Arc<DashMap<String, PerModelHashIndex>>,
-    /// Gate request-hot-path `hash_index` writes. The index's only
-    /// consumers are mesh paths (`apply_known_remote_insert` reads,
-    /// `apply_repair_page` writes). When mesh is disabled the
-    /// hot-path writes accumulate with no reader and OOM the
-    /// gateway. Off by default; the mesh wiring code flips it on
-    /// when it attaches.
-    populate_hash_index: AtomicBool,
+    /// Whether the mesh adapter is attached, as one atomic for the request
+    /// path (it mirrors [`Self::mesh_tree_sync`]; both flip in
+    /// [`Self::set_mesh_tree_sync`]). While it is, every routed path is
+    /// inserted with its hash, so the tree resolves a peer's delta that
+    /// names the path, and published as a delta; detached, no hash is
+    /// computed and nothing is published. The trees own the lookup: a hash
+    /// is forgotten exactly when its node is evicted, so a delta for a path
+    /// this gateway no longer holds reads as unknown and the peer is asked.
+    mesh_attached: AtomicBool,
     /// Outbound bridge into the mesh `td:` broadcast namespace.
     /// `Some` after [`Self::set_mesh_tree_sync`] (called by mesh wiring
     /// at startup); `None` when mesh is disabled, in which case
-    /// `sync_local_insert` is a no-op. The setter also toggles
-    /// [`Self::populate_hash_index`] to match adapter presence so the
-    /// two never drift apart. Note the pairing is best-effort at a
-    /// point-in-time — later eviction of a hash-index entry can leave
-    /// a still-in-flight delta with no local resolution; peers that
-    /// repair against us will simply see the gap the next tick.
+    /// `sync_local_insert` is a no-op.
     mesh_tree_sync: RwLock<Option<Arc<TreeSyncAdapter>>>,
     /// Hash-mode placement index (`cache_index = hash`): model →
     /// (boundary, head hash) → live holders. Empty in tree mode.
     /// Inner maps are Arc'd and model entries are never removed, so a
     /// cloned inner handle stays canonical and walking it never holds
     /// an outer-shard guard.
-    placement_index: Arc<DashMap<String, Arc<PlacementMap>>>,
+    placement_index: Arc<DashMap<String, Arc<PlacementMap>, FxBuildHasher>>,
 }
 
 /// Hash-mode per-model placement map: (boundary position, xxh3 of the token
@@ -305,18 +317,6 @@ fn hash_token_head(namespace: Option<CacheNamespace>, head: &[u32]) -> u64 {
     }
 }
 
-/// Per-model inner container for [`CacheAwarePolicy::hash_index`].
-/// Keeping both kinds in one struct per model makes the
-/// "separate model-scoped hash indexes for string and token
-/// trees" invariant from spec §7.1 explicit in the type.
-#[derive(Debug, Default)]
-struct PerModelHashIndex {
-    /// path hash → matched prefix (reconstructs the string-tree node).
-    string_tree: DashMap<u64, String>,
-    /// token-path hash → tokens (reconstructs the token-tree node).
-    token_tree: DashMap<u64, Vec<u32>>,
-}
-
 /// Total cached characters across tenants and the tenant count for one
 /// model's string tree. O(tenants): sums the tree's maintained counters.
 fn string_tree_totals(tree: &Tree) -> (usize, usize) {
@@ -339,7 +339,7 @@ fn token_tree_totals(tree: &TokenTree) -> (usize, usize) {
 /// read plus an `Arc` clone is uncontended; only a model's first request pays
 /// for the insert.
 fn tree_for_model<V>(
-    trees: &DashMap<String, Arc<V>>,
+    trees: &DashMap<String, Arc<V>, FxBuildHasher>,
     model_id: &str,
     new_tree: impl FnOnce() -> V,
 ) -> Arc<V> {
@@ -364,10 +364,16 @@ impl CacheAwarePolicy {
         config.cache_boundaries.sort_unstable();
         config.cache_boundaries.dedup();
 
-        let string_trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
-        let token_trees = Arc::new(DashMap::<String, Arc<TokenTree>>::new());
-        let hash_index = Arc::new(DashMap::<String, PerModelHashIndex>::new());
-        let placement_index = Arc::new(DashMap::<String, Arc<PlacementMap>>::new());
+        // Keyed by the operator's model ids and read on every request: the Fx
+        // hasher, as the model registry's maps.
+        let string_trees = Arc::new(DashMap::<String, Arc<Tree>, FxBuildHasher>::with_hasher(
+            FxBuildHasher,
+        ));
+        let token_trees =
+            Arc::new(DashMap::<String, Arc<TokenTree>, FxBuildHasher>::with_hasher(FxBuildHasher));
+        let placement_index = Arc::new(
+            DashMap::<String, Arc<PlacementMap>, FxBuildHasher>::with_hasher(FxBuildHasher),
+        );
 
         // Start background eviction thread if configured
         let eviction_task = if config.cache_index == CacheIndexKind::Hash {
@@ -381,7 +387,6 @@ impl CacheAwarePolicy {
         } else if config.eviction_interval_secs > 0 {
             let string_trees_clone = Arc::clone(&string_trees);
             let token_trees_clone = Arc::clone(&token_trees);
-            let hash_index_clone = Arc::clone(&hash_index);
             let max_tree_size = config.max_tree_size;
 
             Some(PeriodicTask::spawn(
@@ -390,6 +395,7 @@ impl CacheAwarePolicy {
                 move || {
                     // Evict string trees (HTTP)
                     let mut total_chars: usize = 0;
+                    let mut string_hashed: usize = 0;
                     for tree_ref in string_trees_clone.iter() {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
@@ -397,6 +403,7 @@ impl CacheAwarePolicy {
 
                         let (chars, tenants) = string_tree_totals(tree);
                         total_chars += chars;
+                        string_hashed += tree.hashed_paths();
                         Metrics::set_cache_tree_chars(model_id, chars);
                         Metrics::set_cache_tree_tenants(model_id, "string", tenants);
 
@@ -407,6 +414,7 @@ impl CacheAwarePolicy {
                     }
                     // Evict token trees (gRPC)
                     let mut total_tokens: usize = 0;
+                    let mut token_hashed: usize = 0;
                     for tree_ref in token_trees_clone.iter() {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
@@ -414,6 +422,7 @@ impl CacheAwarePolicy {
 
                         let (tokens, tenants) = token_tree_totals(tree);
                         total_tokens += tokens;
+                        token_hashed += tree.hashed_paths();
                         Metrics::set_cache_tree_tokens(model_id, tokens);
                         Metrics::set_cache_tree_tenants(model_id, "token", tenants);
 
@@ -422,46 +431,19 @@ impl CacheAwarePolicy {
                             model_id, max_tree_size
                         );
                     }
-                    // Evict hash index per model: `max_tree_size` is a
-                    // per-tree bound, so clearing one model's overflow
-                    // must not wipe other models' still-valid metadata.
-                    // Each tree kind is checked independently.
-                    let mut hash_total: usize = 0;
-                    for entry in hash_index_clone.iter() {
-                        let per_model = entry.value();
-                        if per_model.string_tree.len() > max_tree_size {
-                            per_model.string_tree.clear();
-                            debug!(
-                                model_id = entry.key(),
-                                "String hash index cleared (exceeded max_tree_size: {})",
-                                max_tree_size
-                            );
-                        }
-                        if per_model.token_tree.len() > max_tree_size {
-                            per_model.token_tree.clear();
-                            debug!(
-                                model_id = entry.key(),
-                                "Token hash index cleared (exceeded max_tree_size: {})",
-                                max_tree_size
-                            );
-                        }
-                        hash_total += per_model.string_tree.len() + per_model.token_tree.len();
-                    }
-
-                    // Log tree sizes — model counts, aggregate sizes +
-                    // hash-index total, from the per-tenant counters.
+                    // Log tree sizes — model counts, aggregate sizes and the
+                    // paths a mesh hash names, from the per-tenant counters.
                     // DO NOT call tree.snapshot() here — it clones all
                     // edge text (~170 MB) every cycle.
                     tracing::info!(
-                        "Tree memory: string_trees={} models / {} chars, \
-                         token_trees={} models / {} tokens, \
-                         hash_index={} models / {} entries",
+                        "Tree memory: string_trees={} models / {} chars / {} hashed paths, \
+                         token_trees={} models / {} tokens / {} hashed paths",
                         string_trees_clone.len(),
                         total_chars,
+                        string_hashed,
                         token_trees_clone.len(),
                         total_tokens,
-                        hash_index_clone.len(),
-                        hash_total,
+                        token_hashed,
                     );
                 },
             ))
@@ -499,22 +481,22 @@ impl CacheAwarePolicy {
             divert_hits: AtomicU64::new(0),
             divert_shallow_seen: AtomicBool::new(false),
             pool_tables: ArcSwap::from_pointee(Vec::new()),
+            named_tables: ArcSwap::from_pointee(Vec::new()),
+            misplaced: AtomicU64::new(0),
             pool_table_building: AtomicBool::new(false),
-            hash_index,
-            populate_hash_index: AtomicBool::new(false),
+            mesh_attached: AtomicBool::new(false),
             mesh_tree_sync: RwLock::new(None),
             placement_index,
         }
     }
 
-    /// Enable request-hot-path `hash_index` population without attaching
-    /// an adapter. Only exists so unit tests can seed the populate flag
-    /// without the ceremony of wiring in a real [`TreeSyncAdapter`];
-    /// production code goes through [`Self::set_mesh_tree_sync`], which
-    /// flips both fields together.
+    /// Test-only: the mesh flag without an adapter, so tests of the hashed
+    /// inserts and of a delta's resolution need no mesh wiring; production
+    /// code goes through [`Self::set_mesh_tree_sync`], which flips both
+    /// fields together.
     #[cfg(test)]
-    fn set_populate_hash_index(&self, enabled: bool) {
-        self.populate_hash_index.store(enabled, Ordering::Relaxed);
+    pub fn set_mesh_attached_for_test(&self, attached: bool) {
+        self.mesh_attached.store(attached, Ordering::Relaxed);
     }
 
     /// Token tree sized to the backend's KV page (`block_size`): affinity
@@ -523,8 +505,8 @@ impl CacheAwarePolicy {
         TokenTree::with_config(self.config.block_size.max(1), Default::default())
     }
 
-    fn should_populate_hash_index(&self) -> bool {
-        self.populate_hash_index.load(Ordering::Relaxed)
+    fn mesh_attached(&self) -> bool {
+        self.mesh_attached.load(Ordering::Relaxed)
     }
 
     // ---- The four readings of a request's cache namespace ----
@@ -619,77 +601,29 @@ impl CacheAwarePolicy {
         self.kv_monitor.read().is_some()
     }
 
-    /// Test-only view onto the populate flag so integration tests
-    /// outside this file can assert wiring flipped it. Not part of
-    /// the public API.
+    /// Test-only view onto the mesh flag so integration tests outside this
+    /// file can assert wiring flipped it. Not part of the public API.
     #[cfg(test)]
-    pub fn should_populate_hash_index_for_test(&self) -> bool {
-        self.should_populate_hash_index()
+    pub fn mesh_attached_for_test(&self) -> bool {
+        self.mesh_attached()
     }
 
-    /// Test-only: flip populate on without going through the mesh
-    /// wiring path. Used by bridge tests that need to seed
-    /// `hash_index` directly.
-    #[cfg(test)]
-    pub fn set_populate_hash_index_for_test_true(&self) {
-        self.set_populate_hash_index(true);
-    }
-
-    /// Test-only: seed a single hash-index entry so bridge tests
-    /// can exercise the inbound resolution path without driving a
-    /// full request through `select_worker`. `matched` is the
-    /// matched-prefix shape the populate site would normally store
-    /// (full text for string / full token vec for token) — for a
-    /// unit test that only asserts the lookup succeeded, any
-    /// non-empty value works because the underlying tree seeds
-    /// itself in `apply_known_remote_insert`.
-    #[cfg(test)]
-    pub fn seed_hash_index_for_test(
-        &self,
-        model_id: &str,
-        tree_kind: TreeKind,
-        node_hash: u64,
-        matched: &str,
-    ) {
-        let entry = self.hash_index.entry(model_id.to_string()).or_default();
-        match tree_kind {
-            TreeKind::String => {
-                entry.string_tree.insert(node_hash, matched.to_string());
-                // Ensure the string_tree map has a matching tree so
-                // apply_known_remote_insert doesn't hit the
-                // populate-site invariant warning.
-                self.string_trees
-                    .entry(model_id.to_string())
-                    .or_insert_with(|| Arc::new(Tree::new()));
-            }
-            TreeKind::Token => {
-                entry
-                    .token_tree
-                    .insert(node_hash, matched.bytes().map(u32::from).collect());
-                self.token_trees
-                    .entry(model_id.to_string())
-                    .or_insert_with(|| Arc::new(self.new_token_tree()));
-            }
-        }
-    }
-
-    /// Attach the mesh outbound bridge and enable hash-index population
-    /// in one atomic step; pass `None` to detach and disable both. The
-    /// pair moves together because the hash-index has no non-mesh
-    /// readers — enabling population without an adapter attached would
-    /// waste memory, and the producer-side `sync_local_insert` calls
-    /// only fire while population is on.
+    /// Attach the mesh outbound bridge and raise the mesh flag in one
+    /// atomic step; pass `None` to detach and lower it. The pair moves
+    /// together because a hashed insert has no reader without the mesh (a
+    /// hash per request would be computed for nobody), and the
+    /// producer-side `sync_local_insert` calls only fire while it is on.
     ///
     /// Interior-mutability setter so it composes with policies stored
     /// behind `Arc<dyn LoadBalancingPolicy>` after construction, matching
     /// `set_kv_event_monitor` / `set_load_receiver`.
     pub fn set_mesh_tree_sync(&self, adapter: Option<Arc<TreeSyncAdapter>>) {
-        let populate = adapter.is_some();
+        let attached = adapter.is_some();
         let mut guard = self.mesh_tree_sync.write();
         *guard = adapter;
         // Store under the guard so no observer can see the pair
-        // split (adapter attached ↔ populate flag on).
-        self.populate_hash_index.store(populate, Ordering::Relaxed);
+        // split (adapter attached ↔ flag on).
+        self.mesh_attached.store(attached, Ordering::Relaxed);
     }
 
     /// Publish one local tree change to the mesh outbound buffer.
@@ -714,6 +648,20 @@ impl CacheAwarePolicy {
     #[cfg(test)]
     pub(crate) fn has_load_receiver_for_test(&self) -> bool {
         self.load_rx.read().is_some()
+    }
+
+    /// Test-only: the worker URLs the string tree of `model_id` routes to,
+    /// sorted, so registry tests can assert the paths that fill and empty a
+    /// tree.
+    #[cfg(test)]
+    pub(crate) fn tree_tenants_for_test(&self, model_id: &str) -> Vec<String> {
+        let mut tenants: Vec<String> = self
+            .string_trees
+            .get(normalize_model_key(model_id))
+            .map(|tree| tree.get_tenant_char_count().into_keys().collect())
+            .unwrap_or_default();
+        tenants.sort();
+        tenants
     }
 
     /// True when backend KV pressure demands abandoning cache affinity.
@@ -763,8 +711,9 @@ impl CacheAwarePolicy {
 
     /// Min and max backend KV-cache utilization (0.0–1.0) across healthy workers
     /// that have a `WorkerMonitor` snapshot entry, as `(min, max)`. `None` when
-    /// no receiver is wired or no healthy worker has a load entry (→ caller
-    /// relies on the request-count spread).
+    /// no receiver is wired or no healthy worker has a load entry: the KV
+    /// triggers are then inert, and the per-candidate count gate is the only
+    /// balance.
     fn backend_token_usage_bounds(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -792,81 +741,25 @@ impl CacheAwarePolicy {
         bounds
     }
 
-    /// Initialize the trees with worker URLs (used only during initial setup)
-    /// Initializes both string trees (HTTP) and token trees (gRPC) for each model.
+    /// Give every worker a root in the two trees of its model (the string
+    /// tree for text, the token tree for tokens), so the trees route to it
+    /// before it has served a request.
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
-        // Hash mode keeps no tree state.
-        if self.config.cache_index == CacheIndexKind::Hash {
-            return;
-        }
-        // Group workers by model
-        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in workers {
-            let tree_key = normalize_model_key(worker.model_id());
-            model_workers
-                .entry(tree_key.to_string())
-                .or_default()
-                .push(worker);
-        }
-
-        // Initialize trees for each model (both string and token trees)
-        for (tree_key, model_workers) in model_workers {
-            // Initialize string tree (HTTP)
-            let string_tree = self
-                .string_trees
-                .entry(tree_key.clone())
-                .or_insert_with(|| Arc::new(Tree::new()));
-            // Initialize token tree (gRPC)
-            let token_tree = self
-                .token_trees
-                .entry(tree_key)
-                .or_insert_with(|| Arc::new(self.new_token_tree()));
-
-            for worker in model_workers {
-                string_tree.insert_text("", worker.url());
-                token_tree.insert_tokens(&[], worker.url());
-            }
+            self.add_worker(worker.as_ref());
         }
     }
 
-    /// Add a single worker to the trees (incremental update)
+    /// Give one worker its root in the two trees of its model. Hash mode
+    /// keeps no tree state.
     pub fn add_worker(&self, worker: &dyn Worker) {
         if self.config.cache_index == CacheIndexKind::Hash {
             return;
         }
-        let tree_key = normalize_model_key(worker.model_id()).to_string();
-        // Add to string tree (HTTP)
-        let string_tree = self
-            .string_trees
-            .entry(tree_key.clone())
-            .or_insert_with(|| Arc::new(Tree::new()));
-        string_tree.insert_text("", worker.url());
-        // Add to token tree (gRPC)
-        let token_tree = self
-            .token_trees
-            .entry(tree_key)
-            .or_insert_with(|| Arc::new(self.new_token_tree()));
-        token_tree.insert_tokens(&[], worker.url());
-    }
-
-    /// Add a worker by URL and model (for backward compatibility)
-    pub fn add_worker_by_url(&self, url: &str, model_id: &str) {
-        if self.config.cache_index == CacheIndexKind::Hash {
-            return;
-        }
-        let model_id_string = model_id.to_string();
-        // Add to string tree (HTTP)
-        let string_tree = self
-            .string_trees
-            .entry(model_id_string.clone())
-            .or_insert_with(|| Arc::new(Tree::new()));
-        string_tree.insert_text("", url);
-        // Add to token tree (gRPC)
-        let token_tree = self
-            .token_trees
-            .entry(model_id_string)
-            .or_insert_with(|| Arc::new(self.new_token_tree()));
-        token_tree.insert_tokens(&[], url);
+        let tree_key = normalize_model_key(worker.model_id());
+        tree_for_model(&self.string_trees, tree_key, Tree::new).insert_text("", worker.url());
+        tree_for_model(&self.token_trees, tree_key, || self.new_token_tree())
+            .insert_tokens(&[], worker.url());
     }
 
     /// Remove a worker from the trees
@@ -897,6 +790,14 @@ impl CacheAwarePolicy {
                 !holders.is_empty()
             });
         }
+    }
+
+    /// `model_id`'s string tree, for tests that seed and read its tenants.
+    #[cfg(test)]
+    pub(crate) fn string_tree(&self, model_id: &str) -> Option<Arc<Tree>> {
+        self.string_trees
+            .get(normalize_model_key(model_id))
+            .map(|tree| Arc::clone(tree.value()))
     }
 
     /// Remove several workers from one model. Tree cleanup remains precise per
@@ -937,8 +838,10 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Run cache eviction to prevent unbounded growth
-    pub fn evict_cache(&self, max_size: usize) {
+    /// Test-only: one eviction pass over every tree at `max_size`, what the
+    /// eviction task does on its interval (without the gauges it publishes).
+    #[cfg(test)]
+    pub(crate) fn evict_cache(&self, max_size: usize) {
         // Evict string trees (HTTP)
         for tree_ref in self.string_trees.iter() {
             let model_id = tree_ref.key();
@@ -958,26 +861,6 @@ impl CacheAwarePolicy {
                 "Token tree eviction for model {}, max_size: {}",
                 model_id, max_size
             );
-        }
-        // Evict hash index per model per tree kind. `max_size` is a
-        // per-tree bound; clearing one model's overflow must not wipe
-        // other models' still-valid metadata.
-        for entry in self.hash_index.iter() {
-            let per_model = entry.value();
-            if per_model.string_tree.len() > max_size {
-                per_model.string_tree.clear();
-                debug!(
-                    model_id = entry.key(),
-                    "String hash index cleared (exceeded max_size: {})", max_size
-                );
-            }
-            if per_model.token_tree.len() > max_size {
-                per_model.token_tree.clear();
-                debug!(
-                    model_id = entry.key(),
-                    "Token hash index cleared (exceeded max_size: {})", max_size
-                );
-            }
         }
     }
 
@@ -1007,22 +890,18 @@ impl CacheAwarePolicy {
                 .get(model_id)
                 .map(|entry| entry.value().clone());
             if let Some(tree) = tree {
-                // We need the match result (the prior shared prefix) BEFORE the
-                // insert so the hash_index stores only that bounded prefix, not
-                // the full path that exists post-insert (32K tokens × 4 bytes ×
-                // max_tree_size = multi-GB/model). `match_and_insert` resolves
-                // the match against the pre-insert tree and inserts in the SAME
-                // descent, so `result.matched_token_count` is the same prior
-                // prefix length the standalone match returned. When we don't
-                // populate the index, a plain insert (no match) suffices.
-                if self.should_populate_hash_index() {
-                    let result = tree.match_and_insert(tokens, worker_url);
-                    let matched_prefix: Vec<u32> = tokens[..result.matched_token_count].to_vec();
-                    self.hash_index
-                        .entry(model_id.to_string())
-                        .or_default()
-                        .token_tree
-                        .insert(kv_index::hash_token_path(tokens), matched_prefix);
+                // With the mesh attached the path's hash rides on the insert, so
+                // a peer's delta that names this path resolves to its node here.
+                // The hash is of the page-aligned prefix, the path the tree
+                // stores: every sequence that ends at a node names it by the one
+                // hash a repair page's entry (an aligned path) names it by.
+                let aligned = tree.aligned_len(tokens.len());
+                if self.mesh_attached() && aligned > 0 {
+                    tree.insert_tokens_with_hash(
+                        tokens,
+                        worker_url,
+                        kv_index::hash_token_path(&tokens[..aligned]),
+                    );
                 } else {
                     tree.insert_tokens(tokens, worker_url);
                 }
@@ -1037,22 +916,9 @@ impl CacheAwarePolicy {
                 .map(|entry| entry.value().clone());
 
             if let Some(tree) = tree {
-                // Match BEFORE insert so the hash_index stores only the prior
-                // shared prefix (~50-200 chars), not the full prompt (20KB+)
-                // that exists post-insert. `match_and_insert` does both in a
-                // single descent; `result.matched_char_count` is the same prior
-                // prefix length the standalone match returned. When we don't
-                // populate the index, a plain insert (no match) suffices.
-                if self.should_populate_hash_index() {
-                    let result = tree.match_and_insert(text, worker_url);
-                    let matched_prefix: String =
-                        text.chars().take(result.matched_char_count).collect();
-                    let path_hash = kv_index::hash_node_path(text);
-                    self.hash_index
-                        .entry(model_id.to_string())
-                        .or_default()
-                        .string_tree
-                        .insert(path_hash, matched_prefix);
+                // The empty text ends at the root, which no hash names.
+                if self.mesh_attached() && !text.is_empty() {
+                    tree.insert_text_with_hash(text, worker_url, kv_index::hash_node_path(text));
                 } else {
                     tree.insert_text(text, worker_url);
                 }
@@ -1066,7 +932,7 @@ impl CacheAwarePolicy {
 
         debug!(
             branch = "kv_pressure_expected_wait",
-            worker = worker_url,
+            worker = workers[selected].redacted_url(),
             model_id,
             "Cache-aware selection"
         );
@@ -1086,17 +952,18 @@ pub enum TreeKind {
 /// into private fields. Defined here (not in the adapter) to keep
 /// the dependency direction `adapter → policy`.
 pub trait TreeHandle: Send + Sync + std::fmt::Debug {
-    /// If `node_hash` is known locally (resolvable to a stored
-    /// matched-prefix), record `worker_url` as a tenant of the
-    /// matched node and return `true`. Returns `false` if the
-    /// hash isn't known — the caller is expected to request
-    /// repair so the path can be reconstructed from a peer.
+    /// If the local tree holds the node that ends the path `node_hash`
+    /// names (a path this gateway inserted with its hash: a request it
+    /// routed while the mesh was attached, or a repaired entry), record
+    /// `worker_url` as a tenant of that whole path and return `true`.
+    /// Returns `false` when it does not — the path was evicted or never
+    /// seen — and the caller is expected to request repair so the path
+    /// can be reconstructed from a peer.
     ///
     /// This subsumes "is the hash known?" plus "apply the
     /// insert": the adapter doesn't need separate read+write
-    /// trips, and we never expose the matched value across the
-    /// trait boundary (it stays inside the policy where
-    /// eviction owns its lifecycle).
+    /// trips, and the text never crosses the trait boundary (the
+    /// tree that owns the node owns the lookup and its eviction).
     fn apply_known_remote_insert(
         &self,
         model_id: &str,
@@ -1138,48 +1005,22 @@ impl TreeHandle for CacheAwarePolicy {
         worker_url: &str,
     ) -> bool {
         // Normalize empty → UNKNOWN_MODEL_ID so lookups match the
-        // key shape every populate site already uses.
+        // key shape every insert site already uses.
         let model_id = normalize_model_key(model_id);
-        let Some(model_entry) = self.hash_index.get(model_id) else {
-            return false;
-        };
         match tree_kind {
             TreeKind::String => {
-                let Some(path) = model_entry.string_tree.get(&node_hash) else {
-                    return false;
-                };
-                let Some(tree) = self.string_trees.get(model_id) else {
-                    // Hash index entry without a corresponding
-                    // tree means a populate site mutated
-                    // `hash_index` without creating the tree
-                    // (or eviction dropped the tree but left the
-                    // index). Returning false here masks the
-                    // invariant violation as a spurious repair
-                    // request, so log loudly.
-                    warn!(
-                        model_id,
-                        node_hash,
-                        "string hash_index entry without matching string_trees entry; populate-site invariant violated",
-                    );
-                    return false;
-                };
-                tree.insert_text(path.value(), worker_url);
-                true
+                let tree = self
+                    .string_trees
+                    .get(model_id)
+                    .map(|entry| Arc::clone(entry.value()));
+                tree.is_some_and(|tree| tree.insert_tenant_by_hash(node_hash, worker_url))
             }
             TreeKind::Token => {
-                let Some(tokens) = model_entry.token_tree.get(&node_hash) else {
-                    return false;
-                };
-                let Some(tree) = self.token_trees.get(model_id) else {
-                    warn!(
-                        model_id,
-                        node_hash,
-                        "token hash_index entry without matching token_trees entry; populate-site invariant violated",
-                    );
-                    return false;
-                };
-                tree.insert_tokens(tokens.value(), worker_url);
-                true
+                let tree = self
+                    .token_trees
+                    .get(model_id)
+                    .map(|entry| Arc::clone(entry.value()));
+                tree.is_some_and(|tree| tree.insert_tenant_by_hash(node_hash, worker_url))
             }
         }
     }
@@ -1222,14 +1063,14 @@ impl TreeHandle for CacheAwarePolicy {
                 for entry in &page.entries {
                     match entry {
                         RepairEntry::String { path, tenants } => {
+                            // The path rides with its hash, so a later delta
+                            // that names it resolves to this node; a node this
+                            // gateway named from its own request keeps that hash
+                            // (a repair fills, it never displaces).
+                            let path_hash = kv_index::hash_node_path(path);
                             for (tenant, _epoch) in tenants {
-                                tree.insert_text(path, tenant);
+                                tree.insert_text_with_hash_unless_named(path, tenant, path_hash);
                             }
-                            self.hash_index
-                                .entry(model_id.to_string())
-                                .or_default()
-                                .string_tree
-                                .insert(kv_index::hash_node_path(path), path.clone());
                             applied += 1;
                         }
                         RepairEntry::Token { .. } => {
@@ -1252,14 +1093,16 @@ impl TreeHandle for CacheAwarePolicy {
                 for entry in &page.entries {
                     match entry {
                         RepairEntry::Token { tokens, tenants } => {
+                            // A request names the sequence it routed, a repair
+                            // the page-aligned path the tree holds: the node
+                            // keeps the hash this gateway recorded itself and the
+                            // repair fills the rest.
+                            let path_hash = kv_index::hash_token_path(tokens);
                             for (tenant, _epoch) in tenants {
-                                tree.insert_tokens(tokens, tenant);
+                                tree.insert_tokens_with_hash_unless_named(
+                                    tokens, tenant, path_hash,
+                                );
                             }
-                            self.hash_index
-                                .entry(model_id.to_string())
-                                .or_default()
-                                .token_tree
-                                .insert(kv_index::hash_token_path(tokens), tokens.clone());
                             applied += 1;
                         }
                         RepairEntry::String { .. } => {
@@ -1285,66 +1128,58 @@ struct OverlapCandidate {
     idx: usize,
     raw_score: f64,
     effective_score: f64,
+    /// The overlap the index scored and the cache group that bound it, when
+    /// the worker's group view shrank the score ([`KvIndex::cap_by_groups`]).
+    group_cap: Option<(u32, u32)>,
 }
 
-/// One routing pool's workers by their KV index ids, built once per pool
-/// snapshot and refreshed every [`POOL_TABLE_REFRESH_MS`]. The registry hands
-/// the policy the same slice until membership changes, so an overlap lookup's
-/// `index id -> blocks` result maps to slice positions through this table
-/// instead of a string lookup per healthy worker per request, and the warm-up
-/// slice reads the workers inside its window from it instead of scanning the
-/// pool on every thin miss.
+/// One list of workers by their ids in one KV index, read in one pass over
+/// the list and kept for [`POOL_TABLE_REFRESH_MS`]. The rows are of the
+/// index they were read against, since an index numbers its workers in its
+/// own space. An overlap lookup's `index id -> blocks` result maps to
+/// candidates through them instead of a string lookup per healthy worker
+/// per request, and the warm-up slice reads the workers inside its window
+/// from them instead of scanning the pool on every thin miss.
 #[derive(Debug)]
-struct PoolTable {
-    /// Address and length of the slice the table was built from.
-    slice: (usize, usize),
+struct Rows {
     /// Gateway clock at the build, for the refresh.
     built_ms: u64,
-    /// Address of the worker at each position at the build: a pool rebuilt
-    /// at the same address with other workers fails this check per holder.
-    worker_at: Vec<usize>,
-    /// The index id of the worker at each position; `None` while it is not
+    /// The index the ids below are of, as a weak handle: it keeps no index
+    /// alive, and it keeps the index's allocation, so the address is never
+    /// another index's while the rows live.
+    index: Weak<KvIndex>,
+    /// The index id of the worker at each row; `None` while it is not
     /// interned.
     id_at: Vec<Option<u32>>,
-    /// Index id -> position.
-    position_of: HashMap<u32, u32>,
+    /// Index id -> row.
+    row_of: HashMap<u32, u32>,
     /// The fleet's index level at the build: the upper median of the
     /// workers' index sizes, what a thin worker is thin against.
     fleet_level: usize,
-    /// Positions of the warm-up slice's candidates at the build: the workers
+    /// Rows of the warm-up slice's candidates at the build: the workers
     /// thinner than the fleet (an index emptied by a resync, or never fed)
     /// whatever their age, else the workers inside the warm-up window
     /// (admitted within it, index still growing) unless every worker was (a
     /// young fleet slices nothing).
     warming: Vec<u32>,
-    /// Positions of the thin workers alone, the targets of the hit diversion
+    /// Rows of the thin workers alone, the targets of the hit diversion
     /// (see [`CacheAwarePolicy::warmup_divert`]).
     thin: Vec<u32>,
 }
 
-impl PoolTable {
-    fn slice_key(workers: &[Arc<dyn Worker>]) -> (usize, usize) {
-        (workers.as_ptr() as usize, workers.len())
-    }
-
-    fn worker_address(worker: &Arc<dyn Worker>) -> usize {
-        Arc::as_ptr(worker).cast::<()>() as usize
-    }
-
-    /// One pass over the pool: the string lookup per worker happens here,
-    /// once per snapshot and refresh, not per request.
-    fn build(workers: &[Arc<dyn Worker>], indexer: &KvIndex, now_ms: u64) -> Self {
+impl Rows {
+    /// One pass over the list: the string lookup per worker happens here,
+    /// once per list and refresh, not per request.
+    fn read(workers: &[Arc<dyn Worker>], indexer: &Arc<KvIndex>, now_ms: u64) -> Self {
         let warmup = liveness::warmup();
-        let mut worker_at = Vec::with_capacity(workers.len());
         let mut id_at = Vec::with_capacity(workers.len());
-        let mut position_of = HashMap::with_capacity(workers.len());
+        let mut row_of = HashMap::with_capacity(workers.len());
         let mut sized: Vec<Option<(usize, usize)>> = Vec::with_capacity(workers.len());
-        for (position, worker) in workers.iter().enumerate() {
-            worker_at.push(Self::worker_address(worker));
+        for (row, worker) in workers.iter().enumerate() {
             let id = indexer.worker_id(worker.url());
             id_at.push(id);
             if let Some(id) = id {
-                position_of.insert(id, position as u32);
+                row_of.insert(id, row as u32);
             }
             // Index size, and its growth since the admission for the age rule
             // (the baseline restarts when the count drops); thinness is read
@@ -1365,7 +1200,7 @@ impl PoolTable {
         let mut thin = Vec::new();
         let mut young = Vec::new();
         if warmup.share > 0.0 {
-            for (position, (worker, sized)) in workers.iter().zip(&sized).enumerate() {
+            for (row, (worker, sized)) in workers.iter().zip(&sized).enumerate() {
                 let (indexed, grown) = match sized {
                     Some((indexed, grown)) => (*indexed, Some(*grown)),
                     None => (0, None),
@@ -1374,9 +1209,9 @@ impl PoolTable {
                     continue;
                 }
                 if warmup.is_thin(indexed, fleet_level) {
-                    thin.push(position as u32);
+                    thin.push(row as u32);
                 } else {
-                    young.push(position as u32);
+                    young.push(row as u32);
                 }
             }
         }
@@ -1391,35 +1226,172 @@ impl PoolTable {
             Vec::new()
         };
         Self {
-            slice: Self::slice_key(workers),
             built_ms: now_ms,
-            worker_at,
+            index: Arc::downgrade(indexer),
             id_at,
-            position_of,
+            row_of,
             fleet_level,
             warming,
             thin,
         }
     }
 
-    /// Whether the table was built from `workers` (the same slice).
-    fn describes(&self, workers: &[Arc<dyn Worker>]) -> bool {
-        self.slice == Self::slice_key(workers)
+    /// Whether the rows were read against `indexer`.
+    fn of_index(&self, indexer: &Arc<KvIndex>) -> bool {
+        std::ptr::eq(self.index.as_ptr(), Arc::as_ptr(indexer))
     }
 
-    /// Whether the table is within its refresh period.
+    /// Whether the rows are within their refresh period.
     fn fresh(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.built_ms) < POOL_TABLE_REFRESH_MS
     }
+}
 
-    /// The position holding index worker `id`, when the worker there is
-    /// still the one the table was built from.
-    fn position(&self, id: u32, workers: &[Arc<dyn Worker>]) -> Option<usize> {
-        let position = *self.position_of.get(&id)? as usize;
-        let same_worker = workers
+/// The table of a list its caller named ([`NamedList`]): the rows of the
+/// whole list, whatever part of it a request may use, so the fleet's level
+/// and the warm-up's candidates do not move with the workers that were open
+/// at the build. A named list has one table for as long as it lives, found
+/// by the list's and the index's own addresses: the registry's slice of a
+/// model's pool, a PD role's pool whose open workers change with every
+/// request, a partner list.
+#[derive(Debug)]
+struct NamedTable {
+    /// The list, as a weak handle of the snapshot's own allocation: it
+    /// keeps no worker alive, and it keeps the allocation, so the address
+    /// is never another list's while the table lives.
+    list: Weak<[Arc<dyn Worker>]>,
+    rows: Rows,
+}
+
+impl NamedTable {
+    fn build(list: &Arc<[Arc<dyn Worker>]>, indexer: &Arc<KvIndex>, now_ms: u64) -> Self {
+        Self {
+            list: Arc::downgrade(list),
+            rows: Rows::read(list, indexer, now_ms),
+        }
+    }
+
+    /// The table's place among the kept ones: the addresses of its list and
+    /// of its index, each its own while the table holds the weak handle.
+    fn key(&self) -> (usize, usize) {
+        (
+            self.list.as_ptr().cast::<()>() as usize,
+            self.rows.index.as_ptr() as usize,
+        )
+    }
+
+    /// Whether the list and the index both live: nothing asks for a dead
+    /// table again, so it leaves at the next publish.
+    fn live(&self) -> bool {
+        self.list.strong_count() > 0 && self.rows.index.strong_count() > 0
+    }
+}
+
+/// The table of a list nobody named, by the worker at each position at the
+/// build: it answers for a slice that holds the same worker at every
+/// position, wherever the slice lives.
+#[derive(Debug)]
+struct WorkersTable {
+    /// The worker at each position, as weak handles: they keep no worker
+    /// alive, and they keep each worker's allocation, so an address the
+    /// table holds is never another worker's while the table lives.
+    worker_at: Vec<Weak<dyn Worker>>,
+    rows: Rows,
+}
+
+impl WorkersTable {
+    fn build(workers: &[Arc<dyn Worker>], indexer: &Arc<KvIndex>, now_ms: u64) -> Self {
+        Self {
+            worker_at: workers.iter().map(Arc::downgrade).collect(),
+            rows: Rows::read(workers, indexer, now_ms),
+        }
+    }
+
+    /// Whether `worker` is the worker the table was built from at
+    /// `position`.
+    fn holds(&self, position: usize, worker: &Arc<dyn Worker>) -> bool {
+        self.worker_at
             .get(position)
-            .is_some_and(|worker| Self::worker_address(worker) == self.worker_at[position]);
-        same_worker.then_some(position)
+            .is_some_and(|kept| std::ptr::addr_eq(kept.as_ptr(), Arc::as_ptr(worker)))
+    }
+
+    /// Whether the table was built from `workers` against `indexer`: the
+    /// same index, and the same worker at every position, in one pass that
+    /// stops at the first difference. The slice's address says nothing: a
+    /// `Vec` built per request repeats one with another list in it, and
+    /// never repeats across threads.
+    fn describes(&self, workers: &[Arc<dyn Worker>], indexer: &Arc<KvIndex>) -> bool {
+        self.rows.of_index(indexer)
+            && self.worker_at.len() == workers.len()
+            && workers
+                .iter()
+                .enumerate()
+                .all(|(position, worker)| self.holds(position, worker))
+    }
+}
+
+/// The table one decision reads its candidates through. A named list's
+/// table comes with the caller's name for the list, so a use of a row needs
+/// nothing else to place it: a named table without a name, or a name over a
+/// table by its workers, cannot be written.
+enum PoolTable<'a> {
+    /// The table of the whole list, the caller's word on which part of it
+    /// the candidates are, and the policy's count of the holders that word
+    /// misplaced ([`CacheAwarePolicy::misplaced`]).
+    Named {
+        table: Arc<NamedTable>,
+        named: NamedList<'a>,
+        misplaced: &'a AtomicU64,
+    },
+    /// The table of exactly the candidates.
+    Workers(Arc<WorkersTable>),
+}
+
+impl PoolTable<'_> {
+    fn rows(&self) -> &Rows {
+        match self {
+            Self::Named { table, .. } => &table.rows,
+            Self::Workers(table) => &table.rows,
+        }
+    }
+
+    /// The candidate holding index worker `id`, when the request may use
+    /// it ([`Self::candidate_at`]).
+    fn candidate(&self, id: u32, workers: &[Arc<dyn Worker>]) -> Option<usize> {
+        let row = *self.rows().row_of.get(&id)? as usize;
+        self.candidate_at(row, workers)
+    }
+
+    /// The candidate that is the table's worker at `row`. The rows of a
+    /// table by its workers are its slice's positions, each checked against
+    /// the worker it was built from. A named table's row is a position of
+    /// the whole list: its place among the candidates comes from the
+    /// caller's positions, and the candidate there must be the list's own
+    /// worker at the row, one pointer compare. A caller whose positions do
+    /// not match its workers loses the holder, counted on the policy, and
+    /// is never handed another worker in its place.
+    fn candidate_at(&self, row: usize, workers: &[Arc<dyn Worker>]) -> Option<usize> {
+        match self {
+            Self::Workers(table) => {
+                let same_worker = workers
+                    .get(row)
+                    .is_some_and(|worker| table.holds(row, worker));
+                same_worker.then_some(row)
+            }
+            Self::Named {
+                named, misplaced, ..
+            } => {
+                let candidate = named.candidate(row)?;
+                let same_worker = workers.get(candidate).zip(named.list.get(row)).is_some_and(
+                    |(worker, listed)| std::ptr::addr_eq(Arc::as_ptr(worker), Arc::as_ptr(listed)),
+                );
+                if !same_worker {
+                    misplaced.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                Some(candidate)
+            }
+        }
     }
 }
 
@@ -1477,20 +1449,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         self.select_worker_scanned(workers, info)
     }
 
-    fn on_request_complete(&self, worker_url: &str, success: bool) {
+    fn on_request_complete(&self, worker_url: &str) {
         if let Some(accounting) = &self.accounting {
             accounting.release(worker_url);
         }
         self.selection.on_request_complete(worker_url);
-        // Could track success rates per worker for more intelligent routing
-        if !success {
-            // Optionally reduce affinity for failed requests
-            tracing::debug!(
-                "Request to {} completed with success={}",
-                worker_url,
-                success
-            );
-        }
     }
 
     fn name(&self) -> &'static str {
@@ -1529,6 +1492,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         true
     }
 
+    /// The event-driven path reads the model's KV-event index; without it
+    /// the selection falls back to the approximate token tree.
+    fn needs_kv_events(&self) -> bool {
+        true
+    }
+
     fn remove_worker(&self, url: &str) {
         // The CacheAware-specific removal path already prunes trees and hash
         // placements before the registry invokes this generic load-aware
@@ -1550,7 +1519,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if released > 0 {
             Metrics::record_policy_inflight_reconciled(self.name(), released);
             debug!(
-                worker = worker_url,
+                worker = Endpoint::redacted_url(worker_url).as_str(),
                 in_flight, released, "Released bookings whose completion never arrived"
             );
         }
@@ -1590,7 +1559,8 @@ impl CacheAwarePolicy {
         // replacing the former separate passes whose per-worker guard traffic
         // dominated routing CPU at scale. Collects eligible indices, the load
         // sum (for the per-request pressure gate). Final selection and credit
-        // are delegated atomically to LeastLoad after affinity is resolved.
+        // are delegated to one LeastLoad call after affinity is resolved
+        // (`select_expected_wait` says what its write guard covers).
         let mut healthy_indices: Vec<usize> = Vec::with_capacity(workers.len());
         let mut load_sum = 0usize;
         for (idx, worker) in workers.iter().enumerate() {
@@ -1598,7 +1568,7 @@ impl CacheAwarePolicy {
             let eligible = info.admits(state);
             if cache_trace::enabled() && !eligible {
                 cache_trace::gate(serde_json::json!({
-                    "phase": "eligibility", "worker": worker.url(),
+                    "phase": "eligibility", "worker": worker.redacted_url(),
                     "load": state.load, "overloaded": state.overloaded,
                     "eligible": false,
                 }));
@@ -1741,34 +1711,100 @@ impl CacheAwarePolicy {
             || self.config.overload_token_usage_threshold < 1.0
     }
 
-    /// The pool table for `workers`: the one kept when it is fresh, a stale
-    /// one while another decision rebuilds, else built here and published.
-    fn pool_table(
+    /// The table of a named list under `indexer`: found among the kept ones
+    /// by the two addresses, built from the whole list, and refreshed like
+    /// any other. A publish drops the tables whose list or index died, so
+    /// the kept ones are the live lists', however many they are, and says
+    /// what the callers' positions lost since the last one. The decisions
+    /// that meet a list before its first table is published each build one,
+    /// and the last publish stays: the single flight is the rebuild's
+    /// alone.
+    fn named_table(
         &self,
-        workers: &[Arc<dyn Worker>],
-        indexer: &KvIndex,
+        list: &Arc<[Arc<dyn Worker>]>,
+        indexer: &Arc<KvIndex>,
         now_ms: u64,
-    ) -> Arc<PoolTable> {
+    ) -> Arc<NamedTable> {
+        let key = (
+            Arc::as_ptr(list).cast::<()>() as usize,
+            Arc::as_ptr(indexer) as usize,
+        );
+        let mut rebuilds = false;
         {
-            let tables = self.pool_tables.load();
-            if let Some(table) = tables.iter().find(|table| table.describes(workers)) {
-                if table.fresh(now_ms) || self.pool_table_building.swap(true, Ordering::AcqRel) {
+            let tables = self.named_tables.load();
+            if let Ok(at) = tables.binary_search_by_key(&key, |table| table.key()) {
+                let table = &tables[at];
+                if table.rows.fresh(now_ms) || self.pool_table_building.swap(true, Ordering::AcqRel)
+                {
                     return Arc::clone(table);
                 }
+                rebuilds = true;
             }
         }
-        let table = Arc::new(PoolTable::build(workers, indexer, now_ms));
-        self.pool_tables.rcu(|tables| {
-            let mut next: Vec<Arc<PoolTable>> = tables
+        let table = Arc::new(NamedTable::build(list, indexer, now_ms));
+        self.named_tables.rcu(|tables| {
+            let mut next: Vec<Arc<NamedTable>> = tables
                 .iter()
-                .filter(|kept| kept.slice != table.slice)
+                .filter(|kept| kept.live() && kept.key() != key)
+                .cloned()
+                .collect();
+            let at = next.partition_point(|kept| kept.key() < key);
+            next.insert(at, Arc::clone(&table));
+            next
+        });
+        let misplaced = self.misplaced.swap(0, Ordering::Relaxed);
+        if misplaced > 0 {
+            // The count is the policy's; the list is the one published now.
+            let first = list.first();
+            warn!(
+                misplaced,
+                model_id = first.map(|worker| worker.model_id()),
+                role = ?first.map(|worker| worker.worker_type()),
+                "Callers' positions did not match their named lists; the holders were dropped"
+            );
+        }
+        if rebuilds {
+            self.pool_table_building.store(false, Ordering::Release);
+        }
+        table
+    }
+
+    /// The table of a list nobody named under `indexer`: the one kept when
+    /// it is fresh, a stale one while another decision rebuilds it, else
+    /// built here and published, the oldest leaving past
+    /// [`POOL_TABLES_KEPT`].
+    fn workers_table(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        indexer: &Arc<KvIndex>,
+        now_ms: u64,
+    ) -> Arc<WorkersTable> {
+        let mut rebuilds = false;
+        {
+            let tables = self.pool_tables.load();
+            if let Some(table) = tables
+                .iter()
+                .find(|table| table.describes(workers, indexer))
+            {
+                if table.rows.fresh(now_ms) || self.pool_table_building.swap(true, Ordering::AcqRel)
+                {
+                    return Arc::clone(table);
+                }
+                rebuilds = true;
+            }
+        }
+        let table = Arc::new(WorkersTable::build(workers, indexer, now_ms));
+        self.pool_tables.rcu(|tables| {
+            let mut next: Vec<Arc<WorkersTable>> = tables
+                .iter()
+                .filter(|kept| !kept.describes(workers, indexer))
                 .cloned()
                 .collect();
             if next.len() >= POOL_TABLES_KEPT {
                 if let Some(oldest) = next
                     .iter()
                     .enumerate()
-                    .min_by_key(|(_, kept)| kept.built_ms)
+                    .min_by_key(|(_, kept)| kept.rows.built_ms)
                     .map(|(position, _)| position)
                 {
                     next.swap_remove(oldest);
@@ -1777,8 +1813,34 @@ impl CacheAwarePolicy {
             next.push(Arc::clone(&table));
             next
         });
-        self.pool_table_building.store(false, Ordering::Release);
+        if rebuilds {
+            self.pool_table_building.store(false, Ordering::Release);
+        }
         table
+    }
+
+    /// The pool table for `workers` under `indexer`. A list its caller
+    /// names has the table of the whole list ([`Self::named_table`]), read
+    /// through that name; any other is found by the workers it holds
+    /// ([`Self::workers_table`]). Either way only the rebuild of a stale
+    /// table takes the building flag, and only it gives the flag back: a
+    /// table built for a list that had none leaves a rebuild running beside
+    /// it its flag.
+    fn pool_table<'a>(
+        &'a self,
+        workers: &[Arc<dyn Worker>],
+        named: Option<&NamedList<'a>>,
+        indexer: &Arc<KvIndex>,
+        now_ms: u64,
+    ) -> PoolTable<'a> {
+        match named {
+            Some(named) => PoolTable::Named {
+                table: self.named_table(named.list, indexer, now_ms),
+                named: *named,
+                misplaced: &self.misplaced,
+            },
+            None => PoolTable::Workers(self.workers_table(workers, indexer, now_ms)),
+        }
     }
 
     /// The union of two ascending position lists, ascending: the eligible
@@ -1837,6 +1899,16 @@ impl CacheAwarePolicy {
         })
     }
 
+    /// How many pool tables are kept: the named lists', then the unnamed
+    /// lists'. What a test of the routers reads of them.
+    #[cfg(test)]
+    pub(crate) fn kept_tables(&self) -> (usize, usize) {
+        (
+            self.named_tables.load().len(),
+            self.pool_tables.load().len(),
+        )
+    }
+
     /// Check if an event-driven indexer exists with data for this model.
     #[cfg(test)]
     fn has_event_indexer(&self, model_id: &str) -> bool {
@@ -1868,10 +1940,15 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Select and credit one final worker atomically with LeastLoad's
-    /// expected-wait algorithm. CacheAware must call this exactly once per
-    /// successful dispatch, after cache affinity and spill logic have fixed
-    /// the candidate set.
+    /// Select one final worker with LeastLoad's expected-wait algorithm and
+    /// credit it, in one call. Up to `HELD_GUARD_CANDIDATES` candidates (the
+    /// usual holder set) one write guard covers the scores and the credit;
+    /// above it (a spill set on most pools) the scores are read without the
+    /// tally's write guard and the credit lands under it, so every decision
+    /// in flight at once can pick the same worker before any of their
+    /// credits lands (see `select_min_expected_wait`). CacheAware must call
+    /// this exactly once per successful dispatch, after cache affinity and
+    /// spill logic have fixed the candidate set.
     fn select_expected_wait(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -2007,7 +2084,7 @@ impl CacheAwarePolicy {
         let spill = self.over_count_pressure_gate(load, avg_load, held_tokens);
         if cache_trace::enabled() {
             cache_trace::gate(serde_json::json!({
-                "worker": workers[selected].url(), "load": load, "average_load": avg_load,
+                "worker": workers[selected].redacted_url(), "load": load, "average_load": avg_load,
                 "relative_threshold": self.config.balance_rel_threshold,
                 "absolute_threshold": self.config.balance_abs_threshold,
                 "held_tokens": held_tokens,
@@ -2040,12 +2117,12 @@ impl CacheAwarePolicy {
     fn warmup_slice(
         &self,
         workers: &[Arc<dyn Worker>],
-        table: &PoolTable,
+        table: &PoolTable<'_>,
         indexer: &KvIndex,
         info: &SelectWorkerInfo,
         avg_load: f64,
     ) -> Option<usize> {
-        if table.warming.is_empty() {
+        if table.rows().warming.is_empty() {
             return None;
         }
         let warmup = liveness::warmup();
@@ -2055,22 +2132,23 @@ impl CacheAwarePolicy {
         let mut pick: Option<(usize, usize)> = None;
         let mut tied = 0u32;
         let mut rng = rand::rng();
-        for &position in &table.warming {
-            let idx = position as usize;
-            let Some(worker) = workers.get(idx) else {
+        for &row in &table.rows().warming {
+            let row = row as usize;
+            let Some(idx) = table.candidate_at(row, workers) else {
                 continue;
             };
+            let worker = &workers[idx];
             let state = worker.routing_state();
             if !info.admits(state) {
                 continue;
             }
-            let indexed = table.id_at[idx].map(|id| indexer.worker_block_count(id));
+            let indexed = table.rows().id_at[row].map(|id| indexer.worker_block_count(id));
             let grown = indexed.map(|indexed| worker.warmup_growth(indexed));
             if !warmup.applies(
                 worker.admitted_age(),
                 grown,
                 indexed.unwrap_or(0),
-                table.fleet_level,
+                table.rows().fleet_level,
             ) {
                 continue;
             }
@@ -2133,13 +2211,13 @@ impl CacheAwarePolicy {
     fn warmup_divert(
         &self,
         workers: &[Arc<dyn Worker>],
-        table: &PoolTable,
+        table: &PoolTable<'_>,
         indexer: &KvIndex,
         info: &SelectWorkerInfo,
         candidates: &[OverlapCandidate],
         overlap_share: f64,
     ) -> Option<usize> {
-        if table.thin.is_empty() {
+        if table.rows().thin.is_empty() {
             return None;
         }
         let warmup = liveness::warmup();
@@ -2178,17 +2256,18 @@ impl CacheAwarePolicy {
         let mut pick: Option<(usize, usize)> = None;
         let mut tied = 0u32;
         let mut rng = rand::rng();
-        for &position in &table.thin {
-            let idx = position as usize;
-            let Some(worker) = workers.get(idx) else {
+        for &row in &table.rows().thin {
+            let row = row as usize;
+            let Some(idx) = table.candidate_at(row, workers) else {
                 continue;
             };
+            let worker = &workers[idx];
             let state = worker.routing_state();
             if !info.admits(state) {
                 continue;
             }
-            let indexed = table.id_at[idx].map_or(0, |id| indexer.worker_block_count(id));
-            if !warmup.is_thin(indexed, table.fleet_level) {
+            let indexed = table.rows().id_at[row].map_or(0, |id| indexer.worker_block_count(id));
+            if !warmup.is_thin(indexed, table.rows().fleet_level) {
                 continue;
             }
             if state.load > 0 && now < worker.divert_until_ms() {
@@ -2331,10 +2410,9 @@ impl CacheAwarePolicy {
     ///   gate, then expected wait, which credits the result).
     /// - `Pick::None`: the miss path (expected wait over the eligible workers
     ///   under the count-pressure gate).
-    /// - `Pick::Final`: that worker, credited through the expected-wait
-    ///   selector; the policy owns the load trade-off, so the count-pressure
-    ///   gate does not apply. If the waiting-queue veto drops it, the fleet
-    ///   fallback runs.
+    /// - `Pick::Final`: that worker, credited the whole prompt through the
+    ///   expected-wait selector; the policy owns the load trade-off, so the
+    ///   count-pressure gate does not apply.
     ///
     /// `unit` is what the request's lengths count (tokens, or the string
     /// tree's characters); the gate prices each holder's prefix in tokens.
@@ -2423,8 +2501,10 @@ impl CacheAwarePolicy {
                 cache_trace::mark_truncated();
             }
             for candidate in inputs.iter().take(32) {
+                // The candidate's address stays whole for the policies that
+                // match on it; the row names the worker masked.
                 cache_trace::score(serde_json::json!({
-                    "source": "policy_affinity", "worker": candidate.url,
+                    "source": "policy_affinity", "worker": workers[candidate.idx].redacted_url(),
                     "device_blocks": candidate.device_blocks, "effective_score": candidate.effective_score,
                     "request_blocks": request.request_blocks, "block_size": request.block_size,
                     "selection_policy": self.selection.name(),
@@ -2533,6 +2613,7 @@ impl CacheAwarePolicy {
                     idx,
                     raw_score: matched_blocks,
                     effective_score: 1.0,
+                    group_cap: None,
                 });
             }
         }
@@ -2552,7 +2633,7 @@ impl CacheAwarePolicy {
                     .iter()
                     .any(|tenant| tenant.as_ref() == workers[idx].url());
                 cache_trace::score(serde_json::json!({
-                    "source": "approximate_tree", "worker": workers[idx].url(),
+                    "source": "approximate_tree", "worker": workers[idx].redacted_url(),
                     "matched_units": holder.then_some(matched_units),
                     "match_status": if holder { "deepest_holder" } else { "shallower_match_unknown" },
                     "input_units": request.prompt_tokens, "block_size": self.config.block_size,
@@ -2606,7 +2687,7 @@ impl CacheAwarePolicy {
         };
 
         let content_hashes = Self::event_content_hashes(info, tokens, block_size);
-        let table = self.pool_table(workers, indexer, liveness::now_ms());
+        let table = self.pool_table(workers, info.named.as_ref(), indexer, liveness::now_ms());
         // Over a sampled pool the candidates read are bounded as the pool
         // is: a tie among the deepest holders is drawn from, and an
         // all-workers policy ranks the sample and the deepest holders; a
@@ -2679,7 +2760,7 @@ impl CacheAwarePolicy {
                 Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
                 observe(overlap_of(idx));
                 debug!(
-                    worker = workers[idx].url(),
+                    worker = workers[idx].redacted_url(),
                     branch = "warmup_slice",
                     request_blocks = content_hashes.len(),
                     "Cache miss routed to a warming worker"
@@ -2697,7 +2778,7 @@ impl CacheAwarePolicy {
             Metrics::record_worker_cache_aware_policy_branch("warmup_divert");
             observe(overlap_of(idx));
             debug!(
-                worker = workers[idx].url(),
+                worker = workers[idx].redacted_url(),
                 branch = "warmup_divert",
                 overlap_blocks = best_overlap as u64,
                 request_blocks = content_hashes.len(),
@@ -2730,7 +2811,7 @@ impl CacheAwarePolicy {
         Metrics::record_worker_cache_aware_policy_branch(branch);
         observe(overlap);
         debug!(
-            worker = workers[idx].url(),
+            worker = workers[idx].redacted_url(),
             branch,
             overlap_blocks,
             request_blocks = content_hashes.len(),
@@ -2739,10 +2820,22 @@ impl CacheAwarePolicy {
             "Event-driven routing"
         );
         if cache_trace::enabled() {
-            cache_trace::prediction(serde_json::json!({
+            let mut prediction = serde_json::json!({
                 "source": "event_index_overlap", "branch": branch,
                 "overlap_blocks": overlap_blocks, "request_blocks": content_hashes.len(), "block_size": block_size,
-            }));
+            });
+            // The index's overlap before the chosen worker's cache groups
+            // bounded it, and the group that did: what a join against the
+            // engine's cached tokens reads on a hybrid model.
+            let group_cap = candidates
+                .iter()
+                .find(|candidate| candidate.idx == idx)
+                .and_then(|candidate| candidate.group_cap);
+            if let Some((uncapped, group)) = group_cap {
+                prediction["uncapped_blocks"] = uncapped.into();
+                prediction["capped_by_group"] = group.into();
+            }
+            cache_trace::prediction(prediction);
         }
         Some(idx)
     }
@@ -2761,17 +2854,22 @@ impl CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         tokens: &[u32],
         healthy_indices: &[usize],
-        indexer: &KvIndex,
+        indexer: &Arc<KvIndex>,
         block_size: usize,
         tuning: &OverlapTuning<'_>,
     ) -> Vec<OverlapCandidate> {
         let content_hashes = compute_request_content_hashes(tokens, block_size);
-        let table = PoolTable::build(workers, indexer, liveness::now_ms());
+        let table = PoolTable::Workers(Arc::new(WorkersTable::build(
+            workers,
+            indexer,
+            liveness::now_ms(),
+        )));
         let mut candidates = Self::overlap_holders(
             workers,
             &content_hashes,
             &table,
             indexer,
+            block_size,
             Gather::All { cap: None },
             &SelectWorkerInfo::default(),
         );
@@ -2796,15 +2894,22 @@ impl CacheAwarePolicy {
     fn overlap_candidates_for_hashes(
         workers: &[Arc<dyn Worker>],
         content_hashes: &[ContentHash],
-        table: &PoolTable,
+        table: &PoolTable<'_>,
         indexer: &KvIndex,
         block_size: usize,
         tuning: &OverlapTuning<'_>,
         gather: Gather,
         info: &SelectWorkerInfo,
     ) -> Vec<OverlapCandidate> {
-        let mut candidates =
-            Self::overlap_holders(workers, content_hashes, table, indexer, gather, info);
+        let mut candidates = Self::overlap_holders(
+            workers,
+            content_hashes,
+            table,
+            indexer,
+            block_size,
+            gather,
+            info,
+        );
         if candidates.is_empty() {
             return candidates;
         }
@@ -2823,12 +2928,16 @@ impl CacheAwarePolicy {
     /// The eligible holders of the request's blocks with their undecayed
     /// overlap, in slice order: the index names them by id, the pool table
     /// places them, and eligibility is read for them alone, so the cost
-    /// follows the holders gathered and not the pool.
+    /// follows the holders gathered and not the pool. A holder with a group
+    /// view (a hybrid model's worker) is scored at what its cache groups can
+    /// serve of the index's overlap, the engine's own rule, before the
+    /// holders are gathered ([`KvIndex::cap_by_groups`]).
     fn overlap_holders(
         workers: &[Arc<dyn Worker>],
         content_hashes: &[ContentHash],
-        table: &PoolTable,
+        table: &PoolTable<'_>,
         indexer: &KvIndex,
+        block_size: usize,
         gather: Gather,
         info: &SelectWorkerInfo,
     ) -> Vec<OverlapCandidate> {
@@ -2837,8 +2946,12 @@ impl CacheAwarePolicy {
         }
 
         let started = Instant::now();
-        let overlap = indexer.find_matches(content_hashes, false);
+        let mut overlap = indexer.find_matches(content_hashes, false);
         Metrics::record_kv_index_lookup(indexer.name(), started.elapsed().as_secs_f64());
+        if overlap.scores.is_empty() {
+            return Vec::new();
+        }
+        let caps = indexer.cap_by_groups(content_hashes, block_size, &mut overlap);
         if overlap.scores.is_empty() {
             return Vec::new();
         }
@@ -2847,6 +2960,14 @@ impl CacheAwarePolicy {
             Gather::TopGroup { cap } => Self::top_group(workers, table, &overlap, cap, info),
             Gather::All { cap } => Self::all_holders(workers, table, &overlap, cap, info),
         };
+        for cap in &caps {
+            let Some(idx) = table.candidate(cap.worker, workers) else {
+                continue;
+            };
+            if let Some(candidate) = candidates.iter_mut().find(|candidate| candidate.idx == idx) {
+                candidate.group_cap = Some((cap.uncapped, cap.group));
+            }
+        }
         // Downstream reads candidates in slice order: the all-workers merge
         // in `resolve_selection` and the tie-breaks.
         candidates.sort_unstable_by_key(|candidate| candidate.idx);
@@ -2861,7 +2982,7 @@ impl CacheAwarePolicy {
     /// would have found.
     fn top_group(
         workers: &[Arc<dyn Worker>],
-        table: &PoolTable,
+        table: &PoolTable<'_>,
         overlap: &OverlapScores,
         cap: Option<usize>,
         info: &SelectWorkerInfo,
@@ -2888,7 +3009,7 @@ impl CacheAwarePolicy {
     /// blocks; `cap` of the tied holders, drawn uniformly, when they are more.
     fn holders_at(
         workers: &[Arc<dyn Worker>],
-        table: &PoolTable,
+        table: &PoolTable<'_>,
         overlap: &OverlapScores,
         depth: u32,
         cap: Option<usize>,
@@ -2903,7 +3024,7 @@ impl CacheAwarePolicy {
         Self::draw(&mut tied, cap);
         let mut group = Vec::with_capacity(tied.len());
         for id in tied {
-            let Some(idx) = table.position(id, workers) else {
+            let Some(idx) = table.candidate(id, workers) else {
                 continue;
             };
             if !info.admits(workers[idx].routing_state()) {
@@ -2913,6 +3034,7 @@ impl CacheAwarePolicy {
                 idx,
                 raw_score: f64::from(depth),
                 effective_score: f64::from(depth),
+                group_cap: None,
             });
         }
         group
@@ -2938,7 +3060,7 @@ impl CacheAwarePolicy {
     /// deepest of them when set.
     fn all_holders(
         workers: &[Arc<dyn Worker>],
-        table: &PoolTable,
+        table: &PoolTable<'_>,
         overlap: &OverlapScores,
         cap: Option<usize>,
         info: &SelectWorkerInfo,
@@ -2948,7 +3070,7 @@ impl CacheAwarePolicy {
             if score == 0 {
                 continue;
             }
-            let Some(idx) = table.position(id, workers) else {
+            let Some(idx) = table.candidate(id, workers) else {
                 continue;
             };
             if !info.admits(workers[idx].routing_state()) {
@@ -2958,6 +3080,7 @@ impl CacheAwarePolicy {
                 idx,
                 raw_score: f64::from(score),
                 effective_score: f64::from(score),
+                group_cap: None,
             });
         }
         if let Some(cap) = cap {
@@ -3097,7 +3220,11 @@ impl CacheAwarePolicy {
         debug!(
             index = "tree",
             branch,
-            worker = selected_url.or(fallback_url).unwrap_or("none"),
+            worker = selected_url
+                .or(fallback_url)
+                .map(Endpoint::redacted_url)
+                .as_deref()
+                .unwrap_or("none"),
             model_id,
             matched_ratio = f64::from(matched_ratio),
             threshold = f64::from(self.config.cache_threshold),
@@ -3109,7 +3236,8 @@ impl CacheAwarePolicy {
     }
 
     /// One decision line per hash-mode selection. `level` is the matched
-    /// boundary (0 for the fallback branches).
+    /// boundary (0 for the fallback branches), `worker` the selected worker's
+    /// masked address.
     fn log_hash_decision(branch: &'static str, level: usize, worker: &str, model_id: &str) {
         if cache_trace::enabled() {
             cache_trace::prediction(serde_json::json!({
@@ -3214,7 +3342,7 @@ impl CacheAwarePolicy {
                 workers[selected].url(),
                 now,
             );
-            Self::log_hash_decision(branch, boundary, workers[selected].url(), model_id);
+            Self::log_hash_decision(branch, boundary, workers[selected].redacted_url(), model_id);
             return Some(selected);
         }
 
@@ -3258,7 +3386,7 @@ impl CacheAwarePolicy {
                 now,
             );
         }
-        Self::log_hash_decision(branch, 0, workers[idx].url(), model_id);
+        Self::log_hash_decision(branch, 0, workers[idx].redacted_url(), model_id);
         Some(idx)
     }
 
@@ -3356,7 +3484,7 @@ impl CacheAwarePolicy {
     /// Drop expired holders and empty keys; refresh the per-model entry
     /// gauge. Returns total live entries across models.
     fn sweep_placement_index(
-        index: &DashMap<String, Arc<PlacementMap>>,
+        index: &DashMap<String, Arc<PlacementMap>, FxBuildHasher>,
         ttl: Duration,
         now: Instant,
     ) -> usize {
@@ -3394,11 +3522,22 @@ impl CacheAwarePolicy {
         let (keyed, marker_len) = self.keyed_tokens(info, tokens);
         let keyed: &[u32] = &keyed;
 
-        // One fused descent: match first, atomically choose+credit the final
-        // worker from the affinity/spill candidate set, then insert only that
-        // worker before the closure returns.
+        // With the mesh attached the path's hash rides on the insert (the tree
+        // remembers the node that ends this path, so a peer's delta naming the
+        // hash resolves there) and on the delta published below. The hash is of
+        // the page-aligned prefix, the path the tree stores, so every prompt
+        // that ends at a node names it by the one hash a repair page's entry
+        // (an aligned path) names it by; a prompt under one page is never
+        // inserted, so there is no node to name and no delta.
+        let aligned = tree.aligned_len(keyed.len());
+        let path_hash = (self.mesh_attached() && aligned > 0)
+            .then(|| kv_index::hash_token_path(&keyed[..aligned]));
+
+        // One fused descent: match first, choose and credit the final worker
+        // from the affinity/spill candidate set in one LeastLoad call, then
+        // insert only that worker before the closure returns.
         let mut selected_idx: Option<usize> = None;
-        let result = tree.match_and_insert_with(keyed, |result| {
+        let result = tree.match_and_insert_with_hash(keyed, path_hash, |result| {
             let matched = result.matched_token_count.saturating_sub(marker_len);
             let input = result.input_token_count.saturating_sub(marker_len);
             let match_rate = if input == 0 {
@@ -3441,14 +3580,7 @@ impl CacheAwarePolicy {
         );
 
         let idx = selected_idx?;
-        if self.should_populate_hash_index() {
-            let matched_prefix: Vec<u32> = keyed[..result.matched_token_count].to_vec();
-            let node_hash = kv_index::hash_token_path(keyed);
-            self.hash_index
-                .entry(model_id.to_string())
-                .or_default()
-                .token_tree
-                .insert(node_hash, matched_prefix);
+        if let Some(node_hash) = path_hash {
             self.sync_local_insert(
                 model_id,
                 TreeDelta {
@@ -3478,8 +3610,14 @@ impl CacheAwarePolicy {
         let (keyed, marker_len) = Self::keyed_text(info, text);
         let keyed: &str = &keyed;
 
+        // The hash rides on the insert and the delta while the mesh is
+        // attached (see `select_worker_with_tokens`); the empty text ends at
+        // the root, which no hash names.
+        let path_hash =
+            (self.mesh_attached() && !keyed.is_empty()).then(|| kv_index::hash_node_path(keyed));
+
         let mut selected_idx: Option<usize> = None;
-        let result = tree.match_and_insert_with(keyed, |result| {
+        let result = tree.match_and_insert_with_hash(keyed, path_hash, |result| {
             let matched = result.matched_char_count.saturating_sub(marker_len);
             let input = result.input_char_count.saturating_sub(marker_len);
             let match_rate = if input == 0 {
@@ -3522,19 +3660,12 @@ impl CacheAwarePolicy {
         );
 
         let idx = selected_idx?;
-        if self.should_populate_hash_index() {
-            let matched_prefix: String = keyed.chars().take(result.matched_char_count).collect();
-            let path_hash = kv_index::hash_node_path(keyed);
-            self.hash_index
-                .entry(model_id.to_string())
-                .or_default()
-                .string_tree
-                .insert(path_hash, matched_prefix);
+        if let Some(node_hash) = path_hash {
             self.sync_local_insert(
                 model_id,
                 TreeDelta {
                     tree_kind: TreeKind::String,
-                    node_hash: path_hash,
+                    node_hash,
                     worker_url: workers[idx].url().to_string(),
                     epoch: 0,
                 },

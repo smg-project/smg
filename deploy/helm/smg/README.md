@@ -40,12 +40,16 @@ The gateway image is on Docker Hub, engine images are on GitHub Container Regist
 
 | Component | Registry | Image |
 |-----------|----------|-------|
-| Gateway | `docker.io` | `lightseekorg/smg:1.13.0` |
-| vLLM worker | `ghcr.io` | `smg-project/smg:1.13.0-vllm-v0.31.0` |
-| TRT-LLM worker | `ghcr.io` | `smg-project/smg:1.13.0-trtllm-1.3.0rc24` |
-| SGLang worker | `ghcr.io` | `smg-project/smg:1.13.0-sglang-v0.5.21` |
+| Gateway | `docker.io` | `lightseekorg/smg:1.14.0` |
+| Gateway with the Slurm clients | `docker.io` | `lightseekorg/smg:<version>-slurm`, beside every release image from 1.16.0 on |
+| Policy controller | `docker.io` | `lightseekorg/smg:<version>-policy-controller`, beside every release image from 1.16.0 on |
+| vLLM worker | `ghcr.io` | `smg-project/smg:1.14.0-vllm-v0.31.0` |
+| TRT-LLM worker | `ghcr.io` | `smg-project/smg:1.14.0-trtllm-1.3.0rc24` |
+| SGLang worker | `ghcr.io` | `smg-project/smg:1.14.0-sglang-v0.5.21` |
 
 Worker images default to `ghcr.io/smg-project/smg`. Set `workers[].image.tag` to the engine-specific tag; `workers[].image.registry` and `workers[].image.repository` override the path.
+
+A tag is text: quote one made of digits alone (`tag: "1.16"`, or `--set-string` on the command line). `global.image.tag` and `workers[].image.tag` written as a number are refused at render, as `policyController.image.tag` is: a number is not rendered as written, and `1.10` would read as `1.1`.
 
 The TRT-LLM image is published, but the chart does not template `engine: trtllm` yet: `engineDefaults` knows `vllm` and `sglang`.
 
@@ -60,15 +64,43 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 | `global` | Image registry, pull secrets |
 | `router` | Router deployment, routing policy, networking, observability |
 | `workers` | Worker (inference engine) deployments |
+| `policyController` | The standalone policy controller: its Deployment and Service, off by default |
 | `huggingface` | HuggingFace token for gated model downloads |
-| `auth` | API key authentication, rate limiting |
+| `auth` | API key authentication, control-plane keys, rate limiting |
 | `history` | Storage backend (none/memory/postgres/redis/oracle) and the Secret its connection URL or credentials come from |
 | `serviceAccount` | Service account creation and annotations |
 | `rbac` | RBAC for reading pods through the Kubernetes API (Kubernetes discovery, mesh peer discovery) |
 
 ### Routing Policies
 
-`cache_aware` (default), `round_robin`, `power_of_two`, `consistent_hashing`, `prefix_hash`, `manual`, `random`, `bucket`
+`cache_aware` (default), `round_robin`, `power_of_two`, `least_load`, `passthrough`, `consistent_hashing`, `prefix_hash`, `manual`, `random`: the launcher's `--policy` choices, which `values.schema.json` lists. `bucket` is a prefill-side policy: the launcher takes it for `--prefill-policy` (`router.disaggregation.prefillPolicy`), not for `--policy`.
+
+### Disaggregated Serving
+
+`router.disaggregation.mode` selects the gateway's `--pd-disaggregation` (`pd`) or `--epd-disaggregation` (`epd`); empty, the default, is a regular fleet. The role policies `prefillPolicy`, `decodePolicy` and `encodePolicy` are the launcher's `--prefill-policy`, `--decode-policy` and `--encode-policy` choices, which the schema lists (`bucket` is a prefill-side choice). A prefill or decode role with no policy of its own runs under the fleet's policy, and an encode role with none under `consistent_hashing`; on the decode pool a load policy (`decodePolicy: power_of_two`, the launcher's own example) is the lighter choice for the gateway, because a `cache_aware` decode pool also ingests the decode workers' cache events. The role workers are either static URLs, `prefill`, `decode` and `encode` lists of `{url, bootstrapPort}` rendered as `--prefill URL [BOOTSTRAP_PORT]`, `--decode URL` and `--encode URL [BOOTSTRAP_PORT]`, or, under Kubernetes discovery, the pods matching `router.discovery.kubernetes.prefillSelector`, `decodeSelector` and `encodeSelector`. A role given without its mode, or the encode role outside `epd`, is refused at render rather than ignored by the gateway at start-up; a typo in a role key is refused by the schema. A prefill-decode fleet found by label:
+
+```yaml
+router:
+  disaggregation:
+    mode: pd
+    prefillPolicy: cache_aware
+    decodePolicy: power_of_two
+  discovery:
+    provider: kubernetes
+    kubernetes:
+      prefillSelector: "app=engine role=prefill"
+      decodeSelector: "app=engine role=decode"
+```
+
+Under a mode the gateway reads only its role workers. `router.workerUrls` and the regular Slurm `jobNames` are refused, the chart's own `workers` are passed only through a role or a discovery provider, and chart workers given no role fail the render. The Slurm role job names `prefillJobNames`, `decodeJobNames` and `encodeJobNames` follow the same rule as the role selectors.
+
+### Admission Bound
+
+`router.maxConcurrentRequests` is the gateway's `--max-concurrent-requests`: the in-flight requests it admits before shedding with 429 or 503, each permit held for the whole response, streaming bodies included. `-1` (the default) derives the bound from the host, 1024 per available core and at least 4096; `0` lifts the bound; a positive value is the bound.
+
+### Native JPEG Decoder
+
+`router.mmTurbojpeg` is the gateway's `--mm-turbojpeg`: what it does when libjpeg-turbo (`libturbojpeg.so.0`) cannot be loaded. `require` (the default) refuses to start, so a gateway never decodes JPEGs with the pure-Rust fallback, whose pixels differ from the engine's by a few levels. `prefer` decodes with the fallback, says so once at start-up and sets the gauge `smg_mm_turbojpeg_available` to 0. The published image ships the library; a custom image without it needs `prefer`.
 
 ### Workers
 
@@ -84,7 +116,7 @@ workers:
     gpu:
       count: 1                        # GPUs per replica (tensor parallel)
     image:
-      tag: "1.13.0-vllm-v0.31.0"     # engine image tag
+      tag: "1.14.0-vllm-v0.31.0"     # engine image tag
 ```
 
 Workers are automatically wired to the router via `--worker-urls`, unless the router discovers its workers ([Worker Discovery](#worker-discovery)). The URL scheme (`http://` or `grpc://`) is set based on `connectionMode`.
@@ -126,14 +158,14 @@ labelled `model`, `rank` and `wire`; it binds beside the gRPC listener before
 the engine connects, so a scrape during start-up answers
 `smg_servicer_state{state="starting"} 1`.
 
-Off (the default), nothing changes: the launcher's own servicer choice stands
-and the pod exposes no metrics port. The Python servicer has no endpoint, so
-`extraArgs: ["--servicer-impl", "python"]` together with `metrics.enabled`
-is refused by the launcher before the engine starts. The SGLang Rust servicer
-serves neither PD/EPD disaggregation nor image and video input yet (it
-advertises no vision support, so the gateway refuses media for that worker at
-its gate), so a disaggregated or multimodal SGLang worker keeps `metrics` off.
-A `metrics.port` equal to the serving port is refused when the chart renders.
+Off (the default), the pod exposes no metrics port and the launcher's own
+servicer choice stands: the Rust servicer, its default, unless the worker's
+`servicerImpl` is `"python"` (the deprecated Python servicer, kept for the
+deprecation window; the pod then gets `SMG_<ENGINE>_SERVICER_IMPL=python`).
+The Python servicer has no metrics endpoint, so `servicerImpl: "python"` (or
+`extraArgs: ["--servicer-impl", "python"]`) together with `metrics.enabled`
+is refused by the launcher before the engine starts. A `metrics.port` equal to
+the serving port is refused when the chart renders.
 An HTTP worker runs the engine's own server, which has its own `/metrics`; the
 setting is ignored there.
 
@@ -166,7 +198,7 @@ one) keeps that parser.
 |---|---|---|
 | `kubernetes` | pods matching `kubernetes.selector` in `kubernetes.namespace` (the release's by default; every namespace with `clusterWide`) | a Role, or a ClusterRole with `clusterWide`, which the chart creates |
 | `file` | the workers listed in a JSON manifest, reread when it changes | the manifest: an existing ConfigMap (`file.configMap.name`, its key `file.configMap.key`), or a path in the image (`file.path`) |
-| `slurm` | a worker on every node of each running job named in `slurm.jobNames` (or `encodeJobNames`, `prefillJobNames`, `decodeJobNames`), at `slurm.port` | an image with Slurm clients (below) |
+| `slurm` | a worker on every node of each running job named in `slurm.jobNames` (or `encodeJobNames`, `prefillJobNames`, `decodeJobNames`), at `slurm.port` | the gateway image's `-slurm` variant (below) |
 | `consul` | the instances of `consul.service` with passing health checks | Consul's address, and the ACL token and TLS files from existing Secrets |
 
 `router.serviceDiscovery.enabled` is the legacy spelling of `provider: kubernetes` and renders the arguments it always has; `router.discovery.kubernetes` takes the same settings. The chart refuses the two together, as the gateway refuses `--service-discovery` beside `--discovery-provider`. It also refuses a provider without what it cannot start without (a file provider without a manifest, Slurm without a port or a job name, Consul without a service, a Consul client certificate without its key), so the mistake surfaces at `helm install` rather than as a crash-looping pod.
@@ -177,7 +209,7 @@ Mesh without `router.mesh.peerUrls` finds its peers through Kubernetes discovery
 
 **File.** The ConfigMap is mounted whole at `/etc/smg/discovery`, not as a subPath, so the kubelet projects each update of it into the pod and the gateway's watch on that directory picks it up; the manifest path is `/etc/smg/discovery/<key>` unless `file.path` names another. The volume is optional: the gateway waits for a manifest that is not there yet, so the ConfigMap can be published after the release. The manifest format is in the gateway's file provider (`model_gateway/src/service_discovery/file.rs`); [`with-file-discovery.yaml`](examples/with-file-discovery.yaml) has an example.
 
-**Slurm.** The provider runs `squeue` and `scontrol` (Slurm 23.11 or later) in the router container, and the published gateway image has no Slurm client. It needs an image built from the gateway's with those commands and what the cluster's authentication needs, its `slurm.conf` and MUNGE, or `auth/jwt` with `SLURM_JWT` (which `router.extraEnv` can take from a Secret); the chart mounts nothing for it. The router runs as UID 65532, so set `slurm.user` to the user whose jobs are the workers. Every node of a selected job runs one server on `slurm.port`, so worker jobs should run `--exclusive`.
+**Slurm.** The provider runs `squeue` and `scontrol` (Slurm 23.11 or later) in the router container. The published gateway image has no Slurm client and refuses to start the provider, naming the missing command; its `-slurm` variant (`global.image.tag: "<version>-slurm"`, the release tag with `-slurm` appended, published beside every release image from 1.16.0 on and as `ghcr.io/smg-project/smg:nightly-slurm`) carries Ubuntu's Slurm 23.11 client package and its JWT authentication plugin. A controller accepts commands up to two major releases older than itself (three from 24.11 on), so those clients speak to a controller on 23.11, 24.05, 24.11 or 25.05; a newer cluster needs an image with its own clients. What the cluster's authentication needs still comes from the deployment: its `slurm.conf`, and a running `munged`'s socket (a sidecar or the host; the image starts none and ships no MUNGE key) or `auth/jwt` with `SLURM_JWT` (which `router.extraEnv` can take from a Secret); the chart mounts nothing for it. The router runs as UID 65532, so set `slurm.user` to the user whose jobs are the workers. Every node of a selected job runs one server on `slurm.port`, so worker jobs should run `--exclusive`.
 
 **Consul.** The ACL token and the TLS files reach the gateway through Consul's own environment variables, never as arguments. `consul.token.existingSecret` sets `CONSUL_HTTP_TOKEN` from that Secret's `consul.token.secretKey` (default `token`). `consul.tls.existingSecret` mounts the Secret's `consul.tls.secretKeys` at `/etc/smg/consul-tls` and points `CONSUL_CACERT` (`caCert`, default `ca.crt`) and, when both are set, `CONSUL_CLIENT_CERT` and `CONSUL_CLIENT_KEY` (`clientCert`, `clientKey`) at them; give `consul.address` an `https://` scheme. The gateway reads them once, at start-up, so restart the router pods after rotating either Secret.
 
@@ -209,6 +241,33 @@ The gateway also reads its other secrets from the environment or from files, whi
 The gateway reads the key file once, at start-up, so a rotated key reaches a pod when the pod restarts. A rotated `auth.apiKey` rolls the router pods by itself: the pod template carries a `checksum/auth` annotation over the chart-managed Secret, so `helm upgrade` with a new key is a rolling update. A rotated `auth.existingSecret` is not seen by the chart; roll the pods by hand after updating it, or the running pods keep accepting the old key until they restart. By label, which covers both workload kinds and every release name: `kubectl rollout restart deployment,statefulset -l app.kubernetes.io/instance=<release>,app.kubernetes.io/component=router` (the workload is `<fullname>-router`, where `<fullname>` is `<release>-smg` unless the release name contains `smg` or `fullnameOverride` is set).
 
 An older gateway image does not know `--api-key-file`; a chart of this version with such an image refuses to start rather than starting without the key.
+
+#### Control Plane
+
+`router.adminPort` starts the admin listener (`--admin-port`): the control-plane routes (the admin routes, `/workers` and `/v1/rl`) are served on that container port, with the probes, and the data port answers 404 for them. The chart renders a second Service, `<fullname>-router-admin` (`router.adminService`, ClusterIP by default), so the control plane has a name of its own inside the cluster; the ingress never names it. `router.adminHost` binds the listener on another address. A loopback `router.adminHost` (`127.0.0.1`, `::1`) leaves the admin Service with nowhere to send traffic: Service traffic reaches the pod IP. A host without `router.adminPort`, or an admin port equal to another listener's, is refused at render.
+
+The control-plane API keys (`auth.controlPlane`) reach the gateway as a file, like the shared key: `auth.controlPlane.apiKeys` (one `id:name:role:key` entry per line, role `admin` or `user`) is written into a chart-managed Secret, or `auth.controlPlane.existingSecret` names one, mounted at `/etc/smg/control-plane` and read with `--control-plane-api-keys-file`. A rotated `auth.controlPlane.apiKeys` rolls the router pods (`checksum/control-plane`); a rotated existing Secret needs the rollout restart described above. [`examples/with-admin-plane.yaml`](examples/with-admin-plane.yaml) sets both.
+
+```bash
+kubectl create secret generic smg-control-plane \
+  --from-file=control-plane-api-keys=./control-plane-keys.txt
+helm install smg deploy/helm/smg \
+  --set router.adminPort=9001 \
+  --set auth.controlPlane.existingSecret=smg-control-plane
+```
+
+#### Admission Config
+
+`router.tenantRateLimit` and `router.priorityScheduler` carry the admission configuration the gateway reads from files: `enabled` renders the feature's flag (`--tenant-rate-limit-enabled`, `--priority-scheduler-enabled`), and `configMap.name` names a ConfigMap of yours, mounted whole at `/etc/smg/rate-limit` or `/etc/smg/scheduler` and read through `--tenant-rate-limit-config` or `--priority-scheduler-config` (`configMap.key` names the file: `rate-limit.yaml` and `scheduler.yaml` by default). The chart refuses what the gateway would refuse or ignore: the rate limit enabled without its ConfigMap, and a rate-limit or scheduler ConfigMap without its feature enabled.
+
+```bash
+kubectl create configmap smg-rate-limit --from-file=rate-limit.yaml=./rate-limit.yaml
+helm install smg deploy/helm/smg \
+  --set router.tenantRateLimit.enabled=true \
+  --set router.tenantRateLimit.configMap.name=smg-rate-limit
+```
+
+The gateway reads both files once at start. An edit of a ConfigMap reaches the mounted file through the kubelet's symlink swap, but it takes effect on the next `kubectl rollout restart` of the router Deployment; the mounts stay whole ConfigMaps for a later file watch.
 
 #### Store URLs
 
@@ -277,24 +336,27 @@ shutdowns and local Ctrl+C exits. A value of 0 skips the propagation wait
 
 #### Dashboard and Alerts
 
-`grafana.dashboard.enabled` ships a Grafana dashboard as a ConfigMap (label `grafana_dashboard: "1"` for the sidecar loader) with `namespace` and `job` variables that pick the release (every query is scoped to both) and 41 panels in seven rows: traffic (request rate, responses by status, 5xx ratio, errors by API code and router error type, token throughput), latency (TTFT and time per output token p50/p95/p99 and per model, request and HTTP duration p99), capacity and queues (admission in-flight and queued, rejections, engine running and waiting requests, KV cache usage and in-flight request age per worker, connections), workers (healthy count, health and circuit-breaker state per worker, health checks, overload shed and fallback, retries), cache and KV events (engine prefix cache hit rate, cache-aware decisions and match ratio, KV event lag, integrity counters, degraded ranks, index size), Symphony (outputs by outcome, malformed outputs by reason, fallbacks and refusals) and runtime (tokio busy ratio, event-loop stalls and delay, dropped log lines, memory, tasks, tokenizer cache). Every panel queries a family the gateway describes; the gateway's test suite holds the dashboard to the catalog.
+`grafana.dashboard.enabled` ships a Grafana dashboard as a ConfigMap (label `grafana_dashboard: "1"` for the sidecar loader) with `namespace` and `job` variables that pick the release (every query is scoped to both) and 49 panels in eight rows: traffic (request rate, responses by status, 5xx ratio, errors by API code and router error type, token throughput), latency (TTFT and time per output token p50/p95/p99 and per model, request and HTTP duration p99), capacity and queues (admission in-flight and queued, rejections, engine running and waiting requests, KV cache usage and in-flight request age per worker, connections), workers (healthy count, health and circuit-breaker state per worker, health checks, overload shed and fallback, retries), cache and KV events (engine prefix cache hit rate, cache-aware decisions and match ratio, KV event lag, integrity counters, degraded ranks, index size), Symphony (outputs by outcome, malformed outputs by reason, fallbacks and refusals), runtime (tokio busy ratio, event-loop stalls and delay, dropped log lines, memory, tasks, tokenizer cache) and prefill-decode (time to first token p99 by phase and by model, rendezvous, bootstrap and KV transfer failures, prefill admission in flight, queued, rejections, waits and sheds, the admission wait, the admission window per decode worker, KV connector mode decisions). Every panel queries a family the gateway describes; the gateway's test suite holds the dashboard to the catalog.
 
-`prometheusRule.enabled` adds a `PrometheusRule` with ten alerts, thresholds under `prometheusRule.alerts` (the defaults and their rationale are in `values.yaml`). Every expression selects this release's series through `prometheusRule.jobSelector` (empty = this release's namespace and the Service the ServiceMonitor scrapes, the Operator's default `namespace` and `job` labels, so a same-named release in another namespace stays out) and keeps `namespace` and `job` through its aggregation, so several releases on one Prometheus alert apart and a firing alert names its gateway:
+`prometheusRule.enabled` adds a `PrometheusRule` with eleven alerts, thresholds under `prometheusRule.alerts` (the defaults and their rationale are in `values.yaml`). Every expression selects this release's series through `prometheusRule.jobSelector` (empty = this release's namespace and the Service the ServiceMonitor scrapes, the Operator's default `namespace` and `job` labels, so a same-named release in another namespace stays out) and keeps `namespace` and `job` through its aggregation, so several releases on one Prometheus alert apart and a firing alert names its gateway:
 
 | Alert | Severity | Fires when |
 |---|---|---|
 | `SmgGatewayDown` | critical | the router's scrape target is down, or no target matches the selector, for `scrapeMissingFor` |
-| `SmgNoHealthyWorker` | critical | no registered worker is healthy for `noHealthyWorkerFor` |
-| `SmgHighErrorRatio` | critical | the 5xx share of responses exceeds `errorRatio` for `errorRatioFor` |
-| `SmgTtftP99High` | critical | p99 time to first token exceeds `ttftP99Seconds` for `ttftP99For` |
+| `SmgNoHealthyWorker` | critical | no registered worker is healthy, or no worker is registered at all while the gateway's scrape is up, for `noHealthyWorkerFor` |
+| `SmgHighErrorRatio` | critical | the 5xx share of responses, the probe routes (`/health`, `/readiness`, `/liveness`) excluded, exceeds `errorRatio` for `errorRatioFor` |
+| `SmgHighRouterErrorRatio` | critical | the router's server-side failed share of its requests (upstream failures and streams that failed after their first token, which the edge counts as 200s; the client's own refusals are not counted) exceeds `errorRatio` for `errorRatioFor` |
+| `SmgTtftP99High` | critical | p99 time to first token of the gRPC router's streamed answers (the HTTP router records none; a collected answer, and a streamed Responses answer on the Harmony pipeline, records no first token) exceeds `ttftP99Seconds` for `ttftP99For`, evaluated per namespace and job |
 | `SmgKvUsageNearCapacity` | warning | a worker's KV token usage exceeds `kvUsage` for `kvUsageFor` |
 | `SmgCircuitBreakerOpen` | warning | a worker's circuit breaker is open or half-open for `circuitBreakerOpenFor` (a worker failing requests while passing its probes cycles between the two) |
-| `SmgAdmissionRejections` | warning | the admission queue rejects requests for `admissionRejectionsFor` |
+| `SmgAdmissionRejections` | warning | the concurrency limit's queue or the priority scheduler's per-class queues reject requests for `admissionRejectionsFor` |
 | `SmgEventLoopStalls` | warning | more than `eventLoopStalls` event-loop stalls in ten minutes |
 | `SmgDroppedLogLines` | warning | a log sink dropped lines in the last ten minutes |
 | `SmgKvEventDegradedRanks` | warning | an engine rank's KV index stays degraded for `degradedRanksFor` |
 
 Readiness itself is a kubelet signal: with kube-state-metrics in the cluster, `kube_pod_status_ready` on the router pods complements `SmgGatewayDown`.
+
+The rules have unit tests under `tests/rules`: `tests/rules/run.sh` (needs `helm` and `promtool`) renders the chart's rules and replays each test file's traffic shape against them. The `PR Helm Chart` workflow (`.github/workflows/pr-helm.yml`) lints the chart and runs them on every pull request that touches it.
 
 #### Readiness Deadlines
 
@@ -314,7 +376,7 @@ The budget is not a startup probe on the router's `/readiness`: a startup probe 
 Model loading takes from a minute to tens of minutes, depending on the checkpoint and where it is streamed from. Workers have startup probes with these defaults (`initialDelaySeconds` plus `failureThreshold` times `periodSeconds`: 360 s of budget):
 
 - HTTP mode: `httpGet /health` with `initialDelaySeconds: 60`, `failureThreshold: 30`
-- gRPC mode: `tcpSocket` probe (not all engines implement gRPC health checking yet)
+- gRPC mode: `grpc` probe on the serving port, the same budget. The probe asks the servicer's `grpc.health.v1` service, which every servicer serves (the Rust servicer for every engine, the Python servicers alike) and which answers `SERVING` once the engine serves. The pod therefore counts as started when the engine does, not when the servicer binds its port. The built-in gRPC probe needs Kubernetes 1.24 or later; the chart requires 1.26.
 
 Override per worker:
 
@@ -327,6 +389,46 @@ workers:
 ```
 
 Size the budget past the longest load you expect: a startup probe that fails for its whole budget restarts the worker, and the load starts over. The worker Deployment's rollout deadline follows the budget (`initialDelaySeconds + failureThreshold * periodSeconds`, plus 600 s for what runs on the rollout's clock before the probe's starts: the node's provisioning, the image pull, the container start), so `kubectl rollout status`, Argo CD, Flux and `helm --wait` do not report a worker still loading within its budget as a failed rollout. On an autoscaled GPU pool or with a cold image cache, where the node and a multi-GB pull can take longer than that margin, set `progressDeadlineSeconds` on the worker entry past them; it overrides the default.
+
+#### Policy Controller
+
+`policyController.enabled` deploys the standalone policy controller (`smg-policy-controller`) beside the router: a Deployment and one Service, `<fullname>-policy-controller`. The controller runs on its own today: it serves its probes and its metrics and runs the load path, with the election on its replicas elect a leader, and nothing in the chart points the router at it. The specification document's mount and replication join the chart with the controller release that reads each.
+
+The controller's image is the router's with `-policy-controller` appended to the tag, the tag a release publishes it under: one version names both images. Each part of `policyController.image` left empty falls back to the router's: the registry to `global.image.registry`, the repository to `global.image.repository`, the tag to the router's tag with the suffix. A router on its `-slurm` variant takes the same controller image: the variant's suffix is cut first. A registry that holds the router's image alone, a mirror for one, needs the controller's image under the suffixed tag too: the pod fails at the pull without it. For an image of your own, build one from `docker/policy-controller.Dockerfile` (`docker build --file docker/policy-controller.Dockerfile --tag <repository>:<tag> .` at the repository's root), push it and name `policyController.image.repository` and `policyController.image.tag`: a repository of your own is refused without its tag, and so is a router image named by a digest. A router tag that names a release older than the first with a controller image is refused too, until `policyController.image.tag` names the controller's tag: no such release published a controller image. A `null` removes a value's default, so with the controller on the schema refuses it for every value whose default is not empty: the chart leaves none of them to the cluster's or the controller's own default. The members of `securityContext` are apart: a `null` drops one, by design. With the controller off the block is not read, so `helm upgrade --reuse-values` on a release from before the block renders as before. To turn the controller on in such an upgrade, use `--reset-then-reuse-values` (Helm 3.14 and later) or pass the chart's whole `policyController` block in a values file: reused values hold none of the block's defaults, and the schema refuses the upgrade, naming each value it lacks, until all are given. A release that adds a value whose default is not empty refuses an upgrade with reused values the same way.
+
+| Value | Default | What it sets |
+|-------|---------|--------------|
+| `policyController.replicas` | `1` | Replicas. With the election off every replica is a controller of its own: keep one. With it on, run two or more. |
+| `policyController.election.enabled`, `.leaseName` | `false`, `""` | Leader election among the replicas over one `coordination.k8s.io` Lease in the release's namespace: see below. `leaseName` `""` is `<fullname>-policy-controller`; a name of your own is unique to one controller. |
+| `policyController.ports.gateway`, `.control`, `.replication`, `.admin` | `30100`, `30101`, `30102`, `30103` | The listeners' container ports, passed as `--gateway-listen`, `--control-listen`, `--replication-listen` and `--admin-listen`. |
+| `policyController.identityAsTold` | `[]` | Nothing is verified on a listener named here. `--identity-as-told`: the listeners, any of `gateway`, `control` and `replication`, that take a caller's stated name as its identity: see below. |
+| `policyController.service.type`, `.annotations` | `ClusterIP`, `{}` | The Service, with three ports on the listeners' own numbers: `grpc` (the gateways' listener), `control` (the operators') and `metrics` (the admin listener). The standbys' listener has no Service. |
+| `policyController.logging.level`, `.json` | `info`, `false` | `--log-level` (`debug`, `info`, `warn` or `error`) and `--log-json`. |
+| `policyController.runtimeWorkerThreads` | `2` | `--runtime-worker-threads`. The controller's own default is one worker thread for every CPU it may use, which with no CPU limit is every core of the node. Raise it with the CPU limit; `0` leaves the flag out, so the count follows the limit. |
+| `policyController.shutdownGracePeriodSeconds` | `30` | `--shutdown-grace-period-secs`. The pod's `terminationGracePeriodSeconds` is this plus `policyController.terminationGraceMarginSeconds` (10). |
+| `policyController.shutdownSettleSeconds` | `null` | `--shutdown-settle-secs`; `null` keeps the controller's default of 5 seconds. |
+| `policyController.podDisruptionBudget.enabled`, `.minAvailable` | `false`, `1` | A PodDisruptionBudget over the controller's pods. With one replica, `minAvailable: 1` lets no pod be evicted and a node drain waits on it for ever, as with the router's budget: run two replicas or more, or leave the budget off. |
+| `policyController.livenessProbe`, `.readinessProbe` | `/liveness`, `/readiness` | `httpGet` probes on the admin port, with `initialDelaySeconds` and `periodSeconds`. |
+| `policyController.securityContext` | the router's | The container's security context. With the controller on the schema refuses a `null` here: to run with none, set each member to `null`. Reused values hold no default under it: the map given there is the whole context, and an empty one runs the container with none. |
+| `policyController.resources`, `.nodeSelector`, `.tolerations`, `.affinity`, `.podAnnotations`, `.podLabels`, `.extraArgs`, `.extraEnv` | | As the router's values of the same names. |
+
+With `router.metrics.serviceMonitor.enabled`, a third ServiceMonitor scrapes the Service's `metrics` port under the same interval and labels. With more than one replica and no `policyController.affinity`, the chart prefers one replica a node. The chart refuses at render what the controller refuses at start: two listeners on one port, a settle window over half the grace period, and a listener named in `policyController.identityAsTold` that is none of the three. See [`with-policy-controller.yaml`](examples/with-policy-controller.yaml).
+
+**Identities as told.** Nothing is verified on a listener named in `policyController.identityAsTold`: whoever reaches its port acts as any principal of its scopes. None is named by default, and a listener that is not named refuses every call but `Leader` as unauthenticated. The Service carries the gateways' and the operators' ports and a pod's address reaches all three listeners, so the standbys' listener is not out of reach for having no Service: name a listener only behind a mesh that verifies its callers, or a network policy that admits them alone. The value is a set, passed in the listeners' own order. An `--identity-as-told` flag in `policyController.extraArgs` adds to it: the ingestion listener, which the chart does not render, is named where it is turned on, and a listener named in both places is named once more, which the controller takes.
+
+**Election.** With `policyController.election.enabled` the replicas elect one leader over a Lease, and the chart renders four more objects: the Lease, a ServiceAccount of the controller's own, and a Role and RoleBinding that grant that account `get` and `update` on that one Lease and nothing else. The account's token is mounted in the controller's pods alone. The controller is passed `--lease-name`, and its pod's address as `--advertise-address`: the Lease's holder is named by an address the other replicas and the gateways can dial. The timings are the controller's own (a lease of 3 seconds, renewed every second); `policyController.extraArgs` carries `--lease-duration-ms`, `--lease-renew-period-ms` and `--lease-renew-deadline-ms` for others, and a Lease's duration is whole seconds. With the election off the pod mounts no token: the controller then calls no Kubernetes API.
+
+The rollout follows the election. On, the Deployment rolls one pod more at a time with none unavailable: the new pod stands by, and the old leader's stop hands the Lease over. A stop whose release fails tries it twice more, a renew period apart: two seconds longer at the controller's own timings, inside the default grace period. If none lands the Lease runs out by itself. Off, the Deployment rolls as it did before the election. A change of mode overlaps the two kinds: turning the election on starts an elected pod while the lone one still leads, and turning it off starts a lone pod while the elected leader still leads. Scale the controller to zero first (`policyController.enabled=false`, or the Deployment by hand), then change the mode. A changed `leaseName` on a running release is such a change as well: a pod elected over the new Lease may lead while the old Lease's leader still leads, until that leader's renew deadline, and the term starts again under the new name. Scale to zero before it too. The elected pod template names its account by `serviceAccountName` and by that field's deprecated alias `serviceAccount`: turning the election off, or a rollback past it, removes both, and new pods run under the namespace's default account.
+
+The Lease is the release's object and its record is the cluster's:
+
+- The chart renders the Lease with no `spec`: the holder, the times and the term are written by the controllers, and an upgrade has nothing to say of them. An apply that replaces objects wipes the record: the old leader fences itself at its next renewal, inside the renew deadline, and the replicas elect anew above the term they remember.
+- The controller is granted no `create` (a create cannot be held to one name), so a Lease deleted by hand leaves no leader: every replica's election step is refused and none leads, the old leader fencing itself inside the renew deadline. Replicas that were ready stay ready, as followers that name no leader; one started after stays not ready. Applying the release again restores it.
+- A delivery tool that excludes Leases, as Argo CD's default `resource.exclusions` do since its version 3, never creates this one: every replica then stays not ready and nobody leads until the kind is taken out of the exclusion.
+- The Lease carries the election's term. A deleted or replaced Lease restarts the term once no running controller remembers the last one, and turning the election off deletes the Lease. While a replica remembers a higher term than the Lease holds, a holder that never saw that term leads all the same: the replica names no leader, and takes the Lease above the term it remembers once it is free.
+- Two controllers handed one `leaseName` in one namespace elect one leader between two stores: the chart cannot see it.
+
+Two choices are deliberate. The Role holds `get` and `update` only: the controller calls no `create` and no `watch` with the chart's Lease in place. The Lease's name carries no revision: a name that moved at an upgrade would elect a second leader beside the first.
 
 ## Examples
 
@@ -344,6 +446,9 @@ Size the budget past the longest load you expect: a startup probe that fails for
 | [`with-slurm-discovery.yaml`](examples/with-slurm-discovery.yaml) | Workers on Slurm job nodes (custom image) |
 | [`with-ingress.yaml`](examples/with-ingress.yaml) | Ingress with TLS |
 | [`with-monitoring.yaml`](examples/with-monitoring.yaml) | ServiceMonitor + Grafana dashboard + PrometheusRule |
+| [`with-policy-controller.yaml`](examples/with-policy-controller.yaml) | The standalone policy controller beside the router |
+
+An example that pins `global.image.tag` at a release with no controller image is refused with `policyController.enabled` until `policyController.image.tag` names one.
 
 ## Testing
 

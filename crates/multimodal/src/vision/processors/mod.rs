@@ -15,6 +15,7 @@
 //! - **Qwen3-VL** (`qwen3_vl`): Similar to Qwen2-VL but with patch_size=16 and [0.5,0.5,0.5] normalization
 //! - **Qwen3-Omni** (`qwen3_omni_vision`): Qwen3 vision preprocessing with Omni video limits and timing metadata
 //! - **Inkling** (`inkling`): Optional aspect-preserving resize with CLIP normalization and padded patch columns
+//! - **Inkling2** (`inkling2`): Native image grids, checkerboard alpha and BF16 patch inputs
 //! - **Kimi-K2.5** (`kimi_k25`): MoonViT resize and zero-padding to patch alignment
 //! - **Kimi-K3** (`kimi_k3`): Same MoonViT stack with a 4x patch budget and
 //!   chessboard alpha compositing
@@ -23,11 +24,13 @@
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 //! - **Nemotron-H Omni** (`nemotron_omni`): C-RADIO dynamic resolution, an even 16px patch grid with CLIP normalization
+//! - **Step3-VL** (`step3_vl`): a 728px global view and 504px sliding-window crops with CLIP normalization
 
 pub mod deepseek_v41;
 pub mod gemma4;
 pub mod glm53_flash;
 pub mod inkling;
+pub mod inkling2;
 pub mod kimi_k25;
 pub mod kimi_k3;
 pub mod llama4_vision;
@@ -43,11 +46,13 @@ pub mod qwen2_vl;
 pub mod qwen3_omni_vision;
 pub mod qwen3_vl;
 pub mod qwen_vl_base;
+pub mod step3_vl;
 
 pub use deepseek_v41::DeepseekV41Processor;
 pub use gemma4::Gemma4Processor;
 pub use glm53_flash::Glm53FlashProcessor;
 pub use inkling::InklingImageProcessor;
+pub use inkling2::Inkling2ImageProcessor;
 pub use kimi_k25::KimiK25Processor;
 pub use kimi_k3::KimiK3Processor;
 pub use llama4_vision::Llama4VisionProcessor;
@@ -61,3 +66,4 @@ pub use pixtral::PixtralProcessor;
 pub use qwen2_vl::Qwen2VLProcessor;
 pub use qwen3_omni_vision::Qwen3OmniVisionProcessor;
 pub use qwen3_vl::Qwen3VLProcessor;
+pub use step3_vl::Step3VLProcessor;

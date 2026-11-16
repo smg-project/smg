@@ -1,0 +1,46 @@
+# Regression gate for `cargo bench -p smg --bench stream_state_machines`, run by
+# .github/workflows/benchmark-stream-state-machines.yml on pull requests through scripts/bench_gate.py.
+#
+# The five rows each drive one stream of 300 single-token chunks and a completion through a stream state
+# machine (a chat under the legacy parsers, the same chat under a Symphony table, a completion, a generate
+# and a Messages stream) over a scripted engine stream decoded by the client's own codec, no socket under it;
+# criterion's warmed-up sample medians, in nanoseconds per chunk.
+#
+# Threshold. tokenizer.toml describes the method: the smallest multiple of 5 % that is at least twice the
+# identical-build spread, (max - min) / median over every run of a side. The spread here was measured three
+# times (ten pinned interleaved runs of one build, five a side of the gate, on a busy shared build host).
+# Quiet, 2.2 - 3.6 % over every run (chat_legacy 3.6 %, chat_symphony 3.0 %, completion 2.2 %, generate
+# 2.8 %, messages 2.4 %). Busy, 8.3 - 17.1 % and 7.5 - 15.2 % over every run, where a single run per side
+# sat 10 - 17 % above its four siblings (261 - 306 us on chat_legacy) while those four stayed within
+# 0.5 - 7.6 % of each other and the two sides' medians within 3 %. This gate deviates from the method in
+# one point: the busy spread is taken over the four closest runs of five (7.6 %), not over every run,
+# because a lone spike is what the gate's overlap rule is for (an id fails only when every pull-request
+# run is worse than every base run) and a threshold covering it (35 %) would let a real regression through.
+# The rule on that trimmed spread gives 20 % (twice 7.6 % is 15.2 %), which is also more than five times
+# the quiet spread. The null case through this gate passed all three times.
+
+#
+# Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
+# run's, with every function on a 64-byte boundary (RUSTFLAGS:
+# `-C llvm-args=-align-all-functions=6`, beside the outliner flag of .cargo/config.toml).
+# symphony.toml records why: identical code sits in one of two speed states chosen by where its
+# unchanged hot functions land modulo 64, and a pull request's code size alone moved them. Under the
+# flags this gate's null read (the same bytes twice, three interleaved runs a side on one core, 5
+# ids) read 0 failed, 0 suspect with a largest change of medians of +3.7 %, so the thresholds stand.
+# An inserted regression on the path the rows run (200 dependent multiply-adds on every poll of the
+# engine stream) is caught: 5 of 5 failed, +21 to +36 % (generate +21 %, the other four +32 to +36
+# %), about 310 polls per iteration on every row.
+
+repeats = 3
+filter = "^stream_state_machines/"
+
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
+# bench target of its own.
+sources = ["model_gateway/benches/stream_state_machines.rs"]
+
+[[gate]]
+pattern = "^stream_state_machines/"
+threshold = 0.20
+note = "identical build 2.2 - 3.6 % quiet, 0.5 - 7.6 % over the four closest runs of five busy (trimmed)"

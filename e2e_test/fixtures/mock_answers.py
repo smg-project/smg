@@ -48,6 +48,13 @@ def set_class_workers(workers: list[Worker]) -> None:
     _CLASS_WORKERS[:] = list(workers)
 
 
+def class_workers() -> list[Worker]:
+    """The class's workers, every role: a test that reads one worker's own
+    admin API (an encode worker's count of the completions it served, which
+    the gateway does not count) finds it here."""
+    return list(_CLASS_WORKERS)
+
+
 def clear_class_workers() -> None:
     _CLASS_WORKERS.clear()
 
@@ -188,6 +195,11 @@ class MockAnswers:
                 if self.harmony
                 else output_text
             )
+        self._file(answer)
+
+    def _file(self, answer: dict[str, Any]) -> None:
+        """File a built answer on the class's workers (the checks and the count
+        ``enqueue`` documents)."""
         if len(self.workers) > 1 and "prompt_contains" not in answer:
             raise ValueError(
                 f"this class runs {len(self.workers)} mock workers and the gateway picks one: "
@@ -238,6 +250,19 @@ class MockAnswers:
         if not segments:
             raise ValueError("state an analysis, a final text or a tool call")
         self.enqueue("<|start|>assistant".join(segments), **answer)
+
+    def enqueue_scores(self, logprobs: list[float]) -> None:
+        """State the mock worker's next scoring answer: the logprob of each token
+        id the request asks a score for, in the request's order, on a completion
+        of no output tokens (what a prefill-only scoring request reads: the
+        gateway's Decisions stage sends one per question on the SGLang wire, its
+        candidate labels' ids in the question's order). An answer of no tokens
+        has no channel, so a Harmony model's scoring answer is filed as it is,
+        with an empty ``output_text``. No-op on a real engine.
+        """
+        if not self.workers:
+            return
+        self._file({"output_text": "", "token_id_logprobs": list(logprobs)})
 
     def enqueue_with_logprobs(self, output_text: str, logprob: float = -0.1, **answer: Any) -> None:
         """State the mock worker's next answer with a logprob per token.

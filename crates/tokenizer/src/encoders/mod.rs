@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::{
-    chat_template::{ChatTemplateContentFormat, ThinkingKeyName, ThinkingToggle},
+    chat_template::{
+        ChatTemplateContentFormat, ChatTemplateState, ThinkingKeyName, ThinkingToggle,
+    },
     traits::{MediaHandling, RendererCapabilities},
 };
 
@@ -17,6 +19,7 @@ pub mod deepseek_v32;
 pub mod deepseek_v4;
 pub mod deepseek_v41;
 pub mod glm53;
+pub mod inkling2;
 pub mod kimi_k25_tools;
 pub mod kimi_k3_xtml;
 pub(crate) mod marks;
@@ -56,6 +59,21 @@ pub(crate) fn join_segments(segments: &[PromptSegment]) -> String {
     segments.iter().map(|s| s.text.as_str()).collect()
 }
 
+/// Python's truthiness of a JSON value, the test the reference encoders and
+/// the Jinja templates put on an optional field (`if response_format:`):
+/// `null`, `false`, zero and an empty string, array or object are all
+/// nothing.
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64() != Some(0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
 /// A renderer's own rule for the thinking mode a request renders with, from
 /// the template kwargs and the request's `thinking` field.
 pub(crate) type ThinkingModeRule = fn(Option<&HashMap<String, Value>>, Option<bool>) -> bool;
@@ -77,8 +95,9 @@ pub(crate) struct RendererProfile {
     /// The thinking switch and its default. The Jinja processor knows
     /// nothing of a native renderer, so the renderer states it.
     pub(crate) thinking_toggle: ThinkingToggle,
-    /// The kwarg the switch reads.
-    pub(crate) thinking_key_name: ThinkingKeyName,
+    /// The kwarg the switch reads; `None` for a renderer without a thinking
+    /// switch.
+    pub(crate) thinking_key_name: Option<ThinkingKeyName>,
     /// `chat_template_kwargs.reasoning_effort` values that switch thinking
     /// on, so the gateway's parser is armed from the kwarg as the prompt is;
     /// empty when the renderer takes only the protocol's own words.
@@ -107,6 +126,8 @@ impl RendererProfile {
         native_assistant_continuation: false,
         raw_tool_call_arguments: false,
         leading_system_only: false,
+        json_requires_separate_reasoning: false,
+        json_requires_empty_assistant_prefix: false,
     };
 
     /// The behaviours of a renderer without a profile: the Jinja template,
@@ -116,6 +137,115 @@ impl RendererProfile {
         native_assistant_continuation: true,
         ..Self::NO_CAPABILITIES
     };
+}
+
+/// What a tokenizer answers to the template questions the gateway asks: a
+/// renderer with an encoder of its own answers from its profile, the Jinja
+/// template answers otherwise. The two tokenizers hold the same pair and read
+/// it through this one view, so the rule is written once.
+pub(crate) struct TemplateAnswers<'a> {
+    pub(crate) profile: Option<&'a RendererProfile>,
+    pub(crate) template: &'a ChatTemplateState,
+}
+
+impl TemplateAnswers<'_> {
+    pub(crate) fn content_format(&self) -> ChatTemplateContentFormat {
+        self.profile
+            .and_then(|profile| profile.content_format)
+            .unwrap_or_else(|| self.template.content_format())
+    }
+
+    /// The content format of the template a request renders through, by
+    /// whether it declares tools; a profile's own format wins.
+    pub(crate) fn content_format_for_tools(&self, has_tools: bool) -> ChatTemplateContentFormat {
+        self.profile
+            .and_then(|profile| profile.content_format)
+            .unwrap_or_else(|| self.template.content_format_for_tools(has_tools))
+    }
+
+    pub(crate) fn thinking_toggle(&self) -> ThinkingToggle {
+        self.profile.map_or_else(
+            || self.template.thinking_toggle(),
+            |profile| profile.thinking_toggle,
+        )
+    }
+
+    pub(crate) fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
+        self.profile.map_or_else(
+            || self.template.thinking_key_name(),
+            |profile| profile.thinking_key_name,
+        )
+    }
+
+    pub(crate) fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
+        self.profile.map_or_else(
+            || self.template.native_reasoning_effort_values(),
+            |profile| profile.native_effort_values,
+        )
+    }
+
+    pub(crate) fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
+        self.profile.map_or_else(
+            || self.template.native_reasoning_effort_off_values(),
+            |profile| profile.native_effort_off_values,
+        )
+    }
+
+    pub(crate) fn think_in_prefill(&self) -> bool {
+        self.profile.map_or_else(
+            || self.template.think_in_prefill(),
+            |profile| profile.think_in_prefill,
+        )
+    }
+
+    /// Every native renderer reports a thinking switch, so its profile's
+    /// `think_in_prefill` answers the switchless-template question too.
+    pub(crate) fn prefill_opens_think_block(&self) -> bool {
+        self.profile.map_or_else(
+            || self.template.prefill_opens_think_block(),
+            |profile| profile.think_in_prefill,
+        )
+    }
+
+    /// The profile's capabilities, or the Jinja template's: it continues a
+    /// trailing assistant message the way the reference's
+    /// `continue_final_message` does, takes a history call's arguments as the
+    /// text the request sent when it writes them that way, and handles media
+    /// as `media_handling` says (resolved by the tokenizer that owns the
+    /// template).
+    pub(crate) fn renderer_capabilities(
+        &self,
+        media_handling: MediaHandling,
+    ) -> RendererCapabilities {
+        self.profile.map_or_else(
+            || RendererCapabilities {
+                media_handling,
+                raw_tool_call_arguments: self.template.raw_tool_call_arguments(),
+                ..RendererProfile::TEMPLATE_CAPABILITIES
+            },
+            |profile| profile.capabilities,
+        )
+    }
+
+    /// The thinking mode the profile's own rule renders for the kwargs and
+    /// the request-level toggle; `None` without a profile or a rule.
+    pub(crate) fn native_thinking_mode(
+        &self,
+        template_kwargs: Option<&HashMap<String, Value>>,
+        thinking: Option<bool>,
+    ) -> Option<bool> {
+        self.profile
+            .and_then(|profile| profile.thinking_mode)
+            .map(|resolve| resolve(template_kwargs, thinking))
+    }
+
+    /// Whether the renderer reads the kwarg `name`: a profile's encoder reads
+    /// the kwargs itself (its tool choice, response format and effort come
+    /// from them), so every name is read under a profile; the Jinja template
+    /// answers for itself otherwise.
+    pub(crate) fn template_reads(&self, name: &str) -> bool {
+        self.profile.is_some() || self.template.reads(name)
+    }
 }
 
 /// Whether a marked render of the V4 family ends in the generation header its

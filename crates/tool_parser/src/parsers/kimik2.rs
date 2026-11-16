@@ -63,7 +63,7 @@ impl KimiK2Parser {
             if name.is_empty() {
                 continue;
             }
-            let schema = &tool.function.parameters;
+            let schema = tool.function.parameters_schema();
 
             // Tag for FIRST tool call (includes outer section wrapper)
             tags.push(serde_json::json!({

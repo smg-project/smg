@@ -64,12 +64,108 @@ where
     }
 }
 
+/// The choices of one request: the one choice of a request without fan-out,
+/// polled in place, or the `SelectAll` merge of an `n > 1` fan-out. The merge
+/// re-queues a choice behind every item it yields (a task node allocated and
+/// the choice moved out and back in per output), which a single choice never
+/// needs; that choice lives inline in the request stream, boxed once with it.
+pub(crate) enum Choices<C> {
+    /// The one choice of a request without fan-out; `None` once it ended.
+    One(Option<C>),
+    /// The `n > 1` fan-out, polled together and yielding as ready.
+    Many(SelectAll<C>),
+}
+
+impl<C: Stream + Unpin> Choices<C> {
+    /// No choice yet; [`push`](Self::push) adds them.
+    pub(crate) fn new() -> Self {
+        Self::One(None)
+    }
+
+    /// Add a choice: the first stays in place, the second turns the two into
+    /// a merge.
+    pub(crate) fn push(&mut self, choice: C) {
+        match self {
+            Self::Many(many) => many.push(choice),
+            Self::One(None) => *self = Self::One(Some(choice)),
+            Self::One(first) => {
+                let mut many = SelectAll::new();
+                if let Some(first) = first.take() {
+                    many.push(first);
+                }
+                many.push(choice);
+                *self = Self::Many(many);
+            }
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &C> {
+        match self {
+            Self::One(choice) => ChoicesIter::One(choice.iter()),
+            Self::Many(many) => ChoicesIter::Many(many.iter()),
+        }
+    }
+
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut C> {
+        match self {
+            Self::One(choice) => ChoicesIter::One(choice.iter_mut()),
+            Self::Many(many) => ChoicesIter::Many(many.iter_mut()),
+        }
+    }
+
+    /// Drop every choice, which aborts their engine side.
+    pub(crate) fn clear(&mut self) {
+        match self {
+            Self::One(choice) => *choice = None,
+            Self::Many(many) => many.clear(),
+        }
+    }
+}
+
+/// The iterator over either shape of [`Choices`].
+enum ChoicesIter<A, B> {
+    One(A),
+    Many(B),
+}
+
+impl<A: Iterator, B: Iterator<Item = A::Item>> Iterator for ChoicesIter<A, B> {
+    type Item = A::Item;
+
+    fn next(&mut self) -> Option<A::Item> {
+        match self {
+            Self::One(iter) => iter.next(),
+            Self::Many(iter) => iter.next(),
+        }
+    }
+}
+
+impl<C: Stream + Unpin> Stream for Choices<C> {
+    type Item = C::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<C::Item>> {
+        match self.get_mut() {
+            Self::One(choice) => {
+                let Some(stream) = choice.as_mut() else {
+                    return Poll::Ready(None);
+                };
+                let polled = Pin::new(stream).poll_next(cx);
+                if matches!(polled, Poll::Ready(None)) {
+                    // Ended: dropped, as the merge drops an ended stream.
+                    *choice = None;
+                }
+                polled
+            }
+            Self::Many(many) => Pin::new(many).poll_next(cx),
+        }
+    }
+}
+
 /// The merged response stream of one request: its choices polled together
 /// (interleaved, each tagged with its `index`), ended early by the `Abort`
 /// RPC or by shutdown. `H` is whatever else must live as long as the stream
 /// (a servicer's load-tracker guard); nothing, by default.
 pub(crate) struct RequestStream<C: Choice, H = ()> {
-    choices: SelectAll<C>,
+    choices: Choices<C>,
     cancel: oneshot::Receiver<CancelReason>,
     /// Set once aborted: the terminal `Complete` of every choice still open
     /// at that point, yielded before the stream ends.
@@ -89,7 +185,7 @@ impl<C: Choice> RequestStream<C> {
     /// handle for the request), keeping the request registered and its
     /// `metrics` observed for as long as it lives.
     pub(crate) fn new(
-        choices: SelectAll<C>,
+        choices: Choices<C>,
         cancel: oneshot::Receiver<CancelReason>,
         registration: Registration,
         metrics: Arc<RequestMetrics>,
@@ -288,7 +384,7 @@ mod tests {
     fn request(choices: Vec<Scripted>) -> (Arc<RequestRegistry>, RequestStream<Scripted>) {
         let registry = Arc::new(RequestRegistry::default());
         let (registration, cancel) = registry.register("r1").expect("a fresh id");
-        let mut all = SelectAll::new();
+        let mut all = Choices::new();
         for choice in choices {
             all.push(choice);
         }
@@ -296,6 +392,56 @@ mod tests {
             registry,
             RequestStream::new(all, cancel, registration, request_metrics()),
         )
+    }
+
+    /// One choice is polled in place and dropped once it ended, as the merge
+    /// drops an ended stream; a second choice makes the merge.
+    #[test]
+    fn one_choice_is_polled_in_place_and_two_are_merged() {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut one = Choices::new();
+        assert!(one.iter().next().is_none());
+        one.push(Scripted::open(&["a"]));
+        assert!(matches!(one, Choices::One(Some(_))));
+        assert_eq!(one.iter().count(), 1);
+        assert!(matches!(
+            Pin::new(&mut one).poll_next(&mut cx),
+            Poll::Ready(Some(Ok("a")))
+        ));
+        assert!(Pin::new(&mut one).poll_next(&mut cx).is_pending());
+        one.clear();
+        assert!(one.iter_mut().next().is_none());
+        assert!(matches!(
+            Pin::new(&mut one).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+
+        let mut ended = Scripted::open(&[]);
+        ended.inner = None;
+        let mut one = Choices::new();
+        one.push(ended);
+        assert!(matches!(
+            Pin::new(&mut one).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+        assert!(one.iter().next().is_none(), "an ended choice is dropped");
+
+        let mut two = Choices::new();
+        two.push(Scripted::open(&["a"]));
+        two.push(Scripted::open(&["b"]));
+        assert!(matches!(two, Choices::Many(_)));
+        assert_eq!(two.iter().count(), 2);
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            if let Poll::Ready(Some(Ok(item))) = Pin::new(&mut two).poll_next(&mut cx) {
+                seen.push(item);
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, ["a", "b"]);
+        assert!(Pin::new(&mut two).poll_next(&mut cx).is_pending());
     }
 
     #[test]

@@ -17,7 +17,9 @@ use super::{stream_failure::UpstreamClass, tonic_ext::is_the_engines_own_report}
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     worker::{
-        bootstrap_probe::{probe_partners_bootstrap_port, DeadBootstrapPort, REQUEST_PHASE},
+        health::bootstrap_probe::{
+            probe_partners_bootstrap_port, DeadBootstrapPort, REQUEST_PHASE,
+        },
         Worker,
     },
 };
@@ -136,8 +138,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE, test_support::RefusedAddress,
-        worker::BasicWorkerBuilder,
+        routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
+        worker::{test_support::RefusedAddress, BasicWorkerBuilder},
     };
 
     /// A prefill side on the loopback host whose partners are handed `port`.

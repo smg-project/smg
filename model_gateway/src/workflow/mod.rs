@@ -36,6 +36,8 @@ pub use steps::{
     // Utility functions
     group_models_into_cards,
     infer_model_type_from_id,
+    registered_entries,
+    registered_in,
     // Shared steps
     ActivateWorkersStep,
     // Classification step
@@ -56,6 +58,7 @@ pub use steps::{
     ModelInfo,
     ModelsResponse,
     RegisterWorkersStep,
+    ReleaseTokenizerStep,
     RemoveFromPolicyRegistryStep,
     RemoveFromWorkerRegistryStep,
     UpdatePoliciesForWorkerStep,

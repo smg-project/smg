@@ -1,0 +1,36 @@
+name: Codex posting token
+description: >-
+  Mints the SMG Codex Review App's one-hour installation token from the runner pod's key-proxy
+  sidecar (scripts/k8s-runner-resources/README.md), after proving this job with its GitHub
+  Actions OIDC token; the sidecar checks the signature against GitHub's keys and pins the
+  audience, the repository and the Codex workflow file. The calling job needs `id-token: write`.
+  The token is masked and returned as `token`.
+inputs:
+  proxy:
+    description: The key-proxy sidecar's address
+    required: false
+    default: http://127.0.0.1:8787
+outputs:
+  token:
+    description: The App's installation token, good for an hour
+    value: ${{ steps.mint.outputs.token }}
+runs:
+  using: composite
+  steps:
+    - id: mint
+      shell: bash
+      run: |
+        oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=ai-key-proxy" | jq -r '.value // empty')
+        if [ -z "$oidc" ]; then
+          echo "::error::this job got no GitHub OIDC token to prove itself with (id-token: write?)"
+          exit 1
+        fi
+        reply=$(curl -sS -X POST -H "Authorization: Bearer $oidc" "${{ inputs.proxy }}/github/app-token" || true)
+        token=$(jq -r '.token // empty' <<<"$reply" 2>/dev/null || true)
+        if [ -z "$token" ]; then
+          echo "::error::the key-proxy sidecar minted no posting token: ${reply:0:300}"
+          exit 1
+        fi
+        echo "::add-mask::$token"
+        echo "token=$token" >> "$GITHUB_OUTPUT"

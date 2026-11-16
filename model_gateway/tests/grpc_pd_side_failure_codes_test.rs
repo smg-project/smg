@@ -16,27 +16,46 @@
 //! typed `stream_error` event, since the response has begun. The parallel
 //! shape's prefill speaks the TokenSpeed proto and fails its stream after a
 //! chunk, for the collected answer that drains it.
+//!
+//! A worker's own `INTERNAL` before the side's first byte is the worker's
+//! definitive answer for the payload, and it meets the retry layer as that
+//! worker's alone: the rows with the retry loop at its defaults read the
+//! worker's 500 under the side's start code when the worker is the only one
+//! of its kind, a fail-over to a free worker of the kind when there is one,
+//! and the last worker's 500 once every worker of the kind has answered,
+//! never a `no_available_workers` refusal, which names an outage the healthy
+//! pair does not have. Both shapes run the rows, on the proto their runtime
+//! speaks.
 
-use std::time::Duration;
-
-use common::grpc_harness::{
-    build_grpc_router, grpc_router_config, grpc_workers, serve_canned_worker, serve_engine, Canned,
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
-use proto::generate_response::Response as GenResp;
+
+use common::{
+    decode_stream::{chunk, complete, GenerateTx},
+    engine_answers::{
+        TokenSpeedAnswers, TokenSpeedGenerateStream, VllmAnswers, VllmGenerateStream,
+    },
+    grpc_harness::{
+        build_grpc_router, grpc_router_config, grpc_workers, serve_canned_worker, serve_engine,
+        Canned,
+    },
+};
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
     tenant::TenantKey,
     worker::{RuntimeType, WorkerType},
 };
-use smg_grpc_client::{
-    common_proto as grpc_common, tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto,
-};
+use smg_grpc_client::{tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto};
 use smg_test_harness as common;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status};
-use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 
 const MODEL: &str = "pd-side-failure-codes-test-model";
 /// Tokens an engine that completes produces; ids 1..=3 are in the mock
@@ -47,8 +66,6 @@ const OUTPUT_TOKENS: u32 = 3;
 const CASE_CAP: Duration = Duration::from_secs(30);
 /// The words the failing engines put on their status.
 const REASON: &str = "the engine says no";
-
-type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
 /// What a mock engine does with a generate call.
 #[derive(Clone, Copy, Debug)]
@@ -67,35 +84,12 @@ enum Behaviour {
     FailsAfterTokens(Code),
 }
 
-/// A sequential-shape mock engine (the vLLM proto) with one behaviour.
+/// A sequential-shape mock engine (the vLLM proto) with one behaviour,
+/// counting its generate calls.
 #[derive(Clone)]
 struct Engine {
     behaviour: Behaviour,
-}
-
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete(tokens: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=tokens).collect(),
-            finish_reason: "stop".to_string(),
-            prompt_tokens: 1,
-            completion_tokens: tokens,
-            index: 0,
-            ..Default::default()
-        })),
-    }
+    calls: Arc<AtomicUsize>,
 }
 
 /// Feed one generate stream as `behaviour` says.
@@ -117,7 +111,7 @@ fn produce(tx: GenerateTx, behaviour: Behaviour) {
                 }
                 let last = match behaviour {
                     Behaviour::FailsAfterTokens(code) => Err(Status::new(code, REASON)),
-                    _ => Ok(complete(OUTPUT_TOKENS)),
+                    _ => Ok(complete("stop", OUTPUT_TOKENS)),
                 };
                 let _ = tx.send(last).await;
             }
@@ -128,103 +122,92 @@ fn produce(tx: GenerateTx, behaviour: Behaviour) {
 }
 
 #[tonic::async_trait]
-impl proto::vllm_engine_server::VllmEngine for Engine {
-    async fn start_profile(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::StartProfileRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::StopProfileRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    type GenerateStream = ReceiverStream<Result<proto::GenerateResponse, Status>>;
-
+impl VllmAnswers for Engine {
     async fn generate(
         &self,
         _request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<VllmGenerateStream>, Status> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         if let Behaviour::RefusesStart(code) = self.behaviour {
             return Err(Status::new(code, REASON));
         }
         let (tx, rx) = mpsc::channel(8);
         produce(tx, self.behaviour);
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+}
 
-    async fn abort(
-        &self,
-        _request: Request<proto::AbortRequest>,
-    ) -> Result<Response<proto::AbortResponse>, Status> {
-        Ok(Response::new(proto::AbortResponse::default()))
+/// A parallel-shape mock engine (the TokenSpeed proto) with one behaviour,
+/// counting its generate calls: it completes (`OUTPUT_TOKENS` chunks, then
+/// the completion), or refuses its call with the code before any stream.
+#[derive(Clone)]
+struct TokenSpeedEngine {
+    behaviour: Behaviour,
+    calls: Arc<AtomicUsize>,
+}
+
+fn ts_chunk(request_id: &str, id: u32) -> ts::GenerateResponse {
+    ts::GenerateResponse {
+        request_id: request_id.to_string(),
+        response: Some(ts::generate_response::Response::Chunk(
+            ts::GenerateStreamChunk {
+                token_ids: vec![id],
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                index: 0,
+                ..Default::default()
+            },
+        )),
     }
+}
 
-    async fn flush_cache(
-        &self,
-        _request: Request<grpc_common::FlushCacheRequest>,
-    ) -> Result<Response<grpc_common::FlushCacheResponse>, Status> {
-        Ok(Response::new(grpc_common::FlushCacheResponse::default()))
+fn ts_complete(request_id: &str) -> ts::GenerateResponse {
+    ts::GenerateResponse {
+        request_id: request_id.to_string(),
+        response: Some(ts::generate_response::Response::Complete(
+            ts::GenerateComplete {
+                output_ids: (1..=OUTPUT_TOKENS).collect(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 1,
+                completion_tokens: OUTPUT_TOKENS,
+                index: 0,
+                ..Default::default()
+            },
+        )),
     }
+}
 
-    async fn embed(
+#[tonic::async_trait]
+impl TokenSpeedAnswers for TokenSpeedEngine {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test mock; the producer task ends with its stream"
+    )]
+    async fn generate(
         &self,
-        _request: Request<proto::EmbedRequest>,
-    ) -> Result<Response<proto::EmbedResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<proto::HealthCheckRequest>,
-    ) -> Result<Response<proto::HealthCheckResponse>, Status> {
-        Ok(Response::new(proto::HealthCheckResponse {
-            healthy: true,
-            ..Default::default()
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<proto::GetModelInfoRequest>,
-    ) -> Result<Response<proto::GetModelInfoResponse>, Status> {
-        Ok(Response::new(proto::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<proto::GetServerInfoRequest>,
-    ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
-        Ok(Response::new(proto::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<proto::GetLoadsRequest>,
-    ) -> Result<Response<proto::GetLoadsResponse>, Status> {
-        Ok(Response::new(proto::GetLoadsResponse::default()))
-    }
-
-    type GetTokenizerStream = ReceiverStream<Result<grpc_common::GetTokenizerChunk, Status>>;
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<grpc_common::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    type SubscribeKvEventsStream = ReceiverStream<Result<grpc_common::KvEventBatch, Status>>;
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<grpc_common::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
+        request: Request<ts::GenerateRequest>,
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.behaviour {
+            Behaviour::Completes => {}
+            Behaviour::RefusesStart(code) => return Err(Status::new(code, REASON)),
+            Behaviour::FailsFirst(_) | Behaviour::FailsAfterTokens(_) => {
+                return Err(Status::unimplemented(
+                    "a stream failure is not scripted on the TokenSpeed proto here",
+                ))
+            }
+        }
+        let request_id = request.into_inner().request_id;
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            for id in 1..=OUTPUT_TOKENS {
+                if tx.send(Ok(ts_chunk(&request_id, id))).await.is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(Ok(ts_complete(&request_id))).await;
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
@@ -237,11 +220,7 @@ struct CutPrefill {
 }
 
 #[tonic::async_trait]
-impl TokenSpeedScheduler for CutPrefill {
-    type GenerateStream = ReceiverStream<Result<ts::GenerateResponse, Status>>;
-    type GetTokenizerStream = ReceiverStream<Result<grpc_common::GetTokenizerChunk, Status>>;
-    type SubscribeKvEventsStream = ReceiverStream<Result<grpc_common::KvEventBatch, Status>>;
-
+impl TokenSpeedAnswers for CutPrefill {
     #[expect(
         clippy::disallowed_methods,
         reason = "test mock; the producer task ends with its two items"
@@ -249,7 +228,7 @@ impl TokenSpeedScheduler for CutPrefill {
     async fn generate(
         &self,
         request: Request<ts::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
         let request_id = request.into_inner().request_id;
         let code = self.code;
         let (tx, rx) = mpsc::channel(2);
@@ -271,92 +250,60 @@ impl TokenSpeedScheduler for CutPrefill {
             }
             let _ = tx.send(Err(Status::new(code, REASON))).await;
         });
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<ts::HealthCheckRequest>,
-    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        Ok(Response::new(ts::HealthCheckResponse {
-            healthy: true,
-            message: "ok".to_string(),
-        }))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<ts::AbortRequest>,
-    ) -> Result<Response<ts::AbortResponse>, Status> {
-        Ok(Response::new(ts::AbortResponse {
-            success: true,
-            message: String::new(),
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<ts::GetModelInfoRequest>,
-    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-        Ok(Response::new(ts::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<ts::GetServerInfoRequest>,
-    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        Ok(Response::new(ts::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<ts::GetLoadsRequest>,
-    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        Ok(Response::new(ts::GetLoadsResponse::default()))
-    }
-
-    async fn flush_cache(
-        &self,
-        _request: Request<grpc_common::FlushCacheRequest>,
-    ) -> Result<Response<grpc_common::FlushCacheResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn start_profile(
-        &self,
-        _request: Request<grpc_common::StartProfileRequest>,
-    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<grpc_common::StopProfileRequest>,
-    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<grpc_common::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<grpc_common::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
 /// Serve a sequential-shape mock engine in-process; returns its port.
 async fn start_engine(behaviour: Behaviour) -> u16 {
-    serve_engine(proto::vllm_engine_server::VllmEngineServer::new(Engine {
-        behaviour,
-    }))
-    .await
+    start_engine_of(RuntimeType::Vllm, behaviour).await.0
+}
+
+/// Serve a mock engine with `behaviour` in-process, on the proto `runtime`'s
+/// dispatch shape speaks (the vLLM proto for the sequential shape, the
+/// TokenSpeed proto for the parallel one); returns its port and its count of
+/// generate calls.
+async fn start_engine_of(runtime: RuntimeType, behaviour: Behaviour) -> (u16, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let port = match runtime {
+        RuntimeType::TokenSpeed => {
+            serve_engine(
+                TokenSpeedEngine {
+                    behaviour,
+                    calls: Arc::clone(&calls),
+                }
+                .into_server(),
+            )
+            .await
+        }
+        _ => {
+            serve_engine(
+                Engine {
+                    behaviour,
+                    calls: Arc::clone(&calls),
+                }
+                .into_server(),
+            )
+            .await
+        }
+    };
+    (port, calls)
+}
+
+/// A PD gRPC router over `workers`, registered as `runtime` (which picks the
+/// dispatch shape), with the retry loop at its defaults and round-robin role
+/// policies, so the first request goes to the first registered worker of
+/// each role: the rows that read how a worker's own answer meets the retry
+/// layer.
+async fn build_retrying_pd_router(
+    workers: &[(u16, WorkerType)],
+    runtime: RuntimeType,
+) -> Box<dyn RouterTrait> {
+    let config = grpc_router_config()
+        .prefill_decode_mode(vec![], vec![])
+        .round_robin_policy()
+        .build_unchecked();
+    build_grpc_router(config, MODEL, grpc_workers(workers, runtime, MODEL)).await
 }
 
 /// A PD gRPC router over `prefill_port` and `decode_port`, registered as
@@ -564,6 +511,25 @@ async fn a_side_failure_is_named_by_the_shared_vocabulary_on_the_sequential_shap
     );
 }
 
+/// Both sides complete: the answer's usage carries the token count the
+/// decode's completion scripted, so the count the rows' engines send is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completing_pair_answers_with_the_scripted_completion_count() {
+    let prefill_port = start_engine(Behaviour::Completes).await;
+    let decode_port = start_engine(Behaviour::Completes).await;
+    let router = build_pd_router(prefill_port, decode_port, RuntimeType::Vllm).await;
+
+    let (status, body) = one_chat(router.as_ref(), false).await;
+
+    assert_eq!(status, http::StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON answer");
+    assert_eq!(
+        json["usage"]["completion_tokens"].as_u64(),
+        Some(u64::from(OUTPUT_TOKENS)),
+        "the usage carries the decode's completion count: {body}"
+    );
+}
+
 /// A decode stream that fails once the streamed response began, at its
 /// first item or after its tokens, cannot change the status: the typed
 /// `stream_error` event ends the stream, with the engine's words, as the HTTP
@@ -598,9 +564,12 @@ async fn a_decode_stream_that_fails_after_the_response_began_ends_with_the_typed
 /// sequential shape's drain gives it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_parallel_prefill_cut_after_it_began_is_its_stream_failure_on_a_collected_answer() {
-    let prefill_port = serve_engine(TokenSpeedSchedulerServer::new(CutPrefill {
-        code: Code::Internal,
-    }))
+    let prefill_port = serve_engine(
+        CutPrefill {
+            code: Code::Internal,
+        }
+        .into_server(),
+    )
     .await;
     let decode_port = serve_canned_worker(Canned {
         model: MODEL,
@@ -616,4 +585,162 @@ async fn a_parallel_prefill_cut_after_it_began_is_its_stream_failure_on_a_collec
     let (code, message) = envelope(&body);
     assert_eq!(code, "prefill_stream_error", "{body}");
     assert_eq!(message, format!("Prefill stream error: {REASON}"), "{body}");
+}
+
+/// The two dispatch shapes the rows below run on, by the runtime that picks
+/// each.
+const SHAPES: [RuntimeType; 2] = [RuntimeType::Vllm, RuntimeType::TokenSpeed];
+
+/// The sole worker of a side's kind answers its own `INTERNAL` before the
+/// side's first byte, with the retry loop at its defaults: the worker's 500
+/// under the side's start code is the client's answer on both shapes, with
+/// the worker's words. No worker of the kind is left to take the request, so
+/// the answer stands; it is not replaced by a `no_available_workers` refusal,
+/// which would name an outage the healthy pair does not have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sole_workers_own_500_before_its_first_byte_is_the_clients_answer_on_both_shapes() {
+    use Behaviour::{Completes, RefusesStart};
+    use Side::{Decode, Prefill};
+
+    let mut mismatches = Vec::new();
+    for runtime in SHAPES {
+        for (side, code) in [
+            (Prefill, "prefill_worker_failed_to_start"),
+            (Decode, "decode_worker_failed_to_start"),
+        ] {
+            let (prefill, decode) = match side {
+                Prefill => (RefusesStart(Code::Internal), Completes),
+                Decode => (Completes, RefusesStart(Code::Internal)),
+            };
+            let (prefill_port, prefill_calls) = start_engine_of(runtime, prefill).await;
+            let (decode_port, decode_calls) = start_engine_of(runtime, decode).await;
+            let router = build_retrying_pd_router(
+                &[
+                    (prefill_port, WorkerType::Prefill),
+                    (decode_port, WorkerType::Decode),
+                ],
+                runtime,
+            )
+            .await;
+
+            let (answered, body) = one_chat(router.as_ref(), false).await;
+
+            let (answered_code, message) = envelope(&body);
+            let right = answered == http::StatusCode::INTERNAL_SERVER_ERROR
+                && answered_code == code
+                && message.ends_with(REASON);
+            if !right {
+                mismatches.push(format!(
+                    "{runtime:?} {side:?}: expected 500 {code} ...{REASON:?}, got {} {answered_code} {message:?}",
+                    answered.as_u16()
+                ));
+            }
+            // The side that answered was asked once: a terminal first answer,
+            // not a replay that ran the retries out. The other side's count
+            // stays out of it: on the sequential shape a refused prefill means
+            // the decode is never called.
+            let answering_calls = match side {
+                Prefill => &prefill_calls,
+                Decode => &decode_calls,
+            };
+            if answering_calls.load(Ordering::SeqCst) != 1 {
+                mismatches.push(format!(
+                    "{runtime:?} {side:?}: the worker that answered was asked {} times, not once",
+                    answering_calls.load(Ordering::SeqCst)
+                ));
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "the worker's own answer is not the client's:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// One decode worker answers its own `INTERNAL` before the side's first byte
+/// while another decode worker is free: the retry window closes on the worker
+/// that answered, not on the pair, so the request moves to the free decode
+/// worker with the same prefill and is answered, on both shapes; the worker
+/// that answered is not asked again for the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_decode_workers_own_500_fails_over_to_the_free_decode_worker_on_both_shapes() {
+    use Behaviour::{Completes, RefusesStart};
+
+    for runtime in SHAPES {
+        let (prefill_port, _) = start_engine_of(runtime, Completes).await;
+        let (answering_port, answering_calls) =
+            start_engine_of(runtime, RefusesStart(Code::Internal)).await;
+        let (free_port, free_calls) = start_engine_of(runtime, Completes).await;
+        // Round robin: the first request's decode side is the first decode
+        // worker registered, the one that answers 500.
+        let router = build_retrying_pd_router(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (answering_port, WorkerType::Decode),
+                (free_port, WorkerType::Decode),
+            ],
+            runtime,
+        )
+        .await;
+
+        let (status, body) = one_chat(router.as_ref(), false).await;
+
+        assert_eq!(status, http::StatusCode::OK, "{runtime:?}: {body}");
+        assert_eq!(
+            answering_calls.load(Ordering::SeqCst),
+            1,
+            "{runtime:?}: the decode worker that answered is asked once, never again for the request"
+        );
+        assert_eq!(
+            free_calls.load(Ordering::SeqCst),
+            1,
+            "{runtime:?}: the free decode worker takes the request"
+        );
+    }
+}
+
+/// Every decode worker answered its own `INTERNAL` before the side's first
+/// byte: no worker of the kind is left, and the last worker's 500 under the
+/// side's start code stands as the client's answer on both shapes, each
+/// worker asked once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn once_every_decode_worker_answered_its_own_500_the_last_answer_stands_on_both_shapes() {
+    use Behaviour::{Completes, RefusesStart};
+
+    for runtime in SHAPES {
+        let (prefill_port, _) = start_engine_of(runtime, Completes).await;
+        let (first_port, first_calls) =
+            start_engine_of(runtime, RefusesStart(Code::Internal)).await;
+        let (second_port, second_calls) =
+            start_engine_of(runtime, RefusesStart(Code::Internal)).await;
+        let router = build_retrying_pd_router(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (first_port, WorkerType::Decode),
+                (second_port, WorkerType::Decode),
+            ],
+            runtime,
+        )
+        .await;
+
+        let (status, body) = one_chat(router.as_ref(), false).await;
+
+        assert_eq!(
+            status,
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "{runtime:?}: {body}"
+        );
+        let (code, message) = envelope(&body);
+        assert_eq!(code, "decode_worker_failed_to_start", "{runtime:?}: {body}");
+        assert!(message.ends_with(REASON), "{runtime:?}: {body}");
+        assert_eq!(
+            (
+                first_calls.load(Ordering::SeqCst),
+                second_calls.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "{runtime:?}: each decode worker is asked once"
+        );
+    }
 }

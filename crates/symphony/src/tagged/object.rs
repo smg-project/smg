@@ -9,10 +9,12 @@
 //! member: a declared string streamed from its first fragment and closed with its quote, a string
 //! that may be null held until its text says, any other value written whole at its close.
 
+use std::borrow::Cow;
+
 use crate::{
     event::{Event, Events, MalformedReason, Text},
     tagged::{
-        assembler::{push_escaped, push_quoted},
+        assembler::{escaped, push_escaped, push_quoted},
         value::NULL_WORDS,
     },
 };
@@ -61,7 +63,12 @@ impl Object {
     }
 
     /// A fragment of the arguments, with `source` as the bytes it accounts for.
-    pub(super) fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
+    pub(super) fn push_fragment<'d>(
+        &self,
+        json: impl Into<Cow<'d, str>>,
+        source: Text<'d>,
+        out: &mut Events<'d>,
+    ) {
         out.push(Event::ToolCallArguments {
             index: self.index,
             json: json.into(),
@@ -91,28 +98,29 @@ impl Object {
     /// The next bytes of the value under `key`, whose text starts at `start` in the carried
     /// bytes, by its `mode`: a whole value is carried to its close; a string that may be null is
     /// carried until its text rules the null words out, then opened and streamed; a declared
-    /// string is streamed as it arrives.
-    pub(super) fn value_bytes(
+    /// string is streamed as it arrives. The bytes are the delta's (`Cow::Borrowed`, which a
+    /// streamed piece's fragment keeps) or the assembler's own (`Cow::Owned`: bytes it held).
+    pub(super) fn value_bytes<'d>(
         &mut self,
         key: &str,
         start: usize,
         mode: &mut Mode,
-        text: &str,
-        out: &mut Events,
+        text: Cow<'d, str>,
+        out: &mut Events<'d>,
     ) {
         if text.is_empty() {
             return;
         }
         match *mode {
-            Mode::Whole => self.carried.push_str(text),
+            Mode::Whole => self.carried.push_str(&text),
             Mode::Undecided => {
-                self.carried.push_str(text);
+                self.carried.push_str(&text);
                 let so_far = &self.carried[start..];
                 if !NULL_WORDS.iter().any(|word| word.starts_with(so_far)) {
                     // Not null after all: open the string and stream what arrived.
                     let arrived = self.carried.split_off(start);
                     *mode = Mode::Streaming { opened: false };
-                    self.stream(key, mode, &arrived, out);
+                    self.stream(key, mode, Cow::Owned(arrived), out);
                 }
             }
             Mode::Streaming { .. } => self.stream(key, mode, text, out),
@@ -120,9 +128,11 @@ impl Object {
     }
 
     /// A piece of the streamed string under `key`: the member opens on the first, `{"key": "` or
-    /// `, "key": "` with the carried bytes as its source; every piece is pushed escaped, as its
-    /// own source.
-    fn stream(&mut self, key: &str, mode: &mut Mode, text: &str, out: &mut Events) {
+    /// `, "key": "` with the carried bytes as its source; every piece is pushed as its own
+    /// source. A piece of the delta reaches its fragment borrowed, text and source alike, as the
+    /// JSON syntax's fragments do; its text is escaped into a copy where a character needs it,
+    /// and a piece the assembler held is the fragment's own.
+    fn stream<'d>(&mut self, key: &str, mode: &mut Mode, text: Cow<'d, str>, out: &mut Events<'d>) {
         let Mode::Streaming { opened } = mode else {
             return;
         };
@@ -139,9 +149,15 @@ impl Object {
         if text.is_empty() {
             return;
         }
-        let mut json = String::with_capacity(text.len());
-        push_escaped(&mut json, text);
-        self.push_fragment(json, Text::uncounted(text.to_owned()), out);
+        let (json, source) = match text {
+            Cow::Borrowed(text) => (escaped(text), Text::uncounted(text)),
+            Cow::Owned(text) => {
+                let mut json = String::with_capacity(text.len());
+                push_escaped(&mut json, &text);
+                (Cow::Owned(json), Text::uncounted(text))
+            }
+        };
+        self.push_fragment(json, source, out);
     }
 
     /// A member written whole: `"key": json` after the separator, counted as written.
@@ -190,7 +206,7 @@ mod tests {
         object.close_member(first, "</v>", &mut out);
         let mut mode = Mode::Streaming { opened: false };
         object.carried.push_str("<v>");
-        object.value_bytes("b", 0, &mut mode, "x\"y", &mut out);
+        object.value_bytes("b", 0, &mut mode, "x\"y".into(), &mut out);
         object.close_member("\"".to_string(), "</v>", &mut out);
         object.close(Text::uncounted("</f>"), &mut out);
         assert_eq!(
@@ -217,10 +233,10 @@ mod tests {
         let mut out = Events::new();
         let mut mode = Mode::Undecided;
         let start = object.carried.len();
-        object.value_bytes("k", start, &mut mode, "nu", &mut out);
+        object.value_bytes("k", start, &mut mode, "nu".into(), &mut out);
         assert!(out.is_empty(), "held: {:?}", out.as_slice());
         assert!(matches!(mode, Mode::Undecided));
-        object.value_bytes("k", start, &mut mode, "mber", &mut out);
+        object.value_bytes("k", start, &mut mode, "mber".into(), &mut out);
         assert!(matches!(mode, Mode::Streaming { opened: true }));
         assert_eq!(
             fragments(&out),
@@ -231,7 +247,7 @@ mod tests {
         );
         let mut whole = Object::new(0);
         let mut mode = Mode::Whole;
-        whole.value_bytes("k", 0, &mut mode, "12", &mut out);
+        whole.value_bytes("k", 0, &mut mode, "12".into(), &mut out);
         assert_eq!(whole.carried, "12");
     }
 

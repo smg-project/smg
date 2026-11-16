@@ -9,12 +9,13 @@ use uuid::Uuid;
 use crate::tenant::TenantKey;
 
 /// What a reservation attempt asks for. `model_id` is optional — when
-/// absent, model-rule scoping is skipped.
+/// absent, model-rule scoping is skipped; it is borrowed from the request
+/// for the reserve call, which reads it once against the tenant's rules.
 #[derive(Debug, Clone)]
-pub struct ReserveRequest {
+pub struct ReserveRequest<'a> {
     pub request_charge_id: Uuid,
     pub tenant_key: TenantKey,
-    pub model_id: Option<String>,
+    pub model_id: Option<&'a str>,
     pub estimated_input_tokens: u32,
 }
 
@@ -50,7 +51,7 @@ pub struct UsageSettlement {
 /// so retries reuse one reservation.
 #[async_trait]
 pub trait RateLimitBackend: Send + Sync {
-    async fn reserve(&self, request: ReserveRequest) -> ReserveOutcome;
+    async fn reserve(&self, request: ReserveRequest<'_>) -> ReserveOutcome;
 
     /// Settle from final, authoritative usage. Idempotent: a no-op if the
     /// reservation was already settled/closed/abandoned.

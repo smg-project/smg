@@ -129,7 +129,7 @@ impl Glm4MoeParser {
                     "begin": format!("<tool_call>{}", tool.function.name),
                     "content": {
                         "type": "json_schema",
-                        "json_schema": tool.function.parameters,
+                        "json_schema": tool.function.parameters_schema(),
                         "style": "glm_xml",
                     },
                     "end": "</tool_call>",
@@ -485,7 +485,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict,
                 extra: Default::default(),
             },
@@ -590,7 +590,7 @@ mod tests {
             function: Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: serde_json::json!({"type": "object", "properties": props}),
+                parameters: Some(serde_json::json!({"type": "object", "properties": props})),
                 strict: None,
                 extra: Default::default(),
             },

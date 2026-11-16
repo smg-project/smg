@@ -79,7 +79,7 @@ fn model_config_is_kimi(config: &Value) -> bool {
     let model_type = config.get("model_type").and_then(Value::as_str);
     matches!(
         model_type,
-        Some("kimi_k2") | Some("kimi_k25") | Some("kimi_k3")
+        Some("kimi_k2") | Some("kimi_k25") | Some("kimi_k3") | Some("kimi_k31")
     )
 }
 
@@ -224,20 +224,25 @@ mod tests {
 
     #[test]
     fn matches_via_model_type_kimi_k3() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("tiktoken.model"), MINIMAL_TIKTOKEN_MODEL).unwrap();
-        std::fs::write(
-            dir.path().join("tokenizer_config.json"),
-            r#"{ "added_tokens_decoder": {} }"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("config.json"),
-            r#"{ "model_type": "kimi_k3" }"#,
-        )
-        .unwrap();
+        for model_type in ["kimi_k3", "kimi_k31"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("tiktoken.model"), MINIMAL_TIKTOKEN_MODEL).unwrap();
+            std::fs::write(
+                dir.path().join("tokenizer_config.json"),
+                r#"{ "added_tokens_decoder": {} }"#,
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("config.json"),
+                format!(r#"{{ "model_type": "{model_type}" }}"#),
+            )
+            .unwrap();
 
-        assert!(matches(tokenizer_config(dir.path()).as_ref(), dir.path()));
+            assert!(
+                matches(tokenizer_config(dir.path()).as_ref(), dir.path()),
+                "{model_type}"
+            );
+        }
     }
 
     #[test]

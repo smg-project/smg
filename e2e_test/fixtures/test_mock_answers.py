@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from fixtures.mock_answers import MockAnswers
+from fixtures.mock_answers import (
+    MockAnswers,
+    class_workers,
+    clear_class_workers,
+    set_class_workers,
+)
 from infra.constants import WorkerType
 from infra.worker import Worker
 from tokenizers import Tokenizer, decoders, pre_tokenizers
@@ -152,6 +157,42 @@ def test_an_answer_with_logprobs_is_a_no_op_without_a_mock_worker(monkeypatch):
     answers.enqueue_with_logprobs("Paris.")
 
     assert answers.enqueued == 0
+
+
+def test_a_scoring_answer_states_its_token_id_logprobs_on_no_tokens(monkeypatch):
+    posted = []
+
+    def post(url, json, timeout):
+        posted.append(json)
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(httpx, "get", _nothing_served)
+    worker = Worker(model_id="twin", engine="mock", port=1, gpu_ids=[], admin_port=2)
+    answers = MockAnswers(workers=[worker])
+    answers.enqueue_scores([-0.2, -1.6])
+    assert posted == [{"output_text": "", "token_id_logprobs": [-0.2, -1.6]}]
+    assert answers.enqueued == 1
+    # No worker, no post: a real engine scores on its own.
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: pytest.fail("no worker, no post"))
+    assert MockAnswers().enqueue_scores([-0.2]) is None
+
+
+def test_a_scoring_answer_on_a_harmony_model_rides_on_no_channel(monkeypatch):
+    # An answer of no tokens has no channel: the posted text stays empty where
+    # a text answer of this class would ride on the final channel.
+    posted = []
+
+    def post(url, json, timeout):
+        posted.append(json)
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(httpx, "get", _nothing_served)
+    answers = MockAnswers(workers=[_harmony_worker()])
+    assert answers.harmony
+    answers.enqueue_scores([-0.2, -1.6])
+    assert posted == [{"output_text": "", "token_id_logprobs": [-0.2, -1.6]}]
 
 
 def _nothing_served(url, timeout):
@@ -375,3 +416,24 @@ def test_the_copies_left_on_the_other_workers_are_dropped_once_every_stated_answ
     answers.enqueue("blue", prompt_contains="colour")
     assert deleted == [], "marigold is still waiting"
     assert answers.leftovers() == 2
+
+
+def test_the_class_workers_are_read_in_every_role_as_a_copy():
+    encode = Worker(
+        model_id="twin",
+        engine="mock",
+        port=300,
+        gpu_ids=[],
+        worker_type=WorkerType.ENCODE,
+        admin_port=400,
+    )
+    decodes = _decodes(2)
+    set_class_workers([encode, *decodes])
+    try:
+        workers = class_workers()
+        assert workers == [encode, *decodes], "every role, in the order the backend set"
+        workers.clear()
+        assert len(class_workers()) == 3, "a copy: the class's list is not the caller's to change"
+    finally:
+        clear_class_workers()
+    assert class_workers() == []

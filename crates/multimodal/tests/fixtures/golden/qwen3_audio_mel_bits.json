@@ -1,0 +1,118 @@
+{
+  "digest": "FNV-1a over the little-endian f32 bits of encoder_input",
+  "purpose": "bit-identity gate; audio_mel_parity is a 1e-3 tolerance test and cannot distinguish bit-identical from merely close",
+  "cases": [
+    {
+      "name": "sine",
+      "sample_rate": 16000,
+      "samples": 48000,
+      "shape": [1, 128, 300],
+      "feature_token_counts": [39],
+      "fnv1a_f32": "0364e9eb24eddab8"
+    },
+    {
+      "name": "white_noise",
+      "sample_rate": 16000,
+      "samples": 48000,
+      "shape": [1, 128, 300],
+      "feature_token_counts": [39],
+      "fnv1a_f32": "e7e1314a694099bf"
+    },
+    {
+      "name": "impulse",
+      "sample_rate": 16000,
+      "samples": 48000,
+      "shape": [1, 128, 300],
+      "feature_token_counts": [39],
+      "fnv1a_f32": "da9d4dfd04181410"
+    },
+    {
+      "name": "very_quiet",
+      "sample_rate": 16000,
+      "samples": 48000,
+      "shape": [1, 128, 300],
+      "feature_token_counts": [39],
+      "fnv1a_f32": "0bd8e53208e79325"
+    },
+    {
+      "name": "loud_square",
+      "sample_rate": 16000,
+      "samples": 48000,
+      "shape": [1, 128, 300],
+      "feature_token_counts": [39],
+      "fnv1a_f32": "138b584bf36262a8"
+    },
+    {
+      "name": "silence_then_tone",
+      "sample_rate": 16000,
+      "samples": 48000,
+      "shape": [1, 128, 300],
+      "feature_token_counts": [39],
+      "fnv1a_f32": "99d13981be08c68f"
+    },
+    {
+      "name": "alternating_nyquist",
+      "sample_rate": 16000,
+      "samples": 48000,
+      "shape": [1, 128, 300],
+      "feature_token_counts": [39],
+      "fnv1a_f32": "dd66203a8686b3bd"
+    },
+    {
+      "name": "silence",
+      "sample_rate": 16000,
+      "samples": 4800,
+      "shape": [1, 128, 30],
+      "feature_token_counts": [4],
+      "fnv1a_f32": "24c8cb1a5c8f7b25"
+    },
+    {
+      "name": "sub_window",
+      "sample_rate": 16000,
+      "samples": 300,
+      "shape": [1, 128, 1],
+      "feature_token_counts": [1],
+      "fnv1a_f32": "eea5c56e028f10e8"
+    },
+    {
+      "name": "single_hop",
+      "sample_rate": 16000,
+      "samples": 160,
+      "shape": [1, 128, 1],
+      "feature_token_counts": [1],
+      "fnv1a_f32": "9c94f1ae47420c01"
+    },
+    {
+      "name": "ragged_length",
+      "sample_rate": 16000,
+      "samples": 1237,
+      "shape": [1, 128, 7],
+      "feature_token_counts": [1],
+      "fnv1a_f32": "671d0578032b101b"
+    },
+    {
+      "name": "resample_44100",
+      "sample_rate": 44100,
+      "samples": 44100,
+      "shape": [1, 128, 100],
+      "feature_token_counts": [13],
+      "fnv1a_f32": "09c50c64c72d03cd"
+    },
+    {
+      "name": "resample_48000",
+      "sample_rate": 48000,
+      "samples": 48000,
+      "shape": [1, 128, 100],
+      "feature_token_counts": [13],
+      "fnv1a_f32": "05c341d408fd6cdf"
+    },
+    {
+      "name": "resample_8000",
+      "sample_rate": 8000,
+      "samples": 8000,
+      "shape": [1, 128, 100],
+      "feature_token_counts": [13],
+      "fnv1a_f32": "393d7939d4ba0e17"
+    }
+  ]
+}

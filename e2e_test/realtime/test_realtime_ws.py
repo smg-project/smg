@@ -8,7 +8,7 @@ Tests the gateway's ability to proxy OpenAI Realtime API WebSocket sessions:
 - Error handling (invalid events, missing model, missing auth)
 
 Prerequisites:
-- OPENAI_API_KEY environment variable set
+- Explicit E2E_AI_KEY_PROXY, or OPENAI_API_KEY for direct developer mode
 - ``websockets`` pip package installed
 
 Usage:
@@ -20,15 +20,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from contextlib import asynccontextmanager
 
 import pytest
 import websockets
+from infra.cloud_credentials import resolve_cloud_credentials
 
 logger = logging.getLogger(__name__)
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 REALTIME_MODEL = "gpt-realtime"
 RECV_TIMEOUT = 30  # seconds — cloud latency can be high
 
@@ -131,7 +130,8 @@ def gateway():
     """Launch a cloud gateway in OpenAI mode for realtime tests."""
     from infra import launch_cloud_gateway
 
-    if not OPENAI_API_KEY:
+    credentials = resolve_cloud_credentials("openai", require_key=False)
+    if not credentials.api_key:
         pytest.skip("OPENAI_API_KEY not set")
 
     gw = launch_cloud_gateway("openai", history_backend="memory")
@@ -148,9 +148,8 @@ def ws_url(gateway):
 @pytest.fixture()
 def ws_headers():
     """Build the WebSocket connection headers."""
-    return {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-    }
+    credentials = resolve_cloud_credentials("openai")
+    return {"Authorization": f"Bearer {credentials.api_key}"}
 
 
 # ---------------------------------------------------------------------------

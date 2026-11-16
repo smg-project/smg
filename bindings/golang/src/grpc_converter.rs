@@ -1,7 +1,7 @@
 //! gRPC response converter FFI functions
 
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry, HashMap},
     ffi::{CStr, CString},
     os::raw::{c_char, c_int},
     ptr,
@@ -15,41 +15,41 @@ use openai_protocol::{
     chat::{
         ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
     },
-    common::{
-        FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage,
-    },
+    common::{StringOrArray, Tool, ToolChoice, Usage},
 };
 use serde_json::Value;
 use smg::routers::grpc::utils::create_stop_decoder;
 use smg_grpc_client::sglang_proto::{self as proto, generate_complete::MatchedStop};
-use tool_parser::{types::ToolCallItem, ToolParser};
 
 use super::{
     chat_stream::fingerprint_of,
     error::{clear_error_message, set_error_message, SglErrorCode},
-    forced_tool_choice::tool_parser_for,
     proto_parse::parse_proto_response,
-    runtime::RUNTIME,
+    reader::{engine_finish, Reader, Reading},
     stream_state::{StreamIndexState, StreamStateManager},
     tokenizer::TokenizerHandle,
-    utils::generate_tool_call_id,
 };
 
 /// Handle for gRPC response converter (maintains state for streaming)
 #[repr(C)]
 pub struct GrpcResponseConverterHandle {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    /// The tool parser of each choice, by choice index (see `tool_parser_output`).
-    pub(crate) tool_parsers: HashMap<u32, Option<Box<dyn ToolParser>>>,
+    /// The reader of each choice, by choice index (see `reader_of`).
+    pub(crate) readers: HashMap<u32, Reader>,
     pub(crate) stop: Option<StringOrArray>,
     pub(crate) stop_token_ids: Option<Vec<u32>>,
     pub(crate) model: String,
     pub(crate) request_id: String,
     pub(crate) created: u64,
     pub(crate) system_fingerprint: Option<String>,
-    pub(crate) tools: Option<Vec<Tool>>,
-    pub(crate) tool_choice: Option<ToolChoice>,
-    pub(crate) history_tool_calls_count: usize,
+    /// What the request's output is read with (`reader::Reading`), shared by
+    /// the readers of its choices.
+    pub(crate) reading: Reading,
+    /// The part of the rendered prompt the readers replay
+    /// (`reader::Reading::replay`): from the table's last turn opener, the
+    /// prompt itself for a table that names none; empty from the C entry
+    /// point, which does not receive the prompt.
+    pub(crate) prompt: String,
     pub(crate) stream_state: StreamStateManager,
     pub(crate) initial_prompt_tokens: Option<u32>,
     pub(crate) skip_special_tokens: bool,
@@ -72,6 +72,11 @@ pub struct GrpcResponseConverterHandle {
 ///   the chunks' `system_fingerprint`; may be null or blank for the gateway's
 ///   `default`
 /// * `error_out` - Optional pointer to receive error message
+///
+/// Neither the request's `separate_reasoning` nor its rendered prompt is
+/// among the arguments: the converter reads a thought apart from the
+/// content, the API's default, and its readers start at the table's first
+/// state.
 ///
 /// The parameter order is the Go prototype's (`internal/ffi/grpc_converter.go`);
 /// the two must change together.
@@ -177,6 +182,8 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
         skip_special_tokens != 0,
         tools,
         tool_choice,
+        true,
+        "",
         stop,
         stop_token_ids,
     );
@@ -186,9 +193,12 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
 }
 
 impl GrpcResponseConverterHandle {
-    /// A converter over one request's stream: the tools its parser resolves
-    /// calls against, its tool choice and its stops; the clock stamps
-    /// `created`.
+    /// A converter over one request's stream: what its readers read the
+    /// output with (the request's `tools`, `None` when it declares none, its
+    /// `tool_choice` and whether it separates the reasoning from the content:
+    /// `reader::Reading`), the part of the rendered `prompt` they replay, and
+    /// its stops;
+    /// the clock stamps `created`.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         tokenizer: Arc<dyn Tokenizer>,
@@ -197,12 +207,21 @@ impl GrpcResponseConverterHandle {
         skip_special_tokens: bool,
         tools: Option<Vec<Tool>>,
         tool_choice: Option<ToolChoice>,
+        separate_reasoning: bool,
+        prompt: &str,
         stop: Option<StringOrArray>,
         stop_token_ids: Option<Vec<u32>>,
     ) -> Self {
+        let reading = Reading::of(
+            &model,
+            tools.as_deref(),
+            tool_choice.as_ref(),
+            separate_reasoning,
+        );
+        let prompt = reading.replay(prompt).to_owned();
         Self {
             tokenizer,
-            tool_parsers: HashMap::new(),
+            readers: HashMap::new(),
             stop,
             stop_token_ids,
             model,
@@ -217,9 +236,8 @@ impl GrpcResponseConverterHandle {
             // The engine's weight version, set by the stream or the FFI
             // constructor that knows it.
             system_fingerprint: None,
-            tools,
-            tool_choice,
-            history_tool_calls_count: 0,
+            reading,
+            prompt,
             stream_state: StreamStateManager::new(),
             initial_prompt_tokens: None,
             skip_special_tokens,
@@ -228,11 +246,15 @@ impl GrpcResponseConverterHandle {
 
     /// The converter of a chat request's stream: its effective tools
     /// (request-level and message-declared, the set its constraint was built
-    /// from), its tool choice and its stops.
+    /// from; `None` when it declares none, so the output is scanned for calls
+    /// exactly when the gateway scans it), its tool choice, whether it
+    /// separates the reasoning, the part of the rendered `prompt` its readers replay,
+    /// and its stops.
     pub(crate) fn for_chat(
         tokenizer: Arc<dyn Tokenizer>,
         request: &ChatCompletionRequest,
         request_id: String,
+        prompt: &str,
     ) -> Self {
         let tools: Vec<Tool> = request.effective_tools().cloned().collect();
         Self::new(
@@ -240,8 +262,10 @@ impl GrpcResponseConverterHandle {
             request.model.clone(),
             request_id,
             request.skip_special_tokens,
-            (!tools.is_empty()).then_some(tools),
+            request.declares_tools().then_some(tools),
             request.tool_choice.clone(),
+            request.separate_reasoning,
+            prompt,
             request.stop.clone(),
             request.stop_token_ids.clone(),
         )
@@ -305,12 +329,7 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_convert_chunk(
     let handle_ref = &mut *handle;
     let tokenizer = Arc::clone(&handle_ref.tokenizer);
 
-    // Use tokio runtime to run async code
-    let result = RUNTIME.block_on(async {
-        convert_proto_chunk_to_openai(proto_response, handle_ref, &tokenizer).await
-    });
-
-    match result {
+    match convert_proto_chunk_to_openai(proto_response, handle_ref, &tokenizer) {
         Ok(Some(openai_response)) => {
             // Serialize to JSON
             let result_str = match serde_json::to_string(&openai_response) {
@@ -347,133 +366,38 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_convert_chunk(
     }
 }
 
-/// Whether a tool parser reads this stream: tools declared and a tool choice
-/// that allows calls.
-fn tool_parsing_on(handle: &GrpcResponseConverterHandle) -> bool {
-    handle.tools.is_some()
-        && !matches!(
-            handle.tool_choice.as_ref(),
-            Some(ToolChoice::Value(ToolChoiceValue::None))
-        )
-}
-
-/// What the choice's parser released for `text`: its text (a value that is
-/// not a declared call, a marker prefix) and its calls, both empty while it
-/// holds the text as a prospective call. `None` when no parser reads the
-/// stream: the text is content as it is. A parser error keeps the converter's
-/// fallback: the text is content.
-///
-/// Every choice of an `n > 1` request has its own parser, created on the
-/// choice's first text from the request's tool choice (the model's parser, or
-/// the generic reader of a forced choice, see `tool_parser_for`) and owned by
-/// the handle, as the gateway's streaming path owns its parsers: a parser's
-/// state, its buffer and whether it announced a call's name, belongs to one
-/// choice, so the choices never share one.
-async fn tool_parser_output(
-    handle: &mut GrpcResponseConverterHandle,
-    index: u32,
-    text: &str,
-) -> Option<(String, Vec<ToolCallDelta>)> {
-    if !tool_parsing_on(handle) {
-        return None;
-    }
-    if text.is_empty() {
-        return Some((String::new(), Vec::new()));
-    }
+/// The reader of the choice at `index`, created on the choice's first step
+/// from the request's reading (`reader::Reading`: the model's table, or the
+/// table of a forced choice) and owned by the handle, as the gateway's
+/// streaming path owns its readers: a reader's state, what it holds as a
+/// prospective call and the calls it started, belongs to one choice, so the
+/// choices of an `n > 1` request never share one.
+fn reader_of(handle: &mut GrpcResponseConverterHandle, index: u32) -> Result<&mut Reader, String> {
     let GrpcResponseConverterHandle {
-        tool_parsers,
-        tools,
-        model,
-        tool_choice,
-        history_tool_calls_count,
+        readers,
+        reading,
+        prompt,
         ..
     } = handle;
-    let parser = tool_parsers
-        .entry(index)
-        .or_insert_with(|| tool_parser_for(model, tool_choice.as_ref()))
-        .as_mut()?;
-    let tools = tools.as_deref()?;
-    match parser.parse_incremental(text, tools).await {
-        Ok(result) => Some((
-            result.normal_text,
-            result
-                .calls
-                .into_iter()
-                .map(|item| tool_call_delta(model, *history_tool_calls_count, item))
-                .collect(),
-        )),
-        Err(error) => {
-            tracing::warn!("Tool parser error: {}", error);
-            Some((text.to_string(), Vec::new()))
-        }
-    }
-}
-
-/// What a choice's parser still holds once the choice has ended: text that
-/// never became a call (content, as the gateway's own streaming path sends
-/// it) and arguments it parsed but did not stream. The parser goes with the
-/// choice. `None` when no parser read the choice.
-fn unstreamed_tool_output(
-    handle: &mut GrpcResponseConverterHandle,
-    index: u32,
-) -> Option<(String, Vec<ToolCallDelta>)> {
-    let mut parser = handle.tool_parsers.remove(&index).flatten()?;
-    let text = parser.take_unstreamed_normal_text();
-    let calls = parser
-        .get_unstreamed_tool_args()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|item| ToolCallDelta {
-            index: item.tool_index as u32,
-            id: None,
-            tool_type: None,
-            function: Some(FunctionCallDelta {
-                name: None,
-                arguments: (!item.parameters.is_empty()).then_some(item.parameters),
-            }),
-        })
-        .collect();
-    Some((text, calls))
-}
-
-/// A parsed call, or a piece of its arguments, as the client's delta: the
-/// call's id travels with its name, in the first delta of the call; a delta
-/// that continues the arguments carries none, as the gateway's own streaming
-/// path and the public API send it (a client keeping the latest id it sees
-/// would otherwise end up with a different one than the call's).
-fn tool_call_delta(
-    model: &str,
-    history_tool_calls_count: usize,
-    item: ToolCallItem,
-) -> ToolCallDelta {
-    let id = item
-        .name
-        .as_ref()
-        .map(|name| generate_tool_call_id(model, name, item.tool_index, history_tool_calls_count));
-    ToolCallDelta {
-        index: item.tool_index as u32,
-        id,
-        tool_type: item.name.as_ref().map(|_| "function".to_string()),
-        function: Some(FunctionCallDelta {
-            name: item.name,
-            arguments: (!item.parameters.is_empty()).then_some(item.parameters),
-        }),
-    }
+    Ok(match readers.entry(index) {
+        Entry::Occupied(reader) => reader.into_mut(),
+        Entry::Vacant(slot) => slot.insert(reading.reader(prompt)?),
+    })
 }
 
 /// One engine message of a stream as the client's chunk: a `Chunk` as the
 /// delta its text (and calls) make, a `Complete` as the choice's last chunk
 /// with its finish reason, matched stop and usage. `None` when the message
 /// adds nothing the client gets.
-pub(crate) async fn convert_proto_chunk_to_openai(
+pub(crate) fn convert_proto_chunk_to_openai(
     proto_response: proto::GenerateResponse,
     handle: &mut GrpcResponseConverterHandle,
     tokenizer: &Arc<dyn Tokenizer>,
 ) -> Result<Option<ChatCompletionStreamResponse>, String> {
     use proto::generate_response::Response;
     match proto_response.response {
-        Some(Response::Chunk(chunk)) => Ok(chunk_delta(handle, tokenizer, chunk).await),
-        Some(Response::Complete(complete)) => complete_choice(handle, complete).await.map(Some),
+        Some(Response::Chunk(chunk)) => chunk_delta(handle, tokenizer, chunk),
+        Some(Response::Complete(complete)) => complete_choice(handle, complete).map(Some),
         None => Ok(None),
     }
 }
@@ -536,21 +460,21 @@ fn stop_decoded_text(decoder: &mut StopSequenceDecoder, token_ids: &[u32]) -> St
 
 /// A chunk of a choice as the client's delta. The chunk's counts are kept
 /// (cumulative in the proto; the prompt count falls back to the request's).
-/// When the request's tool parser reads the stream, what it releases is what
-/// the client gets, as on the gateway's own streaming path: its text (a
-/// value that is not a declared call, a marker prefix) beside its calls, in
-/// one delta; text it still holds as a prospective call is not sent raw, so
-/// a call's opening does not leak into the content and a value released
-/// later does not come twice. What it still holds when the stream ends is
-/// flushed at Complete. The first delta of a choice carries the role with
-/// the first text (or calls) the decoder released, as every delta does: a
-/// role-only delta dropped that text, which the decoder had already advanced
-/// past. `None` when nothing is released.
-async fn chunk_delta(
+/// When a table reads the stream, what it releases is what the client gets,
+/// as on the gateway's own streaming path: its content (a value that is not
+/// a declared call, a marker the table shows as text) and its reasoning
+/// beside its calls, in one delta; text it still holds as a prospective call
+/// is not sent raw, so a call's opening does not leak into the content and a
+/// value released later does not come twice. What it still holds when the
+/// stream ends is flushed at Complete. The first delta of a choice carries
+/// the role with the first text (or calls) the decoder released, as every
+/// delta does: a role-only delta dropped that text, which the decoder had
+/// already advanced past. `None` when nothing is released.
+fn chunk_delta(
     handle: &mut GrpcResponseConverterHandle,
     tokenizer: &Arc<dyn Tokenizer>,
     chunk: proto::GenerateStreamChunk,
-) -> Option<ChatCompletionStreamResponse> {
+) -> Result<Option<ChatCompletionStreamResponse>, String> {
     let index = chunk.index;
     let state = handle.stream_state.get_or_create(index);
     if chunk.prompt_tokens > 0 {
@@ -564,26 +488,27 @@ async fn chunk_delta(
 
     let chunk_text = decode_chunk_text(handle, tokenizer, index, &chunk.token_ids);
     if chunk_text.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let (content, tool_calls) = match tool_parser_output(handle, index, &chunk_text).await {
-        Some(released) => released,
-        None => (chunk_text, Vec::new()),
-    };
-    if content.is_empty() && tool_calls.is_empty() {
-        return None;
+    let step = reader_of(handle, index)?.read(index, &chunk_text)?;
+    if step.is_empty() {
+        return Ok(None);
     }
-    if !tool_calls.is_empty() {
-        handle.stream_state.get_or_create(index).has_tool_calls = true;
-    }
-    Some(handle.stream_chunk(index, delta_of(content, tool_calls), None, None, None))
+    Ok(Some(handle.stream_chunk(
+        index,
+        step.into_delta(),
+        None,
+        None,
+        None,
+    )))
 }
 
 /// The choice's last chunk: what its decoders still hold goes through the
-/// parser, then what the parser still holds (text that never became a call,
-/// arguments parsed but not streamed) follows; the finish reason, the matched
-/// stop and the usage close the choice.
-async fn complete_choice(
+/// reader, then the reader ends the output as the engine said (what it still
+/// held goes out: text that never became a call, a call the end closes) and
+/// decides the finish reason; the matched stop and the usage close the
+/// choice. The reader goes with the choice.
+fn complete_choice(
     handle: &mut GrpcResponseConverterHandle,
     complete: proto::GenerateComplete,
 ) -> Result<ChatCompletionStreamResponse, String> {
@@ -593,36 +518,28 @@ async fn complete_choice(
             Some(mut state) => {
                 let (text, stopped, matched) =
                     decoders_tail(&mut state, &handle.request_id, index)?;
-                let counts = (
-                    state.has_tool_calls,
-                    state.prompt_tokens,
-                    state.completion_tokens,
-                );
+                let counts = (state.prompt_tokens, state.completion_tokens);
                 (text, stopped, matched, counts)
             }
-            None => (String::new(), false, None, (false, 0, 0)),
+            None => (String::new(), false, None, (0, 0)),
         };
-    let (had_tool_calls, state_prompt_tokens, state_completion_tokens) = counts;
+    let (state_prompt_tokens, state_completion_tokens) = counts;
+    let engine_finish_reason = if stopped_at_finish {
+        "stop"
+    } else {
+        complete.finish_reason.as_str()
+    };
 
-    let (mut final_text, mut eof_tool_calls) =
-        match tool_parser_output(handle, index, &pending_text).await {
-            Some(released) => released,
-            None => (pending_text, Vec::new()),
-        };
-    if let Some((held_text, held_calls)) = unstreamed_tool_output(handle, index) {
-        final_text.push_str(&held_text);
-        eof_tool_calls.extend(held_calls);
-    }
-    let has_tool_calls = had_tool_calls || !eof_tool_calls.is_empty();
-
-    let finish_reason = finish_reason_of(
-        has_tool_calls,
-        if stopped_at_finish {
-            "stop"
-        } else {
-            complete.finish_reason.as_str()
-        },
-    );
+    let reader = reader_of(handle, index)?;
+    let mut step = reader
+        .read(index, &pending_text)?
+        .then(reader.end(index, engine_finish(engine_finish_reason))?);
+    handle.readers.remove(&index);
+    let finish_reason = step
+        .finish_reason
+        .take()
+        .unwrap_or_else(|| finish_reason_of(engine_finish_reason));
+    let delta = step.into_delta();
     let matched_stop =
         local_matched_stop.or_else(|| engine_matched_stop(complete.matched_stop.as_ref()));
     let usage = usage_of(
@@ -631,13 +548,7 @@ async fn complete_choice(
         state_completion_tokens,
         handle.initial_prompt_tokens,
     );
-    Ok(handle.stream_chunk(
-        index,
-        delta_of(final_text, eof_tool_calls),
-        Some(finish_reason),
-        matched_stop,
-        Some(usage),
-    ))
+    Ok(handle.stream_chunk(index, delta, Some(finish_reason), matched_stop, Some(usage)))
 }
 
 /// What a choice's decoders still hold when it ends: the stop decoder's
@@ -688,13 +599,12 @@ fn decoders_tail(
     Ok((text, stopped, matched))
 }
 
-/// The client's finish reason: `tool_calls` when the choice made calls and
-/// the engine stopped (or said nothing), `stop` when the engine said nothing,
-/// else the engine's own.
-fn finish_reason_of(has_tool_calls: bool, engine_finish_reason: &str) -> String {
-    if has_tool_calls && (engine_finish_reason == "stop" || engine_finish_reason.is_empty()) {
-        "tool_calls".to_string()
-    } else if engine_finish_reason.trim().is_empty() {
+/// The client's finish reason where the reader's end named none: `stop`
+/// when the engine said nothing, else the engine's own. The reader decides
+/// it for every choice it ends (`tool_calls` after a call); this stands in
+/// for an end the table left without one.
+fn finish_reason_of(engine_finish_reason: &str) -> String {
+    if engine_finish_reason.trim().is_empty() {
         "stop".to_string()
     } else {
         engine_finish_reason.to_string()
@@ -735,16 +645,6 @@ fn usage_of(
     Usage::from_counts(prompt_tokens, completion_tokens)
         .with_cached_tokens(complete.cached_tokens)
         .with_reasoning_tokens(complete.reasoning_tokens)
-}
-
-/// A delta with the role, its content and its calls when it has any.
-fn delta_of(content: String, tool_calls: Vec<ToolCallDelta>) -> ChatMessageDelta {
-    ChatMessageDelta {
-        role: Some("assistant".to_string()),
-        content: (!content.is_empty()).then_some(content),
-        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-        reasoning_content: None,
-    }
 }
 
 impl GrpcResponseConverterHandle {
@@ -792,9 +692,30 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_free(
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::common::{ToolCallDelta, ToolChoiceValue};
+    use symphony::{formats::Table, CallIds, Declared, Engine};
+
     use super::*;
 
     const SPLIT_TOOL_PREFIX: &str = r#"{"name":"get_weather","arguments":{"city":"#;
+
+    /// The call ids of a test reader count from this nonce, so a recorded
+    /// delta compares whole.
+    const NONCE: &str = "0123456789abcdef01234567";
+
+    /// A reader over the `json` table (what the converter's older generic
+    /// JSON parser read: bare call objects), its call ids counting from
+    /// `NONCE`.
+    fn json_reader(tools: &[Tool]) -> Reader {
+        let ids = CallIds::from_nonce(NONCE).unwrap();
+        Reader::over(
+            Engine::with_call_ids(Table::Json.shared(), Declared::of(tools), ids),
+            false,
+            false,
+            "",
+        )
+        .unwrap()
+    }
 
     fn byte_fallback_tokenizer() -> Arc<dyn Tokenizer> {
         let path =
@@ -820,23 +741,22 @@ mod tests {
         Arc::new(tokenizer)
     }
 
-    #[tokio::test]
+    #[test]
     /// Flush pending byte fallback at completion while enforcing the configured stop boundary.
-    async fn byte_fallback_complete_releases_tail_and_enforces_stop() {
+    fn byte_fallback_complete_releases_tail_and_enforces_stop() {
         let tokenizer = byte_fallback_tokenizer();
         for stop in ["NEVER", "é"] {
             let mut handle = GrpcResponseConverterHandle {
                 tokenizer: tokenizer.clone(),
-                tool_parsers: HashMap::new(),
+                readers: HashMap::new(),
                 stop: Some(StringOrArray::Array(vec![stop.into()])),
                 stop_token_ids: None,
                 model: "byte-fallback-test".into(),
                 request_id: "test".into(),
                 created: 0,
                 system_fingerprint: None,
-                tools: None,
-                tool_choice: None,
-                history_tool_calls_count: 0,
+                reading: Reading::of("byte-fallback-test", None, None, true),
+                prompt: String::new(),
                 stream_state: StreamStateManager::new(),
                 initial_prompt_tokens: None,
                 skip_special_tokens: true,
@@ -854,9 +774,7 @@ mod tests {
             };
             // The character is complete with its second byte: it streams at
             // once, or the stop on it fires at once (nothing to send then).
-            let streamed = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
-                .await
-                .unwrap();
+            let streamed = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer).unwrap();
             if stop == "é" {
                 assert!(streamed.is_none(), "{streamed:?}");
             } else {
@@ -876,7 +794,6 @@ mod tests {
                 )),
             };
             let response = convert_proto_chunk_to_openai(complete, &mut handle, &tokenizer)
-                .await
                 .unwrap()
                 .unwrap();
             let choice = &response.choices[0];
@@ -892,25 +809,24 @@ mod tests {
     }
     /// The first chunk of a choice that carries text goes out as one delta
     /// with the role and that text, on the plain decode path and on the
-    /// stop-decoder path alike; a first chunk the tool parser reads carries
-    /// the role with what the parser released. Nothing the decoder released
-    /// is dropped.
-    #[tokio::test]
-    async fn the_first_chunk_of_a_choice_carries_the_role_and_its_text() {
+    /// stop-decoder path alike; a first chunk a table reads carries the role
+    /// with what the reader released. Nothing the decoder released is
+    /// dropped.
+    #[test]
+    fn the_first_chunk_of_a_choice_carries_the_role_and_its_text() {
         let tokenizer = byte_fallback_tokenizer();
         for stop in [None, Some(StringOrArray::Array(vec!["NEVER".into()]))] {
             let mut handle = GrpcResponseConverterHandle {
                 tokenizer: tokenizer.clone(),
-                tool_parsers: HashMap::new(),
+                readers: HashMap::new(),
                 stop,
                 stop_token_ids: None,
                 model: "byte-fallback-test".into(),
                 request_id: "first-delta".into(),
                 created: 0,
                 system_fingerprint: None,
-                tools: None,
-                tool_choice: None,
-                history_tool_calls_count: 0,
+                reading: Reading::of("byte-fallback-test", None, None, true),
+                prompt: String::new(),
                 stream_state: StreamStateManager::new(),
                 initial_prompt_tokens: None,
                 skip_special_tokens: true,
@@ -927,16 +843,16 @@ mod tests {
                 )),
             };
             let first = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
-                .await
                 .unwrap()
                 .expect("the first chunk's text is sent");
             let delta = &first.choices[0].delta;
             assert_eq!(delta.role.as_deref(), Some("assistant"), "{first:?}");
             assert_eq!(delta.content.as_deref(), Some("é"), "{first:?}");
         }
-        // A first chunk the tool parser reads: with tools off, the text goes
-        // out as content; with tools on, what the parser released goes out
-        // with the role, as content or as calls, never nothing.
+        // A first chunk a table reads: under `none` on a model the registry
+        // does not know, `plain` gives the text as content; with the json
+        // reader, what it released goes out with the role, as content or as
+        // calls, never nothing.
         let tool_text = r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#;
         let token_ids: Vec<u32> = tool_text.bytes().map(|byte| u32::from(byte) + 1).collect();
         for tool_choice in [Some(ToolChoice::Value(ToolChoiceValue::None)), None] {
@@ -954,7 +870,6 @@ mod tests {
                 )),
             };
             let first = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
-                .await
                 .unwrap()
                 .expect("the first chunk is sent");
             let delta = &first.choices[0].delta;
@@ -963,7 +878,7 @@ mod tests {
                 assert_eq!(delta.content.as_deref(), Some(tool_text), "{first:?}");
                 assert!(delta.tool_calls.is_none(), "{first:?}");
             } else {
-                // A complete call in one chunk: the parser releases it as tool
+                // A complete call in one chunk: the reader releases it as tool
                 // calls and nothing as content.
                 assert!(delta.content.is_none(), "{first:?}");
                 assert!(delta.tool_calls.is_some(), "{first:?}");
@@ -973,8 +888,8 @@ mod tests {
 
     /// A chunk carries the fingerprint the stream set from the engine's
     /// weight version: the version itself, or the gateway's `default`.
-    #[tokio::test]
-    async fn a_chunk_carries_the_engines_weight_version_as_its_fingerprint() {
+    #[test]
+    fn a_chunk_carries_the_engines_weight_version_as_its_fingerprint() {
         let tokenizer = byte_fallback_tokenizer();
         for fingerprint in [Some("default".to_string()), Some("v7".to_string())] {
             let mut handle = tool_test_handle(tokenizer.clone(), None);
@@ -991,7 +906,6 @@ mod tests {
                 )),
             };
             let first = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
-                .await
                 .unwrap()
                 .expect("the first chunk is sent");
             assert_eq!(first.system_fingerprint, fingerprint, "{first:?}");
@@ -1002,7 +916,7 @@ mod tests {
         tokenizer: Arc<dyn Tokenizer>,
         tool_choice: Option<ToolChoice>,
     ) -> GrpcResponseConverterHandle {
-        let tools = serde_json::from_value(serde_json::json!([{
+        let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
             "type":"function", "function":{
                 "name":"get_weather", "parameters":{
                     "type":"object", "properties":{"city":{"type":"string"}}
@@ -1010,30 +924,39 @@ mod tests {
             }
         }]))
         .unwrap();
+        // The json reader stands for a model whose table reads these calls;
+        // under `none` the handle's own reading reads the choice (`plain`:
+        // the registry does not know this model), as in production.
+        let readers = match tool_choice {
+            Some(ToolChoice::Value(ToolChoiceValue::None)) => HashMap::new(),
+            _ => HashMap::from([(0, json_reader(&tools))]),
+        };
+        let reading = Reading::of(
+            "byte-fallback-test",
+            Some(&tools),
+            tool_choice.as_ref(),
+            true,
+        );
         GrpcResponseConverterHandle {
             tokenizer,
-            tool_parsers: HashMap::from([(
-                0,
-                Some(Box::new(tool_parser::JsonParser::new()) as Box<dyn ToolParser>),
-            )]),
+            readers,
             stop: Some(StringOrArray::Array(vec!["NEVER".into()])),
             stop_token_ids: None,
             model: "byte-fallback-test".into(),
             request_id: "tool-tail".into(),
             created: 0,
             system_fingerprint: None,
-            tools: Some(tools),
-            tool_choice,
-            history_tool_calls_count: 0,
+            reading,
+            prompt: String::new(),
             stream_state: StreamStateManager::new(),
             initial_prompt_tokens: None,
             skip_special_tokens: true,
         }
     }
 
-    #[tokio::test]
-    /// Process the final tool-parser tail while respecting disabled tool choice.
-    async fn byte_fallback_complete_parses_tool_tail_and_respects_none() {
+    #[test]
+    /// Process the final tail through the reader while respecting disabled tool choice.
+    fn byte_fallback_complete_parses_tool_tail_and_respects_none() {
         let tokenizer = byte_fallback_tokenizer();
         let tool_text = r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#;
         let token_ids: Vec<u32> = tool_text.bytes().map(|byte| u32::from(byte) + 1).collect();
@@ -1056,7 +979,6 @@ mod tests {
             // Every byte of the JSON is a complete character: the text streams
             // with its chunk and goes through the tool parser there.
             let streamed = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
-                .await
                 .unwrap()
                 .unwrap();
             let streamed_choice = &streamed.choices[0];
@@ -1077,7 +999,6 @@ mod tests {
                 )),
             };
             let response = convert_proto_chunk_to_openai(complete, &mut handle, &tokenizer)
-                .await
                 .unwrap()
                 .unwrap();
             let choice = &response.choices[0];
@@ -1122,9 +1043,9 @@ mod tests {
             }
         }
     }
-    #[tokio::test]
+    #[test]
     /// Recognize a tool control sequence split across chunks before completion.
-    async fn byte_fallback_complete_closed_split_tool_control() {
+    fn byte_fallback_complete_closed_split_tool_control() {
         let tokenizer = byte_fallback_tokenizer();
         let tail = r#""Paris"}}"#;
         let mut handle = tool_test_handle(tokenizer.clone(), None);
@@ -1141,7 +1062,6 @@ mod tests {
             )),
         };
         let prefix_response = convert_proto_chunk_to_openai(prefix_chunk, &mut handle, &tokenizer)
-            .await
             .unwrap()
             .unwrap();
         let prefix_calls = prefix_response.choices[0]
@@ -1179,9 +1099,7 @@ mod tests {
         // The tail's bytes are complete characters: they stream with their
         // chunk and the parser releases the arguments there.
         if let Some(tail_response) =
-            convert_proto_chunk_to_openai(tail_chunk, &mut handle, &tokenizer)
-                .await
-                .unwrap()
+            convert_proto_chunk_to_openai(tail_chunk, &mut handle, &tokenizer).unwrap()
         {
             let tail_choice = &tail_response.choices[0];
             assert!(tail_choice.delta.content.is_none(), "{tail_response:?}");
@@ -1214,7 +1132,6 @@ mod tests {
             )),
         };
         let final_response = convert_proto_chunk_to_openai(complete, &mut handle, &tokenizer)
-            .await
             .unwrap()
             .unwrap();
         let choice = &final_response.choices[0];
@@ -1238,8 +1155,8 @@ mod tests {
         assert_eq!(wire["usage"]["completion_tokens"], completion_tokens);
         assert_eq!(wire["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
     }
-    #[tokio::test]
-    async fn byte_fallback_complete_does_not_repeat_emitted_content() {
+    #[test]
+    fn byte_fallback_complete_does_not_repeat_emitted_content() {
         let tokenizer = byte_fallback_tokenizer();
         let mut handle = tool_test_handle(
             tokenizer.clone(),
@@ -1256,9 +1173,8 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            if let Some(response) = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
-                .await
-                .unwrap()
+            if let Some(response) =
+                convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer).unwrap()
             {
                 text.push_str(response.choices[0].delta.content.as_deref().unwrap());
             }
@@ -1273,7 +1189,6 @@ mod tests {
             ..Default::default()
         };
         let final_response = convert_proto_chunk_to_openai(complete, &mut handle, &tokenizer)
-            .await
             .unwrap()
             .unwrap();
         // "é" streamed with its chunk; Complete repeats nothing.
@@ -1290,8 +1205,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn byte_fallback_complete_keeps_interleaved_choices_separate() {
+    #[test]
+    fn byte_fallback_complete_keeps_interleaved_choices_separate() {
         let tokenizer = byte_fallback_tokenizer();
         let mut handle = tool_test_handle(
             tokenizer.clone(),
@@ -1309,7 +1224,6 @@ mod tests {
                 ..Default::default()
             };
             let response = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
-                .await
                 .unwrap()
                 .unwrap();
             assert_eq!(response.choices[0].index, index);
@@ -1327,7 +1241,6 @@ mod tests {
                 ..Default::default()
             };
             let response = convert_proto_chunk_to_openai(complete, &mut handle, &tokenizer)
-                .await
                 .unwrap()
                 .unwrap();
             assert_eq!(response.choices[0].index, index);
@@ -1336,12 +1249,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_chunk_tool_call_delta_carries_the_text_released_with_it() {
+    #[test]
+    fn a_chunk_tool_call_delta_carries_the_text_released_with_it() {
         let tokenizer = byte_fallback_tokenizer();
         // One chunk holds a value that is not a declared call and the declared
-        // call after it: the parser releases the first as text and the second
-        // as deltas in one result, and the client gets both together.
+        // call after it: the table releases the first as text and the second
+        // as deltas in one step, and the client gets both together; the
+        // whitespace between the two objects is the syntax's separator and
+        // is dropped.
         let released = r#"{"note":"checking"} "#;
         let call = r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#;
         let token_ids: Vec<u32> = format!("{released}{call}")
@@ -1362,12 +1277,15 @@ mod tests {
             ..Default::default()
         };
         let streamed = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
-            .await
             .unwrap()
             .unwrap();
         let delta = &streamed.choices[0].delta;
         assert_eq!(delta.role.as_deref(), Some("assistant"));
-        assert_eq!(delta.content.as_deref(), Some(released), "{streamed:?}");
+        assert_eq!(
+            delta.content.as_deref(),
+            Some(released.trim_end()),
+            "{streamed:?}"
+        );
         let calls = delta.tool_calls.clone().unwrap_or_default();
         assert!(
             !calls.is_empty() && calls.iter().all(|call| call.index == 0),
@@ -1402,7 +1320,6 @@ mod tests {
             ..Default::default()
         };
         let response = convert_proto_chunk_to_openai(complete, &mut handle, &tokenizer)
-            .await
             .unwrap()
             .unwrap();
         let choice = &response.choices[0];
@@ -1457,8 +1374,8 @@ mod tests {
         serde_json::from_str(&arguments).unwrap()
     }
 
-    #[tokio::test]
-    async fn a_calls_opening_split_over_chunks_does_not_leak_into_the_content() {
+    #[test]
+    fn a_calls_opening_split_over_chunks_does_not_leak_into_the_content() {
         let tokenizer = byte_fallback_tokenizer();
         let call = r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#;
         let mut handle = tool_test_handle(tokenizer.clone(), None);
@@ -1467,9 +1384,8 @@ mod tests {
         // complete, and nothing of it is content.
         for (sent, byte) in call.bytes().enumerate() {
             let chunk = chunk_of(vec![u32::from(byte) + 1], sent as u32 + 1);
-            if let Some(response) = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
-                .await
-                .unwrap()
+            if let Some(response) =
+                convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer).unwrap()
             {
                 let delta = &response.choices[0].delta;
                 assert!(delta.content.is_none(), "{response:?}");
@@ -1478,7 +1394,6 @@ mod tests {
         }
         let response =
             convert_proto_chunk_to_openai(complete_of(byte_ids(call)), &mut handle, &tokenizer)
-                .await
                 .unwrap()
                 .unwrap();
         let choice = &response.choices[0];
@@ -1497,8 +1412,8 @@ mod tests {
         assert_eq!(arguments_of(&calls), serde_json::json!({"city":"Paris"}));
     }
 
-    #[tokio::test]
-    async fn text_the_parser_releases_over_two_chunks_reaches_the_client_once() {
+    #[test]
+    fn text_the_parser_releases_over_two_chunks_reaches_the_client_once() {
         let tokenizer = byte_fallback_tokenizer();
         let first = r#"{"note":"check"#;
         let second = r#"ing"} {"name":"get_weather","arguments":{"city":"Paris"}}"#;
@@ -1510,7 +1425,6 @@ mod tests {
             &mut handle,
             &tokenizer,
         )
-        .await
         .unwrap();
         assert!(held.is_none(), "{held:?}");
         let response = convert_proto_chunk_to_openai(
@@ -1518,13 +1432,14 @@ mod tests {
             &mut handle,
             &tokenizer,
         )
-        .await
         .unwrap()
         .unwrap();
         let delta = &response.choices[0].delta;
+        // The whitespace between the two objects is the syntax's separator,
+        // dropped with the value's release.
         assert_eq!(
             delta.content.as_deref(),
-            Some(r#"{"note":"checking"} "#),
+            Some(r#"{"note":"checking"}"#),
             "{response:?}"
         );
         let calls = delta.tool_calls.clone().unwrap_or_default();
@@ -1541,7 +1456,6 @@ mod tests {
             &mut handle,
             &tokenizer,
         )
-        .await
         .unwrap()
         .unwrap();
         let choice = &response.choices[0];
@@ -1550,20 +1464,18 @@ mod tests {
         assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
     }
 
-    #[tokio::test]
-    async fn text_the_parser_still_holds_at_the_end_is_content_at_complete() {
+    #[test]
+    fn text_the_parser_still_holds_at_the_end_is_content_at_complete() {
         let tokenizer = byte_fallback_tokenizer();
         let mut handle = tool_test_handle(tokenizer.clone(), None);
         // A bare brace that never becomes a call is held, then flushed as
         // content when the stream ends.
         let held =
             convert_proto_chunk_to_openai(chunk_of(byte_ids("{"), 1), &mut handle, &tokenizer)
-                .await
                 .unwrap();
         assert!(held.is_none(), "{held:?}");
         let response =
             convert_proto_chunk_to_openai(complete_of(byte_ids("{")), &mut handle, &tokenizer)
-                .await
                 .unwrap()
                 .unwrap();
         let choice = &response.choices[0];
@@ -1609,6 +1521,7 @@ mod tests {
                 tokenizer.clone(),
                 &request,
                 "chatcmpl-1".into(),
+                "",
             );
             // The strings the entry points used to hand the C entry point.
             let json_arg = |value: Option<String>| value.map(|s| CString::new(s).unwrap());
@@ -1658,19 +1571,29 @@ mod tests {
             };
             let view = |handle: &GrpcResponseConverterHandle| {
                 serde_json::json!({
-                    "tools": handle.tools,
-                    "tool_choice": handle.tool_choice,
+                    "table": handle.reading.table(),
+                    "prompt": handle.prompt,
                     "stop": handle.stop,
                     "stop_token_ids": handle.stop_token_ids,
                     "model": handle.model,
                     "request_id": handle.request_id,
                     "skip_special_tokens": handle.skip_special_tokens,
                     "initial_prompt_tokens": handle.initial_prompt_tokens,
-                    "parsers": handle.tool_parsers.len(),
+                    "readers": handle.readers.len(),
                 })
             };
             assert_eq!(view(&typed), view(&through_c), "{}", request.model);
-            assert!(typed.tools.is_some() == (request.model == "kimi-k3"));
+            assert_eq!(typed.reading, through_c.reading, "{}", request.model);
+            assert_eq!(
+                typed.reading.table(),
+                if request.model == "kimi-k3" {
+                    "forced"
+                } else {
+                    "plain"
+                },
+                "{}",
+                request.model
+            );
         }
     }
 
@@ -1685,30 +1608,29 @@ mod tests {
     ) -> GrpcResponseConverterHandle {
         GrpcResponseConverterHandle {
             tokenizer,
-            tool_parsers: HashMap::new(),
+            readers: HashMap::new(),
             stop: stop.map(|stop| StringOrArray::Array(vec![stop.into()])),
             stop_token_ids: None,
             model: "byte-fallback-test".into(),
             request_id: "table".into(),
             created: 0,
             system_fingerprint: None,
-            tools: None,
-            tool_choice: None,
-            history_tool_calls_count: 0,
+            reading: Reading::of("byte-fallback-test", None, None, true),
+            prompt: String::new(),
             stream_state: StreamStateManager::new(),
             initial_prompt_tokens,
             skip_special_tokens: true,
         }
     }
 
-    /// The tool handle under a model whose call ids are deterministic
-    /// (`functions.<name>:<index>`), so a recorded delta compares whole.
+    /// The tool handle, whose reader's call ids count from `NONCE`, so a
+    /// recorded delta compares whole.
     fn recorded_tool_handle(
         tokenizer: Arc<dyn Tokenizer>,
         tool_choice: Option<ToolChoice>,
     ) -> GrpcResponseConverterHandle {
         let mut handle = tool_test_handle(tokenizer, tool_choice);
-        handle.model = "kimi-table".into();
+        handle.model = "recorded-model".into();
         handle.request_id = "table".into();
         handle
     }
@@ -1752,16 +1674,14 @@ mod tests {
 
     /// Every message of a case through the converter, as the JSON the client
     /// reads (`null` for a message that produced no chunk).
-    async fn converted(
+    fn converted(
         handle: &mut GrpcResponseConverterHandle,
         messages: Vec<proto::GenerateResponse>,
     ) -> Vec<Value> {
         let tokenizer = Arc::clone(&handle.tokenizer);
         let mut out = Vec::new();
         for message in messages {
-            let response = convert_proto_chunk_to_openai(message, handle, &tokenizer)
-                .await
-                .unwrap();
+            let response = convert_proto_chunk_to_openai(message, handle, &tokenizer).unwrap();
             out.push(response.map_or(Value::Null, |r| serde_json::to_value(r).unwrap()));
         }
         out
@@ -1870,6 +1790,9 @@ mod tests {
 
     /// The chunks each case produced, recorded on the converter before its split
     /// (`null` where a message produced no chunk), in the order of `table_cases`.
+    /// Re-recorded when the Symphony tables took over the reading: the model
+    /// name and the call ids (the table's, counting from `NONCE`) are the only
+    /// changes; every delta's shape stood.
     fn recorded_chunks() -> Vec<Vec<Value>> {
         vec![
             // a character held until its bytes are complete, then the choice ends
@@ -1903,23 +1826,23 @@ mod tests {
             ],
             // a call in one chunk: deltas with the call, the choice finishes on tool_calls
             vec![
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"functions.get_weather:0","type":"function","function":{"name":"get_weather"}},{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"logprobs":null,"finish_reason":null}]}),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":51,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"recorded-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_0123456789abcdef01234567","type":"function","function":{"name":"get_weather"}},{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"logprobs":null,"finish_reason":null}]}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"recorded-model","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":51,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // a call under a length finish keeps the engine's reason
             vec![
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"functions.get_weather:0","type":"function","function":{"name":"get_weather"}},{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"logprobs":null,"finish_reason":null}]}),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":7,"completion_tokens":51,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"recorded-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_0123456789abcdef01234567","type":"function","function":{"name":"get_weather"}},{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"logprobs":null,"finish_reason":null}]}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"recorded-model","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"length"}],"usage":{"prompt_tokens":7,"completion_tokens":51,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // a brace the parser holds to the end is content at Complete
             vec![
                 serde_json::json!(null),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant","content":"{"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"recorded-model","choices":[{"index":0,"delta":{"role":"assistant","content":"{"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // tool choice none: the call's text is content
             vec![
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant","content":"{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}"},"logprobs":null,"finish_reason":null}]}),
-                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"kimi-table","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":51,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0}}}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"recorded-model","choices":[{"index":0,"delta":{"role":"assistant","content":"{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}"},"logprobs":null,"finish_reason":null}]}),
+                serde_json::json!({"id":"table","object":"chat.completion.chunk","created":0,"model":"recorded-model","choices":[{"index":0,"delta":{"role":"assistant"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":51,"total_tokens":58,"prompt_tokens_details":{"cached_tokens":0}}}),
             ],
             // a second choice has its own index and state
             vec![
@@ -1938,15 +1861,19 @@ mod tests {
     /// engine's, a matched token id or string, a call released in one chunk,
     /// a brace held to the end, tool choice none, a second choice, an empty
     /// message.
-    #[tokio::test]
-    async fn the_chunk_shapes_convert_as_recorded() {
+    #[test]
+    fn the_chunk_shapes_convert_as_recorded() {
         let tokenizer = byte_fallback_tokenizer();
         let cases = table_cases(&tokenizer);
         let recorded = recorded_chunks();
         assert_eq!(cases.len(), recorded.len());
+        let mut differ = Vec::new();
         for ((name, mut handle, messages), expected) in cases.into_iter().zip(recorded) {
-            let produced = converted(&mut handle, messages).await;
-            assert_eq!(produced, expected, "{name}");
+            let produced = converted(&mut handle, messages);
+            if produced != expected {
+                differ.push(format!("{name}: {produced:?} != {expected:?}"));
+            }
         }
+        assert!(differ.is_empty(), "{}", differ.join("\n"));
     }
 }

@@ -66,15 +66,20 @@ The whole-JSON promise breaks under three names, so that an allowance is exact: 
 (a call ended with no arguments fragment at all), `tolerated-json` (arguments whose shape closed,
 or one scalar token, but which JSON refuses: a value left out, a trailing comma, an escape JSON
 lacks, a short `\u`, whitespace outside JSON's, a number or a word cut short) and `whole-json` (the
-committed prefix of a value that never closed). `json-prefix` holds until a call's
-`Malformed { InvalidArguments }` event of no bytes says where its arguments stopped being JSON;
-from there `verbatim-after-break` asks that every fragment be the model's bytes as written.
+committed prefix of a value that never closed). Every fragment is judged by the crate's own judge
+of a JSON prefix (`json::Prefix`, the one the readers hold their fragments to), which refuses at the
+first byte a strict reader refuses and from the backslash of an escape no continuation completes:
+a refusal the partial parser shares is `json-prefix`, and one it tolerates (the shapes above, the
+short `\u` included) is `tolerated-json` at the fragment that brings it, as it would be at the
+call's end, so that an allowance means one thing at a cut and at a close. `json-prefix` holds until
+a call's `Malformed { InvalidArguments }` event of no bytes says where its arguments stopped being
+JSON; from there `verbatim-after-break` asks that every fragment be the model's bytes as written.
 `pythonic-cut-call-closed` is a pythonic call that ended without its own `)` and had its object
 closed for it (one that said nothing and left it open is a breach of the whole-JSON names, so no
 event carries two names). A name is a shape, from any reader on every target, not a reader's own.
-The nightly workflow allows the shapes of the classes reported and not yet fixed, named in
-`symphony-fuzz.yml`; a name leaves the list with its fix, and a new reader's breach of an allowed
-shape surfaces then.
+The nightly workflow allows no class; the classes it allowed are
+[on record below](#the-classes-the-nightly-allows), and a name enters `symphony-fuzz.yml` with its
+report and leaves with its fix, so a new reader's breach of a shape once allowed surfaces at once.
 
 One target by hand, with libFuzzer's own options after `--`:
 
@@ -86,6 +91,64 @@ The sanitizer is off by default: the crate forbids unsafe code, and without inst
 memory errors a target runs two to three times as many executions. `--sanitizer address` turns it
 on. The nightly workflow `symphony-fuzz.yml` runs every target for ten minutes a night and on
 demand, and uploads the artifacts and logs.
+
+## The classes the nightly allows
+
+No breach class is allowed: the scheduled run passes no `--allow`, and the dispatch input's default
+is empty. This section is the record of the classes that were allowed and left, with their
+reproducers and what ended each: `tolerated-json` on 2026-11-08, `empty-arguments` on 2026-11-08
+and `made-up-empty-string` before it. A name enters the allowance with its report and leaves it
+with its fix, from both lines that write it in `symphony-fuzz.yml`: the scheduled run's list and
+the dispatch input's default. A night's red is a new report: a name that left is one too. The
+`tolerated-json` inputs below are the harness's own, from its tests in `src/lib.rs`, but for the one
+marked as the prefix judge's own, from the table its test
+`it_refuses_what_the_partial_parser_tolerates_where_a_strict_reader_does` reads: in
+`the_whole_json_promise_names_its_three_breaches`, each one as a Qwen3-table call's whole arguments
+followed by the call's end marker (`ended_with`) is the breach it names; the short `\u` escape at a
+cut is the fragment case of the test beside it,
+`a_fragments_breach_is_named_by_what_the_partial_parser_makes_of_it`; whitespace outside JSON's has
+no input there, its shape is `prefix_breach`'s.
+
+- `tolerated-json` (left the allowance on 2026-11-08): arguments that strict JSON refuses but that
+  the readers hand on. The name is given by two judges that agree on the shapes: at a fragment,
+  where the crate's prefix judge refuses the text and the partial parser takes it whole; at the
+  call's end, where the arguments' shape closed but the whole-JSON check fails. A scalar cut short
+  (`0e`, `n`, `1.`) is the prefix of a longer value, so the prefix judge accepts it at every
+  fragment and the name comes at the call's end alone; the same scalar cut short before a delimiter
+  (`{"a": 1.}`, from the `TOLERATED` table in `../src/json/prefix.rs`) is named at the fragment. The
+  other shapes are a value left out (`{"city": "Paris", "days": ,}`), a trailing comma (`{"a":
+  1,}`), an escape JSON lacks (`"\h"`), a short `\u` escape at a cut (`{"a": ["\u1"]`) and
+  whitespace outside JSON's. The fix decides per shape whether the readers refuse it (`Malformed {
+  InvalidArguments }` at the fragment that brings it, or at the call's end for a scalar cut short,
+  which stays a valid prefix while it arrives) or the judge accepts it as the engines' own JSON
+  readers do, and makes the readers and the judge agree. What ended it: the readers that take whole
+  JSON arguments (the JSON, JSON-list and shaped syntaxes) say `Malformed { InvalidArguments }` at
+  the fragment that brings every shape above (#3790, #5004), so the harness sees the word before the
+  end; the readers that type a value by the declared schema (the keyed, attributed, tagged, pythonic
+  and Gemma syntaxes) hand the harness a value already spelled as JSON, which the prefix judge
+  takes. Runs on main without any allowance found no breach of any class: on 2026-11-08 the nine
+  targets ran three minutes each (5.1 million executions) and the four readers that still read
+  values through the tolerant parser (`pythonic_calls`, `gemma_calls`, `xml_calls`, `any_table`)
+  fifteen minutes each (7.1 million executions), 87 target-minutes with no crash and no class named.
+  The typed readers' own reading of a value JSON refuses (a trailing comma dropped, an unreadable
+  value kept as a string) is a question of parity with each engine's own parser, on record as its
+  own report, not a breach of this promise.
+- `empty-arguments` (left the allowance on 2026-11-08): a call that ended with no arguments fragment
+  at all and no `Malformed` word inside it other than a stop's (an `OpenAtTheStop` or
+  `OpenAtTheMarker` of no bytes), where the contract asks for `Malformed` before the end of a cut
+  call, or whole arguments (the harness names it at the call's end, as `ended_with("")` does). It
+  was allowed for the pythonic reader's cut call, which a fix of October ended (#3791):
+  `[get_weather(` ended by the stream says `Malformed { UnterminatedRegion }` before its end
+  (`a_call_either_ending_cuts_right_after_its_parenthesis_says_so_before_its_end` in
+  `../src/pythonic.rs`). An allowed breach leaves no trace in the nightly's log, so a dispatch of
+  `symphony-fuzz.yml` with `allow` set to `tolerated-json` alone ran the nine targets for the
+  nightly's ten minutes each on main `7de38d7c2` (workflow run 42463947758) and found no breach;
+  the name then left both lines of the allowance. A night that names it again is a new report: its artifact names the reader and
+  the input, which go on record here with the fix.
+- `made-up-empty-string` (left the allowance with #3880, the pythonic reader's fix for a parameter
+  without a value): a fragment that wrote an empty string with no byte of a value behind it, where
+  the model left the value out before a comma or a close. The harness still names it
+  (`made_up_empty_string` in `src/lib.rs`), so a new red under the name is a new report.
 
 ## The input
 

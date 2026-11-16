@@ -8,14 +8,14 @@
 
 use std::{
     fs::{self, File},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{Ipv4Addr, SocketAddr, TcpStream},
     path::Path,
     process::{Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-use crate::gateway_launch::serial;
+use crate::gateway_launch::{free_ports, serial};
 
 const IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// How long the gateway gets to refuse or to serve; one that serves is
@@ -32,16 +32,6 @@ struct Launch {
     listened: bool,
     /// Its stdout and stderr.
     log: String,
-}
-
-/// Two distinct free ports: bound at once so the kernel hands out different
-/// ones, then released for the gateway to bind moments later.
-fn free_ports() -> [u16; 2] {
-    let listeners = [
-        TcpListener::bind((IP, 0)).expect("a free port"),
-        TcpListener::bind((IP, 0)).expect("a free port"),
-    ];
-    listeners.map(|listener| listener.local_addr().expect("the bound address").port())
 }
 
 /// Runs the gateway with `args` on fresh ports, its output in `log_path`,

@@ -24,11 +24,66 @@ The repeat count, the id filter and the thresholds come from a TOML file
 (.github/bench-gates/<bench>.toml); the measured spreads that justify each threshold are
 documented there.
 
+The gate file also names the bench sources: the files that feed the gated binary beyond the
+crate it measures (the bench file and what it includes by path). The bench profile links one
+codegen unit under thin LTO, so a row added to that file changes the inlining of the code the
+other rows time, and the gated rows move with the measured crate untouched (+32 % on the
+Symphony prose rows from a bench-file-only change, 2026-11-08). The base side is therefore
+built with the pull request's bench sources (`build --sources-from`), so the two binaries
+differ in the measured code alone, and the report names the case where those sources do not
+build on the base. The rule for a change: a gated bench binary's sources stay byte-identical
+unless the change is to what they measure, and a new row goes to a bench target of its own.
+
+Four controls keep the verdict about the code. Binaries of the same bytes pass without a run:
+no code change can move a row. Each side is measured from a fresh copy of its binary under the
+output directory, through paths and criterion homes of one length: a file's cached pages decide
+its speed on 1 to 6 µs rows (one binary read 9 to 20 % slower than its byte-identical copy on
+whichever side it stood, 2026-11-09), so neither side carries its file's history; the copies go
+after the runs, the output directory being the workflow's artifact. An id that fails after the
+interleaved runs is measured once more per side before the verdict, and that round is read
+within itself (a process that runs a few ids sits on levels of its own), so one burst on the
+runner cannot fail it alone: a burst re-measures near zero and a regression near its size, so a
+round under half the threshold makes the failure a suspect. The host's load before every run
+is recorded,
+and `--busy-above` makes the gate wait for a quieter host and then refuse to judge (exit 2,
+never a failure) rather than read another job's load as a regression.
+
+A fifth control tells where code sits from what it does. The functions of a bench executable
+move when code ahead of them grows, and the same machine code further on in its page can read
+slower by time alone: +10.4 % on a 330 ns row with every run apart, the row's instruction
+count equal on both sides (2026-11-15). With `count = true` in the gate file, an id that still
+fails after its re-measurement is counted on both executables: the bench under valgrind's
+callgrind in the harness's profile mode, one profile after each batch of iterations. The same
+instruction count in every batch both ran after the first is the same work. The id is then a
+placement, reported with the count and the two places and not failed, when two more facts
+hold: the function the harness spent the most in starts at another address in the pull
+request's executable, and the change is within twice the id's threshold. The same count with
+that function where it was leaves the failure, with the count in its line. An id whose change
+is beyond twice its threshold is not counted: no count makes it a placement, and its line
+says so. Two counts that differ are each taken once more, and
+the failure stands either way: the count moved, or it differs from itself on one executable
+(an id whose work follows the clock, a seed or the allocator's state) and tells nothing. A
+count that was not read (no valgrind on the host, one batch alone) leaves the failure too. The
+count ends by the run's budget: `run_budget`, the seconds from the run's start that a gate
+file asking the count must name, below its gate step's bound by the report's room. No count
+starts with less than 30 s of it left, and one that starts is capped by what is left. The ids
+are counted in name order: the id whose turn the budget cut and the ids behind it keep the
+time's verdict, their lines saying so, and the report is written. The
+count cannot see a change that runs the same instructions slower, a load that misses or a
+branch that stops predicting: where the function moved too, such a row reads as a placement
+up to twice its threshold, by name, in the summary. A placement is still a row to read.
+
 Usage:
-    bench_gate.py build --out FILE [--name BENCH] -- cargo bench ... --no-run
-        Run the cargo command and copy the bench executable it reports to FILE.
+    bench_gate.py build --out FILE [--name BENCH] [--gates FILE [--sources-from REV]]
+                   -- cargo bench ... --no-run
+        Run the cargo command and copy the bench executable it reports to FILE. With a gate
+        file, record the sha256 of each bench source it names in FILE.sources.json; with a
+        revision too, build with those files as REV has them, and fall back to the checkout's
+        own when they do not build, saying so in the record.
     bench_gate.py run --gates FILE --base BIN --pr BIN --out DIR [--cwd DIR] [--repeats N]
-        Run both binaries interleaved, write DIR/results.json and DIR/gate.md, compare.
+                  [--recheck N] [--busy-above LOAD [--busy-wait S]] [--cpu N]
+        Run both binaries interleaved, write DIR/results.json and DIR/gate.md, compare. With
+        `count = true` in the gate file, the ids that still fail are counted first (valgrind).
     bench_gate.py compare --gates FILE RESULTS_JSON [--summary FILE]
         Re-evaluate a saved results.json.
 
@@ -39,7 +94,9 @@ Exit code 1 means a gated regression, 2 a usage or run error.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -52,6 +109,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SIDES = ("base", "pr")
+# The on-disk names of the two sides, of one length: the criterion homes, the logs and the
+# copies the binaries run from, so the two processes have the same shape.
+SIDE_DIRS = {"base": "base", "pr": "head"}
 
 
 # --------------------------------------------------------------------------- gate file
@@ -67,11 +127,23 @@ class Gate:
         return re.search(self.pattern, bench_id) is not None
 
 
+# No count starts with less than this left of the run's budget (`run_budget` in the gate file,
+# seconds from the run's start): a count is the harness's one-second warm-up under an emulator,
+# and one the budget cuts short only fails. A step's bound that ends the script takes the
+# report with it, so a gate file sets its budget below that bound by the report's room.
+COUNT_FLOOR_S = 30.0
+
+
 @dataclass
 class Gates:
     repeats: int = 3
     filter: str | None = None
     bench_args: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+    # An id that fails by time is counted on both executables before the verdict.
+    count: bool = False
+    # Seconds from the run's start by which the count ends; a gate file that counts names it.
+    run_budget: float | None = None
     gates: list[Gate] = field(default_factory=list)
 
     def threshold_for(self, bench_id: str) -> Gate | None:
@@ -82,7 +154,7 @@ class Gates:
         return None
 
 
-GATE_FILE_KEYS = {"repeats", "filter", "bench_args", "gate"}
+GATE_FILE_KEYS = {"repeats", "filter", "bench_args", "sources", "count", "run_budget", "gate"}
 GATE_ENTRY_KEYS = {"pattern", "threshold", "note"}
 
 
@@ -107,7 +179,37 @@ def load_gates(path: Path) -> Gates:
     bench_args = raw.get("bench_args", [])
     if not isinstance(bench_args, list):
         raise ValueError(f"{path}: bench_args must be a list of strings, got {bench_args!r}")
-    gates = Gates(repeats=repeats, filter=filter_, bench_args=[str(arg) for arg in bench_args])
+    sources = raw.get("sources", [])
+    if not isinstance(sources, list) or not all(
+        isinstance(source, str) and source for source in sources
+    ):
+        raise ValueError(f"{path}: sources must be a list of file paths, got {sources!r}")
+    count = raw.get("count", False)
+    if not isinstance(count, bool):
+        raise ValueError(f"{path}: count must be true or false, got {count!r}")
+    run_budget = raw.get("run_budget")
+    if run_budget is not None:
+        if isinstance(run_budget, bool) or not isinstance(run_budget, (int, float)):
+            raise ValueError(f"{path}: run_budget must be a number of seconds, got {run_budget!r}")
+        try:
+            seconds = float(run_budget)
+        except OverflowError:  # an integer past a float's range
+            seconds = math.inf
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError(f"{path}: run_budget must be finite and above zero: {run_budget!r}")
+    elif count:
+        raise ValueError(
+            f"{path}: count = true needs run_budget, the seconds from the run's start by which "
+            "the count ends (below the gate step's bound)"
+        )
+    gates = Gates(
+        repeats=repeats,
+        filter=filter_,
+        bench_args=[str(arg) for arg in bench_args],
+        sources=sources,
+        count=count,
+        run_budget=None if run_budget is None else float(run_budget),
+    )
     if gates.filter is not None:
         try:
             re.compile(gates.filter)
@@ -167,6 +269,69 @@ def select_bench_executable(messages: list[dict], name: str | None) -> str:
     return next(iter(found.values()))
 
 
+def run_cargo(cargo: list[str]) -> tuple[int, list[dict]]:
+    """The cargo command's exit code and the JSON messages it printed."""
+    print("+", " ".join(cargo), flush=True)
+    proc = subprocess.run(cargo, stdout=subprocess.PIPE, text=True, check=False)
+    messages = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            messages.append(json.loads(line))
+    return proc.returncode, messages
+
+
+def sources_at(paths: list[str], rev: str) -> dict[str, bytes | None]:
+    """The listed files as the commit `rev` has them, None for one it does not have."""
+    verify = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if verify.returncode != 0:
+        raise ValueError(f"--sources-from {rev}: not a commit of this repository")
+    contents: dict[str, bytes | None] = {}
+    for path in paths:
+        shown = subprocess.run(
+            ["git", "show", f"{rev}:./{path}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        contents[path] = shown.stdout if shown.returncode == 0 else None
+    return contents
+
+
+def place_sources(contents: dict[str, bytes | None]) -> dict[str, bytes | None]:
+    """Write each file as given (remove it for None) and return what was there, for the way
+    back."""
+    before: dict[str, bytes | None] = {}
+    for path, data in contents.items():
+        file = Path(path)
+        before[path] = file.read_bytes() if file.exists() else None
+        if data is None:
+            if file.exists():
+                file.unlink()
+        else:
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(data)
+    return before
+
+
+def digests(paths: list[str]) -> dict[str, str | None]:
+    """The sha256 of each listed file as it is now, None for one that is absent."""
+    return {
+        path: hashlib.sha256(Path(path).read_bytes()).hexdigest() if Path(path).exists() else None
+        for path in paths
+    }
+
+
+def sources_record_path(binary: Path) -> Path:
+    """Where `build` records the bench sources a binary was built from, beside it."""
+    return binary.with_name(binary.name + ".sources.json")
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     cargo = list(args.cargo)
     if cargo and cargo[0] == "--":
@@ -177,16 +342,37 @@ def cmd_build(args: argparse.Namespace) -> int:
     if "--no-run" not in cargo:
         cargo.append("--no-run")
     cargo.append("--message-format=json-render-diagnostics")
-    print("+", " ".join(cargo), flush=True)
-    proc = subprocess.run(cargo, stdout=subprocess.PIPE, text=True, check=False)
-    if proc.returncode != 0:
-        print(f"build: cargo exited with {proc.returncode}", file=sys.stderr)
+    gates = load_gates(Path(args.gates)) if args.gates else None
+    sources = gates.sources if gates else []
+    if args.sources_from and not sources:
+        print("build: --sources-from needs a --gates file that names sources", file=sys.stderr)
         return 2
-    messages = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            messages.append(json.loads(line))
+    record: dict | None = None
+    if args.sources_from:
+        # The base side carries the pull request's bench sources, so the two binaries differ
+        # in the measured code alone; the checkout is its own again before anything else runs.
+        before = place_sources(sources_at(sources, args.sources_from))
+        try:
+            built = digests(sources)
+            code, messages = run_cargo(cargo)
+        finally:
+            place_sources(before)
+        record = {"rev": args.sources_from, "applied": code == 0, "files": built}
+        if code != 0:
+            record["reason"] = (
+                f"The bench sources of {args.sources_from} did not build here "
+                f"(cargo exited with {code})"
+            )
+            print(f"build: {record['reason']}, so the checkout's own are built", file=sys.stderr)
+            record["files"] = digests(sources)
+            code, messages = run_cargo(cargo)
+    else:
+        code, messages = run_cargo(cargo)
+        if gates is not None:
+            record = {"rev": None, "applied": None, "files": digests(sources)}
+    if code != 0:
+        print(f"build: cargo exited with {code}", file=sys.stderr)
+        return 2
     try:
         executable = select_bench_executable(messages, args.name)
     except ValueError as err:
@@ -197,6 +383,9 @@ def cmd_build(args: argparse.Namespace) -> int:
     shutil.copy2(executable, out)
     out.chmod(out.stat().st_mode | 0o111)
     print(f"build: {executable} -> {out}", flush=True)
+    if record is not None:
+        sources_record_path(out).write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
+        print(f"build: {len(sources)} bench sources recorded in {sources_record_path(out)}")
     return 0
 
 
@@ -226,11 +415,16 @@ def run_once(
     gates: Gates,
     extra_args: list[str],
     log_path: Path,
+    bench_filter: str | None = None,
+    cpu: int | None = None,
 ) -> dict[str, float]:
     home.mkdir(parents=True, exist_ok=True)
     cmd = [str(binary), "--bench", "--noplot", *gates.bench_args, *extra_args]
-    if gates.filter:
-        cmd.append(gates.filter)
+    bench_filter = gates.filter if bench_filter is None else bench_filter
+    if bench_filter:
+        cmd.append(bench_filter)
+    if cpu is not None:
+        cmd = ["taskset", "-c", str(cpu), *cmd]
     env = dict(os.environ, CRITERION_HOME=str(home))
     with log_path.open("w") as log:
         log.write("+ " + " ".join(cmd) + "\n")
@@ -244,16 +438,62 @@ def run_once(
     return medians
 
 
+def round_sides(i: int) -> tuple[str, ...]:
+    """The sides in the order run i takes them: odd runs base first, even runs the pull request
+    first, so neither side always warms the other up."""
+    return SIDES if i % 2 == 1 else tuple(reversed(SIDES))
+
+
 def interleaved_order(repeats: int) -> list[tuple[int, str]]:
-    """Run i alternates which side goes first, so neither side always warms the other up."""
-    order = []
-    for i in range(1, repeats + 1):
-        sides = SIDES if i % 2 == 1 else tuple(reversed(SIDES))
-        order.extend((i, side) for side in sides)
-    return order
+    """Every run of the gate, in order."""
+    return [(i, side) for i in range(1, repeats + 1) for side in round_sides(i)]
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def copy_binary(binary: Path, copy: Path) -> Path:
+    """`copy`, a fresh copy of `binary`: the side runs from pages this copy caches, through a
+    path of the same length as the other side's."""
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    if copy.is_symlink() or copy.exists():
+        copy.unlink()
+    shutil.copy2(binary, copy)
+    return copy
+
+
+def host_load() -> float | None:
+    """The host's one-minute load average, None where /proc/loadavg is not readable."""
+    try:
+        return float(Path("/proc/loadavg").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def quiet_host(limit: float, wait_s: float, poll_s: float = 15.0) -> tuple[float | None, bool]:
+    """Wait up to `wait_s` for the one-minute load to be at most `limit`: the load read last
+    and whether the host is quiet (a host without a readable load counts as quiet)."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        load = host_load()
+        if load is None or load <= limit:
+            return load, True
+        if time.monotonic() >= deadline:
+            return load, False
+        time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
+
+
+class BusyHost(RuntimeError):
+    """The host stayed busier than `--busy-above` allows: the gate does not judge."""
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    run_started = time.monotonic()
     gates = load_gates(Path(args.gates))
     repeats = args.repeats or gates.repeats
     # Absolute: the bench binaries run under --cwd and get this path through the environment.
@@ -261,32 +501,405 @@ def cmd_run(args: argparse.Namespace) -> int:
     out.mkdir(parents=True, exist_ok=True)
     cwd = Path(args.cwd).resolve() if args.cwd else Path.cwd()
     binaries = {"base": Path(args.base).resolve(), "pr": Path(args.pr).resolve()}
+    if args.cpu is not None and shutil.which("taskset") is None:
+        print("run: --cpu needs taskset on this host", file=sys.stderr)
+        return 2
     extra_args = [arg for arg in args.bench_args if arg != "--"]
+    sources: dict[str, dict | None] = {}
+    for side, binary in binaries.items():
+        record = sources_record_path(binary)
+        sources[side] = json.loads(record.read_text()) if record.exists() else None
+    hashes = {side: sha256_of(binary) for side, binary in binaries.items()}
     results = {
         "gates": str(args.gates),
         "repeats": repeats,
         "filter": gates.filter,
         "bench_args": gates.bench_args + extra_args,
+        "sources": sources,
+        "binaries": {side: {"path": str(binaries[side]), "sha256": hashes[side]} for side in SIDES},
+        "identical": hashes["base"] == hashes["pr"],
         "order": [],
-        "base": {"binary": str(binaries["base"]), "runs": [], "seconds": []},
-        "pr": {"binary": str(binaries["pr"]), "runs": [], "seconds": []},
+        "base": {"binary": str(binaries["base"]), "runs": [], "seconds": [], "load": []},
+        "pr": {"binary": str(binaries["pr"]), "runs": [], "seconds": [], "load": []},
     }
-    for i, side in interleaved_order(repeats):
-        home = out / side / f"run-{i}"
+    results_path = out / "results.json"
+
+    def save() -> None:
+        with results_path.open("w") as handle:
+            json.dump(results, handle, indent=1, sort_keys=True)
+
+    if results["identical"]:
+        # The same bytes on both sides: no code change can move a row, nothing to measure.
+        save()
+        print(f"results: {results_path}", flush=True)
+        return report(results, gates, out / "gate.md", args.summary)
+    # Each side from a fresh copy of its binary: a file's cached pages are not a side. The two
+    # processes have one shape: paths and criterion homes of one length, the same environment.
+    copies = {side: copy_binary(binaries[side], out / SIDE_DIRS[side] / "bench") for side in SIDES}
+
+    def run(i: int, side: str, bench_filter: str | None, label: str) -> None:
+        load = host_load()
+        if args.busy_above is not None:
+            load, quiet = quiet_host(args.busy_above, args.busy_wait)
+            if not quiet:
+                results["not_judged"] = (
+                    f"host busy: the one-minute load {load:.1f} stayed above {args.busy_above:g} "
+                    f"for {args.busy_wait:g} s before {label}"
+                )
+                raise BusyHost(results["not_judged"])
+        side_dir = out / SIDE_DIRS[side]
         started = time.monotonic()
         medians = run_once(
-            binaries[side], home, cwd, gates, extra_args, out / side / f"run-{i}.log"
+            copies[side],
+            side_dir / f"run-{i}",
+            cwd,
+            gates,
+            extra_args,
+            side_dir / f"run-{i}.log",
+            bench_filter=bench_filter,
+            cpu=args.cpu,
         )
         seconds = time.monotonic() - started
         results[side]["runs"].append(medians)
         results[side]["seconds"].append(round(seconds, 1))
+        results[side]["load"].append(load)
         results["order"].append(f"{side}-{i}")
-        print(f"[run {i}/{repeats}] {side}: {len(medians)} ids in {seconds:.0f} s", flush=True)
-    results_path = out / "results.json"
-    with results_path.open("w") as handle:
-        json.dump(results, handle, indent=1, sort_keys=True)
-    print(f"results: {results_path}", flush=True)
-    return report(results, gates, out / "gate.md", args.summary)
+        print(f"[{label}] {side}: {len(medians)} ids in {seconds:.0f} s", flush=True)
+
+    try:
+        try:
+            for i, side in interleaved_order(repeats):
+                run(i, side, None, f"run {i}/{repeats}")
+            # An id that fails after the full rounds is measured once more per side before
+            # the verdict, in the interleaved order: one burst on the runner cannot fail it
+            # alone. Every `--recheck` round runs the same ids, fixed here, so the median of
+            # the rounds reads the same whichever round came first.
+            failing = sorted(
+                row.bench_id for row in compare(results, gates) if row.verdict == "regression"
+            )
+            if failing and args.recheck > 0:
+                results["recheck"] = {"ids": failing, "rounds": 0}
+                exact = "^(" + "|".join(re.escape(bench_id) for bench_id in failing) + ")$"
+                for extra in range(1, args.recheck + 1):
+                    i = repeats + extra
+                    results["recheck"]["rounds"] = extra
+                    for side in round_sides(i):
+                        run(i, side, exact, f"recheck {extra}/{args.recheck}")
+            # An id that still fails is counted on both executables: on the same instruction
+            # count its time can be a placement in the bench executable, not work. A change
+            # beyond twice the threshold is no placement whatever its count reads: not counted.
+            still = [row for row in compare(results, gates) if row.verdict == "regression"]
+            if still and gates.count:
+                # The timed rounds are written first: a count that hangs, or a job cancelled
+                # in it, still leaves them in the output directory.
+                save()
+                within = sorted(row.bench_id for row in still if row.within_ceiling)
+                results["count"] = {
+                    row.bench_id: {"skipped": "no_base" if row.change is None else "beyond"}
+                    for row in still
+                    if not row.within_ceiling
+                }
+                deadline = run_started + (gates.run_budget or math.inf)
+                results["count"].update(
+                    count_ids(within, copies, out, cwd, gates, extra_args, args.cpu, deadline)
+                )
+        except BusyHost as busy:
+            save()
+            print(f"run: not judged, {busy}", file=sys.stderr)
+            report(results, gates, out / "gate.md", args.summary)
+            return 2
+        save()
+        print(f"results: {results_path}", flush=True)
+        return report(results, gates, out / "gate.md", args.summary)
+    finally:
+        # The copies served the runs. The output directory is what the workflows upload,
+        # and two bench binaries do not belong in that artifact.
+        for copy in copies.values():
+            copy.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------- count
+
+# The harness's functions that time a routine, in callgrind's demangled names under either
+# symbol mangling. The harness calls one of them once for a batch of iterations.
+HARNESS = re.compile(r"criterion::bencher::(?:Async)?Bencher\b.*::iter")
+# The same functions as callgrind's own wildcard: it writes one profile after each call.
+HARNESS_WILDCARD = "*criterion::bencher::*Bencher*::iter*"
+# A count is the harness's one-second warm-up under an emulator: 2 to 3 s where it was read,
+# never minutes. A row takes four counts at most.
+COUNT_TIMEOUT_S = 120.0
+# What a placement can excuse, in thresholds of its id. Code that moved was read to cost
+# +10.4 % at most on rows gated at 10 %: a change beyond twice the threshold on the same
+# instructions is more than where they sit has explained.
+PLACEMENT_CEILING = 2.0
+
+
+@dataclass
+class Batch:
+    """What one callgrind profile holds of the harness's timed calls."""
+
+    # The instructions run under the calls into the harness's timing functions.
+    count: int = 0
+    calls: int = 0
+    # The function those calls spent the most instructions in, and where its code starts.
+    unit: str = ""
+    address: int | None = None
+
+
+def read_profile(path: Path) -> Batch:
+    """The harness's timed calls in one callgrind profile. In the profile a `fn=` line opens a
+    function's block; under it a `cfn=` line names a callee, the `calls=` line after it carries
+    the number of calls and the callee's address, and the next line their cost, the callee's
+    own callees included. A name is spelled once, with a number, and is that number after."""
+    names: dict[str, str] = {}
+    positions = 1
+    function = callee = ""
+    edge: tuple[int, int | None] | None = None
+    batch = Batch()
+    harness: tuple[str, int | None] = ("", None)
+    callees: dict[str, tuple[int, int | None]] = {}
+    with path.open(encoding="utf-8", errors="replace") as lines:
+        for raw in lines:
+            line = raw.rstrip("\n")
+            if not line:
+                continue
+            if line[0].isdigit() or line[0] in "+-*":
+                if edge is None:
+                    continue
+                (calls, address), edge = edge, None
+                fields = line.split()
+                cost = int(fields[positions]) if len(fields) > positions else 0
+                if HARNESS.search(function):
+                    spent = callees.get(callee, (0, address))[0]
+                    callees[callee] = (spent + cost, address)
+                elif HARNESS.search(callee):
+                    batch.count += cost
+                    batch.calls += calls
+                    harness = (callee, address)
+                continue
+            key, sep, value = line.partition("=")
+            if not sep:
+                if line.startswith("positions:"):
+                    positions = len(line.split()) - 1
+                continue
+            if key in ("fn", "cfn"):
+                numbered = re.match(r"\((\d+)\)(?: (.*))?$", value)
+                if numbered is None:
+                    name = value
+                else:
+                    if numbered.group(2) is not None:
+                        names[numbered.group(1)] = numbered.group(2)
+                    name = names.get(numbered.group(1), "")
+                if key == "fn":
+                    function = name
+                else:
+                    callee = name
+            elif key == "calls":
+                fields = value.split()
+                address = None
+                if positions > 1 and len(fields) > 1 and fields[1].startswith("0x"):
+                    address = int(fields[1], 16)
+                edge = (int(fields[0]), address)
+    # The unit is the callee the timed calls spent most of their instructions in; a routine
+    # inlined into the harness's function has none, and the unit is that function.
+    batch.unit, batch.address = harness
+    if callees:
+        name, (spent, address) = max(callees.items(), key=lambda item: item[1][0])
+        if 2 * spent >= batch.count:
+            batch.unit, batch.address = name, address
+    return batch
+
+
+def count_once(
+    binary: Path,
+    work: Path,
+    cwd: Path,
+    gates: Gates,
+    extra_args: list[str],
+    bench_id: str,
+    cpu: int | None,
+    bound: float,
+) -> dict:
+    """The instruction counts of one id on one executable: the bench in the harness's profile
+    mode under callgrind, which writes one profile after each batch of iterations (the mode
+    is the harness's warm-up: one second of batches of 1, 2, 4, ... iterations, whatever the
+    bench configures), ended after `bound` seconds. Returns the batches' counts in order and
+    the last batch's unit; a `RuntimeError` says why nothing was read."""
+    valgrind = shutil.which("valgrind")
+    if valgrind is None:
+        raise RuntimeError("valgrind is not on this host")
+    work.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        valgrind,
+        "--tool=callgrind",
+        "--dump-instr=yes",
+        f"--dump-after={HARNESS_WILDCARD}",
+        f"--callgrind-out-file={work / 'profile'}.%p",
+        str(binary),
+        "--bench",
+        "--noplot",
+        *gates.bench_args,
+        *extra_args,
+        "--profile-time",
+        "1",
+        f"^{re.escape(bench_id)}$",
+    ]
+    if cpu is not None:
+        cmd = ["taskset", "-c", str(cpu), *cmd]
+    log_path = work / "count.log"
+    env = dict(os.environ, CRITERION_HOME=str(work / "home"))
+    try:
+        with log_path.open("w") as log:
+            log.write("+ " + " ".join(cmd) + "\n")
+            log.flush()
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=cwd,
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    timeout=bound,
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f"the count ran over {bound:g} s; see {log_path}") from None
+        if proc.returncode != 0:
+            raise RuntimeError(f"the count exited with {proc.returncode}; see {log_path}")
+        # callgrind names a profile by its process and numbers the one it writes after each
+        # batch; the one without a number is a process's end, the bench's own or that of a
+        # child it forked before its first batch.
+        numbered: dict[str, list[tuple[int, Path]]] = {}
+        for part in work.glob("profile.*.*"):
+            pid, _, number = part.name.removeprefix("profile.").partition(".")
+            if number.isdigit():
+                numbered.setdefault(pid, []).append((int(number), part))
+        if len(numbered) > 1:
+            raise RuntimeError(f"two processes of the count ran batches; see {log_path}")
+        parts = sorted(next(iter(numbered.values()), []))
+        try:
+            batches = [read_profile(part) for _, part in parts]
+        except (ValueError, IndexError) as err:
+            raise RuntimeError(
+                f"a profile of the count does not parse ({err}); see {log_path}"
+            ) from None
+    finally:
+        for part in work.glob("profile.*"):
+            part.unlink()
+    if not batches:
+        raise RuntimeError(f"the count holds no batch of the harness; see {log_path}")
+    if any(batch.calls != 1 for batch in batches):
+        raise RuntimeError(f"a profile of the count does not hold one batch; see {log_path}")
+    return {
+        "batches": [batch.count for batch in batches],
+        "unit": batches[-1].unit,
+        "address": batches[-1].address,
+    }
+
+
+def count_ids(
+    ids: list[str],
+    binaries: dict[str, Path],
+    out: Path,
+    cwd: Path,
+    gates: Gates,
+    extra_args: list[str],
+    cpu: int | None,
+    deadline: float,
+) -> dict[str, dict]:
+    """The ids on both executables, in their order, until the run's budget ends (`deadline`,
+    on the monotonic clock); a side that was not read carries the reason. Two counts that
+    differ are each taken once more (`again`): a count that differs from itself is the id's
+    own (a seed the process draws, the allocator's state) and says nothing of the change. No
+    count starts with less than `COUNT_FLOOR_S` left, and one that starts is capped by what
+    is left: the id whose turn the budget cut and the ids behind it are not counted."""
+    counts: dict[str, dict] = {}
+    for n, bench_id in enumerate(ids, start=1):
+
+        def count(side: str, turn: int) -> dict | None:
+            """One count; None when the run's budget left no room for it or ended it."""
+            left = deadline - time.monotonic()
+            if left < COUNT_FLOOR_S:
+                return None
+            bound = min(COUNT_TIMEOUT_S, left)
+            started = time.monotonic()
+            try:
+                work = out / SIDE_DIRS[side] / f"count-{n}-{turn}"
+                read = count_once(
+                    binaries[side], work, cwd, gates, extra_args, bench_id, cpu, bound
+                )
+                said = f"{len(read['batches'])} batches"
+            except (RuntimeError, OSError) as err:
+                if bound < COUNT_TIMEOUT_S and time.monotonic() - started >= bound:
+                    return None
+                read = {"error": str(err)}
+                said = f"not read, {err}"
+            seconds = time.monotonic() - started
+            label = f"count {n}/{len(ids)}" + (", once more" if turn == 2 else "")
+            print(f"[{label}] {side}: {bench_id}: {said} in {seconds:.0f} s", flush=True)
+            return read
+
+        def counted() -> dict | None:
+            """The id's two to four counts; None when the run's budget cut its turn."""
+            # The two counts of a side run from directories of one length: the length of a
+            # path the process holds moves what it allocates after, and a count can follow that.
+            sides: dict[str, dict] = {}
+            for side in SIDES:
+                read = count(side, 1)
+                if read is None:
+                    return None
+                sides[side] = read
+            if any("batches" not in read for read in sides.values()):
+                return sides
+            if differs_at(sides["base"]["batches"], sides["pr"]["batches"]) is None:
+                return sides
+            for side in SIDES:
+                again = count(side, 2)
+                if again is None:
+                    return None
+                if "batches" in again:
+                    sides[side]["again"] = again["batches"]
+            return sides
+
+        sides = counted()
+        if sides is None:
+            # This id and the ids behind it keep the time's verdict, and the report is written.
+            left_ids = ids[n - 1 :]
+            print(
+                f"[count] the run's budget of {gates.run_budget:g} s leaves no room: "
+                f"{len(left_ids)} of {len(ids)} ids not counted",
+                flush=True,
+            )
+            counts.update({left_id: {"skipped": "budget"} for left_id in left_ids})
+            break
+        counts[bench_id] = sides
+    return counts
+
+
+def differs_at(one: list[int], other: list[int]) -> int | None:
+    """The last batch two counts both ran that differs, the first left out (a first iteration
+    pays what the process has not done yet); None when every one is the same."""
+    for n in range(min(len(one), len(other)) - 1, 0, -1):
+        if one[n] != other[n]:
+            return n
+    return None
+
+
+@dataclass
+class Counted:
+    """What the count of an id read, at the batch that decides it."""
+
+    # "same": every batch both executables ran after the first is equal. "moved": one
+    # differs, and each executable counted the same twice. "unsteady": one differs, and so
+    # do an executable's own two counts.
+    state: str
+    # The harness's warm-up doubles a batch: 1, 2, 4, ... iterations.
+    iterations: int
+    # The batch's instructions on the base and on the pull request.
+    base: int
+    pr: int
+    # For an unsteady count: the executable whose two counts differ, and by how much.
+    side: str = ""
+    own: float = 0.0
 
 
 # --------------------------------------------------------------------------- compare
@@ -299,6 +912,13 @@ class Row:
     pr: list[float]
     gate: Gate | None
     verdict: str = ""
+    # The re-measured rounds, (base, pull request) per round: a process that runs the
+    # failing ids alone sits on levels of its own, so these are never pooled with the
+    # full rounds; each round is read within itself.
+    rechecks: list[tuple[float, float]] = field(default_factory=list)
+    # The count of an id that failed by time, per side: the batches' instruction counts and
+    # the last batch's unit, or why the side was not read.
+    counts: dict | None = None
 
     @property
     def base_median(self) -> float | None:
@@ -345,6 +965,84 @@ class Row:
     def fails(self) -> bool:
         return self.verdict in ("regression", "missing")
 
+    @property
+    def recheck_change(self) -> float | None:
+        """The median of the re-measured rounds' own changes (a round with a zero base:
+        +inf for a rise, -inf otherwise); None without a re-measurement."""
+        if not self.rechecks:
+            return None
+        changes = []
+        for base, pr in self.rechecks:
+            if base:
+                changes.append((pr - base) / abs(base))
+            else:
+                changes.append(math.inf if pr > base else -math.inf)
+        return statistics.median(changes)
+
+    @property
+    def confirmed(self) -> bool | None:
+        """Whether the re-measured rounds agree with the failure. Their job is to rule out
+        a burst, not to measure the change again: a burst re-measures near zero and a
+        regression near its size, so the bar is half the threshold (a zero base: any
+        rise) on the median of the rounds; None without a re-measurement."""
+        change = self.recheck_change
+        if change is None:
+            return None
+        threshold = self.gate.threshold if self.gate else 0.0
+        return change > threshold / 2
+
+    @property
+    def counted(self) -> Counted | None:
+        """What the count read: every batch both executables ran but the first, decided at
+        the last one that differs, or at the last one when none does. None when a side was
+        not read, or when the first batch is the only one both ran."""
+        sides = [(self.counts or {}).get(side) or {} for side in SIDES]
+        if any("batches" not in side for side in sides):
+            return None
+        base, pr = (side["batches"] for side in sides)
+        if min(len(base), len(pr)) < 2:
+            return None
+        n = differs_at(base, pr)
+        if n is None:
+            n = min(len(base), len(pr)) - 1
+            return Counted("same", 2**n, base[n], pr[n])
+        for label, side in zip(("base", "pull request"), sides):
+            first, again = side["batches"], side.get("again") or []
+            own = differs_at(first, again)
+            if own is not None:
+                moved = (again[own] - first[own]) / first[own]
+                return Counted("unsteady", 2**n, base[n], pr[n], label, moved)
+        return Counted("moved", 2**n, base[n], pr[n])
+
+    @property
+    def same_count(self) -> bool:
+        """Whether the count read the same instructions on the two executables."""
+        counted = self.counted
+        return counted is not None and counted.state == "same"
+
+    @property
+    def moved(self) -> bool | None:
+        """Whether the function the count names starts at another address in the pull
+        request's executable. None when a side names no function or no address, or when the
+        two sides name different functions."""
+        sides = [(self.counts or {}).get(side) or {} for side in SIDES]
+        unit, places = sides[0].get("unit"), [side.get("address") for side in sides]
+        if not unit or unit != sides[1].get("unit") or None in places:
+            return None
+        return places[0] != places[1]
+
+    @property
+    def within_ceiling(self) -> bool:
+        """Whether the change is one a placement can excuse: within twice the threshold."""
+        change, threshold = self.change, self.gate.threshold if self.gate else 0.0
+        return change is not None and change <= PLACEMENT_CEILING * threshold
+
+    @property
+    def placed(self) -> bool:
+        """Whether where the code sits can carry the time: the same count, a measured
+        function that starts elsewhere, and a change within twice the threshold."""
+        return bool(self.same_count and self.moved) and self.within_ceiling
+
 
 def judge(row: Row) -> str:
     if not row.pr:
@@ -360,34 +1058,66 @@ def judge(row: Row) -> str:
         # suspect, as for a change beyond the threshold; below zero and
         # separated, an improvement.
         if row.pr_median > 0:
-            return "regression" if row.separated else "suspect (runs overlap)"
+            return regression_or_suspect(row)
         if row.pr_median < 0 and row.separated:
             return "improvement"
         return "ok"
     if change > row.gate.threshold:
-        return "regression" if row.separated else "suspect (runs overlap)"
+        return regression_or_suspect(row)
     if change < -row.gate.threshold and row.separated:
         return "improvement"
     return "ok"
 
 
+def regression_or_suspect(row: Row) -> str:
+    """Beyond the threshold: a regression when every pull-request run is worse than every
+    base run and the re-measured round, read within itself, is beyond half the threshold;
+    otherwise suspect. A regression is a placement, where the code sits in the bench executable
+    and not work the change adds, on three facts: the two executables run it in the same
+    instruction count, its measured function starts elsewhere, and the change is within twice
+    the threshold."""
+    if not row.separated:
+        return "suspect (runs overlap)"
+    if row.confirmed is False:
+        return "suspect (not confirmed by the re-measurement)"
+    return "placement" if row.placed else "regression"
+
+
 def compare(results: dict, gates: Gates) -> list[Row]:
+    # The first `repeats` runs of a side are the full rounds; the runs after them are the
+    # re-measured rounds, kept apart from the full rounds and paired by round.
+    repeats = results.get("repeats") or len(results["base"]["runs"])
     per_side: dict[str, dict[str, list[float]]] = {side: {} for side in SIDES}
+    extra: dict[str, dict[str, dict[int, float]]] = {side: {} for side in SIDES}
     for side in SIDES:
-        for run in results[side]["runs"]:
+        for i, run in enumerate(results[side]["runs"]):
             for bench_id, value in run.items():
-                per_side[side].setdefault(bench_id, []).append(value)
+                if i < repeats:
+                    per_side[side].setdefault(bench_id, []).append(value)
+                else:
+                    extra[side].setdefault(bench_id, {})[i] = value
     ids = sorted(set(per_side["base"]) | set(per_side["pr"]))
+    counts = results.get("count") or {}
     rows = []
     for bench_id in ids:
+        base_extra = extra["base"].get(bench_id, {})
+        pr_extra = extra["pr"].get(bench_id, {})
+        rounds = sorted(set(base_extra) & set(pr_extra))
         row = Row(
             bench_id,
             per_side["base"].get(bench_id, []),
             per_side["pr"].get(bench_id, []),
             gates.threshold_for(bench_id),
+            rechecks=[(base_extra[i], pr_extra[i]) for i in rounds],
+            counts=counts.get(bench_id),
         )
         row.verdict = judge(row)
         rows.append(row)
+    # (3) A run the busy host stopped: the rows it left one-sided are not missing ids.
+    if results.get("not_judged"):
+        for row in rows:
+            if not row.base or not row.pr:
+                row.verdict = "not judged (the run stopped)"
     return rows
 
 
@@ -421,10 +1151,158 @@ def fmt_side(values: list[float], unit_ns: float, unit: str | None = None) -> st
     )
 
 
+def fmt_run(value: float) -> str:
+    """One run's value: six significant digits below a million, above it the plain integer
+    with separators (a millisecond row in nanoseconds reads `1,234,567`, never `1.23e+06`)."""
+    return f"{value:.6g}" if abs(value) < 1e6 else f"{value:,.0f}"
+
+
+def fmt_runs(values: list[float]) -> str:
+    """The per-run values of one side, compact."""
+    return "[" + ", ".join(fmt_run(value) for value in values) + "]"
+
+
+def fmt_rechecks(row: Row, unit_suffix: str) -> str:
+    """The re-measured rounds of a row, each read within itself."""
+    parts = []
+    for base, pr in row.rechecks:
+        change = (pr - base) / abs(base) if base else None
+        parts.append(
+            f"base {fmt_run(base)}{unit_suffix}, pull request {fmt_run(pr)}{unit_suffix} "
+            f"({fmt_pct(change)})"
+        )
+    return "; re-measured " + "; ".join(parts) if parts else ""
+
+
+def fmt_place(address: int) -> str:
+    """Where code starts inside its 4 KiB page."""
+    return f"0x{address % 4096:03x}"
+
+
+# Why an id that failed by time was not counted, as its line and the report say it.
+NOT_COUNTED = {
+    "beyond": (
+        f"a change beyond {PLACEMENT_CEILING:g} times the threshold, which no placement excuses"
+    ),
+    "no_base": "a base median of zero, which leaves no change for a placement to excuse",
+    "budget": "the run's budget left no room for its count, and the time alone decides",
+}
+
+
+def fmt_count(row: Row) -> str:
+    """What the count of a row read, as sentences for its line; "" for a row never counted."""
+    if not row.counts:
+        return ""
+    skipped = NOT_COUNTED.get(row.counts.get("skipped"))
+    if skipped:
+        return f" Not counted: {skipped}."
+    sides = [row.counts.get(side) or {} for side in SIDES]
+    counted = row.counted
+    if counted is None:
+        errors = [
+            f"{label}: {side['error']}"
+            for label, side in zip(("base", "pull request"), sides)
+            if "error" in side
+        ]
+        why = "; ".join(errors) or "the first batch alone ran on both sides"
+        return f" The count was not read ({why}): the time alone decides."
+    counts = f"{counted.base:,} instructions on the base and {counted.pr:,} on the pull request"
+    batch = f"a batch of {counted.iterations:,} iterations"
+    if counted.state != "same":
+        change = (counted.pr - counted.base) / counted.base
+        each = abs(counted.pr - counted.base) / counted.iterations
+        more = "more" if counted.pr > counted.base else "fewer"
+        differs = (
+            f"{counts} over {batch} ({change:+.3%}, {each:,.1f} instructions an iteration {more})"
+        )
+        if counted.state == "unsteady":
+            return (
+                f" The count differs, {differs}, and it is not steady on one executable alone: "
+                f"the {counted.side}'s own two counts differ by {abs(counted.own):.3%}. The "
+                "time alone decides."
+            )
+        twice = ", the same in two counts of each" if all(s.get("again") for s in sides) else ""
+        return f" The count moved too: {differs}{twice}."
+    return fmt_same_count(row, counted)
+
+
+def fmt_same_count(row: Row, counted: Counted) -> str:
+    """The sentences of a row the two executables run in the same instruction count: a
+    placement, or which of its two other facts leaves the failure."""
+    same = (
+        " The two executables run it in the same instruction count in every batch after the "
+        f"first, {counted.base:,} over the {counted.iterations:,} iterations of the last "
+        f"({counted.base / counted.iterations:,.1f} an iteration)"
+    )
+    sides = [(row.counts or {}).get(side) or {} for side in SIDES]
+    unit, places = sides[0].get("unit"), [side.get("address") for side in sides]
+    moved = row.moved
+    if moved is None:
+        return (
+            f"{same}, but the count names no one function with a place on both sides: the "
+            "failure stands."
+        )
+    if not moved:
+        return (
+            f"{same}, and `{unit}` starts at 0x{places[0]:x} in both: where the code sits does "
+            "not explain the time, and the failure stands."
+        )
+    if places[0] % 4096 == places[1] % 4096:
+        where = (
+            f"`{unit}` starts at 0x{places[0]:x} in the base's executable and at "
+            f"0x{places[1]:x} in the pull request's, the same place in its 4 KiB page."
+        )
+    else:
+        where = (
+            f"`{unit}` starts at {fmt_place(places[0])} of its 4 KiB page in the base's "
+            f"executable and at {fmt_place(places[1])} in the pull request's."
+        )
+    if not row.placed:
+        ceiling = PLACEMENT_CEILING * (row.gate.threshold if row.gate else 0.0)
+        return (
+            f"{same}. {where} A placement excuses a change up to {PLACEMENT_CEILING:g} times "
+            f"the threshold, {fmt_pct(ceiling, signed=False)}: the failure stands."
+        )
+    return (
+        f"{same}: the time is where the code sits in the bench executable, not work the pull "
+        f"request adds. {where}"
+    )
+
+
 def fmt_pct(value: float | None, signed: bool = True) -> str:
     if value is None:
         return "-"
     return f"{value:+.1%}" if signed else f"{value:.1%}"
+
+
+def sources_note(sources: dict | None) -> str:
+    """One line on the bench sources the two binaries were built from, when both builds
+    recorded them: byte-identical, so the rows compare the measured code alone, or the files
+    that differ and why the base side does not carry the pull request's."""
+    if not sources or any(sources.get(side) is None for side in SIDES):
+        return ""
+    base, pr = sources["base"]["files"], sources["pr"]["files"]
+    files = sorted(set(base) | set(pr))
+    if not files:
+        return ""
+    differing = [path for path in files if base.get(path) != pr.get(path)]
+    named = f"Bench sources ({len(files)} named by the gate file):"
+    if not differing:
+        return (
+            f"{named} byte-identical in the two binaries, so the rows compare the measured "
+            "code alone."
+        )
+    listed = ", ".join(f"`{path}`" for path in differing)
+    verb = "differs" if len(differing) == 1 else "differ"
+    why = ""
+    if sources["base"].get("applied") is False:
+        reason = sources["base"].get("reason", "the pull request's were not applied")
+        why = f" {reason}, so the base's binary carries its own."
+    return (
+        f"{named} {listed} {verb} between the two binaries.{why} A gated row that moves "
+        "without a change to what it measures is the binary's inlining of a neighbour: a row "
+        "this pull request adds goes to a bench target of its own."
+    )
 
 
 def markdown(results: dict, rows: list[Row]) -> str:
@@ -432,9 +1310,20 @@ def markdown(results: dict, rows: list[Row]) -> str:
     # Criterion results carry nanoseconds; another producer (crates/gateway_perf)
     # names the unit of its values, "" when the id names it. Lower is better either way.
     unit = results.get("unit")
+    if results.get("identical"):
+        sha = results["binaries"]["base"]["sha256"]
+        return (
+            "### Benchmark gate: PASS (identical binaries)\n\n"
+            f"The base and pull-request bench binaries are the same bytes (sha256 {sha[:16]}...): "
+            "no code change can move a row, so nothing was run.\n"
+        )
     failed = [row for row in rows if row.fails]
     suspect = [row for row in rows if row.verdict.startswith("suspect")]
-    verdict = "FAIL" if failed else "PASS"
+    placed = [row for row in rows if row.verdict == "placement"]
+    recheck = results.get("recheck") or {}
+    rechecked = set(recheck.get("ids", []))
+    not_judged = results.get("not_judged")
+    verdict = "NOT JUDGED" if not_judged else ("FAIL" if failed else "PASS")
     lines = [
         f"### Benchmark gate: {verdict}",
         "",
@@ -442,6 +1331,46 @@ def markdown(results: dict, rows: list[Row]) -> str:
         "spread = the larger side's (max - min) / median. A gated id fails when its change is "
         "worse than the threshold and every pull-request run is worse (higher) than every base run.",
         "",
+    ]
+    if not_judged:
+        lines += [
+            f"Not judged: {not_judged}. The runs below are the ones that completed; "
+            "run the gate again on a quiet host.",
+            "",
+        ]
+    if rechecked:
+        lines += [
+            f"Re-measured before the verdict, {recheck.get('rounds', 1)} more run(s) per side in the "
+            f"interleaved order: {', '.join(f'`{bench_id}`' for bench_id in sorted(rechecked))}.",
+            "",
+        ]
+    reads = results.get("count") or {}
+    counted = sorted(bench_id for bench_id, read in reads.items() if "skipped" not in read)
+    if counted:
+        lines += [
+            "Counted before the verdict, on both executables under callgrind: "
+            f"{', '.join(f'`{bench_id}`' for bench_id in counted)}. An id that "
+            "fails by time is a placement (where its code sits in the bench executable) when "
+            "it runs the same instruction count on both, its measured function starts at "
+            "another address and the change is within twice its threshold: reported, not "
+            "failed, and still a row to read.",
+            "",
+        ]
+    for why, said in NOT_COUNTED.items():
+        left = sorted(bench_id for bench_id, read in reads.items() if read.get("skipped") == why)
+        if left:
+            names = ", ".join(f"`{bench_id}`" for bench_id in left)
+            lines += [f"Not counted, {names}: {said}.", ""]
+    if any(results.get(side, {}).get("load") for side in SIDES):
+        shown = ", ".join(
+            f"{side} {[round(v, 1) for v in results[side]['load'] if v is not None]}"
+            for side in SIDES
+        )
+        lines += [f"Host load (one minute) before each run: {shown}.", ""]
+    note = sources_note(results.get("sources"))
+    if note:
+        lines += [note, ""]
+    lines += [
         "| benchmark | base | pull request | change | spread | threshold | verdict |",
         "|---|---|---|---|---|---|---|",
     ]
@@ -460,7 +1389,14 @@ def markdown(results: dict, rows: list[Row]) -> str:
     gated = sum(1 for row in rows if row.gate is not None)
     lines.append(
         f"{len(rows)} ids, {gated} gated, {len(failed)} failed, {len(suspect)} suspect "
-        f"(beyond the threshold, runs overlap: not failed)."
+        "(beyond the threshold, the runs overlap or the re-measurement did not confirm: "
+        "not failed)."
+        + (
+            f" {len(placed)} placement (beyond the threshold on the same instruction count, "
+            "the measured function moved, within twice the threshold: not failed)."
+            if placed
+            else ""
+        )
     )
     unit_suffix = " ns" if unit is None else (f" {unit}" if unit else "")
     for row in failed:
@@ -473,8 +1409,17 @@ def markdown(results: dict, rows: list[Row]) -> str:
         else:
             lines.append(
                 f"- `{row.bench_id}`: {fmt_pct(row.change)} against a {fmt_pct(row.gate.threshold, signed=False)} "
-                f"threshold; base runs {[round(v, 3) for v in row.base]}{unit_suffix}, pull request runs "
-                f"{[round(v, 3) for v in row.pr]}{unit_suffix}."
+                f"threshold; base runs {fmt_runs(row.base)}{unit_suffix}, pull request runs "
+                f"{fmt_runs(row.pr)}{unit_suffix}{fmt_rechecks(row, unit_suffix)}.{fmt_count(row)}"
+            )
+    # The per-run values of every suspect, placed or re-measured row, so a bimodal set is
+    # visible here; a placement carries what its count read.
+    for row in rows:
+        if row in suspect or row in placed or (row.bench_id in rechecked and not row.fails):
+            lines.append(
+                f"- `{row.bench_id}`: {row.verdict}, {fmt_pct(row.change)}; base runs "
+                f"{fmt_runs(row.base)}{unit_suffix}, pull request runs "
+                f"{fmt_runs(row.pr)}{unit_suffix}{fmt_rechecks(row, unit_suffix)}.{fmt_count(row)}"
             )
     return "\n".join(lines) + "\n"
 
@@ -489,6 +1434,8 @@ def report(results: dict, gates: Gates, gate_md: Path | None, summary: str | Non
     if summary:
         with open(summary, "a") as handle:
             handle.write(text)
+    if results.get("not_judged"):
+        return 2
     return 1 if any(row.fails for row in rows) else 0
 
 
@@ -509,6 +1456,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     build = sub.add_parser("build", help="build a bench binary and copy it to --out")
     build.add_argument("--out", required=True, help="where the bench executable is copied")
     build.add_argument("--name", help="the bench target when the command builds several")
+    build.add_argument("--gates", help="the TOML gate file: its bench sources are recorded")
+    build.add_argument(
+        "--sources-from",
+        metavar="REV",
+        help="build with the gate file's bench sources as this commit has them "
+        "(the base side carries the pull request's)",
+    )
     build.add_argument("cargo", nargs=argparse.REMAINDER, help="the cargo bench command")
     build.set_defaults(func=cmd_build)
 
@@ -519,6 +1473,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--out", required=True, help="output directory (results.json, logs)")
     run.add_argument("--cwd", help="working directory for the bench binaries")
     run.add_argument("--repeats", type=int, help="override the gate file's repeat count")
+    run.add_argument(
+        "--recheck",
+        type=int,
+        default=1,
+        metavar="N",
+        help="more runs per side for the ids that fail, before the verdict (default 1, 0 for none)",
+    )
+    run.add_argument("--cpu", type=int, metavar="N", help="pin the bench processes to this CPU")
+    run.add_argument(
+        "--busy-above",
+        type=float,
+        metavar="LOAD",
+        help="wait for the host's one-minute load to be at most LOAD before a run, "
+        "then refuse to judge",
+    )
+    run.add_argument(
+        "--busy-wait",
+        type=float,
+        default=600.0,
+        metavar="S",
+        help="how long --busy-above waits for a quiet host (default 600 s)",
+    )
     run.add_argument("--summary", help="markdown file to append to (default: GITHUB_STEP_SUMMARY)")
     run.add_argument("bench_args", nargs=argparse.REMAINDER, help="extra bench arguments")
     run.set_defaults(func=cmd_run)

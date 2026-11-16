@@ -149,9 +149,33 @@ pub(crate) fn prepare_tools(tools: &[Tool]) -> Result<Arc<PreparedTools>, String
 fn tool_values(tools: &[Tool]) -> Result<Vec<Value>, String> {
     tools
         .iter()
-        .map(serde_json::to_value)
+        .map(tool_value)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Failed to serialize tools: {e}"))
+}
+
+/// One tool as the template reads it: its serialized form, with the schema
+/// the client did not give handed on as `null`. A serialized function leaves
+/// an absent schema out, as any optional field the client left out; the
+/// engine's own template reads the declaration with `"parameters": null`, in
+/// the place of the schema (after the description, before `strict` and any
+/// further field), and renders the tool so.
+fn tool_value(tool: &Tool) -> Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(tool)?;
+    if tool.function.parameters.is_none() {
+        if let Some(function) = value.get_mut("function").and_then(Value::as_object_mut) {
+            let fields = std::mem::take(function);
+            let has_description = fields.contains_key("description");
+            for (key, field) in fields {
+                let schema_follows = key == "description" || (key == "name" && !has_description);
+                function.insert(key, field);
+                if schema_follows {
+                    function.insert("parameters".to_string(), Value::Null);
+                }
+            }
+        }
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -308,6 +332,74 @@ mod tests {
                 &prepare_tools(&heavy).unwrap()
             ),
             "a set above the weight cap is prepared for its request alone"
+        );
+    }
+
+    fn declared(function: Value) -> Tool {
+        serde_json::from_value(json!({"type": "function", "function": function})).unwrap()
+    }
+
+    /// A tool declared without a schema (the field absent or `null`) reaches
+    /// the template with `"parameters": null` in the schema's place, as the
+    /// engine's own template reads the declaration; a client's own `{}`
+    /// stays `{}`. The kept sets tell the two apart: the serialized key of a
+    /// schema-less tool leaves the field out, the key of a `{}` tool carries it.
+    #[test]
+    fn a_tool_without_a_schema_reaches_the_template_with_a_null_schema_in_its_place() {
+        let _serial = SERIAL.lock().unwrap();
+        let without = [
+            declared(json!({"name": "schema_less_absent", "description": "no schema given"})),
+            declared(json!({"name": "schema_less_null", "parameters": null, "strict": false})),
+        ];
+        let prepared = prepare_tools(&without).unwrap();
+        assert_eq!(
+            prepared.tools(),
+            [
+                json!({"type": "function", "function": {
+                    "name": "schema_less_absent", "description": "no schema given", "parameters": null}}),
+                json!({"type": "function", "function": {
+                    "name": "schema_less_null", "parameters": null, "strict": false}}),
+            ],
+            "the schema's place is after the description, or after the name, before the rest"
+        );
+        let keys: Vec<Vec<&str>> = prepared
+            .tools()
+            .iter()
+            .map(|tool| {
+                tool["function"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                vec!["name", "description", "parameters"],
+                vec!["name", "parameters", "strict"]
+            ]
+        );
+
+        assert!(
+            Arc::ptr_eq(
+                &prepare_tools(&without[..1]).unwrap(),
+                &prepare_tools(&without[..1]).unwrap()
+            ),
+            "a schema-less set is kept and shared like any other"
+        );
+        let with_empty = [declared(json!({"name": "schema_less_absent",
+            "description": "no schema given", "parameters": {}}))];
+        let empty = prepare_tools(&with_empty).unwrap();
+        assert_eq!(
+            empty.tools()[0]["function"]["parameters"],
+            json!({}),
+            "a client's own empty schema renders as it was given"
+        );
+        assert!(
+            !Arc::ptr_eq(&prepare_tools(&without[..1]).unwrap(), &empty),
+            "a schema-less tool and the same tool with an empty schema are kept apart"
         );
     }
 }

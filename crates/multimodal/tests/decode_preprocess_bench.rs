@@ -35,9 +35,7 @@ fn bench_decode_preprocess() {
 
     // warmup
     let img = jpeg_turbo::decode_jpeg_rgb(&bytes).expect("turbojpeg decode");
-    let _ = proc
-        .preprocess(std::slice::from_ref(&img))
-        .expect("preprocess");
+    let _ = proc.preprocess(&[&img]).expect("preprocess");
 
     let n_dec = 300usize;
     let t0 = Instant::now();
@@ -49,7 +47,7 @@ fn bench_decode_preprocess() {
     let n_pp = 200usize;
     let t1 = Instant::now();
     for _ in 0..n_pp {
-        let _ = proc.preprocess(std::slice::from_ref(&img)).unwrap();
+        let _ = proc.preprocess(&[&img]).unwrap();
     }
     let pp_ms = t1.elapsed().as_secs_f64() * 1000.0 / n_pp as f64;
 

@@ -148,6 +148,14 @@ pub fn hash_video_with_sampling(
             hasher.update(&(max_frames as u64).to_le_bytes());
             hasher.update(&(temporal_patch_size as u64).to_le_bytes());
         }
+        FrameSampling::SteppedGroups {
+            temporal_patch_size,
+            max_frames,
+        } => {
+            hasher.update(&[7]);
+            hasher.update(&(temporal_patch_size as u64).to_le_bytes());
+            hasher.update(&(max_frames as u64).to_le_bytes());
+        }
     }
     hasher.finalize().to_hex().to_string()
 }

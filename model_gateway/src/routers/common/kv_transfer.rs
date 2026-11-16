@@ -14,7 +14,7 @@ use tracing::warn;
 use crate::{
     observability::metrics::metrics_labels,
     worker::{
-        pd_pairing::{connector_profile, KvTransferProfile},
+        pd::pairing::{connector_profile, KvTransferProfile},
         Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR, MORIIO_MODE_LABEL,
         NIXL_CONNECTOR,
     },
@@ -170,7 +170,7 @@ pub(crate) fn moriio_endpoint(worker: &dyn Worker) -> Result<MoriIoEndpoint, Str
     };
     if worker.dp_rank().is_some() {
         return Err(format!(
-            "{url}: MoRI-IO PD pins both legs of a request to one data-parallel rank itself; \
+            "{url}: MoRI-IO PD pins both sides of a request to one data-parallel rank itself; \
              register the engine once, with a dp_size label, instead of one worker per rank"
         ));
     }
@@ -243,7 +243,7 @@ pub(crate) fn moriio_dp_mismatch_error(
 ) -> Option<String> {
     (prefill.dp_size != decode.dp_size).then(|| {
         format!(
-            "prefill dp_size={} but decode dp_size={}: MoRI-IO PD sends both legs of a \
+            "prefill dp_size={} but decode dp_size={}: MoRI-IO PD sends both sides of a \
              request to the same data-parallel rank, so both engines need the same dp_size",
             prefill.dp_size, decode.dp_size
         )
@@ -502,7 +502,7 @@ pub(crate) fn moriio_side_channel_error(
             .map_or_else(|| "none".to_string(), Value::to_string)
     };
     Some(format!(
-        "prefill reports MoRI-IO side channel handshake {} / notify {}, but the decode leg \
+        "prefill reports MoRI-IO side channel handshake {} / notify {}, but the decode worker \
          was told {} / {}; set labels {MORIIO_HANDSHAKE_PORT_LABEL} / \
          {MORIIO_NOTIFY_PORT_LABEL} on the prefill worker",
         shown("remote_handshake_port"),
@@ -601,6 +601,7 @@ pub(crate) fn mooncake_decode_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::{BasicWorker, BasicWorkerBuilder, WorkerType};
 
     /// The decode side's bootstrap URL must parse for every spelling the
     /// bootstrap host arrives in: bracketed from a worker URL, bare from a
@@ -675,9 +676,9 @@ mod tests {
         );
     }
 
-    fn moriio_worker(url: &str, labels: &[(&str, &str)]) -> crate::worker::BasicWorker {
-        let mut builder = crate::worker::BasicWorkerBuilder::new(url)
-            .worker_type(crate::worker::WorkerType::Decode)
+    fn moriio_worker(url: &str, labels: &[(&str, &str)]) -> BasicWorker {
+        let mut builder = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Decode)
             .kv_connector(MORIIO_CONNECTOR);
         for (key, value) in labels {
             builder = builder.label(*key, *value);
@@ -751,15 +752,15 @@ mod tests {
                 "{labels:?} must be refused"
             );
         }
-        let nixl = crate::worker::BasicWorkerBuilder::new("http://p:1")
+        let nixl = BasicWorkerBuilder::new("http://p:1")
             .kv_connector(NIXL_CONNECTOR)
             .label("moriio_mode", "read")
             .build();
         assert!(moriio_endpoint(&nixl).is_err());
         // One worker per rank would let the two sides of a request pick
         // different ranks.
-        let per_rank = crate::worker::BasicWorkerBuilder::new("http://decode:8200")
-            .worker_type(crate::worker::WorkerType::Decode)
+        let per_rank = BasicWorkerBuilder::new("http://decode:8200")
+            .worker_type(WorkerType::Decode)
             .kv_connector(MORIIO_CONNECTOR)
             .label("moriio_mode", "write")
             .dp_config(3, 8)
@@ -1177,8 +1178,6 @@ mod tests {
 
     #[test]
     fn invalid_dp_size_label_fails_closed_on_minting() {
-        use crate::worker::{BasicWorkerBuilder, WorkerType};
-
         let worker = BasicWorkerBuilder::new("http://prefill:8000")
             .worker_type(WorkerType::Prefill)
             .kv_connector(MOONCAKE_CONNECTOR)
@@ -1228,7 +1227,7 @@ mod tests {
 
     #[test]
     fn a_refreshed_engine_id_is_what_the_handoff_is_minted_for() {
-        use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType};
+        use crate::worker::{ConnectionMode, RuntimeType};
 
         let worker = BasicWorkerBuilder::new("grpc://p:1")
             .worker_type(WorkerType::Prefill)

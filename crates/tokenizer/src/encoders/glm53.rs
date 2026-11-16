@@ -8,12 +8,17 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
+    sync::LazyLock,
 };
 
 use anyhow::{bail, Result};
 use serde_json::Value;
 
-use crate::chat_template::{self, ChatTemplateParams};
+use super::truthy;
+use crate::{
+    chat_template::{self, ChatTemplateParams},
+    json_dumps,
+};
 
 /// The current official templates identify the supported renderer revision.
 /// Other templates retain MiniJinja; checkpoint metadata alone cannot identify 5.3.
@@ -46,19 +51,38 @@ impl Template {
     }
 }
 
-const TOOLS_PREFIX: &str = "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n";
-const TOOLS_SUFFIX: &str = "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>";
+// GLM's markup, each tag spelled once: the tool instruction text and the
+// rendered history are built from these, and the cross-crate marker pin
+// reads this one place.
+const BOS: &str = "[gMASK]<sop>";
+const SYSTEM: &str = "<|system|>";
+const ASSISTANT: &str = "<|assistant|>";
+const OBSERVATION: &str = "<|observation|>";
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+const TOOLS_OPEN: &str = "<tools>";
+const TOOLS_CLOSE: &str = "</tools>";
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+const ARG_KEY_OPEN: &str = "<arg_key>";
+const ARG_KEY_CLOSE: &str = "</arg_key>";
+const ARG_VALUE_OPEN: &str = "<arg_value>";
+const ARG_VALUE_CLOSE: &str = "</arg_value>";
+const TOOL_RESPONSE_OPEN: &str = "<tool_response>";
+const TOOL_RESPONSE_CLOSE: &str = "</tool_response>";
 
-pub(super) fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64() != Some(0.0),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(value) => !value.is_empty(),
-        Value::Object(value) => !value.is_empty(),
-    }
-}
+/// The tool instruction text around the tool definitions, built once from the
+/// tags at first use.
+static TOOLS_PREFIX: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{SYSTEM}\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within {TOOLS_OPEN}{TOOLS_CLOSE} XML tags:\n{TOOLS_OPEN}\n"
+    )
+});
+static TOOLS_SUFFIX: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{TOOLS_CLOSE}\n\nFor each function call, output the function name and arguments within the following XML format:\n{TOOL_CALL_OPEN}{{function-name}}{ARG_KEY_OPEN}{{arg-key-1}}{ARG_KEY_CLOSE}{ARG_VALUE_OPEN}{{arg-value-1}}{ARG_VALUE_CLOSE}{ARG_KEY_OPEN}{{arg-key-2}}{ARG_KEY_CLOSE}{ARG_VALUE_OPEN}{{arg-value-2}}{ARG_VALUE_CLOSE}...{TOOL_CALL_CLOSE}"
+    )
+});
 
 fn text(value: &Value) -> String {
     match value {
@@ -125,7 +149,7 @@ fn tool_definition(tool: &Value) -> Result<String> {
         if out.len() > 1 {
             out.push_str(", ");
         }
-        let _ = write!(out, "\"{key}\": {}", json(value)?);
+        let _ = write!(out, "\"{key}\": {}", json_dumps::to_string(value));
     }
     out.push('}');
     Ok(out)
@@ -146,7 +170,7 @@ fn reference_response(refs: &Value, tools: &[Value]) -> Result<String> {
     if tools.is_empty() {
         bail!("Rendering a tool_reference requires tools");
     }
-    let mut out = String::from("<tool_response><tools>\n");
+    let mut out = format!("{TOOL_RESPONSE_OPEN}{TOOLS_OPEN}\n");
     for reference in refs.as_array().into_iter().flatten() {
         for tool in tools.iter().map(unwrap_tool) {
             if tool.get("name") == reference.get("name") {
@@ -155,7 +179,8 @@ fn reference_response(refs: &Value, tools: &[Value]) -> Result<String> {
             }
         }
     }
-    out.push_str("</tools></tool_response>");
+    out.push_str(TOOLS_CLOSE);
+    out.push_str(TOOL_RESPONSE_CLOSE);
     Ok(out)
 }
 
@@ -164,7 +189,7 @@ fn response(value: &Value, tools: &[Value], media: &mut MediaContext) -> Result<
         reference_response(value, tools)
     } else {
         Ok(format!(
-            "<tool_response>{}</tool_response>",
+            "{TOOL_RESPONSE_OPEN}{}{TOOL_RESPONSE_CLOSE}",
             visible_text(value, media)
         ))
     }
@@ -269,17 +294,17 @@ fn tool_call(out: &mut String, call: &Value) -> Result<()> {
     let Some(arguments) = arguments.as_object() else {
         bail!("tool_call arguments must be a JSON object");
     };
-    let _ = write!(out, "<tool_call>{name}");
+    let _ = write!(out, "{TOOL_CALL_OPEN}{name}");
     for (key, value) in arguments {
-        let _ = write!(out, "<arg_key>{key}</arg_key><arg_value>");
+        let _ = write!(out, "{ARG_KEY_OPEN}{key}{ARG_KEY_CLOSE}{ARG_VALUE_OPEN}");
         if let Some(value) = value.as_str() {
             out.push_str(value);
         } else {
-            out.push_str(&json(value)?);
+            out.push_str(&json_dumps::to_string(value));
         }
-        out.push_str("</arg_value>");
+        out.push_str(ARG_VALUE_CLOSE);
     }
-    out.push_str("</tool_call>");
+    out.push_str(TOOL_CALL_CLOSE);
     Ok(())
 }
 
@@ -331,16 +356,16 @@ fn render_inner(
     let clear_thinking = kwargs
         .and_then(|k| k.get("clear_thinking"))
         .is_some_and(truthy);
-    let mut out = format!("[gMASK]<sop><|system|>Reasoning Effort: {effort}");
+    let mut out = format!("{BOS}{SYSTEM}Reasoning Effort: {effort}");
     if !tools.is_empty() {
-        out.push_str(TOOLS_PREFIX);
+        out.push_str(&TOOLS_PREFIX);
         for tool in tools.iter().map(unwrap_tool) {
             if !truthy(&tool["defer_loading"]) {
                 out.push_str(&tool_definition(tool)?);
                 out.push('\n');
             }
         }
-        out.push_str(TOOLS_SUFFIX);
+        out.push_str(&TOOLS_SUFFIX);
     }
     let last_user = messages
         .iter()
@@ -358,22 +383,23 @@ fn render_inner(
                 );
             }
             "assistant" => {
-                out.push_str("<|assistant|><think>");
+                out.push_str(ASSISTANT);
+                out.push_str(THINK_OPEN);
                 let mut content = visible_text(&message["content"], media);
                 let mut reasoning = message["reasoning_content"].as_str().map(str::to_owned);
-                if reasoning.is_none() && content.contains("</think>") {
+                if reasoning.is_none() && content.contains(THINK_CLOSE) {
                     reasoning = Some(
                         content
-                            .split("</think>")
+                            .split(THINK_CLOSE)
                             .next()
                             .unwrap_or_default()
-                            .rsplit("<think>")
+                            .rsplit(THINK_OPEN)
                             .next()
                             .unwrap_or_default()
                             .to_owned(),
                     );
                     content = content
-                        .rsplit("</think>")
+                        .rsplit(THINK_CLOSE)
                         .next()
                         .unwrap_or_default()
                         .to_owned();
@@ -383,7 +409,7 @@ fn render_inner(
                         out.push_str(&reasoning);
                     }
                 }
-                out.push_str("</think>");
+                out.push_str(THINK_CLOSE);
                 // Match MiniJinja pycompat's str.strip (Rust whitespace); the
                 // shared continuation cut separately follows Python whitespace.
                 out.push_str(content.trim());
@@ -396,7 +422,7 @@ fn render_inner(
                 while index + 1 < messages.len() && messages[index + 1]["role"] == "tool" {
                     index += 1;
                 }
-                out.push_str("<|observation|>");
+                out.push_str(OBSERVATION);
                 out.push_str(&ordered_tool_block(
                     &messages[start..=index],
                     start.checked_sub(1).map(|i| &messages[i]),
@@ -409,13 +435,10 @@ fn render_inner(
         index += 1;
     }
     if params.add_generation_prompt {
-        out.push_str("<|assistant|><think>");
+        out.push_str(ASSISTANT);
+        out.push_str(THINK_OPEN);
     }
     Ok(out)
-}
-
-fn json(value: &Value) -> Result<String> {
-    chat_template::compact_python_json(value)
 }
 
 #[cfg(test)]
@@ -603,6 +626,55 @@ mod tests {
                     (actual, expected) => panic!("native={actual:?}, jinja={expected:?}"),
                 }
             }
+        }
+    }
+
+    /// A tool schema and a history call's non-string arguments render with
+    /// Python's `json.dumps` spacing, `", "` between items and `": "` after a
+    /// key, as the engine's template writes them. The corpus test above reads
+    /// the template as its oracle, and the template shares the formatter, so
+    /// the spelling is pinned here in bytes.
+    #[test]
+    fn tool_schemas_and_call_arguments_render_with_pythons_json_spacing() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                    },
+                    "required": ["city"]
+                }
+            }
+        })];
+        let messages = vec![
+            json!({"role": "user", "content": "Weather?"}),
+            json!({"role": "assistant", "tool_calls": [{
+                "id": "a",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": {"city": "Paris", "window": {"days": 2, "hours": [6, 18]}}
+                }
+            }]}),
+            json!({"role": "tool", "tool_call_id": "a", "content": "Sunny"}),
+        ];
+        let params = || ChatTemplateParams {
+            add_generation_prompt: true,
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        for template in [Template::Text, Template::Flash] {
+            let out = render(&messages, params(), template).unwrap();
+            assert!(
+                out.0.contains(r#""enum": ["celsius", "fahrenheit"]"#)
+                    && out.0.contains(r#"{"days": 2, "hours": [6, 18]}"#),
+                "{template:?}: {}",
+                out.0
+            );
         }
     }
 }

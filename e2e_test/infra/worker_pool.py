@@ -31,7 +31,7 @@ import atexit
 import logging
 import threading
 
-from .constants import DEFAULT_STARTUP_TIMEOUT, ConnectionMode, WorkerType
+from .constants import DEFAULT_STARTUP_TIMEOUT, ConnectionMode, WorkerType, zmq_backend
 from .gateway import Gateway
 from .process_utils import wait_for_workers_ready
 from .worker import Worker, start_workers, stop_workers
@@ -256,7 +256,7 @@ class WorkerPool:
                     worker_urls=[w.base_url for w in workers],
                     workers=workers,
                     model_path=model_path,
-                    backend=engine,
+                    backend=zmq_backend(engine),
                     policy=gateway_config["policy"],
                     timeout=gateway_config["timeout"],
                     extra_args=gateway_config["extra_args"],

@@ -66,7 +66,10 @@ async fn every_steps_logprobs_reach_the_client_once() {
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
     let response = Arc::new(HarmonyStreamingProcessor::new())
         .process_streaming_chat_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             Arc::new(request),
             dispatch,
             Vec::new(),
