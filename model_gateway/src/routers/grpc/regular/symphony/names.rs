@@ -80,10 +80,10 @@ pub(crate) fn labels_select_nothing(names: &Names) -> bool {
     matches!(selection(names), Selection::Nothing)
 }
 
-/// Why the legacy parsers read a request Symphony was configured for, by the site that decided
-/// it: the precedence among the names and the registry ([`decision`]), or the table's missing
-/// tag ([`assign_for`](super::reader::assign_for)). A request so read is counted once under its
-/// reason ([`telemetry::record_fallback`]); its response's header says `legacy`, as before.
+/// Why the legacy parsers read a request Symphony was configured for: the precedence among the
+/// names and the registry decides it ([`decision`]), and nothing else does. A request so read is
+/// counted once under its reason ([`telemetry::record_fallback`]); its response's header says
+/// `legacy`, as before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fallback {
     /// No table reads the model and no name is set for it: the registry does not know the model,
@@ -100,10 +100,6 @@ pub(crate) enum Fallback {
     /// `passthrough`, as the tool-call name or alone as the reasoning name: the choice to leave a
     /// channel as written, which no table does.
     Passthrough,
-    /// A table reads the model and has no tag for the request's forced or required call: the older
-    /// registry's JSON schema constrains the output, which then has no markers for the table to
-    /// read, so the legacy parsers read it ([`assign_for`](super::reader::assign_for)).
-    ForcedCallWithoutTag,
 }
 
 /// What reads a model's responses under Symphony ([`decision`]).
@@ -113,8 +109,7 @@ pub(super) enum Decision {
     /// A table, shared with every request and engine that reads with it: the registry's, or
     /// the one the names select.
     Table(Arc<Format>),
-    /// The legacy parsers, for the reason the precedence names: never
-    /// [`Fallback::ForcedCallWithoutTag`], which the assignment decides.
+    /// The legacy parsers, for the reason the precedence names.
     Legacy(Fallback),
 }
 
@@ -284,10 +279,11 @@ pub(crate) fn set_aside_by_the_registry(
 /// is absent is not checked (its parsers are unused in that configuration). A name no legacy
 /// parser has that a table answers to (the table's own name, or a launcher's name for a family
 /// whose table has no older parser), and [`TEMPLATE_PARSER`], bind the other name to the same or
-/// to nothing: the legacy parsers read a forced call the table has no tag for by the names they
-/// are given, and have no parser of that name. A legacy parser's name a table answers to is
-/// checked as the legacy name it is, in its own kind. The error says what is wrong with which
-/// name, for the startup or registration failure.
+/// to nothing: the two names are one selection, and where the other name selects the legacy
+/// parsers ([`decision`]) those read by the names they are given and have no parser of that
+/// name. A legacy parser's name a table answers to is checked as the legacy name it is, in its
+/// own kind. The error says what is wrong with which name, for the startup or registration
+/// failure.
 pub(crate) fn check_names(
     parser: ParserChoice,
     names: &Names,

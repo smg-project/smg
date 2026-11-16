@@ -145,13 +145,12 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
-
-        ctx.policy_registry.set_prefill_policy(prefill_policy);
-        ctx.policy_registry.set_decode_policy(decode_policy);
+        Self::set_pd_policies(
+            prefill_policy_config,
+            decode_policy_config,
+            main_policy_config,
+            ctx,
+        );
 
         let config = ctx.router_config.clone();
         if config.dp_minimum_tokens_scheduler {
@@ -181,8 +180,8 @@ impl RouterFactory {
         Ok(Box::new(router))
     }
 
-    /// Register the prefill/decode policies for a gRPC PD deployment, defaulting
-    /// to the main policy when a per-role policy is unset.
+    /// Register the prefill/decode policies (HTTP PD, gRPC PD and gRPC EPD),
+    /// each from its own config or, when unset, the main policy.
     fn set_pd_policies(
         prefill_policy_config: Option<&PolicyConfig>,
         decode_policy_config: Option<&PolicyConfig>,
@@ -212,14 +211,13 @@ impl RouterFactory {
         let encode_policy = PolicyFactory::create_from_config(
             encode_policy_config.unwrap_or(&default_encode_policy),
         );
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
-
         ctx.policy_registry.set_encode_policy(encode_policy);
-        ctx.policy_registry.set_prefill_policy(prefill_policy);
-        ctx.policy_registry.set_decode_policy(decode_policy);
+        Self::set_pd_policies(
+            prefill_policy_config,
+            decode_policy_config,
+            main_policy_config,
+            ctx,
+        );
     }
 
     /// Mount the external router that `backend` names, or say which Cargo

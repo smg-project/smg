@@ -85,11 +85,16 @@ interface plugin {
 /// Request block: an 80-byte header, then the variable sections in the order
 /// below (the header carries their counts, not offsets: a reader walks the
 /// sections in order), offsets relative to the block's start:
-///   0 namespace-seed u64; 8 seed u64; 16 tenant u64; 24 session-key u64
-///   (the key's fingerprint in both the hash and the plain form: 64-bit
-///   FNV-1a over the key's bytes, offset basis 0xcbf29ce484222325, prime
-///   0x100000001b3, a zero result mapped to 1, so 0 is `none`; under `plain`
-///   the string follows in its section and bit 1 or 2 says so);
+///   0 namespace-seed u64; 8 seed u64; 16 tenant u64 (the key's fingerprint
+///   in both the hash and the plain form: 64-bit FNV-1a over the key's
+///   bytes, offset basis 0xcbf29ce484222325, prime 0x100000001b3, a zero
+///   result mapped to 1, so 0 is `none`; under `plain` the string follows in
+///   its section and bit 1 says so); 24 session-key u64 (the session's value
+///   in both forms, the number a lease's `session-key` carries: the key
+///   within the request's model and phase, by the formula beside `Identity`
+///   in `policy_plugin.proto`, whose phase number is this header's phase
+///   byte plus one; 0 is `none`; under `plain` the key's string follows in
+///   its section and bit 2 says so);
 ///   32 budget-micros u32;
 ///   36 prompt-tokens u32; 40 max-output-tokens u32; 44 priority s32;
 ///   48 hash-count u16; 50 tried-count u16; 52 header-count u16;

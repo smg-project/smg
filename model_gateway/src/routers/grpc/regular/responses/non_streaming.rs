@@ -117,7 +117,7 @@ async fn execute_without_mcp(
             error = %e,
             "Failed to convert ResponsesRequest to ChatCompletionRequest"
         );
-        error::bad_request(e.code(), format!("Failed to convert request: {e}"))
+        error::bad_request(e.code(), e.to_string())
     })?;
 
     // Execute chat pipeline (errors already have proper HTTP status codes)
@@ -205,11 +205,13 @@ pub(super) async fn execute_tool_loop(
                         error = %e,
                         "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
                     );
-                    error::bad_request(e.code(), format!("Failed to convert request: {e}"))
+                    error::bad_request(e.code(), e.to_string())
                 })?;
 
         // Prepare tool_choice for this iteration
-        prepare_tool_choice(&mut chat_request, state.iteration);
+        prepare_tool_choice(&mut chat_request, &state, |name| {
+            session.has_exposed_tool(name)
+        });
 
         // Execute chat pipeline (errors already have proper HTTP status codes)
         let (chat_response, parser) = ctx
@@ -243,7 +245,9 @@ pub(super) async fn execute_tool_loop(
             .and_then(|choice| choice.finish_reason.as_deref())
             .is_some_and(|reason| matches!(reason, "length" | "failed" | "error"))
             || has_unfinished_mcp_call(&tool_calls, &session);
-        if tool_calls.is_empty() || generation_interrupted {
+        // The final turn's answer ends the loop whatever it holds: a server
+        // call made anyway is hidden below and does not run.
+        if tool_calls.is_empty() || generation_interrupted || state.final_turn {
             // No more tool calls, we're done
             trace!(
                 "Tool loop completed: {} iterations, {} total calls",
@@ -363,7 +367,11 @@ pub(super) async fn execute_tool_loop(
                 state.total_calls += 1;
             }
 
-            if tool_call_limit.is_some() || !function_tool_calls.is_empty() {
+            // A client call or the internal safety cap ends the response
+            // here. The request's own cap does not: the loop gives the model
+            // one final turn on the results, the server tools withheld.
+            if tool_call_limit == Some(McpToolCallLimit::Safety) || !function_tool_calls.is_empty()
+            {
                 let mut responses_response = conversions::chat_to_responses(
                     &chat_response,
                     original_request,
@@ -394,8 +402,8 @@ pub(super) async fn execute_tool_loop(
                     &user_function_names,
                 );
 
-                // A user processing cap is a normal stop. Only the internal
-                // safety cap introduces an error; keep generation status intact.
+                // Only the internal safety cap introduces an error; a client
+                // call keeps the generation's status intact.
                 if tool_call_limit == Some(McpToolCallLimit::Safety) {
                     responses_response.status = ResponseStatus::Failed;
                     responses_response.incomplete_details = None;
@@ -407,6 +415,8 @@ pub(super) async fn execute_tool_loop(
                 responses_response.usage = state.usage.map(ResponsesUsage::Modern);
                 return Ok((responses_response, parser));
             }
+
+            state.final_turn = tool_call_limit == Some(McpToolCallLimit::User);
 
             // Build resume request with conversation history
             current_request = build_next_request(&mut state, current_request);

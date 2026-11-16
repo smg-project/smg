@@ -29,6 +29,7 @@ The ``type``-discrimination invariants exercised here live in:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -38,12 +39,14 @@ import pytest
 logger = logging.getLogger(__name__)
 
 
-def _post_responses(gateway, body: dict, timeout: float = 30.0) -> httpx.Response:
+def _post_responses(gateway, body: dict | str, timeout: float = 30.0) -> httpx.Response:
     """POST a raw JSON body to ``{gateway.base_url}/v1/responses``.
 
     We need full control over the wire payload (invalid ``type`` strings,
     empty discriminators, etc.), which the OpenAI SDK's typed client will
-    not emit, so all four cases drop to raw ``httpx``.
+    not emit, so all four cases drop to raw ``httpx``. A body given as text
+    goes on the wire as it is, for a shape a dict cannot carry (a repeated
+    key).
 
     Forwards ``OPENAI_API_KEY`` when present so the accept-path tests
     (``!= 400``) cannot be satisfied vacuously by a ``401`` from an
@@ -53,9 +56,10 @@ def _post_responses(gateway, body: dict, timeout: float = 30.0) -> httpx.Respons
     auth so the key value is irrelevant for them.
     """
     api_key = os.environ.get("OPENAI_API_KEY", "sk-not-used")
+    payload = {"content": body} if isinstance(body, str) else {"json": body}
     return httpx.post(
         f"{gateway.base_url}/v1/responses",
-        json=body,
+        **payload,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -166,17 +170,10 @@ class TestResponsesInputValidation:
         with no untagged fallback, so ``{"type": "input_video"}`` inside a
         message's content array cannot silently deserialize to any variant.
 
-        The audit §E7 case calls for the rejected ``type`` being echoed in
-        the error message, but the outer ``ResponseInput`` is
-        ``#[serde(untagged)]`` (responses.rs:2051-2056): when the ``Items``
-        variant fails for any nested reason, serde collapses the error to
-        ``"data did not match any variant of untagged enum ResponseInput"``
-        and the inner tag name is not preserved on the wire. We therefore
-        pin the invariants that are observable — the 400 envelope and the
-        canonical ``input``-path reference in the message — rather than
-        asserting the specific rejected tag. Tightening beyond this
-        would require P5.5 (flattening ``ResponseInput`` away from
-        ``#[serde(untagged)]``), which is out of scope for E7.
+        The refusal names the part and its ``type`` (``input`` is read by
+        its JSON type and an item's part by its field, so the rejected tag
+        and the accepted ones reach the wire): ``invalid_value`` on
+        ``input[0].content[0].type``.
         """
         _, model_path, _, gw = setup_backend
         body = {
@@ -189,16 +186,13 @@ class TestResponsesInputValidation:
             ],
         }
         resp = _post_responses(gw, body)
-        # ``input`` is an untagged enum, so a part no variant accepts is
-        # serde's "data did not match any variant": a wrong type.
-        err = _assert_validation_400(resp, code="invalid_type")
-        message = err["error"]["message"].lower()
-        # Minimal observable invariant: the error must surface at the
-        # ``input`` field (the only field that can carry content parts),
-        # proving serde actually drove into the input structure rather
-        # than failing at an unrelated key.
-        assert "input" in message, (
-            f"expected error to name the input field, got message={message!r}"
+        # A part of a type no variant accepts is an unknown variant of the
+        # part's ``type``: a wrong value, named with the accepted ones.
+        err = _assert_validation_400(resp, code="invalid_value")
+        assert err["error"]["param"] == "input[0].content[0].type", err
+        message = err["error"]["message"]
+        assert "input[0].content[0].type: unknown variant `input_video`" in message, (
+            f"expected the part's type to be named, got message={message!r}"
         )
 
     def test_input_file_with_unknown_field_accepted(self, setup_backend):
@@ -303,5 +297,31 @@ class TestResponsesInputValidation:
             ],
         }
         resp = _post_responses(gw, body)
-        # The same untagged ``input``: the empty ``type`` matches no variant.
-        _assert_validation_400(resp, code="invalid_type")
+        # The empty ``type`` matches no variant: a wrong value, named at the
+        # second part's ``type``.
+        err = _assert_validation_400(resp, code="invalid_value")
+        assert err["error"]["param"] == "input[0].content[1].type", err
+
+    def test_repeated_key_inside_a_content_part_rejected_400(self, setup_backend):
+        """A key repeated inside a content part is refused, the part named.
+
+        An input item's own keys are read one at a time, and so is every
+        value below them, so a part written as ``{"type": "input_text",
+        "text": "a", "text": "b"}`` is refused with serde's words
+        (``duplicate field `text```, the code of a reason the public API
+        has no name for) at ``input[0].content[0]``, as the derived readers
+        refuse a repeated key, instead of the last value winning. The body
+        goes on the wire as text: a dict cannot carry the repeated key.
+        """
+        _, model_path, _, gw = setup_backend
+        body = (
+            '{"model": ' + json.dumps(model_path) + ', "input": [{"role": "user", '
+            '"content": [{"type": "input_text", "text": "a", "text": "b"}]}]}'
+        )
+        resp = _post_responses(gw, body)
+        err = _assert_validation_400(resp, code="json_parse_error")
+        assert err["error"]["param"] == "input[0].content[0]", err
+        message = err["error"]["message"]
+        assert "input[0].content[0]: duplicate field `text`" in message, (
+            f"expected the part to be named with serde's words, got message={message!r}"
+        )
