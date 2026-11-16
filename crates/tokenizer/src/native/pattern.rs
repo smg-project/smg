@@ -5215,6 +5215,15 @@ mod tests {
         let mut cut = Vec::new();
         reader.for_each_match(&late, false, |s, e| cut.push((s, e)));
         assert_eq!(cut, template.find_iter(&late).collect::<Vec<_>>());
+        // A text of more than `block::PLACES` steps is asked at that many
+        // places, further apart: here every second place of the short
+        // step. A stretch one of the others alone would begin is passed
+        // over, and the text keeps the scanner's loop.
+        let step = 2 * block::SAMPLE;
+        let rest = "я".repeat((block::PLACES * step - text.len()) / 'я'.len_utf8());
+        let stretch_at = |at: usize| format!("{}{text}{}", &rest[..at], &rest[at..]);
+        assert!(template.by_blocks(&stretch_at(step)).is_some());
+        assert!(template.by_blocks(&stretch_at(block::SAMPLE)).is_none());
         // A blank run behind a line break that runs through the whole next
         // block, which no generated text is likely to hold. Where the run
         // ends beyond ASCII the pass declines the block: that character may

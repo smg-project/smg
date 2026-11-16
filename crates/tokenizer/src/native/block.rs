@@ -342,12 +342,20 @@ where
 }
 
 /// Bytes between two places a text is asked at for an ASCII stretch
-/// ([`has_stretch`]).
+/// ([`has_stretch`]), on a text of up to [`PLACES`] such steps.
 pub(super) const SAMPLE: usize = 64 * BLOCK;
 
-/// Whether one of the places `text` is asked at, one per [`SAMPLE`] bytes,
-/// begins a stretch [`pieces`] cuts (two blocks of ASCII). The encoder reads
-/// a text by blocks only then: between two stretches the caller of
+/// The most places a text is asked at: a longer text is asked at this many,
+/// further apart. A place of a long text is memory the scan has not reached
+/// yet, a cache miss ahead of the scan each (measured on a text of 4 MB
+/// with no stretch, asked every [`SAMPLE`] bytes: 1,024 places, 0.5 to
+/// 2.3 % of the encode's time).
+pub(super) const PLACES: usize = 64;
+
+/// Whether one of the places `text` is asked at begins a stretch [`pieces`]
+/// cuts (two blocks of ASCII): one place per [`SAMPLE`] bytes, on a text of
+/// more than [`PLACES`] such steps that many places evenly apart. The
+/// encoder reads a text by blocks only then: between two stretches the caller of
 /// [`pieces`] walks piece by piece, and on a text with no stretch that walk
 /// is all there is, slower than the scanner's own loop (measured on a
 /// Cyrillic text: 1 % more instructions, 4 to 7 % more time). The first
@@ -355,7 +363,8 @@ pub(super) const SAMPLE: usize = 64 * BLOCK;
 /// opens with any of them. It is a sample and no search, so a text whose
 /// stretches every place misses keeps the scanner's loop and loses nothing.
 pub(super) fn has_stretch(text: &[u8]) -> bool {
-    text.chunks(SAMPLE).any(|part| {
+    let step = text.len().div_ceil(PLACES).max(SAMPLE);
+    text.chunks(step).any(|part| {
         part.first_chunk::<{ 2 * BLOCK }>()
             .is_some_and(|stretch| stretch.is_ascii())
     })
