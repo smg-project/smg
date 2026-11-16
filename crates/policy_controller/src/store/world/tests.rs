@@ -271,6 +271,13 @@ fn running_in(world: &World, model: &str, now: Instant) -> Option<u32> {
     out.candidates[0].load.map(|load| load.running)
 }
 
+/// The rows of `model`'s single pool as `world` lists them, under a count
+/// of the caller's own.
+fn rows_of(world: &World, model: &str) -> Arc<[Candidate]> {
+    let index = world.derived.by_model[model][super::role_slot(Role::Single)].expect("the pool");
+    Arc::clone(&world.rows[index as usize])
+}
+
 #[test]
 fn two_publications_of_one_membership_are_two_worlds_of_one_epoch_sharing_what_it_derived() {
     let store = MemoryStore::new();
@@ -292,13 +299,14 @@ fn two_publications_of_one_membership_are_two_worlds_of_one_epoch_sharing_what_i
     // Nothing derived was built again: the two worlds share it by pointer,
     assert!(Arc::ptr_eq(&before.derived, &after.derived));
     // and the pool no write was folded into keeps its rows by pointer.
-    let rows = |world: &World, model: &str| {
-        let index =
-            world.derived.by_model[model][super::role_slot(Role::Single)].expect("the pool");
-        Arc::clone(&world.rows[index as usize])
-    };
-    assert!(Arc::ptr_eq(&rows(&before, "two"), &rows(&after, "two")));
-    assert!(!Arc::ptr_eq(&rows(&before, "one"), &rows(&after, "one")));
+    assert!(Arc::ptr_eq(
+        &rows_of(&before, "two"),
+        &rows_of(&after, "two")
+    ));
+    assert!(!Arc::ptr_eq(
+        &rows_of(&before, "one"),
+        &rows_of(&after, "one")
+    ));
     // A world never changes once published: the one a decision took before
     // the record reads none.
     assert_eq!(running_in(&before, "one", t0), None);
@@ -309,6 +317,190 @@ fn two_publications_of_one_membership_are_two_worlds_of_one_epoch_sharing_what_i
     let next = store.world();
     assert!(next.epoch() > after.epoch());
     assert!(!Arc::ptr_eq(&after.derived, &next.derived));
+}
+
+/// What `id`'s row reads as running in the store's world.
+fn running_of(store: &MemoryStore, id: WorkerId, now: Instant) -> Option<u32> {
+    let (rows, _, _) = view(store, &ask(now));
+    let row = rows.iter().find(|row| row.id == id).expect("the row");
+    row.load.map(|load| load.running)
+}
+
+#[test]
+fn a_pool_no_reader_holds_is_published_into_two_buffers_in_turn() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    member(&store, "http://b:8000");
+    // Each record lands a window after the last and publishes by itself.
+    let publish = |turn: u32| {
+        let at = t0 + PUBLISH_WINDOW * turn;
+        store.record(id, 0, load(turn, 0), at, LoadSource::Stream);
+        assert_eq!(running_of(&store, id, at), Some(turn));
+    };
+    // Where the store's world lists the pool's rows, no hold kept on them.
+    let listed = || rows_of(&store.world(), MODEL).as_ptr();
+    let derived = listed();
+    assert_eq!(
+        store.publication_allocations(),
+        0,
+        "a membership write is not counted"
+    );
+
+    // The pool's first publication has no earlier rows to write over.
+    publish(1);
+    let second = listed();
+    assert_ne!(second, derived);
+    assert_eq!(store.publication_allocations(), 1);
+    // Each one after it writes over the rows published before the last:
+    // two buffers in turn, and nothing allocated.
+    for turn in 2..=7 {
+        publish(turn);
+        let written = if turn % 2 == 0 { derived } else { second };
+        assert_eq!(listed(), written, "turn {turn}");
+    }
+    assert_eq!(store.publication_allocations(), 1);
+
+    // A membership write derives its pools anew, uncounted, and each pool
+    // starts again without earlier rows. The rows it retired are the
+    // writer's to free: the spare at once, the published at the next
+    // publication, when the world that listed them has left the store.
+    member(&store, "http://c:8000");
+    assert_eq!((store.publication_allocations(), store.held_rows()), (1, 1));
+    publish(8);
+    assert_eq!((store.publication_allocations(), store.held_rows()), (2, 0));
+    publish(9);
+    publish(10);
+    assert_eq!(store.publication_allocations(), 2);
+}
+
+#[test]
+fn a_pool_written_once_keeps_its_rows_while_another_pool_publishes() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let one = store
+        .upsert(facts("http://a:8000", Role::Single, &["one"]))
+        .id();
+    let two = store
+        .upsert(facts("http://b:8000", Role::Single, &["two"]))
+        .id();
+    // One record into the first pool, published by itself.
+    store.record(one, 0, load(1, 0), t0, LoadSource::Stream);
+    let listed = |model: &str| rows_of(&store.world(), model).as_ptr();
+    let written = listed("one");
+    // The other pool publishes five times, a window apart. The first pool
+    // moved in none of them: it is not published again, and the world
+    // lists the rows it listed.
+    for turn in 1..=5 {
+        let at = t0 + PUBLISH_WINDOW * turn;
+        store.record(two, 0, load(turn, 0), at, LoadSource::Stream);
+        assert_eq!(running_in(&store.world(), "two", at), Some(turn));
+        assert_eq!(listed("one"), written, "turn {turn}");
+    }
+    // The first pool was written over the rows the second registration
+    // retired, and the other allocated at its own first publication alone.
+    assert_eq!(store.publication_allocations(), 1);
+}
+
+#[test]
+fn rows_a_reader_still_holds_are_left_whole_and_that_publication_allocates() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    let publish = |turn: u32| {
+        let at = t0 + PUBLISH_WINDOW * turn;
+        store.record(id, 0, load(turn, 0), at, LoadSource::Stream);
+        assert_eq!(running_of(&store, id, at), Some(turn));
+    };
+    let counts = || (store.publication_allocations(), store.held_rows());
+    publish(1);
+    assert_eq!(counts(), (1, 0));
+
+    // A reader takes the world of the first publication and keeps it
+    // across two publications of its pool.
+    let kept = store.world();
+    let read = format!("{:?}", rows_of(&kept, MODEL));
+    publish(2);
+    assert_eq!(counts(), (1, 0));
+    // The second would write over the rows that world lists: it leaves
+    // them whole, allocates and is counted.
+    publish(3);
+    assert_eq!(counts(), (2, 1));
+    assert_eq!(running_in(&kept, MODEL, t0), Some(1));
+    assert_eq!(format!("{:?}", rows_of(&kept, MODEL)), read);
+
+    // One world held is one buffer more: the two others go on in turn.
+    publish(4);
+    publish(5);
+    assert_eq!(counts(), (2, 1));
+    assert_eq!(format!("{:?}", rows_of(&kept, MODEL)), read);
+
+    // The writer kept its own reference to the rows it left, so the
+    // reader dropping the last world that lists them frees no rows: two
+    // counts stay, the writer's and this case's.
+    let rows = rows_of(&kept, MODEL);
+    drop(kept);
+    assert_eq!(Arc::strong_count(&rows), 2);
+    publish(6);
+    assert_eq!((counts(), Arc::strong_count(&rows)), ((2, 1), 2));
+    // The publication that finds them alone frees them.
+    drop(rows);
+    publish(7);
+    assert_eq!(counts(), (2, 0));
+
+    // A membership write keeps its outgoing rows the same way, uncounted:
+    // the spare for its reader, the published rows for the world the store
+    // showed till then. The pool's next publication frees both and
+    // allocates.
+    let kept = store.world();
+    publish(8);
+    member(&store, "http://b:8000");
+    assert_eq!(counts(), (2, 2));
+    let rows = rows_of(&kept, MODEL);
+    drop(kept);
+    assert_eq!(Arc::strong_count(&rows), 2);
+    drop(rows);
+    publish(9);
+    assert_eq!(counts(), (3, 0));
+}
+
+#[test]
+fn a_pool_with_no_spare_to_write_over_takes_rows_the_writer_holds_alone() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    let publish = |turn: u32| {
+        let at = t0 + PUBLISH_WINDOW * turn;
+        store.record(id, 0, load(turn, 0), at, LoadSource::Stream);
+        assert_eq!(running_of(&store, id, at), Some(turn));
+    };
+    let counts = || (store.publication_allocations(), store.held_rows());
+    publish(1);
+    // A reader that holds the worlds of the last two publications: each
+    // publication finds its pool's spare listed by the older one.
+    let mut kept = [store.world(), store.world()];
+    publish(2);
+    kept[0] = store.world();
+    // The first such publication has no other rows to take.
+    publish(3);
+    assert_eq!(counts(), (2, 1));
+    // From then on the rows the reader let go come back in turn: three
+    // buffers carry every window and nothing is allocated.
+    for turn in 4..=9 {
+        kept[(turn % 2) as usize] = store.world();
+        publish(turn);
+        assert_eq!(counts(), (2, 1), "turn {turn}");
+    }
+    drop(kept);
+    publish(10);
+    assert_eq!(counts(), (2, 0));
+
+    // A membership write that leaves the pool its length: the pool's next
+    // publication takes the rows the write retired.
+    store.upsert(facts("http://z:8000", Role::Single, &["other"]));
+    assert_eq!(counts(), (2, 1));
+    publish(11);
+    assert_eq!(counts(), (2, 0));
 }
 
 #[test]
@@ -1548,6 +1740,61 @@ fn row_serving(id: u64, models: &[&str], admitted_at: Instant) -> WorkerRow {
         status: WorkerStatus::Ready,
         revision: 1,
         admitted_at,
+    }
+}
+
+#[test]
+fn a_spare_of_another_length_is_left_and_the_publication_allocates() {
+    let origin = Instant::now();
+    let members = [
+        row_serving(1, &[MODEL], origin),
+        row_serving(2, &[MODEL], origin),
+    ];
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    writer.rebuild(1, members.iter(), |_, _| None);
+    // No write leaves a pool a spare of another length: one is planted,
+    // the rows of a pool of one, held by the pool alone.
+    writer.spares[0] = Some(Arc::from(&writer.working[0].rows[..1]));
+    let world = writer
+        .fold_status(WorkerId(1), WorkerStatus::Draining)
+        .expect("a publication");
+    assert_eq!(world.rows[0].len(), 2);
+    assert!(world.rows[0].iter().any(|row| row.health.draining));
+    assert_eq!((writer.allocations, writer.held_rows()), (1, 1));
+    // The next publication finds the planted rows free of every world and
+    // of no pool's length: it frees them and writes over the pool's own.
+    writer
+        .fold_status(WorkerId(1), WorkerStatus::Ready)
+        .expect("a publication");
+    assert_eq!((writer.allocations, writer.held_rows()), (1, 0));
+}
+
+#[test]
+fn a_membership_write_leaves_the_writers_lists_at_one_slot_a_pool() {
+    let origin = Instant::now();
+    let members = [
+        row_serving(1, &[MODEL, "other"], origin),
+        row_serving(2, &[MODEL, "other"], origin),
+    ];
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    for epoch in 1..=4 {
+        writer.rebuild(epoch, members.iter(), |_, _| None);
+        // Two models, a pool each: one slot a pool in each list, however
+        // many membership writes came before.
+        assert_eq!(
+            (
+                writer.spares.len(),
+                writer.published.len(),
+                writer.working.len()
+            ),
+            (2, 2, 2),
+            "epoch {epoch}"
+        );
+        // Both pools publish, so each holds a spare for the next membership
+        // write to retire.
+        writer
+            .fold_status(WorkerId(1), WorkerStatus::Draining)
+            .expect("a publication");
     }
 }
 
