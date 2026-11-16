@@ -55,6 +55,7 @@ fn word(tick: &Tick) -> String {
         Tick::Lost { term, .. } => format!("lost:{term}"),
         Tick::Following { term, .. } => format!("following:{term}"),
         Tick::Gone { term } => format!("gone:{term}"),
+        Tick::Waiting { term } => format!("waiting:{term}"),
         Tick::Raced => "raced".to_string(),
     }
 }
