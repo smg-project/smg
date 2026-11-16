@@ -32,7 +32,7 @@ use crate::{
         create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
         registered_entries, registered_in, McpServerConfigRequest, TokenizerConfigRequest,
         TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
-        WorkerRegistrationMode,
+        WorkerRegistrationMode, WorkflowEngines,
     },
 };
 
@@ -929,6 +929,15 @@ impl JobQueue {
         })
     }
 
+    /// The workflow engines, or the refusal a job answers while they are not
+    /// built yet.
+    fn workflow_engines(context: &AppContext) -> Result<&WorkflowEngines, String> {
+        context
+            .workflow_engines
+            .get()
+            .ok_or_else(|| "Workflow engines not initialized".to_string())
+    }
+
     /// Cancels the `POST /workers` registration workflows the store holds for
     /// `worker_url`: the active ones are cancelled, a cancelled one counts, one
     /// that ended between the listing and the cancel is skipped. Says how many
@@ -938,11 +947,7 @@ impl JobQueue {
         context: &AppContext,
         worker_url: &str,
     ) -> Result<(usize, bool), String> {
-        let engine = &context
-            .workflow_engines
-            .get()
-            .ok_or_else(|| "Workflow engines not initialized".to_string())?
-            .worker_registration;
+        let engine = &Self::workflow_engines(context)?.worker_registration;
         let states = engine
             .state_store()
             .list_all()
@@ -1191,10 +1196,7 @@ impl JobQueue {
                 if Self::take_mark(cancelled_before_start, own_id) {
                     return Err("Registration cancelled before it started".to_string());
                 }
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let timeout_duration =
                     Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
@@ -1279,10 +1281,7 @@ impl JobQueue {
                 }
             }
             Job::UpdateWorker { url, update } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data = create_worker_update_workflow_data(
                     url.to_string(),
@@ -1301,10 +1300,7 @@ impl JobQueue {
                 .await
             }
             Job::RefreshWorkerLabels { url } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let mut workflow_data = create_worker_update_workflow_data(
                     url.to_string(),
@@ -1333,10 +1329,7 @@ impl JobQueue {
                 url,
                 expected_revisions,
             } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data = create_worker_removal_workflow_data(
                     url.to_string(),
@@ -1384,10 +1377,7 @@ impl JobQueue {
                 result
             }
             Job::AddWasmModule { config } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data =
                     create_wasm_registration_workflow_data(*config.clone(), Arc::clone(context));
@@ -1403,10 +1393,7 @@ impl JobQueue {
                 .await
             }
             Job::RemoveWasmModule { request } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data =
                     create_wasm_removal_workflow_data(*request.clone(), Arc::clone(context));
@@ -1555,10 +1542,7 @@ impl JobQueue {
                 Ok(format!("Submitted {server_count} RegisterMcpServer jobs"))
             }
             Job::RegisterMcpServer { config } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data =
                     create_mcp_workflow_data((**config).clone(), Arc::clone(context));
@@ -1578,10 +1562,7 @@ impl JobQueue {
                 // noted for the model (a failure of the model's last load
                 // answers its requests 503 tokenizer_load_failed).
                 let result = async {
-                    let engines = context
-                        .workflow_engines
-                        .get()
-                        .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                    let engines = Self::workflow_engines(context)?;
 
                     let workflow_data =
                         create_tokenizer_workflow_data(*config.clone(), Arc::clone(context));

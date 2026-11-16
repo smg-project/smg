@@ -118,10 +118,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
                 Arc::new(FindWorkersToRemoveStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
+            .with_retry(single_attempt()),
         )
         .add_step(
             StepDefinition::new(
@@ -136,10 +133,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
             // without visibility into runtime config and would
             // preemptively fail the workflow for legitimately long
             // drain windows, leaving workers stuck in `Draining`.
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["find_workers_to_remove"]),
         )
         .add_step(
@@ -149,10 +143,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
                 Arc::new(RemoveFromWorkerRegistryStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["drain_workers"]),
         )
         .add_step(
@@ -163,10 +154,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
             )
             // The old 10s override was too short for large cache cleanup.
             // Inherit the workflow default after the worker is deregistered.
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["remove_from_worker_registry"]),
         )
         .add_step(
@@ -176,10 +164,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
                 Arc::new(ReleaseTokenizerStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             // On the registry step, not the policy cleanup: the release reads
             // what that step settled, and a cleanup that fails or times out
             // must not hold it back (a failed step's dependents never run).
@@ -206,10 +191,7 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
                 Arc::new(FindWorkerToUpdateStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
+            .with_retry(single_attempt()),
         )
         .add_step(
             StepDefinition::new(
@@ -233,10 +215,7 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
                 Arc::new(UpdateWorkerPropertiesStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["rediscover_labels"]),
         )
         .add_step(
@@ -246,10 +225,7 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
                 Arc::new(UpdatePoliciesForWorkerStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["update_worker_properties"]),
         )
 }
@@ -289,6 +265,14 @@ pub fn create_worker_update_workflow_data(
         refresh_discovered_labels: false,
         fresh_engine_labels: None,
         snapshot: None,
+    }
+}
+
+/// One attempt and no wait: a step given this policy is not run again.
+fn single_attempt() -> RetryPolicy {
+    RetryPolicy {
+        max_attempts: 1,
+        backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
     }
 }
 
