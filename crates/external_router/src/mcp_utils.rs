@@ -975,7 +975,11 @@ mod tests {
                 // key's connect pools a second whose listing the server
                 // refuses at once; the held listing is released after that
                 // and completes last.
-                arrived.notified().await;
+                // Bounded: a first connection that never lists fails here and
+                // says so, not at the job's timeout.
+                tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+                    .await
+                    .expect("the first connection's tools/list reaches the server");
                 hold.holding.store(false, Ordering::SeqCst);
                 refusing.store(true, Ordering::SeqCst);
                 connect_mcp_servers(&orchestrator, &format_registry, &evicting_input).await;
