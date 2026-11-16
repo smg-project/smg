@@ -4,6 +4,7 @@ mod exif_orientation;
 mod hop_budget;
 mod ico_png_entry;
 mod max_long_side_pixel;
+mod pooled_png;
 mod seek_decode;
 mod sixteen_bit_colour;
 mod sixteen_bit_grey;
