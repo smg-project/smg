@@ -984,6 +984,10 @@ async fn a_demoted_worker_returns_on_consecutive_reads_not_consecutive_intervals
     // The engine is back; the next probe is an interval after the
     // registration's, however long the held read took.
     serving.store(true, Ordering::SeqCst);
+    // The return is due 4 s after the registration. The deadline leaves
+    // 1.5 s for the launch lag and the two later round trips, which took
+    // under 0.1 s of it under load, and still ends before the 6 s of two
+    // whole intervals, the return this test rules out.
     wait_until(
         registered + Duration::from_millis(5500),
         "the worker did not return within one interval and a probe timeout",
