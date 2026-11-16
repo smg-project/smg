@@ -3656,6 +3656,42 @@ async fn an_unstreamed_turn_the_allowance_cuts_renders_each_call_once() {
     mcp.stop().await;
 }
 
+/// A streamed request holds a call under `require_approval: always` as a
+/// non-streamed request does: the tool does not run, and the call the stream
+/// announced closes as failed.
+#[tokio::test]
+async fn a_streamed_call_that_waits_for_approval_does_not_run() {
+    let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
+    let mut req = streaming_mcp_request(&mcp.url(), None);
+    if let Some(ResponseTool::Mcp(tool)) = req.tools.as_mut().and_then(|tools| tools.first_mut()) {
+        tool.require_approval = Some(RequireApproval::Mode(RequireApprovalMode::Always));
+    }
+
+    let body = stream_body(router.as_ref(), req).await;
+
+    assert_eq!(mcp.call_count(), 0, "the tool ran without its approval");
+    let events = frame_events(&body);
+    let closed_calls: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["type"] == "mcp_call"
+        })
+        .collect();
+    assert_eq!(
+        closed_calls.len(),
+        1,
+        "one call announced and closed: {body}"
+    );
+    assert_eq!(closed_calls[0]["item"]["status"], "failed");
+    assert_eq!(
+        events.last().and_then(|event| event["type"].as_str()),
+        Some("response.completed")
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
 /// An upstream nothing listens on: the stream is the one typed error event
 /// with the request's failure, at sequence number 0.
 #[tokio::test]

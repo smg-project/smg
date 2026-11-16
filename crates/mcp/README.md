@@ -509,6 +509,8 @@ Router code should use `McpToolSession` so exposed tool names are collision-safe
 | `PolicyOnly` | Batch processing, Chat API | Auto-decide via PolicyEngine |
 | `Interactive` | Responses API | Return approval request to client |
 
+On a streamed Responses request a tool that requires approval is not run and the stream carries no approval request; a client that wants the approval request sends the request non-streamed.
+
 ### Trust Levels
 
 | Level | Behavior |
