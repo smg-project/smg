@@ -97,6 +97,32 @@ impl WasmStorageHook {
         store.set_epoch_deadline(1);
         store
     }
+
+    async fn instantiate(
+        &self,
+    ) -> Result<(Store<StorageHookWasiState>, StorageHookBindings), HookError> {
+        let mut store = self.new_store();
+        let bindings =
+            StorageHookBindings::instantiate_async(&mut store, &self.component, &self.linker)
+                .await
+                .map_err(|e| HookError::Internal(format!("WASM instantiation failed: {e}")))?;
+        Ok((store, bindings))
+    }
+
+    /// Spawn epoch ticker to enforce a 5-second execution budget.
+    /// The task is aborted immediately after the WASM call completes,
+    /// so it is safe for the gateway to shut down without waiting for it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "epoch ticker is aborted after WASM call"
+    )]
+    fn execution_budget(&self) -> tokio::task::JoinHandle<()> {
+        let epoch_engine = self.engine.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            epoch_engine.increment_epoch();
+        })
+    }
 }
 
 // ── Type conversions ─────────────────────────────────────────────────────
@@ -170,29 +196,13 @@ impl StorageHook for WasmStorageHook {
         context: Option<&RequestContext>,
         payload: &Value,
     ) -> Result<BeforeHookResult, HookError> {
-        let mut store = self.new_store();
-
-        let bindings =
-            StorageHookBindings::instantiate_async(&mut store, &self.component, &self.linker)
-                .await
-                .map_err(|e| HookError::Internal(format!("WASM instantiation failed: {e}")))?;
+        let (mut store, bindings) = self.instantiate().await?;
 
         let wit_op = to_wit_operation(operation);
         let wit_ctx = to_wit_context(context);
         let payload_str = payload.to_string();
 
-        // Spawn epoch ticker to enforce a 5-second execution budget.
-        // The task is aborted immediately after the WASM call completes,
-        // so it is safe for the gateway to shut down without waiting for it.
-        let epoch_engine = self.engine.clone();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "epoch ticker is aborted after WASM call"
-        )]
-        let ticker = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            epoch_engine.increment_epoch();
-        });
+        let ticker = self.execution_budget();
 
         let result = bindings
             .smg_storage_storage_hook_before()
@@ -220,12 +230,7 @@ impl StorageHook for WasmStorageHook {
         result: &Value,
         extra: &ExtraColumns,
     ) -> Result<ExtraColumns, HookError> {
-        let mut store = self.new_store();
-
-        let bindings =
-            StorageHookBindings::instantiate_async(&mut store, &self.component, &self.linker)
-                .await
-                .map_err(|e| HookError::Internal(format!("WASM instantiation failed: {e}")))?;
+        let (mut store, bindings) = self.instantiate().await?;
 
         let wit_op = to_wit_operation(operation);
         let wit_ctx = to_wit_context(context);
@@ -233,18 +238,7 @@ impl StorageHook for WasmStorageHook {
         let result_str = result.to_string();
         let wit_extra = to_wit_extra_columns(extra);
 
-        // Spawn epoch ticker to enforce a 5-second execution budget.
-        // The task is aborted immediately after the WASM call completes,
-        // so it is safe for the gateway to shut down without waiting for it.
-        let epoch_engine = self.engine.clone();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "epoch ticker is aborted after WASM call"
-        )]
-        let ticker = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            epoch_engine.increment_epoch();
-        });
+        let ticker = self.execution_budget();
 
         let updated = bindings
             .smg_storage_storage_hook_after()

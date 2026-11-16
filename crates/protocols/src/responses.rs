@@ -2280,7 +2280,16 @@ impl<'de> Deserialize<'de> for InputItem {
 
 /// An item's fields, read one entry at a time so a repeated key is refused
 /// with serde's own words (`duplicate field `role``), as the derived readers
-/// refuse it, instead of the last value winning.
+/// refuse it, instead of the last value winning; each value is read by the
+/// crate's strict value reader, so a key repeated at any depth below the
+/// item's own is refused the same way. That is the derived readers' answer
+/// for a key a typed struct reads; a key it does not know, and a free-form
+/// value or a map inside an item (a shell call's `env`, an MCP tool's
+/// `input_schema`), is refused too, where a derived read passes over the
+/// key or keeps the last value: one rule for the whole item, since the
+/// buffer cannot tell these places apart. The place is the deserializer's
+/// to name, as it is for the derived readers (the door's path tracker
+/// records the nested read: `input[0].content[0]: duplicate field `text``).
 struct ItemFields(serde_json::Map<String, Value>);
 
 impl<'de> Deserialize<'de> for ItemFields {
@@ -2298,14 +2307,7 @@ impl<'de> Deserialize<'de> for ItemFields {
                 self,
                 mut entries: A,
             ) -> Result<Self::Value, A::Error> {
-                let mut fields = serde_json::Map::new();
-                while let Some((key, value)) = entries.next_entry::<String, Value>()? {
-                    if fields.contains_key(&key) {
-                        return Err(serde::de::Error::custom(format!("duplicate field `{key}`")));
-                    }
-                    fields.insert(key, value);
-                }
-                Ok(ItemFields(fields))
+                crate::strict_value::strict_entries(&mut entries).map(ItemFields)
             }
         }
 
@@ -5580,27 +5582,54 @@ mod tests {
     }
 
     /// An input item with a repeated key is refused with serde's words, as
-    /// the derived readers refuse it, instead of the last value winning.
+    /// the derived readers refuse it, instead of the last value winning: at
+    /// the item's own keys and at any depth below them (the place is the
+    /// deserializer's to name, as for the derived readers; the door's test
+    /// reads it). The last row is a free-form value inside an item: a
+    /// derived read keeps its last value, the item's one rule refuses it.
     #[test]
     fn an_input_item_with_a_repeated_key_is_refused() {
-        for (body, key) in [
+        for (body, refusal) in [
             (
                 r#"{"model":"m","input":[{"role":"user","content":"hi","role":"system"}]}"#,
-                "role",
+                "duplicate field `role`",
             ),
             (
                 r#"{"model":"m","input":[{"type":"function_call","type":"message","role":"user","content":"hi"}]}"#,
-                "type",
+                "duplicate field `type`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}]}"#,
+                "duplicate field `text`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"t","annotations":[{"type":"file_citation","file_id":"f","filename":"n","index":0,"index":1}]}]}]}"#,
+                "duplicate field `index`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call_output","call_id":"c","output":[{"type":"input_text","text":"a"},{"type":"input_image","detail":"low","detail":"high"}]}]}"#,
+                "duplicate field `detail`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","type":"input_image","text":"a"}]}]}"#,
+                "duplicate field `type`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"computer_call","id":"cu_1","call_id":"c","action":{"type":"screenshot"},"pending_safety_checks":[{"id":"s1","code":"k","message":"m","id":"s2"}],"status":"completed"}]}"#,
+                "duplicate field `id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"apply_patch_call","id":"ap_1","call_id":"c","operation":{"type":"create_file","path":"a","diff":"d","path":"b"},"status":"completed"}]}"#,
+                "duplicate field `path`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"local_shell_call","id":"ls_1","call_id":"c","action":{"type":"exec","command":["ls"],"env":{"A":"1","A":"2"}},"status":"completed"}]}"#,
+                "duplicate field `A`",
             ),
         ] {
             let error = serde_json::from_str::<ResponsesRequest>(body)
                 .expect_err("the repeated key is refused");
-            assert!(
-                error
-                    .to_string()
-                    .starts_with(&format!("duplicate field `{key}`")),
-                "{error}"
-            );
+            assert!(error.to_string().starts_with(refusal), "{error}");
         }
     }
 

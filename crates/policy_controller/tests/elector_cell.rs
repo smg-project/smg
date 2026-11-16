@@ -49,6 +49,7 @@ fn word(tick: &Tick) -> String {
         Tick::Renewed { term } => format!("renewed:{term}"),
         Tick::Lost { term, .. } => format!("lost:{term}"),
         Tick::Following { term, .. } => format!("following:{term}"),
+        Tick::Gone { term } => format!("gone:{term}"),
         Tick::Raced => "raced".to_string(),
     }
 }
@@ -215,10 +216,18 @@ fn two_processes_over_one_lease_file_hand_over_without_an_overlap() {
     let words = |lines: &[Line]| lines.iter().map(|l| l.word.clone()).collect::<Vec<_>>();
 
     let holder_words = words(&holder);
-    assert_eq!(
-        &holder_words[..4],
-        ["acquired:1", "renewed:1", "renewed:1", "lost:1"],
-        "the holder's run"
+    // The holder takes, renews twice and reads its loss at the late step. A
+    // holder descheduled for the record's duration between two of its first
+    // three steps reads the loss at an earlier one, after fewer renewals.
+    let lost = holder_words
+        .iter()
+        .position(|w| w == "lost:1")
+        .expect("the holder read its loss");
+    assert!(
+        (1..=3).contains(&lost)
+            && holder_words[0] == "acquired:1"
+            && holder_words[1..lost].iter().all(|w| w == "renewed:1"),
+        "the holder's run: {holder_words:?}"
     );
     // After the loss the holder follows the taker. A holder descheduled past
     // the taker's exit may take term 3 once the taker's fence is closed and
@@ -226,7 +235,9 @@ fn two_processes_over_one_lease_file_hand_over_without_an_overlap() {
     let retook = holder_words.iter().position(|w| w == "acquired:3");
     let followed = retook.unwrap_or(holder_words.len());
     assert!(
-        holder_words[4..followed].iter().all(|w| w == "following:2"),
+        holder_words[lost + 1..followed]
+            .iter()
+            .all(|w| w == "following:2"),
         "{holder_words:?}"
     );
     if let Some(retook) = retook {
@@ -253,7 +264,7 @@ fn two_processes_over_one_lease_file_hand_over_without_an_overlap() {
 
     // The fence's promise across processes: the holder's fence had closed
     // before the taker's take began.
-    let holder_closed = holder[..3]
+    let holder_closed = holder[..lost]
         .iter()
         .filter_map(|l| l.closes)
         .max()
@@ -264,7 +275,7 @@ fn two_processes_over_one_lease_file_hand_over_without_an_overlap() {
         "the taker took at {take_began} while the holder's fence was open until {holder_closed}"
     );
     assert!(
-        holder[3..followed].iter().all(|l| l.closes.is_none()),
+        holder[lost..followed].iter().all(|l| l.closes.is_none()),
         "the holder's fence stays closed after the loss"
     );
     if let Some(retook) = retook {

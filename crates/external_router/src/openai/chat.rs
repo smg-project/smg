@@ -46,6 +46,8 @@ pub(super) struct ChatRouterContext<'a> {
 
 /// One attempt against the worker: the payload posted with the caller's auth
 /// and the provider's headers, as an event stream when the request streams.
+/// A failure comes back without the request URL the client's text ends with:
+/// the route's answers carry that text to the caller.
 async fn send_attempt(
     client: &reqwest::Client,
     url: &str,
@@ -60,7 +62,7 @@ async fn send_attempt(
     if streaming {
         req = req.header("Accept", "text/event-stream");
     }
-    req.send().await
+    req.send().await.map_err(reqwest::Error::without_url)
 }
 
 /// The upstream's success stream relayed to the client frame by frame; an
@@ -355,7 +357,9 @@ mod tests {
         error::extract_error_code_from_response,
         retry::REQUEST_TIMEOUT_CODE,
         tenant::TenantKey,
-        test_support::{counting_alloc, http_client, upstream, RefusedAddress, StubWorker},
+        test_support::{
+            counting_alloc, http_client, text_of, upstream, RefusedAddress, StubWorker,
+        },
         worker::{ExternalWorker, WorkerStats},
     };
 
@@ -596,5 +600,40 @@ mod tests {
             (4000..5500).contains(&per_thousand),
             "bytes allocated per thousand bytes of message text: {per_thousand}"
         );
+    }
+
+    /// A chat request nothing answers: the caller's 503 says why without the
+    /// worker's address. The HTTP client's own error text ends with the
+    /// request URL.
+    #[tokio::test]
+    async fn a_failed_chat_send_answers_without_the_workers_address() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("http://{}", refused.addr());
+        let workers: Arc<dyn WorkerSource> = Arc::new(OneWorker(StubWorker::at(&url)));
+        let provider_registry = ProviderRegistry::new();
+        let shared_components = Arc::new(SharedComponents {
+            client: http_client(),
+        });
+        let retry_config = RetryConfig {
+            max_retries: 0,
+            initial_backoff_ms: 0,
+            max_backoff_ms: 0,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        };
+        let deps = ChatRouterContext {
+            workers: &workers,
+            provider_registry: &provider_registry,
+            shared_components: &shared_components,
+            retry_config: &retry_config,
+        };
+        let tenant = TenantRequestMeta::new(TenantKey::new("t"));
+
+        let response = route_chat(&deps, None, &tenant, chat_request(1), "m").await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = text_of(response).await;
+        assert!(body.contains("Failed to contact upstream"), "{body}");
+        assert!(!body.contains(&refused.addr().to_string()), "{body}");
     }
 }

@@ -89,6 +89,9 @@ pub(crate) async fn send_request(
             Ok(response)
         }
         Err(e) => {
+            // The client's text ends with the request URL: the line names the
+            // worker masked, and the answer names no address.
+            let e = e.without_url();
             warn!(url = %redacted_url(url), error = %e, "Request to worker failed");
 
             let (kind, reason) = if e.is_timeout() {
@@ -723,6 +726,33 @@ mod tests {
                 1
             )
         );
+    }
+
+    /// A send nothing answers: the caller's 502 and the transport's line say
+    /// why without the request URL. The HTTP client's own error text ends
+    /// with it, its query kept.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_failed_send_goes_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("http://{}/v1/messages?key=s3cret", refused.addr());
+
+        let answer = send_request(
+            &client_with_timeout(Duration::from_secs(5)),
+            &url,
+            &HeaderMap::new(),
+            &request(),
+            Duration::from_secs(5),
+            "closed-port",
+            Instant::now(),
+        )
+        .await;
+
+        let body = text_of(answer.expect_err("a failed send")).await;
+        assert!(!body.contains("s3cret"), "{body}");
+        assert!(!body.contains(&refused.addr().to_string()), "{body}");
+        assert!(logs_contain("Request to worker failed"));
+        assert!(!logs_contain("s3cret"));
     }
 
     fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {

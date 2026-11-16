@@ -1511,7 +1511,7 @@ impl Engine {
     }
 
     /// Where the prompt leaves the engine: the table's replay of it ([`Format::replayed`], which
-    /// [`Format::reasoning_open`] reads too), from the last turn opener the table names or after
+    /// [`Format::reasoning_open`] reads too), from the turn opener the table names or after
     /// its last turn anchor, the turn's first piece deciding its start where the table has a start
     /// row. An arguments state is not entered from the prompt: the engine rests where the turn
     /// started.

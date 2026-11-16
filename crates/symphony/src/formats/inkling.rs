@@ -1229,6 +1229,7 @@ mod json_answer_tests {
         };
         let events = under(&[output]);
         assert_eq!(bytes(&events), output);
+        assert_eq!(malformed(&events), [], "{events:?}");
         let with = said(&events);
         assert_eq!(with.content, "after");
         assert_eq!(

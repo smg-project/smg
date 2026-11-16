@@ -120,7 +120,12 @@ pub async fn forward_realtime_rest(
         }
         Err(e) => {
             worker.record_outcome(502);
-            error!(error = %e, endpoint, "Failed to forward realtime REST request");
+            error!(
+                url = %worker.redacted_url(),
+                error = %e.without_url(),
+                endpoint,
+                "Failed to forward realtime REST request"
+            );
             Metrics::record_router_error(
                 labels.router,
                 labels.backend,
@@ -165,7 +170,7 @@ mod tests {
     use axum::http::header::CONTENT_TYPE;
 
     use super::*;
-    use crate::test_support::{text_of, upstream};
+    use crate::test_support::{text_of, upstream, RefusedAddress, StubWorker};
 
     /// The provider's error envelope as its realtime REST endpoints answer
     /// it: the message names the operator's organization and project.
@@ -206,5 +211,36 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
         assert_eq!(text_of(response).await, SESSION);
+    }
+
+    /// A realtime REST call nothing answers, to an address registered with a
+    /// query: the failure line names the worker masked and says why without
+    /// the query. The HTTP client's own error text ends with the request URL,
+    /// its query kept.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_failed_realtime_send_goes_without_the_clients_url_in_its_line() {
+        let refused = RefusedAddress::reserve();
+        let worker = StubWorker::at(&format!("http://{}?key=s3cret", refused.addr()));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer k".parse().expect("a header value"));
+
+        let response = forward_realtime_rest(
+            RealtimeLabels {
+                router: metrics_labels::ROUTER_OPENAI,
+                backend: metrics_labels::BACKEND_EXTERNAL,
+            },
+            Ok(worker),
+            Some(&headers),
+            &serde_json::json!({}),
+            "realtime-model",
+            "/v1/realtime/sessions",
+            "realtime_sessions",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(logs_contain("Failed to forward realtime REST request"));
+        assert!(!logs_contain("s3cret"));
     }
 }

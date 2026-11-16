@@ -538,11 +538,19 @@ mod tests {
             moved();
         };
 
-        // The record is gone: this run takes again, under the next term.
+        // The record is gone, by no release: this run waits its own lost
+        // record's duration out, as a candidate that saw it does, and takes
+        // again under the next term.
+        let removed = Instant::now();
         locked(&|| std::fs::remove_file(&path).expect("the removal"));
         answers_until(&service, &mut last, "the take after the removal", |info| {
             info.is_leader && info.term == 2
         });
+        assert!(
+            removed.elapsed() >= settings.duration,
+            "the take came {:?} after the removal, sooner than the lost record's duration",
+            removed.elapsed()
+        );
 
         // The store goes back to the first record, whole, as a restore puts
         // it. The run's own record under an older term: nobody leads under

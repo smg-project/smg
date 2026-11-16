@@ -140,6 +140,9 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
             Ok(r) => r,
             Err(e) => {
                 worker.record_outcome(502);
+                // The client's text ends with the request URL: the line names the
+                // worker masked, and the answer names no address.
+                let e = e.without_url();
                 tracing::error!(
                     url = %redacted_url(&url),
                     error = %e,
@@ -239,7 +242,10 @@ mod tests {
             },
             provider::OpenAIProvider,
         },
-        test_support::{http_client, StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL},
+        test_support::{
+            http_client, text_of, RefusedAddress, StubWorker, CREDENTIALED_WORKER_URL,
+            MASKED_WORKER_URL,
+        },
     };
 
     /// A request context past worker selection with its payload ready, the
@@ -338,5 +344,20 @@ mod tests {
         assert!(!logs_contain("user:"));
         assert!(logs_contain("Failed to forward request to OpenAI"));
         assert!(logs_contain(&format!("{MASKED_WORKER_URL}/v1/responses")));
+    }
+
+    /// A forward nothing answers: the caller's 502 says why without the
+    /// worker's address. The HTTP client's own error text ends with the
+    /// request URL, which the line names masked.
+    #[tokio::test]
+    async fn a_failed_forward_answers_without_the_workers_address() {
+        let refused = RefusedAddress::reserve();
+        let worker_url = format!("http://{}", refused.addr());
+
+        let response = handle_non_streaming_response(context_for(&worker_url)).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = text_of(response).await;
+        assert!(!body.contains(&refused.addr().to_string()), "{body}");
     }
 }

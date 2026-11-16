@@ -210,7 +210,7 @@ impl Config {
 
 /// A configuration refused, by name. The last four come from the binary's
 /// command line, which maps one server identity and one client authority
-/// per scope onto the listeners; the five before them are the election's.
+/// per scope onto the listeners; the eight before them are the election's.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ConfigError {
     /// `controller_id` is empty.
