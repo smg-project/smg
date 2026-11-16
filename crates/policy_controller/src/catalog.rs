@@ -677,7 +677,7 @@ profiles:
                 "{weight}"
             );
         }
-        for written in ["2", "null", r#""heavy""#, "[]"] {
+        for written in ["2", "-1", "0.5", "true", "null", r#""heavy""#, "[]"] {
             assert_eq!(
                 bad(&format!(r#"{{"high-id":{written}}}"#)),
                 "profiles.p.score[0].high-id",
@@ -708,6 +708,26 @@ profiles:
         )
         .expect_err("two keys");
         assert!(two.to_string().contains("single key"), "{two}");
+        // A key written twice is the parser's refusal too, in both document
+        // forms and in a built-in's words: the map read would keep the last.
+        for name in ["high-id", "least-requests"] {
+            let json = format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{"score":[{{"{name}":{{"weight":0,"weight":2}}}}],"pick":"best"}}}}}}"#
+            );
+            let twice = serde_json::from_str::<PolicySpec>(&json).expect_err("a key twice");
+            assert!(
+                twice.to_string().contains("duplicate field `weight`"),
+                "{twice}"
+            );
+            let yaml = format!(
+                "apiVersion: smg.policy/v1\nprofiles:\n  p:\n    score:\n      - {name}: {{weight: 0, weight: 2}}\n    pick: best\n"
+            );
+            let twice = serde_yaml::from_str::<PolicySpec>(&yaml).expect_err("a key twice");
+            assert!(
+                twice.to_string().contains("duplicate field `weight`"),
+                "{twice}"
+            );
+        }
     }
 
     #[test]
@@ -731,6 +751,20 @@ profiles:
             Box::new(HighId)
         });
         assert!(matches!(again, Err(CatalogError::Held { .. })));
+        assert_eq!(built.load(Ordering::Relaxed), 1);
+        // So does a filter's registration under it, and a picker's.
+        let count = Arc::clone(&built);
+        let filter = catalog.filter("high-id", move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            Box::new(OddIds)
+        });
+        assert!(matches!(filter, Err(CatalogError::Held { .. })));
+        let count = Arc::clone(&built);
+        let picker = catalog.picker("high-id", move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            Box::new(Worst)
+        });
+        assert!(matches!(picker, Err(CatalogError::Held { .. })));
         assert_eq!(built.load(Ordering::Relaxed), 1);
         let named = spec(r#"{"score":["high-id"],"pick":"best"}"#);
         for generation in 1..=3 {

@@ -22,7 +22,7 @@ use std::{
 
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{
-    de::{self, MapAccess, Visitor},
+    de::{self, value::SeqAccessDeserializer, MapAccess, SeqAccess, Visitor},
     ser::SerializeMap,
     Deserialize, Deserializer, Serialize, Serializer,
 };
@@ -681,7 +681,8 @@ pub enum ScoreSpec {
     /// A name that is no built-in's, mapped to what the document wrote under
     /// it: a scorer the catalog adds, with its weight (`{ name: { weight }
     /// }`). Kept as read: the validator asks the catalog for the name first
-    /// and reads the keys of a name it holds.
+    /// and reads the keys of a name it holds. A key written twice is the
+    /// parser's refusal, as under a built-in.
     Added {
         name: String,
         written: serde_json::Value,
@@ -763,7 +764,7 @@ fn scorer_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<ScoreSpec, A::Erro
         "consistent-hash" => ScoreStage::ConsistentHash(map.next_value()?),
         "resident-work" => ScoreStage::ResidentWork(map.next_value()?),
         _ => {
-            let written = map.next_value()?;
+            let Written(written) = map.next_value()?;
             return single_key(map, ScoreSpec::Added { name: key, written });
         }
     };
@@ -778,6 +779,68 @@ fn single_key<'de, A: MapAccess<'de>>(mut map: A, entry: ScoreSpec) -> Result<Sc
         ));
     }
     Ok(entry)
+}
+
+/// What a document wrote under a scorer's name that is no built-in's, kept
+/// as read for the validator. A key written twice is refused here, in the
+/// words a built-in's parameters refuse it: the map of `serde_json` keeps
+/// the last value and says nothing. Only the entry's own keys are asked:
+/// the validator takes the weight alone, a number.
+struct Written(serde_json::Value);
+
+impl<'de> Deserialize<'de> for Written {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct WrittenVisitor;
+
+        impl<'de> Visitor<'de> for WrittenVisitor {
+            type Value = Written;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a scorer's parameters")
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Written, E> {
+                Ok(Written(value.into()))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Written, E> {
+                Ok(Written(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Written, A::Error> {
+                Deserialize::deserialize(SeqAccessDeserializer::new(seq)).map(Written)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Written, A::Error> {
+                let mut keys = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if keys.contains_key(&key) {
+                        return Err(de::Error::custom(format_args!("duplicate field `{key}`")));
+                    }
+                    keys.insert(key, map.next_value()?);
+                }
+                Ok(Written(keys.into()))
+            }
+        }
+
+        deserializer.deserialize_any(WrittenVisitor)
+    }
 }
 
 impl<'de> Deserialize<'de> for ScoreSpec {

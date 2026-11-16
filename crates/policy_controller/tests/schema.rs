@@ -122,22 +122,48 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
             .map(str::to_string)
             .collect()
     };
-    // Read from the stock catalog, the one the validator resolves a name in:
-    // a built-in added to the catalog and not to the schema, or the other
-    // way round, fails here.
+    // Read from the stock catalog, the one the validator resolves a name in.
+    // The catalog's pickers are a table of its own, so a picker in one and
+    // not in the other fails here. Its scorers are the list the schema
+    // reads, so the literals are what pins a published spelling.
     let stock = Catalog::builtin();
     let scorers: Vec<&str> = stock
         .scorers()
         .filter(|name| *name != "resident-work")
         .collect();
     assert_eq!(bare("ScoreSpec"), scorers);
-    assert_eq!(scorers.len(), 9);
+    assert_eq!(
+        scorers,
+        [
+            "least-load",
+            "least-requests",
+            "fewest-sessions",
+            "session-affinity",
+            "prefix-affinity",
+            "kv-pressure",
+            "warmup-slice",
+            "bucket",
+            "consistent-hash",
+        ]
+    );
     let pickers: Vec<&str> = stock
         .pickers()
         .filter(|name| *name != "best-with-temperature")
         .collect();
     assert_eq!(bare("PickSpec"), pickers);
-    assert_eq!(pickers.len(), 8);
+    assert_eq!(
+        pickers,
+        [
+            "best",
+            "round-robin",
+            "random",
+            "power-of-two",
+            "count-first",
+            "power-of-two-count-first",
+            "passthrough",
+            "manual",
+        ]
+    );
     // The ranges the validator enforces are the schema's too, so an editor
     // refuses on shape what apply would refuse.
     let field = |def: &str, name: &str| defs[def]["properties"][name].clone();
