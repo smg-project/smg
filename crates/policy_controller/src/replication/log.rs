@@ -185,11 +185,12 @@ impl Ring {
 ///
 /// The bound in bytes: a slot is at most 120 bytes whatever the event. A
 /// load row is its slot alone: 65,536 of them are 7.9 MB, held from the
-/// start. A membership event's rows stand apart from its slot, 288 bytes a
-/// row and its strings: about 0.48 KB an event at a row of a short URL, one
-/// model, no label and no pairing descriptor, a second row for a
-/// replacement, so 4,096 membership events are about 2 MB at that row. A
-/// pairing descriptor stands apart from its row, 168 bytes and its strings.
+/// start. A membership event's rows stand apart from its slot, 320 bytes a
+/// row and its strings: about 0.51 KB an event at a row of a short URL, one
+/// model, no label, no pairing descriptor and no encode connector, a second
+/// row for a replacement, so 4,096 membership events are about 2.1 MB at
+/// that row. A pairing descriptor stands apart from its row, 168 bytes and
+/// its strings.
 pub struct Log {
     ring: Mutex<Ring>,
     /// The highest term the log has seen: the store's takes, the events it
@@ -783,7 +784,7 @@ mod tests {
         // and apart from its slot a membership event's rows (two for a
         // replacement), each with its strings.
         assert!(size_of::<Entry>() <= 120);
-        assert!(size_of::<WorkerRow>() <= 288);
+        assert!(size_of::<WorkerRow>() <= 320);
     }
 
     #[test]

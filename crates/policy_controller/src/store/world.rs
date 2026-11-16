@@ -31,6 +31,12 @@
 //! write that moves no member and no member's offer carries the last
 //! write's classes and reads no member's facts for them.
 //!
+//! **The encode classes stand beside them.** Where a model's encoders state
+//! an end of the encode handoff, the same write derives which encoders each
+//! prefill's handoff reaches ([`EncodeClasses`]), by the rows of the two
+//! pools. A write that moves no member and no member's offer carries them,
+//! and every other write derives them whole.
+//!
 //! A row in a pool is the candidate row itself. Its fixed fields are
 //! written when the membership's first world is built. Its moving facts
 //! (the load record with its sample instant, the two status bits) are
@@ -90,6 +96,7 @@ use crate::{
     framework::{OverloadThresholds, PairPools, PairTable},
     spec::{AppliedSpec, Pairing},
     store::{
+        encoding::{EncodeClasses, EncodeMember},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
         workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
@@ -275,6 +282,11 @@ struct PoolShape {
     /// ([`Classes::Carry`]) and a written worker's derive that leaves them
     /// as they were ([`Classes::Written`]).
     pairs: Option<Arc<PairClasses>>,
+    /// The encode classes of the pool's model, on its prefill pool where an
+    /// encoder of the model states an end: a decision that carries encode
+    /// items reads its chosen prefill's class beside the pool it chose in.
+    /// Counted and carried as the pair classes are.
+    encodes: Option<Arc<EncodeClasses>>,
 }
 
 /// The roles a model's pools are derived for: one slot each.
@@ -317,10 +329,21 @@ struct Derived {
 }
 
 impl Derived {
+    /// The shape of `model`'s prefill pool: the model's classes stand on it.
+    fn prefill(&self, model: &str) -> Option<&PoolShape> {
+        let prefill = self.by_model.get(model)?[role_slot(Role::Prefill)]?;
+        self.pools.get(prefill as usize)
+    }
+
     /// The pair classes of `model`, where it has a prefill and a decode.
     fn pairs(&self, model: &str) -> Option<&Arc<PairClasses>> {
-        let prefill = self.by_model.get(model)?[role_slot(Role::Prefill)]?;
-        self.pools.get(prefill as usize)?.pairs.as_ref()
+        self.prefill(model)?.pairs.as_ref()
+    }
+
+    /// The encode classes of `model`, where it has a prefill and an encoder
+    /// that states an end.
+    fn encodes(&self, model: &str) -> Option<&Arc<EncodeClasses>> {
+        self.prefill(model)?.encodes.as_ref()
     }
 
     /// How many members `pool` holds: none where there is no pool.
@@ -663,6 +686,18 @@ impl World {
     /// the classes a reader keeps across worlds.
     pub fn pairs(&self, model: &str) -> Option<&PairClasses> {
         self.derived.pairs(model).map(|classes| &**classes)
+    }
+
+    /// The encode classes of `model` as this world's pools were derived: the
+    /// class each row of its prefill pool names and each
+    /// class's encoders by their rows in its encode pool, another gateway's
+    /// host-local rows counted ([`EncodeClasses`]). A class's number is read
+    /// under this world's borrow and never kept. `None` when the model has
+    /// no prefill or no encoder that states an end. A membership write
+    /// derives them, and so does a generation of another pairing mode at the
+    /// same epoch, as it does the pair classes ([`World::pairs`]).
+    pub fn encodes(&self, model: &str) -> Option<&EncodeClasses> {
+        self.derived.encodes(model).map(|classes| &**classes)
     }
 
     fn pool(&self, model: &str, role: Role) -> Option<(&[Candidate], &PoolShape)> {
@@ -1071,7 +1106,9 @@ impl<'a> Pool<'a> for [Entry<'a>] {
     }
 }
 
-/// What a membership write asks of the pair classes.
+/// What a membership write asks of a model's classes. The pair classes
+/// follow each variant's words. The encode classes are carried under
+/// [`Classes::Carry`] and derived whole under the other two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Classes {
     /// Every model's classes are derived whole: a generation of another
@@ -1096,14 +1133,16 @@ pub(super) enum Classes {
 /// Whether two versions of one worker's facts stand in the same pools with
 /// the same offer: the role and the models place a worker in its pools, and
 /// the wires, the runtime and the descriptor are what the pairing rule reads of
-/// it, the runtime as an offer holds it ([`known`]). A write from one such
-/// version to the other moves no pair class.
+/// it, the runtime as an offer holds it ([`known`]); the runtime and the
+/// stated end are what [`encode_member`] reads. A write from one such
+/// version to the other moves no pair class and no encode class.
 pub(super) fn same_offer(old: &WorkerFacts, new: &WorkerFacts) -> bool {
     old.role == new.role
         && old.models == new.models
         && old.wire_modes == new.wire_modes
         && known(&old.engine_kind) == known(&new.engine_kind)
         && old.pairing == new.pairing
+        && old.encode == new.encode
 }
 
 /// One model's pair classes under `mode`, each prefill's and each decode's
@@ -1158,6 +1197,47 @@ fn pair_up(
         }
     }
     Some(classes)
+}
+
+/// What the encode handoff's rule reads of one entry: its worker's runtime
+/// and stated end.
+fn encode_member<'a>(entry: &Entry<'a>) -> EncodeMember<'a> {
+    EncodeMember {
+        runtime: &entry.facts.engine_kind,
+        offer: &entry.facts.encode,
+    }
+}
+
+/// One model's encode classes, each side in its rows' order: what the last
+/// write left on the model's prefill pool (`kept`), classes or none, where
+/// this write moved no member and no offer ([`Classes::Carry`]), else
+/// derived. `None` when the model has none: no prefill, or no encoder that
+/// states an end. A model with no encoder pays no derivation, and a write
+/// that carries pays none whatever the model holds.
+fn encode_up(
+    sides: &[Vec<Entry<'_>>; ROLES],
+    kept: Option<&PoolShape>,
+) -> Option<Arc<EncodeClasses>> {
+    let encoders = &sides[role_slot(Role::Encode)];
+    let prefills = &sides[role_slot(Role::Prefill)];
+    if let Some(kept) = kept {
+        debug_assert!(
+            kept.encodes.iter().all(|classes| {
+                classes.encoders().len() == encoders.len()
+                    && classes.prefills().len() == prefills.len()
+            }),
+            "the classes are these members'"
+        );
+        return kept.encodes.clone();
+    }
+    if encoders.is_empty() || prefills.is_empty() {
+        return None;
+    }
+    let classes = EncodeClasses::derive(
+        encoders.iter().map(encode_member),
+        prefills.iter().map(encode_member),
+    );
+    (classes.classes() != 0).then(|| Arc::new(classes))
 }
 
 /// One member's row in one pool of the writer's working copy.
@@ -1906,6 +1986,13 @@ impl Writer {
             let carried = last.as_deref().and_then(|last| last.pairs(&model));
             let (mode, kept) = (self.spec.pairing(), &mut self.derivations);
             let mut pairs = pair_up(&mut sides, mode, classes, carried, kept, &model);
+            // The encode classes are carried where no member and no offer
+            // moved, and derived whole at every other write.
+            let kept = match classes {
+                Classes::Carry => last.as_deref().and_then(|last| last.prefill(&model)),
+                Classes::Derive | Classes::Written { .. } => None,
+            };
+            let mut encodes = encode_up(&sides, kept);
             let mut indexes = [None; ROLES];
             for (side, entries) in sides.into_iter().enumerate() {
                 if entries.is_empty() {
@@ -1936,6 +2023,11 @@ impl Writer {
                         .collect(),
                     pairs: if side == role_slot(Role::Prefill) {
                         pairs.take()
+                    } else {
+                        None
+                    },
+                    encodes: if side == role_slot(Role::Prefill) {
+                        encodes.take()
                     } else {
                         None
                     },

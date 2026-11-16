@@ -676,11 +676,12 @@ impl MemoryStore {
 
 impl WorkersStore for MemoryStore {
     fn upsert(&self, mut facts: WorkerFacts) -> MembershipChange {
-        // A blank value of a descriptor is no report: the row of record holds
-        // what the pairing rule reads.
+        // A blank value of a descriptor or of an encode offer is no report:
+        // the row of record holds what the two rules read.
         if let Some(descriptor) = facts.pairing.as_deref_mut() {
             descriptor.normalize();
         }
+        facts.encode = facts.encode.normalized();
         let mut workers = self.writing();
         let now = Instant::now();
         if let Some(old_id) = workers.by_key.get(&facts.key).copied() {
