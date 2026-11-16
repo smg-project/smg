@@ -1670,10 +1670,12 @@ fn time_per_router_record_contended() {
 }
 
 /// The chat path's remaining per-request records (the selection, the
-/// cache-aware decision, the routing-key source, the admission gauges,
-/// the body path, the early release) render the same through kept
-/// handles as through a key built per record: the same series with the
-/// same values.
+/// cache-aware decision, the index lookup, the routing-key source, the
+/// admission gauges, the body path, the early release) render the same
+/// through kept handles as through a key built per record: the same
+/// series with the same values. A second pass through kept handles,
+/// under another recorder, renders them again: the reset between the
+/// passes dropped every handle of the first.
 #[test]
 fn the_per_request_records_render_the_same_through_kept_handles() {
     let records = || {
@@ -1700,6 +1702,9 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         Metrics::record_worker_prefix_hash_policy_branch("ring_hit");
         Metrics::record_cache_aware_match_ratio(0.25);
         Metrics::record_cache_aware_match_ratio(0.75);
+        Metrics::record_kv_index_lookup("chain", 0.000_002);
+        Metrics::record_kv_index_lookup("chain", 0.000_004);
+        Metrics::record_kv_index_lookup("reference", 0.000_008);
         Metrics::record_routing_key_source("header");
         Metrics::record_admission_queue_entered();
         Metrics::record_admission_inflight_acquired();
@@ -1724,6 +1729,12 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         handles::reset();
     });
     assert_eq!(sorted_series(&kept), sorted_series(&built));
+    let kept_again = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        records();
+        handles::reset();
+    });
+    assert_eq!(sorted_series(&kept_again), sorted_series(&built));
     for expected in [
         "smg_worker_selection_total{worker_type=\"regular\",connection_mode=\"grpc\",model=\"m1\",policy=\"cache_aware\"} 2",
         "smg_worker_selection_total{worker_type=\"prefill\",connection_mode=\"grpc\",model=\"m2\",policy=\"random\"} 1",
@@ -1733,6 +1744,9 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         "smg_consistent_hashing_policy_branch_total{branch=\"routing_key_hit\"} 1",
         "smg_prefix_hash_policy_branch_total{branch=\"ring_hit\"} 1",
         "smg_cache_aware_match_ratio_count 2",
+        "smg_kv_index_lookup_seconds_count{index=\"chain\"} 2",
+        "smg_kv_index_lookup_seconds_count{index=\"reference\"} 1",
+        "smg_kv_index_lookup_seconds_sum{index=\"reference\"} 0.000008",
         "smg_routing_key_source_total{source=\"header\"} 1",
         "smg_admission_queue_depth 1",
         "smg_admission_inflight 1",
