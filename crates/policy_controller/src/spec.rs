@@ -139,10 +139,15 @@ pub struct Needs {
     /// reads any of the five declares this, whatever feeds them: `events`
     /// asks for the index and the hash fields for the request's hashes, and
     /// neither stands for the column. A host fills the column where this is
-    /// declared and may hand an empty one elsewhere. The engine checks the
-    /// column's shape, never its presence: an unfilled column reads as
-    /// nothing held for every candidate and nothing is refused. What holds
-    /// a host to the need is the builder of its view, by a case of its own.
+    /// declared and may hand an empty column elsewhere. Rows it names in
+    /// the column's place ([`NamedAffinity`](crate::NamedAffinity)) answer
+    /// the crate's own affinity stages and no other reader: a named row
+    /// says its two depths and nothing of its age, growth or index size, so
+    /// a host fills the column for a profile with a stage that reads those,
+    /// a guest's among them. The engine checks the column's shape, never
+    /// its presence: an unfilled column reads as nothing held for every
+    /// candidate and nothing is refused. What holds a host to the need is
+    /// the builder of its view, by a case of its own.
     pub affinity: bool,
 }
 

@@ -4,10 +4,11 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    identity, identity_of, BatchFacts, BatchOutcome, GatewayId, HealthSink, KvEventSink,
-    LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource, MembershipChange,
-    MembershipTail, MemoryStore, Pin, PollMode, ReservationKind, ReservationStore, ResyncReason,
-    SessionsStore, SnapshotChunk, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+    identity, identity_of, BatchFacts, BatchOutcome, ContentHash, GatewayId, HealthSink, KvEvent,
+    KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
+    MembershipChange, MembershipTail, MemoryStore, Pin, PollMode, ReservationKind,
+    ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals, SnapshotChunk,
+    StoredBlock, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
 };
 use crate::{
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
@@ -654,22 +655,55 @@ fn a_scrape_writes_no_receipt_so_the_poll_stays() {
     );
 }
 
+/// A row whose signals ask for events, at `rank`: the store indexes its
+/// blocks.
+fn publisher(store: &MemoryStore, key: &str, rank: u16) -> WorkerId {
+    let facts = WorkerFacts {
+        dp_rank: rank,
+        signals: Signals {
+            events: true,
+            ..Signals::default()
+        },
+        ..facts(key, 1)
+    };
+    store.upsert(facts).id()
+}
+
+/// What the batch of `sequence` carries in these cases: one block of its
+/// own at a chain's start, so the blocks a rank holds count the batches
+/// applied since its last clear.
+fn one_block(sequence: u64) -> [KvEvent; 1] {
+    [KvEvent::Stored {
+        parent: None,
+        blocks: vec![StoredBlock {
+            seq_hash: SequenceHash(1_000 + sequence),
+            content_hash: ContentHash(2_000 + sequence),
+        }],
+    }]
+}
+
 #[test]
 fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
     let store = MemoryStore::new();
-    let sink: &dyn KvEventSink<Batch = ()> = &store;
-    let id = WorkerId(9);
+    let sink: &dyn KvEventSink<Batch = [KvEvent]> = &store;
+    let id = publisher(&store, "w", 0);
     assert_eq!(sink.cursor(id, 0), None, "a rank never heard from");
-    assert_eq!(sink.admit(id, 0, batch(17), &()), BatchOutcome::Applied);
-    assert_eq!(sink.admit(id, 0, batch(18), &()), BatchOutcome::Applied);
     assert_eq!(
-        sink.admit(id, 0, batch(18), &()),
+        sink.admit(id, 0, batch(17), &one_block(17)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(
+        sink.admit(id, 0, batch(18), &one_block(18)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(
+        sink.admit(id, 0, batch(18), &one_block(18)),
         BatchOutcome::Skipped,
         "a duplicate"
     );
     assert_eq!(sink.cursor(id, 0).expect("heard").applied, 18);
     assert_eq!(
-        sink.admit(id, 0, batch(25), &()),
+        sink.admit(id, 0, batch(25), &one_block(25)),
         BatchOutcome::Gap {
             expected: 19,
             received: 25
@@ -678,36 +712,50 @@ fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
     assert!(sink.cursor(id, 0).expect("heard").replay_pending);
     for seq in 19..=25 {
         assert_eq!(
-            sink.admit(id, 0, batch(seq), &()),
+            sink.admit(id, 0, batch(seq), &one_block(seq)),
             BatchOutcome::Applied,
             "the replay fills the gap"
         );
     }
-    assert_eq!(store.applied_batches(id, 0), 9);
+    assert_eq!(store.indexed_blocks(id, 0), 9);
     assert_eq!(
-        sink.admit(id, 0, batch(40), &()),
+        sink.admit(id, 0, batch(40), &one_block(40)),
         BatchOutcome::Gap {
             expected: 26,
             received: 40
         }
     );
     assert_eq!(
-        sink.admit(id, 0, batch(50), &()),
+        sink.admit(id, 0, batch(50), &one_block(50)),
         BatchOutcome::Applied,
         "a second gap is lost history, applied"
     );
     let cursor = sink.cursor(id, 0).expect("heard");
     assert!(cursor.degraded && !cursor.replay_pending);
     assert_eq!(
-        store.applied_batches(id, 0),
+        store.indexed_blocks(id, 0),
         10,
         "a small gap keeps the state"
     );
-    assert_eq!(sink.admit(id, 1, batch(3), &()), BatchOutcome::Applied);
+    let second = publisher(&store, "w/1", 1);
     assert_eq!(
-        sink.cursor(id, 1).expect("heard").applied,
+        sink.admit(second, 1, batch(3), &one_block(3)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(
+        sink.cursor(second, 1).expect("heard").applied,
         3,
         "each rank its own counter"
+    );
+    assert_eq!(
+        sink.admit(id, 1, batch(3), &one_block(3)),
+        BatchOutcome::Skipped,
+        "a batch of a rank the row is not"
+    );
+    assert_eq!(
+        sink.admit(WorkerId(9), 0, batch(1), &one_block(1)),
+        BatchOutcome::Skipped,
+        "a batch of a worker the store holds no row for"
     );
 }
 
@@ -717,13 +765,16 @@ fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
 #[test]
 fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_not() {
     let store = MemoryStore::new();
-    let sink: &dyn KvEventSink<Batch = ()> = &store;
-    let id = WorkerId(11);
+    let sink: &dyn KvEventSink<Batch = [KvEvent]> = &store;
+    let id = publisher(&store, "w", 0);
     for seq in 1..=5 {
-        assert_eq!(sink.admit(id, 0, batch(seq), &()), BatchOutcome::Applied);
+        assert_eq!(
+            sink.admit(id, 0, batch(seq), &one_block(seq)),
+            BatchOutcome::Applied
+        );
     }
     assert_eq!(
-        sink.admit(id, 0, batch(3), &()),
+        sink.admit(id, 0, batch(3), &one_block(3)),
         BatchOutcome::Skipped,
         "a late duplicate on the same connection"
     );
@@ -731,20 +782,16 @@ fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_no
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 0);
     sink.reconnected(id);
     assert_eq!(
-        sink.admit(id, 0, batch(3), &()),
+        sink.admit(id, 0, batch(3), &one_block(3)),
         BatchOutcome::Applied,
         "the same sequence on a fresh connection is a restarted publisher"
     );
     let cursor = sink.cursor(id, 0).expect("heard");
     assert_eq!((cursor.applied, cursor.degraded), (3, false));
-    assert_eq!(
-        store.applied_batches(id, 0),
-        1,
-        "the rank was cleared first"
-    );
+    assert_eq!(store.indexed_blocks(id, 0), 1, "the rank was cleared first");
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
     assert_eq!(
-        sink.admit(id, 0, batch(4), &()),
+        sink.admit(id, 0, batch(4), &one_block(4)),
         BatchOutcome::Applied,
         "the new life continues from there"
     );
@@ -754,10 +801,13 @@ fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_no
 #[test]
 fn a_publisher_restart_and_a_resync_clear_the_rank_and_a_removal_forgets_it() {
     let store = MemoryStore::new();
-    let sink: &dyn KvEventSink<Batch = ()> = &store;
-    let id = WorkerId(9);
+    let sink: &dyn KvEventSink<Batch = [KvEvent]> = &store;
+    let id = publisher(&store, "w", 0);
     for seq in 1..=5 {
-        assert_eq!(sink.admit(id, 0, batch(seq), &()), BatchOutcome::Applied);
+        assert_eq!(
+            sink.admit(id, 0, batch(seq), &one_block(seq)),
+            BatchOutcome::Applied
+        );
     }
     let clearing = BatchFacts {
         sequence: 2,
@@ -765,51 +815,51 @@ fn a_publisher_restart_and_a_resync_clear_the_rank_and_a_removal_forgets_it() {
         snapshot: None,
     };
     assert_eq!(
-        sink.admit(id, 0, clearing, &()),
+        sink.admit(id, 0, clearing, &one_block(2)),
         BatchOutcome::Applied,
         "a clear below the cursor is a restarted publisher"
     );
-    assert_eq!(
-        store.applied_batches(id, 0),
-        1,
-        "the rank was cleared first"
-    );
+    assert_eq!(store.indexed_blocks(id, 0), 1, "the rank was cleared first");
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
     sink.reconnected(id);
     assert_eq!(
-        sink.admit(id, 0, batch(1), &()),
+        sink.admit(id, 0, batch(1), &one_block(1)),
         BatchOutcome::Applied,
         "below the cursor on a fresh connection: a restart too"
     );
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 2);
     for seq in 2..=4 {
-        sink.admit(id, 0, batch(seq), &());
+        sink.admit(id, 0, batch(seq), &one_block(seq));
     }
+    assert_eq!(store.indexed_blocks(id, 0), 4);
     sink.resync(id, Some(0), ResyncReason::OutOfRange);
-    assert_eq!(store.applied_batches(id, 0), 0);
+    assert_eq!(store.indexed_blocks(id, 0), 0);
     assert_eq!(sink.cursor(id, 0).expect("heard").applied, 0);
     assert_eq!(store.resyncs(ResyncReason::OutOfRange), 1);
     let chunk = BatchFacts {
         sequence: 90,
         clears: false,
         snapshot: Some(SnapshotChunk {
-            index: 0,
-            count: 2,
             unknown_before: true,
         }),
     };
-    assert_eq!(sink.admit(id, 0, chunk, &()), BatchOutcome::Applied);
+    sink.resync(id, Some(0), ResyncReason::Snapshot);
+    assert_eq!(
+        sink.admit(id, 0, chunk, &one_block(90)),
+        BatchOutcome::Applied
+    );
     let cursor = sink.cursor(id, 0).expect("heard");
     assert_eq!((cursor.applied, cursor.degraded), (90, true));
     assert_eq!(store.resyncs(ResyncReason::Snapshot), 1);
     assert_eq!(
-        sink.admit(id, 0, batch(91), &()),
+        sink.admit(id, 0, batch(91), &one_block(91)),
         BatchOutcome::Applied,
         "live batches continue after the snapshot's stamp"
     );
+    assert_eq!(store.indexed_blocks(id, 0), 2);
     sink.removed(id);
     assert_eq!(sink.cursor(id, 0), None);
-    assert_eq!(store.applied_batches(id, 0), 0);
+    assert_eq!(store.indexed_blocks(id, 0), 0);
     sink.set_block_size("m", 16);
     sink.set_block_size("m", 8);
     assert_eq!(sink.block_size("m"), Some(16), "only ever raised");
