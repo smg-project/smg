@@ -533,7 +533,8 @@ message OverloadThresholds {
 // controller's default.
 message HealthPolicy {
   // Consecutive failed probes before a ready worker leaves rotation; three
-  // times as many fail it.
+  // times as many fail it. A threshold whose multiple passes the probe
+  // counter's range (32 bits) is never met before the counter's end.
   uint32 failure_threshold = 1;
   // Consecutive passed probes before a worker returns.
   uint32 success_threshold = 2;
@@ -625,7 +626,9 @@ message RegisterWorkerRequest {
     MODE_REPLACE = 2;
     // Registers an absent URL. Over a standing row: equal facts write nothing
     // and answer the row unmoved, a change of role, wire or models is a new
-    // incarnation, any other change is made in place.
+    // incarnation, any other change is made in place. The models change
+    // when their set does: the same ids in another order are written in
+    // place, and the row tells the stated order.
     MODE_UPSERT = 3;
   }
   Mode mode = 2;
@@ -641,8 +644,11 @@ message RegisterWorkerRequest {
 // written: a URL, a runtime or a model id that holds a blank or a control
 // character is INVALID_ARGUMENT. Over a standing row (MODE_REPLACE,
 // MODE_UPSERT) the labels and the health policy are the registration's,
-// whole; any other field left unset or empty keeps the row's value, and a
-// block that is present replaces the row's.
+// whole; any other field left unset or empty keeps the row's value, and an
+// overload or a signals block that is present replaces the row's. A URL's
+// first registration names its wire and its role: INVALID_ARGUMENT by the
+// field it leaves unset, and by the field that states a number this
+// contract does not name.
 //
 // Bounds, each INVALID_ARGUMENT by its field: a URL at most 2,048 bytes; a
 // runtime, a zone and a model id at most 256 bytes each; at most 128 labels,
@@ -650,8 +656,12 @@ message RegisterWorkerRequest {
 // row the registration would make is at most 16,384 bytes as WorkerRow
 // encodes it, measured with the numbers the controller gives a row (its id,
 // incarnation, revision and status) and the overload block at their widest:
-// no later status, revision or patched block adds a byte. A list has no
-// count of its own beyond the labels': the row's bound holds it.
+// no later status, revision or patched block adds a byte.
+//
+// A limit of this build, not a number of the contract: a row names at most
+// 128 model ids (INVALID_ARGUMENT by `spec.models`). A gateway's own
+// registration takes a worker of more ids, and this door refuses it; the
+// count is said again once the store's cost of a row's ids is measured.
 message WorkerSpec {
   string url = 1;
   // WIRE_MODE_ZMQ is INVALID_ARGUMENT here: a host-local wire is reachable
@@ -665,6 +675,11 @@ message WorkerSpec {
   string zone = 7;
   OverloadThresholds overload = 8;
   uint32 kv_block_size = 9;
+  // Of the descriptor a registration states the bootstrap port alone, and
+  // the row tells it back: the store holds no other field of it yet, and one
+  // a caller states is INVALID_ARGUMENT by its path. Zero states no port:
+  // the standing port stays, under a REPLACE too, and it is cleared by
+  // removing the worker and registering it again.
   PairingDescriptor pairing = 10;
   // 0: the data-parallel width is discovered where a handshake runs (always
   // on) and is one rank where none does. Above 1: INVALID_ARGUMENT where no

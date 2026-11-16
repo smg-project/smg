@@ -47,6 +47,9 @@ const KEY_BYTES: usize = 128;
 const VALUE_BYTES: usize = 4_096;
 /// The labels of one row.
 const LABELS: usize = 128;
+/// The model ids of one row: a limit of this build and no number of the
+/// contract, said again once the store's cost of a row's ids is measured.
+const MODELS: usize = 128;
 /// The row whole on the wire, as [`weight`] measures it.
 const ROW_BYTES: usize = 16 * 1024;
 
@@ -102,8 +105,9 @@ fn reachable(from: Reachability) -> proto::Reachability {
     }
 }
 
-/// The wire's row of a store row. The pairing descriptor is not told here:
-/// its conversion arrives with the store's typed descriptor.
+/// The wire's row of a store row. Of the pairing descriptor it tells the
+/// bootstrap port, the one field of it the store holds: the rest arrives
+/// with the store's typed descriptor.
 pub(crate) fn row(row: &WorkerRow) -> proto::WorkerRow {
     told(row.id, &row.facts, row.status, row.revision)
 }
@@ -153,6 +157,10 @@ fn numbers(
         status: status(state) as i32,
         revision,
         health: health_bits(state),
+        pairing: facts.bootstrap_port.map(|port| proto::PairingDescriptor {
+            bootstrap_port: u32::from(port),
+            ..Default::default()
+        }),
         overload: Some(proto::OverloadThresholds {
             queue_limit: facts.overload.waiting_requests,
             kv_usage_permille: facts.overload.kv_usage_permille.map(u32::from),
@@ -236,6 +244,10 @@ pub(crate) fn event(
 /// each text as the wire frames it, under the contract's field numbers.
 /// `labels` are the row's own, or the ones a patch would leave: nothing is
 /// copied to weigh the row it would make.
+///
+/// This sum and [`told`] tell one contract twice, and the pin over the
+/// cases' full row holds them together: a text the row gains later is
+/// stated in that row first.
 fn weight(facts: &WorkerFacts, labels: &BTreeMap<String, String>) -> usize {
     use prost::encoding::{btree_map, encoded_len_varint, string};
     // A length's own bytes, and a text under its tag: nothing when empty.
@@ -336,23 +348,9 @@ fn overload(block: &proto::OverloadThresholds, path: &'static str) -> Result<Ove
     })
 }
 
-/// The facts of the row a registration states, laid over `standing` (the
-/// facts of the key's standing row, which keep what the registration leaves
-/// unsaid) or over the store's defaults. Two facts are the registration's,
-/// whole, whatever stood: the labels, and the health policy, so nobody's
-/// "do not check" outlives the registration that said it. The incarnation
-/// is the caller's to number.
-///
-/// A name is taken as written, so one that holds a blank or a control
-/// character is refused, never mended: the URL, the runtime and each model
-/// id key the store's rows, its pools and its classes.
-///
-/// One rank a registration: the contract's call answers one row, so a stated
-/// width above one is refused until a call can answer a row a rank.
-pub(crate) fn facts(
-    spec: &proto::WorkerSpec,
-    standing: Option<&WorkerFacts>,
-) -> Result<WorkerFacts, Refused> {
+/// The URL a registration states, under its own rules: stated, within its
+/// bound, with no blank and no control character.
+fn key(spec: &proto::WorkerSpec) -> Result<&str, Refused> {
     if spec.url.is_empty() {
         return Err(refused("spec.url", "a registration names its worker's URL"));
     }
@@ -364,6 +362,44 @@ pub(crate) fn facts(
             "spec.url",
             "a URL holds no blank and no control character",
         ));
+    }
+    Ok(&spec.url)
+}
+
+/// The facts of the row a registration states ([`over`]), with the row that
+/// stands under its URL. `standing` reads that row and is called once the
+/// URL holds its own rules ([`key`]): a URL past its bound is refused
+/// before anything is looked up under it.
+pub(crate) fn registration(
+    spec: &proto::WorkerSpec,
+    standing: impl FnOnce(&str) -> Option<WorkerRow>,
+) -> Result<(WorkerFacts, Option<WorkerRow>), Refused> {
+    let standing = standing(key(spec)?);
+    let facts = over(spec, standing.as_ref().map(|row| &row.facts))?;
+    Ok((facts, standing))
+}
+
+/// The facts of the row a registration states, laid over `standing` (the
+/// facts of the key's standing row, which keep what the registration leaves
+/// unsaid) or over the store's defaults, where a new row names its wire and
+/// its role itself. Two facts are the registration's,
+/// whole, whatever stood: the labels, and the health policy, so nobody's
+/// "do not check" outlives the registration that said it. The incarnation
+/// is the caller's to number.
+///
+/// A name is taken as written, so one that holds a blank or a control
+/// character is refused, never mended: the URL, the runtime and each model
+/// id key the store's rows, its pools and its classes.
+///
+/// One rank a registration: the contract's call answers one row, so a stated
+/// width above one is refused until a call can answer a row a rank.
+///
+/// The URL's own rules are [`key`]'s, held before this is called.
+fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<WorkerFacts, Refused> {
+    // The count first, before one id is read or copied: every membership
+    // write walks the ids of every standing row.
+    if spec.models.len() > MODELS {
+        return Err(refused("spec.models", "a row names at most 128 model ids"));
     }
     if spec.runtime.len() > NAME_BYTES {
         return Err(refused("spec.runtime", "a runtime is at most 256 bytes"));
@@ -398,18 +434,24 @@ pub(crate) fn facts(
                 "a host-local wire is one gateway's and a registration names none: not served by this build",
             ));
         }
-        Ok(proto::WireMode::Unspecified) | Err(_) => {
-            return Err(refused("spec.wire", "a registration names its one wire"));
-        }
+        // Left unsaid, the wire is the standing row's.
+        Ok(proto::WireMode::Unspecified) => match standing {
+            Some(row) => row.wire_modes,
+            None => return Err(refused("spec.wire", "a new row names its one wire")),
+        },
+        Err(_) => return Err(refused("spec.wire", "a wire this build does not know")),
     };
     let role = match proto::Role::try_from(spec.role) {
         Ok(proto::Role::Single) => Role::Single,
         Ok(proto::Role::Prefill) => Role::Prefill,
         Ok(proto::Role::Decode) => Role::Decode,
         Ok(proto::Role::Encode) => Role::Encode,
-        Ok(proto::Role::Unspecified) | Err(_) => {
-            return Err(refused("spec.role", "a registration names its role"));
-        }
+        // And so is the role.
+        Ok(proto::Role::Unspecified) => match standing {
+            Some(row) => row.role,
+            None => return Err(refused("spec.role", "a new row names its role")),
+        },
+        Err(_) => return Err(refused("spec.role", "a role this build does not know")),
     };
     if spec.dp_size > 1 {
         return Err(refused(
@@ -423,12 +465,6 @@ pub(crate) fn facts(
             "no row holds a topology in this build",
         ));
     }
-    if spec.pairing.is_some() {
-        return Err(refused(
-            "spec.pairing",
-            "a pairing descriptor is not served by this build",
-        ));
-    }
     if spec.zone.len() > NAME_BYTES {
         return Err(refused("spec.zone", "a zone is at most 256 bytes"));
     }
@@ -438,6 +474,10 @@ pub(crate) fn facts(
     for (name, value) in &spec.labels {
         label(name, value, "spec.labels")?;
     }
+    let bootstrap = match &spec.pairing {
+        Some(pairing) => bootstrap_port(pairing)?,
+        None => None,
+    };
     let mut facts = standing.cloned().unwrap_or_default();
     facts.key.clone_from(&spec.url);
     if standing.is_none() {
@@ -463,6 +503,9 @@ pub(crate) fn facts(
     }
     if spec.kv_block_size != 0 {
         facts.kv_block_size = Some(spec.kv_block_size);
+    }
+    if bootstrap.is_some() {
+        facts.bootstrap_port = bootstrap;
     }
     if let Some(block) = &spec.overload {
         facts.overload = overload(block, "spec.overload.kv_usage_permille")?;
@@ -510,6 +553,61 @@ pub(crate) fn facts(
     Ok(facts)
 }
 
+/// The bootstrap port a registration's pairing descriptor states; `None`
+/// where it states none. The store holds no other field of a descriptor
+/// yet: one a caller states is refused by its path, never dropped.
+fn bootstrap_port(pairing: &proto::PairingDescriptor) -> Result<Option<u16>, Refused> {
+    const NOT_HELD: &str = "the store holds a descriptor's bootstrap port alone in this build";
+    // Every field by its name: one the contract gains stops the build
+    // here, so none passes unread.
+    let proto::PairingDescriptor {
+        protocol,
+        connector,
+        transport,
+        version,
+        bootstrap_port,
+        bootstrap_host,
+        kv_layout,
+        pair_class,
+        ec_producer,
+        ec_consumer,
+        vision,
+    } = pairing;
+    let others = [
+        (!protocol.is_empty(), "spec.pairing.protocol"),
+        (!connector.is_empty(), "spec.pairing.connector"),
+        (!transport.is_empty(), "spec.pairing.transport"),
+        (!version.is_empty(), "spec.pairing.version"),
+        (!kv_layout.is_empty(), "spec.pairing.kv_layout"),
+        (*ec_producer, "spec.pairing.ec_producer"),
+        (*ec_consumer, "spec.pairing.ec_consumer"),
+        (*vision, "spec.pairing.vision"),
+    ];
+    if let Some(&(_, path)) = others.iter().find(|(stated, _)| *stated) {
+        return Err(refused(path, NOT_HELD));
+    }
+    if !bootstrap_host.is_empty() {
+        return Err(refused(
+            "spec.pairing.bootstrap_host",
+            "the bootstrap host is the URL's: its reader derives it",
+        ));
+    }
+    if *pair_class != 0 {
+        return Err(refused(
+            "spec.pairing.pair_class",
+            "the store derives a pairing class: a registration states none",
+        ));
+    }
+    match u16::try_from(*bootstrap_port) {
+        Ok(0) => Ok(None),
+        Ok(port) => Ok(Some(port)),
+        Err(_) => Err(refused(
+            "spec.pairing.bootstrap_port",
+            "a port is at most 65535",
+        )),
+    }
+}
+
 /// The store's patch of the contract's over the row it names: the labels
 /// merged (set, then removed), the overload block replaced when present.
 /// `None` when the patch changes nothing of `standing`. The labels it would
@@ -518,6 +616,13 @@ pub(crate) fn patch(
     request: &proto::PatchWorkerRequest,
     standing: &WorkerFacts,
 ) -> Result<Option<WorkerPatch>, Refused> {
+    // The count first: a list past it is refused unread.
+    if request.remove_labels.len() > LABELS {
+        return Err(refused(
+            "remove_labels",
+            "a patch removes at most 128 labels",
+        ));
+    }
     if request
         .remove_labels
         .iter()
@@ -526,12 +631,6 @@ pub(crate) fn patch(
         return Err(refused(
             "remove_labels",
             "a label is set or removed, not both",
-        ));
-    }
-    if request.remove_labels.len() > LABELS {
-        return Err(refused(
-            "remove_labels",
-            "a patch removes at most 128 labels",
         ));
     }
     if request
@@ -591,8 +690,8 @@ mod tests {
     use prost::Message as _;
 
     use super::{
-        event, facts, patch, refused, replaced, row, status, status_changed, Refused, KEY_BYTES,
-        LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
+        event, patch, refused, registration, replaced, row, status, status_changed, Refused,
+        KEY_BYTES, LABELS, MODELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
     };
     use crate::{
         proto::{self, worker_event::Event},
@@ -617,6 +716,19 @@ mod tests {
     /// What the row of these facts weighs under its own labels.
     fn weight(facts: &WorkerFacts) -> usize {
         super::weight(facts, &facts.labels)
+    }
+
+    /// The facts of a registration over a row of `standing`, through the
+    /// door's own entry.
+    fn facts(
+        spec: &proto::WorkerSpec,
+        standing: Option<&WorkerFacts>,
+    ) -> Result<WorkerFacts, Refused> {
+        let row = standing.map(|facts| WorkerRow {
+            facts: facts.clone(),
+            ..full()
+        });
+        registration(spec, |_| row).map(|(facts, _)| facts)
     }
 
     /// A name of `bytes` bytes.
@@ -661,6 +773,7 @@ mod tests {
             zone: Some("zone-1".to_owned()),
             max_running: Some(96),
             kv_block_size: Some(16),
+            bootstrap_port: Some(8_998),
             reachable_from: Reachability::Gateway(GatewayId(0xabc)),
             signals: Signals {
                 events: true,
@@ -716,7 +829,10 @@ mod tests {
                     "0000000000000abc".to_owned(),
                 )),
             }),
-            pairing: None,
+            pairing: Some(proto::PairingDescriptor {
+                bootstrap_port: 8_998,
+                ..Default::default()
+            }),
             overload: Some(proto::OverloadThresholds {
                 queue_limit: None,
                 kv_usage_permille: Some(875),
@@ -851,6 +967,10 @@ mod tests {
                 kv_usage_permille: None,
             }),
             kv_block_size: 16,
+            pairing: Some(proto::PairingDescriptor {
+                bootstrap_port: 8_998,
+                ..Default::default()
+            }),
             dp_size: 1,
             signals: Some(proto::Signals {
                 events: true,
@@ -883,6 +1003,7 @@ mod tests {
                 labels: BTreeMap::from([("tier".to_owned(), "gold".to_owned())]),
                 zone: Some("zone-1".to_owned()),
                 kv_block_size: Some(16),
+                bootstrap_port: Some(8_998),
                 signals: Signals {
                     events: true,
                     loads: false,
@@ -904,6 +1025,32 @@ mod tests {
                 ..WorkerFacts::default()
             }
         );
+    }
+
+    #[test]
+    fn a_descriptor_states_the_bootstrap_port_or_leaves_it_as_it_stands() {
+        let with = |bootstrap_port| proto::WorkerSpec {
+            pairing: Some(proto::PairingDescriptor {
+                bootstrap_port,
+                ..Default::default()
+            }),
+            ..spec()
+        };
+        let port = |stated: &proto::WorkerSpec, standing: Option<&WorkerFacts>| {
+            facts(stated, standing)
+                .expect("a registration")
+                .bootstrap_port
+        };
+        assert_eq!(port(&spec(), None), None);
+        assert_eq!(port(&with(0), None), None);
+        assert_eq!(port(&with(8_998), None), Some(8_998));
+        assert_eq!(port(&with(65_535), None), Some(65_535));
+        // Over a standing row: a port stated replaces it, none stated keeps
+        // it, with a descriptor or without.
+        let standing = facts(&with(8_998), None).expect("a registration");
+        assert_eq!(port(&with(9_001), Some(&standing)), Some(9_001));
+        assert_eq!(port(&with(0), Some(&standing)), Some(8_998));
+        assert_eq!(port(&spec(), Some(&standing)), Some(8_998));
     }
 
     #[test]
@@ -959,6 +1106,31 @@ mod tests {
             }
         );
         assert!(made.health.probes);
+        // The wire and the role are kept too where a registration names
+        // neither, and a number this build does not know is not "unsaid".
+        let standing = WorkerFacts {
+            wire_modes: WireModes::HTTP,
+            ..full().facts
+        };
+        let unsaid = proto::WorkerSpec {
+            wire: 0,
+            role: 0,
+            ..spec()
+        };
+        let kept = facts(&unsaid, Some(&standing)).expect("a registration that names neither");
+        assert_eq!(
+            (kept.role, kept.wire_modes),
+            (Role::Decode, WireModes::HTTP)
+        );
+        for (stated, path) in [
+            (proto::WorkerSpec { wire: 3, ..spec() }, "spec.wire"),
+            (proto::WorkerSpec { role: 5, ..spec() }, "spec.role"),
+        ] {
+            assert_eq!(
+                facts(&stated, Some(&standing)).map_err(|refused| refused.path),
+                Err(path)
+            );
+        }
     }
 
     #[test]
@@ -1033,6 +1205,7 @@ mod tests {
                 "spec.wire",
             ),
             (proto::WorkerSpec { role: 0, ..spec() }, "spec.role"),
+            (proto::WorkerSpec { role: 5, ..spec() }, "spec.role"),
             (
                 proto::WorkerSpec {
                     dp_size: 2,
@@ -1046,13 +1219,6 @@ mod tests {
                     ..spec()
                 },
                 "spec.topology",
-            ),
-            (
-                proto::WorkerSpec {
-                    pairing: Some(proto::PairingDescriptor::default()),
-                    ..spec()
-                },
-                "spec.pairing",
             ),
             (
                 proto::WorkerSpec {
@@ -1090,6 +1256,98 @@ mod tests {
         for (stated, path) in cases {
             let Refused { path: found, why } =
                 facts(&stated, None).expect_err("the registration is refused");
+            assert_eq!(found, path, "{stated:?}");
+            assert!(!why.is_empty());
+        }
+        // Of a pairing descriptor the store holds the bootstrap port alone:
+        // every other field a caller states is refused by its own path.
+        let named = |name: &str| name.to_owned();
+        let descriptors: [(proto::PairingDescriptor, &str); 11] = [
+            (
+                proto::PairingDescriptor {
+                    protocol: named("protocol-a"),
+                    ..Default::default()
+                },
+                "spec.pairing.protocol",
+            ),
+            (
+                proto::PairingDescriptor {
+                    connector: named("connector-a"),
+                    ..Default::default()
+                },
+                "spec.pairing.connector",
+            ),
+            (
+                proto::PairingDescriptor {
+                    transport: named("transport-a"),
+                    ..Default::default()
+                },
+                "spec.pairing.transport",
+            ),
+            (
+                proto::PairingDescriptor {
+                    version: named("1"),
+                    ..Default::default()
+                },
+                "spec.pairing.version",
+            ),
+            (
+                proto::PairingDescriptor {
+                    kv_layout: [(named("layers"), named("32"))].into(),
+                    ..Default::default()
+                },
+                "spec.pairing.kv_layout",
+            ),
+            (
+                proto::PairingDescriptor {
+                    ec_producer: true,
+                    ..Default::default()
+                },
+                "spec.pairing.ec_producer",
+            ),
+            (
+                proto::PairingDescriptor {
+                    ec_consumer: true,
+                    ..Default::default()
+                },
+                "spec.pairing.ec_consumer",
+            ),
+            (
+                proto::PairingDescriptor {
+                    vision: true,
+                    ..Default::default()
+                },
+                "spec.pairing.vision",
+            ),
+            (
+                proto::PairingDescriptor {
+                    bootstrap_host: named("10.0.0.5"),
+                    ..Default::default()
+                },
+                "spec.pairing.bootstrap_host",
+            ),
+            (
+                proto::PairingDescriptor {
+                    pair_class: 7,
+                    ..Default::default()
+                },
+                "spec.pairing.pair_class",
+            ),
+            (
+                proto::PairingDescriptor {
+                    bootstrap_port: 65_536,
+                    ..Default::default()
+                },
+                "spec.pairing.bootstrap_port",
+            ),
+        ];
+        for (pairing, path) in descriptors {
+            let stated = proto::WorkerSpec {
+                pairing: Some(pairing),
+                ..spec()
+            };
+            let Refused { path: found, why } =
+                facts(&stated, None).expect_err("the descriptor is refused");
             assert_eq!(found, path, "{stated:?}");
             assert!(!why.is_empty());
         }
@@ -1203,7 +1461,7 @@ mod tests {
     #[test]
     fn a_field_at_its_bound_is_taken_and_one_over_is_refused_by_its_path() {
         type Stating = fn(usize) -> proto::WorkerSpec;
-        let cases: [(&str, usize, &str, Stating); 7] = [
+        let cases: [(&str, usize, &str, Stating); 8] = [
             (
                 "spec.url",
                 URL_BYTES,
@@ -1270,6 +1528,15 @@ mod tests {
                     }
                 },
             ),
+            (
+                "spec.models",
+                MODELS,
+                "a row names at most 128 model ids",
+                |count| proto::WorkerSpec {
+                    models: (0..count).map(|n| n.to_string()).collect(),
+                    ..spec()
+                },
+            ),
         ];
         for (path, bound, why, stating) in cases {
             assert!(facts(&stating(bound), None).is_ok(), "{path} at {bound}");
@@ -1280,6 +1547,44 @@ mod tests {
             );
             assert!(why.contains(&bound.to_string()), "{why}");
         }
+        // The models' count is read before the list is: past it a
+        // registration is refused by the count, whatever its ids hold.
+        let unread = proto::WorkerSpec {
+            models: vec![text(NAME_BYTES + 1); MODELS + 1],
+            ..spec()
+        };
+        assert_eq!(
+            facts(&unread, None).map(|_| ()),
+            Err(refused("spec.models", "a row names at most 128 model ids"))
+        );
+    }
+
+    #[test]
+    fn a_url_past_its_rules_is_refused_before_its_row_is_looked_up() {
+        let looked = std::cell::Cell::new(0);
+        let lookup = |_: &str| {
+            looked.set(looked.get() + 1);
+            None
+        };
+        let named = |url: String| proto::WorkerSpec { url, ..spec() };
+        let refusals = [
+            (String::new(), "a registration names its worker's URL"),
+            (text(URL_BYTES + 1), "a URL is at most 2048 bytes"),
+            (
+                "grpc://10.0.0.5 :8000".to_owned(),
+                "a URL holds no blank and no control character",
+            ),
+        ];
+        for (url, why) in refusals {
+            assert_eq!(
+                registration(&named(url), lookup).map(|_| ()),
+                Err(refused("spec.url", why))
+            );
+        }
+        assert_eq!(looked.get(), 0, "a refused URL is never looked up");
+        // A URL at its bound is looked up, once.
+        assert!(registration(&named(text(URL_BYTES)), lookup).is_ok());
+        assert_eq!(looked.get(), 1);
     }
 
     #[test]
@@ -1363,6 +1668,20 @@ mod tests {
             );
             assert!(why.contains(&bound.to_string()), "{why}");
         }
+        // The removals' count is read before the list is: past it a patch
+        // is refused by the count, whatever its list holds.
+        let both = proto::PatchWorkerRequest {
+            labels: [("0".to_owned(), String::new())].into(),
+            remove_labels: (0..=LABELS).map(|n| n.to_string()).collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            patch(&both, &bare).map(|_| ()),
+            Err(refused(
+                "remove_labels",
+                "a patch removes at most 128 labels"
+            ))
+        );
         // The count is of the row the patch would make: a label it removes
         // makes room for the one it sets.
         let mut crowded = bare.clone();
@@ -1390,6 +1709,23 @@ mod tests {
         assert_eq!(weight(&after), ROW_BYTES);
         assert_eq!(
             patch(&filling(501), &near).map(|_| ()),
+            Err(refused(
+                "labels",
+                "a row is at most 16384 bytes on the wire"
+            ))
+        );
+        // The policy label is told twice, as a label and under its own
+        // field: one of 246 bytes on a row with none adds 510.
+        let under = facts(&weighing(ROW_BYTES - 510), None).expect("a row under its bound");
+        let policy = |bytes| keyed(vec![("policy".to_owned(), text(bytes))]);
+        let made = patch(&policy(246), &under).expect("a row at its bound");
+        let mut after = under.clone();
+        after.labels = made
+            .and_then(|patch| patch.labels)
+            .expect("the labels moved");
+        assert_eq!(weight(&after), ROW_BYTES);
+        assert_eq!(
+            patch(&policy(247), &under).map(|_| ()),
             Err(refused(
                 "labels",
                 "a row is at most 16384 bytes on the wire"
@@ -1456,11 +1792,29 @@ mod tests {
             facts: facts(&spec(), None).expect("a bare row"),
             ..full()
         };
+        // A row that names a runtime and scrapes nothing tells no family.
+        let idle = WorkerRow {
+            facts: WorkerFacts {
+                signals: Signals {
+                    scrape_interval_ms: 0,
+                    ..full().facts.signals
+                },
+                ..full().facts
+            },
+            ..full()
+        };
         // The widest a row of these facts is told: the controller's numbers
         // at their most, under a status that sets a health bit, its overload
         // block stated in full. The sum is the wire's own length at each
         // side of a length's second byte, and with a field left empty.
-        for stored in [full(), bare, edge(127, 127), edge(128, 128), edge(300, 0)] {
+        for stored in [
+            full(),
+            bare,
+            idle,
+            edge(127, 127),
+            edge(128, 128),
+            edge(300, 0),
+        ] {
             let widest = WorkerRow {
                 id: WorkerId(u64::MAX),
                 status: WorkerStatus::Ready,

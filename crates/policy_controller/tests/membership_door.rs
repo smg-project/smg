@@ -318,9 +318,17 @@ async fn the_leader_takes_a_fleet_through_the_door_and_polls_the_engine_it_was_g
     // The engine, its checks off and waited for: ready at once, at the
     // revision its registration made (a status change moves none).
     let engine_url = format!("http://{engine}");
+    // It states its bootstrap port, and the answer's row tells it back.
+    let with_port = proto::WorkerSpec {
+        pairing: Some(proto::PairingDescriptor {
+            bootstrap_port: 8_998,
+            ..Default::default()
+        }),
+        ..unchecked(&engine_url)
+    };
     let waited = proto::RegisterWorkerRequest {
         wait_ready: true,
-        ..ask(unchecked(&engine_url), Mode::Add)
+        ..ask(with_port, Mode::Add)
     };
     let told = operator
         .register_worker(stated(waited))
@@ -331,6 +339,10 @@ async fn the_leader_takes_a_fleet_through_the_door_and_polls_the_engine_it_was_g
     assert_eq!(
         (ready.status, ready.revision, told.membership_epoch),
         (proto::WorkerStatus::Ready as i32, 1, 5)
+    );
+    assert_eq!(
+        ready.pairing.as_ref().map(|pairing| pairing.bootstrap_port),
+        Some(8_998)
     );
 
     // A second add is refused; an equal upsert writes nothing; a label is a

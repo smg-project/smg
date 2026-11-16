@@ -400,6 +400,19 @@ impl MemoryStore {
         &self.kv
     }
 
+    /// Sets a row's probe counters: no case reaches a counter's end by
+    /// probes.
+    #[cfg(test)]
+    pub(super) fn probed(&self, id: WorkerId, failures: u32, successes: u32, pending_total: u32) {
+        if let Some(row) = self.workers.lock().rows.get_mut(&id) {
+            row.probes = Probes {
+                failures,
+                successes,
+                pending_total,
+            };
+        }
+    }
+
     /// A worker's row is gone (removed, or replaced by a new incarnation):
     /// the store's tables that live exactly as long as the row leave with
     /// it, here and nowhere else: the health tables, the load rows and the
@@ -593,7 +606,7 @@ impl WorkersStore for MemoryStore {
                 .filter(|old| {
                     old.row.status != WorkerStatus::Draining
                         && old.row.facts.role == facts.role
-                        && old.row.facts.models == facts.models
+                        && old.row.facts.same_models(&facts)
                         && old.row.facts.wire_modes == facts.wire_modes
                 })
                 .map_or(WorkerStatus::Pending, |old| old.row.status);
@@ -781,13 +794,16 @@ fn next_status(row: &mut Row, ok: bool) -> Option<WorkerStatus> {
     let status = row.row.status;
     let failure = policy.failure_threshold.max(1);
     let success = policy.success_threshold.max(1);
-    let liveness = failure * 3;
-    let pending_cap = failure * 10;
+    // A threshold is any number its writer took: the products and the
+    // counters stop at their range's end, so a threshold whose product
+    // passes the range is never met before the counter's end.
+    let liveness = failure.saturating_mul(3);
+    let pending_cap = failure.saturating_mul(10);
     let probes = &mut row.probes;
     if ok {
         probes.failures = 0;
-        probes.successes += 1;
-        probes.pending_total += 1;
+        probes.successes = probes.successes.saturating_add(1);
+        probes.pending_total = probes.pending_total.saturating_add(1);
         if matches!(
             status,
             WorkerStatus::Pending | WorkerStatus::NotReady | WorkerStatus::Failed
@@ -804,8 +820,8 @@ fn next_status(row: &mut Row, ok: bool) -> Option<WorkerStatus> {
         return None;
     }
     probes.successes = 0;
-    probes.failures += 1;
-    probes.pending_total += 1;
+    probes.failures = probes.failures.saturating_add(1);
+    probes.pending_total = probes.pending_total.saturating_add(1);
     match status {
         WorkerStatus::Ready if probes.failures >= failure => {
             probes.failures = 0;
