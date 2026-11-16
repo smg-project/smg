@@ -221,7 +221,10 @@ fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
         Some((WorkerStatus::Pending, WorkerStatus::Ready)),
         "two passes promote a pending worker"
     );
-    let stale = revision() - 1;
+    // A patch moves the revision: an outcome read under the one it left is
+    // stale.
+    let stale = revision();
+    WorkersStore::patch(&store, id, WorkerPatch::default(), stale).expect("the patch");
     assert_eq!(
         health.probe_outcome(id, false, stale),
         None,
@@ -258,7 +261,31 @@ fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
     assert_eq!(
         health.connected(fresh, fresh_revision),
         None,
-        "the promotion moved the revision"
+        "a ready row takes no second promotion"
+    );
+}
+
+#[test]
+fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
+    let store = MemoryStore::new();
+    let health: &dyn HealthSink = &store;
+    let id = store.upsert(facts("http://p:8000", 1)).id();
+    let read = WorkersStore::get(&store, id).expect("the row").revision;
+    WorkersStore::patch(&store, id, WorkerPatch::default(), read).expect("the patch");
+    assert_eq!(
+        health.connected(id, read),
+        None,
+        "a stale signal is dropped"
+    );
+    assert_eq!(
+        WorkersStore::get(&store, id).expect("the row").status,
+        WorkerStatus::Pending,
+        "and the row stays as it stood"
+    );
+    assert_eq!(
+        health.connected(id, read + 1),
+        Some((WorkerStatus::Pending, WorkerStatus::Ready)),
+        "the signal read under the row's revision promotes"
     );
 }
 

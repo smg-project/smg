@@ -156,7 +156,9 @@ pub struct WorkerRow {
     pub id: WorkerId,
     pub facts: WorkerFacts,
     pub status: WorkerStatus,
-    /// Moves on every write to the row; the guard a racing write names.
+    /// Counts the row's stated facts: it moves on every write of them (a
+    /// registration's refresh, a patch) and on no status change. The guard
+    /// a racing write names.
     pub revision: u64,
     /// When the row was created on the host's clock.
     pub admitted_at: Instant,
@@ -243,7 +245,8 @@ pub enum MembershipTail {
 
 /// The membership store's write side and its watch.
 ///
-/// Every write moves the store's epoch and the row's revision. A watcher
+/// Every write moves the store's epoch; a write of a row's facts moves the
+/// row's revision, a status change does not. A watcher
 /// reads a snapshot with its epoch, then the changes since it; past the
 /// store's buffer it is told to snapshot again. The snapshot carries the
 /// facts the gateways' pools derive from (role, wire modes, engine kind,

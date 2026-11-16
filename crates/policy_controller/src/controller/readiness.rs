@@ -101,14 +101,22 @@ impl Readiness {
             if self.state() == wanted {
                 return Some(wanted);
             }
-            tokio::select! {
-                moved = self.phase.changed() => moved.ok()?,
-                stepped = self.steps.changed() => {
-                    if stepped.is_err() {
-                        // The election is gone: the run loop alone moves.
-                        self.phase.changed().await.ok()?;
-                    }
+            self.moved().await?;
+        }
+    }
+
+    /// Resolves at the next move of the run loop or step of the election,
+    /// when a follower of the state reads it again; `None` when the
+    /// controller is gone.
+    pub(crate) async fn moved(&mut self) -> Option<()> {
+        tokio::select! {
+            moved = self.phase.changed() => moved.ok(),
+            stepped = self.steps.changed() => {
+                if stepped.is_err() {
+                    // The election is gone: the run loop alone moves.
+                    self.phase.changed().await.ok()?;
                 }
+                Some(())
             }
         }
     }
