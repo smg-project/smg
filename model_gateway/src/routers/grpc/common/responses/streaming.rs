@@ -18,7 +18,7 @@ use openai_protocol::{
         ResponsesResponse, ResponsesUsage,
     },
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use smg_mcp::{self as mcp};
 use tokio::sync::oneshot;
@@ -1217,7 +1217,7 @@ impl ResponseStreamEventEmitter {
             .iter()
             .filter_map(|item| {
                 let data = item.item_data.as_ref()?;
-                match <ResponseOutputItem as serde::Deserialize>::deserialize(data) {
+                match ResponseOutputItem::deserialize(data) {
                     Ok(typed) => Some(typed),
                     Err(error) => {
                         // The terminal event carries the raw item; the stored object carries
