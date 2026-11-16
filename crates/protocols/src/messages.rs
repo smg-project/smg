@@ -1402,8 +1402,11 @@ pub enum ThinkingConfig {
         /// How thinking content is returned in the response.
         display: Option<ThinkingDisplay>,
         /// What happens when a thinking block the request sends back fails
-        /// the conversation check (beta), kept as written.
-        block_binding: Option<Value>,
+        /// the conversation check (beta), kept as written. Boxed, as the
+        /// request's `output_config` is: few requests send it, and inline
+        /// it grew the request every Messages call carries past the
+        /// 512-byte allocation the gateway shares it in.
+        block_binding: Option<Box<Value>>,
     },
     /// Disable extended thinking
     Disabled,
@@ -1413,8 +1416,9 @@ pub enum ThinkingConfig {
         /// Defaults vary by model (Opus 4.7 / Mythos default to `Omitted`; others to `Summarized`).
         display: Option<ThinkingDisplay>,
         /// What happens when a thinking block the request sends back fails
-        /// the conversation check (beta), kept as written.
-        block_binding: Option<Value>,
+        /// the conversation check (beta), kept as written (boxed as under
+        /// `enabled`).
+        block_binding: Option<Box<Value>>,
     },
     /// No thinking up front; the model may think between its tool calls.
     /// The public API takes `type` alone here: the `/v1/messages` request
