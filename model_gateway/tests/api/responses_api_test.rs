@@ -3683,6 +3683,12 @@ async fn a_streamed_call_that_waits_for_approval_does_not_run() {
         "one call announced and closed: {body}"
     );
     assert_eq!(closed_calls[0]["item"]["status"], "failed");
+    assert!(
+        closed_calls[0]["item"]["error"]
+            .to_string()
+            .contains("requires approval"),
+        "the call failed for its approval: {body}"
+    );
     assert_eq!(
         events.last().and_then(|event| event["type"].as_str()),
         Some("response.completed")
