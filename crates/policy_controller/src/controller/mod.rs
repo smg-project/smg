@@ -17,6 +17,9 @@
 //! Every replica runs the same loop, the load driver included: a follower
 //! that waited for a leader's log nobody writes yet would be cold at its
 //! promotion. The standby turns a follower's polls into that log.
+//!
+//! Every socket a listener accepts is set to send at once: a small answer
+//! never waits for the peer's acknowledgement of the write before it.
 
 pub mod admin;
 pub mod config;
@@ -29,8 +32,9 @@ pub mod tls;
 
 use std::{future::Future, io, net::SocketAddr, pin::pin, sync::Arc};
 
+use axum::serve::{ListenerExt as _, TapIo};
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::watch,
     task::{JoinError, JoinSet},
     time::timeout,
@@ -91,9 +95,23 @@ pub struct Controller {
     /// its field, the run loop's drivers read the same one.
     shared: Arc<Shared>,
     listeners: Vec<Bound>,
-    admin: TcpListener,
+    admin: AdminSockets,
     admin_addr: SocketAddr,
 }
+
+/// Sets an accepted socket to send at once. An answer is a few small writes
+/// in a row. A socket left with the kernel's default holds each write after
+/// the first until the peer acknowledges the one before, and a peer with
+/// nothing to send delays that acknowledgement by tens of milliseconds: a
+/// call answered in microseconds took about 40 ms on the wire.
+fn send_at_once(socket: &mut TcpStream) {
+    if let Err(error) = socket.set_nodelay(true) {
+        warn!(%error, "an accepted socket keeps the kernel's send delay");
+    }
+}
+
+/// The admin listener as it accepts: each socket set to send at once.
+type AdminSockets = TapIo<TcpListener, fn(&mut TcpStream)>;
 
 /// Why the serve left its wait.
 enum Leave {
@@ -105,12 +123,14 @@ enum Leave {
     Election,
 }
 
-/// A gRPC listener, bound, with its server configured (TLS parsed).
+/// A gRPC listener, bound, with its server configured (TLS parsed). Its
+/// accepted sockets are set to send at once by the transport's own
+/// [`TcpIncoming::with_nodelay`]; [`send_at_once`] says why.
 struct Bound {
     name: String,
     scopes: Vec<Scope>,
     addr: SocketAddr,
-    listener: TcpListener,
+    listener: TcpIncoming,
     server: Server,
     tls: bool,
     /// How the listener's calls come by a principal.
@@ -270,7 +290,7 @@ impl Controller {
                 name,
                 scopes: listener.scopes.clone(),
                 addr,
-                listener: socket,
+                listener: TcpIncoming::from(socket).with_nodelay(Some(true)),
                 server,
                 tls: listener.tls.is_some(),
                 layer: Layer::Off,
@@ -280,6 +300,7 @@ impl Controller {
             .await
             .map_err(Error::Admin)?;
         let admin_addr = admin.local_addr().map_err(Error::Admin)?;
+        let admin = admin.tap_io(send_at_once as fn(&mut TcpStream));
         info!(controller_id = %config.controller_id, addr = %admin_addr, "admin listener bound");
         // The holder identity names the gateway listener as bound: a client
         // dials the leader there, with no Service between them.
@@ -460,7 +481,7 @@ impl Controller {
             let routes = Service::new(bound.scopes, Arc::clone(&shared)).routes(bound.layer);
             let mut stop = stop.subscribe();
             let name = bound.name;
-            let incoming = TcpIncoming::from(bound.listener);
+            let incoming = bound.listener;
             let mut server = bound.server;
             tasks.spawn(async move {
                 server
@@ -627,7 +648,13 @@ mod tests {
 
     use std::{future::pending, thread, time::Duration};
 
-    use tokio::{sync::oneshot, time::timeout};
+    use axum::serve::Listener as _;
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::oneshot,
+        time::timeout,
+    };
+    use tonic::codegen::tokio_stream::StreamExt as _;
 
     use super::{config::tests::valid, Controller, Error};
     use crate::elector::{
@@ -659,6 +686,46 @@ mod tests {
         fn place(&self) -> String {
             self.lease.place()
         }
+    }
+
+    /// Every socket the controller accepts sends at once, read from the
+    /// socket itself: one accepted by each gRPC listener as bound, and one
+    /// by the admin listener. A socket accepted with no option set does not.
+    #[tokio::test]
+    async fn every_accepted_socket_sends_at_once() {
+        let plain = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let addr = plain.local_addr().expect("its address");
+        let dialed = TcpStream::connect(addr).await.expect("a connection");
+        let (socket, _) = plain.accept().await.expect("accepted");
+        assert!(
+            !socket.nodelay().expect("the option reads"),
+            "the kernel's default holds small writes"
+        );
+        drop(dialed);
+
+        let mut controller = Controller::bind(valid()).await.expect("the listeners bind");
+        assert!(!controller.listeners.is_empty());
+        for bound in &mut controller.listeners {
+            let dialed = TcpStream::connect(bound.addr).await.expect("a connection");
+            let socket = bound
+                .listener
+                .next()
+                .await
+                .expect("a socket")
+                .expect("accepted");
+            assert!(
+                socket.nodelay().expect("the option reads"),
+                "{}",
+                bound.name
+            );
+            drop(dialed);
+        }
+        let dialed = TcpStream::connect(controller.admin_addr)
+            .await
+            .expect("a connection");
+        let (socket, _) = controller.admin.accept().await;
+        assert!(socket.nodelay().expect("the option reads"), "admin");
+        drop(dialed);
     }
 
     /// The thread gone at its take, before the serve read ready, and at its
