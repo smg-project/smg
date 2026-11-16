@@ -61,7 +61,8 @@ pub struct LoadDriverConfig {
     /// How often an engine is polled while its stream is not serving it;
     /// also the freshness bound of the arbitration (a rank whose newest
     /// record is older than this is polled). The gateway's
-    /// `--load-monitor-interval`, 10 s.
+    /// `--load-monitor-interval`, 10 s. An interval the clock cannot add to
+    /// the present polls an engine once.
     pub poll_interval: Duration,
     /// The bound on one poll, dial included: how long an engine's one call
     /// stays out before the engine can be asked again. A poll past it is a
@@ -275,10 +276,13 @@ struct Schedule {
 /// When an engine's next poll and scrape are due, and whether its call is
 /// out.
 struct Due {
-    poll: tokio::time::Instant,
+    /// `None` after a poll whose interval the clock cannot add to the
+    /// present: the engine is not polled again.
+    poll: Option<tokio::time::Instant>,
     scrape: tokio::time::Instant,
-    /// When a suppressed poll counts next (see [`Stats::suppressed`]).
-    suppressed: tokio::time::Instant,
+    /// When a suppressed poll counts next (see [`Stats::suppressed`]);
+    /// `None` as for `poll`: it counted once.
+    suppressed: Option<tokio::time::Instant>,
     /// The engine's one call (its poll, or its scrape when it has no
     /// servicer) is out until this instant, the call's deadline: set when
     /// the call goes, cleared when its answer lands. The engine is not asked
@@ -290,9 +294,9 @@ impl Due {
     /// An engine's first tick: everything due at `at`, nothing out.
     fn at(at: tokio::time::Instant) -> Self {
         Self {
-            poll: at,
+            poll: Some(at),
             scrape: at,
-            suppressed: at,
+            suppressed: Some(at),
             out: None,
         }
     }
@@ -458,11 +462,11 @@ where
                 // ranks are all served by their stream is asked again at the
                 // next tick, so a rank whose records stop is polled within
                 // one tick of the freshness bound, not one interval later.
-                if tick_at >= slot.poll && !slot.is_out(tick_at) {
+                if slot.poll.is_some_and(|due| tick_at >= due) && !slot.is_out(tick_at) {
                     if let Some(ranks) = self.ranks_to_poll(engine) {
                         let served = ranks.len() < engine.ranks.len();
                         let mark = tick_at + self.config.poll_deadline;
-                        slot.poll = tick_at + self.config.poll_interval;
+                        slot.poll = tick_at.checked_add(self.config.poll_interval);
                         slot.suppressed = slot.poll;
                         slot.out = Some(mark);
                         let probe = Arc::clone(&self.probe);
@@ -484,10 +488,10 @@ where
                                 },
                             }
                         });
-                    } else if tick_at >= slot.suppressed {
+                    } else if slot.suppressed.is_some_and(|due| tick_at >= due) {
                         // Asked at every tick, counted once an interval: the
                         // scale of the polls that go.
-                        slot.suppressed = tick_at + self.config.poll_interval;
+                        slot.suppressed = tick_at.checked_add(self.config.poll_interval);
                         self.stats.suppressed.fetch_add(1, Ordering::Relaxed);
                     }
                 }
