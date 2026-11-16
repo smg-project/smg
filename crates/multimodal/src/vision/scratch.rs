@@ -12,11 +12,10 @@
 //! internals run on blocking-pool threads). A take gets the smallest kept
 //! buffer that holds it and never grows one. The pool is capped to bound
 //! residency, and a full pool keeps its largest buffers. A thread keeps
-//! buffers only
-//! once it has taken from the pool: a tensor's consuming write may run on a
-//! thread that never preprocesses (a runtime worker), and a pool there would
-//! hold the storage for the life of the thread without ever handing it out,
-//! so a give on such a thread is a plain drop.
+//! buffers only once it has taken from the pool: a tensor's consuming write
+//! may run on a thread that never preprocesses (a runtime worker), and a pool
+//! there would hold the storage for the life of the thread without ever
+//! handing it out, so a give on such a thread is a plain drop.
 
 use std::cell::RefCell;
 
