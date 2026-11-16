@@ -547,12 +547,9 @@ impl RequestPipeline {
             stages.preparation.name(),
             stages.preparation.execute(ctx).await
         )?;
+        step!("RateLimitReserve", stages.rate_limit.execute(ctx).await)?;
         step!(
-            stages.rate_limit.name(),
-            stages.rate_limit.execute(ctx).await
-        )?;
-        step!(
-            stages.worker_selection.name(),
+            "WorkerSelection",
             stages.worker_selection.execute(ctx).await
         )?;
         let workers = stage_output(ctx.state.workers.as_ref(), "run_ingress")?;
