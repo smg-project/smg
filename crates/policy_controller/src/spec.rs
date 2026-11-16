@@ -2824,7 +2824,10 @@ impl PolicySpec {
     }
 
     /// The document's digest ([`Digest`]): a change of the file's form or of
-    /// the `generation` line leaves it as it was, any other change moves it.
+    /// the `generation` line leaves it as it was, and any other change to a
+    /// document the validator admits moves it. A `kind` line is in no
+    /// canonical form and so in no digest: the validator refuses it, and
+    /// equal digests say nothing of a document that was not validated.
     pub fn digest(&self) -> Result<Digest, SpecError> {
         let lineless = Self {
             generation: 0,
@@ -2921,6 +2924,21 @@ impl AppliedSpec {
         Ok(Self {
             engine,
             digest: Some(document.digest()?),
+        })
+    }
+
+    /// [`AppliedSpec::validate`] under a digest its caller took already: the
+    /// controller's door reads the document's digest against the standing
+    /// one and hands it on, so an apply digests its document once.
+    #[cfg(feature = "controller")]
+    pub(crate) fn validate_digested(
+        document: &PolicySpec,
+        digest: Digest,
+    ) -> Result<Self, SpecError> {
+        let engine = document.validate()?;
+        Ok(Self {
+            engine,
+            digest: Some(digest),
         })
     }
 
@@ -4635,6 +4653,18 @@ mod tests {
             .push("not-tried".to_owned());
         assert_ne!(moved.digest(), Ok(digest), "a filter more is in it");
 
+        // The one line a document can write that no canonical form carries:
+        // the validator refuses it, and the digest does not read it.
+        let kinded: PolicySpec = serde_yaml::from_str(
+            "kind: PolicySpec\napiVersion: smg.policy/v1\nprofiles:\n  p:\n    filter: [healthy]\n    score: [least-load]\n    pick: best\n",
+        )
+        .expect("a kind line parses");
+        assert_eq!(kinded.digest(), Ok(digest), "a kind line is not in it");
+        assert_eq!(
+            kinded.validate().err(),
+            Some(SpecError::Kind("PolicySpec".into()))
+        );
+
         let canonical = serde_json::to_string(&PolicySpec {
             generation: 0,
             ..numbered
@@ -4651,6 +4681,99 @@ mod tests {
         assert_eq!(digest.to_string(), format!("sha256:{hex}"));
     }
 
+    /// The digest's "any", over the type's fields: a change to each field
+    /// the schema names moves the digest, the `generation` line alone
+    /// excepted. The names are the schema's, so a field added to the type
+    /// joins the case, and fails it until a change to it is shown here.
+    #[test]
+    fn a_digest_moves_with_every_field_the_schema_names_but_the_line() {
+        let base = PolicySpec::preset("least_load").expect("a preset");
+        let digest = base.digest().expect("a digest");
+
+        let mut bindings = base.bindings.clone();
+        bindings.push(BindingSpec::default());
+        let mut index = base.index.clone();
+        index.insert("another*".to_owned(), IndexSpec::default());
+        let mut profiles = base.profiles.clone();
+        let profile = profiles.values().next().expect("a profile").clone();
+        profiles.insert("another".to_owned(), profile);
+        let plans = PlansSpec {
+            pd_pair: PdPairPlanSpec {
+                pairing: Pairing::Off,
+            },
+        };
+        let view = ViewSpec {
+            headers: vec!["x-team".to_owned()],
+            ..base.view.clone()
+        };
+        let changed = [
+            (
+                "apiVersion",
+                PolicySpec {
+                    api_version: "smg.policy/v2".to_owned(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "bindings",
+                PolicySpec {
+                    bindings,
+                    ..base.clone()
+                },
+            ),
+            (
+                "generation",
+                PolicySpec {
+                    generation: base.generation + 9,
+                    ..base.clone()
+                },
+            ),
+            (
+                "index",
+                PolicySpec {
+                    index,
+                    ..base.clone()
+                },
+            ),
+            (
+                "plans",
+                PolicySpec {
+                    plans,
+                    ..base.clone()
+                },
+            ),
+            (
+                "profiles",
+                PolicySpec {
+                    profiles,
+                    ..base.clone()
+                },
+            ),
+            (
+                "view",
+                PolicySpec {
+                    view,
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        let schema = serde_json::to_value(PolicySpec::schema()).expect("the schema is JSON");
+        let named: BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .expect("the type's fields")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let shown: BTreeSet<&str> = changed.iter().map(|(field, _)| *field).collect();
+        assert_eq!(named, shown, "one change a field the schema names");
+        for (field, document) in &changed {
+            assert_ne!(document, &base, "{field} is changed");
+            let moved = document.digest().expect("a digest") != digest;
+            assert_eq!(moved, *field != "generation", "{field}");
+        }
+    }
+
     /// A validated generation carries its document's digest; the unbound
     /// start has no document and no digest.
     #[test]
@@ -4659,5 +4782,21 @@ mod tests {
         let applied = AppliedSpec::validate(&document).expect("a preset validates");
         assert_eq!(applied.digest(), Some(document.digest().expect("a digest")));
         assert_eq!(AppliedSpec::unbound().digest(), None);
+    }
+
+    /// A digest handed on is the generation's, as given: the door's apply
+    /// digests its document once.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_digest_handed_on_is_carried_as_given() {
+        let document = PolicySpec::preset("least_load").expect("a preset");
+        let handed = PolicySpec::preset("random")
+            .expect("a preset")
+            .digest()
+            .expect("a digest");
+        assert_ne!(document.digest(), Ok(handed));
+        let applied =
+            AppliedSpec::validate_digested(&document, handed).expect("a preset validates");
+        assert_eq!(applied.digest(), Some(handed));
     }
 }

@@ -298,6 +298,17 @@ impl Service {
         )))
     }
 
+    /// The answer to a spec call on a controller that was given no spec
+    /// source, behind the listener's admission: this build serves the call,
+    /// and this controller's start named no source for it.
+    fn sourceless<T, R>(&self, call: Call, request: &Request<T>) -> Result<R, Status> {
+        self.admit(call, request)?;
+        Err(Status::unimplemented(format!(
+            "{} is not served by a controller started with no spec file",
+            call.name()
+        )))
+    }
+
     /// The `Leader` call's answer at `now`: [`Shared::leader`] at one read
     /// of the fence.
     fn leader_info(&self, now: Instant) -> proto::LeaderInfo {
@@ -421,7 +432,7 @@ impl PolicyController for Service {
     ) -> Result<Response<proto::PolicySpecDocument>, Status> {
         let generations = &self.shared.generations;
         if !generations.bound() {
-            return self.unserved(Call::GetPolicySpec, &request);
+            return self.sourceless(Call::GetPolicySpec, &request);
         }
         self.admit(Call::GetPolicySpec, &request)?;
         generations
@@ -752,7 +763,7 @@ mod tests {
         assert_eq!(unserved.code(), Code::Unimplemented);
         assert_eq!(
             unserved.message(),
-            "GetPolicySpec is not served by this build"
+            "GetPolicySpec is not served by a controller started with no spec file"
         );
         // A caller no layer placed is refused before the call is named
         // unserved: no call body is reached without a principal.
@@ -875,6 +886,11 @@ mod tests {
                         Code::FailedPrecondition,
                         "no session stands on this stream: Hello is the first frame, a frame of no kind came first"
                             .to_owned(),
+                    )
+                } else if layer == Layer::AsTold && stated && *method == "GetPolicySpec" {
+                    (
+                        Code::Unimplemented,
+                        format!("{method} is not served by a controller started with no spec file"),
                     )
                 } else if layer == Layer::AsTold && stated {
                     (

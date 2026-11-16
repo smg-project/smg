@@ -6,9 +6,10 @@
 //! source's first ([`Generations`]). A file is read whole or not at all: its
 //! identity (where the path leads, its size and times, on Unix its inode)
 //! is looked at before and after the read, and a file that moved under the
-//! read is read again. A file that cannot be read, a file over the bound
-//! (refused by its size, unread) and a document that does not run each
-//! refuse the start.
+//! read is read again, whether the read gave bytes or an error: a mount's
+//! rotation takes a version's directory from under an open. A file that
+//! stood still and cannot be read, a file over the bound (refused by its
+//! size, unread) and a document that does not run each refuse the start.
 //!
 //! The file is not read again after the start.
 
@@ -89,9 +90,9 @@ fn read(identity: &Identity) -> Result<Vec<u8>, SpecRejected> {
     let unreadable = |error: io::Error| SpecRejected::Unreadable(error.to_string());
     let file = fs::File::open(&identity.resolved).map_err(unreadable)?;
     let mut bytes = Vec::with_capacity(usize::try_from(identity.len).unwrap_or(0));
-    // One byte past the bound tells a file that grew since the look: the
-    // apply refuses it by its size.
-    file.take(MAX_DOCUMENT_BYTES + 1)
+    // Never more than the bound: a file that grew since the look is another
+    // file at the look after the read, and these bytes are not applied.
+    file.take(MAX_DOCUMENT_BYTES)
         .read_to_end(&mut bytes)
         .map_err(unreadable)?;
     Ok(bytes)
@@ -112,16 +113,18 @@ fn start_looking(
     mut look: impl FnMut(&Path) -> Seen,
 ) -> Result<Applied, SpecRejected> {
     let format = Format::of(path);
-    // A file that moves under its read is read again; one that never rests
-    // is no document.
+    // The look after the read has the word. A file that moved under its
+    // read is read again, the read's bytes or its error dropped; one that
+    // stood still gives its bytes or its own error. One that never rests is
+    // no document.
     for _ in 0..START_READS {
         let found = look(path);
         let document = match &found {
-            Seen::File(identity) => read(identity)?,
-            Seen::Unreadable(error) => return Err(SpecRejected::Unreadable(error.clone())),
+            Seen::File(identity) => read(identity),
+            Seen::Unreadable(error) => Err(SpecRejected::Unreadable(error.clone())),
         };
         if look(path) == found {
-            return generations.apply(document, format);
+            return generations.apply(document?, format);
         }
     }
     Err(SpecRejected::Unreadable(format!(
@@ -137,7 +140,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        controller::generations::tests::{with_line, LEAST_LOAD, RANDOM},
+        controller::generations::tests::{padded, with_line, LEAST_LOAD, RANDOM},
         spec::SpecError,
         store::MemoryStore,
     };
@@ -160,7 +163,8 @@ mod tests {
 
     /// The start reads the file as it stands: a document with no line is
     /// generation 1 and a written line is the number, in the form the
-    /// file's name says, through every link on the path.
+    /// file's name says, through every link on the path. A file of exactly
+    /// the bound starts: the bound is the largest document.
     #[test]
     fn a_start_applies_the_file_as_it_stands() {
         let (_dir, path, generations) = bed(LEAST_LOAD.as_bytes());
@@ -179,6 +183,11 @@ mod tests {
             answered(&generations),
             (4, "json".to_owned(), json.to_vec())
         );
+
+        let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
+        let (_dir, path, generations) = bed(&padded(RANDOM, bound));
+        assert_eq!(start(&path, &generations), Ok(Applied::Generation(1)));
+        assert_eq!(answered(&generations).2.len(), bound);
     }
 
     /// A mounted ConfigMap's file is a link through `..data` into a
@@ -219,7 +228,7 @@ mod tests {
         ));
 
         // Five bytes over: the refusal names the file's size, which no read
-        // gave it (a read stops one byte past the bound).
+        // gave it (a read stops at the bound).
         let over = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits") + 5;
         fs::write(&path, vec![b'#'; over]).expect("the file");
         assert_eq!(
@@ -238,6 +247,79 @@ mod tests {
         );
         assert!(!generations.bound());
         assert_eq!(generations.generation(), 0);
+    }
+
+    /// The identity reads the file's change time: an edit in place that
+    /// keeps the file's size and puts its modified time back is a new
+    /// identity. The change time has the file system's grain, so the edit
+    /// is made again until it shows, a bounded number of times.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_that_keeps_the_size_and_the_modified_time_is_a_new_identity() {
+        use std::{io::Write as _, thread, time::Duration};
+
+        let (_dir, path, _generations) = bed(LEAST_LOAD.as_bytes());
+        let before = identity(&path).expect("the file");
+        let modified = before.modified.expect("a modified time");
+        let edited = LEAST_LOAD.replace("best", "tseb");
+        let mut after = before.clone();
+        for _ in 0..2_000 {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("the file");
+            file.write_all(edited.as_bytes()).expect("the edit");
+            file.set_modified(modified)
+                .expect("the modified time put back");
+            drop(file);
+            after = identity(&path).expect("the file");
+            if after != before {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_ne!(after, before, "the edit never showed");
+        assert_eq!(
+            (after.len, after.modified, after.inode.number),
+            (before.len, before.modified, before.inode.number),
+            "the change time alone moved"
+        );
+        assert_ne!(after.inode.changed, before.inode.changed);
+    }
+
+    /// A read stops at the bound, whatever the file grew to since its look:
+    /// the bytes of a file that grew are never the whole of a longer file.
+    #[test]
+    fn a_read_stops_at_the_bound() {
+        let (_dir, path, _generations) = bed(LEAST_LOAD.as_bytes());
+        let looked = identity(&path).expect("the file");
+        let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
+        fs::write(&path, vec![b'#'; bound + 5]).expect("the file grows");
+        assert_eq!(read(&looked).map(|bytes| bytes.len()), Ok(bound));
+    }
+
+    /// The identity reads where the path leads: a link turned to another
+    /// name of the same file (one inode, one size, the same times) is a new
+    /// identity.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_turned_to_another_name_of_the_file_is_a_new_identity() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, path, _generations) = bed(LEAST_LOAD.as_bytes());
+        let (other, link) = (dir.path().join("other.yaml"), dir.path().join("link.yaml"));
+        fs::hard_link(&path, &other).expect("another name of the file");
+        symlink(&path, &link).expect("the link");
+        let before = identity(&link).expect("the file");
+        fs::remove_file(&link).expect("the link goes");
+        symlink(&other, &link).expect("the link, turned");
+        let after = identity(&link).expect("the file");
+        assert_ne!(after, before);
+        assert_eq!(
+            (after.len, after.modified, after.inode),
+            (before.len, before.modified, before.inode),
+            "where the path leads alone moved"
+        );
     }
 
     /// A file is read whole or not at all: one that moved under its read is
@@ -271,6 +353,74 @@ mod tests {
         });
         let refused = SpecRejected::Unreadable("the file moved under each of 3 reads".to_owned());
         assert_eq!(restless, Err(refused));
+        assert!(!generations.bound());
+    }
+
+    /// What a look made before a mount's rotation saw: the file, in a
+    /// version's directory the rotation has removed since.
+    fn before_the_rotation(dir: &Path, path: &Path) -> Seen {
+        match look(path) {
+            Seen::File(identity) => Seen::File(Identity {
+                resolved: dir.join("..version_1/policy.yaml"),
+                ..identity
+            }),
+            unreadable @ Seen::Unreadable(_) => unreadable,
+        }
+    }
+
+    /// A rotation takes the version a look resolved from under the open:
+    /// the read fails and the file moved, so it is read again where the
+    /// path leads next. The same for a look that could not read the path
+    /// between two versions.
+    #[test]
+    fn a_file_gone_at_its_read_is_read_where_the_path_leads_next() {
+        let (dir, path, generations) = bed(LEAST_LOAD.as_bytes());
+        let mut looks = 0;
+        let started = start_looking(&path, &generations, |path| {
+            looks += 1;
+            if looks == 1 {
+                before_the_rotation(dir.path(), path)
+            } else {
+                look(path)
+            }
+        });
+        assert_eq!(started, Ok(Applied::Generation(1)));
+        assert_eq!(looks, 4, "the read that failed and the one that stood");
+        assert_eq!(answered(&generations).2, LEAST_LOAD.as_bytes());
+
+        let (_dir, path, generations) = bed(RANDOM.as_bytes());
+        let mut looks = 0;
+        let started = start_looking(&path, &generations, |path| {
+            looks += 1;
+            if looks == 1 {
+                Seen::Unreadable("between two versions".to_owned())
+            } else {
+                look(path)
+            }
+        });
+        assert_eq!(started, Ok(Applied::Generation(1)));
+        assert_eq!(looks, 4, "the look that failed, and a read between two");
+        assert_eq!(answered(&generations).2, RANDOM.as_bytes());
+    }
+
+    /// An error is the file's own where the file stood still: one read
+    /// between two looks that agree, and the start is refused by the
+    /// error's text, not as a file that moved.
+    #[test]
+    fn an_error_of_a_file_that_stood_still_refuses_the_start() {
+        let (dir, path, generations) = bed(LEAST_LOAD.as_bytes());
+        let mut looks = 0;
+        let refused = start_looking(&path, &generations, |path| {
+            looks += 1;
+            before_the_rotation(dir.path(), path)
+        });
+        match refused {
+            Err(SpecRejected::Unreadable(error)) => {
+                assert!(error.contains("No such file"), "{error}");
+            }
+            other => panic!("started as {other:?}"),
+        }
+        assert_eq!(looks, 2, "one read between two looks");
         assert!(!generations.bound());
     }
 }

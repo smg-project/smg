@@ -12,7 +12,9 @@
 //! digest is the standing one's, under no line or under the standing line,
 //! is no change: nothing is applied. A changed document under the standing
 //! line is refused by name, so on one replica a number never names two
-//! documents.
+//! documents. The validator's word comes before either: a document it
+//! refuses is refused whatever its digest, which reads no line the
+//! canonical form leaves out.
 //!
 //! The number and the digest have one holder, the store's
 //! ([`World::spec`](crate::store::World::spec)). What lives here is the
@@ -29,6 +31,7 @@
 //! and a reader of another build does not recompute it to compare.
 
 use std::{
+    cell::Cell,
     fmt,
     path::Path,
     sync::Arc,
@@ -36,6 +39,9 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use serde::de::{
+    self, DeserializeSeed, Deserializer, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor,
+};
 use tracing::info;
 
 use crate::{
@@ -47,6 +53,12 @@ use crate::{
 /// The largest document a source hands over, in bytes: a ConfigMap holds no
 /// more, and `GetPolicySpec`'s answer stays inside one frame.
 pub(crate) const MAX_DOCUMENT_BYTES: u64 = 1 << 20;
+
+/// How many values a YAML document may read as for each of its bytes. A
+/// document that writes its values out reads as one a byte at its densest
+/// (`{a,b}` is five values in five bytes); what an alias multiplies has no
+/// bound in the bytes.
+const VALUES_A_BYTE: usize = 2;
 
 /// A document's form.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,11 +88,135 @@ impl Format {
         }
     }
 
+    /// The document these bytes read as. A YAML document is counted before
+    /// anything is built from it ([`within_its_bytes`]).
     fn parse(self, document: &[u8]) -> Result<PolicySpec, String> {
         match self {
-            Self::Yaml => serde_yaml::from_slice(document).map_err(|error| error.to_string()),
+            Self::Yaml => {
+                within_its_bytes(document)?;
+                serde_yaml::from_slice(document).map_err(|error| error.to_string())
+            }
             Self::Json => serde_json::from_slice(document).map_err(|error| error.to_string()),
         }
+    }
+}
+
+/// Reads a YAML document through as values, counted and never held, and
+/// refuses one that reads as more than [`VALUES_A_BYTE`] for each of its
+/// bytes.
+///
+/// A document's bytes do not bound what it builds: an alias reads as its
+/// anchor's value at each use, so one list of a thousand values under a
+/// thousand aliases is a million. The count ends at the bound, so a
+/// refusal costs no more than the document's own bytes allow, and what the
+/// parse then builds is under the same bound.
+fn within_its_bytes(document: &[u8]) -> Result<(), String> {
+    let bound = document.len().saturating_mul(VALUES_A_BYTE);
+    // The document itself is a value, an empty one too.
+    let left = Cell::new(bound.saturating_add(1));
+    Values(&left)
+        .deserialize(serde_yaml::Deserializer::from_slice(document))
+        .map_err(|error| error.to_string())
+}
+
+/// The values under one node of a document, counted against what the bound
+/// has left.
+struct Values<'a>(&'a Cell<usize>);
+
+impl Values<'_> {
+    /// One value more.
+    fn one<E: de::Error>(&self) -> Result<(), E> {
+        let Some(left) = self.0.get().checked_sub(1) else {
+            return Err(E::custom(format_args!(
+                "the document reads as more than {VALUES_A_BYTE} values a byte: an alias reads as its anchor's value at each use"
+            )));
+        };
+        self.0.set(left);
+        Ok(())
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for Values<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Values<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a value")
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<(), E> {
+        self.one()
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<(), E> {
+        self.one()
+    }
+
+    fn visit_i128<E: de::Error>(self, _: i128) -> Result<(), E> {
+        self.one()
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<(), E> {
+        self.one()
+    }
+
+    fn visit_u128<E: de::Error>(self, _: u128) -> Result<(), E> {
+        self.one()
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<(), E> {
+        self.one()
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<(), E> {
+        self.one()
+    }
+
+    fn visit_bytes<E: de::Error>(self, _: &[u8]) -> Result<(), E> {
+        self.one()
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<(), E> {
+        self.one()
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+        self.one()
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_newtype_struct<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        self.one()?;
+        while seq.next_element_seed(Values(self.0))?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        self.one()?;
+        while map.next_key_seed(Values(self.0))?.is_some() {
+            map.next_value_seed(Values(self.0))?;
+        }
+        Ok(())
+    }
+
+    /// A tagged value: the tag, then what it tags.
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<(), A::Error> {
+        let ((), tagged) = data.variant_seed(Values(self.0))?;
+        tagged.newtype_variant_seed(Values(self.0))
     }
 }
 
@@ -104,8 +240,9 @@ pub enum SpecRejected {
     /// It is over the bound a source hands over.
     #[error("the document is {0} bytes; at most {MAX_DOCUMENT_BYTES}")]
     TooLarge(u64),
-    /// It is not a document of its format, or it writes a field the schema
-    /// does not know.
+    /// It is not a document of its format, it writes a field the schema
+    /// does not know, or its aliases read as more values than its bytes
+    /// bound.
     #[error("not a policy spec in {format}: {message}")]
     Unparsed {
         /// `yaml` or `json`.
@@ -209,6 +346,15 @@ impl Generations {
             let world = self.store.world();
             (world.spec().generation(), world.spec().digest())
         };
+        let line = spec.generation;
+        if line == 0 {
+            // The mint. At the last number the entry refuses it by name.
+            spec.generation = standing.saturating_add(1);
+        }
+        // The validator's word comes first: the digest reads no line the
+        // canonical form leaves out, so equal digests admit nothing. The
+        // digest is taken once, above, and handed on.
+        let applied = AppliedSpec::validate_digested(&spec, digest)?;
         let hold = |generation| Held {
             generation,
             digest,
@@ -216,7 +362,6 @@ impl Generations {
             format,
             applied: SystemTime::now(),
         };
-        let line = spec.generation;
         if line == 0 || line == standing {
             if standing_digest == Some(digest) {
                 // The standing generation's document again, or in another
@@ -235,11 +380,6 @@ impl Generations {
                 });
             }
         }
-        if line == 0 {
-            // The mint. At the last number the entry refuses it by name.
-            spec.generation = standing.saturating_add(1);
-        }
-        let applied = AppliedSpec::validate(&spec)?;
         let generation = applied.generation();
         self.store.apply(applied)?;
         *held = Some(hold(generation));
@@ -329,6 +469,17 @@ pub(crate) mod tests {
     /// `document` under a written line.
     pub(crate) fn with_line(document: &str, line: u64) -> Vec<u8> {
         format!("generation: {line}\n{document}").into_bytes()
+    }
+
+    /// `document` grown to exactly `len` bytes by one comment line at its
+    /// end.
+    pub(crate) fn padded(document: &str, len: usize) -> Vec<u8> {
+        let mut bytes = document.as_bytes().to_vec();
+        assert!(len > bytes.len() + 1, "no room for a comment line");
+        bytes.push(b'#');
+        bytes.resize(len - 1, b'x');
+        bytes.push(b'\n');
+        bytes
     }
 
     /// The number and the digest the store runs.
@@ -482,6 +633,102 @@ pub(crate) mod tests {
         assert!(generations.bound());
         let answer = generations.document(0).expect("the standing document");
         assert_eq!((answer.generation, answer.document), (5, LEAST_LOAD.into()));
+
+        // The same over older held bytes: a second writer of the store runs
+        // another document, and the source that then hands that document
+        // over holds its bytes in place of the older generation's.
+        let mut next: PolicySpec = serde_yaml::from_str(RANDOM).expect("a document");
+        next.generation = 6;
+        store
+            .apply(AppliedSpec::validate(&next).expect("a valid document"))
+            .expect("above the standing one");
+        assert_eq!(yaml(&generations, RANDOM), Ok(Applied::Unchanged(6)));
+        let answer = generations.document(0).expect("the standing document");
+        assert_eq!((answer.generation, answer.document), (6, RANDOM.into()));
+    }
+
+    /// At the last number there is no next one: the mint stays there and
+    /// the entry refuses it by name, as it refuses a line below the
+    /// standing one. A refusal of the entry leaves the held bytes.
+    #[test]
+    fn a_mint_at_the_last_number_is_refused_by_name_and_the_held_bytes_stay() {
+        let (store, generations) = generations();
+        let last = with_line(LEAST_LOAD, u64::MAX);
+        assert_eq!(
+            yaml(&generations, last.clone()),
+            Ok(Applied::Generation(u64::MAX))
+        );
+        for (document, offered) in [
+            (RANDOM.as_bytes().to_vec(), u64::MAX),
+            (with_line(RANDOM, 3), 3),
+        ] {
+            let stale = StaleGeneration {
+                standing: u64::MAX,
+                offered,
+            };
+            assert_eq!(
+                yaml(&generations, document),
+                Err(SpecRejected::Stale(stale))
+            );
+        }
+        assert_eq!(standing(&store).0, u64::MAX);
+        let answer = generations.document(0).expect("the standing document");
+        assert_eq!(answer.document, last);
+    }
+
+    /// The held document is answered only while its generation stands:
+    /// once another writer's generation runs it is not answered under its
+    /// own number either, and the refusal names the three numbers.
+    #[test]
+    fn a_held_document_is_answered_only_while_its_generation_stands() {
+        let (store, generations) = generations();
+        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+        let mut next: PolicySpec = serde_yaml::from_str(RANDOM).expect("a document");
+        next.generation = 2;
+        store
+            .apply(AppliedSpec::validate(&next).expect("a valid document"))
+            .expect("above the standing one");
+        for (wanted, asked) in [(0, 2), (1, 1), (2, 2)] {
+            let not_held = generations.document(wanted).expect_err("no document");
+            let expected = NotHeld {
+                asked,
+                held: Some(1),
+                standing: 2,
+            };
+            assert_eq!(not_held, expected, "asked for {wanted}");
+        }
+    }
+
+    /// The validator's word comes before the digest's. A `kind` line is in
+    /// no digest and the validator refuses it: the standing document with
+    /// one added is refused by name, under no line and under the standing
+    /// one, and where no bytes are held yet these are not kept.
+    #[test]
+    fn a_document_the_validator_refuses_is_refused_though_its_digest_stands() {
+        let kind = || SpecRejected::Invalid(SpecError::Kind("PolicySpec".to_owned()));
+        let with_kind = format!("kind: PolicySpec\n{LEAST_LOAD}");
+
+        {
+            let (store, generations) = generations();
+            assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+            let running = standing(&store);
+            assert_eq!(yaml(&generations, with_kind.as_str()), Err(kind()));
+            assert_eq!(yaml(&generations, with_line(&with_kind, 1)), Err(kind()));
+            assert_eq!(standing(&store), running);
+            let answer = generations.document(0).expect("the standing document");
+            assert_eq!(answer.document, LEAST_LOAD.as_bytes());
+        }
+
+        // A store that runs the document already, no bytes of it held: the
+        // refused ones are not the read call's.
+        let (store, generations) = generations();
+        let mut running: PolicySpec = serde_yaml::from_str(LEAST_LOAD).expect("a document");
+        running.generation = 5;
+        store
+            .apply(AppliedSpec::validate(&running).expect("a valid document"))
+            .expect("above the unbound start");
+        assert_eq!(yaml(&generations, with_kind.as_str()), Err(kind()));
+        assert!(!generations.bound());
     }
 
     /// A later document the validator or the parser refuses is rejected
@@ -514,8 +761,72 @@ pub(crate) mod tests {
         assert_eq!(standing(&store), running);
     }
 
+    /// The bytes do not bound what a YAML document builds: an alias reads
+    /// as its anchor's value at each use. One list of 300 names under 299
+    /// aliases reads as some 90,000 values in 14,000 bytes, and is refused
+    /// by the count, before anything is built from it. An alias under the
+    /// bound is read as its anchor's value.
+    #[test]
+    fn a_yaml_document_reads_as_no_more_values_than_its_bytes_bound() {
+        let shared = |profiles: usize, names: usize| {
+            let list = ["healthy", "not-tried"].repeat(names / 2).join(", ");
+            let mut document = String::from("apiVersion: smg.policy/v1\nprofiles:\n");
+            writeln!(
+                document,
+                "  default: {{filter: &names [{list}], pick: random}}"
+            )
+            .expect("a string takes it");
+            for profile in 1..profiles {
+                writeln!(document, "  p{profile}: {{filter: *names, pick: random}}")
+                    .expect("a string takes it");
+            }
+            document
+        };
+        let (store, generations) = generations();
+        let document = shared(300, 300);
+        let bytes = document.len();
+        match yaml(&generations, document) {
+            Err(SpecRejected::Unparsed {
+                format: "yaml",
+                message,
+            }) => assert!(
+                message.contains("reads as more than 2 values a byte"),
+                "{message}"
+            ),
+            other => panic!("{bytes} bytes applied as {other:?}"),
+        }
+        assert_eq!(standing(&store).0, 0);
+
+        // Under the bound an alias is read as its anchor's value: the three
+        // profiles reach the validator, which refuses them for its own
+        // reason.
+        assert_eq!(
+            yaml(&generations, shared(3, 2)),
+            Err(SpecRejected::Invalid(SpecError::NoBindings { profiles: 3 }))
+        );
+    }
+
+    /// The count reads every kind of value a YAML document writes, a tagged
+    /// one too, and the densest document that writes its values out is
+    /// under the bound: a value a byte.
+    #[test]
+    fn the_count_reads_every_kind_of_value() {
+        let every_kind = "a: [1, -1, 340282366920938463463374607431768211455, -170141183460469231731687303715884105728, 1.5, true, ~, text]\nb: !tagged {c: !!str 5, d: !one 1}\ne: &anchor [x, y]\nf: *anchor\n";
+        assert_eq!(within_its_bytes(every_kind.as_bytes()), Ok(()));
+        assert_eq!(within_its_bytes(b""), Ok(()));
+
+        let densest = format!("{{{}a}}", "a,".repeat(500));
+        assert_eq!(within_its_bytes(densest.as_bytes()), Ok(()));
+        let left = Cell::new(usize::MAX);
+        Values(&left)
+            .deserialize(serde_yaml::Deserializer::from_slice(densest.as_bytes()))
+            .expect("it reads");
+        assert_eq!(usize::MAX - left.get(), densest.len(), "{densest}");
+    }
+
     /// The bound fails fast: a document one byte over it is refused by its
-    /// size, before any of it is parsed.
+    /// size, before any of it is parsed. The bound is the largest document:
+    /// one of exactly that size runs.
     #[test]
     fn a_document_over_the_bound_is_refused_by_its_size() {
         let (store, generations) = generations();
@@ -526,6 +837,12 @@ pub(crate) mod tests {
         );
         assert_eq!(standing(&store), (0, None));
         assert!(!generations.bound());
+
+        let bound = over - 1;
+        assert_eq!(
+            generations.apply(padded(LEAST_LOAD, bound), Format::Yaml),
+            Ok(Applied::Generation(1))
+        );
     }
 
     /// The read call answers the source's bytes, the comment included, with

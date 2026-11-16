@@ -238,7 +238,7 @@ async fn a_replica_with_no_spec_file_runs_as_it_did() {
     assert_eq!(unserved.code(), Code::Unimplemented, "{unserved:?}");
     assert_eq!(
         unserved.message(),
-        "GetPolicySpec is not served by this build"
+        "GetPolicySpec is not served by a controller started with no spec file"
     );
     let metrics = page(&replica, "/metrics", None).await;
     assert!(!metrics.contains("smg_policy_spec"), "{metrics}");
