@@ -33,14 +33,14 @@ use axum::{
     Json,
 };
 #[cfg(feature = "axum")]
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 #[cfg(feature = "axum")]
 use serde_json::{json, Value};
 #[cfg(feature = "axum")]
 use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
 #[cfg(feature = "axum")]
-use crate::common::FIELD_PARAM;
+use crate::{common::FIELD_PARAM, strict_value::StrictValue};
 
 /// A JSON extractor that automatically validates and normalizes the request body
 ///
@@ -64,10 +64,78 @@ pub struct ValidatedJson<T>(pub T);
 /// A body a route reads as a JSON value and checks itself (the Conversations
 /// routes): it rides the validated extractor for the envelope its refusals
 /// take, with nothing to validate or normalize before the handler sees it.
+/// A repeated key is refused as a typed body's is, at the body's own keys
+/// and at any depth below them; the keys of `metadata` keep the last value,
+/// as that map's do in a typed body.
 #[cfg(feature = "axum")]
-#[derive(Debug, serde::Deserialize)]
-#[serde(transparent)]
+#[derive(Debug)]
 pub struct ValueBody(pub Value);
+
+#[cfg(feature = "axum")]
+impl<'de> serde::Deserialize<'de> for ValueBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(BodyVisitor).map(ValueBody)
+    }
+}
+
+/// [`ValueBody`]'s reader. The `metadata` member of the body's own object is
+/// left to [`Value`]'s own reader, as a typed body's `metadata` map is read:
+/// a repeated key of that map answers the same on every route.
+#[cfg(feature = "axum")]
+struct BodyVisitor;
+
+#[cfg(feature = "axum")]
+impl<'de> Visitor<'de> for BodyVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        StrictValue.expecting(formatter)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+        StrictValue.visit_bool(value)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+        StrictValue.visit_i64(value)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+        StrictValue.visit_u64(value)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+        StrictValue.visit_f64(value)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+        StrictValue.visit_str(value)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+        StrictValue.visit_unit()
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, elements: A) -> Result<Value, A::Error> {
+        StrictValue.visit_seq(elements)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Value, A::Error> {
+        let mut fields = serde_json::Map::new();
+        while let Some(key) = entries.next_key::<String>()? {
+            if fields.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!("duplicate field `{key}`")));
+            }
+            let value = if key == "metadata" {
+                entries.next_value()?
+            } else {
+                entries.next_value_seed(StrictValue)?
+            };
+            fields.insert(key, value);
+        }
+        Ok(Value::Object(fields))
+    }
+}
 
 #[cfg(feature = "axum")]
 impl Validate for ValueBody {
@@ -1709,6 +1777,62 @@ mod tests {
             assert!(
                 text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
                 "{text}"
+            );
+        }
+    }
+
+    /// A Conversations body refuses a repeated key as the Responses door
+    /// refuses one: at the body's own keys (no place to name, as for a typed
+    /// body's own), at an item's keys and at any depth below them (the place
+    /// the extractor's tracker recorded). The keys of `metadata` keep the
+    /// last value, as that map's do on every door, and a body that is no
+    /// object is read whole for the handler to refuse.
+    #[tokio::test]
+    async fn a_value_body_refuses_a_repeated_key_outside_metadata_at_its_place() {
+        for (body, param, message) in [
+            (
+                r#"{"metadata":{"a":"1"},"metadata":{"a":"2"}}"#,
+                Value::Null,
+                "duplicate field `metadata`",
+            ),
+            (
+                r#"{"items":[{"type":"message","role":"user","content":"hi","role":"system"}]}"#,
+                json!("items[0]"),
+                "items[0]: duplicate field `role`",
+            ),
+            (
+                r#"{"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}]}"#,
+                json!("items[0].content[0]"),
+                "items[0].content[0]: duplicate field `text`",
+            ),
+        ] {
+            let (status, json) = rejected::<ValueBody>(body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], "json_parse_error", "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+        for (body, read) in [
+            (
+                r#"{"metadata":{"a":"1","a":"2"}}"#,
+                json!({"metadata": {"a": "2"}}),
+            ),
+            ("[1]", json!([1])),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_default();
+            let accepted = ValidatedJson::<ValueBody>::from_request(request, &()).await;
+            assert!(
+                matches!(&accepted, Ok(ValidatedJson(ValueBody(value))) if *value == read),
+                "{body}"
             );
         }
     }

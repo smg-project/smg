@@ -41,11 +41,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   Messages route answered before. That route reads both through a typed header extractor, and the
   external router's beta reading shares the grammar.
 - `ValueBody`, behind the `axum` feature: the body of a route that reads JSON it checks itself, a
-  transparent newtype over `serde_json::Value` with nothing to validate or normalize before the
-  handler sees it, so such a route rides `ValidatedJson` and refuses a body that does not parse, or
-  one under another or no content type, in the gateway's JSON error envelope (`400`, `error.code`
-  `invalid_json` or `json_parse_error`) as the typed routes do. The gateway's Conversations routes
-  read it.
+  newtype over `serde_json::Value` with nothing to validate or normalize before the handler sees
+  it, so such a route rides `ValidatedJson` and refuses a body that does not parse, or one under
+  another or no content type, in the gateway's JSON error envelope (`400`, `error.code`
+  `invalid_json` or `json_parse_error`) as the typed routes do. A repeated key is refused as a
+  typed body's is (`json_parse_error`, serde's `duplicate field` words, the place as `param`), at
+  the body's own keys and at any depth below them; the keys of `metadata` keep the last value, as
+  that map's do in a typed body. The gateway's Conversations routes read it.
 - `Usage::with_image_tokens`: the prompt's image token count reported as
   `prompt_tokens_details.image_tokens`, kept within `prompt_tokens`; `None` leaves the details as
   they are. The gateway's chat route reports the tokens its own multimodal expansion wrote into
