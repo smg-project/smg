@@ -9,7 +9,7 @@
 //! # Consistent Hash Ring
 //! The registry maintains a pre-computed [`HashRing`] per model for O(log n)
 //! consistent hashing. The ring is rebuilt only when workers are added or
-//! removed, not per request. See [`crate::policies::hash_ring`] for the ring
+//! removed, not per request. See [`hash_ring`] for the ring
 //! itself — this file only wires registry events to ring rebuilds.
 
 #[cfg(test)]
@@ -33,7 +33,6 @@ use uuid::Uuid;
 use crate::{
     config::types::RetryConfig,
     observability::metrics::{metrics_labels, Metrics},
-    policies::hash_ring::HashRing,
     worker::{
         health::circuit_breaker::CircuitState,
         identity::{
@@ -44,14 +43,19 @@ use crate::{
             pair_index::{PdPairIndex, PdWire},
             pairing::PdPairingMode,
         },
-        registry::event::{WorkerConnected, WorkerEvent},
+        registry::{
+            event::{WorkerConnected, WorkerEvent},
+            hash_ring::HashRing,
+        },
         ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
 };
 
 pub mod event;
+pub mod hash_ring;
 // The admin API's service over this registry lives with the control plane
-// (`crate::admin::worker_service`); the path it had here is kept.
+// (`crate::admin::worker_service`); the path it had here is kept until the
+// runtime moves into the worker crate.
 pub use crate::admin::worker_service as service;
 
 /// Unique identifier for a worker
