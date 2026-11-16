@@ -1336,8 +1336,8 @@ impl Format {
                 break 'last in_tail;
             }
             // A place that starts no anchor costs about as much as 384 bytes of one anchor's
-            // pass from the start: where there are more such places than that, past an
-            // anchor's length from the end, the passes cost less.
+            // pass from the start: once the places read so far stand denser than one in 384
+            // bytes an anchor, past an anchor's length from the end, the passes cost less.
             for (passed, at) in memchr::memrchr_iter(first, bytes).enumerate() {
                 if taken(at).is_some() {
                     break 'last Some(at);
