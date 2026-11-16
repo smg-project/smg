@@ -66,7 +66,8 @@ use crate::{
         metrics::{method_to_static_str, Metrics},
     },
     routers::{
-        error::extract_error_code_from_response, grpc::utils::stream_failure::STREAM_ERROR_TYPE,
+        error::{extract_error_code_from_response, HEADER_X_SMG_ERROR_CODE},
+        grpc::utils::stream_failure::STREAM_ERROR_TYPE,
     },
 };
 
@@ -271,7 +272,7 @@ impl Duty for EdgeDuty {
             }
         };
 
-        outcome.head(&response);
+        outcome.head(&mut response);
 
         // Hold the in-flight guard for the response BODY's lifetime, not
         // the handler's: streaming handlers return their response
@@ -337,11 +338,20 @@ impl ResponseOutcome {
     }
 
     /// The response head is out: the status a completed response counts as.
-    pub(super) fn head(&mut self, response: &Response) {
-        self.head = Some((
-            response.status().as_u16(),
-            error_code_label(response).to_owned(),
-        ));
+    /// A body the JSON extractor refused gets its `X-SMG-Error-Code` header
+    /// here: the extractor's envelope is built in the protocols crate, which
+    /// names the code in the body and in an extension, and this layer reads
+    /// that extension for every response.
+    pub(super) fn head(&mut self, response: &mut Response) {
+        let code = error_code_label(response).to_owned();
+        if !code.is_empty() && extract_error_code_from_response(response).is_empty() {
+            if let Ok(value) = http::HeaderValue::from_str(&code) {
+                response
+                    .headers_mut()
+                    .insert(HEADER_X_SMG_ERROR_CODE, value);
+            }
+        }
+        self.head = Some((response.status().as_u16(), code));
     }
 
     /// The response went out in full: count its head's status.
@@ -550,6 +560,33 @@ mod tests {
         assert_eq!(error_code_label(&built), "model_not_found");
         let ok: Response = "ok".into_response();
         assert_eq!(error_code_label(&ok), "");
+    }
+
+    /// A body the extractor refused leaves with its code in
+    /// `X-SMG-Error-Code`; the builder's refusal keeps the header it set and a
+    /// success gets none.
+    #[test]
+    fn the_head_of_a_refused_body_gets_the_code_header() {
+        use axum::response::IntoResponse;
+
+        use crate::routers::error::create_error;
+
+        let header_after = |mut response: Response| {
+            ResponseOutcome::pending(PathLabel::Static("/test")).head(&mut response);
+            response
+                .headers()
+                .get(HEADER_X_SMG_ERROR_CODE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        let mut refused = http::StatusCode::BAD_REQUEST.into_response();
+        refused
+            .extensions_mut()
+            .insert(RejectionCode("invalid_type".to_string()));
+        assert_eq!(header_after(refused).as_deref(), Some("invalid_type"));
+        let built = create_error(http::StatusCode::NOT_FOUND, "model_not_found", "no");
+        assert_eq!(header_after(built).as_deref(), Some("model_not_found"));
+        assert_eq!(header_after("ok".into_response()), None);
     }
 
     /// A code an upstream forges in `X-SMG-Error-Code` never becomes an
