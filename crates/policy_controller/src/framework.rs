@@ -8,7 +8,8 @@ use std::fmt::Debug;
 use crate::{
     builtins::{target_of, Best, FewestSessions, LeastRequests, Random},
     decision::{
-        Decision, Pair, Pick, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+        Decision, Pair, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
+        TRACE_TOP,
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
     sessions::{Assignment, Claim, SessionRule, SessionTable, SessionVerdict},
@@ -26,6 +27,15 @@ pub trait Filter: Send + Sync + Debug {
     fn keep(&self, facts: &RequestFacts<'_>, candidate: &Candidate, cx: &Constraints<'_>) -> bool;
 
     fn soft(&self) -> bool {
+        false
+    }
+
+    /// Whether a decision that draws first ([`Picker::draw_first`]) may ask
+    /// this filter about the rows it drew alone, with no pass over the
+    /// rest: [`Filter::keep`] of one row is the filter's whole word on it.
+    /// The default is no, and a profile that holds such a filter runs its
+    /// whole pass: a plugin's filter is shown the whole view.
+    fn row_wise(&self) -> bool {
         false
     }
 
@@ -98,6 +108,14 @@ pub trait Scorer: Lifecycle + Debug {
         out: &mut [f32],
     ) -> TieBand;
 
+    /// Whether the scorer may be handed the rows a picker drew first
+    /// ([`Picker::draw_first`]), where no pass over the pool ran before it.
+    /// The default is no, and a profile that holds such a scorer runs its
+    /// whole pass: a plugin's scorer is shown the whole view.
+    fn row_wise(&self) -> bool {
+        false
+    }
+
     /// What the host must feed for this scorer to mean anything. A scorer
     /// that reads the affinity column ([`RequestFacts::affinity`]) declares
     /// [`Needs::affinity`]; one that does not may be handed an empty
@@ -134,6 +152,27 @@ impl Narrowed {
         }
     }
 }
+
+/// The most rows a decision that draws first ([`Picker::draw_first`]) may see
+/// refused before it stops drawing: the one bound every picker that draws
+/// first counts against. A draw asks the filters about no more rows than
+/// the targets it hands out and these, and a decision about no more than
+/// those and the whole pass's.
+pub const DRAW_BOUND: u32 = 8;
+
+/// The smallest pool at which a decision draws first, set by run. A draw
+/// pays more than the whole pass for each row it asks about, so a small
+/// pool is read whole. With every row ready the draw reads faster than the
+/// pass from eight rows on, and with one row in seventeen not ready from
+/// sixteen, for every built-in that draws: sixteen is the first size the
+/// `draw` bench reads at which it wins on both. Rows refused do not move
+/// this size, and under twice this size they can cost more than the draw
+/// gains: with every second row refused, a pool under 32 rows can pay more
+/// than its whole pass: under a picker that draws two rows, and under
+/// `round_robin` too in a whole decision with its view's build. The bench's
+/// cells `power_of_two/half/16` and `power_of_two/half/32` hold that shape
+/// and where it ends.
+pub const DRAW_FROM: usize = 16;
 
 /// Turns the survivors into ordered targets, in two steps the engine runs
 /// around the scorers: `narrow` names the set the picker compares, the
@@ -176,6 +215,52 @@ pub trait Picker: Lifecycle + Debug {
         band: TieBand,
         out: &mut Targets,
     );
+
+    /// Whether the picker draws first ([`Picker::draw_first`]); the default
+    /// is no. The engine reads it once per profile when it is built, and
+    /// asks such a picker to draw over a pool of [`DRAW_FROM`] rows or more.
+    fn draws_first(&self) -> bool {
+        false
+    }
+
+    /// Finds the rows the picker hands out without the survivors' list: it
+    /// draws rows of `candidates` by its own rule and asks `keep`, every
+    /// filter of the profile, about each. On `true`, `kept` holds the rows
+    /// it hands out, each one kept by `keep` and none twice: the scorers are
+    /// handed them and [`Picker::order_drawn`] orders them. On `false`
+    /// nothing is decided, what `kept` holds is dropped and the whole pass
+    /// runs: the picker does not draw first, or [`DRAW_BOUND`] rows were
+    /// refused before it held its pick. A draw that keeps nobody says
+    /// nothing of the pool: the pass alone sheds. `draw` is the seed's stream: the
+    /// picker takes its values from it and from nowhere else, and whatever
+    /// follows the draw reads the stream past them.
+    fn draw_first(
+        &self,
+        _facts: &RequestFacts<'_>,
+        _pool: &PoolFacts<'_>,
+        _candidates: &[Candidate],
+        _keep: &mut dyn FnMut(&Candidate) -> bool,
+        _kept: &mut Vec<u32>,
+        _draw: &mut Draw,
+    ) -> bool {
+        false
+    }
+
+    /// Orders the rows [`Picker::draw_first`] left in `kept`; `scores[i]`
+    /// belongs to `kept[i]`. The default is [`Picker::pick`] over them. A
+    /// picker whose `pick` would draw or turn again hands them out as it
+    /// drew them.
+    fn order_drawn(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        self.pick(facts, candidates, kept, scores, band, out);
+    }
 
     /// What the host must feed for this picker to mean anything. A picker
     /// that reads the affinity column ([`RequestFacts::affinity`]) declares
@@ -398,6 +483,33 @@ struct Buffers {
     scores: Vec<f32>,
     stage: Vec<f32>,
     before_soft: Vec<u32>,
+    /// The pool size every buffer holds room for ([`Buffers::reserve`]).
+    room: usize,
+}
+
+impl Buffers {
+    /// Room in every buffer for the whole pass over a pool of `rows`. A
+    /// decision that draws first writes a few rows and asks for the room
+    /// all the same: the pass it widens to may be many decisions away, and
+    /// it allocates nothing the thread's first decision did not.
+    fn reserve(&mut self, rows: usize) {
+        if self.room < rows {
+            self.grow(rows);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, rows: usize) {
+        fn room<T>(buffer: &mut Vec<T>, rows: usize) {
+            buffer.reserve(rows.saturating_sub(buffer.len()));
+        }
+        room(&mut self.kept, rows);
+        room(&mut self.scores, rows);
+        room(&mut self.stage, rows);
+        room(&mut self.before_soft, rows);
+        self.room = rows;
+    }
 }
 
 impl Scratch {
@@ -448,7 +560,9 @@ impl ClassBits {
 }
 
 /// Combined scores of the rows in `kept`, written into `scores`; the
-/// profile's tie band comes back.
+/// profile's tie band comes back. Inlined into its two callers, as it was
+/// into its one before a draw's rows were scored too.
+#[inline(always)]
 fn combine(
     profile: &Profile,
     facts: &RequestFacts<'_>,
@@ -622,7 +736,8 @@ fn filter(
 
 /// The single plan's opening for a request a sessions rule pins or places:
 /// the profile's filters over the whole pool, the survivors left in
-/// `buf.kept`. `Some` is the shed, when a filter leaves nobody.
+/// `buf.kept`. `Some` is the shed, when a filter leaves nobody
+/// ([`single_emptied`]).
 fn single_survivors(
     profile: &Profile,
     index: u16,
@@ -639,11 +754,26 @@ fn single_survivors(
         encode: false,
     };
     let emptied_by = filter(profile, facts, cx, buf, set)?;
-    Some(shed(
+    Some(single_emptied(index, facts, pool, candidates, emptied_by))
+}
+
+/// What the single plan decides over a pool its filter half emptied: the
+/// shed that names the stage. Every path of the plan ends here when a stage
+/// leaves nobody, a plain request ([`run_single`]) and the two a sessions
+/// rule or an assignment places ([`single_survivors`]): what the plan asks
+/// of an emptied pool has this one home.
+fn single_emptied(
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    candidates: &[Candidate],
+    emptied_by: &'static str,
+) -> Decision {
+    shed(
         reason_of(emptied_by),
         emptied_by,
         trace_of(index, facts, pool, candidates, &[], &[]),
-    ))
+    )
 }
 
 fn trace_of(
@@ -656,7 +786,7 @@ fn trace_of(
 ) -> Trace {
     let mut trace = Trace {
         profile,
-        survivors: kept.len() as u32,
+        survivors: Survivors::counted(kept.len() as u32),
         seed: facts.seed,
         generation: pool.generation,
         ..Trace::default()
@@ -730,8 +860,37 @@ fn vision_fits(facts: &RequestFacts<'_>, c: &Candidate) -> bool {
     facts.media.images == 0 || c.vision
 }
 
-/// One profile over one pool: the filters, the scorers, the picker and the
-/// trace. Both plans run their sides through here.
+/// The scoring half of a profile's run, over the survivors its filter half
+/// left in `buf.kept`: the scorers and the picker ([`score_and_pick`]), then
+/// the trace. A picker that pushes no target declined. Inlined: each of its
+/// two callers is one profile's run, as it was before the halves had names.
+#[inline(always)]
+fn score_survivors(
+    profile: &Profile,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    candidates: &[Candidate],
+    buf: &mut Buffers,
+) -> Decision {
+    let mut targets = Targets::new();
+    score_and_pick(profile, facts, candidates, buf, &mut targets);
+    // The trace counts every survivor of the filters; its top rows are of
+    // the compared set, which leads the survivors and alone holds scores.
+    let trace = trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores);
+    if targets.is_empty() {
+        return shed(ShedReason::PolicyDeclined, profile.picker.name(), trace);
+    }
+    Decision::Pick(Pick {
+        targets,
+        trace,
+        session_verdict: SessionVerdict::None,
+    })
+}
+
+/// One profile over one side of a pair: the filter half of its run, then
+/// the scoring half. The pair plans run their sides through here; the single
+/// plan runs the same two halves from its own opening ([`run_single`]).
 fn run_profile(
     profile: &Profile,
     index: u16,
@@ -749,19 +908,127 @@ fn run_profile(
             trace_of(index, facts, pool, candidates, &[], &[]),
         );
     }
-    let mut targets = Targets::new();
-    score_and_pick(profile, facts, candidates, buf, &mut targets);
-    // The trace counts every survivor of the filters; its top rows are of
-    // the compared set, which leads the survivors and alone holds scores.
-    let trace = trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores);
-    if targets.is_empty() {
-        return shed(ShedReason::PolicyDeclined, profile.picker.name(), trace);
+    score_survivors(profile, index, facts, pool, candidates, buf)
+}
+
+/// The single plan's whole pass for a plain request (an `epd` plan's encode
+/// item among them, its rules in `set`): the filter half of the profile's
+/// run, then the scoring half; a pool the filters emptied ends in the
+/// plan's one home for it ([`single_emptied`]). Inlined, as the profile's
+/// run was in the decision before a draw could stand in front of it.
+#[inline(always)]
+fn run_single(
+    profile: &Profile,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    set: Set<'_>,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+) -> Decision {
+    let candidates = set.candidates;
+    if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
+        return single_emptied(index, facts, pool, candidates, emptied_by);
     }
-    Decision::Pick(Pick {
-        targets,
-        trace,
-        session_verdict: SessionVerdict::None,
-    })
+    score_survivors(profile, index, facts, pool, candidates, buf)
+}
+
+/// Whether a profile's single-plan decision may draw first ([`run_drawn`]):
+/// its picker draws first and every other stage answers row by row.
+fn draws_first(profile: &Profile) -> bool {
+    profile.picker.draws_first()
+        && profile.filters.iter().all(|f| f.row_wise())
+        && profile.scorers.iter().all(|w| w.scorer.row_wise())
+}
+
+/// A single-plan decision by a picker that draws first
+/// ([`Picker::draw_first`]), in front of the plan's opening. The picker
+/// draws rows and every filter of the profile is asked about each through
+/// the filter's own `keep`, hard and soft alike. A row every filter keeps is
+/// a row the whole pass keeps, so every target handed out is one the pass
+/// could have handed out; the scorers are handed the rows drawn and the
+/// picker orders them. A draw that keeps nobody says nothing of the pool:
+/// the decision widens to the whole pass ([`run_single`]), which alone sheds
+/// and names a stage.
+///
+/// Whatever follows the draw reads the seed's stream past the values the
+/// draw read. The stream is continued, never restarted: a pass behind
+/// refused draws that read those values again would decide by the values
+/// that refused them, and skew the picker's law on that path. The trace
+/// keeps the request's seed, from which the whole decision replays.
+///
+/// Out of line, so a decision that draws nothing keeps the engine's decision
+/// path as it was.
+#[inline(never)]
+fn run_drawn(
+    profile: &Profile,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    set: Set<'_>,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+) -> Decision {
+    let candidates = set.candidates;
+    buf.reserve(candidates.len());
+    buf.kept.clear();
+    let mut draw = Draw::new(facts.seed);
+    let drew = profile.picker.draw_first(
+        facts,
+        pool,
+        candidates,
+        &mut |c| profile.filters.iter().all(|f| f.keep(facts, c, cx)),
+        &mut buf.kept,
+        &mut draw,
+    );
+    // A picker that read no value of the stream left the seed as it was.
+    let resumed;
+    let after = if draw.state() == facts.seed {
+        facts
+    } else {
+        resumed = RequestFacts {
+            seed: draw.state(),
+            ..*facts
+        };
+        &resumed
+    };
+    if drew {
+        let band = combine(
+            profile,
+            after,
+            candidates,
+            &buf.kept,
+            &mut buf.scores,
+            &mut buf.stage,
+        );
+        let mut targets = Targets::new();
+        profile.picker.order_drawn(
+            after,
+            candidates,
+            &buf.kept,
+            &buf.scores,
+            band,
+            &mut targets,
+        );
+        if !targets.is_empty() {
+            let trace = Trace {
+                survivors: Survivors::NOT_COUNTED,
+                ..trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores)
+            };
+            return Decision::Pick(Pick {
+                targets,
+                trace,
+                session_verdict: SessionVerdict::None,
+            });
+        }
+    }
+    let mut decision = run_single(profile, index, after, pool, set, cx, buf);
+    match &mut decision {
+        Decision::Pick(pick) => pick.trace.seed = facts.seed,
+        Decision::Shed(shed) => shed.trace.seed = facts.seed,
+        Decision::Queue(queue) => queue.trace.seed = facts.seed,
+    }
+    decision
 }
 
 /// The plan: the sequence of profiles a request runs.
@@ -873,18 +1140,20 @@ pub struct Engine {
 
 /// What a profile's stages ask of a decision beyond the profile's own run,
 /// read once when the engine is built. A decision reads the byte in one
-/// compare, so a profile that asks nothing pays for neither mark.
+/// compare, so a profile that asks nothing pays for no mark.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Marks(u8);
 
 impl Marks {
-    /// Nothing asked: the profile's run is the decision.
-    const NONE: Self = Self(0);
     /// A stage holds a [`DecisionScope`] to open.
     const SCOPED: u8 = 1;
     /// The picker leaves the placement to the binding's sessions assignment
     /// ([`Picker::by_assignment`]).
     const BY_ASSIGNMENT: u8 = 1 << 1;
+    /// The picker draws first and every other stage answers row by row
+    /// ([`draws_first`]): a pool of [`DRAW_FROM`] rows or more is decided by
+    /// the rows drawn. It asks nothing before the profile's run.
+    const DRAWS_FIRST: u8 = 1 << 2;
 
     fn of(profile: &Profile) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
@@ -893,7 +1162,22 @@ impl Marks {
         } else {
             0
         };
-        Self(scoped | by_assignment)
+        let draws_first = if draws_first(profile) {
+            Self::DRAWS_FIRST
+        } else {
+            0
+        };
+        Self(scoped | by_assignment | draws_first)
+    }
+
+    /// Whether no stage asks anything before the profile's run: no scope
+    /// to open, no assignment that places.
+    const fn asks_nothing_first(self) -> bool {
+        self.0 & (Self::SCOPED | Self::BY_ASSIGNMENT) == 0
+    }
+
+    const fn draws_first(self) -> bool {
+        self.0 & Self::DRAWS_FIRST != 0
     }
 
     const fn scoped(self) -> bool {
@@ -1495,7 +1779,10 @@ impl Engine {
     /// compatibility and vision rules filter the pool before the profile);
     /// under a `single` binding's sessions rule a keyed request goes to its
     /// pinned worker first, and a profile whose picker leaves the placement
-    /// to that rule is placed by its assignment. The request's affinity
+    /// to that rule is placed by its assignment. Every other request of a
+    /// profile whose picker draws first ([`Picker::draw_first`]) is decided
+    /// by the rows it draws where the pool is large enough, and by the whole
+    /// pass under that size or when the draw keeps nobody. The request's affinity
     /// column is empty or holds one entry a candidate; any other is
     /// refused, as a decline under the stage name `affinity-column`. Rows
     /// named in the column's place
@@ -1524,7 +1811,7 @@ impl Engine {
         };
         let Entry { binding, placing } = entry;
         let marks = self.marks[usize::from(index)];
-        let _opened = if marks == Marks::NONE {
+        let _opened = if marks.asks_nothing_first() {
             None
         } else {
             let opened = marks
@@ -1553,20 +1840,18 @@ impl Engine {
             (binding.plan, facts.phase),
             (Plan::Epd { .. }, Phase::Encode)
         );
-        run_profile(
-            profile,
-            index,
-            facts,
-            pool,
-            Set {
-                candidates,
-                class: None,
-                partnered: None,
-                encode,
-            },
-            cx,
-            &mut scratch.single,
-        )
+        let set = Set {
+            candidates,
+            class: None,
+            partnered: None,
+            encode,
+        };
+        let buf = &mut scratch.single;
+        // An encode item's rules are the whole pass's own: it never draws.
+        if marks.draws_first() && !encode && candidates.len() >= DRAW_FROM {
+            return run_drawn(profile, index, facts, pool, set, cx, buf);
+        }
+        run_single(profile, index, facts, pool, set, cx, buf)
     }
 
     /// A keyed decision under a sessions rule (design 4.6 and the host's
@@ -1637,7 +1922,7 @@ impl Engine {
             });
             let mut trace = Trace {
                 profile: index,
-                survivors: buf.kept.len() as u32,
+                survivors: Survivors::counted(buf.kept.len() as u32),
                 seed: facts.seed,
                 generation: pool.generation,
                 ..Trace::default()
@@ -2110,11 +2395,11 @@ mod tests {
     use super::*;
     use crate::{
         builtins::{
-            Best, CountFirst, Healthy, LeastRequests, Manual, NotOverloaded, NotTried, PowerOfTwo,
-            PowerOfTwoCountFirst,
+            Best, CountFirst, Healthy, LeastRequests, Manual, NotOverloaded, NotTried, Passthrough,
+            PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
         },
         sessions::Recovery,
-        spec::PolicySpec,
+        spec::{PolicySpec, PowerOfTwoMetric},
         view::{Health, Identity, MediaCounts, Role, Session, WorkerId},
     };
 
@@ -2180,7 +2465,7 @@ mod tests {
         let pick = decision.pick().expect("a pick");
         let order: Vec<u32> = pick.targets.iter().map(|t| t.position).collect();
         assert_eq!(order, vec![1, 2, 0]);
-        assert_eq!(pick.trace.survivors, 3);
+        assert_eq!(pick.trace.survivors.get(), Some(3));
         assert_eq!(pick.trace.top[0].0, WorkerId(101));
         assert_eq!(pick.trace.top_len, 3);
     }
@@ -3254,6 +3539,7 @@ mod tests {
             Decision::Shed(shed) => {
                 assert_eq!(shed.reason, ShedReason::PolicyDeclined);
                 assert_eq!(shed.emptied_by, "binding");
+                assert_eq!(shed.trace.survivors.get(), Some(0), "no pool was read");
             }
             other => panic!("a single binding answered a pair with {other:?}"),
         }
@@ -3409,7 +3695,7 @@ mod tests {
             vec![1],
             "the tried worker is dropped while another remains"
         );
-        assert_eq!(pick.trace.survivors, 1);
+        assert_eq!(pick.trace.survivors.get(), Some(1));
     }
 
     #[test]
@@ -3443,6 +3729,7 @@ mod tests {
             Decision::Shed(shed) => {
                 assert_eq!(shed.reason, ShedReason::PolicyDeclined);
                 assert_eq!(shed.emptied_by, "binding");
+                assert_eq!(shed.trace.survivors.get(), Some(0), "no pool was read");
             }
             other => panic!("an unbound model answered {other:?}"),
         }
@@ -3719,7 +4006,7 @@ mod tests {
                 .iter()
                 .map(|(id, _)| id.0 - 100)
                 .collect();
-            assert_eq!(pick.trace.survivors, 5, "the filters' count");
+            assert_eq!(pick.trace.survivors.get(), Some(5), "the filters' count");
             (rows, order, top)
         };
         let mut pairs = std::collections::BTreeSet::new();
@@ -4687,7 +4974,7 @@ mod tests {
         type Said = (
             Option<(ShedReason, &'static str)>,
             Vec<(WorkerId, Option<WorkerId>)>,
-            u32,
+            Survivors,
         );
         fn said(decision: &Decision) -> Said {
             match decision {
@@ -4842,7 +5129,7 @@ mod tests {
             [2, 1, 0, 3],
             "the later of the fewest, then by count"
         );
-        assert_eq!(pick.trace.survivors, 4);
+        assert_eq!(pick.trace.survivors.get(), Some(4));
     }
 
     #[test]
@@ -5936,7 +6223,11 @@ mod tests {
         let text = decide(&encode_facts(0), &pool);
         let pick = text.pick().expect("a pick");
         assert!(pick.targets.iter().all(|t| t.position != 0), "{pick:?}");
-        assert_eq!(pick.trace.survivors, 2, "the incompatible encoder is out");
+        assert_eq!(
+            pick.trace.survivors.get(),
+            Some(2),
+            "the incompatible encoder is out"
+        );
         let image = decide(&encode_facts(1), &pool);
         let pick = image.pick().expect("a pick");
         let order: Vec<u32> = pick.targets.iter().map(|t| t.position).collect();
@@ -6002,5 +6293,728 @@ mod tests {
                 .map(|p| p.decode_position),
             Some(0)
         );
+    }
+
+    // ---- a decision that draws first
+
+    /// `rows` ready candidates in the host's order, the rows `refused`
+    /// names not ready.
+    fn pool_of(rows: u32, refused: impl Fn(u32) -> bool) -> Vec<Candidate> {
+        (0..rows)
+            .map(|i| Candidate {
+                health: Health {
+                    healthy: !refused(i),
+                    ..Health::default()
+                },
+                ..candidate(i, i % 5)
+            })
+            .collect()
+    }
+
+    /// A preset's engine. `power_of_two/requests` is that preset's form
+    /// that compares its two draws by the requests in flight.
+    fn preset(name: &str) -> Engine {
+        let document = match name {
+            "power_of_two/requests" => PolicySpec::power_of_two(PowerOfTwoMetric::Requests),
+            name => PolicySpec::preset(name),
+        };
+        document
+            .expect("a preset")
+            .validate()
+            .expect("the preset validates")
+    }
+
+    fn request(seed: u64) -> RequestFacts<'static> {
+        RequestFacts {
+            model: "m",
+            seed: Draw::new(seed).next_u64(),
+            ..RequestFacts::default()
+        }
+    }
+
+    /// The whole pass of the engine's profile over `pool`, as a decision
+    /// under [`DRAW_FROM`] rows runs it.
+    fn whole_pass(engine: &Engine, facts: &RequestFacts<'_>, pool: &[Candidate]) -> Decision {
+        let (index, profile) = engine
+            .profile_for(facts.model, Phase::Single)
+            .expect("a profile");
+        run_single(
+            profile,
+            index,
+            facts,
+            &PoolFacts::default(),
+            Set {
+                candidates: pool,
+                class: None,
+                partnered: None,
+                encode: false,
+            },
+            &Constraints::default(),
+            &mut Buffers::default(),
+        )
+    }
+
+    fn drawn(engine: &Engine, facts: &RequestFacts<'_>, pool: &[Candidate]) -> Decision {
+        engine.decide(
+            facts,
+            &PoolFacts::default(),
+            pool,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        )
+    }
+
+    fn positions(decision: &Decision) -> Vec<u32> {
+        decision.pick().map_or_else(Vec::new, |pick| {
+            pick.targets.iter().map(|t| t.position).collect()
+        })
+    }
+
+    /// The fleets a draw is held against the whole pass over: every row
+    /// ready, one in seventeen not, every second not, one row ready, none.
+    const REFUSED: [fn(u32) -> bool; 5] = [
+        |_| false,
+        |i| i % 17 == 5,
+        |i| i % 2 == 1,
+        |i| i != 6,
+        |_| true,
+    ];
+
+    #[test]
+    fn a_draw_hands_out_only_rows_the_whole_pass_keeps() {
+        let mut drew = 0u32;
+        let mut widened = 0u32;
+        const NAMES: [&str; 5] = [
+            "passthrough",
+            "random",
+            "round_robin",
+            "power_of_two",
+            "power_of_two/requests",
+        ];
+        let mut drew_by = [0u32; NAMES.len()];
+        for (which, name) in NAMES.into_iter().enumerate() {
+            // Round robin turns a rotation at each decision: the pass that
+            // answers for it runs on a twin, so neither turns the other's.
+            let (engine, twin) = (preset(name), preset(name));
+            for rows in [8u32, 9, 17, 64, 257] {
+                for (fleet, refused) in REFUSED.into_iter().enumerate() {
+                    let pool = pool_of(rows, refused);
+                    for seed in 0..40u64 {
+                        // Every third request already tried a row: the
+                        // soft filter is asked of the rows drawn too.
+                        let tried = [pool[(seed as usize * 7) % pool.len()].id];
+                        let facts = RequestFacts {
+                            tried: if seed % 3 == 0 { &tried } else { &[] },
+                            ..request(seed ^ u64::from(rows) << 32)
+                        };
+                        let untried = |c: &&Candidate| !facts.tried.contains(&c.id);
+                        let ready = || pool.iter().filter(|c| c.health.healthy);
+                        // What the pass keeps: the ready rows not tried, or
+                        // every ready row when that leaves none.
+                        let kept: Vec<u32> = if ready().any(|c| untried(&c)) {
+                            ready().filter(untried).map(|c| c.position).collect()
+                        } else {
+                            ready().map(|c| c.position).collect()
+                        };
+                        let got = drawn(&engine, &facts, &pool);
+                        let want = whole_pass(&twin, &facts, &pool);
+                        let at = format!("{name}, {rows} rows, fleet {fleet}, seed {seed}");
+                        assert_eq!(got.trace().seed, facts.seed, "{at}: the request's seed");
+                        if kept.is_empty() {
+                            assert_eq!(got, want, "{at}: a shed is the whole pass's own");
+                            continue;
+                        }
+                        let pick = got.pick().unwrap_or_else(|| panic!("{at}: a pick"));
+                        if pick.trace.drew_first() {
+                            drew += 1;
+                            drew_by[which] += 1;
+                            assert_eq!(pick.trace.survivors.get(), None, "{at}: no count");
+                        } else {
+                            widened += 1;
+                            assert_eq!(pick.trace.survivors.get(), Some(kept.len() as u32), "{at}");
+                        }
+                        let (got, want) = (positions(&got), positions(&want));
+                        assert!(
+                            got.iter().all(|row| kept.contains(row)),
+                            "{at}: {got:?} holds a row a filter refuses (kept {kept:?})"
+                        );
+                        let mut once = got.clone();
+                        once.sort_unstable();
+                        once.dedup();
+                        assert_eq!(once.len(), got.len(), "{at}: a row handed out twice");
+                        assert!(got.len() <= want.len(), "{at}: {got:?} against {want:?}");
+                        if fleet == 0 && facts.tried.is_empty() {
+                            assert_eq!(got.len(), want.len(), "{at}: every target, no row refused");
+                        }
+                        if name == "passthrough" {
+                            assert_eq!(got, want[..got.len()], "{at}: row for row");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            drew > 1_000 && widened > 100,
+            "{drew} drew, {widened} widened"
+        );
+        // Each of the five draws, the requests form of `power_of_two` too.
+        assert!(
+            drew_by.iter().all(|&drew| drew > 100),
+            "{drew_by:?} drew, by picker"
+        );
+    }
+
+    #[test]
+    fn a_pool_under_the_draws_size_is_read_whole() {
+        for name in ["passthrough", "random", "round_robin", "power_of_two"] {
+            let engine = preset(name);
+            let facts = request(3);
+            let under = pool_of(DRAW_FROM as u32 - 1, |_| false);
+            let trace = *drawn(&engine, &facts, &under).trace();
+            assert!(!trace.drew_first(), "{name}");
+            assert_eq!(trace.survivors.get(), Some(DRAW_FROM as u32 - 1), "{name}");
+            let at = pool_of(DRAW_FROM as u32, |_| false);
+            let trace = *drawn(&engine, &facts, &at).trace();
+            assert!(trace.drew_first(), "{name}");
+            assert_eq!(
+                trace.survivors.get(),
+                None,
+                "{name}: a draw counts no survivor"
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_with_a_stage_that_is_not_row_wise_never_draws() {
+        /// A filter that keeps every row and does not say its word on one
+        /// row is its whole word: a plugin's filter is such a one.
+        #[derive(Debug)]
+        struct Whole;
+        impl Filter for Whole {
+            fn name(&self) -> &'static str {
+                "whole"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+        }
+        // `least-requests` does not say it may be handed drawn rows.
+        let engine = Engine::new(
+            vec![Profile {
+                name: "two".into(),
+                filters: vec![Box::new(Healthy)],
+                scorers: vec![Weighted {
+                    scorer: Box::new(LeastRequests),
+                    weight: 1.0,
+                }],
+                picker: Box::new(PowerOfTwo),
+            }],
+            vec![single_binding()],
+            1,
+            Needs::default(),
+        );
+        let pool = pool_of(64, |_| false);
+        let trace = *drawn(&engine, &request(1), &pool).trace();
+        assert!(!trace.drew_first());
+        assert_eq!(trace.survivors.get(), Some(64));
+        // Nor does a picker that compares every survivor.
+        let trace = *drawn(&preset("least_load"), &request(1), &pool).trace();
+        assert!(!trace.drew_first());
+        // Nor does a filter that is not row-wise, under a picker that draws
+        // and at the first size it draws from.
+        let engine = Engine::new(
+            vec![Profile {
+                name: "whole".into(),
+                filters: vec![Box::new(Healthy), Box::new(Whole)],
+                scorers: Vec::new(),
+                picker: Box::new(Passthrough),
+            }],
+            vec![single_binding()],
+            1,
+            Needs::default(),
+        );
+        let pool = pool_of(DRAW_FROM as u32, |_| false);
+        let trace = *drawn(&engine, &request(1), &pool).trace();
+        assert!(!trace.drew_first());
+        assert_eq!(trace.survivors.get(), Some(DRAW_FROM as u32));
+    }
+
+    #[test]
+    fn the_drawing_pickers_keep_their_law_over_the_rows_the_pass_keeps() {
+        // Thirteen rows kept of sixteen, equal loads: the pick is uniform
+        // over them, under `random` and under a tie of the two drawn.
+        let pool: Vec<Candidate> = pool_of(16, |i| [3, 7, 11].contains(&i))
+            .into_iter()
+            .map(|c| Candidate { in_flight: 0, ..c })
+            .collect();
+        const DECISIONS: u32 = 26_000;
+        for name in ["random", "power_of_two"] {
+            let engine = preset(name);
+            let mut scratch = Scratch::new();
+            let mut first = [0u32; 16];
+            let mut any = [0u32; 16];
+            for seed in 0..u64::from(DECISIONS) {
+                let decision = engine.decide(
+                    &request(seed),
+                    &PoolFacts::default(),
+                    &pool,
+                    &Constraints::default(),
+                    &mut scratch,
+                );
+                let rows = positions(&decision);
+                first[rows[0] as usize] += 1;
+                for row in rows {
+                    any[row as usize] += 1;
+                }
+            }
+            // 2,000 a row expected, a standard deviation of 43: five of them.
+            for row in 0..16usize {
+                if [3, 7, 11].contains(&row) {
+                    assert_eq!(any[row], 0, "{name}: a refused row handed out");
+                } else {
+                    assert!(
+                        first[row].abs_diff(DECISIONS / 13) < 220,
+                        "{name}: {first:?}"
+                    );
+                }
+            }
+            let (low, high) = (any.iter().filter(|n| **n > 0).min(), any.iter().max());
+            let (low, high) = (*low.expect("a row"), *high.expect("a row"));
+            assert!(
+                high - low < high / 10,
+                "{name}: every target, by row: {any:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn round_robin_turns_the_pool_and_shares_the_refused_rows_turns() {
+        let engine = preset("round_robin");
+        let mut scratch = Scratch::new();
+        let mut turn = |pool: &[Candidate], model: &'static str| {
+            let facts = RequestFacts {
+                model,
+                ..request(0)
+            };
+            let decision = engine.decide(
+                &facts,
+                &PoolFacts::default(),
+                pool,
+                &Constraints::default(),
+                &mut scratch,
+            );
+            positions(&decision)
+        };
+        // No row refused: a turn of the pool visits every row once, in the
+        // host's order, and the rows behind the pick are its alternates.
+        let ready = pool_of(32, |_| false);
+        let start = turn(&ready, "a")[0];
+        for step in 1..=32u32 {
+            let rows = turn(&ready, "a");
+            let want: Vec<u32> = (0..4).map(|k| (start + step + k) % 32).collect();
+            assert_eq!(rows, want, "step {step}");
+        }
+        // Another model's pool turns its own rotation: its decisions take
+        // no turn of the first.
+        let other = turn(&ready, "b")[0];
+        assert_eq!(turn(&ready, "a")[0], (start + 33) % 32);
+        assert_eq!(turn(&ready, "b")[0], (other + 1) % 32);
+        // Three rows refused, twenty turns of the pool: a kept row takes its
+        // own twenty turns and an even share of the refused rows' sixty.
+        let pool = pool_of(32, |i| [3, 7, 11].contains(&i));
+        let mut picks = [0u32; 32];
+        for _ in 0..32 * 20 {
+            picks[turn(&pool, "c")[0] as usize] += 1;
+        }
+        for (row, &n) in picks.iter().enumerate() {
+            if [3, 7, 11].contains(&row) {
+                assert_eq!(n, 0, "a refused row picked");
+            } else {
+                assert!((22..=23).contains(&n), "row {row}: {picks:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pick_that_stands_keeps_its_turn_behind_a_run_of_refused_rows() {
+        // Row 4 is kept and the twelve rows behind it are not: the walk for
+        // alternates meets the bound, and the pick stands with none.
+        let pool = pool_of(32, |i| (5..17).contains(&i));
+        let engine = preset("round_robin");
+        let mut scratch = Scratch::new();
+        let mut picks = [0u32; 32];
+        let mut alone = 0;
+        for _ in 0..32 * 10 {
+            let decision = engine.decide(
+                &request(0),
+                &PoolFacts::default(),
+                &pool,
+                &Constraints::default(),
+                &mut scratch,
+            );
+            let rows = positions(&decision);
+            picks[rows[0] as usize] += 1;
+            if rows == [4] {
+                alone += 1;
+                assert!(decision.trace().drew_first());
+            }
+        }
+        assert_eq!(alone, 10, "row 4's own turns, one a turn of the pool");
+        // Twelve refused turns a turn of the pool, shared by twenty rows.
+        for (row, &n) in picks.iter().enumerate() {
+            if (5..17).contains(&row) {
+                assert_eq!(n, 0);
+            } else {
+                assert!((16..=16).contains(&n), "row {row}: {picks:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_pass_behind_a_draw_reads_the_seeds_stream_past_the_draws_values() {
+        // Four rows ready of sixty-four: `random` spends its bound on the
+        // pick, and where all eight draws were refused the whole pass runs
+        // on the stream past those eight values, never from its start.
+        let pool = pool_of(64, |i| ![5, 20, 40, 60].contains(&i));
+        let (engine, twin) = (preset("random"), preset("random"));
+        let mut widened = 0;
+        for seed in 0..200 {
+            let facts = request(seed);
+            let got = drawn(&engine, &facts, &pool);
+            if got.trace().drew_first() {
+                continue;
+            }
+            widened += 1;
+            let mut stream = Draw::new(facts.seed);
+            for _ in 0..DRAW_BOUND {
+                stream.next_u64();
+            }
+            let past = RequestFacts {
+                seed: stream.state(),
+                ..facts
+            };
+            let want = whole_pass(&twin, &past, &pool);
+            assert_eq!(positions(&got), positions(&want), "seed {seed}");
+            assert_eq!(
+                got.trace().seed,
+                facts.seed,
+                "the trace keeps the request's seed"
+            );
+        }
+        assert!(widened > 50, "{widened} of 200 decisions widened");
+    }
+
+    #[test]
+    fn two_tied_rows_drawn_past_a_refused_one_are_ordered_on_the_stream_past_the_draws() {
+        // Every second row ready and every ready row alike: the two rows
+        // drawn tie, and the stream orders them from where the draws left
+        // it, never from a value a draw already read.
+        let pool: Vec<Candidate> = (0..64)
+            .map(|i| Candidate {
+                health: Health {
+                    healthy: i % 2 == 0,
+                    ..Health::default()
+                },
+                ..candidate(i, 0)
+            })
+            .collect();
+        let engine = preset("power_of_two");
+        let (mut past_a_refusal, mut second_first) = (0u32, 0u32);
+        for seed in 0..400 {
+            let facts = request(seed);
+            let got = drawn(&engine, &facts, &pool);
+            if !got.trace().drew_first() {
+                continue;
+            }
+            // The two draws, replayed: each value of the stream is one row
+            // asked, and the second draw passes over the first's row.
+            let mut stream = Draw::new(facts.seed);
+            let mut asked = 0u32;
+            let mut draw_one = |except: Option<usize>| loop {
+                let mut row = stream.below(pool.len() - usize::from(except.is_some()));
+                if except.is_some_and(|taken| row >= taken) {
+                    row += 1;
+                }
+                asked += 1;
+                if pool[row].health.healthy {
+                    break row;
+                }
+            };
+            let first = draw_one(None);
+            let second = draw_one(Some(first));
+            if asked == 2 {
+                continue;
+            }
+            past_a_refusal += 1;
+            let past = RequestFacts {
+                seed: stream.state(),
+                ..facts
+            };
+            let kept = [first as u32, second as u32];
+            let mut want = Targets::new();
+            PowerOfTwo.pick(
+                &past,
+                &pool,
+                &kept,
+                &[0.5, 0.5],
+                TieBand::NORMALIZED,
+                &mut want,
+            );
+            let want: Vec<u32> = want.iter().map(|t| t.position).collect();
+            assert_eq!(positions(&got), want, "seed {seed}");
+            second_first += u32::from(want.first() == Some(&kept[1]));
+        }
+        assert!(
+            second_first > 20 && past_a_refusal - second_first > 20,
+            "{past_a_refusal} decisions drew past a refused row, {second_first} put the second first"
+        );
+    }
+
+    #[test]
+    fn the_two_draws_of_one_decision_share_its_bound_of_refused_rows() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static ASKS: AtomicU32 = AtomicU32::new(0);
+        static PASSES: AtomicU32 = AtomicU32::new(0);
+        /// Keeps the fourth row it is asked about and no other; a whole
+        /// pass keeps the pool as it stands and is counted apart.
+        #[derive(Debug)]
+        struct FourthAsk;
+        impl Filter for FourthAsk {
+            fn name(&self) -> &'static str {
+                "fourth-ask"
+            }
+
+            fn row_wise(&self) -> bool {
+                true
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                ASKS.fetch_add(1, Ordering::Relaxed) + 1 == 4
+            }
+
+            fn retain(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &[Candidate],
+                _: &Constraints<'_>,
+                _: &mut Vec<u32>,
+            ) {
+                PASSES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let engine = Engine::new(
+            vec![Profile {
+                name: "two".into(),
+                filters: vec![Box::new(FourthAsk)],
+                scorers: Vec::new(),
+                picker: Box::new(PowerOfTwo),
+            }],
+            vec![single_binding()],
+            1,
+            Needs::default(),
+        );
+        let pool = pool_of(64, |_| false);
+        let got = drawn(&engine, &request(1), &pool);
+        // Three rows refused, the fourth kept, then the second draw's rows
+        // refused until the DECISION's bound: one ask more than the bound,
+        // not the bound again for the second draw, and the whole pass
+        // decides.
+        assert_eq!(ASKS.load(Ordering::Relaxed), DRAW_BOUND + 1);
+        assert_eq!(PASSES.load(Ordering::Relaxed), 1);
+        assert!(!got.trace().drew_first());
+        assert!(got.pick().is_some());
+    }
+
+    #[test]
+    fn a_draw_asks_about_its_targets_and_its_bound_of_refused_rows_and_no_row_more() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static ASKS: AtomicU32 = AtomicU32::new(0);
+        /// The health filter's word, with each ask about one row counted;
+        /// a whole pass is the health filter's own and is not counted.
+        #[derive(Debug)]
+        struct Counted;
+        impl Filter for Counted {
+            fn name(&self) -> &'static str {
+                "counted"
+            }
+
+            fn row_wise(&self) -> bool {
+                true
+            }
+
+            fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+                ASKS.fetch_add(1, Ordering::Relaxed);
+                Healthy.keep(facts, c, cx)
+            }
+
+            fn retain(
+                &self,
+                facts: &RequestFacts<'_>,
+                candidates: &[Candidate],
+                cx: &Constraints<'_>,
+                kept: &mut Vec<u32>,
+            ) {
+                Healthy.retain(facts, candidates, cx, kept);
+            }
+        }
+        let pickers: [(&str, Box<dyn Picker>); 5] = [
+            ("passthrough", Box::new(Passthrough)),
+            ("random", Box::new(Random)),
+            ("round-robin", Box::new(RoundRobin::new())),
+            ("power-of-two", Box::new(PowerOfTwo)),
+            ("power-of-two-count-first", Box::new(PowerOfTwoCountFirst)),
+        ];
+        for (name, picker) in pickers {
+            let engine = Engine::new(
+                vec![Profile {
+                    name: name.into(),
+                    filters: vec![Box::new(Counted)],
+                    scorers: Vec::new(),
+                    picker,
+                }],
+                vec![single_binding()],
+                1,
+                Needs::default(),
+            );
+            for (fleet, refused) in REFUSED.into_iter().enumerate() {
+                let pool = pool_of(64, refused);
+                for seed in 0..50 {
+                    ASKS.store(0, Ordering::Relaxed);
+                    let decision = drawn(&engine, &request(seed), &pool);
+                    let asks = ASKS.load(Ordering::Relaxed) as usize;
+                    // The first fleet is ready whole: a draw there asks
+                    // about the rows it hands out and about no other.
+                    let most = if fleet == 0 {
+                        assert!(decision.trace().drew_first(), "{name}, seed {seed}");
+                        MAX_TARGETS
+                    } else {
+                        MAX_TARGETS + DRAW_BOUND as usize
+                    };
+                    assert!(
+                        (1..=most).contains(&asks),
+                        "{name}, fleet {fleet}, seed {seed}: {asks} asks"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pool_under_a_new_membership_epoch_turns_its_own_rotation() {
+        let engine = preset("round_robin");
+        let ready = pool_of(32, |_| false);
+        let mut scratch = Scratch::new();
+        let mut turn = |epoch: u64| {
+            let pool = PoolFacts {
+                membership_epoch: epoch,
+                ..PoolFacts::default()
+            };
+            let cx = Constraints::default();
+            let decision = engine.decide(&request(0), &pool, &ready, &cx, &mut scratch);
+            positions(&decision)[0]
+        };
+        let old = turn(1);
+        for step in 1..=5 {
+            assert_eq!(turn(1), (old + step) % 32, "step {step}");
+        }
+        // A membership write moves the epoch: another list of rows stands
+        // behind the pool's key, and it turns a rotation of its own.
+        let new = turn(2);
+        for step in 1..=3 {
+            assert_eq!(turn(2), (new + step) % 32, "step {step}");
+        }
+        // The old epoch's rotation stands where its last decision left it.
+        assert_eq!(turn(1), (old + 6) % 32);
+    }
+
+    #[test]
+    fn two_lists_of_one_pool_each_turn_their_own_rotation() {
+        // Two lists behind one model and phase, asked through one engine,
+        // each pair apart by one word of the key: two callers' lists of one
+        // pool that the host names apart, as where a pool holds host-local
+        // rows; two lists of two sizes; a pool's list before a membership
+        // write and after it.
+        let engine = preset("round_robin");
+        let mut scratch = Scratch::new();
+        for (sizes, reaches, epochs) in [
+            ([16u32, 16], [1, 2], [1, 1]),
+            ([16, 32], [0, 0], [1, 1]),
+            ([16, 16], [0, 0], [2, 3]),
+        ] {
+            let lists = sizes.map(|rows| pool_of(rows, |_| false));
+            let mut drawn = sizes.map(|rows| vec![0u32; rows as usize]);
+            let mut ask = |list: usize, drawn: &mut [Vec<u32>; 2]| {
+                let pool = PoolFacts {
+                    membership_epoch: epochs[list],
+                    reach: reaches[list],
+                    ..PoolFacts::default()
+                };
+                let cx = Constraints::default();
+                let decision = engine.decide(&request(0), &pool, &lists[list], &cx, &mut scratch);
+                assert!(decision.trace().drew_first());
+                drawn[list][positions(&decision)[0] as usize] += 1;
+            };
+            // Their asks reach one engine in turn: one rotation turned by
+            // both would draw every other row of each list.
+            for turn in 0..64 {
+                ask(turn % 2, &mut drawn);
+            }
+            for (rows, drawn) in sizes.iter().zip(&drawn) {
+                assert!(
+                    drawn.iter().all(|&n| n == 32 / rows),
+                    "{sizes:?}: {drawn:?}"
+                );
+            }
+            // And as a coin falls: each list's turn is still its own, so no
+            // two of its rows are more than one decision apart.
+            let mut coin = Draw::new(11);
+            for _ in 0..320 {
+                ask((coin.next_u64() & 1) as usize, &mut drawn);
+            }
+            for drawn in &drawn {
+                let least = drawn.iter().copied().min().unwrap_or(0);
+                let most = drawn.iter().copied().max().unwrap_or(0);
+                assert!(most - least <= 1, "{sizes:?}: {drawn:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_encode_item_never_draws() {
+        // The `epd` plan's compatibility rule is the whole pass's own: under
+        // an encode profile whose picker draws first, an encode item over a
+        // pool of the draw's size is still read whole, and the incompatible
+        // encoder that leads the pool is handed to nobody.
+        let engine = PolicySpec::epd_presets("passthrough", "least_load", "least_load")
+            .expect("the presets")
+            .validate()
+            .expect("the spec validates");
+        let pool: Vec<Candidate> = (0..16).map(|i| encode_candidate(i, i != 0, true)).collect();
+        let decision = drawn(&engine, &encode_facts(0), &pool);
+        assert_eq!(positions(&decision), [1, 2, 3, 4]);
+        assert!(!decision.trace().drew_first());
+        assert_eq!(decision.trace().survivors.get(), Some(15));
+    }
+
+    #[test]
+    fn a_drawn_decision_replays_from_its_seed_and_a_widened_one_too() {
+        for name in ["random", "power_of_two"] {
+            let engine = preset(name);
+            for (fleet, refused) in REFUSED.into_iter().enumerate() {
+                let pool = pool_of(64, refused);
+                for seed in 0..200 {
+                    let facts = request(seed);
+                    let first = drawn(&engine, &facts, &pool);
+                    assert_eq!(
+                        first,
+                        drawn(&engine, &facts, &pool),
+                        "{name}, fleet {fleet}"
+                    );
+                }
+            }
+        }
     }
 }

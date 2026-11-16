@@ -435,7 +435,7 @@ fn the_honest_guest_picks_the_least_in_flight_through_either_world() {
         let Some(pick) = decision.pick() else {
             panic!("a pick, not {decision:?}")
         };
-        assert_eq!(pick.trace.survivors, 8);
+        assert_eq!(pick.trace.survivors.get(), Some(8));
         let stats = plugin.stats();
         assert_eq!(
             stats.answered, 4,
@@ -491,7 +491,7 @@ fn the_filters_answer_narrows_the_pool_once_per_decision_and_row_by_row() {
     let Some(pick) = decision.pick() else {
         panic!("a pick, not {decision:?}")
     };
-    assert_eq!(pick.trace.survivors, 4);
+    assert_eq!(pick.trace.survivors.get(), Some(4));
     assert_eq!(plugin.stats().answered, 4, "filter asked once");
 }
 
@@ -533,7 +533,11 @@ fn a_plugin_scorer_under_a_two_draw_picker_scores_the_two_drawn() {
             let Some(pick) = decision.pick() else {
                 panic!("a pick, not {decision:?}")
             };
-            assert_eq!(pick.trace.survivors, 8, "{name}: the filters' count");
+            assert_eq!(
+                pick.trace.survivors.get(),
+                Some(8),
+                "{name}: the filters' count"
+            );
             let top = &pick.trace.top[..usize::from(pick.trace.top_len)];
             assert_eq!(
                 top.iter().map(|(id, _)| id.0).collect::<Vec<_>>(),

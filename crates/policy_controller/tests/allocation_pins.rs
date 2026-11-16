@@ -170,6 +170,43 @@ fn a_round_robin_decision_over_a_changing_survivor_set_allocates_nothing() {
 }
 
 #[test]
+fn the_pass_behind_a_draw_that_keeps_nobody_allocates_nothing() {
+    // The first decision draws over a pool with every row ready and writes
+    // a few rows. A later one meets the pool with one row ready: the draw
+    // keeps nobody and the whole pass runs, for the first time on this
+    // scratch. The first decision took the pass's room.
+    for preset in ["passthrough", "random", "round_robin", "power_of_two"] {
+        let engine = engine_of(preset);
+        let mut ready = fleet(512);
+        for row in &mut ready {
+            row.health.healthy = true;
+        }
+        let mut lone = ready.clone();
+        for row in &mut lone {
+            row.health.healthy = row.position == 300;
+        }
+        let cx = Constraints::default();
+        let mut scratch = Scratch::new();
+        let first = engine.decide(&facts(1), &pool(512), &ready, &cx, &mut scratch);
+        assert!(
+            first.trace().drew_first(),
+            "{preset}: the first decision drew"
+        );
+        let mut widened = 0;
+        for seed in 2..66u64 {
+            let (decision, allocations) = allocations_during(|| {
+                engine.decide(&facts(seed), &pool(512), &lone, &cx, &mut scratch)
+            });
+            assert_eq!(allocations, 0, "{preset}: a decision allocated");
+            let pick = decision.pick().expect("the lone row routes");
+            assert_eq!(pick.targets.first().map(|t| t.position), Some(300));
+            widened += u32::from(!pick.trace.drew_first());
+        }
+        assert!(widened > 0, "{preset}: no decision reached the whole pass");
+    }
+}
+
+#[test]
 fn a_decision_over_credited_rows_allocates_nothing() {
     let engine = engine_of("least_load");
     let view = fleet(512);

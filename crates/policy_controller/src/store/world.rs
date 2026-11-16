@@ -148,6 +148,12 @@ pub struct Built {
     /// The number of the generation the world was published under
     /// ([`World::spec`]): the rows and it are of one load.
     pub generation: u64,
+    /// Which list of the pool was written, as [`PoolFacts::reach`] takes
+    /// it: the asking gateway's id where the pool holds a host-local row,
+    /// each gateway being handed a list of its own there, or where a veto
+    /// of that gateway masks a row of its copy, and `0` for a pool every
+    /// gateway dials whole and reads alike.
+    pub reach: u64,
 }
 
 impl Built {
@@ -162,6 +168,7 @@ impl Built {
             regime: OverloadRegime::None,
             generation: self.generation,
             zones: &[],
+            reach: self.reach,
         }
     }
 }
@@ -246,13 +253,20 @@ type PoolVetoes = Arc<[GatewayRun]>;
 /// met the search when the two were timed alone.
 const WALKED_RUNS: usize = 160;
 
+/// The runs a walk passes in one step while every one of them is short of
+/// the gateway it seeks. A walk run by run is a loop of a few instructions
+/// whose time follows where the build's text puts it; by strides the walk
+/// is the shorter wherever it sits.
+const STRIDE: usize = 4;
+
 /// `gateway`'s run among a pool's runs, sorted by gateway. While the runs
 /// are at most [`WALKED_RUNS`] the two ends are asked first, which is the
 /// whole answer where one gateway alone holds a veto, and a gateway
 /// between them is walked to from the nearer end, over the runs between
 /// the two ends alone: from the front to the first gateway not under it,
-/// or from the back to the first not above it. Above that count the run
-/// is found by one search.
+/// or from the back to the first not above it, [`STRIDE`] runs a step
+/// while a whole stride is short of it. Above that count the run is found
+/// by one search.
 fn run_of(runs: &[GatewayRun], gateway: GatewayId) -> Option<&GatewayRun> {
     if runs.len() > WALKED_RUNS {
         let at = runs
@@ -268,12 +282,36 @@ fn run_of(runs: &[GatewayRun], gateway: GatewayId) -> Option<&GatewayRun> {
     if gateway >= last.gateway {
         return (gateway == last.gateway).then_some(last);
     }
-    // The middle run says which half holds the gateway's.
+    // The middle run says which half holds the gateway's. From either end
+    // the walk passes a stride while the stride's far run is short of the
+    // gateway, then goes run by run.
     let middle = between.get(between.len() / 2)?;
     let run = if gateway < middle.gateway {
-        between.iter().find(|run| run.gateway >= gateway)
+        let mut from = 0;
+        while between
+            .get(from + STRIDE - 1)
+            .is_some_and(|run| run.gateway < gateway)
+        {
+            from += STRIDE;
+        }
+        between
+            .get(from..)?
+            .iter()
+            .find(|run| run.gateway >= gateway)
     } else {
-        between.iter().rev().find(|run| run.gateway <= gateway)
+        let mut to = between.len();
+        while to >= STRIDE
+            && between
+                .get(to - STRIDE)
+                .is_some_and(|run| run.gateway > gateway)
+        {
+            to -= STRIDE;
+        }
+        between
+            .get(..to)?
+            .iter()
+            .rev()
+            .find(|run| run.gateway <= gateway)
     };
     run.filter(|run| run.gateway == gateway)
 }
@@ -565,31 +603,6 @@ impl World {
                 load.report_age_ms = age_ms(now_micros, sampled_at);
             }
         }
-        // The asking gateway's run among the gateways that hold a veto in
-        // this pool: no other gateway's veto is read.
-        let own = self
-            .vetoes
-            .get(index)
-            .and_then(|runs| run_of(runs, ask.gateway));
-        if let Some(run) = own {
-            // A pool every gateway dials whole is copied whole: a veto's
-            // row is its position. Another gateway's host-local rows are
-            // left out, so there the row is found by its id.
-            let whole = shape.locals.is_empty();
-            for veto in run.vetoes.iter() {
-                if veto.until <= ask.now {
-                    continue;
-                }
-                let row = if whole {
-                    out.candidates.get_mut(veto.row as usize)
-                } else {
-                    row_of_id(&mut out.candidates, veto.id)
-                };
-                if let Some(row) = row {
-                    row.health.stalled = true;
-                }
-            }
-        }
         if let Some(row) = ask.pinned.and_then(|id| row_of_id(&mut out.candidates, id)) {
             row.session_hit = true;
         }
@@ -603,13 +616,60 @@ impl World {
                     }));
             }
         }
+        // The asking gateway's run among the gateways that hold a veto in
+        // this pool: no other gateway's veto is read.
+        let own = self
+            .vetoes
+            .get(index)
+            .and_then(|runs| run_of(runs, ask.gateway));
+        // Whether a veto of the asking gateway masks a row of its list:
+        // asked last, so no loop of the build holds the answer.
+        let masked =
+            own.is_some_and(|run| mask(run, ask.now, shape.locals.is_empty(), &mut out.candidates));
         Some(Built {
             pool_size: out.candidates.len() as u32,
             membership_epoch: self.epoch,
             now_micros,
             generation: self.spec.generation(),
+            // A copy a veto masks reads apart from the other gateways': it
+            // is the asking gateway's own list, as one short of another's
+            // host-local rows is.
+            reach: if shape.locals.is_empty() && !masked {
+                0
+            } else {
+                ask.gateway.0
+            },
         })
     }
+}
+
+/// Write the stalled bit on each row of `rows` a veto of `run` masks at
+/// `now`, and say whether one did.
+///
+/// A pool every gateway dials whole is copied whole (`whole`): a veto's row
+/// is its position. Another gateway's host-local rows are left out, so
+/// there the row is found by its id.
+///
+/// Out of line: a build that holds no veto of the asking gateway pays one
+/// test for this walk, and the build's row loop pays nothing for it.
+#[inline(never)]
+fn mask(run: &GatewayRun, now: Instant, whole: bool, rows: &mut [Candidate]) -> bool {
+    let mut masked = false;
+    for veto in run.vetoes.iter() {
+        if veto.until <= now {
+            continue;
+        }
+        let row = if whole {
+            rows.get_mut(veto.row as usize)
+        } else {
+            row_of_id(rows, veto.id)
+        };
+        if let Some(row) = row {
+            row.health.stalled = true;
+            masked = true;
+        }
+    }
+    masked
 }
 
 /// The row of worker `id` in a slice sorted by worker id.

@@ -347,7 +347,7 @@ fn target(t: &Target) -> proto::Target {
 fn trace(t: &Trace) -> proto::Trace {
     proto::Trace {
         profile: u32::from(t.profile),
-        survivors: t.survivors,
+        survivors: t.survivors.get(),
         top: t.top[..usize::from(t.top_len)]
             .iter()
             .map(|(id, score)| proto::Scored {
@@ -365,6 +365,7 @@ fn trace(t: &Trace) -> proto::Trace {
         shadow_pick: 0,
         fallback: false,
         affinity_source: 0,
+        drew_first: t.drew_first(),
     }
 }
 

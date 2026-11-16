@@ -274,6 +274,11 @@ impl ModelFingerprint {
     pub fn of(model: &str) -> Self {
         Self(fingerprint(model.as_bytes()))
     }
+
+    /// The fingerprint's value, for a key the crate derives from a model.
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 /// A session: a key within its model and phase, as the one value a lease
@@ -865,6 +870,14 @@ pub struct PoolFacts<'a> {
     pub generation: u64,
     /// Healthy capacity per zone; empty for an unzoned fleet.
     pub zones: &'a [ZoneCapacity],
+    /// Which of the pool's lists the candidates are, where the host hands
+    /// more than one of a pool under one membership epoch: two that differ
+    /// by a row, or by a bit the host writes on a row for one asker alone,
+    /// carry different values, and a host that hands one leaves `0`. A
+    /// stage that keeps state by the pool and reads no row for it, as a
+    /// rotation does, keys it by this too. In-process only: a plugin reads
+    /// the rows it is handed.
+    pub reach: u64,
 }
 
 #[cfg(test)]

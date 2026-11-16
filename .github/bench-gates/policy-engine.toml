@@ -11,6 +11,12 @@
 # (`policy_engine/spec/parse_validate`): 33 single-threaded rows, deterministic by construction (a fresh
 # seed per iteration), about five minutes a run, so three interleaved runs a side fit the job's budget.
 #
+# From sixteen workers on, a decision under `passthrough`, `random`, `round_robin` or `power_of_two` is made by
+# the rows its picker draws and no pass over the pool: those presets' rows at 64 and 512 workers hold the draw
+# over this file's fleet (about one worker in seventeen not ready), and their rows at 8 workers the whole pass.
+# The `draw` bench target holds the same presets over fleets of its own, one with every second worker not ready
+# among them; no gate reads it yet.
+#
 # Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median
 # of the per-run criterion medians over six pinned runs of one build of main, each from a fresh copy of the
 # binary with a fresh criterion home, on a shared many-core build host at a load of 25 to 45:
