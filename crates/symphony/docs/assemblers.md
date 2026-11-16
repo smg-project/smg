@@ -442,6 +442,14 @@ What the syntax says, and what the assembler does with it:
   array or an object there, `null` when nothing is declared and it is a list's item, and `""`
   everywhere else: the template writes `None` inside a list as an empty element, skips a
   mapping's `None` member, and leaves a top-level argument that is `None` out altogether.
+  An element declared an array or an object that the model opens, leaves empty (whitespace at
+  most) and never closes, the closing tag of the element directly around it following, is
+  written empty the same way: a closing tag is no value of a list or an object, so only the
+  element's own close is missing. One `Malformed { TagCutShort }` event of no bytes stands
+  before its fragment, nothing is refused, and the call stays whole. The tag stays the
+  element's text under a declared string or integer, under an element with no declaration,
+  under a declared container that holds text already or whose empty value would nest past the
+  bound, and when it names an element further out; the call's own end closes no element so.
   Nothing is taken from a value: the template writes it directly between the tags, with no
   escaping.
 - **A top-level null is never written.** The template leaves an argument whose value is `None`
