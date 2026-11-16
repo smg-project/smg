@@ -2,10 +2,12 @@
 //! the load driver over it, the election, the gRPC listeners with their
 //! scopes, the service and the health service on each, the admin listener,
 //! readiness and the drain. The service answers `Leader`, a gateway's
-//! `Session` and, on the leader, the control scope's registration calls,
-//! and the run loop sweeps the gateways that are gone; the scopes' other
-//! call bodies arrive with the gateway, ingestion and control scope PRs,
-//! the other ingestion drivers with their move out of the gateway. In the
+//! `Session` and its `Decide` streams, whose decisions run on the
+//! controller's deciding threads, and, on the leader, the control scope's
+//! registration calls, and the run loop sweeps the gateways that are gone;
+//! the scopes' other call bodies arrive with the gateway, ingestion and
+//! control scope PRs, the other ingestion drivers with their move out of
+//! the gateway. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document, watches the file and
 //! answers `GetPolicySpec` ([`Controller::spec_file`]).
@@ -27,13 +29,7 @@
 
 pub mod admin;
 pub mod config;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Decide call's streams hand their requests to the deciders; that call is the step's next PR"
-    )
-)]
+mod decide;
 mod deciders;
 pub mod election;
 mod gateways;
@@ -48,13 +44,6 @@ mod service;
 mod session;
 mod spec_file;
 pub mod tls;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Decide call's streams read their frames through it; that call is the step's next PR"
-    )
-)]
 mod wire;
 mod worker_wire;
 

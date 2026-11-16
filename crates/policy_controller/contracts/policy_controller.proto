@@ -39,11 +39,19 @@
 // nothing.
 // Flow: design 5.2. Budgets are relative to receipt, never absolute; credits
 // ride the Decide stream as deltas (Credit) and are never taken back; with
-// no credit the gateway decides locally; a Decide whose budget is gone on
-// arrival, or ends while it is decided, is answered
+// no credit the gateway decides locally, and a DecideRequest sent with none
+// is answered Busy { NO_CREDIT } and spends none; a Decide whose budget is
+// gone on arrival, or ends while it is decided, is answered
 // Busy { BUDGET_GONE_ON_ARRIVAL } without a lease, and the controller counts
 // the second apart; a Decision that arrives after a fallback is answered
 // with Released.
+// A DecideRequest the controller has no decision for is answered Busy with
+// no reason, and the gateway decides it locally.
+// Where the controller leads, a Decide stream is a present gateway's: one
+// whose Session stands or ended within Welcome.grace_period_ms. A replica
+// that does not lead opens the stream and answers each DecideRequest
+// Busy { NOT_LEADER }; the stream is asked for its gateway's presence at
+// the first request under each term the replica leads.
 // Errors (gRPC status): UNAUTHENTICATED no principal, or Hello's id is not
 // the subject (the stream closes); PERMISSION_DENIED the scope or
 // role does not cover the RPC; FAILED_PRECONDITION not the leader (a
@@ -52,32 +60,37 @@
 // tells it; on Session, the NotLeader frame ahead
 // of the status), a first frame that is not Hello or a second Hello, no
 // protocol version in common, a floor above the term, a revision or
-// digest guard, or a rejoin position not held under its term (a
-// resync_required batch precedes it; the rejoin opens a new Replicate
-// stream); INVALID_ARGUMENT a spec, registration or patch rejected (the
-// field path in ApplyResult.issues, and at the head of a refused
-// registration's or patch's status message), a Dispatched, Completed or
-// Released whose side, class, reason or number reads wrong, or a Released
-// that names neither a lease nor a ticket (the field's name in the
-// message); RESOURCE_EXHAUSTED a
-// relay over its per-subscriber budget or a standby over its backlog (a
-// resync_required batch precedes it), a Hello past the controller's
-// ceiling of present gateways, or a Session frame over the transport's
-// limit of 4 MiB a message; ALREADY_EXISTS a Hello whose id collides
-// with another present gateway's, refused while that one stands, or an
-// add of a registered URL; NOT_FOUND a replace of an absent URL, or no
-// worker under the id; DEADLINE_EXCEEDED a Session stream that said no
-// Hello within 5 s of its open; UNAVAILABLE a standby not yet synced;
+// digest guard, a Decide stream of a gateway that is not present where
+// the controller leads (at its open, at its first request under a term,
+// and an open one when the presence ends), or a rejoin position not
+// held under its term (a resync_required batch precedes it; the rejoin
+// opens a new Replicate stream); INVALID_ARGUMENT a spec, registration
+// or patch rejected (the field path in ApplyResult.issues, and at the
+// head of a refused registration's or patch's status message), a
+// Dispatched, Completed or Released whose side, class, reason or number
+// reads wrong, a Released that names neither a lease nor a ticket (the
+// field's name in the message), or a DecideRequest field out of its range
+// in this protocol version (the status message names the field, and the
+// stream closes); RESOURCE_EXHAUSTED a relay over its per-subscriber
+// budget or a standby over its backlog (a resync_required batch precedes
+// it), a Hello past the controller's ceiling of present gateways, a
+// Decide stream past its gateway's Welcome.max_decide_streams, a Session
+// frame over the transport's limit of 4 MiB a message, or a Decide frame
+// over 64 KiB as encoded; ALREADY_EXISTS a Hello whose id collides with
+// another present gateway's, refused while that one stands, or an add of
+// a registered URL; NOT_FOUND a replace of an absent URL, or no worker
+// under the id; DEADLINE_EXCEEDED a Session stream that said no Hello
+// within 5 s of its open; UNAVAILABLE a standby not yet synced;
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read
 // under a term the election left before its seat was taken, or a session
 // a newer one of its gateway replaced, or a worker row that moved under a
 // membership call (a second writer: read the row again); OUT_OF_RANGE and
 // DATA_LOSS raised by no handler, forwarded as RelayResync. The
 // transport answers OUT_OF_RANGE itself to a request over its limit of
-// 4 MiB on a call of one request message; on a Session stream the reader
-// answers that finding RESOURCE_EXHAUSTED. Any other read of a
-// Session frame that the transport fails ends the stream under the
-// transport's own status. In-band within a stream:
+// 4 MiB on a call of one request message; on a Session or Decide stream
+// the reader answers that finding RESOURCE_EXHAUSTED. Any other read of
+// a Session or Decide frame that the transport fails ends the stream
+// under the transport's own status. In-band within a stream:
 // Busy, NotLeader, SpecAck { accepted: false }, Decline.
 
 syntax = "proto3";
@@ -247,6 +260,7 @@ message Welcome {
   repeated ModelHashing hashing = 6;
   // Initial credit per Decide stream; a new Decide stream starts here again.
   uint32 decide_window = 7;
+  // The Decide streams the gateway holds open at most.
   uint32 max_decide_streams = 8;
   // The stream rule's grace period and the default dispatch TTL. A gateway
   // is let go one grace period after its last session ended, and one period
@@ -335,9 +349,15 @@ message SpecPush {
 // --- Decide: one stream per gateway runtime thread --------------------------
 
 // Idempotent on (verified gateway id, request_id) for the lease's lifetime: a
-// repeated Decide after a stream reset returns the standing decision.
+// repeated Decide after a stream reset returns the standing decision. A
+// frame is at most 64 KiB as encoded.
 message DecideRequest {
+  // 1 to 256 bytes: the gateway's own key of one request among those it has
+  // standing, carried back on every answer. A longer id is sent as a digest
+  // of it, never cut: a cut key can be two requests'.
   bytes request_id = 1;
+  // At most 256 headers, as many as a view names: a longer list repeats a
+  // name and is out of its range.
   RequestFacts facts = 2;
   Constraints constraints = 3;
 }

@@ -46,6 +46,7 @@ use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
 use tracing::{debug, info};
 
 use super::{
+    decide,
     gateways::{Refused, Seat},
     lifecycle,
     principal::Principal,
@@ -189,14 +190,14 @@ fn refusal(refused: Refused) -> Status {
     }
 }
 
-/// The status of a frame the stream could not read. The transport's own
-/// stands, but for a message over the transport's limit: the contract
-/// never raises the transport's code for that one, and the code alone
-/// tells the case.
-fn unread(status: Status) -> Status {
+/// The status of a frame a stream could not read, `frame` naming the
+/// stream's kind of frame. The transport's own stands, but for a message
+/// over the transport's limit: the contract never raises the transport's
+/// code for that one, and the code alone tells the case.
+pub(crate) fn unread(frame: &str, status: Status) -> Status {
     if status.code() == Code::OutOfRange {
         Status::resource_exhausted(format!(
-            "a Session frame is over the transport's limit: {}",
+            "{frame} is over the transport's limit: {}",
             status.message()
         ))
     } else {
@@ -265,7 +266,7 @@ async fn session(
                 first = inbound.message() => match first {
                     Ok(Some(first)) => break first,
                     Ok(None) => return None,
-                    Err(status) => return Some(unread(status)),
+                    Err(status) => return Some(unread("a Session frame", status)),
                 },
                 () = &mut deadline => {
                     return Some(Status::deadline_exceeded(format!(
@@ -338,10 +339,11 @@ async fn session(
         }),
         needs,
         hashing,
-        // No call decides yet: with no credit a gateway decides locally.
-        // The call that issues leases sets these three.
-        decide_window: 0,
-        max_decide_streams: 0,
+        // A decide stream's credit at its open, and the streams a gateway
+        // holds at most. No lease is issued yet: the call that issues one
+        // sets the dispatch TTL.
+        decide_window: decide::WINDOW,
+        max_decide_streams: decide::MAX_STREAMS,
         dispatch_ttl_ms: 0,
         grace_period_ms: millis(shared.gateways.grace()),
         leader_poll_ms: millis(LEADER_POLL),
@@ -365,7 +367,7 @@ async fn session(
                 let frame = match frame {
                     Ok(Some(frame)) => frame,
                     Ok(None) => break None,
-                    Err(status) => break Some(unread(status)),
+                    Err(status) => break Some(unread("a Session frame", status)),
                 };
                 if let Some(status) = judge(shared, gateway, term, &seat, &frame, answers).await {
                     break Some(status);
@@ -793,8 +795,8 @@ mod tests {
                     }),
                     needs: None,
                     hashing: Vec::new(),
-                    decide_window: 0,
-                    max_decide_streams: 0,
+                    decide_window: 128,
+                    max_decide_streams: 256,
                     grace_period_ms: 10_000,
                     dispatch_ttl_ms: 0,
                     leader_poll_ms: 1_000,

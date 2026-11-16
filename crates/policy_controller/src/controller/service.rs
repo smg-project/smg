@@ -3,10 +3,11 @@
 //! health service, one instance a listener, holding that listener's scopes.
 //!
 //! `Leader` is served, on every listener and by every replica, to a caller
-//! with a principal or with none. `Session` is served to a gateway
-//! ([`session`]), and the control scope's three registration calls by the
-//! leader. `GetPolicySpec` is served on the control scope by a controller
-//! given a spec source. Every other call is refused:
+//! with a principal or with none. `Session` and `Decide` are served to a
+//! gateway ([`session`], [`decide`]), and the control scope's three
+//! registration calls by the leader. `GetPolicySpec` is served on the
+//! control scope by a controller given a spec source. Every other call is
+//! refused:
 //! `PERMISSION_DENIED` where the listener mounts none of the call's scopes
 //! (the contract: the scope does not cover the RPC), `UNAUTHENTICATED`
 //! where it does and the listener's layer placed no principal on the call
@@ -28,6 +29,7 @@ use tonic::{service::Routes, Code, Request, Response, Status, Streaming};
 
 use super::{
     config::Scope,
+    decide::{self, Streams},
     deciders::{self, Deciders, Reads},
     election::{split_identity, Standing},
     gateways::Gateways,
@@ -76,6 +78,8 @@ pub(crate) struct Shared {
     pub(crate) door: Door,
     /// The threads the decisions run on, a model's on one.
     pub(crate) deciders: Deciders,
+    /// The decide streams each gateway holds open.
+    pub(crate) streams: Arc<Streams>,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -139,6 +143,7 @@ impl Shared {
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
             deciders,
+            streams: Arc::new(Streams::new(decide::MAX_STREAMS)),
         })
     }
 
@@ -422,7 +427,7 @@ impl Service {
 #[tonic::async_trait]
 impl PolicyController for Service {
     type SessionStream = session::Frames;
-    type DecideStream = Unserved<proto::DecideAnswer>;
+    type DecideStream = decide::Answers;
     type WatchWorkersStream = Unserved<proto::WorkerEvent>;
     type WatchRegimeStream = Unserved<proto::Regime>;
     type ReplicateStream = Unserved<proto::ReplicationBatch>;
@@ -440,7 +445,9 @@ impl PolicyController for Service {
         &self,
         request: Request<Streaming<proto::DecideRequest>>,
     ) -> Result<Response<Self::DecideStream>, Status> {
-        self.unserved(Call::Decide, &request)
+        let principal = self.admit(Call::Decide, &request)?.clone();
+        let answers = decide::serve(Arc::clone(&self.shared), &principal, request.into_inner())?;
+        Ok(Response::new(answers))
     }
 
     async fn watch_workers(
@@ -1014,6 +1021,13 @@ mod tests {
                     (
                         Code::FailedPrecondition,
                         "this replica does not lead".to_owned(),
+                    )
+                } else if layer == Layer::AsTold && stated && *method == "Decide" {
+                    // The stream opens, and the call itself refuses the
+                    // case's one frame: it carries no id.
+                    (
+                        Code::InvalidArgument,
+                        "request_id is out of its range in this protocol version".to_owned(),
                     )
                 } else if layer == Layer::AsTold && stated {
                     (
