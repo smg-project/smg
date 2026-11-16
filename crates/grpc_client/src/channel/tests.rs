@@ -22,8 +22,8 @@ use super::{
         drive, open, Connection, End, CONNECTION_WINDOW, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT,
         STREAM_WINDOW,
     },
-    is_transport_failure, normalize_grpc_endpoint, testing, BoxError, Channel, RecvBody, Shared,
-    DEFAULT_CONNECT_TIMEOUT,
+    dial_failure_without_peer, is_transport_failure, normalize_grpc_endpoint, testing, BoxError,
+    Channel, RecvBody, Shared, DEFAULT_CONNECT_TIMEOUT,
 };
 use crate::{tokenspeed_proto, TokenSpeedSchedulerClient};
 
@@ -1113,6 +1113,37 @@ async fn a_refused_dial_names_the_peer_in_its_error() {
     );
 }
 
+/// The same refusal reads without the peer for an answer to a client: the
+/// failure as the dial worded it, less the address.
+#[tokio::test]
+async fn a_refused_dial_reads_without_the_peer_for_a_client() {
+    let (peer, status) = a_refused_dial().await;
+    let without_peer = dial_failure_without_peer(&status).expect("a dial's failure");
+    assert!(
+        status
+            .message()
+            .ends_with(&format!("{peer}: {without_peer}")),
+        "the message less the peer is not {without_peer}: {status:?}"
+    );
+    let port = peer.rsplit(':').next().expect("the peer's port");
+    assert!(
+        !without_peer.contains("127.0.0.1") && !without_peer.contains(port),
+        "the peer is left in: {without_peer}"
+    );
+}
+
+/// A status the channel did not make of a failed dial has no such form: the
+/// worker's own answer is read whole.
+#[test]
+fn a_status_that_is_no_failed_dial_has_no_form_without_a_peer() {
+    for status in [
+        tonic::Status::unavailable("the engine is draining"),
+        tonic::Status::internal("the engine failed the request"),
+    ] {
+        assert_eq!(dial_failure_without_peer(&status), None, "{status:?}");
+    }
+}
+
 /// A loopback peer that accepts the connect, reads the client's
 /// connection preface and resets the socket without answering it: the
 /// TCP connect and the handshake's write complete, the handshake's read
@@ -1745,6 +1776,12 @@ async fn callers_behind_a_refused_dial_each_end_unavailable_at_once() {
         let status = answer.expect_err("nothing listens");
         assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
         assert!(!is_transport_failure(&status), "{status:?}");
+        // The callers that queued behind the dial get its failure again, the
+        // peer still apart from its words.
+        assert!(
+            dial_failure_without_peer(&status).is_some_and(|text| !text.contains("127.0.0.1")),
+            "{status:?}"
+        );
     }
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -1946,6 +1983,11 @@ async fn diagnostics_name_the_peer_without_the_url_userinfo() {
         assert!(
             status.message().contains("no connection to 127.0.0.1:"),
             "the connect timeout names the peer: {status:?}"
+        );
+        assert_eq!(
+            dial_failure_without_peer(&status),
+            Some("no connection within 300ms"),
+            "the connect timeout reads without the peer for a client: {status:?}"
         );
         assert!(
             without_userinfo(status.message()),

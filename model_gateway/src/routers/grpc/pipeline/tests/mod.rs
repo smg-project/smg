@@ -3924,6 +3924,70 @@ async fn a_request_that_completes_before_the_request_timeout_is_unchanged() {
     assert_eq!(worker.load(), 0);
 }
 
+/// A worker whose process is gone refuses the dial under the next call. The
+/// client's answer is that failure without the worker's address; the
+/// gateway's own line names the worker.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_dial_is_answered_without_the_workers_address() {
+    use crate::{routers::grpc::test_engine::serve_on, worker::test_support::RefusedAddress};
+
+    // The worker comes up on a port that stays taken after it: the port
+    // refuses again once the worker's listener is gone.
+    let address = RefusedAddress::reserve_shared();
+    let router =
+        Server::builder().add_service(TokenSpeedSchedulerServer::new(GatedScheduler::default()));
+    let server = serve_on(router, address.listen_shared());
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let worker = register_worker(&worker_registry, address.port(), WorkerType::Regular);
+    let deps = PipelineDeps::pair(
+        worker_registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    );
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+        .expect("completion pipeline");
+    let components = components(Arc::clone(&worker_registry)).await;
+    // The gateway holds the worker's connection, as after any served request.
+    worker
+        .get_backend_client()
+        .await
+        .expect("the worker is up")
+        .expect("a gRPC worker");
+    server.abort();
+    let _ = server.await;
+
+    let response = pipeline
+        .execute_completion(
+            completion(false),
+            None,
+            MODEL.to_string(),
+            Arc::clone(&components),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("drain body");
+    let error: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+    assert_eq!(error["error"]["code"], "start_generation_failed", "{error}");
+    let message = error["error"]["message"].as_str().expect("a message");
+    assert!(
+        message.starts_with("Failed to start generation: "),
+        "{message}"
+    );
+    assert!(
+        !message.contains("127.0.0.1") && !message.contains(&address.port().to_string()),
+        "the answer names the worker's address: {message}"
+    );
+}
+
 /// The request timeout under test and the cap a gateway without it fails at.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(300);
 const CASE_CAP: Duration = Duration::from_secs(10);

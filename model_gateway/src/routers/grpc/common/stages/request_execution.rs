@@ -1271,7 +1271,10 @@ pub(crate) fn start_failure_response(
     } else {
         error!(function = function, error = %e, "{}", description);
     }
-    let mut response = e.to_http_error(code, format!("{description}: {}", e.message()));
+    // The status of a dial that failed names the worker's address, for the
+    // line above; the client's answer is the same failure without it.
+    let detail = smg_grpc_client::dial_failure_without_peer(e).unwrap_or_else(|| e.message());
+    let mut response = e.to_http_error(code, format!("{description}: {detail}"));
     // INTERNAL is the servicers' code for a request the engine took and failed
     // on: the worker's own answer for this payload, which the retry layer does
     // not replay on it (see `routers::common::attempt_ledger`). tonic gives
