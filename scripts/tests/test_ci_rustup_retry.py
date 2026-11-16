@@ -1,7 +1,8 @@
 """The rustup installs of the CI jobs go through scripts/ci_retry.sh: the toolchain install of
 scripts/ci_install_rust.sh and the wasm32-wasip2 target install of the WASM fixture build each survive a
-failed download, a failure that stays is still the step's, and no workflow step installs a toolchain or a
-target by a bare rustup call or leaves the policy guest's target to the guest's own build script.
+failed download and a burst of them, a failure that stays is still the step's, every install takes the same
+attempts, and no workflow step installs a toolchain or a target by a bare rustup call or leaves the policy
+guest's target to the guest's own build script.
 
 Run with: pytest -q scripts/tests/test_ci_rustup_retry.py
 """
@@ -19,6 +20,12 @@ INSTALL = REPO / "scripts" / "ci_install_rust.sh"
 RETRY = REPO / "scripts" / "ci_retry.sh"
 FIXTURES = REPO / "crates" / "wasm" / "tests" / "fixtures" / "build_fixtures.sh"
 WORKFLOW = REPO / ".github" / "workflows" / "pr-test-rust.yml"
+
+# The attempts of every rustup install and the pauses between them (the helper
+# doubles its delay): 630 s in all. The release host fails in bursts of
+# minutes, and three attempts 10 s and 20 s apart gave up inside one.
+ATTEMPTS = 7
+PAUSES = ["10", "20", "40", "80", "160", "320"]
 
 # The utilities the scripts, the retry helper and the stubs call, linked into
 # the bed's own PATH so the host's rustup, cargo and curl are never found by
@@ -181,11 +188,21 @@ def test_a_failed_fetch_of_the_installer_is_retried_too(tmp_path: Path) -> None:
     assert lines(tmp_path / "sleeps") == ["10"]
 
 
+def test_the_toolchain_install_outlasts_a_burst_of_failed_downloads(tmp_path: Path) -> None:
+    # Every attempt but the last fails: the install still ends well, after
+    # every pause.
+    result = install(tmp_path, exits=[1] * (ATTEMPTS - 1))
+    assert result.returncode == 0, result.stderr
+    assert len(lines(tmp_path / "calls")) == ATTEMPTS
+    assert lines(tmp_path / "sleeps") == PAUSES
+    assert lines(tmp_path / "github_path") == [f"{tmp_path}/home/.cargo/bin"]
+
+
 def test_a_toolchain_download_that_keeps_failing_ends_the_step(tmp_path: Path) -> None:
-    result = install(tmp_path, exits=[1, 1, 1])
+    result = install(tmp_path, exits=[1] * ATTEMPTS)
     assert result.returncode == 1
-    assert len(lines(tmp_path / "calls")) == 3
-    assert lines(tmp_path / "sleeps") == ["10", "20"]
+    assert len(lines(tmp_path / "calls")) == ATTEMPTS
+    assert lines(tmp_path / "sleeps") == PAUSES
     assert lines(tmp_path / "github_path") == []
 
 
@@ -198,10 +215,10 @@ def test_the_wasm_target_install_is_retried_after_a_failed_download(tmp_path: Pa
 
 
 def test_a_wasm_target_download_that_keeps_failing_ends_the_step(tmp_path: Path) -> None:
-    result = build_fixtures(tmp_path, exits=[1, 1, 1])
+    result = build_fixtures(tmp_path, exits=[1] * ATTEMPTS)
     assert result.returncode == 1
-    assert len(lines(tmp_path / "calls")) == 3
-    assert lines(tmp_path / "sleeps") == ["10", "20"]
+    assert len(lines(tmp_path / "calls")) == ATTEMPTS
+    assert lines(tmp_path / "sleeps") == PAUSES
     assert lines(tmp_path / "builds") == []
 
 
@@ -220,11 +237,25 @@ def test_no_workflow_installs_a_toolchain_or_a_target_by_a_bare_rustup_call() ->
     assert bare == []
 
 
+# Every install behind the helper: the script's installer pipe, and each
+# rustup call of the fixture build and of the workflows.
+RETRIED_PIPE = re.compile(r'ci_retry\.sh" (\d+) (\d+) bash -o pipefail -c')
+RETRIED_RUSTUP = re.compile(r'ci_retry\.sh"? (\d+) (\d+) rustup ')
+
+
+def test_every_rustup_install_takes_the_same_attempts() -> None:
+    takes = RETRIED_PIPE.findall(INSTALL.read_text())
+    for path in [FIXTURES, *sorted((REPO / ".github").rglob("*.yml"))]:
+        takes += RETRIED_RUSTUP.findall(path.read_text())
+    assert len(takes) >= 6
+    assert set(takes) == {(str(ATTEMPTS), PAUSES[0])}
+
+
 def test_the_policy_plugin_step_adds_the_guest_target_before_the_script_that_would() -> None:
     # The guest's build.sh is the copy a user starts from: it adds a missing
     # target by one attempt. The step adds it first, behind the helper.
     step = WORKFLOW.read_text().split("- name: Build the example policy plugin", 1)[1]
     step = step.split("\n      - name:", 1)[0]
-    install = "bash scripts/ci_retry.sh 3 10 rustup target add wasm32-unknown-unknown"
+    install = f"bash scripts/ci_retry.sh {ATTEMPTS} 10 rustup target add wasm32-unknown-unknown"
     assert install in step
     assert step.index(install) < step.index("bash examples/wasm/wasm-guest-policy/build.sh")
