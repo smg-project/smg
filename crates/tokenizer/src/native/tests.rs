@@ -4231,6 +4231,117 @@ fn long_entry_bytes(piece: &[u8], ids: &[u32]) -> usize {
     LONG_PIECE_ENTRY_BYTES + piece.len() + size_of_val(ids)
 }
 
+/// A piece of 16 to 32 bytes is kept in the wide table when its ids fit an
+/// entry and in the map when they do not: every first sight stores the piece
+/// in one of the two, and a second encode reads the same ids.
+#[test]
+fn pieces_of_sixteen_to_thirty_two_bytes_are_kept_by_their_id_count() {
+    let mut state = 0x51DE_7AB1_E5EE_D001u64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let (mut fit, mut over) = (0, 0);
+    let mut text = String::new();
+    for i in 0..200u32 {
+        let piece = letters(16 + i as usize % 17, i);
+        let alone = tokenizer.encode(piece.as_str(), false).expect("encode");
+        if alone.get_ids().len() <= 7 {
+            fit += 1;
+        } else {
+            over += 1;
+        }
+        // Newlines split the words without joining a space to them.
+        text.push_str(&piece);
+        text.push('\n');
+    }
+    let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+    let first = native.encode(Some(model), &text, false).expect("ids");
+    assert_eq!(first, reference.get_ids());
+    {
+        let cache = native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow();
+        assert_eq!((cache.wide.len(), cache.short.len()), (fit, over));
+    }
+    assert_eq!(
+        native.encode(Some(model), &text, false).expect("ids"),
+        first
+    );
+}
+
+/// A thread's wide table grown for an earlier share keeps its slots through
+/// the clear of a share they still serve and gives them back at the
+/// thread's next encode once the share takes fewer (threads joined), as its
+/// packed table is cut back and its map made anew.
+#[test]
+fn a_thread_whose_wide_table_outgrew_its_share_gives_it_back_at_its_next_encode() {
+    let mut state = 0xFACE_B00C_0DD5_EED5u64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let mut native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let text = " a b c";
+    let before = native
+        .encode_with(Some(model), text, false, false)
+        .expect("ids");
+    // Sixteen thousand pieces of 20 bytes, stored as first sights store them.
+    for cache in &mut native.piece_cache {
+        let cache = cache.get_mut();
+        for i in 0..16_000u32 {
+            let key = WideKey::of(letters(20, i).as_bytes()).expect("a key");
+            assert!(cache.wide.insert(key, &[i, i + 1]));
+        }
+    }
+    let slots = |native: &mut NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .iter_mut()
+            .map(|cache| cache.get_mut().wide_slots())
+            .sum()
+    };
+    let entries = |native: &mut NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .iter_mut()
+            .map(|cache| cache.get_mut().short_entries())
+            .sum()
+    };
+    let grown = slots(&mut native);
+    assert_eq!(grown, 32_768);
+    assert!(entries(&mut native) >= 16_000);
+    // Threads join: the entries pass the share, whose slots these still are;
+    // the clear at the start of the next call keeps them.
+    native.threads.store(300, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert!(
+        share < 16_000 && grown <= ShortPieceTable::slots_for(share),
+        "{share}"
+    );
+    assert_eq!(
+        native
+            .encode_with(Some(model), text, false, false)
+            .expect("ids"),
+        before
+    );
+    assert!(entries(&mut native) <= share);
+    assert_eq!(slots(&mut native), grown);
+    // More threads join: the share takes fewer slots; the next call gives
+    // the table's back.
+    native.threads.store(1_024, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert!(grown > ShortPieceTable::slots_for(share), "{share}");
+    assert_eq!(
+        native
+            .encode_with(Some(model), text, false, false)
+            .expect("ids"),
+        before
+    );
+    assert_eq!(slots(&mut native), 0);
+}
+
 #[test]
 fn long_pieces_are_cached_by_their_bytes() {
     let mut state = 0x0BAD_F00D_1234_5678u64;
