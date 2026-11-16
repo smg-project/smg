@@ -19,6 +19,7 @@ use openai_protocol::{
         InputMessage, SystemContent, ToolResultContent,
     },
     profile::ProviderProfile,
+    worker::MmProcessingMode,
 };
 use serde_json::{json, Value};
 use tracing::error;
@@ -410,7 +411,16 @@ pub(crate) async fn resolve_media(
     // such a request and never schedules it), and no modality to a pool whose engines take none of
     // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,
     // on the declared parts, before any byte of media is fetched, decoded or sent.
-    multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
+    let router_processes = components
+        .multimodal
+        .as_ref()
+        .is_some_and(|mm_components| mm_components.processing == MmProcessingMode::Router);
+    multimodal::ensure_model_accepts_media(
+        &components.worker_registry,
+        model_id,
+        &plan,
+        router_processes,
+    )?;
     if plan.is_empty() {
         // A request without media renders the same under either order (its text parts in
         // their own order): the registries are not asked for a model with nothing to place.
