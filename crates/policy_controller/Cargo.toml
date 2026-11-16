@@ -81,7 +81,9 @@ tonic-health = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
-# The spec file's YAML form.
+# The spec file's YAML form, and the path of a field its reader refuses
+# (in the tree already, under the web framework).
+serde_path_to_error = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
 
 # The plugin host measures a call's bound on the CPU its thread had: the
@@ -131,6 +133,7 @@ controller = [
     "dep:prost",
     "dep:rustix",
     "dep:rustls",
+    "dep:serde_path_to_error",
     "dep:serde_yaml",
     "dep:thread_local",
     "dep:tokio",

@@ -540,8 +540,9 @@ mod tests {
     use super::{bind, color_for, set, truthy, Cli};
     use crate::{
         catalog::Catalog,
-        controller::{Config, ConfigError, Election, Error, LeasePlace, Scope},
+        controller::{Config, ConfigError, Election, Error, LeasePlace, Scope, SpecRejected},
         elector::ElectionSettings,
+        spec::SpecError,
         Candidate, Constraints, Filter, RequestFacts,
     };
 
@@ -962,6 +963,37 @@ mod tests {
         assert!(controller.catalog().filters().any(|name| name == "any"));
         // The stock build holds no such stage.
         assert!(Catalog::builtin().filters().all(|name| name != "any"));
+    }
+
+    /// A spec file's document names the stages the run is handed: a stage
+    /// of a host's own starts the controller on it, and the stock build
+    /// refuses the same file by the stage's name.
+    #[tokio::test]
+    async fn a_spec_file_names_the_stages_the_run_is_handed() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("policy.yaml");
+        let document =
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [any]\n    pick: random\n";
+        std::fs::write(&path, document).expect("the file");
+        let start = |stages: Catalog| {
+            let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+            bind(config, stages, &[], Some(path.clone()))
+        };
+
+        let mut stages = Catalog::builtin();
+        stages.filter("any", || Box::new(Any)).expect("a free name");
+        let controller = start(stages).await.expect("a host's stage starts");
+        assert_eq!(controller.store().world().spec().generation(), 1);
+        drop(controller);
+
+        match start(Catalog::builtin()).await {
+            Err(Error::SpecFile {
+                source: SpecRejected::Invalid(SpecError::UnknownFilter { profile, name }),
+                ..
+            }) => assert_eq!((profile.as_str(), name.as_str()), ("default", "any")),
+            Err(other) => panic!("the stock build refused it as {other}"),
+            Ok(_) => panic!("the stock build holds no such stage"),
+        }
     }
 
     /// The flag's names reach the bound controller: a name the flags mount

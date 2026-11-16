@@ -90,9 +90,12 @@ fn read(identity: &Identity) -> Result<Vec<u8>, SpecRejected> {
     let unreadable = |error: io::Error| SpecRejected::Unreadable(error.to_string());
     let file = fs::File::open(&identity.resolved).map_err(unreadable)?;
     let mut bytes = Vec::with_capacity(usize::try_from(identity.len).unwrap_or(0));
-    // Never more than the bound: a file that grew since the look is another
-    // file at the look after the read, and these bytes are not applied.
-    file.take(MAX_DOCUMENT_BYTES)
+    // One byte past the bound and no more. A file that grew since the look
+    // is another file at the look after the read. A source whose size a look
+    // cannot read (a device, a pipe) and that streams past the bound hands
+    // the door one byte over it and is refused by its size, never cut to a
+    // prefix that may parse.
+    file.take(MAX_DOCUMENT_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(unreadable)?;
     Ok(bytes)
@@ -151,7 +154,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("a directory");
         let path = dir.path().join("policy.yaml");
         fs::write(&path, document).expect("the file");
-        let generations = Generations::new(Arc::new(MemoryStore::new()));
+        let generations = Generations::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(crate::Catalog::builtin()),
+        );
         (dir, path, generations)
     }
 
@@ -228,7 +234,7 @@ mod tests {
         ));
 
         // Five bytes over: the refusal names the file's size, which no read
-        // gave it (a read stops at the bound).
+        // gave it (a read stops one byte past the bound).
         let over = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits") + 5;
         fs::write(&path, vec![b'#'; over]).expect("the file");
         assert_eq!(
@@ -287,15 +293,31 @@ mod tests {
         assert_ne!(after.inode.changed, before.inode.changed);
     }
 
-    /// A read stops at the bound, whatever the file grew to since its look:
-    /// the bytes of a file that grew are never the whole of a longer file.
+    /// A read stops one byte past the bound, whatever the file grew to since
+    /// its look: the byte over tells the door a document over the bound.
     #[test]
-    fn a_read_stops_at_the_bound() {
+    fn a_read_stops_one_byte_past_the_bound() {
         let (_dir, path, _generations) = bed(LEAST_LOAD.as_bytes());
         let looked = identity(&path).expect("the file");
         let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
         fs::write(&path, vec![b'#'; bound + 5]).expect("the file grows");
-        assert_eq!(read(&looked).map(|bytes| bytes.len()), Ok(bound));
+        assert_eq!(read(&looked).map(|bytes| bytes.len()), Ok(bound + 1));
+    }
+
+    /// A source whose size a look cannot read (a device, a pipe) and that
+    /// streams past the bound is refused by its size: the read hands the
+    /// door one byte over the bound, never a prefix that may parse.
+    #[cfg(unix)]
+    #[test]
+    fn a_stream_past_the_bound_is_refused_by_its_size() {
+        let (_dir, _path, generations) = bed(b"");
+        let zeros = Path::new("/dev/zero");
+        assert_eq!(identity(zeros).expect("the device").len, 0);
+        assert_eq!(
+            start(zeros, &generations),
+            Err(SpecRejected::TooLarge(MAX_DOCUMENT_BYTES + 1))
+        );
+        assert!(!generations.bound());
     }
 
     /// The identity reads where the path leads: a link turned to another

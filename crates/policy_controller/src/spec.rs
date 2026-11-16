@@ -2829,15 +2829,55 @@ impl PolicySpec {
     /// canonical form and so in no digest: the validator refuses it, and
     /// equal digests say nothing of a document that was not validated.
     pub fn digest(&self) -> Result<Digest, SpecError> {
-        let lineless = Self {
-            generation: 0,
-            ..self.clone()
-        };
         let mut hash = Sha256::new();
-        serde_json::to_writer(HashWriter(&mut hash), &lineless)
+        serde_json::to_writer(HashWriter(&mut hash), &self.lineless())
             .map_err(|error| SpecError::NoCanonicalForm(error.to_string()))?;
         Ok(Digest(hash.finalize().into()))
     }
+
+    /// The document's canonical form, borrowed: a digest copies none of the
+    /// document. Every field is named here, so a field the type gains does
+    /// not compile until this form takes it or leaves it out by name.
+    fn lineless(&self) -> Lineless<'_> {
+        let Self {
+            api_version,
+            generation: _,
+            kind: _,
+            view,
+            index,
+            profiles,
+            plans,
+            bindings,
+        } = self;
+        Lineless {
+            api_version,
+            generation: 0,
+            view,
+            index,
+            profiles,
+            plans,
+            bindings,
+        }
+    }
+}
+
+/// A document's canonical form ([`Digest`]) by reference: [`PolicySpec`]'s
+/// fields in its order and under its attributes, the `generation` line
+/// zeroed and no `kind` line. It serializes as the document itself does
+/// under a zeroed line, byte for byte.
+#[derive(Serialize)]
+struct Lineless<'a> {
+    #[serde(rename = "apiVersion")]
+    api_version: &'a str,
+    generation: u64,
+    #[serde(skip_serializing_if = "is_default::<ViewSpec>")]
+    view: &'a ViewSpec,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    index: &'a BTreeMap<String, IndexSpec>,
+    profiles: &'a BTreeMap<String, ProfileSpec>,
+    #[serde(skip_serializing_if = "is_default::<PlansSpec>")]
+    plans: &'a PlansSpec,
+    bindings: &'a [BindingSpec],
 }
 
 /// A document's digest: SHA-256 over its canonical bytes, which are the
@@ -2927,15 +2967,17 @@ impl AppliedSpec {
         })
     }
 
-    /// [`AppliedSpec::validate`] under a digest its caller took already: the
-    /// controller's door reads the document's digest against the standing
-    /// one and hands it on, so an apply digests its document once.
+    /// [`AppliedSpec::validate`] over the stages `catalog` holds, under a
+    /// digest its caller took already: the controller's door reads the
+    /// document's digest against the standing one and hands it on, so an
+    /// apply digests its document once.
     #[cfg(feature = "controller")]
     pub(crate) fn validate_digested(
         document: &PolicySpec,
         digest: Digest,
+        catalog: &Catalog,
     ) -> Result<Self, SpecError> {
-        let engine = document.validate()?;
+        let engine = document.validate_in(catalog, &[])?;
         Ok(Self {
             engine,
             digest: Some(digest),
@@ -4774,6 +4816,60 @@ mod tests {
         }
     }
 
+    /// The digest copies none of the document: what it hashes is, byte for
+    /// byte, the JSON the document itself writes under a zeroed line. Held
+    /// for every preset, under a line and under none, for a document that
+    /// writes every field the schema names and for one that writes the
+    /// least: a field left out where it is the default is left out of both.
+    #[test]
+    fn a_digest_hashes_what_the_document_itself_writes_under_a_zeroed_line() {
+        let base = PolicySpec::preset("least_load").expect("a preset");
+        let every_field = PolicySpec {
+            view: ViewSpec {
+                headers: vec!["x-team".to_owned()],
+                ..base.view.clone()
+            },
+            index: BTreeMap::from([("another*".to_owned(), IndexSpec::default())]),
+            plans: PlansSpec {
+                pd_pair: PdPairPlanSpec {
+                    pairing: Pairing::Off,
+                },
+            },
+            bindings: vec![BindingSpec::default()],
+            ..base
+        };
+        let written = serde_json::to_value(&every_field).expect("the document is JSON");
+        let schema = serde_json::to_value(PolicySpec::schema()).expect("the schema is JSON");
+        let fields = |of: &serde_json::Value| -> BTreeSet<String> {
+            let fields = of.as_object().expect("a map of fields");
+            fields.keys().cloned().collect()
+        };
+        assert_eq!(
+            fields(&written),
+            fields(&schema["properties"]),
+            "the document writes every field the schema names"
+        );
+        let least = doc(r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}}}"#);
+        let mut documents = vec![every_field, least];
+        for name in PRESETS {
+            let preset = PolicySpec::preset(name).expect(name);
+            documents.push(PolicySpec {
+                generation: 7,
+                ..preset.clone()
+            });
+            documents.push(preset);
+        }
+        for document in documents {
+            let borrowed = serde_json::to_string(&document.lineless()).expect("serializes");
+            let owned = serde_json::to_string(&PolicySpec {
+                generation: 0,
+                ..document
+            })
+            .expect("serializes");
+            assert_eq!(borrowed, owned);
+        }
+    }
+
     /// A validated generation carries its document's digest; the unbound
     /// start has no document and no digest.
     #[test]
@@ -4795,8 +4891,8 @@ mod tests {
             .digest()
             .expect("a digest");
         assert_ne!(document.digest(), Ok(handed));
-        let applied =
-            AppliedSpec::validate_digested(&document, handed).expect("a preset validates");
+        let applied = AppliedSpec::validate_digested(&document, handed, &Catalog::builtin())
+            .expect("a preset validates");
         assert_eq!(applied.digest(), Some(handed));
     }
 }

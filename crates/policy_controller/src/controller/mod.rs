@@ -118,7 +118,7 @@ pub struct Controller {
     config: Config,
     /// The stages a policy document may name, fixed at the bind: the stock
     /// build's, or the host's own.
-    catalog: Catalog,
+    catalog: Arc<Catalog>,
     phase: watch::Sender<Phase>,
     readiness: Readiness,
     metrics: Arc<metrics::Metrics>,
@@ -311,6 +311,7 @@ impl Controller {
             pickers = ?catalog.pickers().collect::<Vec<_>>(),
             "stages held"
         );
+        let catalog = Arc::new(catalog);
         let mut listeners = Vec::with_capacity(config.listeners.len());
         for listener in &config.listeners {
             let name = listener.name.clone();
@@ -395,6 +396,7 @@ impl Controller {
             &elector,
             stood,
             Arc::new(MemoryStore::new()),
+            Arc::clone(&catalog),
         ));
         let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
         Ok(Self {
@@ -470,8 +472,8 @@ impl Controller {
     }
 
     /// The stages a policy document may name in this controller, fixed at
-    /// the bind. No call hands it a document yet, so a host judges one
-    /// against them here, as the controller will.
+    /// the bind: a spec file's document is validated against them
+    /// ([`Controller::spec_file`]).
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
@@ -482,8 +484,10 @@ impl Controller {
     /// answers `GetPolicySpec` with it. The file is read here and not again.
     ///
     /// A file that cannot be read, or a document the validator refuses, is
-    /// refused here, before anything serves. A controller that takes no
-    /// spec file serves no spec call and renders no spec series.
+    /// refused here, before anything serves. The document names the stages
+    /// the bind was handed ([`Controller::catalog`]), a host's own among
+    /// them. A controller that takes no spec file serves no spec call and
+    /// renders no spec series.
     pub async fn spec_file(&mut self, path: impl Into<PathBuf>) -> Result<(), Error> {
         let path = path.into();
         let generations = Arc::clone(&self.shared.generations);

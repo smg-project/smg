@@ -32,6 +32,7 @@ use super::{
     session, PROTOCOL_VERSION,
 };
 use crate::{
+    catalog::Catalog,
     elector::{Elector, Fence},
     proto::{
         self,
@@ -84,13 +85,15 @@ impl Shared {
     /// its state as a field and fills it here, from these arguments where
     /// it can, so the other builders do not change. The identity and the
     /// fence are `elector`'s, so no instance answers under an identity
-    /// another fence guards.
+    /// another fence guards. A spec document names the stages `catalog`
+    /// holds.
     pub(crate) fn new(
         controller_id: String,
         address: String,
         elector: &Elector,
         standing: watch::Receiver<Standing>,
         store: Arc<MemoryStore>,
+        catalog: Arc<Catalog>,
     ) -> Self {
         let gateways = Arc::new(Gateways::new(
             session::GRACE_PERIOD,
@@ -104,7 +107,7 @@ impl Shared {
             identity: elector.identity().to_owned(),
             fence: elector.fence(),
             standing,
-            generations: Arc::new(Generations::new(Arc::clone(&store))),
+            generations: Arc::new(Generations::new(Arc::clone(&store), catalog)),
             store,
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
@@ -500,6 +503,7 @@ mod tests {
 
     use super::{Call, Service, Shared};
     use crate::{
+        catalog::Catalog,
         controller::{
             config::Scope,
             election::{self, Standing},
@@ -538,6 +542,7 @@ mod tests {
             &elector,
             stood,
             Arc::new(MemoryStore::new()),
+            Arc::new(Catalog::builtin()),
         ));
         (elector, standing, Service::new(scopes.to_vec(), shared))
     }
@@ -594,6 +599,7 @@ mod tests {
             &elector,
             stood,
             Arc::clone(&store),
+            Arc::new(Catalog::builtin()),
         ));
         let service = Service::new(vec![Scope::Gateway], shared);
         let mut running = election::start(elector, store, standing).expect("a thread");
@@ -967,6 +973,7 @@ mod tests {
                 &elector,
                 stood,
                 Arc::new(MemoryStore::new()),
+                Arc::new(Catalog::builtin()),
             )),
         );
 

@@ -420,7 +420,10 @@ mod tests {
         let rendered = metrics.render(|| State::Leader, &Stats::default());
         assert!(!rendered.contains("smg_policy_spec"), "{rendered}");
 
-        let generations = Arc::new(Generations::new(Arc::new(MemoryStore::new())));
+        let generations = Arc::new(Generations::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(crate::Catalog::builtin()),
+        ));
         metrics.spec(Arc::clone(&generations));
         for (document, generation) in [(LEAST_LOAD, 1), (RANDOM, 2)] {
             generations
