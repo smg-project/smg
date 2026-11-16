@@ -195,6 +195,8 @@ experiments against it transfer to engines:
 | `--max-batched-tokens` | 8192 | token budget per pass |
 | `--max-running` | 256 | sequences per pass |
 | `--kv-tokens` / `--kv-blocks` | 524288 tokens | KV pool capacity |
+| `--worker-kv-tokens` | none | `worker=tokens,...`: the named workers' pool capacity instead, at most the fleet's or a calibration's pool, whichever is larger (any size under `--timing linear`, whose decode reads no utilisation; workers named `grpc:<port>`, `http:<port>` or `zmq:<index>`; a data-parallel worker is named once and every rank takes the override). The pool's size is room, not speed: the worker's decode keeps the fleet's pool as its utilisation reference (a calibration's reference when one gave it), so it steps as fast as its peers on the same context. Generating workers only: a prefill or encode worker answers without running its engine |
+| `--worker-pass-time-scale` | none | `worker=factor,...`: every pass of the named workers takes `factor` times the timing model's duration (0.001 to 1000; above 1 a slower engine, below 1 a faster one); the rates the worker reports follow, as a servicer measures them. Named and limited as `--worker-kv-tokens` |
 | `--block-size` | 16 | cache block/page size (tokens); must match the worker's `kv_block_size` |
 | `--prefix-cache` | true | prefix caching + KV events |
 | `--prefill-first` | false | SGLang-style prefill-only passes |
