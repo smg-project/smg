@@ -9,8 +9,9 @@
 //! sink. Loads are the controller's own load driver's: the harness writes no
 //! load row. Health has no driver in the crate yet, so the harness stands in
 //! for one ([`probe`]): once an interval it asks each engine its wire's
-//! health check and writes what it heard, never what the case knows. The
-//! stand-in leaves the day a driver feeds that sink.
+//! health check and writes what it heard, never what the case knows. A dial
+//! is bounded, so an engine that stops answering costs a turn that bound and
+//! no more. The stand-in leaves the day a driver feeds that sink.
 //!
 //! What is the store's handle today is the wire tomorrow: a rank's
 //! registration ([`Harness::register`]) becomes the control scope's call when
@@ -23,7 +24,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        mpsc, Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -46,6 +47,7 @@ use smg_policy_controller::{
     view::{LoadRow, Role, WireModes, WorkerId},
 };
 use tokio::{
+    io::{copy, sink},
     net::{TcpListener, TcpStream},
     sync::{oneshot, watch},
     task::JoinSet,
@@ -112,6 +114,9 @@ pub struct Verdict {
 pub struct Death {
     /// When the kill was asked: no socket of the engine had closed yet.
     pub at: Instant,
+    /// The probe turns begun when the kill was asked: a dial of a turn
+    /// numbered below it heard a live engine.
+    pub asked: u64,
     /// The probe turns begun once every socket of the engine had closed: a
     /// turn numbered above it dialed a dead engine.
     pub turn: u64,
@@ -121,19 +126,37 @@ pub struct Death {
 /// runtime, so every socket of the engine closes at once, as a dead
 /// process's do.
 struct Engine {
-    addr: SocketAddr,
     endpoint: String,
     kill: Option<oneshot::Sender<()>>,
     /// Its sender drops when the engine's thread ends, the runtime gone: a
     /// wait on it is bounded, where a join of the thread is not.
     ended: Option<oneshot::Receiver<()>>,
+    /// A connection of the harness's own, opened at the start and never
+    /// written: it reads its end when the engine's sockets close.
+    witness: Option<TcpStream>,
+    /// Hangs the engine: its thread waits on the receiver it is sent, so
+    /// nothing of the engine answers while its sockets stay open.
+    hang: Option<oneshot::Sender<mpsc::Receiver<()>>>,
+    /// Held while the engine hangs: its drop lets the thread go on to its
+    /// end.
+    release: Option<mpsc::Sender<()>>,
 }
 
 /// What the stand-in prober counts and writes.
 #[derive(Default)]
 struct Turns {
     begun: AtomicU64,
+    /// What each dial heard, in the order dialed.
+    dialed: Mutex<Vec<Dialed>>,
     verdicts: Mutex<Vec<Verdict>>,
+}
+
+/// What one dial of an engine heard.
+#[derive(Clone, Copy, Debug)]
+struct Dialed {
+    engine: usize,
+    turn: u64,
+    healthy: bool,
 }
 
 /// An engine as the stand-in prober dials it: its address and the rows its
@@ -207,11 +230,14 @@ fn engine_params() -> EngineParams {
 
 /// One mock engine with `ranks` ranks, served on a runtime of this thread
 /// until `killed` resolves; the runtime is dropped at the return, and every
-/// task of the engine with it. `bound` takes the listener's address.
+/// task of the engine with it. `bound` takes the listener's address. A
+/// receiver sent on `hung` stops the thread on it: nothing of the engine
+/// answers and its sockets stay open, until that receiver's sender drops.
 fn serve_engine(
     ranks: u16,
     bound: oneshot::Sender<Result<SocketAddr, String>>,
     killed: oneshot::Receiver<()>,
+    hung: oneshot::Receiver<mpsc::Receiver<()>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -252,6 +278,10 @@ fn serve_engine(
                 std::future::pending(),
             ) => {}
             _ = killed => {}
+            Ok(release) = hung => {
+                // The thread stops here, and the runtime with it.
+                let _ = release.recv();
+            }
         }
     });
 }
@@ -262,21 +292,31 @@ async fn start_engine(ranks: u16) -> Result<Engine, String> {
     let (bound, address) = oneshot::channel::<Result<SocketAddr, String>>();
     let (kill, killed) = oneshot::channel::<()>();
     let (ending, ended) = oneshot::channel::<()>();
+    let (hang, hung) = oneshot::channel::<mpsc::Receiver<()>>();
     thread::Builder::new()
         .name("mock-engine".to_owned())
         .spawn(move || {
-            serve_engine(ranks, bound, killed);
+            serve_engine(ranks, bound, killed, hung);
             drop(ending);
         })
         .map_err(|error| error.to_string())?;
     let addr = bounded("an engine's listener is bound", ROOM, address)
         .await?
         .map_err(|_| "an engine's thread ended before its listener was bound".to_owned())??;
+    let witness = bounded(
+        "an engine accepts a connection",
+        ROOM,
+        TcpStream::connect(addr),
+    )
+    .await?
+    .map_err(|error| error.to_string())?;
     Ok(Engine {
-        addr,
         endpoint: format!("http://{addr}"),
         kill: Some(kill),
         ended: Some(ended),
+        witness: Some(witness),
+        hang: Some(hang),
+        release: None,
     })
 }
 
@@ -333,6 +373,11 @@ async fn probe(
         } in engines
         {
             let healthy = dial(&mut clients, &endpoint).await;
+            turns.dialed.lock().push(Dialed {
+                engine,
+                turn,
+                healthy,
+            });
             for id in ids {
                 let Some(row) = store.get(id) else { continue };
                 // A verdict is pushed under the lock its write was made
@@ -592,35 +637,69 @@ impl Harness {
     }
 
     /// Kills the engine at `engine`: its runtime is dropped and the call
-    /// returns once its thread has ended, every socket of it closed and its
-    /// address refusing a connection. The thread is never joined: a thread
-    /// that did not end would hold the test process at its exit.
+    /// returns once its thread has ended and a connection the harness held
+    /// to it read its end, so every socket of the engine closed. A hung
+    /// engine is let go first. The thread is never joined: a thread that
+    /// did not end would hold the test process at its exit.
     pub async fn kill(&mut self, engine: usize) -> Result<Death, String> {
         let slot = self
             .engines
             .get_mut(engine)
             .ok_or_else(|| format!("no engine {engine}"))?;
-        let (Some(kill), Some(ended)) = (slot.kill.take(), slot.ended.take()) else {
+        let (Some(kill), Some(ended), Some(mut witness)) =
+            (slot.kill.take(), slot.ended.take(), slot.witness.take())
+        else {
             return Err(format!("engine {engine} is dead already"));
         };
-        let addr = slot.addr;
+        slot.hang = None;
+        slot.release = None;
         let at = Instant::now();
+        let asked = self.turns.begun.load(Ordering::SeqCst);
         drop(kill);
         // The sender's drop is the thread's end: the wait ends on the error.
         let _ = bounded("a killed engine's thread ends", ROOM, ended).await?;
-        let dialed = bounded(
-            "a dead engine's address answers a connect",
+        // The proof of death is a socket of the harness's own: it reads to
+        // its end once the engine's side closed. A reset is an end too.
+        let _ = bounded(
+            "a killed engine's sockets close",
             ROOM,
-            TcpStream::connect(addr),
+            copy(&mut witness, &mut sink()),
         )
         .await?;
-        if dialed.is_ok() {
-            return Err(format!("engine {engine} still accepts a connection"));
-        }
         Ok(Death {
             at,
+            asked,
             turn: self.turns.begun.load(Ordering::SeqCst),
         })
+    }
+
+    /// Hangs the engine at `engine`: its thread stops, so nothing of it
+    /// answers, and every socket of it stays open. A kill ends the hang.
+    pub fn hang(&mut self, engine: usize) -> Result<(), String> {
+        let slot = self
+            .engines
+            .get_mut(engine)
+            .ok_or_else(|| format!("no engine {engine}"))?;
+        let hang = slot
+            .hang
+            .take()
+            .ok_or_else(|| format!("engine {engine} hangs already, or is dead"))?;
+        let (release, released) = mpsc::channel();
+        hang.send(released)
+            .map_err(|_| format!("engine {engine} ended before it hung"))?;
+        slot.release = Some(release);
+        Ok(())
+    }
+
+    /// The first turn, from `turn` on, whose dial of the engine at `engine`
+    /// heard it unhealthy.
+    pub fn first_unhealthy(&self, engine: usize, turn: u64) -> Option<u64> {
+        self.turns
+            .dialed
+            .lock()
+            .iter()
+            .find(|dial| dial.engine == engine && dial.turn >= turn && !dial.healthy)
+            .map(|dial| dial.turn)
     }
 
     /// The statuses the stand-in prober moved so far, in the order written.
