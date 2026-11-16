@@ -199,6 +199,7 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
                 tokenizer.as_ref(),
                 &request.messages,
                 false,
+                false,
             )
             .await
             .unwrap();
@@ -353,6 +354,7 @@ fn glm53_media_is_recorded_before_the_template_renders_it_as_text() {
                 tokenizer.as_ref(),
                 &request.messages,
                 true,
+                false,
             )
             .await
             .unwrap();

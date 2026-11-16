@@ -17,6 +17,8 @@ on:
       - 'crates/policy_controller/Cargo.toml'
       - 'crates/policy_controller/build.rs'
       - 'crates/policy_controller/src/**'
+      # The index crate the binary links.
+      - 'crates/kv_index/**'
       # The contracts: the binary's protocol and plugin bindings are compiled
       # from them, the protocol's with the engine wire's messages it imports.
       - 'crates/policy_controller/contracts/**'

@@ -1401,6 +1401,7 @@ fn kept_worker_gauges_set_the_recorders_series() {
         Metrics::set_worker_requests_active("http://w1", 2);
         Metrics::set_worker_cb_consecutive_failures("http://w1", 1);
         Metrics::set_worker_cb_consecutive_successes("http://w1", 4);
+        Metrics::set_worker_routing_keys_active("http://w1", 5);
         assert_eq!(
             value("smg_worker_requests_active", "http://w1").as_deref(),
             Some("2")
@@ -1412,6 +1413,10 @@ fn kept_worker_gauges_set_the_recorders_series() {
         assert_eq!(
             value("smg_worker_cb_consecutive_successes", "http://w1").as_deref(),
             Some("4")
+        );
+        assert_eq!(
+            value("smg_worker_routing_keys_active", "http://w1").as_deref(),
+            Some("5")
         );
 
         workers.retire("http://w1", gone("http://w1"));
@@ -1792,6 +1797,107 @@ fn kept_worker_outcome_counters_follow_the_workers_registrations() {
         handles::worker_set_changed();
         Metrics::record_worker_cb_outcome("http://w1", "success");
         assert_eq!(value("http://w1", "success").as_deref(), Some("1"));
+    });
+    handles::reset();
+}
+
+/// The KV-event set a batch moves, recorded through kept handles, renders
+/// exactly as it does with a key built per record: the same series with
+/// the same values, each worker's own.
+#[test]
+fn the_kv_event_set_renders_the_same_through_kept_handles() {
+    let records = || {
+        for worker in ["grpc://w:1", "grpc://w:2"] {
+            Metrics::record_kv_event_blocks(worker, "stored", 3);
+            Metrics::record_kv_event_blocks(worker, "stored", 2);
+            Metrics::record_kv_event_blocks(worker, "removed", 1);
+            Metrics::record_kv_event_batch(worker, "applied");
+            Metrics::record_kv_event_batch(worker, "applied");
+            Metrics::record_kv_event_batch(worker, "load_only");
+            Metrics::record_kv_event_apply(worker, 0.001);
+            Metrics::record_kv_event_lag(worker, 0.25);
+            Metrics::set_kv_index_blocks(worker, 9);
+            Metrics::set_kv_index_blocks(worker, 4);
+        }
+    };
+    let built = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(false));
+        records();
+        handles::reset();
+    });
+    let kept = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        records();
+        handles::reset();
+    });
+    assert_eq!(sorted_series(&kept), sorted_series(&built));
+    for expected in [
+        "smg_kv_event_blocks_total{worker=\"grpc://w:1\",op=\"stored\"} 5",
+        "smg_kv_event_blocks_total{worker=\"grpc://w:2\",op=\"removed\"} 1",
+        "smg_kv_event_batches_total{worker=\"grpc://w:1\",disposition=\"applied\"} 2",
+        "smg_kv_event_batches_total{worker=\"grpc://w:2\",disposition=\"load_only\"} 1",
+        "smg_kv_event_apply_seconds_count{worker=\"grpc://w:2\"} 1",
+        "smg_kv_event_lag_seconds_count{worker=\"grpc://w:1\"} 1",
+        "smg_kv_index_blocks{worker=\"grpc://w:1\"} 4",
+    ] {
+        assert!(
+            kept.lines().any(|line| line == expected),
+            "missing {expected} in:\n{kept}"
+        );
+    }
+}
+
+/// The KV-event set is per-worker series: through kept handles a batch's
+/// records land on the recorder's own series, a retirement drops the kept
+/// handles (a batch racing the removal feeds nothing), and a
+/// re-registration starts the counter over instead of feeding the handles
+/// built while the address was retired.
+#[test]
+fn kept_kv_event_handles_follow_the_workers_registrations() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(&workers),
+    );
+    workers.activate("grpc://w1");
+    // The rendered value of the worker's one series of a name.
+    let value = |name: &str| -> Option<String> {
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        rendered
+            .lines()
+            .find(|line| line.starts_with(&format!("{name}{{")))
+            .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
+    };
+    let batch = |blocks: usize| {
+        Metrics::record_kv_event_batch("grpc://w1", "applied");
+        Metrics::set_kv_index_blocks("grpc://w1", blocks);
+    };
+    handles::force_on_this_thread(Some(true));
+    metrics::with_local_recorder(&recorder, || {
+        batch(3);
+        batch(5);
+        assert_eq!(value("smg_kv_event_batches_total").as_deref(), Some("2"));
+        assert_eq!(value("smg_kv_index_blocks").as_deref(), Some("5"));
+
+        workers.retire("grpc://w1", gone("grpc://w1"));
+        handles::worker_set_changed();
+        batch(7);
+        assert_eq!(value("smg_kv_event_batches_total"), None);
+        assert_eq!(value("smg_kv_index_blocks"), None);
+
+        workers.activate("grpc://w1");
+        handles::worker_set_changed();
+        batch(2);
+        assert_eq!(value("smg_kv_event_batches_total").as_deref(), Some("1"));
+        assert_eq!(value("smg_kv_index_blocks").as_deref(), Some("2"));
     });
     handles::reset();
 }

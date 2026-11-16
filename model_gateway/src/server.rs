@@ -2837,8 +2837,10 @@ async fn graceful_shutdown(
         "Beginning graceful shutdown: readiness draining"
     );
     // Everything below shares the grace: the drain takes what the settle
-    // window and the leave of the mesh leave of it.
-    let deadline = tokio::time::Instant::now() + budget.grace;
+    // window and the leave of the mesh leave of it. A grace the clock cannot
+    // hold ends at the far future: the plain sum would panic here, in the
+    // signal's task, before readiness drains.
+    let deadline = middleware::body_timeout::deadline_from_now(budget.grace);
     inflight_tracker.begin_drain();
     let left_in_time = if budget.settle.is_zero() {
         tokio::time::timeout(budget.grace, leave_mesh).await.is_ok()
@@ -3249,6 +3251,71 @@ mod graceful_shutdown_tests {
             1,
             "the stuck request is reported, not waited for"
         );
+    }
+
+    /// A grace the clock cannot hold (an operator's "never", written as the
+    /// largest number) still drains: its end is the far future, thirty years
+    /// on. Readiness drains at once, the listeners are gated after the settle
+    /// window with what is left to that end, and a request in flight is
+    /// waited for. The plain sum of such a grace and the clock panics before
+    /// readiness drains. A grace the clock holds ends where it always did,
+    /// one past the far future too.
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_past_the_clocks_range_still_drains() {
+        const YEAR: u64 = 86400 * 365;
+        let far_future = Duration::from_secs(30 * YEAR);
+        for (grace_secs, end) in [
+            (u64::MAX, far_future),
+            // The clock counts seconds in a signed 64-bit number: 2^63 does
+            // not fit, and neither does one second less once added to now.
+            (1 << 63, far_future),
+            ((1 << 63) - 1, far_future),
+            (10 * YEAR, Duration::from_secs(10 * YEAR)),
+            (40 * YEAR, Duration::from_secs(40 * YEAR)),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let request = tracker.track();
+            let start = tokio::time::Instant::now();
+            let gated = Arc::new(Mutex::new(None));
+            let stop_listeners = {
+                let gated = Arc::clone(&gated);
+                let tracker = Arc::clone(&tracker);
+                move |drain_timeout| {
+                    *gated.lock().expect("no poison") =
+                        Some((start.elapsed(), drain_timeout, tracker.is_draining()));
+                }
+            };
+            // The request ends an hour in, during the drain.
+            let release = async {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                drop(request);
+            };
+            let shutdown = graceful_shutdown(
+                &tracker,
+                ShutdownBudget::from_grace_secs(grace_secs, None),
+                async {},
+                || panic!("a completed mesh leave must not be stopped again"),
+                stop_listeners,
+            );
+            let (deadline, ()) = tokio::join!(shutdown, release);
+            assert_eq!(
+                gated.lock().expect("no poison").take(),
+                Some((Duration::from_secs(5), end - Duration::from_secs(5), true)),
+                "{grace_secs}: gated after the settle window, with what is left of the grace, \
+                 while draining"
+            );
+            assert_eq!(
+                start.elapsed(),
+                Duration::from_secs(3600),
+                "{grace_secs}: the drain ended with the request"
+            );
+            assert_eq!(
+                deadline,
+                Some(start + end),
+                "{grace_secs}: the end of the grace the caller waits to"
+            );
+            assert!(tracker.is_empty());
+        }
     }
 
     /// With no grace there is no settle window: the leave gets no time (a
