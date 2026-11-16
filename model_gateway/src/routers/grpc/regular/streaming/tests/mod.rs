@@ -183,10 +183,8 @@ fn text_delta_frames_write_the_bytes_of_the_serialized_choice() {
                 "\u{0}\u{1f}\u{7f}",
             ] {
                 let choice = bare(index, field, text);
-                let (read_field, read_text, read_logprobs) =
-                    text_delta(&choice).expect("a bare text delta");
+                let (read_field, read_text) = text_delta(&choice).expect("a bare text delta");
                 assert_eq!((read_field, read_text), (field, text));
-                assert!(read_logprobs.is_none());
                 for (usage, emit_usage_null) in [
                     (None, false),
                     (None, true),
@@ -232,139 +230,6 @@ fn text_delta_frames_write_the_bytes_of_the_serialized_choice() {
     let mut neither = bare(0, TextDelta::Content, "x");
     neither.delta.content = None;
     assert!(text_delta(&neither).is_none(), "no text");
-}
-
-/// A bare text delta carrying the token's logprobs, written in one pass, is
-/// byte for byte the serialized choice: tokens with every escape, byte lists
-/// of one to eight bytes and none, logprobs that are negative, zero, whole,
-/// tiny, large and not finite, no candidates, a refusal list, a null content
-/// and a raw logprobs value; over both text fields, texts that need escaping
-/// and the usage tail's three shapes.
-#[test]
-fn text_delta_logprobs_frames_write_the_bytes_of_the_serialized_choice() {
-    use std::borrow::Cow;
-
-    use openai_protocol::{
-        chat::{ChatMessageDeltaRef, ChatStreamChoiceRef},
-        common::{ChatLogProbs, ChatLogProbsContent, TopLogProb},
-    };
-
-    fn entry(
-        token: &str,
-        logprob: f32,
-        bytes: Option<&[u8]>,
-        candidates: &[(&str, f32, Option<&[u8]>)],
-    ) -> ChatLogProbsContent {
-        ChatLogProbsContent {
-            token: token.to_string(),
-            logprob,
-            bytes: bytes.map(<[u8]>::to_vec),
-            top_logprobs: candidates
-                .iter()
-                .map(|&(token, logprob, bytes)| TopLogProb {
-                    token: token.to_string(),
-                    logprob,
-                    bytes: bytes.map(<[u8]>::to_vec),
-                })
-                .collect(),
-        }
-    }
-    let utf8 = |text: &'static str| -> Option<&'static [u8]> { Some(text.as_bytes()) };
-    let raw_bytes: &[u8] = &[0, 31, 255, 128, 100, 10, 9, 1];
-    let none_bytes: Option<&[u8]> = None;
-    let empty_bytes: Option<&[u8]> = Some(&[]);
-    let shapes = [
-        ChatLogProbs::Detailed {
-            content: Some(vec![
-                entry(
-                    "he",
-                    -0.125,
-                    utf8("he"),
-                    &[
-                        ("he", -0.125, utf8("he")),
-                        ("she", -1.5, utf8("she")),
-                        ("\"q\"", -2.0, utf8("\"q\"")),
-                        ("\\", -3.25, none_bytes),
-                        ("\n", -1e-7, utf8("\n")),
-                    ],
-                ),
-                entry(" \u{1F642}", -0.0, utf8(" \u{1F642}"), &[]),
-                entry(
-                    "\u{0}\u{1f}",
-                    f32::NEG_INFINITY,
-                    Some(raw_bytes),
-                    &[("x", f32::NAN, utf8("x")), ("y", 1234.5678, none_bytes)],
-                ),
-                entry("", 0.0, empty_bytes, &[("", f32::INFINITY, empty_bytes)]),
-            ]),
-            refusal: None,
-        },
-        ChatLogProbs::Detailed {
-            content: None,
-            refusal: Some(vec![entry(
-                "no",
-                -0.5,
-                utf8("no"),
-                &[("no", -0.5, utf8("no"))],
-            )]),
-        },
-        ChatLogProbs::Detailed {
-            content: None,
-            refusal: None,
-        },
-        ChatLogProbs::Raw(serde_json::json!({
-            "content": [{"token": "t", "logprob": -1.0}],
-            "extra": [1, "two", null]
-        })),
-    ];
-    let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, Some("v7"));
-    for logprobs in shapes {
-        for field in [TextDelta::Content, TextDelta::Reasoning] {
-            for text in ["a", "he said \"hi\" \\ done", "\u{1F642} ünïcödé", ""] {
-                let choice = ChatStreamChoiceRef {
-                    index: 3,
-                    delta: ChatMessageDeltaRef {
-                        role: None,
-                        content: (field == TextDelta::Content).then_some(Cow::Borrowed(text)),
-                        tool_calls: None,
-                        reasoning_content: (field == TextDelta::Reasoning)
-                            .then_some(Cow::Borrowed(text)),
-                    },
-                    logprobs: Some(logprobs.clone()),
-                    finish_reason: None,
-                    matched_stop: None,
-                };
-                let Some((read_field, read_text, Some(read_logprobs))) = text_delta(&choice) else {
-                    panic!("a bare delta with logprobs reads as one: {field:?} {text:?}");
-                };
-                assert_eq!((read_field, read_text), (field, text));
-                for (usage, emit_usage_null) in [
-                    (None, false),
-                    (None, true),
-                    (Some(Usage::from_counts(3, 2)), false),
-                ] {
-                    let mut expected = BytesMut::new();
-                    frame.write_chunk(&mut expected, &choice, usage.as_ref(), emit_usage_null);
-                    let mut got = BytesMut::new();
-                    frame.write_text_delta_logprobs(
-                        &mut got,
-                        3,
-                        field,
-                        text,
-                        read_logprobs,
-                        usage.as_ref(),
-                        emit_usage_null,
-                    );
-                    assert_eq!(
-                        got,
-                        expected,
-                        "{field:?} {text:?} usage {} placeholder {emit_usage_null}",
-                        usage.is_some()
-                    );
-                }
-            }
-        }
-    }
 }
 
 /// A generate event written from the choice's escaped text is byte for byte
@@ -859,6 +724,8 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
 /// crossed it.
 #[test]
 fn the_chat_writer_returns_at_the_bound_and_resumes_with_the_next_event() {
+    use super::character_tokenizer::CharacterTokenizer;
+
     const EVENTS: usize = 600;
     const ONE_EVENT: usize = 1024;
     let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, Some("v7"));
@@ -882,6 +749,7 @@ fn the_chat_writer_returns_at_the_bound_and_resumes_with_the_next_event() {
     }
     let mut buffer = BytesMut::new();
     let mut logprobs = None;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let mut frames: Vec<Vec<u8>> = Vec::new();
     let mut pending = events.consume();
     while StreamingProcessor::write_events(
@@ -890,6 +758,8 @@ fn the_chat_writer_returns_at_the_bound_and_resumes_with_the_next_event() {
         0,
         &mut pending,
         &mut logprobs,
+        &tokenizer,
+        None,
         None,
         false,
     ) {
@@ -921,4 +791,133 @@ fn the_chat_writer_returns_at_the_bound_and_resumes_with_the_next_event() {
         EVENTS,
         "every event left exactly once across the flushes"
     );
+}
+
+/// A bare text delta's logprobs written straight from the engine message's
+/// view are byte for byte the serialized choice carrying the converted
+/// object (which [`text_delta`] reads as a bare delta): over a column wire
+/// and the record wire, requested candidate counts of none, fewer than, as
+/// many as and more than the engine ranked, a position without candidates,
+/// tokens whose text needs escaping, is empty or holds a replacement
+/// character, logprobs that are negative, zero, large, tiny and not finite,
+/// an empty view (`"content":null`), both text fields and the usage tail's
+/// three shapes.
+#[test]
+fn text_delta_logprobs_frames_write_the_bytes_of_the_serialized_choice() {
+    use std::borrow::Cow;
+
+    use openai_protocol::chat::{ChatMessageDeltaRef, ChatStreamChoiceRef};
+    use smg_grpc_client::{trtllm_proto as trtllm, vllm_proto as vllm};
+
+    use crate::routers::grpc::{proto_wrapper::ProtoOutputLogProbs, utils::convert_proto_logprobs};
+
+    let decode = |id: u32| -> String {
+        match id {
+            1 => "he".to_string(),
+            2 => " said \"hi\" \\".to_string(),
+            3 => "\n".to_string(),
+            4 => "\u{FFFD}".to_string(),
+            5 => String::new(),
+            6 => " \u{1F642} ünïcödé".to_string(),
+            other => format!("<token_{other}>"),
+        }
+    };
+    let columns = vllm::OutputLogProbs {
+        token_logprobs: vec![-0.125, -0.0, f32::NEG_INFINITY, 0.0],
+        token_ids: vec![1, 2, 4, 5],
+        top_logprobs: vec![
+            vllm::TopLogProbs {
+                values: vec![-0.125, -1.5, -2.0, -3.25, -1e-7, f32::NAN],
+                token_ids: vec![1, 2, 3, 4, 5, 6],
+            },
+            vllm::TopLogProbs {
+                values: vec![],
+                token_ids: vec![],
+            },
+            vllm::TopLogProbs {
+                values: vec![1234.5678],
+                token_ids: vec![9],
+            },
+            vllm::TopLogProbs {
+                values: vec![f32::INFINITY, -0.5],
+                token_ids: vec![5, 6],
+            },
+        ],
+    };
+    let candidate = |token_id, logprob| trtllm::TopLogprob { token_id, logprob };
+    let records = vec![
+        trtllm::TokenLogprob {
+            token_id: 1,
+            logprob: -0.125,
+            top_logprobs: vec![candidate(1, -0.125), candidate(3, -1.5)],
+        },
+        trtllm::TokenLogprob {
+            token_id: 6,
+            logprob: -2.0,
+            top_logprobs: vec![],
+        },
+    ];
+    let empty = vllm::OutputLogProbs {
+        token_logprobs: vec![],
+        token_ids: vec![],
+        top_logprobs: vec![],
+    };
+    let views = [
+        ProtoOutputLogProbs::Vllm(&columns),
+        ProtoOutputLogProbs::Trtllm(&records),
+        ProtoOutputLogProbs::Vllm(&empty),
+    ];
+    let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, Some("v7"));
+    for view in views {
+        for requested in [0usize, 1, 2, 6, 20] {
+            let converted = convert_proto_logprobs(view, Some(requested), decode);
+            for field in [TextDelta::Content, TextDelta::Reasoning] {
+                for text in ["a", "he said \"hi\" \\ done", ""] {
+                    let choice = ChatStreamChoiceRef {
+                        index: 3,
+                        delta: ChatMessageDeltaRef {
+                            role: None,
+                            content: (field == TextDelta::Content).then_some(Cow::Borrowed(text)),
+                            tool_calls: None,
+                            reasoning_content: (field == TextDelta::Reasoning)
+                                .then_some(Cow::Borrowed(text)),
+                        },
+                        logprobs: Some(converted.clone()),
+                        finish_reason: None,
+                        matched_stop: None,
+                    };
+                    let Some((read_field, read_text)) = text_delta(&choice) else {
+                        panic!("a bare delta with logprobs reads as one: {field:?} {text:?}");
+                    };
+                    assert_eq!((read_field, read_text), (field, text));
+                    for (usage, emit_usage_null) in [
+                        (None, false),
+                        (None, true),
+                        (Some(Usage::from_counts(3, 2)), false),
+                    ] {
+                        let mut expected = BytesMut::new();
+                        frame.write_chunk(&mut expected, &choice, usage.as_ref(), emit_usage_null);
+                        let mut got = BytesMut::new();
+                        frame.write_text_delta_logprobs_view(
+                            &mut got,
+                            3,
+                            field,
+                            text,
+                            view,
+                            requested,
+                            decode,
+                            usage.as_ref(),
+                            emit_usage_null,
+                        );
+                        assert_eq!(
+                            got,
+                            expected,
+                            "{view:?} requested {requested} {field:?} {text:?} usage {} placeholder {emit_usage_null}",
+                            usage.is_some()
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

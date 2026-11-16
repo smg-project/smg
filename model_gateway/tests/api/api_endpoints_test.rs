@@ -1683,6 +1683,7 @@ mod load_balancing_tests {
 #[cfg(test)]
 mod pd_mode_tests {
     use super::*;
+    use crate::common::create_test_context;
 
     #[tokio::test]
     async fn test_pd_mode_routing() {
@@ -1730,7 +1731,7 @@ mod pd_mode_tests {
         config.health_check.disable_health_check = true;
 
         // Create app context
-        let app_context = crate::common::create_test_context(config).await;
+        let app_context = create_test_context(config).await;
 
         let router_result = RouterFactory::create_router(&app_context).await;
 
@@ -2469,6 +2470,72 @@ mod validated_body_tests {
             assert_eq!(body["error"]["param"], param, "{context}: {body}");
         }
         assert!(body["error"]["message"].is_string(), "{context}: {body}");
+    }
+
+    /// A refusal raised while a request body is read and validated names its
+    /// code in the `x-smg-error-code` header, as a route's own refusal does.
+    /// On the Messages door, whose envelope has no code field, the header is
+    /// the only place the code is.
+    #[tokio::test]
+    async fn a_body_reading_refusal_names_its_code_in_the_header() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        for (path, refused, code) in [
+            (
+                "/v1/chat/completions",
+                r#"{"model":"mock-model","messages":"hi"}"#,
+                "invalid_type",
+            ),
+            (
+                "/v1/responses",
+                r#"{"model":"mock-model","input":7}"#,
+                "invalid_type",
+            ),
+            (
+                "/v1/messages",
+                r#"{"model":"mock-model","max_tokens":8,"messages":"hi"}"#,
+                "invalid_type",
+            ),
+            (
+                "/generate",
+                r#"{"model":"mock-model","text":7}"#,
+                "invalid_type",
+            ),
+            // A rule run on the body after it is read.
+            (
+                "/generate",
+                r#"{"model":"mock-model","text":""}"#,
+                "prompt_empty",
+            ),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(refused))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{path}: {refused}"
+            );
+            let header = response
+                .headers()
+                .get("x-smg-error-code")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(header.as_deref(), Some(code), "{path}: {refused}: {body}");
+            if path != "/v1/messages" {
+                assert_eq!(body["error"]["code"], code, "{path}: {refused}: {body}");
+            }
+        }
+        ctx.shutdown().await;
     }
 
     /// `/v1/rerank` runs the rules of the native route on its body before the

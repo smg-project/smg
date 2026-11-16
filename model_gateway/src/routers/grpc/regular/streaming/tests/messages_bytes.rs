@@ -143,6 +143,10 @@ async fn stream_bytes(scenario: &MessagesScenario) -> Vec<u8> {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            forcing: None,
+            opener: None,
+            forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         }),
@@ -363,4 +367,77 @@ async fn the_first_tokens_frame_is_pending_to_the_connection_before_the_burst_is
             .is_some_and(|frame| frame.contains("event: message_stop")),
         "the stream ends after the burst: {rest:?}"
     );
+}
+
+/// A tool call whose arguments do not open an object (a model that writes an
+/// array where the tool's schema asks for one): the stream's `tool_use` block
+/// keeps the empty object it started with and no `input_json_delta` is
+/// written, as the buffered answer's `input` is an empty object too, so a
+/// client that replays the streamed answer replays an object. A call whose
+/// arguments open an object streams them as written. Both tool routes:
+/// Symphony's Qwen3 table and the model's own tool parser.
+#[tokio::test]
+async fn a_tool_call_whose_arguments_are_not_an_object_streams_an_empty_input() {
+    let array_under_symphony = MessagesScenario {
+        name: "array_arguments_symphony",
+        with_tools: true,
+        thinking: false,
+        symphony: true,
+        model: "fixture-model",
+        frames: vec![
+            chunk(0, "<tool_call>\n{\"name\": \"lookup\", \"arguments\": [1, "),
+            chunk(0, "2]}\n</tool_call>"),
+            complete(0, "stop"),
+        ],
+        must_contain: "",
+    };
+    let array_under_the_parser = MessagesScenario {
+        name: "array_arguments_parser",
+        with_tools: true,
+        thinking: false,
+        symphony: false,
+        model: "kimi-fixture",
+        frames: vec![
+            chunk(0, r#"{"name": "lookup", "#),
+            chunk(0, r#""parameters": [1, 2]}"#),
+            complete(0, "stop"),
+        ],
+        must_contain: "",
+    };
+    for scenario in [array_under_symphony, array_under_the_parser] {
+        let bytes = stream_bytes(&scenario).await;
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(r#""type":"tool_use""#),
+            "{}: {text}",
+            scenario.name
+        );
+        assert!(text.contains(r#""input":{}"#), "{}: {text}", scenario.name);
+        assert!(
+            !text.contains("input_json_delta"),
+            "{}: {text}",
+            scenario.name
+        );
+    }
+
+    let object_under_symphony = MessagesScenario {
+        name: "object_arguments_symphony",
+        with_tools: true,
+        thinking: false,
+        symphony: true,
+        model: "fixture-model",
+        frames: vec![
+            chunk(
+                0,
+                "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": ",
+            ),
+            chunk(0, "\"x\"}}\n</tool_call>"),
+            complete(0, "stop"),
+        ],
+        must_contain: "",
+    };
+    let bytes = stream_bytes(&object_under_symphony).await;
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("input_json_delta"), "{text}");
+    assert!(text.contains(r#""partial_json":"#), "{text}");
 }

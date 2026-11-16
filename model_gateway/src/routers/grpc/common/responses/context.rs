@@ -42,7 +42,9 @@ pub(crate) struct ResponsesContext {
 
     pub mcp_format_registry: FormatRegistry,
 
-    /// Storage hook request context extracted from HTTP headers by middleware.
+    /// This request's storage-hook context (the middleware's header-derived
+    /// task-local), derived by the route in the request task; `None` in the
+    /// contexts the router stores at start-up, outside any request.
     pub request_context: Option<StorageRequestContext>,
 
     /// The background responses in flight (shared by every context of the

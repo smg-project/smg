@@ -21,8 +21,8 @@ use tokio::sync::Notify;
 
 // The trait is named only by the doc links of this module.
 #[cfg(doc)]
-use super::basic::Worker;
-use super::basic::WorkerRoutingKeyLoad;
+use super::identity::basic::Worker;
+use super::identity::basic::WorkerRoutingKeyLoad;
 
 /// Why the liveness tracker vetoes a worker (see the `liveness` module).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,7 +205,7 @@ pub struct WorkerRuntime {
     /// series at 1, or a stale code over a fresh one.
     publish_lock: Mutex<()>,
     /// Last successful contact and last token or completion, in
-    /// [`super::liveness::now_ms`] milliseconds.
+    /// [`super::health::liveness::now_ms`] milliseconds.
     last_contact_ms: AtomicU64,
     last_token_ms: AtomicU64,
     /// Waiting-queue depth from the previous load report.
@@ -213,10 +213,10 @@ pub struct WorkerRuntime {
     /// A transport failure happened since the last contact.
     transport_failed: AtomicBool,
     /// The worker's KV-event stream has pushed a load record: silence is
-    /// then judged by the stream's cadence (see [`super::liveness`]).
+    /// then judged by the stream's cadence (see [`super::health::liveness`]).
     pushed_loads: AtomicBool,
     /// The latest pushed load record reports the engine silent on its
-    /// in-flight requests past the wedge bound (see [`super::liveness`]).
+    /// in-flight requests past the wedge bound (see [`super::health::liveness`]).
     engine_stalled: AtomicBool,
     /// In-flight count at the previous liveness sweep.
     last_load_sample: AtomicUsize,
@@ -224,7 +224,7 @@ pub struct WorkerRuntime {
     /// KV event subscriber) retries the moment the worker is heard from.
     contact_wake: Arc<Notify>,
     /// When the worker last became routable (promoted to Ready, or a liveness
-    /// veto cleared), in [`super::liveness::now_ms`] milliseconds.
+    /// veto cleared), in [`super::health::liveness::now_ms`] milliseconds.
     admitted_at_ms: AtomicU64,
     /// The warm-up slice's baseline: the admission it was taken for and the
     /// blocks the index held for the worker then (see [`Self::warmup_growth`]).
@@ -234,12 +234,12 @@ pub struct WorkerRuntime {
     /// no further diverted hit.
     divert_until_ms: AtomicU64,
     /// When the current run of in-flight requests began (the load counter
-    /// left zero), in [`super::liveness::now_ms`] milliseconds; zero while
+    /// left zero), in [`super::health::liveness::now_ms`] milliseconds; zero while
     /// idle. The no-progress clock of the wedged rule starts here, not at
     /// registration or the last token before an idle spell.
     busy_since_ms: AtomicU64,
     /// Requests in flight whose responses the gateway sees one by one (see
-    /// [`Worker::tracked_load`]).
+    /// [`Self::tracked_load`]).
     tracked_in_flight: AtomicUsize,
     /// Open streams that have produced a token or completion (see
     /// [`Worker::output_silence`]).
@@ -701,15 +701,15 @@ impl WorkerRuntime {
             stall: AtomicU8::new(0),
             published_state: AtomicU8::new(0),
             publish_lock: Mutex::new(()),
-            last_contact_ms: AtomicU64::new(super::liveness::now_ms()),
-            last_token_ms: AtomicU64::new(super::liveness::now_ms()),
+            last_contact_ms: AtomicU64::new(super::health::liveness::now_ms()),
+            last_token_ms: AtomicU64::new(super::health::liveness::now_ms()),
             last_waiting_reqs: AtomicI64::new(0),
             transport_failed: AtomicBool::new(false),
             pushed_loads: AtomicBool::new(false),
             engine_stalled: AtomicBool::new(false),
             last_load_sample: AtomicUsize::new(0),
             contact_wake: Arc::new(Notify::new()),
-            admitted_at_ms: AtomicU64::new(super::liveness::now_ms()),
+            admitted_at_ms: AtomicU64::new(super::health::liveness::now_ms()),
             warmup_base_admitted_ms: AtomicU64::new(u64::MAX),
             warmup_base_blocks: AtomicUsize::new(0),
             divert_until_ms: AtomicU64::new(0),
@@ -722,7 +722,7 @@ impl WorkerRuntime {
 
     pub fn note_admitted(&self) {
         self.admitted_at_ms
-            .store(super::liveness::now_ms(), Ordering::Relaxed);
+            .store(super::health::liveness::now_ms(), Ordering::Relaxed);
     }
 
     pub fn admitted_age(&self) -> Duration {
@@ -810,13 +810,13 @@ impl WorkerRuntime {
 
     pub fn note_contact(&self) {
         self.last_contact_ms
-            .store(super::liveness::now_ms(), Ordering::Relaxed);
+            .store(super::health::liveness::now_ms(), Ordering::Relaxed);
         self.transport_failed.store(false, Ordering::Relaxed);
         self.contact_wake.notify_one();
     }
 
     pub fn note_token_progress(&self) {
-        self.note_token_progress_at(super::liveness::now_ms());
+        self.note_token_progress_at(super::health::liveness::now_ms());
     }
 
     /// [`Self::note_token_progress`] at `now` on the gateway clock.
@@ -882,7 +882,7 @@ impl WorkerRuntime {
     // ── Prefill backlog (the wedged rule's bound) ───────────────────
 
     pub fn note_prefill_started(&self, tokens: u64, timed: bool) {
-        self.note_prefill_started_at(tokens, timed, super::liveness::now_ms().max(1));
+        self.note_prefill_started_at(tokens, timed, super::health::liveness::now_ms().max(1));
     }
 
     /// [`Self::note_prefill_started`] at `now_ms` on the gateway clock.
@@ -891,7 +891,12 @@ impl WorkerRuntime {
     }
 
     pub fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
-        self.note_prefill_ended_at(tokens, timed, cached, super::liveness::now_ms().max(1));
+        self.note_prefill_ended_at(
+            tokens,
+            timed,
+            cached,
+            super::health::liveness::now_ms().max(1),
+        );
     }
 
     /// [`Self::note_prefill_ended`] at `now_ms` on the gateway clock.
@@ -918,7 +923,7 @@ impl WorkerRuntime {
     }
 
     pub fn prefill_answered_ago(&self) -> Option<Duration> {
-        self.prefill_answered_ago_at(super::liveness::now_ms().max(1))
+        self.prefill_answered_ago_at(super::health::liveness::now_ms().max(1))
     }
 
     /// [`Self::prefill_answered_ago`] as of `now_ms` on the gateway clock.
@@ -929,7 +934,7 @@ impl WorkerRuntime {
     /// A decode side showed a handoff of this worker's (see
     /// [`Worker::note_prefill_handoff`]): stamped apart from the answers.
     pub fn note_prefill_handoff(&self) {
-        self.note_prefill_handoff_at(super::liveness::now_ms().max(1));
+        self.note_prefill_handoff_at(super::health::liveness::now_ms().max(1));
     }
 
     /// [`Self::note_prefill_handoff`] at `now_ms` on the gateway clock.
@@ -938,7 +943,7 @@ impl WorkerRuntime {
     }
 
     pub fn prefill_handed_off_ago(&self) -> Option<Duration> {
-        self.prefill_handed_off_ago_at(super::liveness::now_ms().max(1))
+        self.prefill_handed_off_ago_at(super::health::liveness::now_ms().max(1))
     }
 
     /// [`Self::prefill_handed_off_ago`] as of `now_ms` on the gateway clock.
@@ -951,7 +956,7 @@ impl WorkerRuntime {
     }
 
     pub fn prefill_unanswered_run(&self) -> Option<Duration> {
-        self.prefill_unanswered_run_at(super::liveness::now_ms().max(1))
+        self.prefill_unanswered_run_at(super::health::liveness::now_ms().max(1))
     }
 
     /// [`Self::prefill_unanswered_run`] as of `now_ms` on the gateway clock.
@@ -960,7 +965,7 @@ impl WorkerRuntime {
     }
 
     pub fn prefill_unanswered_total(&self) -> Duration {
-        self.prefill_unanswered_total_at(super::liveness::now_ms().max(1))
+        self.prefill_unanswered_total_at(super::health::liveness::now_ms().max(1))
     }
 
     /// [`Self::prefill_unanswered_total`] as of `now_ms` on the gateway clock.
@@ -977,7 +982,7 @@ impl WorkerRuntime {
     }
 
     fn age_of(stamp_ms: u64) -> Duration {
-        Duration::from_millis(super::liveness::now_ms().saturating_sub(stamp_ms))
+        Duration::from_millis(super::health::liveness::now_ms().saturating_sub(stamp_ms))
     }
 
     // ── Lifecycle status ────────────────────────────────────────────
@@ -1063,7 +1068,7 @@ impl WorkerRuntime {
     pub fn try_increment_load(&self, max: usize) -> bool {
         match self
             .load_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1).filter(|next| *next <= max)
             }) {
             Ok(0) => {
@@ -1093,7 +1098,7 @@ impl WorkerRuntime {
     pub fn note_tracked_ended(&self) {
         let _ =
             self.tracked_in_flight
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |tracked| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |tracked| {
                     Some(tracked.saturating_sub(1))
                 });
     }
@@ -1108,7 +1113,7 @@ impl WorkerRuntime {
     pub fn note_output_ended(&self) {
         let _ = self
             .producing_streams
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             });
     }
@@ -1120,7 +1125,7 @@ impl WorkerRuntime {
     }
     /// The load counter left zero: the wedged rule's clock starts now.
     fn note_busy_started(&self) {
-        self.note_busy_started_at(super::liveness::now_ms());
+        self.note_busy_started_at(super::health::liveness::now_ms());
     }
     /// [`Self::note_busy_started`] at `now_ms`, a stamp the caller read.
     fn note_busy_started_at(&self, now_ms: u64) {
@@ -1132,7 +1137,7 @@ impl WorkerRuntime {
     pub fn try_decrement_load(&self) -> bool {
         match self
             .load_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             }) {
             Ok(1) => {
@@ -1160,7 +1165,7 @@ impl WorkerRuntime {
     /// `window`. All-or-nothing: a refusal claims nothing.
     pub fn try_admit_pd(&self, count: usize, window: usize) -> bool {
         self.pd_admitted
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 admitted.checked_add(count).filter(|total| *total <= window)
             })
             .is_ok()
@@ -1171,7 +1176,7 @@ impl WorkerRuntime {
     pub fn release_pd(&self, count: usize) {
         let _ = self
             .pd_admitted
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 Some(admitted.saturating_sub(count))
             });
         self.wake_claimable();
@@ -1226,11 +1231,11 @@ impl WorkerRuntime {
             };
             let could_claim = queue.may_claim(place);
             let rooms = queue.waiting.remove(at).map_or(0, |gone| gone.rooms);
-            let _ = self.pd_waiting_rooms.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |waiting| Some(waiting.saturating_sub(rooms)),
-            );
+            let _ =
+                self.pd_waiting_rooms
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |waiting| {
+                        Some(waiting.saturating_sub(rooms))
+                    });
             if could_claim {
                 queue.claimable_wakes()
             } else {
@@ -1299,7 +1304,7 @@ mod tests {
     use tokio::time;
 
     use super::*;
-    use crate::worker::liveness::now_ms;
+    use crate::worker::health::liveness::now_ms;
 
     #[test]
     fn a_token_within_the_stamped_millisecond_records_nothing_new_and_keeps_the_semantics() {

@@ -42,7 +42,7 @@ pub mod tokenspeed_proto {
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
 pub type AbortOnDropStream =
-    crate::AbortOnDropStream<tokenspeed_proto::GenerateResponse, TokenSpeedSchedulerClient>;
+    crate::AbortOnDropStream<Box<tokenspeed_proto::GenerateResponse>, TokenSpeedSchedulerClient>;
 
 /// gRPC client for the TokenSpeed scheduler.
 #[derive(Clone)]
@@ -58,7 +58,9 @@ impl TokenSpeedSchedulerClient {
     crate::impl_engine_client_basics!(
         tokenspeed_proto,
         tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient<Channel>,
-        "TokenSpeed"
+        "TokenSpeed",
+        "tokenspeed.grpc.scheduler.TokenSpeedScheduler",
+        tokenspeed_proto::token_speed_scheduler_server::SERVICE_NAME
     );
 
     pub async fn abort_request(
@@ -588,7 +590,7 @@ impl TokenSpeedSchedulerClient {
                 tracing::warn!("Failed to inject trace context: {}", e);
             }
             let (metadata, _extensions, ()) = carrier.into_parts();
-            let stream = call_with_frames::<tokenspeed_proto::GenerateResponse>(
+            let stream = call_with_frames::<Box<tokenspeed_proto::GenerateResponse>>(
                 self.channel(),
                 "/tokenspeed.grpc.scheduler.TokenSpeedScheduler/Generate",
                 metadata.into_headers(),

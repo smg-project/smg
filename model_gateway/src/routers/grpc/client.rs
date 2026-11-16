@@ -22,7 +22,8 @@ use crate::{
     observability::otel_trace::OtelTraceInjector,
     routers::grpc::{
         proto_wrapper::{
-            cleanup_mm_shm_handles, collect_tokenspeed_generate_request_shm_handles,
+            cleanup_generate_request_shm, cleanup_mm_shm_handles,
+            collect_tokenspeed_generate_request_shm_handles,
             collect_vllm_generate_request_shm_handles, finish_tokenspeed_request,
             finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
             ProtoStream,
@@ -77,44 +78,13 @@ pub struct GenerateRequestBuildOptions {
 impl GrpcClient {
     #[expect(
         clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang_mut(&mut self) -> &mut SglangSchedulerClient {
-        match self {
-            Self::Sglang(client) => client,
-            _ => panic!("Expected SGLang client"),
-        }
-    }
-
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
-    pub fn is_vllm(&self) -> bool {
-        matches!(self, Self::Vllm(_))
-    }
-
-    pub fn is_trtllm(&self) -> bool {
-        matches!(self, Self::Trtllm(_))
-    }
-
-    pub fn is_mlx(&self) -> bool {
-        matches!(self, Self::Mlx(_))
-    }
-
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_tokenspeed() check"
+        reason = "typed accessor: the caller guarantees the variant"
     )]
     pub fn as_tokenspeed(&self) -> &TokenSpeedSchedulerClient {
         match self {
             Self::TokenSpeed(client) => client,
             _ => panic!("Expected TokenSpeed client"),
         }
-    }
-
-    pub fn is_tokenspeed(&self) -> bool {
-        matches!(self, Self::TokenSpeed(_))
     }
 
     /// Runtime type backing this client. Lets shared logic (e.g. the multimodal
@@ -384,6 +354,9 @@ impl GrpcClient {
     ///
     /// Dispatches to the appropriate backend client and wraps the result in ProtoStream.
     /// Returns `tonic::Status` on error so callers can inspect the gRPC status code directly.
+    /// A request in another runtime's message type than the client's is
+    /// answered `UNIMPLEMENTED` with both runtimes named, as an RPC absent
+    /// on a backend's wire is.
     pub async fn generate(
         &mut self,
         req: ProtoGenerateRequest,
@@ -421,11 +394,23 @@ impl GrpcClient {
                     }
                 }
             }
-            #[expect(
-                clippy::panic,
-                reason = "client and request types are always matched by construction in the pipeline"
-            )]
-            _ => panic!("Mismatched client and request types"),
+            // A request in another runtime's message type than this client's.
+            // The pair index keeps known runtimes apart on this wire and a
+            // single placement builds its request with the client that sends
+            // it, so nothing is known to reach this arm. A pair that did is
+            // one this wire has no call for: the status is the caller's to
+            // answer, where a panic ended the request's task with no answer.
+            // No worker receives the request, so its shared-memory segments
+            // are unlinked here, as the arms above unlink theirs on a send
+            // error.
+            (client, req) => {
+                cleanup_generate_request_shm(&req);
+                Err(tonic::Status::unimplemented(format!(
+                    "a {} request cannot be sent to a {} worker",
+                    req.runtime_type(),
+                    client.runtime_type()
+                )))
+            }
         }
     }
 
@@ -445,11 +430,16 @@ impl GrpcClient {
             (Self::Mlx(_), _) => Err(tonic::Status::unimplemented(
                 "MLX backend does not support embedding",
             )),
-            #[expect(
-                clippy::panic,
-                reason = "client and request types are always matched by construction in the pipeline"
-            )]
-            _ => panic!("Mismatched client and request types or unsupported embedding backend"),
+            // A request in another runtime's message type than this client's,
+            // or a backend with no embedding call. The embedding stage builds
+            // each request with the client that sends it, so nothing is known
+            // to reach this arm; one that did is answered as the generate
+            // dispatch answers it.
+            (client, req) => Err(tonic::Status::unimplemented(format!(
+                "a {} embedding request cannot be sent to a {} worker",
+                req.runtime_type(),
+                client.runtime_type()
+            ))),
         }
     }
 

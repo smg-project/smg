@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use smg_policy_controller::{
+    plugins::OpenDecisions,
     wasm::{
         Failure, LoadError, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer, World,
     },
@@ -75,7 +76,7 @@ fn engine_with(component: Vec<u8>, config: &[u8]) -> (Arc<Plugin>, Engine) {
 /// The example loaded as `spec` says and bound as the three stages of one
 /// profile, with no fallback stage.
 fn engine_under(spec: PluginSpec) -> (Arc<Plugin>, Engine) {
-    let runtime = Arc::new(Runtime::new().expect("a runtime"));
+    let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
     let plugin = Plugin::load(&runtime, spec).expect("the example loads");
     let bound = plugin.bind();
     let profile = Profile {
@@ -229,7 +230,7 @@ fn the_example_refuses_a_configuration_it_cannot_read() {
     else {
         return;
     };
-    let runtime = Arc::new(Runtime::new().expect("a runtime"));
+    let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
     for (config, said) in [
         (&[101][..], "0 to 100 percent, got 101"),
         (&[20, 20][..], "one byte, got 2"),

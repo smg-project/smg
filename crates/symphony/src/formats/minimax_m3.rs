@@ -1389,6 +1389,188 @@ mod tests {
         assert_eq!(refused(&events), "<cou");
     }
 
+    /// One function whose `days` is a list of objects, each with a string, an integer, a list
+    /// of objects and an object.
+    fn plan() -> Declared {
+        declared(
+            "plan",
+            value!({"type": "object", "properties": {
+                "days": {"type": "array", "items": {"type": "object", "properties": {
+                    "day": {"type": "string"},
+                    "minutes": {"type": "integer"},
+                    "blocks": {"type": "array", "items": {"type": "object", "properties": {
+                        "marks": {"type": "array", "items": {"type": "string"}}}}},
+                    "notes": {"type": "object"},
+                }}},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            }}),
+        )
+    }
+
+    /// One `plan` invoke with `body` as its elements, the template's separator before every tag.
+    fn plan_call(body: &str) -> String {
+        format!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"plan\">{}\
+             ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+            separated(body)
+        )
+    }
+
+    /// The events of a call with `levels` nested `<d>` elements and an empty `<e>`, declared a
+    /// list, in the innermost, which the first `</d>` cuts short.
+    fn an_empty_list_under(levels: usize) -> Vec<Event<'static>> {
+        let innermost = value!({"type": "object", "properties": {"e": {"type": "array"}}});
+        let schema = (1..levels).fold(
+            innermost,
+            |schema, _| value!({"type": "object", "properties": {"d": schema}}),
+        );
+        let body = format!("{}<e>{}", "<d>".repeat(levels), "</d>".repeat(levels));
+        let output = format!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"alert\">{}\
+             ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+            separated(&body)
+        );
+        run_with(
+            declared(
+                "alert",
+                value!({"type": "object", "properties": {"d": schema}}),
+            ),
+            "",
+            &[&output],
+        )
+    }
+
+    /// A parameter the tool declares a list or an object, opened, left empty and never closed:
+    /// the closing tag of the element directly around it follows. A closing tag is no value of
+    /// a list or an object, so the element is written empty, as its own close would write it;
+    /// one `Malformed { TagCutShort }` event of no bytes stands before its fragment, nothing is
+    /// refused and the call closes whole: at every cut, for an object, with whitespace held in
+    /// the element, and in the deepest element the reader takes an empty list in.
+    #[test]
+    fn a_declared_list_or_object_the_close_around_it_cut_short_is_written_empty() {
+        use crate::{json::PartialJson, testing::the_same_at_every_cut};
+        let read = |pieces: &[&str]| run_with(plan(), "", pieces);
+        let output =
+            plan_call("<days><item><day>Sun</day><minutes>0</minutes><blocks></item></days>");
+        let said = the_same_at_every_cut(|pieces| read(pieces), &output);
+        assert_eq!(
+            said.calls,
+            [(
+                "plan".to_string(),
+                r#"{"days": [{"day": "Sun", "minutes": 0, "blocks": []}]}"#.to_string()
+            )]
+        );
+        assert_eq!(said.content, "");
+        let events = read(&[&output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        assert_eq!(refused(&events), "");
+        assert_eq!(ends(&events), 1);
+        let counted = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the slip is counted");
+        let after: Vec<&str> = events[counted..]
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(after, [r#", "blocks": []"#, "}", "]", "}"]);
+
+        for (body, written) in [
+            (
+                "<days><item><notes></item></days>",
+                value!({"days": [{"notes": {}}]}),
+            ),
+            (
+                "<days><item><blocks>\n </item></days>",
+                value!({"days": [{"blocks": []}]}),
+            ),
+        ] {
+            let output = plan_call(body);
+            let events = read(&[&output]);
+            assert_eq!(bytes(&events), output, "{body}");
+            assert_eq!(arguments(&events), written, "{body}");
+            assert_eq!(reported(&events), [MalformedReason::TagCutShort], "{body}");
+            assert_eq!(refused(&events), "", "{body}");
+        }
+
+        let deepest = PartialJson::DEFAULT_MAX_DEPTH;
+        let events = an_empty_list_under(deepest - 2);
+        assert_eq!(
+            arguments(&events),
+            value!({ "d": wrapped(value!({"e": []}), deepest - 3) })
+        );
+        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        assert_eq!(refused(&events), "");
+    }
+
+    /// The close of the element around an open element is that element's text everywhere else:
+    /// under a declared string, a declared integer and an element the tool does not declare,
+    /// under a declared list that holds text, when it names an element further out than the one
+    /// directly around the list, and one element deeper than the reader takes an empty list in.
+    /// A string streams it, and the invoke's close closes the string; the others are held for a
+    /// close that never comes and refused at the call's end, as a list the call's own end finds
+    /// open is.
+    #[test]
+    fn the_close_around_any_other_open_element_is_that_elements_text() {
+        use crate::json::PartialJson;
+        let read = |body: &str| run_with(plan(), "", &[&plan_call(body)]);
+
+        let events = read("<days><item><day></item></days>");
+        assert_eq!(
+            arguments(&events),
+            value!({"days": [{"day": "</item></days>"}]})
+        );
+        assert_eq!(reported(&events), [MalformedReason::OpenAtTheMarker]);
+
+        for (body, written, lost) in [
+            (
+                "<days><item><minutes></item></days>",
+                r#"{"days": [{"#,
+                "<minutes></item></days>",
+            ),
+            (
+                "<days><item><extra></item></days>",
+                r#"{"days": [{"#,
+                "<extra></item></days>",
+            ),
+            (
+                "<days><item><blocks>x</item></days>",
+                r#"{"days": [{"#,
+                "<blocks>x</item></days>",
+            ),
+            (
+                "<days><item><blocks><item><marks></blocks></item></days>",
+                r#"{"days": [{"blocks": [{"#,
+                "<marks></blocks></item></days>",
+            ),
+        ] {
+            let events = read(body);
+            assert_eq!(arguments_of(&events, 0), written, "{body}");
+            assert_eq!(reported(&events), [MalformedReason::TagCutShort], "{body}");
+            assert_eq!(refused(&events), lost, "{body}");
+        }
+
+        let events = read("<tags>");
+        assert_eq!(arguments_of(&events, 0), "");
+        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+
+        let deepest = PartialJson::DEFAULT_MAX_DEPTH;
+        let events = an_empty_list_under(deepest - 1);
+        assert_eq!(
+            arguments_of(&events, 0),
+            format!("{{{}", "\"d\": {".repeat(deepest - 1))
+        );
+        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        assert_eq!(
+            refused(&events),
+            format!("<e>{}", "</d>".repeat(deepest - 1))
+        );
+    }
+
     /// A closing tag that names an open element further out, an inner close left out (`</range>`
     /// missing), closes it out of order: the members after it would land in the wrong container
     /// (`limit` inside `range`), so it is refused as any tag out of its place and the call is no
