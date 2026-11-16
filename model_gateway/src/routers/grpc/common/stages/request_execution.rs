@@ -340,10 +340,7 @@ pub(crate) async fn execute_plan(
     let prefill_guard = ctx.pd_prefill_guard.take();
 
     // Extract dispatch metadata for the tracing span and PD metric labels.
-    let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
-        error!(function = "execute_plan", "Dispatch metadata not set");
-        error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
-    })?;
+    let dispatch = stage_output(ctx.dispatch.as_ref(), "execute_plan")?;
     let request_id = dispatch.request_id.as_str();
     let model = dispatch.model.as_str();
     let request_type = execution_plan.request_type();

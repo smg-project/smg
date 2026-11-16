@@ -30,6 +30,23 @@ pub(crate) fn resolve_proxy_config<'a>(
     }
 }
 
+/// Finish a proxy the `scheme` constructor made: a construction error becomes
+/// `McpError::Config` naming `scheme`, then `proxy_cfg`'s exclusions and credentials apply.
+fn configured(
+    made: reqwest::Result<reqwest::Proxy>,
+    scheme: &str,
+    proxy_cfg: &McpProxyConfig,
+) -> McpResult<reqwest::Proxy> {
+    let mut proxy = made.map_err(|e| McpError::Config(format!("Invalid {scheme} proxy: {e}")))?;
+    if let Some(ref no_proxy) = proxy_cfg.no_proxy {
+        proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
+    }
+    if let (Some(ref username), Some(ref password)) = (&proxy_cfg.username, &proxy_cfg.password) {
+        proxy = proxy.basic_auth(username, password);
+    }
+    Ok(proxy)
+}
+
 /// Apply proxy configuration to a ClientBuilder
 ///
 /// This is a reusable helper that applies proxy settings without building the client,
@@ -45,42 +62,20 @@ pub(super) fn apply_proxy_to_builder(
     mut builder: reqwest::ClientBuilder,
     proxy_cfg: &McpProxyConfig,
 ) -> McpResult<reqwest::ClientBuilder> {
-    // Configure HTTP proxy
     if let Some(ref http_proxy) = proxy_cfg.http {
-        let mut proxy = reqwest::Proxy::http(http_proxy)
-            .map_err(|e| McpError::Config(format!("Invalid HTTP proxy: {e}")))?;
-
-        // Apply no_proxy exclusions
-        if let Some(ref no_proxy) = proxy_cfg.no_proxy {
-            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
-        }
-
-        // Apply authentication if configured
-        if let (Some(ref username), Some(ref password)) = (&proxy_cfg.username, &proxy_cfg.password)
-        {
-            proxy = proxy.basic_auth(username, password);
-        }
-
-        builder = builder.proxy(proxy);
+        builder = builder.proxy(configured(
+            reqwest::Proxy::http(http_proxy),
+            "HTTP",
+            proxy_cfg,
+        )?);
     }
 
-    // Configure HTTPS proxy
     if let Some(ref https_proxy) = proxy_cfg.https {
-        let mut proxy = reqwest::Proxy::https(https_proxy)
-            .map_err(|e| McpError::Config(format!("Invalid HTTPS proxy: {e}")))?;
-
-        // Apply no_proxy exclusions
-        if let Some(ref no_proxy) = proxy_cfg.no_proxy {
-            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
-        }
-
-        // Apply authentication if configured
-        if let (Some(ref username), Some(ref password)) = (&proxy_cfg.username, &proxy_cfg.password)
-        {
-            proxy = proxy.basic_auth(username, password);
-        }
-
-        builder = builder.proxy(proxy);
+        builder = builder.proxy(configured(
+            reqwest::Proxy::https(https_proxy),
+            "HTTPS",
+            proxy_cfg,
+        )?);
     }
 
     Ok(builder)
@@ -202,5 +197,44 @@ mod tests {
         let builder = http_client_builder();
         let result = apply_proxy_to_builder(builder, &proxy);
         assert!(result.is_err(), "Should fail with invalid proxy URL");
+    }
+
+    #[test]
+    fn test_apply_proxy_to_builder_with_http_and_https() {
+        let proxy = McpProxyConfig {
+            http: Some("http://proxy.example.com:8080".to_string()),
+            https: Some("http://proxy.example.com:8443".to_string()),
+            no_proxy: Some("localhost,127.0.0.1".to_string()),
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+        };
+
+        let builder = http_client_builder();
+        let result = apply_proxy_to_builder(builder, &proxy);
+        assert!(result.is_ok(), "Should apply both proxies to builder");
+        assert!(result.unwrap().build().is_ok(), "Should build client");
+    }
+
+    #[test]
+    fn test_apply_proxy_to_builder_invalid_url_names_the_scheme() {
+        for (http, https, named) in [
+            (Some("://invalid"), None, "Invalid HTTP proxy"),
+            (None, Some("://invalid"), "Invalid HTTPS proxy"),
+        ] {
+            let proxy = McpProxyConfig {
+                http: http.map(str::to_string),
+                https: https.map(str::to_string),
+                no_proxy: None,
+                username: None,
+                password: None,
+            };
+            let Err(err) = apply_proxy_to_builder(http_client_builder(), &proxy) else {
+                panic!("an invalid proxy URL must be refused");
+            };
+            assert!(
+                matches!(&err, McpError::Config(m) if m.starts_with(named)),
+                "{named}: {err:?}"
+            );
+        }
     }
 }
