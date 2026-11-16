@@ -535,8 +535,10 @@ What the table says beyond `inkling`, whose rows it shares:
   after any message's close; a prompt whose last `<|message_model|>` is followed by
   `<|end_message|>` (an assistant message in the history) starts there too, and a prompt that
   continues an assistant message (`<|message_model|><|content_text|>Partial`, the template's
-  continuation) replays from the opener as Inkling's does. Every recorded output of the group
-  starts with the opener, and the corpus replay feeds the close alone before it, no opener.
+  continuation) replays from the opener as Inkling's does: the message's own, the first after the
+  last close, since an opener said again inside the body the prompt left open opens nothing.
+  Every recorded output of the group starts with the opener, and the corpus replay feeds the
+  close alone before it, no opener.
 - **A JSON answer's tag writes the opener first.** The way into the answer from where the turn
   starts is `<|message_model|>` and then `<|content_text|>`: `Format::answer_grammar` leads the
   tag with the rows from the unopened state to the turn's own state, owed outright before the

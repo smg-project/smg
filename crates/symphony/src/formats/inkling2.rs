@@ -46,7 +46,7 @@ mod tests {
         testing::{
             arguments_of, bytes, content, drive, dropped, names, reasoning, said, weather_tools,
         },
-        Declared,
+        Declared, ForcedCall, OutputPosition,
     };
 
     /// A prompt that opens no turn: the user's message closed, as the template leaves it.
@@ -153,6 +153,75 @@ mod tests {
     }
 
     #[test]
+    fn a_continued_thought_goes_on_past_an_opener_said_again_inside_it() {
+        // The last opener stands inside the thought the prompt left open, where no row reads it as
+        // an opener: the replay starts at the message's own, so the output goes on as the thought
+        // under both tables.
+        let prompt = "<|end_message|><|message_model|><|content_thinking|>Par<|message_model|>is";
+        let tail = [" a city.<|end_message|><|message_model|><|content_text|>Yes.<|end_message|>"];
+        for (table, events) in [
+            ("inkling", run_inkling(prompt, &tail)),
+            ("inkling2", run(prompt, &tail)),
+        ] {
+            assert_eq!(reasoning(&events), " a city.", "{table}: {events:?}");
+            assert_eq!(content(&events), "Yes.", "{table}: {events:?}");
+            assert!(names(&events).is_empty(), "{table}: {events:?}");
+            assert_eq!(malformed_count(&events), 0, "{table}: {events:?}");
+        }
+        // Under a forced call the table keeps the opener's row and the thought's close: the
+        // continued thought replays from the same opener.
+        for format in [inkling(), inkling2()] {
+            let forced = format.with_forced_call(ForcedCall::Arguments);
+            assert_eq!(forced.replay(prompt), &prompt["<|end_message|>".len()..]);
+        }
+    }
+
+    #[test]
+    fn a_continued_answer_goes_on_past_an_opener_said_again_inside_it() {
+        let prompt = "<|end_message|><|message_model|><|content_text|>Par<|message_model|>is";
+        let tail = [" a city.<|end_message|>"];
+        for (table, events) in [
+            ("inkling", run_inkling(prompt, &tail)),
+            ("inkling2", run(prompt, &tail)),
+        ] {
+            assert_eq!(content(&events), " a city.", "{table}: {events:?}");
+            assert_eq!(malformed_count(&events), 0, "{table}: {events:?}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_that_ends_at_an_opener_said_again_inside_a_thought_is_inside_it() {
+        // The output grammar's position reads the turn's start, as the replay does.
+        let prompt = "<|end_message|><|message_model|><|content_thinking|>Par<|message_model|>";
+        for format in [inkling(), inkling2()] {
+            assert_eq!(
+                format.output_position(prompt, true),
+                OutputPosition::InThought,
+                "{}",
+                format.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_prompt_past_a_thought_with_an_opener_said_again_inside_it_is_past_the_thought() {
+        // A prompt that ends at an opener is past its thought when the message before that opener
+        // was one, and that message too is read from its own opener.
+        let prompt = concat!(
+            "<|end_message|><|message_model|><|content_thinking|>Pl<|message_model|>an",
+            "<|end_message|><|message_model|>"
+        );
+        for format in [inkling(), inkling2()] {
+            assert_eq!(
+                format.output_position(prompt, true),
+                OutputPosition::AfterThought,
+                "{}",
+                format.name()
+            );
+        }
+    }
+
+    #[test]
     fn a_quoted_spelling_in_a_json_answer_is_the_answers_text_under_the_option() {
         let answer = concat!(
             "<|message_model|><|content_text|>",
@@ -226,9 +295,10 @@ mod tests {
         // An engine that gates the answer's grammar on its reasoning parser has consumed the
         // opener and the kind marker when the tag starts, and the tag's optional way in (the
         // engine's start cannot say) still admits them: the model may write the opener again from
-        // inside the answer, with or without a thought first, and again inside the thought. The
-        // opener said again inside a body is framing and the kind marker after it the kind, so the
-        // answer is the JSON alone, whole and at every cut, with and without the JSON-answer option.
+        // inside the answer, with or without a thought first, and, outside the tag's constraint,
+        // again inside the thought. The opener said again inside a body is framing and the kind
+        // marker after it the kind, so the answer is the JSON alone, whole and at every cut, with
+        // and without the JSON-answer option.
         let consumed = "<|end_message|><|message_model|><|content_text|>";
         let answer = "{\"city\":\"Paris\"}";
         let plain = format!("<|message_model|><|content_text|>{answer}<|end_message|>");
