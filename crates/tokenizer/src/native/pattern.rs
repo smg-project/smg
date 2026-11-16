@@ -890,6 +890,12 @@ impl Pattern {
         &self.classes
     }
 
+    /// The class every match begins with, when the pattern names one
+    /// (`opens_with`): a text that holds no character of it holds no match.
+    pub(super) fn opening_class(&self) -> Option<&Class> {
+        self.opens_with.map(|class| &self.classes[class])
+    }
+
     /// What the pattern is as a stage of a three-stage chain, if anything.
     pub(super) fn part(&self) -> Option<&chain::Part> {
         self.part.as_ref()

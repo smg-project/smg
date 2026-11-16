@@ -1165,6 +1165,14 @@ pub(crate) struct NativeEncoder {
     /// raw text. Such a text is never cut into units for the thread pool
     /// either (see [`Self::stable_cut`]).
     mapped_from: Option<usize>,
+    /// For the stages over the image: whether the image of each byte is a
+    /// character one of their matches can begin with. A piece that holds no
+    /// such byte holds no match of any of them and goes through every one
+    /// whole, so it is final as it stands, with no image built and no search
+    /// started (see [`Self::pieces_mapping`]). `None` when no stage runs
+    /// over the image, or one of them names no opening class or drops the
+    /// text outside its matches.
+    image_opens: Option<Box<[bool; 256]>>,
     /// Added tokens matched on the raw text (`normalized: false`).
     raw_added: Option<AddedTokens>,
     /// Added tokens matched after normalization (`normalized: true`).
@@ -1315,9 +1323,12 @@ impl NativeEncoder {
             None => chain::Scanner::recognize(&stages),
             Some(_) => None,
         };
+        // One alphabet for the walk's map and for the table read through it.
+        let alphabet = bytes_char();
         Ok(Self {
             end_anchored: stages.iter().any(|stage| stage.pattern.end_anchored()),
             mapped_from,
+            image_opens: Self::image_opening_bytes(&stages, mapped_from, &alphabet),
             nfc_quick: (normalizer == Normalizer::Nfc).then(NfcQuick::read),
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
@@ -1328,7 +1339,7 @@ impl NativeEncoder {
             stages,
             chain,
             frame,
-            alphabet: bytes_char(),
+            alphabet,
             seed: ShortPieceTable::for_entries(0),
             seed_covers_short_entries: false,
             long_entries: None,
@@ -1400,6 +1411,7 @@ impl NativeEncoder {
         Ok(Self {
             end_anchored: false,
             mapped_from: None,
+            image_opens: None,
             normalizer: Normalizer::None,
             nfc_quick: None,
             raw_added: AddedTokens::build(&raw)?,
@@ -2023,6 +2035,7 @@ impl NativeEncoder {
             nfc_quick: None,
             end_anchored: false,
             mapped_from: None,
+            image_opens: None,
             space_inside: stages
                 .iter()
                 .any(|stage| stage.pattern.reads_space_inside()),
@@ -2144,6 +2157,29 @@ impl NativeEncoder {
             }
         }
         Ok((stages, mapped_from))
+    }
+
+    /// The bytes whose image a match of a stage over the image can begin
+    /// with (the `image_opens` field), read through `alphabet`, the map the
+    /// walk builds each image with: every stage from `mapped_from` on must
+    /// name the class its matches begin with and keep the text outside its
+    /// matches, or there is no table.
+    fn image_opening_bytes(
+        stages: &[Stage],
+        mapped_from: Option<usize>,
+        alphabet: &[char; 256],
+    ) -> Option<Box<[bool; 256]>> {
+        let mut opens = Box::new([false; 256]);
+        for stage in &stages[mapped_from?..] {
+            if !matches!(stage.pieces.walk(), Walk::Apart { gaps: true, .. }) {
+                return None;
+            }
+            let class = stage.pattern.opening_class()?;
+            for (open, &c) in opens.iter_mut().zip(alphabet) {
+                *open |= class.contains(c);
+            }
+        }
+        Some(opens)
     }
 
     /// A stage anchored to its text (`\A`, `\z` or `\G`) reads the bounds of
@@ -3079,6 +3115,14 @@ impl NativeEncoder {
             return;
         }
         if depth >= from {
+            // No match of a stage over the image begins in a piece that
+            // holds none of their opening bytes: the piece is final.
+            if let Some(opens) = &self.image_opens {
+                if !text.bytes().any(|byte| opens[usize::from(byte)]) {
+                    f(text.as_bytes());
+                    return;
+                }
+            }
             image.clear();
             image.extend(text.bytes().map(|b| self.alphabet[usize::from(b)]));
             self.pieces_in_alphabet(depth, image, text.as_bytes(), f);
