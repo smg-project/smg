@@ -864,13 +864,14 @@ impl McpOrchestrator {
                             // The write-back is this connection's: a recovery
                             // during the listings replaced the entry (or a
                             // removal dropped it), and its own load's tools
-                            // and outcome stand, not a stale listing's.
-                            match static_servers.get_mut(key) {
-                                Some(mut entry) if Arc::ptr_eq(&entry.client, &client) => {
-                                    entry.list_error = None;
-                                }
+                            // and outcome stand, not a stale listing's. The
+                            // entry stays held while the listing goes in and
+                            // its error is cleared last: a reader that finds
+                            // no listing error finds the tools.
+                            let mut server = match static_servers.get_mut(key) {
+                                Some(entry) if Arc::ptr_eq(&entry.client, &client) => entry,
                                 _ => continue,
-                            }
+                            };
                             tool_inventory.clear_server_tool_entries(key);
                             for entry in tools {
                                 tool_inventory.insert_entry(entry);
@@ -884,6 +885,8 @@ impl McpOrchestrator {
                                 install_resources(&tool_inventory, key, resources);
                             }
                             apply_tool_configs(&tool_inventory, &config);
+                            server.list_error = None;
+                            drop(server);
                             info!(
                                 "Refreshed '{}'; the inventory now holds {} tools",
                                 key,
