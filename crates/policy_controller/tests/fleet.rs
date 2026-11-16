@@ -4,14 +4,17 @@
 //! of the case asks each engine its health and writes what it heard; and
 //! the pool is read back as a decision's view reads it: every rank a row,
 //! healthy by its probe, its load from a poll, an engine that holds
-//! requests reading them. Then one engine is killed: the first dial that
-//! hears it dead writes it, and the pool reads its rows unhealthy and every
-//! other row healthy. Next, an engine stops answering with its sockets
-//! open: a probe turn waits out its dial bound, writes it and goes on. Last,
-//! the gateway sends requests of its own and reports each on its session:
-//! the store holds the completion of the engine that answered, none of class
-//! ok for the dead and the hung one, and nothing of it for another gateway;
-//! a frame that reads wrong ends the session of the gateway that sent it.
+//! requests reading them. That engine's KV events follow: a subscriber of
+//! the case hands each batch of its stream to the sink, and its row's index
+//! holds every block the events left the engine holding. Then one engine is
+//! killed: the first dial that hears it dead writes it, and the pool reads
+//! its rows unhealthy and every other row healthy. Next, an engine stops
+//! answering with its sockets open: a probe turn waits out its dial bound,
+//! writes it and goes on. Last, the gateway sends requests of its own and
+//! reports each on its session: the store holds the completion of the engine
+//! that answered, none of class ok for the dead and the hung one, and nothing
+//! of it for another gateway; a frame that reads wrong ends the session of
+//! the gateway that sent it.
 //!
 //! No decision is asked yet: the service answers `Leader` and takes the
 //! session's reports, and the case asserts both end to end. The decisions
@@ -228,36 +231,42 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "the busy engine's blocks reach its row's index",
             PROBE_INTERVAL + ROOM,
             || {
-                harness.heard(busy).first().is_some_and(|rank| {
-                    rank.indexed > 0 && rank.cursor.is_some_and(|cursor| cursor.applied >= 1)
+                harness.heard(busy).first().is_some_and(|row| {
+                    row.indexed > 0 && row.cursor.is_some_and(|cursor| cursor.applied >= 1)
                 })
             },
         )
         .await
+        .map_err(|bound| {
+            format!(
+                "{bound}; what refuses its stream: {:?}",
+                harness.refused(busy)
+            )
+        })
         .expect("the KV events follow");
         let heard = harness.heard(busy);
-        let rank = heard.first().expect("the busy engine's one rank");
+        let fed = heard.first().expect("the busy engine's one rank");
         assert!(
-            rank.last >= 1
-                && rank.cursor.is_some_and(|cursor| {
-                    cursor.applied >= rank.last && !cursor.replay_pending && !cursor.degraded
+            fed.last >= 1
+                && fed.cursor.is_some_and(|cursor| {
+                    cursor.applied >= fed.last && !cursor.replay_pending && !cursor.degraded
                 }),
-            "the cursor stands at what the stream delivered: {rank:?}"
+            "the cursor stands at what the stream delivered: {fed:?}"
         );
         assert!(
-            rank.applied >= 1 && rank.indexed == rank.held,
-            "the index holds each block the engine's events left it holding: {rank:?}"
+            fed.applied >= 1 && fed.indexed == fed.held,
+            "the index holds each block the engine's events left it holding: {fed:?}"
         );
         assert_eq!(
-            rank.counts,
+            fed.counts,
             Some(LaneCounts::default()),
-            "no store came without its parent and no block was refused: {rank:?}"
+            "no store came without its parent and no block was refused: {fed:?}"
         );
         for engine in engines.iter().filter(|engine| **engine != busy) {
-            for rank in harness.heard(*engine) {
+            for idle in harness.heard(*engine) {
                 assert!(
-                    rank.applied == 0 && rank.indexed == 0 && rank.held == 0,
-                    "an engine that stored no block published none: engine {engine} {rank:?}"
+                    idle.applied == 0 && idle.indexed == 0 && idle.held == 0,
+                    "an engine that stored no block published none: engine {engine} {idle:?}"
                 );
             }
         }
@@ -342,6 +351,19 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .map(|verdict| verdict.at.duration_since(death.at))
             .max()
             .unwrap_or_default();
+        // The dead engine's event stream broke with it, and its subscriber
+        // keeps what refuses it since: the dial of an engine that is gone.
+        within(
+            "a dead engine's stream is refused at its dial",
+            PROBE_INTERVAL + DIAL_TIMEOUT + ROOM,
+            || {
+                harness
+                    .refused(dead)
+                    .is_some_and(|refusal| refusal.starts_with("the dial"))
+            },
+        )
+        .await
+        .expect("the subscriber keeps what refuses it");
 
         // The hang. An engine that stops answering with its sockets open
         // costs a probe turn its dial bound and no more: that turn writes
@@ -580,8 +602,8 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         writeln!(out, "FLEET_READY_MS {}", ready.as_millis()).expect("stdout");
         writeln!(out, "FLEET_LOADS_FOLLOW_MS {}", followed.as_millis()).expect("stdout");
         writeln!(out, "FLEET_KV_FOLLOW_MS {}", stored.as_millis()).expect("stdout");
-        writeln!(out, "FLEET_KV_BATCHES {}", rank.applied).expect("stdout");
-        writeln!(out, "FLEET_KV_BLOCKS {}", rank.indexed).expect("stdout");
+        writeln!(out, "FLEET_KV_BATCHES {}", fed.applied).expect("stdout");
+        writeln!(out, "FLEET_KV_BLOCKS {}", fed.indexed).expect("stdout");
         writeln!(out, "FLEET_DEATH_WRITTEN_MS {}", written.as_millis()).expect("stdout");
         writeln!(out, "FLEET_DEATH_SEEN_MS {}", seen.as_millis()).expect("stdout");
         writeln!(out, "FLEET_HANG_SEEN_MS {}", hung_seen.as_millis()).expect("stdout");

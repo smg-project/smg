@@ -132,6 +132,7 @@ pub struct Verdict {
 /// holds of it, read at one instant.
 #[derive(Clone, Copy, Debug)]
 pub struct Heard {
+    /// The engine's data-parallel rank the row stands for.
     pub rank: u16,
     /// The last sequence the engine's stream delivered for the rank; `0`
     /// when none came.
@@ -144,6 +145,7 @@ pub struct Heard {
     pub indexed: usize,
     /// What the row's lane counted beside its blocks.
     pub counts: Option<LaneCounts>,
+    /// The rank's cursor in the store, when the rank has been heard from.
     pub cursor: Option<KvCursor>,
 }
 
@@ -219,11 +221,15 @@ struct Dialed {
 }
 
 /// What the stand-in subscribers heard, a row at a time, and the gaps the
-/// sink named. A row's lock is held across its batch's hand-over, so a read
-/// under it sees the store and the row in step.
+/// sink named. The rows' one lock is held across a batch's hand-over, so a
+/// read under it sees the store and every row in step.
 #[derive(Default)]
 struct Events {
     rows: Mutex<HashMap<WorkerId, Stream>>,
+    /// What refuses each engine's stream, by the engine's index: a dial or
+    /// a subscription that failed or outlasted its bound, a stream that
+    /// broke. An engine whose stream stands open has none.
+    refused: Mutex<HashMap<usize, String>>,
     gaps: AtomicU64,
     /// The snapshot chunks that came: an engine's own stream carries none.
     snapshots: AtomicU64,
@@ -238,7 +244,10 @@ struct Stream {
     applied: u64,
     /// The blocks the applied events left the engine holding, by its hashes.
     /// An engine's own stream carries no snapshot chunk (a relay's does), so
-    /// stores, removals and clears are the whole of it.
+    /// stores, removals and clears are the whole of it. A stream opened
+    /// again past the engine's replay buffer would part it from the index:
+    /// the sink reads a restarted publisher there and empties the rank,
+    /// and this set keeps what it had. No engine of the fleet opens one.
     held: HashSet<SequenceHash>,
 }
 
@@ -595,10 +604,12 @@ fn admit(store: &MemoryStore, engine: &Probed, events: &Events, batch: &KvEventB
 /// The case's stand-in for the KV event subscription: one stream an engine,
 /// every rank's batches on it, each handed to the sink as it arrives. A
 /// stream that ends or names a gap is opened again after one probe interval:
-/// from the rank's cursor for an engine of one rank, from the start for an
-/// engine of several (one cursor names one rank's sequence). A row with no
-/// cursor is unheard: its stream is asked from the start, so what the engine
-/// stored before the row was made is fed too.
+/// from the rank's cursor for an engine of one rank, from zero for an engine
+/// of several (one cursor names one rank's sequence). An engine asked from
+/// zero replays what its buffer still holds. A row with no cursor is
+/// unheard: its stream is asked from zero, so what the engine stored before
+/// the row was made is fed too. What refuses a dial or a stream is kept
+/// until a stream opens, so a wait that runs out can say why.
 async fn subscribe(
     store: Arc<MemoryStore>,
     engine: Probed,
@@ -611,24 +622,38 @@ async fn subscribe(
             _ => 0,
         };
         let opened = tokio::time::timeout(DIAL_TIMEOUT, async {
-            let client = VllmEngineClient::connect(&engine.endpoint).await.ok()?;
-            client.subscribe_kv_events(resume).await.ok()
+            let client = VllmEngineClient::connect(&engine.endpoint)
+                .await
+                .map_err(|error| format!("the dial: {error}"))?;
+            client
+                .subscribe_kv_events(resume)
+                .await
+                .map_err(|status| format!("the subscription: {status}"))
         })
-        .await;
-        if let Ok(Some(mut stream)) = opened {
-            for id in &engine.ids {
-                store.reconnected(*id);
-            }
-            loop {
-                let batch = tokio::select! {
-                    batch = stream.message() => batch,
-                    _ = stop.wait_for(|stop| *stop) => return,
-                };
-                match batch {
-                    Ok(Some(batch)) if admit(&store, &engine, &events, &batch) => {}
-                    _ => break,
+        .await
+        .unwrap_or_else(|_| Err(format!("no stream within {DIAL_TIMEOUT:?}")));
+        let refusal = match opened {
+            Ok(mut stream) => {
+                events.refused.lock().remove(&engine.engine);
+                for id in &engine.ids {
+                    store.reconnected(*id);
+                }
+                loop {
+                    let batch = tokio::select! {
+                        batch = stream.message() => batch,
+                        _ = stop.wait_for(|stop| *stop) => return,
+                    };
+                    match batch {
+                        Ok(Some(batch)) if admit(&store, &engine, &events, &batch) => {}
+                        Ok(_) => break None,
+                        Err(status) => break Some(format!("the stream: {status}")),
+                    }
                 }
             }
+            Err(refusal) => Some(refusal),
+        };
+        if let Some(refusal) = refusal {
+            events.refused.lock().insert(engine.engine, refusal);
         }
         tokio::select! {
             () = tokio::time::sleep(PROBE_INTERVAL) => {}
@@ -893,6 +918,7 @@ impl Harness {
         self.feeding = true;
     }
 
+    /// Starts the stand-in subscriber of one engine.
     fn subscriber(&mut self, engine: Probed) {
         self.feeds.spawn(subscribe(
             Arc::clone(&self.store),
@@ -925,6 +951,12 @@ impl Harness {
             .collect();
         rows.sort_unstable_by_key(|row| row.rank);
         rows
+    }
+
+    /// What refuses the event stream of the engine at `engine`, in the
+    /// subscriber's words; `None` when nothing refuses it.
+    pub fn refused(&self, engine: usize) -> Option<String> {
+        self.events.refused.lock().get(&engine).cloned()
     }
 
     /// The gaps the KV sink named on any engine's stream.
