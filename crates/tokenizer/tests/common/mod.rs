@@ -70,13 +70,14 @@ const KIMI_K3_CACHE_DIR: &str = ".tokenizer_cache/kimi_k3";
 ///
 /// `KIMI_K3_MODEL_DIR` points at a full checkpoint directory and skips the
 /// download; otherwise the two tokenizer files are fetched once from the
-/// public repository into `.tokenizer_cache/kimi_k3/`.
+/// public repository into `.tokenizer_cache/kimi_k3/`. Returns `None` only
+/// when offline (the repository is unreachable) and no override is set; a
+/// wrong answer or an unwritable cache panics, so the cases cannot be
+/// skipped silently.
 #[expect(clippy::expect_used, reason = "test helper — panics are intentional")]
-#[expect(clippy::print_stdout, reason = "test diagnostic output")]
-#[expect(clippy::panic, reason = "test helper — panics are intentional")]
-pub fn ensure_kimi_k3_cached() -> PathBuf {
+pub fn ensure_kimi_k3_cached() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("KIMI_K3_MODEL_DIR") {
-        return PathBuf::from(dir);
+        return Some(PathBuf::from(dir));
     }
 
     let _guard = hub_fetch::download_lock();
@@ -94,26 +95,9 @@ pub fn ensure_kimi_k3_cached() -> PathBuf {
         if path.exists() {
             continue;
         }
-        println!("Downloading Kimi-K3 {file} from HuggingFace...");
-        let client = http_client();
-        let answer = hub_fetch::fetch(&client, &format!("{KIMI_K3_REPO}/{file}"))
-            .unwrap_or_else(|e| panic!("Failed to download {file}: {e}"));
-        assert!(
-            answer.status.is_success(),
-            "Failed to download {file}: HTTP {}",
-            answer.status
-        );
-        let content = answer.body;
-        assert!(
-            content.len() >= min_bytes,
-            "Downloaded {file} too small: {} bytes",
-            content.len()
-        );
-        // Rename into place so a failed write never leaves a short file that
-        // the next run would trust.
-        let part = cache_dir.join(format!("{file}.part"));
-        fs::write(&part, content).expect("Failed to write to cache");
-        fs::rename(&part, &path).expect("Failed to move download into place");
+        if !download_tokenizer_file("Kimi-K3", KIMI_K3_REPO, &cache_dir, file, min_bytes) {
+            return None;
+        }
     }
 
     // Renderer detection reads `config.json::architectures`; the tokenizer
@@ -127,7 +111,7 @@ pub fn ensure_kimi_k3_cached() -> PathBuf {
         .expect("Failed to write config.json");
     }
 
-    cache_dir
+    Some(cache_dir)
 }
 
 const DEEPSEEK_V41_REPO: &str =
@@ -135,9 +119,9 @@ const DEEPSEEK_V41_REPO: &str =
 const DEEPSEEK_V41_CACHE_DIR: &str = ".tokenizer_cache/deepseek_v41";
 
 /// Downloads one tokenizer file of the model `label` from `base` into
-/// `dir/file`, mirroring the Kimi-K3 helper's approach: write to a `.part`
-/// file and rename into place, so a failed write never leaves a short file
-/// that a later run would trust. Only a transport failure that no try got
+/// `dir/file`: written to a `.part` file and renamed into place, so a failed
+/// write never leaves a short file that a later run would trust. Only a
+/// transport failure that no try got
 /// past (no connection, TLS, a timeout before the answer; the GET is sent
 /// again a few times first) returns `false` so the caller can skip when
 /// offline; a reachable but wrong response (non-success status, short body,
@@ -149,7 +133,7 @@ const DEEPSEEK_V41_CACHE_DIR: &str = ".tokenizer_cache/deepseek_v41";
     clippy::panic,
     reason = "test helper — diagnostics and loud failures are intentional"
 )]
-fn download_tokenizer_file(
+pub fn download_tokenizer_file(
     label: &str,
     base: &str,
     dir: &Path,
