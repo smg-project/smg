@@ -1216,7 +1216,7 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-10-01",
         smg: (None, None),
-        table: Some(Table::Plain),
+        table: Some(Table::Qwen2_5),
         set: None,
         status: Status::AwaitingFixtures,
     },
