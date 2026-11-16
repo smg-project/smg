@@ -52,6 +52,9 @@ struct EmbedStub {
     most_in_flight: Arc<AtomicUsize>,
     /// While it reads `false`, every call waits where it arrived.
     gate: Option<watch::Receiver<bool>>,
+    /// The call whose ids are the list waits past the gate until the test
+    /// lets it go.
+    held: Option<(Vec<u32>, watch::Receiver<bool>)>,
 }
 
 #[tonic::async_trait]
@@ -85,6 +88,14 @@ impl VllmEngine for EmbedStub {
             assert!(opened, "the test opens the gate before it lets go of it");
         }
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        let held = self
+            .held
+            .as_ref()
+            .filter(|(ids, _)| *ids == tokenized.input_ids);
+        if let Some((_, let_go)) = held {
+            let released = let_go.clone().wait_for(|go| *go).await.is_ok();
+            assert!(released, "the test lets the held call go before it ends");
+        }
         if self.slow_ids.as_deref() == Some(tokenized.input_ids.as_slice()) {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -394,15 +405,17 @@ async fn a_batch_of_texts_is_one_call_per_text_answered_in_order() {
 
 /// A batch past the window keeps the window's count of calls in flight and
 /// never one more, and is answered in the inputs' order. The stub holds every
-/// call where it arrived, so its count is every call the gateway has open.
+/// call where it arrived, so its count is every call the gateway has open. A
+/// call that is slow to answer holds its own slot and no other.
 #[tokio::test]
 async fn a_batch_past_the_window_keeps_the_window_of_calls_in_flight() {
     let (open, gate) = watch::channel(false);
+    let (let_go, held) = watch::channel(false);
     let stub = EmbedStub {
         gate: Some(gate),
         // The first input's call answers last, so the answers reach the
         // gateway out of the inputs' order.
-        slow_ids: Some(vec![1]),
+        held: Some((vec![1], held)),
         ..EmbedStub::default()
     };
     let bed = Bed::over(Endpoint::Embeddings, stub).await;
@@ -425,6 +438,20 @@ async fn a_batch_past_the_window_keeps_the_window_of_calls_in_flight() {
         // The window is full and no call ends: one past it arrives now.
         tokio::time::sleep(Duration::from_millis(50)).await;
         open.send(true).expect("the stub holds the gate");
+        // The first input's call is still held: every other call, the ones
+        // past the window too, runs to its answer meanwhile. A window that
+        // waits for its oldest call never sends those, and fails here.
+        let others_end = async {
+            while bed.finished_ids().len() < inputs.len() - 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        // Half the bed's budget for the answer: a window that waits for its
+        // oldest call fails here, in these words, before that budget does.
+        tokio::time::timeout(Duration::from_secs(5), others_end)
+            .await
+            .expect("every other call ends while the first input's call is held");
+        let_go.send(true).expect("the stub holds the held call");
     };
     let ((status, body), ()) = tokio::join!(
         bed.embed(json!({"model": MODEL, "input": inputs})),
