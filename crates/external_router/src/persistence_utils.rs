@@ -685,8 +685,8 @@ async fn persist_conversation_items_inner(
     let written_output_ids = output_item_ids(output_items);
     let (input_count, output_count) = (input_items.len(), output_items.len());
     // Only a request that names a conversation links its items, so only that
-    // one copies the two lists; the copy is shallow against compacted items
-    // (the base64 image payloads were stripped above).
+    // one copies the two lists: a deep copy of each item, smaller only by the
+    // base64 image payloads stripped above.
     let to_link = original_body
         .conversation
         .is_some()
