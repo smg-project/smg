@@ -606,22 +606,47 @@ impl WorkerService {
         // removal is draining holds the URL for the drain window; that answer
         // says so and when to retry, instead of offering a PUT or a PATCH of
         // a worker that is leaving.
+        //
+        // The same address under another spelling (a trailing slash, a padded
+        // port) answers the same way, for the worker that holds the address:
+        // a removal selects by address, so a second worker registered for it
+        // would leave with the first one's DELETE. A data-parallel group's
+        // ranks are `{base}@{rank}`: its base posted again, under its own
+        // spelling or another, is answered with the lowest rank.
         let live = self
             .worker_registry
             .get_id_by_url_or_reservation(&worker_url)
-            .and_then(|id| self.worker_registry.get(&id).map(|worker| (id, worker)));
+            .and_then(|id| self.worker_registry.get(&id).map(|worker| (id, worker)))
+            .or_else(|| {
+                // The lookup reads a trailing `@digits` as a rank. On a
+                // network address it can only be one: the URL check refuses
+                // the suffix on a posted address, so a rank holds its base
+                // with or without its data-parallel metadata. In a socket
+                // path the same characters can be the path's own: there only
+                // a worker that carries the rank holds the base. The registry
+                // walks in hash order: the lowest URL, so the answer names
+                // the same worker every time.
+                let other = find_workers_by_url(&self.worker_registry, &worker_url)
+                    .into_iter()
+                    .filter(|other| {
+                        Endpoint::parse_with_rank(other.url()).is_ok_and(|(address, rank)| {
+                            rank == other.dp_rank() || !address.is_ipc()
+                        })
+                    })
+                    .min_by(|a, b| a.url().cmp(b.url()))?;
+                let id = self.worker_registry.get_id_by_url(other.url())?;
+                Some((id, other))
+            });
         if let Some((worker_id, existing)) = live {
+            let url = existing.url().to_string();
             return Err(if existing.status() == WorkerStatus::Draining {
                 WorkerServiceError::RemovalInProgress {
-                    url: worker_url,
+                    url,
                     worker_id,
                     drain_secs: existing.metadata().health_config.drain_settle_secs,
                 }
             } else {
-                WorkerServiceError::Conflict {
-                    url: worker_url,
-                    worker_id,
-                }
+                WorkerServiceError::Conflict { url, worker_id }
             });
         }
 
@@ -1269,6 +1294,133 @@ mod tests {
             .expect("a leftover reservation is no registration in flight");
         assert_eq!(admitted.worker_id, reserved, "the 202 names the adopted id");
         assert_eq!(registry.get_id_by_url_or_reservation(url), Some(reserved));
+    }
+
+    /// One address is one worker. Another spelling of a registered address
+    /// (a trailing slash, a padded port) is refused like the string itself
+    /// and names the worker that holds the address: a removal selects by
+    /// address, so a worker registered under the second spelling would leave
+    /// with the first one's DELETE. A second spelling of a worker that
+    /// drains reads the removal in progress, the same host and port under
+    /// another scheme is another worker, and a data-parallel group's base is
+    /// refused under every spelling, its own included, naming the lowest
+    /// rank. A rank registered without its data-parallel metadata still
+    /// holds its group's base on a network address. A socket path that ends
+    /// in `@` and digits is its own address: the path without them registers
+    /// beside it.
+    #[tokio::test]
+    async fn create_worker_refuses_another_spelling_of_a_registered_address() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let context = app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None);
+        let queue = JobQueue::new(
+            JobQueueConfig {
+                max_concurrent_jobs: 0,
+                ..JobQueueConfig::default()
+            },
+            Arc::downgrade(&context),
+        );
+        let held = Arc::new(std::sync::OnceLock::new());
+        held.set(queue).ok();
+        let service = WorkerService::new(Arc::clone(&registry), held, RouterConfig::default());
+
+        let plain = "grpc://10.0.0.8:8000";
+        register_worker(&registry, plain, Some("m"));
+        let id = registry.get_id_by_url(plain).expect("registered");
+        for spelling in ["grpc://10.0.0.8:8000/", "grpc://10.0.0.8:08000", plain] {
+            let (status, body, _) = answer(
+                service
+                    .create_worker(worker_spec(spelling))
+                    .await
+                    .expect_err("the address is held"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{spelling}: {body}");
+            assert_eq!(body["code"], "WORKER_ALREADY_EXISTS", "{spelling}: {body}");
+            let message = body["error"].as_str().expect("a message");
+            assert!(
+                message.contains(&format!("at URL '{plain}' with ID {}", id.as_str())),
+                "{spelling} is answered with the registered worker: {message}"
+            );
+            assert_eq!(
+                registry.get_id_by_url_or_reservation(spelling),
+                (spelling == plain).then(|| id.clone()),
+                "{spelling}: a refused spelling reserves nothing"
+            );
+        }
+
+        let worker = registry.get(&id).expect("registered");
+        worker.set_status(WorkerStatus::Draining);
+        let (status, body, retry_after) = answer(
+            service
+                .create_worker(worker_spec("grpc://10.0.0.8:8000/"))
+                .await
+                .expect_err("a draining worker holds the address for its drain"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let message = body["error"].as_str().expect("a message");
+        assert!(
+            message.contains("is being removed")
+                && message.contains(plain)
+                && !message.contains("grpc://10.0.0.8:8000/"),
+            "the removal is named with the registered URL: {message}"
+        );
+        assert!(
+            retry_after.is_some(),
+            "Retry-After carries the drain window"
+        );
+
+        service
+            .create_worker(worker_spec("http://10.0.0.8:8000"))
+            .await
+            .expect("the same host and port under another scheme is another worker");
+
+        let base = "grpc://10.0.0.9:8000";
+        for rank in 0..2 {
+            let ranked = BasicWorkerBuilder::new(base)
+                .worker_type(WorkerType::Regular)
+                .dp_config(rank, 2);
+            registry.register(Arc::new(ranked.build())).unwrap();
+        }
+        for spelling in ["grpc://10.0.0.9:8000/", base] {
+            let (status, body, _) = answer(
+                service
+                    .create_worker(worker_spec(spelling))
+                    .await
+                    .expect_err("the group holds the address"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{spelling}: {body}");
+            let message = body["error"].as_str().expect("a message");
+            assert!(
+                message.contains(&format!("at URL '{base}@0'")),
+                "{spelling}: the group's lowest rank is named: {message}"
+            );
+        }
+
+        // A rank built from its URL alone carries no rank in its metadata; on
+        // a network address it still holds the base.
+        let orphan = "grpc://10.0.0.7:8000@1";
+        register_worker(&registry, orphan, Some("m"));
+        let (status, body, _) = answer(
+            service
+                .create_worker(worker_spec("grpc://10.0.0.7:8000"))
+                .await
+                .expect_err("a rank without its metadata holds the base"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let message = body["error"].as_str().expect("a message");
+        assert!(
+            message.contains(&format!("at URL '{orphan}'")),
+            "the rank is named: {message}"
+        );
+
+        register_worker(&registry, "ipc:///tmp/w@0", Some("m"));
+        service
+            .create_worker(worker_spec("ipc:///tmp/w"))
+            .await
+            .expect("a socket path that only reads like a rank's base is another worker");
     }
 
     /// An id with no worker behind it is a registration in flight: a PATCH
