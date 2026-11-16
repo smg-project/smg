@@ -2227,9 +2227,20 @@ async fn a_previous_generations_disconnect_does_not_end_the_next_link() {
     round_trip(&client, &mut engine, "generation-one").await;
 
     // The frontend restarts: its sockets go with the client, and it binds
-    // again (the dropped listeners' socket files go on their own tasks).
+    // again once the dropped listeners' socket files are gone (they go on
+    // the listeners' own tasks).
     drop(client);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(TIMEOUT, async {
+        while [&handshake, &input, &output].into_iter().any(|endpoint| {
+            endpoint
+                .strip_prefix("ipc://")
+                .is_some_and(|path| std::path::Path::new(path).exists())
+        }) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the dropped listeners' socket files go");
     let (transport, next) = tokio::join!(
         connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
         async {
@@ -3674,21 +3685,26 @@ async fn prompts_withdrawn_before_their_allowance_passes_explain_the_silence_unt
 /// rank) or is refused at a blocked input's bound never reached the
 /// engine, so it explains no silence, and the request the engine did
 /// read is answered for at the window, not the refused prompts'
-/// allowance later.
+/// allowance later. The window is set once the refused adds are in and
+/// counts from the engine's one output after them: a starved host
+/// cannot spend it on the setup. That output works the end of the work
+/// in hand out again from the prompts still pending, so that deadline
+/// is read around each refused add, where a queued allowance moves it.
 #[tokio::test]
 async fn an_add_the_engine_never_received_queues_no_allowance_on_the_wire() {
     let (client, mut engine, _ns) = connect().await;
-    let window = Duration::from_secs(2);
-    client.set_silence_death_timeout(window);
     client.set_prefill_tokens_per_sec(10_000);
     client.set_send_timeout(SEND_WINDOW);
     client.set_input_queue_limit(0, usize::MAX);
-    // The engine reads one short request and answers nothing.
-    let started = std::time::Instant::now();
+    // The engine reads one short request.
     let mut stream = client.submit(request_for("req-short", 0)).await.unwrap();
     engine.recv().await.unwrap();
+    // The end of the engine's prefill work in hand: the deadline a queued
+    // allowance moves.
+    let work_end = || client.inner.registry.lock().work_end;
     // A 50k-token prompt (five seconds of allowance) for a rank that does
     // not exist fails before any frame is built.
+    let in_hand = work_end();
     let error = client
         .submit(EngineCoreRequest {
             prompt_token_ids: Some(vec![1; 50_000]),
@@ -3701,10 +3717,16 @@ async fn an_add_the_engine_never_received_queues_no_allowance_on_the_wire() {
         matches!(error, Error::InvalidDataParallelRank { rank: 7, .. }),
         "{error:?}"
     );
+    assert_eq!(
+        work_end(),
+        in_hand,
+        "no allowance for a prompt that has no engine"
+    );
     // The engine stops reading: once the transport's payload budget is
     // full, the next frame waits behind it for a send window and fails,
     // and the 50k-token prompt after it is refused at the bound on the
-    // spot.
+    // spot: its error kind says so, a frame that waited answers as
+    // blocked.
     saturate_input(&client).await;
     let (request, aux) = (request_for("req-blocked", 0), Vec::new());
     let error = client
@@ -3717,31 +3739,51 @@ async fn an_add_the_engine_never_received_queues_no_allowance_on_the_wire() {
         "{error:?}"
     );
     tokio::time::sleep(SEND_WINDOW / 10).await;
-    let refused_at = std::time::Instant::now();
+    let in_hand = work_end();
     let error = client
         .submit(long_request("req-refused", 50_000))
         .await
         .err()
         .expect("the input is blocked and its queue at the bound");
     assert!(matches!(error, Error::EngineInputFull { .. }), "{error:?}");
-    assert!(refused_at.elapsed() < SEND_WINDOW / 2, "refused at once");
+    assert_eq!(
+        work_end(),
+        in_hand,
+        "no allowance for a prompt refused at the bound"
+    );
     assert_eq!(
         client.prefill_pending_tokens(),
         3,
         "only the prompt the engine read is in hand"
     );
-    // The verdict on the request the engine read comes at the window from
-    // its dispatch, not ten seconds of never-handed allowance later.
+    // The engine answers the request it read once, then nothing. The
+    // output re-arms the watchdog under the window set here, so the
+    // verdict comes a window after it.
+    let window = Duration::from_secs(2);
+    client.set_silence_death_timeout(window);
+    let answered = std::time::Instant::now();
+    engine
+        .send_output(batch(
+            0,
+            EngineCoreOutput {
+                request_id: "req-short".into(),
+                new_token_ids: vec![10],
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(stream.next().await, Some(Ok(_))), "the one output");
     let error = match stream.next().await {
         Some(Err(error)) => error,
-        Some(Ok(_)) => panic!("the engine answers nothing"),
+        Some(Ok(_)) => panic!("the engine answers once"),
         None => panic!("the stream ended without the engine's death"),
     };
     assert!(is_engine_dead(&error), "{error:?}");
-    let elapsed = started.elapsed();
+    let elapsed = answered.elapsed();
     assert!(
         elapsed >= window && elapsed < window + Duration::from_secs(2),
-        "at the window, nothing queued for the prompts the engine never got: {elapsed:?}"
+        "a window after the engine's last output: {elapsed:?}"
     );
     assert!(!client.is_alive());
 }
