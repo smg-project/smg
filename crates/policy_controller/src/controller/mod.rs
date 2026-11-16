@@ -51,6 +51,7 @@ pub use self::{
     admin::{Version, VERSION},
     config::{Config, ConfigError, Listener, Scope, Tls},
     election::{Election, LeaseError, LeasePlace},
+    principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},
     tls::TlsError,
 };
@@ -141,6 +142,9 @@ struct Bound {
     listener: TcpIncoming,
     server: Server,
     tls: bool,
+    /// Whether it verifies its callers against a client CA, as the bind
+    /// read its TLS material.
+    mutual: bool,
     /// How the listener's calls come by a principal.
     layer: Layer,
 }
@@ -260,6 +264,7 @@ impl Controller {
             let name = listener.name.clone();
             let mut server = Server::builder();
             let mut mode = "off";
+            let mut mutual = false;
             if let Some(tls) = &listener.tls {
                 let material = tls::Material::read(tls)
                     .await
@@ -273,11 +278,8 @@ impl Controller {
                         name: name.clone(),
                         source,
                     })?;
-                mode = if material.mutual() {
-                    "mutual"
-                } else {
-                    "server"
-                };
+                mutual = material.mutual();
+                mode = if mutual { "mutual" } else { "server" };
             }
             let bind = |source| Error::Bind {
                 name: name.clone(),
@@ -301,6 +303,7 @@ impl Controller {
                 listener: TcpIncoming::from(socket).with_nodelay(Some(true)),
                 server,
                 tls: listener.tls.is_some(),
+                mutual,
                 layer: Layer::Off,
             });
         }
@@ -397,10 +400,9 @@ impl Controller {
             .iter_mut()
             .find(|bound| bound.name == listener)
             .ok_or_else(|| ConfigError::UnknownListener(listener.to_owned()))?;
-        let verifies = self.config.listeners.iter().any(|l| {
-            l.name == listener && l.tls.as_ref().is_some_and(|tls| tls.client_ca.is_some())
-        });
-        if verifies {
+        // The bind read whether the listener verifies its callers: that one
+        // reading is asked here, not the configuration again.
+        if bound.mutual {
             return Err(ConfigError::AsToldBesideClientCa(listener.to_owned()));
         }
         bound.layer = Layer::AsTold;
