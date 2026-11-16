@@ -22,6 +22,7 @@ pub mod admin;
 pub mod config;
 pub mod election;
 pub mod metrics;
+mod principal;
 pub mod readiness;
 mod service;
 pub mod tls;
@@ -47,6 +48,7 @@ pub use self::{
 };
 use self::{
     election::Standing,
+    principal::Layer,
     readiness::Phase,
     service::{Service, Shared},
 };
@@ -56,7 +58,6 @@ use crate::{
         loads::{LoadDriver, LoadDriverConfig},
         probe::EngineProbe,
     },
-    proto::policy_controller_server::PolicyControllerServer,
     store::{MemoryStore, WorkersStore},
 };
 
@@ -112,6 +113,8 @@ struct Bound {
     listener: TcpListener,
     server: Server,
     tls: bool,
+    /// How the listener's calls come by a principal.
+    layer: Layer,
 }
 
 /// Where a bound controller listens.
@@ -270,6 +273,7 @@ impl Controller {
                 listener: socket,
                 server,
                 tls: listener.tls.is_some(),
+                layer: Layer::Off,
             });
         }
         let admin = TcpListener::bind(config.admin)
@@ -339,6 +343,46 @@ impl Controller {
                 .collect(),
             admin: self.admin_addr,
         }
+    }
+
+    /// Names `listener` one that takes its callers' identities as told
+    /// (the contract's `METHOD_AS_TOLD`): a caller states its name in the
+    /// `x-smg-principal` metadata entry of every call and nothing is
+    /// verified, so whoever reaches the listener acts as any principal of
+    /// its scopes. It is for a listener only one trust domain reaches: a
+    /// loopback, or a mesh that verifies in front of the process. No
+    /// listener is named by default, and one that is not named refuses
+    /// every call that needs a principal.
+    ///
+    /// Called between [`Controller::bind`] and [`Controller::serve`]. This
+    /// method is the setting's one home until the configuration is built
+    /// in one place.
+    ///
+    /// # Errors
+    ///
+    /// No listener has the name, or the listener verifies its callers
+    /// against a client CA: a listener has one credential rule.
+    pub fn identity_as_told(&mut self, listener: &str) -> Result<(), ConfigError> {
+        let bound = self
+            .listeners
+            .iter_mut()
+            .find(|bound| bound.name == listener)
+            .ok_or_else(|| ConfigError::UnknownListener(listener.to_owned()))?;
+        let verifies = self.config.listeners.iter().any(|l| {
+            l.name == listener && l.tls.as_ref().is_some_and(|tls| tls.client_ca.is_some())
+        });
+        if verifies {
+            return Err(ConfigError::AsToldBesideClientCa(listener.to_owned()));
+        }
+        bound.layer = Layer::AsTold;
+        warn!(
+            controller_id = %self.config.controller_id,
+            listener = %bound.name,
+            addr = %bound.addr,
+            scopes = ?bound.scopes,
+            "identities are taken as told on this listener: nothing is verified, and whoever reaches it acts as any principal of its scopes"
+        );
+        Ok(())
     }
 
     /// The store the ingestion drivers and the scopes' calls feed and read.
@@ -413,16 +457,15 @@ impl Controller {
             reporter
                 .set_service_status(SERVICE_NAME, ServingStatus::NotServing)
                 .await;
-            let service =
-                PolicyControllerServer::new(Service::new(bound.scopes, Arc::clone(&shared)));
+            let routes = Service::new(bound.scopes, Arc::clone(&shared)).routes(bound.layer);
             let mut stop = stop.subscribe();
             let name = bound.name;
             let incoming = TcpIncoming::from(bound.listener);
             let mut server = bound.server;
             tasks.spawn(async move {
                 server
+                    .add_routes(routes)
                     .add_service(health)
-                    .add_service(service)
                     .serve_with_incoming_shutdown(incoming, async move {
                         let _ = stop.wait_for(|stop| *stop).await;
                     })

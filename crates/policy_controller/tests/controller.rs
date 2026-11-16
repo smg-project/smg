@@ -26,12 +26,19 @@ use smg_policy_controller::{
         TlsError, SERVICE_NAME,
     },
     elector::{ElectionSettings, FileLease, LeaseBackend},
-    proto::{policy_controller_client::PolicyControllerClient, LeaderRequest},
+    proto::{
+        policy_controller_client::PolicyControllerClient, GetPolicySpecRequest, LeaderRequest,
+        WatchWorkersRequest,
+    },
     store::{LoadSink, LoadSource, WorkerFacts, WorkersStore},
     view::{LoadRow, Role},
 };
 use tokio::{net::TcpStream, sync::oneshot};
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+use tonic::{
+    metadata::AsciiMetadataValue,
+    transport::{Certificate, Channel, ClientTlsConfig, Identity},
+    Code, Request,
+};
 use tonic_health::pb::{
     health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
 };
@@ -194,6 +201,81 @@ async fn the_listeners_serve_health_and_the_admin_endpoints_on_ephemeral_ports()
     let (served, ()) = tokio::join!(serve, probe);
     served.expect("a clean stop");
     assert_eq!(readiness.state(), State::Draining);
+}
+
+/// `message` as a call that states `name`, or states none.
+fn stating<T>(name: Option<&'static str>, message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    if let Some(name) = name {
+        request
+            .metadata_mut()
+            .insert("x-smg-principal", AsciiMetadataValue::from_static(name));
+    }
+    request
+}
+
+/// A listener its operator named takes the name a call states, and no
+/// step serves the call yet. The other listeners take none: a call of
+/// theirs that needs a principal is refused whatever it states. `Leader`
+/// asks for no principal on either.
+#[tokio::test]
+async fn a_listener_named_as_told_takes_the_stated_name_and_the_others_take_none() {
+    let mut controller = Controller::bind(config()).await.expect("bind");
+    assert_eq!(
+        controller.identity_as_told("nowhere"),
+        Err(ConfigError::UnknownListener("nowhere".to_owned()))
+    );
+    controller
+        .identity_as_told("control")
+        .expect("a listener of the configuration");
+    let addresses = controller.addresses();
+    let mut readiness = controller.readiness();
+
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serve = controller.serve(async {
+        let _ = stopped.await;
+    });
+    let probe = async {
+        assert_eq!(readiness.wait_for(State::Leader).await, Some(State::Leader));
+        let dial = |scope| {
+            let addr = addresses.of(scope).expect("every scope is mounted");
+            PolicyControllerClient::connect(format!("http://{addr}"))
+        };
+        let mut control = dial(Scope::Control).await.expect("the listener accepts");
+        let mut gateway = dial(Scope::Gateway).await.expect("the listener accepts");
+
+        let read = |name| stating(name, GetPolicySpecRequest::default());
+        let told = control
+            .get_policy_spec(read(Some("operator-a")))
+            .await
+            .expect_err("no step serves the call");
+        assert_eq!(told.code(), Code::Unimplemented, "{told:?}");
+        let silent = control
+            .get_policy_spec(read(None))
+            .await
+            .expect_err("no name is stated");
+        assert_eq!(silent.code(), Code::Unauthenticated, "{silent:?}");
+
+        let watch = stating(Some("gateway-a"), WatchWorkersRequest::default());
+        let unread = gateway
+            .watch_workers(watch)
+            .await
+            .expect_err("the listener takes no identity as told");
+        assert_eq!(unread.code(), Code::Unauthenticated, "{unread:?}");
+
+        for client in [&mut control, &mut gateway] {
+            let info = client
+                .leader(LeaderRequest::default())
+                .await
+                .expect("Leader asks for no principal")
+                .into_inner();
+            assert!(info.is_leader, "{info:?}");
+        }
+
+        stop.send(()).expect("the serve is listening for the stop");
+    };
+    let (served, ()) = tokio::join!(serve, probe);
+    served.expect("a clean stop");
 }
 
 #[tokio::test]
@@ -489,7 +571,13 @@ async fn mutual_tls_admits_the_authoritys_clients_and_refuses_the_rest() {
         key,
         client_ca: None,
     });
-    let controller = Controller::bind(config).await.expect("bind");
+    let mut controller = Controller::bind(config).await.expect("bind");
+    // A listener has one credential rule: the one that verifies its callers
+    // against a client CA takes no identity as told.
+    assert_eq!(
+        controller.identity_as_told("gateway"),
+        Err(ConfigError::AsToldBesideClientCa("gateway".to_owned()))
+    );
     let addresses = controller.addresses();
     let mut readiness = controller.readiness();
     assert_eq!(

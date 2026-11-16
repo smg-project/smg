@@ -249,6 +249,15 @@ pub enum ConfigError {
         /// The listener that named it again.
         second: String,
     },
+    /// A listener named to take identities as told that the configuration
+    /// does not hold.
+    #[error("no listener is named {0:?}: identities are taken as told on a listener of the configuration")]
+    UnknownListener(String),
+    /// A listener named to take identities as told that verifies its
+    /// callers against a client CA: the verified subject is the principal,
+    /// and a listener has one credential rule.
+    #[error("listener {0} verifies its callers against a client CA: it takes no identity as told")]
+    AsToldBesideClientCa(String),
     /// A grace period of zero: a drain needs a bound above zero.
     #[error("the shutdown grace period is zero")]
     ZeroShutdownGrace,
