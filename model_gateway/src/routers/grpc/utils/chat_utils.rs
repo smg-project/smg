@@ -818,6 +818,22 @@ fn validate_chat_parts(
             ChatMessage::Function { .. } => None,
         };
         let assistant = matches!(message, ChatMessage::Assistant { .. });
+        // The roles whose content the public contract keeps to text: a media
+        // part there is refused here, before any fetch, in this door's own
+        // sentence, not after the pipeline processed it and the rendered
+        // prompt's anchors did not match it (none for a system, developer or
+        // root part; one too many for an assistant part on a template that
+        // renders assistant media). The binding carries the role's article
+        // for the sentence.
+        let text_only_role = match message {
+            ChatMessage::System { .. } => Some("a system"),
+            ChatMessage::Developer { .. } => Some("a developer"),
+            ChatMessage::Assistant { .. } => Some("an assistant"),
+            ChatMessage::Root { .. } => Some("a root"),
+            ChatMessage::User { .. } | ChatMessage::Tool { .. } | ChatMessage::Function { .. } => {
+                None
+            }
+        };
         if let Some(MessageContent::Parts(parts)) = content {
             for part in parts {
                 match part {
@@ -849,12 +865,30 @@ fn validate_chat_parts(
                                 .to_string(),
                         );
                     }
-                    _ => {}
+                    _ => {
+                        if let (Some(kind), Some(role)) = (media_part_type(part), text_only_role) {
+                            return Err(format!(
+                                "Unsupported chat content part type {kind:?} in {role} message \
+                                 for gRPC backends: media parts are taken in user and tool messages"
+                            ));
+                        }
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// The wire name (`type`) of a media content part; `None` for any other part.
+fn media_part_type(part: &ContentPart) -> Option<&'static str> {
+    match part {
+        ContentPart::ImageUrl { .. } => Some("image_url"),
+        ContentPart::AudioUrl { .. } => Some("audio_url"),
+        ContentPart::InputAudio { .. } => Some("input_audio"),
+        ContentPart::VideoUrl { .. } => Some("video_url"),
+        ContentPart::Text { .. } | ContentPart::Refusal { .. } | ContentPart::Unknown(_) => None,
+    }
 }
 
 /// The template selects the reference path by the first block and emits only
@@ -1535,28 +1569,51 @@ pub(crate) fn generate_tool_call_id(
     tool_index: usize,
     history_count: usize,
 ) -> String {
-    // Case-insensitive substring checks without allocation.
-    let is_kimi = model
-        .as_bytes()
-        .windows(4) // "kimi".len()
-        .any(|window| window.eq_ignore_ascii_case(b"kimi"));
-
-    if !is_kimi {
+    match CallIdFamily::of(model) {
+        Some(family) => family.id(tool_name, tool_index, history_count),
         // Standard OpenAI format: call_{24-char-uuid}
-        return format!("call_{}", &Uuid::now_v7().simple().to_string()[..24]);
+        None => format!("call_{}", &Uuid::now_v7().simple().to_string()[..24]),
+    }
+}
+
+/// A model family whose call ids are numbered by the call's place in the
+/// conversation ([`generate_tool_call_id`] has the forms); every other
+/// model's ids are minted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallIdFamily {
+    KimiK2,
+    KimiK3,
+}
+
+impl CallIdFamily {
+    /// The family `model` names, read from the name.
+    pub(crate) fn of(model: &str) -> Option<Self> {
+        // Case-insensitive substring checks without allocation.
+        let names = |word: &[u8]| {
+            model
+                .as_bytes()
+                .windows(word.len())
+                .any(|window| window.eq_ignore_ascii_case(word))
+        };
+        if !names(b"kimi") {
+            return None;
+        }
+        Some(if names(b"k3") {
+            Self::KimiK3
+        } else {
+            Self::KimiK2
+        })
     }
 
-    let is_k3 = model
-        .as_bytes()
-        .windows(2) // "k3".len()
-        .any(|window| window.eq_ignore_ascii_case(b"k3"));
-
-    if is_k3 {
-        // Kimi-K3 (XTML) opaque format: {name}_{global_index}.
-        format!("{tool_name}_{}", history_count + tool_index)
-    } else {
-        // Kimi-K2 format: functions.{name}:{global_index}.
-        format!("functions.{}:{}", tool_name, history_count + tool_index)
+    /// The id of the call to `tool_name`, the `tool_index`-th of its message,
+    /// after `history_count` calls in the conversation's earlier messages.
+    pub(crate) fn id(self, tool_name: &str, tool_index: usize, history_count: usize) -> String {
+        match self {
+            // Kimi-K3 (XTML) opaque format: {name}_{global_index}.
+            Self::KimiK3 => format!("{tool_name}_{}", history_count + tool_index),
+            // Kimi-K2 format: functions.{name}:{global_index}.
+            Self::KimiK2 => format!("functions.{}:{}", tool_name, history_count + tool_index),
+        }
     }
 }
 

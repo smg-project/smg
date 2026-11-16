@@ -37,6 +37,7 @@ use crate::{
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
         },
     },
+    tenant::storage_tenant,
 };
 
 /// Serve Harmony Responses API with streaming (SSE)
@@ -55,7 +56,7 @@ pub(crate) async fn serve_harmony_responses_stream(
 ) -> Response {
     // Load the history the request continues, as the caller's tenant may see
     // it; `request` itself stays as it came, for the persist.
-    let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
+    let tenant = storage_tenant(&tenant_request_meta);
     let current_request = match load_history(
         ctx.history_stores(),
         &request,
@@ -220,10 +221,11 @@ async fn execute_mcp_tool_loop_streaming(
 
     // Emit mcp_list_tools on first iteration
     for binding in session.mcp_servers() {
-        let tools_for_server = session.list_tools_for_server(&binding.server_key);
+        let tools_for_server = session.list_tools_for_binding(binding);
+        let list_error = binding.list_error.as_deref();
 
         if emitter
-            .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, tx)
+            .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, list_error, tx)
             .await
             .is_err()
         {
@@ -393,7 +395,7 @@ async fn execute_mcp_tool_loop_streaming(
                         ctx.response_storage.clone(),
                         &final_response,
                         original_request,
-                        crate::tenant::storage_tenant(&tenant_request_meta).as_deref(),
+                        storage_tenant(&tenant_request_meta).as_deref(),
                         ctx.request_context.clone(),
                     )
                     .await
@@ -474,7 +476,7 @@ async fn execute_mcp_tool_loop_streaming(
                         ctx.response_storage.clone(),
                         &final_response,
                         original_request,
-                        crate::tenant::storage_tenant(&tenant_request_meta).as_deref(),
+                        storage_tenant(&tenant_request_meta).as_deref(),
                         ctx.request_context.clone(),
                     )
                     .await
@@ -512,7 +514,7 @@ async fn execute_mcp_tool_loop_streaming(
                 // Persist response to storage if store=true; a foreground
                 // response the client expects stored ends with
                 // response.failed when its record could not be written.
-                let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
+                let tenant = storage_tenant(&tenant_request_meta);
                 let not_stored = persist_response_if_needed(
                     ctx.conversation_storage.clone(),
                     ctx.conversation_item_storage.clone(),
@@ -549,7 +551,7 @@ async fn execute_without_mcp_streaming(
     mut startup: Option<StreamStartupSender>,
 ) {
     debug!("No MCP tools - executing single iteration");
-    let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
+    let tenant = storage_tenant(&tenant_request_meta);
 
     // Execute pipeline and get stream + load guards, under the request's
     // tenant rate-limit reservation; the one iteration shares the request

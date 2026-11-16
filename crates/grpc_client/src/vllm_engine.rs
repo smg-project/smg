@@ -29,7 +29,8 @@ pub mod proto {
 
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
-pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, VllmEngineClient>;
+pub type AbortOnDropStream =
+    crate::AbortOnDropStream<Box<proto::GenerateResponse>, VllmEngineClient>;
 
 /// gRPC client for vLLM scheduler
 #[derive(Clone)]
@@ -46,7 +47,9 @@ impl VllmEngineClient {
     crate::impl_engine_client_basics!(
         proto,
         proto::vllm_engine_client::VllmEngineClient<Channel>,
-        "vLLM"
+        "vLLM",
+        "vllm.grpc.engine.VllmEngine",
+        proto::vllm_engine_server::SERVICE_NAME
     );
 
     /// The request every builder of this client sends: the tokenized input, the
@@ -530,7 +533,7 @@ impl VllmEngineClient {
                 warn!("Failed to inject trace context: {}", e);
             }
             let (metadata, _extensions, ()) = carrier.into_parts();
-            let stream = call_with_frames::<proto::GenerateResponse>(
+            let stream = call_with_frames::<Box<proto::GenerateResponse>>(
                 self.channel(),
                 "/vllm.grpc.engine.VllmEngine/Generate",
                 metadata.into_headers(),

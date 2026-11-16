@@ -6,17 +6,35 @@ adapter names. No adapter is loaded or unloaded on this request path.
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 
 class PreloadedLoras:
     def __init__(self, server_args: Any) -> None:
-        # ServerArgs preserves CLI declarations and keeps parsed LoRARefs in
-        # its resolved view. Resolve before the Rust launcher's facts snapshot
-        # too, so that snapshot and the scheduler inherit the very same IDs.
+        # ServerArgs preserves CLI declarations separately from resolved values.
         if callable(getattr(server_args, "resolved_dict", None)):
             server_args.resolve_once()
             resolved = server_args.resolved_dict()
+            if resolved.get("lora_paths") and callable(
+                getattr(server_args, "check_server_args", None)
+            ):
+                from sglang.srt.server_args import ServerArgs
+
+                if isinstance(server_args, ServerArgs):
+                    from sglang.srt.arg_groups.lora_hook import check_lora_server_args
+                    from sglang.srt.arg_groups.overrides import resolution_result
+                    from sglang.srt.lora.lora_registry import LoRARef
+
+                    refs = resolution_result(server_args, "lora_paths")
+                    if isinstance(refs, dict) or any(not isinstance(ref, LoRARef) for ref in refs):
+                        # LoRA normalization happens during engine validation,
+                        # after the Rust launcher's facts snapshot. Run the native
+                        # hook on a copy: its deterministic IDs match the engine,
+                        # which must still validate its own declarations once.
+                        snapshot_args = copy.deepcopy(server_args)
+                        check_lora_server_args(snapshot_args)
+                        resolved = snapshot_args.resolved_dict()
         else:
             resolved = {
                 "enable_lora": getattr(server_args, "enable_lora", False),

@@ -313,7 +313,6 @@
       },
       "then": {
         "required": [
-          "image",
           "replicas",
           "ports",
           "service",
@@ -327,14 +326,6 @@
           "terminationGraceMarginSeconds"
         ],
         "properties": {
-          "image": {
-            "type": "object",
-            "required": ["repository", "tag"],
-            "properties": {
-              "repository": { "type": "string" },
-              "tag": { "type": "string" }
-            }
-          },
           "replicas": { "type": "integer" },
           "ports": {
             "type": "object",

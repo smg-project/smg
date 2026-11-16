@@ -8,7 +8,7 @@ use smg_grpc_client::connect_channel_with_timeout;
 
 use crate::{
     routers::grpc::client::{GrpcClient, HealthCheckResponse},
-    worker::endpoint::Endpoint,
+    worker::identity::endpoint::Endpoint,
 };
 
 fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
@@ -501,5 +501,82 @@ mod tests {
             not_healthy_error("  "),
             "gRPC health check reports the engine not healthy"
         );
+    }
+
+    /// For an address the door takes, the host and port the probes dial are
+    /// the ones every line names. Where a client and the gateway's own type
+    /// read an address apart (a caller's rank suffix, whose digits a client
+    /// dials as the host), the door refuses it.
+    #[test]
+    fn the_probes_dial_the_host_a_line_names() {
+        use crate::config::validate_worker_url;
+        let dialled = |address: &str| {
+            let health = http_health_url(address).expect(address);
+            let health = url::Url::parse(&health).expect(address);
+            format!(
+                "{}:{}",
+                health.host_str().expect(address),
+                health.port_or_known_default().expect(address)
+            )
+        };
+        for (address, host_and_port) in [
+            ("http://user:s3cret@127.0.0.1:8000", "127.0.0.1:8000"),
+            ("http://worker:3000/v1", "worker:3000"),
+            ("https://[::1]:8443", "[::1]:8443"),
+        ] {
+            validate_worker_url(address).expect(address);
+            assert_eq!(dialled(address), host_and_port);
+            let named = Endpoint::redacted_str(address);
+            assert!(named.contains(host_and_port), "{address}: {named}");
+        }
+        for (address, named, dialled_at) in [
+            (
+                "http://127.0.0.1:35099@2130706433",
+                "127.0.0.1:35099",
+                "127.0.0.1:80",
+            ),
+            (
+                "http://user:s3cret@127.0.0.1:52605@2130706433",
+                "127.0.0.1:52605",
+                "127.0.0.1:80",
+            ),
+            (
+                "http://user:s3cret@127.0.0.1:57697@3",
+                "127.0.0.1:57697",
+                "0.0.0.3:80",
+            ),
+        ] {
+            assert!(Endpoint::redacted_str(address).contains(named), "{address}");
+            assert_eq!(dialled(address), dialled_at, "{address}");
+            assert!(
+                validate_worker_url(address).is_err(),
+                "{address} is refused at the door"
+            );
+        }
+        // The gRPC channel reads the digits as its host too.
+        let address = "grpc://127.0.0.1:61845@2130706433";
+        let channel: http::Uri = grpc_reachable_url(address)
+            .expect(address)
+            .parse()
+            .expect(address);
+        assert_eq!(channel.host(), Some("2130706433"));
+        assert!(Endpoint::redacted_str(address).contains("127.0.0.1:61845"));
+        assert!(
+            validate_worker_url(address).is_err(),
+            "{address} is refused at the door"
+        );
+        // To the gateway's type these two hold no userinfo, only a host and
+        // its rank: a token alone, a user and a password of digits. A line
+        // would name each whole.
+        for address in [
+            "http://s3cret-token@8080",
+            "http://s3cret-user:8080@2130706433",
+        ] {
+            assert_eq!(Endpoint::redacted_str(address), address);
+            assert!(
+                validate_worker_url(address).is_err(),
+                "{address} is refused at the door"
+            );
+        }
     }
 }

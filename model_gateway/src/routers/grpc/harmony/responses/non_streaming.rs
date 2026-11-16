@@ -45,6 +45,7 @@ use crate::{
             harmony::processor::ResponsesIterationResult,
         },
     },
+    tenant::storage_tenant,
 };
 
 /// Execute Harmony Responses API request with multi-turn MCP tool support
@@ -68,7 +69,7 @@ pub(crate) async fn serve_harmony_responses(
 ) -> Result<ResponsesResponse, Response> {
     // Load the history the request continues, as the caller's tenant may see
     // it; `request` itself stays as it came, for the persist.
-    let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
+    let tenant = storage_tenant(&tenant_request_meta);
     let current_request = load_history(
         ctx.history_stores(),
         &request,

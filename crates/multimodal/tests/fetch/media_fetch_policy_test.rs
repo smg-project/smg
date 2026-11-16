@@ -333,7 +333,8 @@ async fn a_redirect_to_a_non_http_target_is_refused() {
         matches!(
             &error,
             MediaConnectorError::DisallowedRedirect { target, reason, .. }
-                if target == "file:///etc/hostname" && reason.contains("unsupported media scheme: file")
+                if target == "file:///etc/hostname"
+                    && *reason == MediaConnectorError::UnsupportedScheme("file".to_string()).to_string()
         ),
         "{error}"
     );
