@@ -246,6 +246,45 @@ fn reasoning_items_preserve_empty_summary_arrays() {
     assert_eq!(serialized, input_payload);
 }
 
+/// A Response's `conversation` is the public API's object, `{"id": ...}`: a
+/// Response carrying it parses and writes it back, and one carrying the bare
+/// id the crate wrote before still parses and writes the object.
+#[test]
+fn a_response_reads_its_conversation_as_an_object_or_a_bare_id() {
+    for conversation in [json!({"id": "conv_1"}), json!("conv_1")] {
+        let response: ResponsesResponse = serde_json::from_value(json!({
+            "id": "resp_conv",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "max_output_tokens": null,
+            "model": "gpt-5.4",
+            "output": [],
+            "parallel_tool_calls": true,
+            "previous_response_id": null,
+            "reasoning": null,
+            "store": true,
+            "temperature": 1.0,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": 1.0,
+            "truncation": "disabled",
+            "usage": null,
+            "user": null,
+            "metadata": {},
+            "conversation": conversation
+        }))
+        .unwrap_or_else(|e| panic!("conversation {conversation}: {e}"));
+        assert_eq!(response.conversation.as_deref(), Some("conv_1"));
+        let written = serde_json::to_value(&response).expect("serialize the response");
+        assert_eq!(written["conversation"], json!({"id": "conv_1"}));
+    }
+}
+
 /// The public API writes a reasoning item as `{id, type, summary,
 /// encrypted_content}`, often with no `content`, which it does not require:
 /// such an item parses with no content, alone and in a Response's output, and
@@ -302,6 +341,29 @@ fn legacy_vec_string_summary_fails_to_deserialize() {
         result.is_err(),
         "legacy Vec<String> summary must no longer deserialize"
     );
+}
+
+/// The public API's reasoning config takes `mode`, `context` and the
+/// deprecated `generate_summary` beside `effort` and `summary`: a request
+/// carrying them writes them back for the upstream as sent, a mode the spec
+/// does not list included, since its `mode` is an open string.
+#[test]
+fn a_responses_reasoning_config_keeps_its_mode_context_and_generate_summary() {
+    for mode in ["pro", "a-mode-the-spec-does-not-list"] {
+        let reasoning = json!({
+            "effort": "high",
+            "summary": "auto",
+            "mode": mode,
+            "context": "all_turns",
+            "generate_summary": "concise"
+        });
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6", "input": "think it through", "reasoning": reasoning.clone()
+        }))
+        .unwrap_or_else(|e| panic!("mode {mode}: {e}"));
+        let written = serde_json::to_value(&request).expect("serialize the request");
+        assert_eq!(written["reasoning"], reasoning, "mode {mode}");
+    }
 }
 
 #[test]
@@ -535,6 +597,36 @@ fn test_file_search_tool_round_trip_hybrid_weights_omitted() {
     assert_eq!(serialized, payload);
 }
 
+/// The preview web search tool as the public API declares it: the dated
+/// `web_search_preview_2025_03_11` type reads as the preview tool and is
+/// written under the canonical `web_search_preview`, and the tool's
+/// `search_content_types` is kept.
+#[test]
+fn the_web_search_preview_tool_takes_its_dated_type_and_content_types() {
+    for tool_type in ["web_search_preview", "web_search_preview_2025_03_11"] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-4o",
+            "input": "news today",
+            "tools": [{
+                "type": tool_type,
+                "search_context_size": "low",
+                "search_content_types": ["text", "image"]
+            }]
+        }))
+        .unwrap_or_else(|e| panic!("{tool_type}: {e}"));
+        let written = serde_json::to_value(&request).expect("serialize the request");
+        assert_eq!(
+            written["tools"][0],
+            json!({
+                "type": "web_search_preview",
+                "search_context_size": "low",
+                "search_content_types": ["text", "image"]
+            }),
+            "{tool_type}"
+        );
+    }
+}
+
 // ------------------------------------------------------------------
 // T3: non-preview web_search tool + WebSearchCall.results
 // ------------------------------------------------------------------
@@ -618,6 +710,44 @@ fn test_web_search_response_tool_echo_accepts_return_token_budget() {
         serialized["tools"][0]["return_token_budget"],
         json!("default")
     );
+}
+
+/// A web search call as the public API writes it: a `find_in_page` action,
+/// an `open_page` action without a URL or with a null one, and the
+/// `incomplete` status parse and are written back as the public API writes
+/// them. The `find` action this crate wrote before still reads, and is
+/// written as `find_in_page`.
+#[test]
+fn a_web_search_call_reads_the_public_apis_actions_and_statuses() {
+    let find = json!({"type": "find_in_page", "url": "https://example.com", "pattern": "price"});
+    let opened = json!({"type": "open_page", "url": "https://example.com"});
+    for (status, action, written_action) in [
+        ("completed", find.clone(), find.clone()),
+        (
+            "completed",
+            json!({"type": "find", "url": "https://example.com", "pattern": "price"}),
+            find.clone(),
+        ),
+        ("completed", opened.clone(), opened.clone()),
+        (
+            "incomplete",
+            json!({"type": "open_page"}),
+            json!({"type": "open_page"}),
+        ),
+        (
+            "completed",
+            json!({"type": "open_page", "url": null}),
+            json!({"type": "open_page"}),
+        ),
+    ] {
+        let raw =
+            json!({"type": "web_search_call", "id": "ws_1", "status": status, "action": action});
+        let item: ResponseOutputItem =
+            serde_json::from_value(raw.clone()).unwrap_or_else(|e| panic!("{raw}: {e}"));
+        let written = serde_json::to_value(&item).expect("serialize the web search call");
+        assert_eq!(written["action"], written_action, "{raw}");
+        assert_eq!(written["status"], status, "{raw}");
+    }
 }
 
 /// Acceptance: `web_search_call` output item carries an optional typed
@@ -865,6 +995,50 @@ fn content_part_input_file_roundtrip() {
     }
     let roundtripped = serde_json::to_value(&part).unwrap();
     assert_eq!(roundtripped, raw);
+}
+
+/// `auto` is the public API's default file detail (`FileInputDetail`): an
+/// input file part carrying it parses and writes it back, and so does a
+/// request whose message holds such a part.
+#[test]
+fn an_input_file_with_detail_auto_round_trips() {
+    let raw = json!({"type": "input_file", "detail": "auto", "file_id": "file_1"});
+    let part: ResponseContentPart =
+        serde_json::from_value(raw.clone()).expect("an input_file with detail auto parses");
+    assert!(
+        matches!(
+            &part,
+            ResponseContentPart::InputFile {
+                detail: Some(FileDetail::Auto),
+                ..
+            }
+        ),
+        "{part:?}"
+    );
+    assert_eq!(serde_json::to_value(&part).unwrap(), raw);
+
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.4",
+        "input": [{"type": "message", "role": "user", "content": [raw.clone()]}]
+    }))
+    .expect("a request with an auto-detail file part parses");
+    let written = serde_json::to_value(&request).unwrap();
+    assert_eq!(written["input"][0]["content"][0], raw);
+}
+
+/// A prompt's file variable keeps its detail level when the request is
+/// written back for an upstream, as an input file part does.
+#[test]
+fn a_prompt_file_variable_keeps_its_detail() {
+    let variable = json!({"type": "input_file", "file_id": "file_1", "detail": "high"});
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.4",
+        "input": "summarize the document",
+        "prompt": {"id": "pmpt_1", "variables": {"doc": variable.clone()}}
+    }))
+    .expect("a request with a file prompt variable parses");
+    let written = serde_json::to_value(&request).unwrap();
+    assert_eq!(written["prompt"]["variables"]["doc"], variable);
 }
 
 #[test]
@@ -1161,9 +1335,14 @@ fn responses_tool_choice_types_round_trip() {
             json!({"type": "image_generation"}),
             BuiltInToolChoiceType::ImageGeneration,
         ),
+        (json!({"type": "computer"}), BuiltInToolChoiceType::Computer),
         (
             json!({"type": "computer_use_preview"}),
             BuiltInToolChoiceType::ComputerUsePreview,
+        ),
+        (
+            json!({"type": "computer_use"}),
+            BuiltInToolChoiceType::ComputerUse,
         ),
         (
             json!({"type": "code_interpreter"}),
@@ -2367,6 +2546,50 @@ fn computer_call_output_input_item_round_trips_spec_shape() {
         item,
         ResponseInputOutputItem::ComputerCallOutput { .. }
     ));
+    assert_eq!(serde_json::to_value(&item).expect("serialize"), payload);
+}
+
+/// A replayed `computer_call_output` may carry `acknowledged_safety_checks:
+/// null`, which the public API's input item allows: it parses as none
+/// acknowledged and is written back without the key, as an item without it
+/// is.
+#[test]
+fn a_computer_call_output_with_null_safety_checks_parses() {
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "computer-use-preview",
+        "input": [{
+            "type": "computer_call_output",
+            "call_id": "call_1",
+            "output": {"type": "computer_screenshot", "file_id": "file_1"},
+            "acknowledged_safety_checks": null
+        }]
+    }))
+    .expect("a computer_call_output with null safety checks parses");
+    let written = serde_json::to_value(&request).expect("serialize the request");
+    assert_eq!(
+        written["input"][0],
+        json!({
+            "type": "computer_call_output",
+            "call_id": "call_1",
+            "output": {"type": "computer_screenshot", "file_id": "file_1"}
+        })
+    );
+}
+
+/// A populated `acknowledged_safety_checks` reaches its value through the
+/// null-tolerant reader: the item round-trips unchanged.
+#[test]
+fn a_computer_call_output_keeps_its_acknowledged_safety_checks() {
+    let payload = json!({
+        "type": "computer_call_output",
+        "call_id": "call_1",
+        "output": {"type": "computer_screenshot", "file_id": "file_1"},
+        "acknowledged_safety_checks": [
+            {"id": "sc_1", "code": "malicious_instructions", "message": "m"}
+        ]
+    });
+    let item: ResponseInputOutputItem =
+        serde_json::from_value(payload.clone()).expect("deserialize");
     assert_eq!(serde_json::to_value(&item).expect("serialize"), payload);
 }
 
@@ -4904,6 +5127,154 @@ fn function_tool_keys_must_have_the_spec_shapes() {
     }
 }
 
+fn function_tool(name: &str) -> serde_json::Value {
+    json!({"type": "function", "name": name, "parameters": {"type": "object"}})
+}
+
+/// The refusal of the tool named nothing at `field`, read in the validator's
+/// verdict.
+fn names_the_unnamed_tool(code: &str, field: &str) -> bool {
+    code.contains("empty_string")
+        && code.contains(&format!(
+            "Invalid '{field}': empty string. Expected a string with minimum length 1"
+        ))
+}
+
+/// A function declared with an empty name is refused with its place in
+/// `tools`: no client can dispatch a call that names nothing. The place counts
+/// every tool, a built-in one ahead of the function too. A named function
+/// passes.
+#[test]
+fn a_function_tool_has_a_name() {
+    for ahead in [function_tool("f"), json!({"type": "web_search_preview"})] {
+        let request = plain_request(json!({
+            "model": "m", "input": "hi", "tools": [ahead, function_tool("")]
+        }))
+        .unwrap();
+        let code = validation_code(&request);
+        assert!(names_the_unnamed_tool(&code, "tools[1].name"), "{code}");
+    }
+
+    let request = plain_request(json!({
+        "model": "m", "input": "hi", "tools": [function_tool("f")]
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok(), "a named function passes");
+}
+
+/// A custom tool, a namespace and a namespace's members are called by name as
+/// a function is: an empty name is refused at its place, a member's inside its
+/// namespace, the two places told apart. Named ones pass.
+#[test]
+fn a_custom_tool_a_namespace_and_its_members_have_names() {
+    let custom = |name: &str| json!({"type": "custom", "name": name});
+    let namespace = |name: &str, tools: serde_json::Value| json!({"type": "namespace", "name": name, "description": "d", "tools": tools});
+    for (tools, field) in [
+        (json!([function_tool("f"), custom("")]), "tools[1].name"),
+        (
+            json!([namespace("", json!([function_tool("f")]))]),
+            "tools[0].name",
+        ),
+        (
+            json!([
+                function_tool("f"),
+                namespace("ns", json!([function_tool("")]))
+            ]),
+            "tools[1].tools[0].name",
+        ),
+        (
+            json!([namespace("ns", json!([function_tool("g"), custom("")]))]),
+            "tools[0].tools[1].name",
+        ),
+    ] {
+        let request = plain_request(json!({"model": "m", "input": "hi", "tools": tools})).unwrap();
+        let code = validation_code(&request);
+        assert!(names_the_unnamed_tool(&code, field), "{field}: {code}");
+    }
+
+    let named = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [custom("c"), namespace("ns", json!([function_tool("g"), custom("h")]))]
+    }))
+    .unwrap();
+    assert!(named.validate().is_ok(), "named tools pass");
+}
+
+/// A namespace's function member is handed to the model as a function of its
+/// own, so its `parameters` are held to the rule a top-level function's are: a
+/// JSON Schema object, refused at the member's place inside its namespace. The
+/// name's rule stands ahead, as it does for a top-level function. A member
+/// with an object, with `null` or with no `parameters` passes, and so does a
+/// custom member, which has none.
+#[test]
+fn a_namespace_members_parameters_must_be_an_object() {
+    let namespace = |name: &str, tools: serde_json::Value| json!({"type": "namespace", "name": name, "description": "d", "tools": tools});
+    let member = |name: &str, parameters: serde_json::Value| json!({"type": "function", "name": name, "parameters": parameters});
+    for (parameters, got) in [
+        (json!("not-an-object"), "a string"),
+        (json!([1]), "an array"),
+        (json!(7), "a number"),
+        (json!(true), "a boolean"),
+    ] {
+        let request = plain_request(json!({
+            "model": "m", "input": "hi",
+            "tools": [
+                function_tool("f"),
+                namespace("ns", json!([function_tool("g"), member("h", parameters.clone())]))
+            ]
+        }))
+        .unwrap();
+        let code = validation_code(&request);
+        assert!(
+            code.contains("invalid_type")
+                && code.contains(&format!(
+                    "Invalid type for 'tools[1].tools[1].parameters': expected an object, but got {got} instead."
+                )),
+            "{parameters}: {code}"
+        );
+    }
+
+    // The first member of a second namespace: the namespace's place, then the member's.
+    let request = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [
+            namespace("a", json!([function_tool("g")])),
+            namespace("b", json!([member("h", json!("x")), function_tool("i")]))
+        ]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(code.contains("'tools[1].tools[0].parameters'"), "{code}");
+
+    // An unnamed member with such parameters is refused for its name.
+    let request = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [namespace("ns", json!([member("", json!("x"))]))]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(
+        names_the_unnamed_tool(&code, "tools[0].tools[0].name") && !code.contains("invalid_type"),
+        "{code}"
+    );
+
+    let accepted = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [namespace("ns", json!([
+            member("object", json!({"type": "object"})),
+            member("null", serde_json::Value::Null),
+            {"type": "function", "name": "absent"},
+            {"type": "custom", "name": "custom"}
+        ]))]
+    }))
+    .unwrap();
+    assert!(
+        accepted.validate().is_ok(),
+        "{}",
+        validation_code(&accepted)
+    );
+}
+
 /// One of OpenAI's own models: the public API's structured-output rules apply.
 const OPENAI_MODEL: &str = "gpt-4.1";
 /// A self-hosted model: those rules are the engine's business, not the gateway's.
@@ -4946,6 +5317,67 @@ fn strict_function_schema_passes_through_for_self_hosted_models() {
     let request = plain_request(json!({
         "model": SELF_HOSTED_MODEL, "input": "hi",
         "tools": [{"type": "function", "name": "f", "strict": true, "parameters": loose}]
+    }))
+    .unwrap();
+    assert!(
+        request.validate().is_ok(),
+        "the engine's grammar compiler decides a self-hosted model's strict schema"
+    );
+}
+
+/// A strict function that is a namespace's member is held to the pin a
+/// top-level strict function is held to, for OpenAI's own models: the refusal
+/// names the member whose schema lacks it. A pinned member and a member that
+/// is not strict pass, and a self-hosted model's strict member is passed
+/// through as its top-level function is.
+#[test]
+fn strict_namespace_member_schema_needs_additional_properties_false_for_openai_models() {
+    let loose = json!({"type": "object", "properties": {"x": {"type": "string"}}});
+    let pinned = json!({
+        "type": "object", "properties": {"x": {"type": "string"}}, "additionalProperties": false
+    });
+    let namespace = |tools: serde_json::Value| json!({"type": "namespace", "name": "ns", "description": "d", "tools": tools});
+    let strict = |name: &str, parameters: &serde_json::Value| json!({"type": "function", "name": name, "strict": true, "parameters": parameters});
+
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "hi",
+        "tools": [namespace(json!([
+            strict("f", &pinned),
+            {"type": "custom", "name": "c"},
+            strict("g", &loose)
+        ]))]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(
+        code.contains("invalid_function_parameters")
+            && code.contains(
+                "Invalid schema for function 'g': In context=(), 'additionalProperties' is required to be supplied and to be false."
+            ),
+        "{code}"
+    );
+
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "hi",
+        "tools": [namespace(json!([strict("f", &pinned)]))]
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok(), "a pinned member passes");
+
+    // Not strict: the pin is not required.
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "hi",
+        "tools": [namespace(json!([{"type": "function", "name": "f", "parameters": loose}]))]
+    }))
+    .unwrap();
+    assert!(
+        request.validate().is_ok(),
+        "a member that is not strict passes"
+    );
+
+    let request = plain_request(json!({
+        "model": SELF_HOSTED_MODEL, "input": "hi",
+        "tools": [namespace(json!([strict("g", &loose)]))]
     }))
     .unwrap();
     assert!(

@@ -29,7 +29,7 @@ use crate::{
     },
     server::http_client,
     worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         registry::WorkerId,
         BasicWorker, ConnectionMode, RuntimeType,
     },

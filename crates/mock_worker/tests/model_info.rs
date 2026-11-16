@@ -13,7 +13,8 @@ async fn grpc_model_info_carries_the_models_sampling_defaults() {
         default_sampling_params_json: r#"{"temperature":0.7,"top_k":20}"#.to_string(),
         ..Config::default()
     })
-    .await;
+    .await
+    .expect("the worker starts");
     let info = client.get_model_info().await.expect("model info");
     assert_eq!(info.model_path, "a-model");
     assert_eq!(
@@ -24,7 +25,9 @@ async fn grpc_model_info_carries_the_models_sampling_defaults() {
 
 #[tokio::test]
 async fn grpc_model_info_reports_no_sampling_defaults_when_the_model_declares_none() {
-    let client = common::start(Config::default()).await;
+    let client = common::start(Config::default())
+        .await
+        .expect("the worker starts");
     let info = client.get_model_info().await.expect("model info");
     assert_eq!(info.default_sampling_params_json, "");
 }

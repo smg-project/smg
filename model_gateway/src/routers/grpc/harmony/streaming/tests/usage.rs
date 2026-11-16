@@ -400,6 +400,7 @@ async fn streamed_responses_iteration(
             None,
             None,
             &[],
+            None,
         )
         .await;
         drop(tx);

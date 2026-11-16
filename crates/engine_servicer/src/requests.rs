@@ -75,11 +75,16 @@ pub(crate) fn is_warmup_request_id(request_id: &str, nonce: Option<&str>) -> boo
     !ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// A registration's generation and the sender that cancels its stream.
+type RegistryEntry = (u64, oneshot::Sender<CancelReason>);
+
 /// Registered in-flight requests. The generation disambiguates an id reused
 /// after an abort from the stream that registered it.
 #[derive(Default)]
 pub(crate) struct RequestRegistry {
-    entries: Mutex<HashMap<String, (u64, oneshot::Sender<CancelReason>)>>,
+    /// Keyed by the id the registration shares (one copy of the id per
+    /// request, held by the map and by the registration that removes it).
+    entries: Mutex<HashMap<Arc<str>, RegistryEntry>>,
     generation: AtomicU64,
     draining: AtomicBool,
     /// Readiness held for the planned warm-up: admission is the warm-up's
@@ -96,7 +101,7 @@ pub(crate) struct RequestRegistry {
 /// since, which the generation tells apart).
 pub(crate) struct Registration {
     registry: Arc<RequestRegistry>,
-    request_id: String,
+    request_id: Arc<str>,
     generation: u64,
     /// Whether this lifetime is in the active count (a client's request is,
     /// the servicer's own health probe is not).
@@ -175,7 +180,8 @@ impl RequestRegistry {
         {
             return Err(Status::unavailable("servicer is warming up"));
         }
-        entries.insert(request_id.to_string(), (generation, cancel_tx));
+        let request_id: Arc<str> = Arc::from(request_id);
+        entries.insert(Arc::clone(&request_id), (generation, cancel_tx));
         if counted {
             self.active.fetch_add(1, Ordering::AcqRel);
         }
@@ -183,7 +189,7 @@ impl RequestRegistry {
         Ok((
             Registration {
                 registry: Arc::clone(self),
-                request_id: request_id.to_string(),
+                request_id,
                 generation,
                 counted,
             },
@@ -230,7 +236,7 @@ impl RequestRegistry {
             .map_err(|_| Status::internal("request registry is poisoned"))?;
         let mut found = 0;
         for request_id in request_ids {
-            if let Some((_, cancel)) = entries.remove(request_id) {
+            if let Some((_, cancel)) = entries.remove(request_id.as_str()) {
                 let _ = cancel.send(CancelReason::Abort);
                 found += 1;
             }
