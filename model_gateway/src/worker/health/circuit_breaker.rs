@@ -895,6 +895,8 @@ mod tests {
         let tick = Duration::from_millis(5);
 
         cb.record_success();
+        let built_ms = cb.last_state_change_ms.load(Ordering::Acquire);
+        thread::sleep(tick);
         cb.record_failure(); // the swap path: closed -> open keeps the failure streak
         assert_eq!(cb.state(), CircuitState::Open);
         assert_eq!(
@@ -902,6 +904,7 @@ mod tests {
             (1, 0)
         );
         let opened_ms = cb.last_state_change_ms.load(Ordering::Acquire);
+        assert!(opened_ms > built_ms);
 
         thread::sleep(tick);
         assert!(cb.time_since_last_state_change() >= tick);
