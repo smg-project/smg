@@ -3294,17 +3294,11 @@ impl smg_policy_controller::Picker for TellsThePick {
 /// A decision makes its instance under the init frame on the wall clock
 /// when the close before it could not. A try in which a decision asked
 /// nothing while its thread, or the thread of the decision before it, was
-/// off the CPU half that frame is made again, three times at most: the last
-/// try asserts whatever it read.
+/// off the CPU half that frame is made again, [`TRIES`] tries at most: the
+/// last try asserts whatever it read.
 #[test]
-#[expect(
-    clippy::print_stdout,
-    reason = "a try that is made again says so on stdout under --nocapture"
-)]
 fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
-    const TRIES: u32 = 3;
     const LATER: u64 = 8;
-    const HALF_THE_INIT_FRAME: std::time::Duration = std::time::Duration::from_millis(50);
     let mut made = 0;
     loop {
         made += 1;
@@ -3341,7 +3335,7 @@ fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
             failures: u32::MAX,
             ..BreakerSpec::default()
         };
-        let plugin = Plugin::load(&runtime, filler).expect("the guest loads");
+        let plugin = loaded(&runtime, filler);
         let engine = single_engine(Profile {
             name: "one-stage".into(),
             filters: vec![],
@@ -3369,9 +3363,7 @@ fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
             let answered = plugin.stats().answered;
             let (wall, cpu) = (std::time::Instant::now(), bound_clock());
             decide(&engine, &candidates, 2 + later);
-            let off_the_cpu = wall
-                .elapsed()
-                .saturating_sub(bound_clock().saturating_sub(cpu));
+            let off_the_cpu = off_cpu_since(wall, cpu);
             if plugin.stats().answered == answered {
                 silent = Some((later, off_the_cpu.max(before_it)));
                 break;
@@ -3382,12 +3374,15 @@ fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
             break;
         };
         assert!(
-            off_the_cpu >= HALF_THE_INIT_FRAME && made < TRIES,
+            off_the_cpu >= INIT_FRAME / 2 && made < TRIES,
             "every later decision asks the plugin as a decision of its own: decision {later} after the stop asked nothing (try {made}, a thread off the CPU {off_the_cpu:?}): {:?}",
             plugin.stats()
         );
-        println!(
-            "a close that stops half-way: made again in this run: decision {later} after the stop asked nothing with a thread off the CPU {off_the_cpu:?}"
+        made_again(
+            "a close that stops half-way",
+            &format!(
+                "decision {later} after the stop asked nothing with a thread off the CPU {off_the_cpu:?}"
+            ),
         );
     }
 }
