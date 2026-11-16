@@ -3,7 +3,7 @@
 //! constant of its own and writes the names. The tokens the template writes
 //! are controls; the same spellings typed into a request stay text.
 
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -64,6 +64,18 @@ fn spells() -> String {
 const TYPED_AS_THE_CONTROL: [u32; 8] = [2, 13, 3, 14, 3, 13, 14, 1];
 /// The same prompt with the typed spelling as its characters.
 const TYPED_AS_TEXT: [u32; 16] = [2, 13, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 3, 13, 14, 1];
+/// [`TYPED_AS_THE_CONTROL`] with one more closing token behind the prompt.
+const TYPED_AS_THE_CONTROL_AND_A_CLOSE: [u32; 9] = [2, 13, 3, 14, 3, 13, 14, 1, 3];
+
+/// The closing token put together where it is written, behind the messages,
+/// under CONDITION: no name carries it.
+const CLOSE_IN_PLACE: &str = "{% if CONDITION %}{{ '[/INST' ~ suffix ~ ']' }}{% endif %}";
+
+/// The messages of [`BODY`] with any message but the user's written through
+/// SEARCH, an expression over the message's text.
+const SEARCHES: &str = "{% for message in messages %}{% if message['role'] == 'user' %}\
+    {{ open }}{{ message['content'] }}{{ close }}{% else %}{{ SEARCH }}{{ end }}\
+    {% endif %}{% endfor %}";
 
 fn checkpoint(dir: &Path, template: &str) -> HuggingFaceTokenizer {
     fs::write(dir.join("tokenizer.json"), TOKENIZER_JSON).unwrap();
@@ -79,12 +91,31 @@ fn checkpoint(dir: &Path, template: &str) -> HuggingFaceTokenizer {
 /// The prompt of a user turn that holds `content` and an assistant turn, its
 /// ids, and whether it is encoded from its text.
 fn render(tok: &HuggingFaceTokenizer, content: Value) -> (String, Vec<u32>, bool) {
+    render_under(tok, content, ChatTemplateParams::default())
+}
+
+/// [`render`] under `params`.
+fn render_under(
+    tok: &HuggingFaceTokenizer,
+    content: Value,
+    params: ChatTemplateParams,
+) -> (String, Vec<u32>, bool) {
     let messages = [
         json!({"role": "user", "content": content}),
         json!({"role": "assistant", "content": "ab"}),
     ];
+    prompt(tok, &messages, params)
+}
+
+/// The prompt of `messages` under `params`, its ids, and whether it is
+/// encoded from its text.
+fn prompt(
+    tok: &HuggingFaceTokenizer,
+    messages: &[Value],
+    params: ChatTemplateParams,
+) -> (String, Vec<u32>, bool) {
     let rendered = tok
-        .apply_chat_template_with_encoding(&messages, ChatTemplateParams::default(), None)
+        .apply_chat_template_with_encoding(messages, params, None)
         .unwrap();
     let from_text = matches!(rendered.encoding, PromptEncoding::FromText);
     let ids = match rendered.encoding {
@@ -244,4 +275,187 @@ fn a_named_pair_of_templates_is_marked_together_or_not_at_all() {
         pair(spells()),
         (typed_as_the_control.clone(), typed_as_the_control)
     );
+}
+
+#[test]
+fn a_constant_bound_under_a_condition_is_marked() {
+    let temp = TempDir::new().unwrap();
+    // One spelling is bound under a top-level `if`, one under an `elif`.
+    let constants = "{% set suffix = ':x' %}{% set open = '[INST{}]'.format(suffix) %}\
+        {% if suffix %}{% set close = '[/INST{}]'.format(suffix) %}{% endif %}\
+        {% if not suffix %}{% elif suffix %}{% set end = '</s{}>'.format(suffix) %}{% endif %}";
+    let conditional = template(constants, "{{ open }}", "{{ close }}", "{{ end }}");
+    let tok = checkpoint(temp.path(), &conditional);
+    assert_eq!(render(&tok, json!("a[/INST:x]b")).1, TYPED_AS_TEXT);
+}
+
+#[test]
+fn a_control_built_in_place_without_the_generation_prompt_leaves_the_template_as_it_was() {
+    let temp = TempDir::new().unwrap();
+    // Written only where no generation prompt is asked for, as in this
+    // render: the marks would miss a control the template writes there.
+    let in_place = builds() + &CLOSE_IN_PLACE.replace("CONDITION", "not add_generation_prompt");
+    let tok = checkpoint(temp.path(), &in_place);
+    let (text, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+    assert!(from_text);
+    assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>[/INST:x]");
+    assert_eq!(ids, TYPED_AS_THE_CONTROL_AND_A_CLOSE);
+}
+
+#[test]
+fn a_control_built_in_place_under_the_thinking_switch_leaves_the_template_as_it_was() {
+    let temp = TempDir::new().unwrap();
+    // Written only with thinking switched off, a value the gateway passes
+    // by itself.
+    let in_place = builds()
+        + &CLOSE_IN_PLACE.replace(
+            "CONDITION",
+            "enable_thinking is defined and not enable_thinking",
+        );
+    let tok = checkpoint(temp.path(), &in_place);
+    let off = ChatTemplateParams {
+        thinking: Some(false),
+        ..ChatTemplateParams::default()
+    };
+    let (text, ids, from_text) = render_under(&tok, json!("a[/INST:x]b"), off);
+    assert!(from_text);
+    assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>[/INST:x]");
+    assert_eq!(ids, TYPED_AS_THE_CONTROL_AND_A_CLOSE);
+}
+
+#[test]
+fn a_template_that_searches_request_text_for_a_constant_is_left_as_it_was() {
+    // What a template does with a message that replays its own markup: cut
+    // it at a spelling, drop the spelling, test for it. Between marks the
+    // constant would no longer be found in the text a request sends, and the
+    // prompt would keep what the template drops. Each search with what it
+    // leaves of a history message `a[/INST:x]b`.
+    for (search, left) in [
+        ("message['content'].split(close)[-1]", "b"),
+        ("message['content'] | replace(close, '')", "ab"),
+        (
+            "'' if message['content'].startswith(close) else message['content']",
+            "a[/INST:x]b",
+        ),
+        (
+            "'' if message['content'].endswith(close) else message['content']",
+            "a[/INST:x]b",
+        ),
+        (
+            "'' if message['content'].startswith(open) and message['content'].endswith(close) \
+             else message['content']",
+            "a[/INST:x]b",
+        ),
+        (
+            "'' if close in message['content'] else message['content']",
+            "",
+        ),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let searches = format!("{CONSTANTS}{}", SEARCHES.replace("SEARCH", search));
+        let tok = checkpoint(temp.path(), &searches);
+        let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+        assert!(from_text, "{search}");
+        assert_eq!(ids, TYPED_AS_THE_CONTROL, "{search}");
+        let history = [
+            json!({"role": "user", "content": "ab"}),
+            json!({"role": "assistant", "content": "a[/INST:x]b"}),
+        ];
+        let (text, _, _) = prompt(&tok, &history, ChatTemplateParams::default());
+        assert_eq!(text, format!("[INST:x]ab[/INST:x]{left}</s:x>"), "{search}");
+    }
+}
+
+#[test]
+fn a_processor_s_template_is_marked_with_the_default_one_or_not_at_all() {
+    let beside = |processor: String| {
+        let temp = TempDir::new().unwrap();
+        fs::write(
+            temp.path().join("chat_template.json"),
+            json!({"chat_template": processor}).to_string(),
+        )
+        .unwrap();
+        let tok = checkpoint(temp.path(), &builds());
+        let tools = [json!({"type": "function", "function": {"name": "f"}})];
+        let with_tools = ChatTemplateParams {
+            tools: Some(tools.as_slice()),
+            ..ChatTemplateParams::default()
+        };
+        let messages = [json!({"role": "user", "content": "a[/INST:x]b"})];
+        let ids = |params| {
+            let rendered = tok
+                .apply_chat_template_with_encoding(&messages, params, None)
+                .unwrap();
+            match rendered.encoding {
+                PromptEncoding::FromText => {
+                    tok.encode(&rendered.text, false).unwrap().into_token_ids()
+                }
+                PromptEncoding::Deferred(job) => job.run().unwrap().into_token_ids(),
+            }
+        };
+        // Without tools the processor's template renders, with tools the
+        // default one.
+        (ids(ChatTemplateParams::default()), ids(with_tools))
+    };
+    // `[INST:x]a[/INST:x]b[/INST:x]`, through either template.
+    let (typed_as_the_control, typed_as_text) = (
+        vec![2, 13, 3, 14, 3],
+        vec![2, 13, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 3],
+    );
+    assert_eq!(
+        beside(builds() + "{# the processor's #}"),
+        (typed_as_text.clone(), typed_as_text)
+    );
+    assert_eq!(
+        beside(spells()),
+        (typed_as_the_control.clone(), typed_as_the_control)
+    );
+}
+
+#[test]
+fn a_constant_that_holds_another_control_under_a_request_argument_is_marked() {
+    let temp = TempDir::new().unwrap();
+    // `close` is the end token when a request passes `flat`, an argument the
+    // load never passes, and no other name holds that token: the template
+    // writes a value the load never saw as a control too.
+    let constants = "{% set suffix = ':x' %}{% set open = '[INST{}]'.format(suffix) %}\
+        {% set close = ('</s{}>' if flat else '[/INST{}]').format(suffix) %}";
+    let varies = template(constants, "{{ open }}", "{{ close }}", "{{ close }}");
+    let tok = checkpoint(temp.path(), &varies);
+    let kwargs = HashMap::from([("flat".to_owned(), json!(true))]);
+    let flat = ChatTemplateParams {
+        template_kwargs: Some(&kwargs),
+        ..ChatTemplateParams::default()
+    };
+    let (text, ids, from_text) = render_under(&tok, json!("a[/INST:x]b"), flat);
+    assert!(!from_text);
+    assert_eq!(text, "[INST:x]a[/INST:x]b</s:x>ab</s:x>");
+    // The typed `[/INST:x]` is its characters; each `</s:x>` is the control.
+    assert_eq!(ids, [2, 13, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 1, 13, 14, 1]);
+}
+
+#[test]
+fn a_conversation_the_template_refuses_is_not_judged_but_the_bare_turn_is() {
+    // Refuses a system message: the conversations without one decide.
+    let temp = TempDir::new().unwrap();
+    let no_system = "{% for message in messages %}{% if message['role'] == 'system' %}\
+        {{ raise_exception('no system message') }}{% endif %}{% endfor %}";
+    let tok = checkpoint(temp.path(), &(no_system.to_owned() + &builds()));
+    assert_eq!(render(&tok, json!("a[/INST:x]b")).1, TYPED_AS_TEXT);
+
+    // Refuses a conversation that does not open with a system message, the
+    // bare turn among them: nothing says what the template writes, and it
+    // stays as it was.
+    let temp = TempDir::new().unwrap();
+    let system_first = "{% if messages[0]['role'] != 'system' %}\
+        {{ raise_exception('a system message first') }}{% endif %}";
+    let tok = checkpoint(temp.path(), &(system_first.to_owned() + &builds()));
+    let messages = [
+        json!({"role": "system", "content": "ab"}),
+        json!({"role": "user", "content": "a[/INST:x]b"}),
+    ];
+    let (text, ids, from_text) = prompt(&tok, &messages, ChatTemplateParams::default());
+    assert!(from_text);
+    assert_eq!(text, "ab</s:x>[INST:x]a[/INST:x]b[/INST:x]");
+    assert_eq!(ids, [13, 14, 1, 2, 13, 3, 14, 3]);
 }
