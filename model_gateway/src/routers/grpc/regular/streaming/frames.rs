@@ -181,6 +181,13 @@ impl ChatChunkFrame {
         Self::close_chunk(buffer, start, Ok(()), usage, emit_usage_null);
     }
 
+    /// Append the chunk that closes a stream with its usage and no choice.
+    pub(super) fn write_usage_chunk(&self, buffer: &mut BytesMut, usage: &Usage) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head);
+        Self::close_chunk(buffer, start, Ok(()), Some(usage), false);
+    }
+
     /// The chunk's end after its choice: `]`, the usage or its `null`
     /// placeholder, `}` and the event's blank line; a choice that failed to
     /// serialize leaves an error event in its place.
