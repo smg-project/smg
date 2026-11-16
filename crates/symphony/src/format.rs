@@ -1227,7 +1227,11 @@ impl Format {
         if closes.peek().is_none() || closes.clone().any(|close| before.ends_with(close)) {
             return Some(last);
         }
+        // Rows that name one close one after another (Inkling's three into `ended`): its search
+        // is not repeated for the next of them.
+        let mut searched = "";
         let closed = closes
+            .filter(|&close| std::mem::replace(&mut searched, close) != close)
             .filter_map(|close| before.rfind(close).map(|at| at + close.len()))
             .max()
             .unwrap_or(0);
@@ -1253,13 +1257,17 @@ impl Format {
     /// the turn opener that opens the model's turn (the last one, or the open message's own
     /// where the opener is a terminal the model writes at every message), or the whole prompt
     /// when the table names none or the prompt does not hold it; for a table with turn anchors,
-    /// from the start of the last anchor found, or nothing when the prompt holds none. A caller
-    /// that keeps the prompt for a later `Input::Prompt` need keep only this: replayed again, it
-    /// gives itself.
+    /// from the start of the last anchor found, or nothing when the prompt holds none. A prompt
+    /// that ends with the turn's end and opens no turn ([`Self::unopened_turn_starts_in`]) is
+    /// not replayed: that end alone stands for it. A caller that keeps the prompt for a later
+    /// `Input::Prompt` need keep only this: replayed again, it gives itself.
     pub fn replay<'p>(&self, prompt: &'p str) -> &'p str {
         if !self.anchors.is_empty() {
             let from = self.last_anchor(prompt).map_or(prompt.len(), |(at, _)| at);
             return &prompt[from..];
+        }
+        if let Some(unopened) = self.ends_unopened(prompt) {
+            return &prompt[prompt.len() - unopened.end.len()..];
         }
         match self.turn_opens_at(prompt) {
             Some(at) => &prompt[at..],
@@ -1426,11 +1434,32 @@ impl Format {
         if prompt.is_empty() {
             return None;
         }
+        if self.ends_unopened(prompt).is_some() {
+            return Some(unopened.state);
+        }
         let opener = self.turn_opener.as_ref()?;
         let opened = opener
             .rfind(prompt)
             .is_some_and(|at| !prompt[at + opener.text.len()..].contains(unopened.end.as_str()));
         (!opened).then_some(unopened.state)
+    }
+
+    /// The unopened row, where `prompt` ends with the turn's end and no turn opener starts so
+    /// late that it runs into that end: such a prompt opens no turn wherever its last opener
+    /// stands, so the answer takes a suffix compare and a search of the last few bytes, not of
+    /// the prompt. A template that writes no opener ends every generation prompt so.
+    fn ends_unopened(&self, prompt: &str) -> Option<&Unopened> {
+        let unopened = self.unopened.as_ref().filter(|row| !row.end.is_empty())?;
+        let opener = self.turn_opener.as_ref()?;
+        let before = prompt.strip_suffix(unopened.end.as_str())?;
+        let late = before
+            .len()
+            .saturating_sub(opener.text.len().saturating_sub(1));
+        opener
+            .finder
+            .rfind(&prompt.as_bytes()[late..])
+            .is_none()
+            .then_some(unopened)
     }
 
     /// The state `prompt` leaves the table in ([`Self::replayed`]): where the engine starts the
@@ -2616,6 +2645,50 @@ mod tests {
             said(&shown),
             ("a thought</a>an answer".to_string(), String::new(), 0)
         );
+    }
+
+    #[test]
+    fn a_prompt_that_ends_with_the_turns_end_keeps_the_end_alone() {
+        let format = Format::new("ends")
+            .terminal("open", "<a>")
+            .terminal("close", "</a>")
+            .state("content", Emits::Content)
+            .state("inside", Emits::Reasoning)
+            .transition("content", "open", "inside")
+            .transition("inside", "close", "content")
+            .opens_turn("<|assistant|>")
+            .unopened_turn_starts_in("inside", "<|end|>");
+        // No opener at all, and an opener the end follows: the end alone is kept, and the output
+        // starts from it where it starts from the whole prompt.
+        for prompt in [
+            "User: hi<|end|>",
+            "<|assistant|><a>t</a>answer<|end|>User: more<|end|>",
+            "<|end|>",
+        ] {
+            let kept = format.replay(prompt);
+            assert_eq!(kept, "<|end|>", "{prompt:?}");
+            assert_eq!(format.replay(kept), kept, "{prompt:?}");
+            assert_eq!(format.replayed(kept), format.replayed(prompt), "{prompt:?}");
+            assert_eq!(format.prompt_state(prompt), 1, "{prompt:?}");
+        }
+        // A prompt that ends elsewhere is searched as before: an opened turn replays from its
+        // opener, and one that opens none is kept whole.
+        assert_eq!(
+            format.replay("User: hi<|end|><|assistant|><a>"),
+            "<|assistant|><a>"
+        );
+        assert_eq!(format.replay("User: hi<|end|>\n"), "User: hi<|end|>\n");
+        assert_eq!(format.prompt_state("User: hi<|end|>\n"), 1);
+        // An opener that runs into the end is followed by no whole end: the turn is opened.
+        let crossing = Format::new("crossing")
+            .state("content", Emits::Content)
+            .state("inside", Emits::Reasoning)
+            .opens_turn("ab")
+            .unopened_turn_starts_in("inside", "bc");
+        assert_eq!(crossing.replay("xabc"), "abc");
+        assert_eq!(crossing.prompt_state("xabc"), 0);
+        assert_eq!(crossing.replay("xab_bc"), "bc");
+        assert_eq!(crossing.prompt_state("xab_bc"), 1);
     }
 
     #[test]
