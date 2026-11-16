@@ -1401,6 +1401,7 @@ fn kept_worker_gauges_set_the_recorders_series() {
         Metrics::set_worker_requests_active("http://w1", 2);
         Metrics::set_worker_cb_consecutive_failures("http://w1", 1);
         Metrics::set_worker_cb_consecutive_successes("http://w1", 4);
+        Metrics::set_worker_routing_keys_active("http://w1", 5);
         assert_eq!(
             value("smg_worker_requests_active", "http://w1").as_deref(),
             Some("2")
@@ -1412,6 +1413,10 @@ fn kept_worker_gauges_set_the_recorders_series() {
         assert_eq!(
             value("smg_worker_cb_consecutive_successes", "http://w1").as_deref(),
             Some("4")
+        );
+        assert_eq!(
+            value("smg_worker_routing_keys_active", "http://w1").as_deref(),
+            Some("5")
         );
 
         workers.retire("http://w1", gone("http://w1"));

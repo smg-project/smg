@@ -375,8 +375,9 @@ mod handles {
     pub(super) type WorkerOutcomes = ByWorker<FxHashMap<&'static str, Counter>>;
 
     /// A per-worker gauge set on every request (the active-request count,
-    /// the circuit breaker's consecutive outcomes): set through its kept
-    /// handle, not through a key built and looked up per call.
+    /// the active routing keys, the circuit breaker's consecutive outcomes):
+    /// set through its kept handle, not through a key built and looked up
+    /// per call.
     pub(super) type WorkerGauges = ByWorker<Gauge>;
 
     /// The `smg_engine_*` set: by worker URL, then the model label as the
@@ -433,6 +434,8 @@ mod handles {
         pub(super) static WORKER_REQUESTS: RefCell<WorkerRequests> = RefCell::new(WorkerRequests::default());
         /// `smg_worker_requests_active`.
         pub(super) static WORKER_REQUESTS_ACTIVE: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
+        /// `smg_worker_routing_keys_active`.
+        pub(super) static WORKER_ROUTING_KEYS_ACTIVE: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
         /// `smg_worker_cb_consecutive_failures`.
         pub(super) static WORKER_CB_FAILURES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
         /// `smg_worker_cb_consecutive_successes`.
@@ -476,6 +479,7 @@ mod handles {
         STREAMS.with_borrow_mut(HashMap::clear);
         WORKER_REQUESTS.with_borrow_mut(|kept| *kept = WorkerRequests::default());
         WORKER_REQUESTS_ACTIVE.with_borrow_mut(|kept| *kept = WorkerGauges::default());
+        WORKER_ROUTING_KEYS_ACTIVE.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_FAILURES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_SUCCESSES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_OUTCOMES.with_borrow_mut(|kept| *kept = WorkerOutcomes::default());
@@ -3153,12 +3157,17 @@ impl Metrics {
 
     /// Set active routing keys per worker
     pub fn set_worker_routing_keys_active(worker: &str, count: usize) {
-        let worker_interned = intern_string(worker);
-        gauge!(
-            "smg_worker_routing_keys_active",
-            "worker" => worker_interned
-        )
-        .set(count as f64);
+        Self::set_worker_gauge(
+            &handles::WORKER_ROUTING_KEYS_ACTIVE,
+            worker,
+            count as f64,
+            || {
+                gauge!(
+                    "smg_worker_routing_keys_active",
+                    "worker" => intern_string(worker)
+                )
+            },
+        );
     }
 
     /// Flip the liveness veto gauge for a worker; count the transition when
