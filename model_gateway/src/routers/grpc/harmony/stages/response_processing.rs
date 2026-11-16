@@ -13,7 +13,7 @@ use crate::{
         error,
         grpc::{
             common::stages::{ProcessStage, RateLimitCell},
-            context::{DispatchContext, FinalResponse},
+            context::{wrong_response_spec, DispatchContext, FinalResponse},
             spec::{HarmonyResponseSpec, ResponseSpec},
             utils::StreamSource,
         },
@@ -54,13 +54,8 @@ impl ProcessStage for HarmonyResponseProcessingStage {
         spec: ResponseSpec,
     ) -> Result<Option<Response>, Response> {
         let ResponseSpec::Harmony(harmony_spec) = spec else {
-            error!(
-                function = "HarmonyResponseProcessingStage::process",
-                "Wrong response spec"
-            );
-            return Err(error::internal_error(
-                "wrong_response_spec",
-                "Wrong response spec",
+            return Err(wrong_response_spec(
+                "HarmonyResponseProcessingStage::process",
             ));
         };
 
