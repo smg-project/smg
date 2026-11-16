@@ -712,6 +712,7 @@ fn bootstrap_port(pairing: &proto::PairingDescriptor) -> Result<Option<u16>, Ref
         vision,
         encode_handoff,
         ec_connector,
+        encode_references,
     } = pairing;
     let others = [
         (!protocol.is_empty(), "spec.pairing.protocol"),
@@ -724,6 +725,7 @@ fn bootstrap_port(pairing: &proto::PairingDescriptor) -> Result<Option<u16>, Ref
         (*vision, "spec.pairing.vision"),
         (*encode_handoff != 0, "spec.pairing.encode_handoff"),
         (!ec_connector.is_empty(), "spec.pairing.ec_connector"),
+        (*encode_references, "spec.pairing.encode_references"),
     ];
     if let Some(&(_, path)) = others.iter().find(|(stated, _)| *stated) {
         return Err(refused(path, NOT_HELD));
@@ -1542,7 +1544,7 @@ mod tests {
         // Of a pairing descriptor the store holds the bootstrap port alone:
         // every other field a caller states is refused by its own path.
         let named = |name: &str| name.to_owned();
-        let descriptors: [(proto::PairingDescriptor, &str); 13] = [
+        let descriptors: [(proto::PairingDescriptor, &str); 14] = [
             (
                 proto::PairingDescriptor {
                     protocol: named("protocol-a"),
@@ -1612,6 +1614,13 @@ mod tests {
                     ..Default::default()
                 },
                 "spec.pairing.ec_connector",
+            ),
+            (
+                proto::PairingDescriptor {
+                    encode_references: true,
+                    ..Default::default()
+                },
+                "spec.pairing.encode_references",
             ),
             (
                 proto::PairingDescriptor {

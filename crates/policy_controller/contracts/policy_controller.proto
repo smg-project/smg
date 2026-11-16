@@ -645,6 +645,8 @@ message PairingDescriptor {
   // which encoders hand an item to which prefills.
   EncodeHandoff encode_handoff = 12;
   string ec_connector = 13;
+  // The worker, an encoder, processes an item's references itself.
+  bool encode_references = 14;
 }
 
 // How an encoder hands an encoded item to a prefill.

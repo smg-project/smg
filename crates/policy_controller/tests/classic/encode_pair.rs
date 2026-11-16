@@ -183,6 +183,7 @@ fn offers(row: &Row) -> Option<(Vec<EncodeOffer>, Vec<EncodeOffer>)> {
             producer: encoder.ec_producer,
             consumer: false,
             connector: encoder.connector.clone(),
+            references: encoder.references,
         })
         .collect();
     let prefills = row
@@ -194,6 +195,7 @@ fn offers(row: &Row) -> Option<(Vec<EncodeOffer>, Vec<EncodeOffer>)> {
                 producer: false,
                 consumer: prefill.ec_consumer,
                 connector: prefill.connector.clone(),
+                references: false,
             })
         })
         .collect::<Option<Vec<_>>>()?;

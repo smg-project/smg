@@ -33,8 +33,8 @@ use crate::{
             WorkerStatus, WorkersStore,
         },
         world::{
-            micros, same_offer, Ask, Built, Classes, OutsideLists, PairBuffers, StaleGeneration,
-            ViewBuffers, World, Writer, PUBLISH_WINDOW,
+            micros, same_offer, Ask, Built, Classes, EncodePairBuffers, OutsideLists, PairBuffers,
+            StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW,
         },
         GatewayId,
     },
@@ -347,6 +347,24 @@ impl MemoryStore {
         out: &mut PairBuffers,
     ) -> Option<(Built, Built)> {
         self.world.load().build_pair(model, ask, out)
+    }
+
+    /// Build one decision's pair and its encode pool from the world as it
+    /// is now, under one borrow ([`World::build_encode_pair`]): the pair's
+    /// two pools and table, the model's encode pool and the two columns the
+    /// encode side reads, all of one publication. `None`, with every buffer
+    /// cleared, when either side of the pair has no member.
+    ///
+    /// This is the door of a request that carries encode items. Like the
+    /// pair's door it borrows the world for the builds and writes no shared
+    /// count.
+    pub fn build_encode_pair(
+        &self,
+        model: &str,
+        ask: &Ask,
+        out: &mut EncodePairBuffers,
+    ) -> Option<(Built, Built)> {
+        self.world.load().build_encode_pair(model, ask, out)
     }
 
     /// One decision's door: `decide` is handed the world of this instant
