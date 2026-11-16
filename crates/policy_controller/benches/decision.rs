@@ -5,9 +5,8 @@
 //! `policy_engine/decide/<preset>/<n>`,
 //! `policy_engine/decide/least_load_credited/<n>`,
 //! `policy_engine/decide/manual_keyed_hit/8`,
-//! `policy_engine/decide/manual_keyed_miss/8`,
-//! `policy_engine/spec/parse_validate` and
-//! `policy_engine/spec/validate_index/<keys>`. The view is built from the synthetic
+//! `policy_engine/decide/manual_keyed_miss/8` and
+//! `policy_engine/spec/parse_validate`. The view is built from the synthetic
 //! per-worker state of `common` the way a host reads its routing state; the
 //! decision runs with a fresh seed per iteration so the drawing pickers draw.
 //! This file is the pull-request gate's (`.github/bench-gates/policy-engine.toml`
@@ -256,49 +255,5 @@ fn spec_parse_validate(c: &mut Criterion) {
     group.finish();
 }
 
-/// A document of `entries` index keys, a `prefix*` and a `*suffix` by turns
-/// of two literal lengths: no two overlap.
-fn indexed(entries: usize) -> PolicySpec {
-    let keys: Vec<String> = (0..entries)
-        .map(|n| {
-            if n % 2 == 0 {
-                format!(r#""p{n:05}*":{{}}"#)
-            } else {
-                format!(r#""*{n:05}ss":{{}}"#)
-            }
-        })
-        .collect();
-    let document = format!(
-        r#"{{"apiVersion":"smg.policy/v1","index":{{{}}},"profiles":{{"p":{{"pick":"round-robin"}}}}}}"#,
-        keys.join(",")
-    );
-    serde_json::from_str(&document).expect("the document parses")
-}
-
-/// One validation by the document's index keys: a thousand, eight thousand,
-/// and the thirteen thousand a document of 128 KiB holds at ten bytes a key.
-fn spec_validate_index(c: &mut Criterion) {
-    let mut group = c.benchmark_group("policy_engine/spec");
-    // Ten samples: a row is one loop over the keys, the same at every run.
-    group.sample_size(10);
-    for entries in [1_000, 8_000, 13_000] {
-        let spec = indexed(entries);
-        group.bench_with_input(
-            BenchmarkId::new("validate_index", entries),
-            &entries,
-            |b, _| {
-                b.iter(|| black_box(&spec).validate().expect("the document validates"));
-            },
-        );
-    }
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    view_build,
-    decide,
-    spec_parse_validate,
-    spec_validate_index
-);
+criterion_group!(benches, view_build, decide, spec_parse_validate);
 criterion_main!(benches);

@@ -401,3 +401,24 @@ fn a_record_inside_the_window_allocates_nothing_and_a_publication_derives_nothin
     assert_eq!(allocations, 3, "a publication of one pool's rows");
     assert_eq!(store.publish_due(), None);
 }
+
+/// A validation builds an index key's error path at the key's refusal
+/// alone: keys that pass add no allocation, so a spec of a thousand keys
+/// more allocates nothing more.
+#[test]
+fn index_keys_that_pass_add_no_allocation_to_a_validation() {
+    // A process's first validation builds the stock catalog, once: unmeasured.
+    let first = PolicySpec::preset("round_robin").expect("a preset");
+    assert!(first.validate().is_ok(), "the preset validates");
+    let allocations = |keys: u32| {
+        let mut spec = PolicySpec::preset("round_robin").expect("a preset");
+        for key in 0..keys {
+            spec.index
+                .insert(format!("model-{key:04}*"), Default::default());
+        }
+        let (engine, allocations) = allocations_during(|| spec.validate());
+        assert!(engine.is_ok(), "{keys} keys validate");
+        allocations
+    };
+    assert_eq!(allocations(2_000), allocations(1_000));
+}
