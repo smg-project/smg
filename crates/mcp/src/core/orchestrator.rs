@@ -1664,8 +1664,7 @@ impl McpOrchestrator {
     /// The key is based on the transport URL, making it suitable for connection pooling.
     pub fn server_key(config: &McpServerConfig) -> String {
         match &config.transport {
-            McpTransport::Streamable { url, .. } => url.clone(),
-            McpTransport::Sse { url, .. } => url.clone(),
+            McpTransport::Streamable { url, .. } | McpTransport::Sse { url, .. } => url.clone(),
             McpTransport::Stdio { command, args, .. } => {
                 format!("{}:{}", command, args.join(" "))
             }
