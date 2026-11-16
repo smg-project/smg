@@ -7604,13 +7604,13 @@ mod tests {
         );
     }
 
-    /// One attempt's dispatch future (`execute_plan`'s) stays in the
-    /// 2,048-byte class the selection stage's future is held to: 1,152 bytes
+    /// One attempt's dispatch future (`execute_plan`'s) stays within the
+    /// 2,048-byte bound the selection stage's future is held to: 1,152 bytes
     /// on 64-bit targets. The pipeline awaits it by value, so it sizes every
     /// attempt's future: that one read 7,280 bytes while the two
     /// disaggregated dispatches were awaited by value, and reads 1,528 with
     /// both boxed at their call. A dispatch that grows the future past the
-    /// class is boxed at its call or needs its own read.
+    /// bound is boxed at its call or needs its own read.
     #[test]
     fn the_dispatch_future_fits_its_class() {
         let mut ctx = dispatch_ctx("test-model", grpc_wire(RuntimeType::Vllm));
