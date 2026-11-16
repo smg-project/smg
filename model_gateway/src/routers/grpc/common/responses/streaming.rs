@@ -817,14 +817,14 @@ impl ResponseStreamEventEmitter {
     /// it closes no item, so an item left open stays as the processor left it.
     pub async fn finish_stream(
         &mut self,
-        usage: &Usage,
+        usage: Option<&ResponseUsage>,
         not_stored: Option<&serde_json::Value>,
         tx: &SseSender,
     ) {
-        let usage_json = json!(ResponseUsage::from(usage));
+        let usage_json = usage.map(|usage| json!(usage));
         let event = match not_stored {
-            Some(error) => self.emit_failed(Some(&usage_json), error),
-            None => self.emit_completed(Some(&usage_json)),
+            Some(error) => self.emit_failed(usage_json.as_ref(), error),
+            None => self.emit_completed(usage_json.as_ref()),
         };
         let delivered = self.send_event_best_effort(&event, tx).await;
         if delivered && not_stored.is_some() {

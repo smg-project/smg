@@ -5,10 +5,11 @@ use std::sync::Arc;
 use axum::response::Response;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use openai_protocol::{
-    common::Tool,
+    common::{Tool, Usage},
     responses::{
-        CustomTool, IncompleteDetails, IncompleteReason, NamespaceTool, ResponseStatus,
-        ResponseTool, ResponsesRequest, ResponsesResponse,
+        CustomTool, IncompleteDetails, IncompleteReason, InputTokensDetails, NamespaceTool,
+        OutputTokensDetails, ResponseStatus, ResponseTool, ResponseUsage, ResponsesRequest,
+        ResponsesResponse,
     },
 };
 use serde_json::{json, to_value, Value};
@@ -123,6 +124,41 @@ pub(crate) fn tool_call_allowance(max_tool_calls: Option<usize>, executed: usize
 /// turn after the request's cap is always the last generation and is exempt.
 pub(crate) fn iteration_exceeds_safety_limit(iteration_count: usize, final_turn: bool) -> bool {
     iteration_count > DEFAULT_MAX_ITERATIONS + 1 && !final_turn
+}
+
+/// Adds one model call's usage to a response's total. Usage is per model
+/// request, so a tool loop reports the sum of its calls; a call that reported
+/// none leaves the total as it is.
+pub(crate) fn add_model_call_usage(total: &mut Option<ResponseUsage>, usage: Option<&Usage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+    let total = total.get_or_insert_with(|| ResponseUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        input_tokens_details: InputTokensDetails::default(),
+        output_tokens_details: OutputTokensDetails::default(),
+    });
+    total.input_tokens = total.input_tokens.saturating_add(usage.prompt_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.completion_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+    if let Some(details) = &usage.prompt_tokens_details {
+        total.input_tokens_details.cached_tokens = total
+            .input_tokens_details
+            .cached_tokens
+            .saturating_add(details.cached_tokens);
+    }
+    if let Some(tokens) = usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens)
+    {
+        total.output_tokens_details.reasoning_tokens = total
+            .output_tokens_details
+            .reasoning_tokens
+            .saturating_add(tokens);
+    }
 }
 
 /// Why a generated batch of server calls must stop after its permitted prefix
@@ -466,8 +502,7 @@ pub(crate) fn namespace_test_request() -> ResponsesRequest {
 /// tokens, 3 of them cached and 2 reasoning; `assert_responses_api_usage`
 /// reads it back off the wire.
 #[cfg(test)]
-pub(crate) fn responses_api_test_usage() -> openai_protocol::common::Usage {
-    use openai_protocol::common::Usage;
+pub(crate) fn responses_api_test_usage() -> Usage {
     Usage::from_counts(12, 7)
         .with_cached_tokens(3)
         .with_reasoning_tokens(2)
@@ -1435,6 +1470,33 @@ mod tests {
             DEFAULT_MAX_ITERATIONS + 2,
             true
         ));
+    }
+
+    #[test]
+    fn a_responses_usage_is_the_sum_of_its_model_calls() {
+        let counts = |usage: &ResponseUsage| {
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.total_tokens,
+                usage.input_tokens_details.cached_tokens,
+                usage.output_tokens_details.reasoning_tokens,
+            )
+        };
+        let mut total = None;
+        add_model_call_usage(&mut total, None);
+        assert!(total.is_none());
+        // One call: what a response served by a single call reports.
+        let first = Usage::from_counts(11, 5).with_cached_tokens(4);
+        add_model_call_usage(&mut total, Some(&first));
+        assert_eq!(
+            total.as_ref().map(counts),
+            Some(counts(&ResponseUsage::from(&first)))
+        );
+        let second = Usage::from_counts(23, 7).with_reasoning_tokens(3);
+        add_model_call_usage(&mut total, Some(&second));
+        add_model_call_usage(&mut total, None);
+        assert_eq!(total.as_ref().map(counts), Some((34, 12, 46, 4, 3)));
     }
 
     #[test]
