@@ -61,6 +61,7 @@ use openai_protocol::worker::{
 };
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
+use rustc_hash::FxHashMap;
 use smg_grpc_client::common_proto::EngineLoad;
 use tokio::{
     sync::{broadcast, Notify},
@@ -73,6 +74,7 @@ use crate::{
     policies::PolicyRegistry,
     worker::{
         health::liveness,
+        identity::endpoint::Endpoint,
         load::state::{LoadReceiver, LoadSnapshot, LoadState},
         registry::event::WorkerEvent,
         ConnectionMode, Worker, WorkerRegistry,
@@ -82,6 +84,24 @@ use crate::{
 mod scrape;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The rank loads by worker as the update line writes them: each address
+/// masked. A worker's address may hold a credential in its userinfo or a
+/// token in its query. The address is read when the line is written, so
+/// nothing is parsed while debug logging is off.
+struct MaskedLoads<'a>(&'a HashMap<String, HashMap<isize, isize>>);
+
+impl Debug for MaskedLoads<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(url, ranks)| (Endpoint::redacted_str(url), ranks)),
+            )
+            .finish()
+    }
+}
 
 /// DP rank load cache used by load-aware routing policies.
 ///
@@ -108,7 +128,10 @@ impl WorkerLoadManager {
 
     /// Replace cached rank loads for the supplied workers, preserving other workers.
     pub fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
-        debug!("WorkerLoadManager update_dp_loads map:{:?}", loads);
+        debug!(
+            "WorkerLoadManager update_dp_loads map:{:?}",
+            MaskedLoads(loads)
+        );
         let mut cached = self.dp_cached_loads.write();
         cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
@@ -324,14 +347,17 @@ pub struct WorkerMonitor {
     /// ([`Self::apply_pushed_load`]), a poll's entry replaces a rank's that
     /// pushed nothing since the poll began ([`Self::apply_polled_load`]).
     /// A record's readers borrow it, and the coalesced publish copies it
-    /// once per window, so a record builds no report of its own.
-    pushed_reports: Mutex<HashMap<String, WorkerLoadResponse>>,
+    /// once per window, so a record builds no report of its own. This map
+    /// and the two below are keyed by the worker's URL, a string of the
+    /// gateway's own, and every record looks its worker up in each: they
+    /// hash with FxHash.
+    pushed_reports: Mutex<FxHashMap<String, WorkerLoadResponse>>,
     /// When each rank of a worker last pushed a load record, by receipt:
     /// the tick's poll decision reads it (see [`PollMode`]).
-    pushed_at: Mutex<HashMap<String, BTreeMap<i32, Instant>>>,
+    pushed_at: Mutex<FxHashMap<String, BTreeMap<i32, Instant>>>,
     /// The workers whose report changed since the last coalesced publish,
     /// each with the incarnation that pushed, for the publish fence.
-    pending_pushed: Mutex<HashMap<String, Arc<dyn Worker>>>,
+    pending_pushed: Mutex<FxHashMap<String, Arc<dyn Worker>>>,
     pushed_notify: Arc<Notify>,
     pushed_flush_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -456,9 +482,9 @@ impl WorkerMonitor {
             event_task: Mutex::new(None),
             eviction_flush_task: Mutex::new(None),
             liveness_sweep_task: Mutex::new(None),
-            pushed_reports: Mutex::new(HashMap::new()),
-            pushed_at: Mutex::new(HashMap::new()),
-            pending_pushed: Mutex::new(HashMap::new()),
+            pushed_reports: Mutex::new(FxHashMap::default()),
+            pushed_at: Mutex::new(FxHashMap::default()),
+            pending_pushed: Mutex::new(FxHashMap::default()),
             pushed_notify: Arc::new(Notify::new()),
             pushed_flush_task: Mutex::new(None),
         }
@@ -2181,7 +2207,7 @@ mod native_loads_tests {
                 .build(),
         );
         worker.set_status(WorkerStatus::Ready);
-        let held = WorkerLoadGuard::new(Arc::clone(&worker), None);
+        let held = WorkerLoadGuard::with_key(Arc::clone(&worker), None);
         registry.register(Arc::clone(&worker)).unwrap();
         monitor.start_event_loop();
 

@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
@@ -9,6 +9,7 @@ use openai_protocol::worker::WorkerLoadResponse;
 #[cfg(test)]
 use rand::SeedableRng;
 use rand::{rngs::StdRng, RngExt};
+use rustc_hash::FxHashMap;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
@@ -210,8 +211,9 @@ pub struct LeastLoadPolicy {
     /// guard for the release and the winner's credit alone, so decisions on
     /// other threads read meanwhile. Token-work feeds the score's in-flight
     /// term; the request count its floor on the router's own in-flight
-    /// count.
-    tally: RwLock<HashMap<String, SincePollDispatch>>,
+    /// count. The key is the gateway's own string (a registered worker's
+    /// URL), never request input, so the map hashes with FxHash.
+    tally: RwLock<FxHashMap<String, SincePollDispatch>>,
     /// KV-pressure weight `λ_t` (seconds).
     kv_pressure_weight: f64,
     /// Mean prefill length (tokens) for estimating in-flight token-work when a
@@ -263,7 +265,7 @@ struct Candidate {
 /// tally for the decision's write phase to release
 /// ([`SincePollDispatch::credit_after`]).
 fn credit_read(
-    tally: &HashMap<String, SincePollDispatch>,
+    tally: &FxHashMap<String, SincePollDispatch>,
     url: &str,
     sampled_at: Option<Instant>,
 ) -> (u64, u64, bool) {
@@ -277,7 +279,7 @@ fn credit_read(
 /// read ([`SincePollDispatch::release_through`]), one lookup per candidate,
 /// and nothing is left for the write phase.
 fn credit_released(
-    tally: &mut HashMap<String, SincePollDispatch>,
+    tally: &mut FxHashMap<String, SincePollDispatch>,
     url: &str,
     sampled_at: Option<Instant>,
 ) -> (u64, u64, bool) {
@@ -376,7 +378,7 @@ impl LeastLoadPolicy {
     ) -> Self {
         Self {
             loads: RwLock::new(None),
-            tally: RwLock::new(HashMap::new()),
+            tally: RwLock::new(FxHashMap::default()),
             kv_pressure_weight: if kv_pressure_weight.is_finite() && kv_pressure_weight >= 0.0 {
                 kv_pressure_weight
             } else {
@@ -1165,6 +1167,8 @@ impl Default for LeastLoadPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use openai_protocol::worker::SchedulerLoadSnapshot;
 
     use super::*;

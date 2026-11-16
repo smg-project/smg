@@ -143,7 +143,6 @@ use openai_protocol::worker::WorkerStatus;
 use tracing::{info, warn};
 
 use crate::{
-    config::RouterConfig,
     observability::metrics::Metrics,
     worker::{
         identity::basic::{StallReason, COLD_PREFILL_TOKENS_PER_SEC},
@@ -641,24 +640,20 @@ pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
     let _ = THRESHOLDS.set((stall, wedge, stale));
 }
 
-/// Apply every liveness budget the configuration carries: the stall, wedge
-/// and stale thresholds and the warm-up slice. The one place the budgets
-/// are read from a configuration, for the server's start-up and, as
+/// Apply every liveness budget the host hands in: the stall, wedge and
+/// stale thresholds and the warm-up slice. The one place the budgets are
+/// set from outside, for the server's start-up and, as
 /// `worker::configure_liveness`, for a host that builds the context without
 /// the builder (the test harness today); the first call in a process wins,
 /// as for the thresholds' own setter.
-pub fn configure_from(config: &RouterConfig) {
-    configure(
-        Duration::from_secs(config.worker_stall_secs),
-        Duration::from_secs(config.worker_wedge_secs),
-        Duration::from_secs(config.worker_stale_secs),
-    );
+pub fn configure_from(budgets: Budgets) {
+    configure(budgets.stall, budgets.wedge, budgets.stale);
     configure_warmup(Warmup {
-        secs: Duration::from_secs(config.worker_warmup_secs),
-        share: config.worker_warmup_share,
-        blocks: config.worker_warmup_blocks,
-        thin_ratio: config.worker_warmup_thin_ratio,
-        divert_every: config.worker_warmup_divert_every,
+        secs: budgets.warmup_secs,
+        share: budgets.warmup_share,
+        blocks: budgets.warmup_blocks,
+        thin_ratio: budgets.warmup_thin_ratio,
+        divert_every: budgets.warmup_divert_every,
     });
 }
 
@@ -1244,6 +1239,16 @@ mod tests {
         Arc::new(BasicWorkerBuilder::new("http://w1:8000").build())
     }
 
+    /// Whether `age` counts from a stamp noted at or after `since` on the
+    /// gateway clock: such an age is within the time elapsed since then,
+    /// and an older stamp's is longer by the wait the test put before
+    /// `since`. The caller passes the age it read, so the clock is read
+    /// here after it and a scheduling stall only widens the bound; a fixed
+    /// margin (`age < 10 ms`) would race it.
+    fn noted_since(since: u64, age: Duration) -> bool {
+        age <= Duration::from_millis(now_ms() - since)
+    }
+
     /// A worker whose prompt was given up on by the silence verdict (a run
     /// the whole cold-shape grace long, released without an answer) is
     /// judged by its own rate once it answers: the wait it was given up on
@@ -1434,13 +1439,14 @@ mod tests {
         // counted from registration. It counts from the dispatch now.
         let w = worker();
         thread::sleep(Duration::from_millis(15));
+        let dispatched_at = now_ms();
         for _ in 0..3 {
             w.increment_load();
             w.runtime_state().unwrap().note_tracked_started();
         }
         let age = w.runtime_state().unwrap().token_progress_age();
         assert!(
-            age < Duration::from_millis(10),
+            noted_since(dispatched_at, age),
             "clock started at the dispatch"
         );
         sweep(&w);
@@ -2059,9 +2065,12 @@ mod tests {
         assert!(w.stall_reason().is_none(), "never pushed");
         // The stream delivers a record: from here on silence counts.
         w.runtime_state().unwrap().note_load_record();
+        let heard_at = now_ms();
         on_contact(&w);
-        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
-        assert!(w.stall_reason().is_none(), "just heard from");
+        assert!(
+            noted_since(heard_at, w.runtime_state().unwrap().contact_age()),
+            "just heard from"
+        );
         thread::sleep(Duration::from_millis(30));
         sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
         assert_eq!(w.stall_reason(), Some(StallReason::Unreachable));
@@ -2072,9 +2081,12 @@ mod tests {
         assert!(!w.routing_state().stalled);
         // A worker that still streams tokens is heard from: never stale.
         thread::sleep(Duration::from_millis(30));
+        let streamed_at = now_ms();
         on_token_progress(&w);
-        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
-        assert!(w.stall_reason().is_none(), "tokens are contact");
+        assert!(
+            noted_since(streamed_at, w.runtime_state().unwrap().contact_age()),
+            "tokens are contact"
+        );
         // Off at zero.
         thread::sleep(Duration::from_millis(30));
         sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, Duration::ZERO);
@@ -2094,7 +2106,7 @@ mod tests {
             Some(StallReason::Wedged),
             "test",
         );
-        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE);
         assert_eq!(
             w.stall_reason(),
             Some(StallReason::Wedged),
@@ -2232,12 +2244,17 @@ mod tests {
         let w = worker();
         tracked_pile(&w, 4);
         thread::sleep(Duration::from_millis(5));
+        let progressed_at = now_ms();
         on_token_progress(&w);
-        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(50), DEFAULT_STALE);
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE);
         assert!(
-            w.stall_reason().is_none(),
+            noted_since(
+                progressed_at,
+                w.runtime_state().unwrap().token_progress_age()
+            ),
             "finishing work is progress, whatever the request's shape"
         );
+        assert!(w.stall_reason().is_none(), "and the pile stays routable");
         thread::sleep(Duration::from_millis(55));
         sweep_with(&w, DEFAULT_STALL, Duration::from_millis(50), DEFAULT_STALE);
         assert_eq!(
@@ -2263,10 +2280,11 @@ mod tests {
         w.increment_load();
         thread::sleep(Duration::from_millis(15));
         assert!(w.runtime_state().unwrap().token_progress_age() >= Duration::from_millis(15));
+        let tracked_at = now_ms();
         w.increment_load();
         w.runtime_state().unwrap().note_tracked_started();
         assert!(
-            w.runtime_state().unwrap().token_progress_age() < Duration::from_millis(10),
+            noted_since(tracked_at, w.runtime_state().unwrap().token_progress_age()),
             "the clock restarted with the tracked run"
         );
     }
@@ -2486,16 +2504,16 @@ mod tests {
     fn re_admission_restarts_the_warm_up_clock() {
         let w = worker();
         thread::sleep(Duration::from_millis(20));
-        let before = w.admitted_age();
         set(
             &w,
             w.runtime_state().as_deref(),
             Some(StallReason::Unreachable),
             "test",
         );
+        let cleared_at = now_ms();
         on_contact(&w);
         assert!(
-            w.admitted_age() < before,
+            noted_since(cleared_at, w.admitted_age()),
             "cleared veto counts as an admission"
         );
     }

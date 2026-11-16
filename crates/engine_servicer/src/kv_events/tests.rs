@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use engine_zmq_client::mock_engine::MOCK_DEADLINE;
 use futures::StreamExt;
 use smg_grpc_client::common_proto::{kv_cache_event, KvCacheLocality, KvCacheTier};
 use tokio::time::timeout;
@@ -901,7 +902,7 @@ impl Lab {
     /// `replies` and the end marker; the request must ask from `start`.
     async fn answer_replay(&mut self, start: u64, replies: &[(u64, Vec<u8>)]) {
         let router = self.router.as_mut().expect("a replay socket");
-        let request = timeout(Duration::from_secs(5), router.recv())
+        let request = timeout(MOCK_DEADLINE, router.recv())
             .await
             .expect("a replay request in time")
             .expect("request");
@@ -968,8 +969,11 @@ fn refused(result: Result<BoxStream<common::KvEventBatch>, Status>) -> Status {
     }
 }
 
+// The stream reads wait under the suite's standing deadline, not a shorter
+// one of their own: a loaded host holds a single read of a busy case for
+// seconds.
 async fn read(stream: &mut BoxStream<common::KvEventBatch>) -> common::KvEventBatch {
-    timeout(Duration::from_secs(5), stream.next())
+    timeout(MOCK_DEADLINE, stream.next())
         .await
         .expect("a batch in time")
         .expect("stream open")
@@ -977,7 +981,7 @@ async fn read(stream: &mut BoxStream<common::KvEventBatch>) -> common::KvEventBa
 }
 
 async fn read_error(stream: &mut BoxStream<common::KvEventBatch>) -> Status {
-    timeout(Duration::from_secs(5), stream.next())
+    timeout(MOCK_DEADLINE, stream.next())
         .await
         .expect("an item in time")
         .expect("stream open")
@@ -985,7 +989,7 @@ async fn read_error(stream: &mut BoxStream<common::KvEventBatch>) -> Status {
 }
 
 async fn read_end(stream: &mut BoxStream<common::KvEventBatch>) {
-    assert!(timeout(Duration::from_secs(5), stream.next())
+    assert!(timeout(MOCK_DEADLINE, stream.next())
         .await
         .expect("the end in time")
         .is_none());
@@ -1766,7 +1770,7 @@ async fn dropping_the_relay_closes_the_publisher_subscription() {
     assert_eq!(read(&mut stream).await.sequence_number, 0);
     drop(lab.relay);
     read_end(&mut stream).await;
-    let disconnected = timeout(Duration::from_secs(5), async {
+    let disconnected = timeout(MOCK_DEADLINE, async {
         while let Some(event) = monitor.next().await {
             if matches!(event, SocketEvent::Disconnected(_)) {
                 return true;

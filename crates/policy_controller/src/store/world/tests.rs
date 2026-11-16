@@ -14,9 +14,10 @@ use super::{
     World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
+    spec::{BindingSpec, Match, OverloadSpec},
     store::{
-        GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Reachability, WorkerFacts,
-        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Overload, Reachability,
+        WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{fingerprint, AffinityFacts, Candidate, LoadRow, Phase, Role, WireModes, WorkerId},
     AppliedSpec, PolicySpec,
@@ -753,8 +754,7 @@ fn a_report_is_folded_whole_and_a_poll_asked_before_the_last_window_waits() {
     assert_eq!(store.publish_due(), Some(t0 + PUBLISH_WINDOW));
     // A poll asked before the last publication lands inside its window.
     store.report(
-        id,
-        &[(0, load(4, 0)), (1, load(5, 0))],
+        &[(id, 0, Some(load(4, 0))), (id, 1, Some(load(5, 0)))],
         t0 - Duration::from_millis(3),
         LoadSource::Poll,
     );
@@ -772,8 +772,11 @@ fn a_report_whose_last_rank_is_not_the_members_still_shows_the_members_row() {
     // The member is rank 0 and the report's last row is another rank's: the
     // report is shown for the row it reached, whichever row came last.
     store.report(
-        id,
-        &[(0, load(4, 0)), (1, load(5, 0)), (2, load(6, 0))],
+        &[
+            (id, 0, Some(load(4, 0))),
+            (id, 1, Some(load(5, 0))),
+            (id, 2, Some(load(6, 0))),
+        ],
         t0,
         LoadSource::Poll,
     );
@@ -781,8 +784,7 @@ fn a_report_whose_last_rank_is_not_the_members_still_shows_the_members_row() {
     // Inside the window that opened, the next one waits and the sink names
     // its instant.
     store.report(
-        id,
-        &[(0, load(7, 0)), (1, load(8, 0))],
+        &[(id, 0, Some(load(7, 0))), (id, 1, Some(load(8, 0)))],
         t0 + Duration::from_millis(1),
         LoadSource::Poll,
     );
@@ -2127,4 +2129,658 @@ fn the_pair_door_builds_no_decode_side_beside_an_empty_prefill_pool() {
         .build_pair(MODEL, &ask(t0), &mut prefill, &mut decode)
         .is_some());
     assert_eq!((prefill.candidates.len(), decode.candidates.len()), (1, 1));
+}
+
+// ------------------------------------------------------ the overload verdict
+
+/// A generation whose one binding hands every pool the block `overload`.
+fn generation_with(number: u64, overload: OverloadSpec) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    let profile = document
+        .profiles
+        .keys()
+        .next()
+        .expect("the preset's profile")
+        .clone();
+    document.bindings = vec![BindingSpec {
+        profile: Some(profile),
+        overload: Some(overload),
+        ..BindingSpec::default()
+    }];
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
+/// A block with both thresholds named.
+fn block(waiting_requests: u32, token_usage: f32) -> OverloadSpec {
+    OverloadSpec {
+        waiting_requests: Some(waiting_requests),
+        token_usage: Some(token_usage),
+        ..OverloadSpec::default()
+    }
+}
+
+/// A load row with a queue and an active KV usage.
+fn pressure(queued: u32, active_kv_permille: u16) -> LoadRow {
+    LoadRow {
+        queued,
+        active_kv_permille,
+        ..LoadRow::default()
+    }
+}
+
+/// The workers of the pool whose rows carry the overload verdict, by id.
+fn overloaded(store: &MemoryStore, now: Instant) -> Vec<WorkerId> {
+    view(store, &ask(now))
+        .0
+        .iter()
+        .filter(|row| row.health.overloaded)
+        .map(|row| row.id)
+        .collect()
+}
+
+/// One rank of the two-rank engine `engine`.
+fn rank_of(store: &MemoryStore, engine: &str, rank: u16) -> WorkerId {
+    store
+        .upsert(WorkerFacts {
+            engine: engine.to_string(),
+            dp_rank: rank,
+            dp_size: 2,
+            ..facts(&format!("{engine}#{rank}"), Role::Single, &[MODEL])
+        })
+        .id()
+}
+
+#[test]
+fn a_store_with_no_threshold_writes_no_verdict() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = member(&store, "http://a:8000");
+    // Under the unbound generation no pool has a pair.
+    store.record(a, 0, pressure(1_000, 1_000), t0, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0), []);
+    // A block switched off hands none, whatever values it still names.
+    let off = OverloadSpec {
+        enabled: false,
+        ..block(1, 0.1)
+    };
+    store.apply(generation_with(1, off)).expect("applied");
+    store.record(a, 0, pressure(1_000, 1_000), t0, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0), []);
+    assert_eq!(store.overload_flips(), 0, "no write moved a verdict");
+}
+
+#[test]
+fn a_row_is_judged_at_and_above_its_pool_s_thresholds_and_its_own_stand_over_them() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = member(&store, "http://a:8000");
+    let b = member(&store, "http://b:8000");
+    // The third names a count of its own and takes the pool's usage.
+    let c = store
+        .upsert(WorkerFacts {
+            overload: Overload {
+                waiting_requests: Some(2),
+                kv_usage_permille: None,
+            },
+            ..facts("http://c:8000", Role::Single, &[MODEL])
+        })
+        .id();
+    store
+        .apply(generation_with(1, block(4, 0.5)))
+        .expect("applied");
+
+    // The count: at the threshold is over, one under is not.
+    store.record(a, 0, pressure(4, 0), t0, LoadSource::Stream);
+    store.record(b, 0, pressure(3, 0), t0, LoadSource::Stream);
+    store.record(c, 0, pressure(2, 0), t0, LoadSource::Stream);
+    let mut over = [a, c];
+    over.sort_unstable();
+    assert_eq!(overloaded(&store, t0), over);
+    // The usage, in the row's unit: at the threshold is over, one
+    // permille under is not; either signal alone vetoes.
+    store.record(a, 0, pressure(0, 499), t0, LoadSource::Stream);
+    store.record(b, 0, pressure(0, 500), t0, LoadSource::Stream);
+    store.record(c, 0, pressure(1, 500), t0, LoadSource::Stream);
+    let mut over = [b, c];
+    over.sort_unstable();
+    assert_eq!(overloaded(&store, t0), over);
+
+    // A worker's own value still vetoes under a block switched off, and
+    // the value it left to the pool is gone with the block.
+    let off = OverloadSpec {
+        enabled: false,
+        ..OverloadSpec::default()
+    };
+    store.apply(generation_with(2, off)).expect("applied");
+    assert_eq!(
+        overloaded(&store, t0),
+        [],
+        "the pool's usage left with the block"
+    );
+    store.record(c, 0, pressure(2, 0), t0, LoadSource::Stream);
+    store.record(a, 0, pressure(9, 0), t0, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0), [c]);
+    // A membership write under no pool's pair judges again the engine
+    // whose only threshold is its registration's own, and its records
+    // are judged after it.
+    member(&store, "http://d:8000");
+    assert_eq!(overloaded(&store, t0), [c]);
+    store.record(c, 0, pressure(1, 0), t0, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0), []);
+    store.record(c, 0, pressure(2, 0), t0, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0), [c]);
+}
+
+#[test]
+fn an_engine_s_ranks_are_judged_as_one_by_their_sum_and_their_mean() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    let mut both = [zero, one];
+    both.sort_unstable();
+    store
+        .apply(generation_with(1, block(8, 0.8)))
+        .expect("applied");
+    let answer = |first: LoadRow, second: LoadRow| {
+        store.report(
+            &[(zero, 0, Some(first)), (one, 1, Some(second))],
+            t0,
+            LoadSource::Poll,
+        );
+        overloaded(&store, t0)
+    };
+    // The queued requests are summed over the ranks: neither rank is at
+    // the count alone.
+    assert_eq!(answer(pressure(5, 0), pressure(3, 0)), both);
+    assert_eq!(answer(pressure(4, 0), pressure(3, 0)), []);
+    // The usage is the mean over the ranks, compared with no division:
+    // 900 and 700 are at 800, 900 and 699 are under it.
+    assert_eq!(answer(pressure(0, 900), pressure(0, 700)), both);
+    assert_eq!(answer(pressure(0, 900), pressure(0, 699)), []);
+    // The ranks on file are the ranks judged: with one evicted, the other
+    // is the whole engine.
+    assert_eq!(answer(pressure(0, 800), pressure(0, 0)), []);
+    // An eviction has no instant of its own: its judgment is shown with
+    // the window's end, as its fold is.
+    store.evict(one);
+    store.publish(t0);
+    assert_eq!(overloaded(&store, t0), both, "one rank on file, at 800");
+    // An engine with nothing on file reads clear.
+    store.evict(zero);
+    store.publish(t0);
+    assert_eq!(overloaded(&store, t0), []);
+}
+
+#[test]
+fn two_ranks_that_trade_their_queues_in_one_answer_move_no_verdict() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(
+        &[
+            (zero, 0, Some(pressure(6, 0))),
+            (one, 1, Some(pressure(1, 0))),
+        ],
+        t0,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![], 0)
+    );
+    // One answer in which the ranks trade: the sum never left 7.
+    store.report(
+        &[
+            (zero, 0, Some(pressure(1, 0))),
+            (one, 1, Some(pressure(6, 0))),
+        ],
+        t0,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![], 0)
+    );
+    // The same trade as two writes reads one new rank beside one old: 6
+    // and 6 between them, a verdict raised and taken back.
+    store.report(&[(zero, 0, Some(pressure(6, 0)))], t0, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t0).len(), 2);
+    store.report(&[(one, 1, Some(pressure(1, 0)))], t0, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![], 2)
+    );
+}
+
+#[test]
+fn the_word_that_no_report_came_clears_the_verdict_until_the_engine_is_heard_again() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = member(&store, "http://a:8000");
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(&[(a, 0, Some(pressure(9, 0)))], t0, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![a], 1)
+    );
+
+    // A poll that brought no report: the verdict is cleared and the row on
+    // file stays.
+    let t1 = t0 + Duration::from_secs(1);
+    store.report(&[(a, 0, None)], t1, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, t1), store.overload_flips()),
+        (vec![], 2)
+    );
+    assert_eq!(store.load(a, 0).map(|sample| sample.row.queued), Some(9));
+    // The word is on file: a membership write judges again and does not
+    // raise the verdict from the row that is still there.
+    member(&store, "http://b:8000");
+    assert_eq!(overloaded(&store, t1), []);
+    // So does a new generation.
+    store
+        .apply(generation_with(2, block(8, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, t1), []);
+    assert_eq!(
+        store.overload_flips(),
+        2,
+        "neither is a write of the load table"
+    );
+    // The engine's next record is judged as any other.
+    let t2 = t1 + Duration::from_secs(1);
+    store.record(a, 0, pressure(9, 0), t2, LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, t2), store.overload_flips()),
+        (vec![a], 3)
+    );
+
+    // A rank whose stream pushed since the poll began is heard: the poll's
+    // word that none came does not stand over its record.
+    store.report(
+        &[(a, 0, None)],
+        t2 - Duration::from_millis(1),
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t2), store.overload_flips()),
+        (vec![a], 3)
+    );
+}
+
+#[test]
+fn a_registration_s_own_usage_stands_over_its_pool_s() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let own = |key: &str, permille: u16| {
+        store
+            .upsert(WorkerFacts {
+                overload: Overload {
+                    waiting_requests: None,
+                    kv_usage_permille: Some(permille),
+                },
+                ..facts(key, Role::Single, &[MODEL])
+            })
+            .id()
+    };
+    let low = own("http://low:8000", 300);
+    let high = own("http://high:8000", 900);
+    let pool = member(&store, "http://pool:8000");
+    // The count is out of reach: the usage alone judges.
+    store
+        .apply(generation_with(1, block(1_000, 0.5)))
+        .expect("applied");
+    let at = |permille: u16| {
+        for id in [low, high, pool] {
+            store.record(id, 0, pressure(0, permille), t0, LoadSource::Stream);
+        }
+        overloaded(&store, t0)
+    };
+    // Under the pool's half: the row that names a lower usage is over it.
+    assert_eq!(at(400), [low]);
+    // Over the pool's half, and under the usage the third row names.
+    let mut over = [low, pool];
+    over.sort_unstable();
+    assert_eq!(at(700), over);
+    let mut all = [low, high, pool];
+    all.sort_unstable();
+    assert_eq!(at(900), all);
+}
+
+#[test]
+fn a_pool_takes_the_thresholds_of_the_binding_that_covers_its_phase() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let prefill = store
+        .upsert(facts("http://p:8000", Role::Prefill, &[MODEL]))
+        .id();
+    let decode = store
+        .upsert(facts("http://d:8000", Role::Decode, &[MODEL]))
+        .id();
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = 1;
+    let profile = document
+        .profiles
+        .keys()
+        .next()
+        .expect("the preset's profile")
+        .clone();
+    // One model, two bindings: each covers one phase with its own count.
+    let binding = |phase: Phase, waiting: u32| BindingSpec {
+        matcher: Match {
+            phase: vec![phase],
+            ..Match::default()
+        },
+        profile: Some(profile.clone()),
+        overload: Some(block(waiting, 1.0)),
+        ..BindingSpec::default()
+    };
+    document.bindings = vec![binding(Phase::Prefill, 2), binding(Phase::Decode, 9)];
+    store
+        .apply(AppliedSpec::validate(&document).expect("the document validates"))
+        .expect("applied");
+    let over = |role: Role| {
+        let mut out = ViewBuffers::default();
+        store
+            .world()
+            .build(MODEL, role, &ask(t0), &mut out)
+            .expect("the pool");
+        out.candidates
+            .iter()
+            .map(|row| row.health.overloaded)
+            .collect::<Vec<_>>()
+    };
+    // The same queue on both sides: over the prefill pool's count alone.
+    store.record(prefill, 0, pressure(5, 0), t0, LoadSource::Stream);
+    store.record(decode, 0, pressure(5, 0), t0, LoadSource::Stream);
+    assert_eq!(
+        (over(Role::Prefill), over(Role::Decode)),
+        (vec![true], vec![false])
+    );
+}
+
+#[test]
+fn a_failed_poll_does_not_silence_an_engine_whose_rank_pushed_since_it_began() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    let mut both = [zero, one];
+    both.sort_unstable();
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(
+        &[
+            (zero, 0, Some(pressure(1, 0))),
+            (one, 1, Some(pressure(1, 0))),
+        ],
+        t0,
+        LoadSource::Poll,
+    );
+    assert_eq!(overloaded(&store, t0), []);
+
+    // A poll goes out, and rank 0's stream reports a queue while it is
+    // out: the engine is over its count.
+    let asked = t0 + Duration::from_secs(1);
+    let pushed = asked + Duration::from_millis(1);
+    store.record(zero, 0, pressure(9, 0), pushed, LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, pushed), store.overload_flips()),
+        (both.to_vec(), 1)
+    );
+    // The poll fails. Its word that none came stands over no engine a
+    // rank of which was heard since it began, in either order of ranks.
+    let none = [(zero, 0, None), (one, 1, None)];
+    store.report(&none, asked, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, pushed), store.overload_flips()),
+        (both.to_vec(), 1)
+    );
+    store.report(&[none[1], none[0]], asked, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, pushed), store.overload_flips()),
+        (both.to_vec(), 1)
+    );
+    // So for an answer that names the other rank alone: a poll is for
+    // the ranks no stream serves, and a failed one names no other.
+    store.report(&[none[1]], asked, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, pushed), store.overload_flips()),
+        (both.to_vec(), 1)
+    );
+    // Nor when the rank that pushed is the other one: rank 1's record
+    // comes while a poll for rank 0 alone is out.
+    let again = pushed + Duration::from_secs(1);
+    let since = again + Duration::from_millis(1);
+    store.record(one, 1, pressure(1, 0), since, LoadSource::Stream);
+    store.report(&[none[0]], again, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, since), store.overload_flips()),
+        (both.to_vec(), 1)
+    );
+    // A poll asked after both records, and failed, is the engine's word:
+    // whether a stream still serves a rank is its caller's to know.
+    let later = since + Duration::from_secs(1);
+    store.report(&none, later, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, later), store.overload_flips()),
+        (vec![], 2)
+    );
+    // An answer that brings one rank's row and omits the other is no such
+    // word: the engine is heard, and the omitted rank keeps what is on
+    // file.
+    store.report(
+        &[(zero, 0, Some(pressure(7, 0))), (one, 1, None)],
+        later,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, later), store.overload_flips()),
+        (both.to_vec(), 3)
+    );
+}
+
+#[test]
+fn the_word_that_no_report_came_is_kept_and_ended_while_no_threshold_stands() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = member(&store, "http://a:8000");
+    let off = || OverloadSpec {
+        enabled: false,
+        ..OverloadSpec::default()
+    };
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(&[(a, 0, Some(pressure(9, 0)))], t0, LoadSource::Poll);
+    store.report(&[(a, 0, None)], t0, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![], 2)
+    );
+
+    // The block is switched off and the engine is heard under no
+    // threshold: its record ends the word, so the generation that brings
+    // the threshold back judges what is on file.
+    store.apply(generation_with(2, off())).expect("applied");
+    store.record(a, 0, pressure(9, 0), t0, LoadSource::Stream);
+    store
+        .apply(generation_with(3, block(8, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, t0), [a]);
+
+    // The word that comes under no threshold is kept: the generation that
+    // brings one back raises no verdict from the row that is still on
+    // file.
+    store.apply(generation_with(4, off())).expect("applied");
+    let t1 = t0 + Duration::from_secs(1);
+    store.report(&[(a, 0, None)], t1, LoadSource::Poll);
+    store
+        .apply(generation_with(5, block(8, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, t1), []);
+    assert_eq!(
+        store.overload_flips(),
+        2,
+        "no write of the load table moved a verdict under no threshold"
+    );
+}
+
+#[test]
+fn the_word_that_no_report_came_is_read_an_engine_at_a_time_in_a_mixed_answer() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = member(&store, "http://a:8000");
+    let b = member(&store, "http://b:8000");
+    let mut both = [a, b];
+    both.sort_unstable();
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(
+        &[(a, 0, Some(pressure(9, 0))), (b, 0, Some(pressure(9, 0)))],
+        t0,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (both.to_vec(), 2)
+    );
+    // One call for two engines: the first brings a row and the second
+    // none. The second engine's word is its own, whatever the first said.
+    let t1 = t0 + Duration::from_secs(1);
+    store.report(
+        &[(a, 0, Some(pressure(9, 0))), (b, 0, None)],
+        t1,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t1), store.overload_flips()),
+        (vec![a], 3)
+    );
+    // A later engine of the answer is heard by any of its rows: a
+    // two-rank engine named after another, its first rank with a row and
+    // its second with none, is judged and keeps what is on file.
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    let mut over = [a, zero, one];
+    over.sort_unstable();
+    let t2 = t1 + Duration::from_secs(1);
+    store.report(
+        &[
+            (a, 0, Some(pressure(9, 0))),
+            (zero, 0, Some(pressure(9, 0))),
+            (one, 1, None),
+        ],
+        t2,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t2), store.overload_flips()),
+        (over.to_vec(), 4)
+    );
+}
+
+#[test]
+fn a_single_rank_worker_is_an_engine_alone_and_ranks_share_their_engine_s_key() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    // Two single-rank rows that name one engine. The facts' rule is that
+    // a single-rank worker's engine is its own key: each is judged alone.
+    let alone = |key: &str| {
+        store
+            .upsert(WorkerFacts {
+                engine: "http://shared:8000".to_string(),
+                ..facts(key, Role::Single, &[MODEL])
+            })
+            .id()
+    };
+    let (x, y) = (alone("http://x:8000"), alone("http://y:8000"));
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    let mut ranks = [zero, one];
+    ranks.sort_unstable();
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    for (id, rank) in [(x, 0), (y, 0), (zero, 0), (one, 1)] {
+        store.record(id, rank, pressure(5, 0), t0, LoadSource::Stream);
+    }
+    // Five and five: at the count as one engine's ranks, under it alone.
+    assert_eq!(overloaded(&store, t0), ranks);
+}
+
+#[test]
+fn a_membership_write_and_a_new_generation_judge_again_from_what_is_on_file() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = member(&store, "http://a:8000");
+    store.record(a, 0, pressure(5, 0), t0, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0), []);
+    // The record was on file before any threshold: a generation that
+    // hands the pool one judges it.
+    store
+        .apply(generation_with(1, block(5, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, t0), [a]);
+    // A membership write makes every row again and carries no bit over:
+    // the verdict stands because the record on file is judged again. The
+    // pool's rows are cut once, after that judgment: the write counts no
+    // publication's copy.
+    let copies = store.publication_allocations();
+    member(&store, "http://b:8000");
+    assert_eq!(
+        (overloaded(&store, t0), store.publication_allocations()),
+        (vec![a], copies)
+    );
+    // A generation with a higher count takes the verdict back.
+    store
+        .apply(generation_with(2, block(6, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, t0), []);
+    assert_eq!(
+        store.overload_flips(),
+        0,
+        "no write of the load table moved one"
+    );
+}
+
+#[test]
+fn the_deciding_door_hands_the_rows_and_the_engine_of_one_publication() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    member(&store, "http://a:8000");
+    store.apply(generation(1)).expect("above the unbound start");
+    store.deciding(|world| {
+        // A generation applied and a member admitted while a decision holds
+        // its world are the next decision's: this one reads the rows and
+        // the engine it was handed, whole.
+        store.apply(generation(2)).expect("above the standing one");
+        member(&store, "http://b:8000");
+        let mut out = ViewBuffers::default();
+        let built = world
+            .build(MODEL, Role::Single, &ask(t0), &mut out)
+            .expect("the pool");
+        assert_eq!(
+            (built.generation, world.spec().generation(), built.pool_size),
+            (1, 1, 1)
+        );
+        assert_eq!(world.spec().engine().generation(), 1);
+    });
+    let next = store.deciding(|world| {
+        (
+            world.spec().generation(),
+            world.members(MODEL, Role::Single),
+        )
+    });
+    assert_eq!(next, (2, Some(2)));
 }

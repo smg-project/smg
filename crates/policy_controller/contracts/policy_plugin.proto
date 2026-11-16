@@ -308,7 +308,10 @@ message RequestFacts {
 message Constraints {
   // Ids this gateway just failed to connect to.
   repeated fixed64 excluded = 1 [packed = true];
-  uint32 wire_modes = 2;  // WireMode bits the gateway speaks
+  // WireMode bits the gateway speaks; 0 states none and narrows nothing.
+  // Read before any stage runs: a worker that shares no bit with a gateway
+  // that states some is no candidate, one that states no wire included.
+  uint32 wire_modes = 2;
   // The overload veto does not apply to this decision.
   bool overload_lifted = 3;
   // At most this many candidates; absent for no hint, a present 0 a decision
@@ -359,7 +362,9 @@ message Pick {
 
 message Shed {
   ShedReason reason = 1;
-  // The filter, the picker or the pair plan's pre-pass that left nothing.
+  // The filter, the picker or the pair plan's pre-pass that left nothing; or
+  // the deciding gateway's own constraint that left none of a pool that has
+  // rows, `wires` or `subset-hint`.
   string emptied_by = 2;
   uint32 retry_after_secs = 3;  // u16
   // The binding's scale-from-zero budget lets the host hold the request.

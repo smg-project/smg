@@ -96,6 +96,23 @@ const ROLES: usize = 14;
 /// such a stretch.
 const STAGE_STOP: Bits = Role::Digit.bit() | Role::Run.bit();
 
+/// The role bits that let the stages after the first cut a group of the
+/// first: a character of the second stage's class, or one that opens a match
+/// of the template, alone (a letter, a punctuation mark, whitespace) or
+/// before a letter (the punctuation lead). A group whose characters hold
+/// none of them is one piece: the second stage finds no run in it and the
+/// template no match at any of its characters. The lead-in of a letter run
+/// and the space before punctuation are not among them: each opens a match
+/// only before a character that holds one of these bits.
+const GROUP_CUTS: Bits = Role::Run.bit()
+    | Role::PunctLead.bit()
+    | Role::Word.bit()
+    | Role::Punct.bit()
+    | Role::BreakSpace.bit()
+    | Role::Break.bit()
+    | Role::TrailSpace.bit()
+    | Role::Space.bit();
+
 /// The template's roles in the order [`Part::Template`] lists their classes,
 /// which is the order of their bits after the two stage classes.
 const TEMPLATE_ROLES: [Role; ROLES - 2] = [
@@ -259,8 +276,9 @@ impl Scanner {
     /// Calls `f` with each piece of `text` as its byte range, in order; the
     /// pieces tile the text, as three `Split` stages that keep their gaps
     /// leave no character out. `words` says the run loops take their word
-    /// scans (a long input; see the encoder's `WORD_SCAN_MIN_BYTES`): the
-    /// walk is compiled both ways and the choice is made once per call.
+    /// scans (a long input, or a unit that opens as ASCII text; see the
+    /// encoder's `WORD_SCAN_MIN_BYTES`): the walk is compiled both ways and
+    /// the choice is made once per unit.
     pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &str, words: bool, f: &mut F) {
         if words {
             self.pieces_as::<true, F>(text, f);
@@ -276,31 +294,54 @@ impl Scanner {
             let after = pos + len;
             pos = if c & Role::Digit.bit() != 0 {
                 // The first stage: a group of up to the bound; the stages
-                // after it see the group on its own.
+                // after it see the group on its own. `any` gathers the role
+                // bits of its characters.
                 let mut end = after;
                 let mut count = 1;
+                let mut any = c;
                 while count < self.digits {
                     match self.roles.at(text, end) {
                         Some((d, n)) if d & Role::Digit.bit() != 0 => {
+                            any |= d;
                             end += n;
                             count += 1;
                         }
                         _ => break,
                     }
                 }
-                self.group_pieces::<WORDS, F>(text, pos, end, f);
+                if any & GROUP_CUTS == 0 {
+                    // No character of the group is of the second stage's
+                    // class or opens a match of the template: the group is
+                    // one piece, and the two stages' reads of it are left
+                    // out.
+                    f(pos, end);
+                } else {
+                    self.group_pieces::<WORDS, F>(text, pos, end, f);
+                }
                 end
             } else if c & Role::Run.bit() != 0 {
                 // The second stage, inside a gap of the first: a run that
                 // the next digit ends, since the first stage cut there.
+                // `every` keeps the role bits all its characters share.
                 let mut end = after;
+                let mut every = c;
                 while let Some((d, n)) = self.roles.at(text, end) {
                     if d & Role::Run.bit() == 0 || d & Role::Digit.bit() != 0 {
                         break;
                     }
+                    every &= d;
                     end += n;
                 }
-                self.template_pieces::<WORDS, F>(text, pos, end, 0, f)
+                if every & Role::Word.bit() != 0 && c & Role::PunctLead.bit() == 0 {
+                    // Every character is a letter of the template and the
+                    // first opens no punctuation match: the template's
+                    // letter run takes the run whole, so the run is one
+                    // piece and the template's read of it is left out.
+                    f(pos, end);
+                    end
+                } else {
+                    self.template_pieces::<WORDS, F>(text, pos, end, 0, f)
+                }
             } else {
                 // A gap of both: the stretch to the next digit or run
                 // character, which the template cuts as it reads it.
@@ -311,9 +352,10 @@ impl Scanner {
 
     /// The second and third stages over one group of the first,
     /// `text[start..end]`: the runs of the second stage's class in it and
-    /// the stretches between them, each cut by the template. For a digit
-    /// class the template cuts nothing and the group is one piece; the
-    /// stages are applied all the same, so the pieces are theirs for any
+    /// the stretches between them, each cut by the template. The walk brings
+    /// only a group that holds a character of [`GROUP_CUTS`]: any other is
+    /// one piece, as a group of a digit class is, and the stages applied
+    /// here would cut nothing in it. So the pieces are the stages' for any
     /// classes.
     fn group_pieces<const WORDS: bool, F: FnMut(usize, usize)>(
         &self,
@@ -395,8 +437,8 @@ impl Scanner {
 
     /// [`Self::run_end_in`] through the word scan `SCAN` of the role's ASCII
     /// members, eight bytes at a time, when no stop class has a character
-    /// among them (read at recognition) and the unit is long (`WORDS`); byte
-    /// by byte otherwise.
+    /// among them (read at recognition) and the encoder passes the scans on
+    /// (`WORDS`); byte by byte otherwise.
     #[inline(always)]
     fn run<const SCAN: u8, const WORDS: bool>(
         &self,
@@ -909,6 +951,71 @@ mod tests {
             assert_eq!(ours, pieces, "text {text:?}");
             assert_eq!(ours, staged(&stages, text), "the programs; text {text:?}");
             assert_eq!(ours, engine(&patterns, text), "the engine; text {text:?}");
+        }
+    }
+
+    /// A run of the second stage's class whose characters are all letters
+    /// of the template, and a group of the first stage that holds no
+    /// character of `GROUP_CUTS`, are one piece without the later stages'
+    /// read of them; the stages still cut every other run and group: a run
+    /// with a punctuation mark or a symbol of its block in it, a run that a
+    /// punctuation lead opens, a group with a letter, a punctuation mark or
+    /// a space in it.
+    #[test]
+    fn a_run_of_letters_and_a_plain_group_are_one_piece_and_the_stages_cut_the_others() {
+        // A punctuation lead that is a letter too, with a run class that
+        // holds it: `ab` is the first alternative's match inside the run.
+        const LEAD_A: &str = "[!a][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+        for (patterns, text, pieces) in [
+            ([DIGITS, RUNS, TEMPLATE], "日本語の文章", vec![(0, 18)]),
+            ([DIGITS, RUNS, TEMPLATE], "か\u{3099}き", vec![(0, 9)]),
+            (
+                [DIGITS, RUNS, TEMPLATE],
+                "カタ・カナ",
+                vec![(0, 6), (6, 9), (9, 15)],
+            ),
+            (
+                [DIGITS, RUNS, TEMPLATE],
+                "あ゛い",
+                vec![(0, 3), (3, 6), (6, 9)],
+            ),
+            ([DIGITS, RUNS, TEMPLATE], "123", vec![(0, 3)]),
+            ([DIGITS, RUNS, TEMPLATE], "١٢٣٤", vec![(0, 6), (6, 8)]),
+            ([DIGITS, "[a-zé]+", LEAD_A], "abé", vec![(0, 2), (2, 4)]),
+            ([HEX, RUNS, TEMPLATE], "1a2", vec![(0, 2), (2, 3)]),
+            // A group class that holds a punctuation mark and a space: each
+            // is a match of the template inside the group. The full stop is
+            // a punctuation lead too; the ideographic one is not.
+            (
+                [r"[0-9 .]{1,3}", RUNS, TEMPLATE],
+                "1.2",
+                vec![(0, 1), (1, 2), (2, 3)],
+            ),
+            (
+                [r"[0-9 .]{1,3}", RUNS, TEMPLATE],
+                "1 2",
+                vec![(0, 1), (1, 2), (2, 3)],
+            ),
+            (
+                ["[0-9。]{1,3}", RUNS, TEMPLATE],
+                "1。2",
+                vec![(0, 1), (1, 4), (4, 5)],
+            ),
+        ] {
+            let stages = chain(&patterns);
+            let scanner = Scanner::recognize(&stages).expect("the scanner");
+            let ours = scanned(&scanner, text);
+            assert_eq!(ours, pieces, "chain {patterns:?} text {text:?}");
+            assert_eq!(
+                ours,
+                staged(&stages, text),
+                "the programs; chain {patterns:?} text {text:?}"
+            );
+            assert_eq!(
+                ours,
+                engine(&patterns, text),
+                "the engine; chain {patterns:?} text {text:?}"
+            );
         }
     }
 

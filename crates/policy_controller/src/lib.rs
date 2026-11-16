@@ -69,6 +69,10 @@
 //!   the load driver over the store, and the binary of the package's name
 //!   over them. The scopes' calls and the election arrive in the step's
 //!   later PRs.
+//! - Behind the `client` feature, the reference client of the controller's
+//!   protocol (`client`): one gateway's side of it (the dial, `Leader`,
+//!   and the session's `Hello` answered by a `Welcome`), with a blocking
+//!   form. No shipped binary builds it.
 //!
 //! What this step does not hold: the gRPC plugin service, the operator calls,
 //! the other ingestion drivers and the gRPC API; they arrive in later
@@ -79,6 +83,8 @@
 pub mod affinity;
 pub mod builtins;
 pub mod catalog;
+#[cfg(feature = "client")]
+pub mod client;
 #[cfg(feature = "controller")]
 pub mod controller;
 pub mod decision;

@@ -22,7 +22,7 @@ use crate::{
         health::HealthSink,
         index::{indexed_under, KvEvent, KvTables, LaneCounts},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
-        leases::{LeaseRecord, LeaseRefused, LeaseState, LeasesStore},
+        leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore},
         loads::{LoadSample, LoadSink, LoadSource, PollMode},
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionsStore},
@@ -163,8 +163,10 @@ impl MemoryStore {
     /// across calls. Taking it and dropping it each write the count every
     /// holder of that world shares, so deciding threads that took it would
     /// write one cache line twice a decision. A decision builds through
-    /// [`build_view`](Self::build_view) and a pair decision through
-    /// [`build_pair`](Self::build_pair): both borrow the world and write
+    /// [`build_view`](Self::build_view), a pair decision through
+    /// [`build_pair`](Self::build_pair), and a decision that runs the
+    /// generation's engine over its rows through
+    /// [`deciding`](Self::deciding): all three borrow the world and write
     /// no shared count.
     ///
     /// A world kept across two publications of a pool keeps the rows it
@@ -222,6 +224,18 @@ impl MemoryStore {
         pair
     }
 
+    /// One decision's door: `decide` is handed the world of this instant
+    /// under one borrow, for the build of its view ([`World::build`]) and
+    /// for the engine of the generation those rows were published under
+    /// ([`World::spec`]). The rows, the engine and the generation's number
+    /// are then of one load, and the borrow writes no shared count, so no
+    /// two deciding threads write one line through it. A publication that
+    /// replaces the world meanwhile is the next decision's: the world
+    /// handed here stays whole until `decide` returns.
+    pub fn deciding<R>(&self, decide: impl FnOnce(&World) -> R) -> R {
+        decide(&self.world.load())
+    }
+
     /// `at` in the rows' clock: microseconds since the store's origin.
     pub fn micros(&self, at: Instant) -> u64 {
         micros(self.origin, at)
@@ -270,11 +284,22 @@ impl MemoryStore {
         self.show(world);
     }
 
-    /// How many entries the health tables hold, over every gateway.
+    /// How many entries the health tables hold, over every gateway. A
+    /// gateway's table that holds none counts as one: a table left behind
+    /// shows.
     #[cfg(test)]
-    pub(super) fn health_entries(&self) -> usize {
+    pub(crate) fn health_entries(&self) -> usize {
         let health = self.health.lock();
-        health.vetoes.len() + health.ok_at.len()
+        let completions = health.ok_at.values().map(|workers| workers.len().max(1));
+        health.vetoes.len() + completions.sum::<usize>()
+    }
+
+    /// How many writes to the load table moved an overload verdict: a
+    /// record, a report, the word that no report came, an eviction. A
+    /// membership write and an applied generation judge again and count
+    /// nothing.
+    pub fn overload_flips(&self) -> u64 {
+        self.loads.lock().writer.flips()
     }
 
     /// How many workers the load table holds an entry for.
@@ -311,6 +336,15 @@ impl MemoryStore {
         health.forget(id);
         let mut loads = self.loads.lock();
         loads.ranks.remove(&id);
+    }
+
+    /// A gateway is gone past its grace period: what the health tables
+    /// hold under its key leaves with it, here and nowhere else. Its
+    /// completions today; its vetoes join with the arm that writes them.
+    /// Called from [`LeasesStore::drop_gateway`]: one door tells the store
+    /// a gateway is gone.
+    fn forget_gateway(&self, gateway: GatewayId) {
+        self.health.lock().ok_at.remove(&gateway);
     }
 
     /// How many times a publication allocated a pool's rows since the store
@@ -611,15 +645,20 @@ struct HealthTables {
     /// A gateway's veto on a worker, until the instant.
     vetoes: FxHashMap<(GatewayId, WorkerId), Instant>,
     /// The latest completed dispatch of class `Ok` on a worker by each
-    /// gateway: the precedence rule is per gateway.
-    ok_at: FxHashMap<(GatewayId, WorkerId), Instant>,
+    /// gateway: the precedence rule is per gateway. One table a gateway:
+    /// a gateway's end lets its own go whole and walks no other's.
+    ok_at: FxHashMap<GatewayId, FxHashMap<WorkerId, Instant>>,
 }
 
 impl HealthTables {
-    /// Drop every gateway's entries on the worker.
+    /// Drop every gateway's entries on the worker; a gateway's table that
+    /// holds none after it goes too.
     fn forget(&mut self, id: WorkerId) {
         self.vetoes.retain(|(_, worker), _| *worker != id);
-        self.ok_at.retain(|(_, worker), _| *worker != id);
+        self.ok_at.retain(|_, workers| {
+            workers.remove(&id);
+            !workers.is_empty()
+        });
     }
 }
 
@@ -745,7 +784,12 @@ impl HealthSink for MemoryStore {
             return;
         }
         let mut health = self.health.lock();
-        let latest = health.ok_at.entry((gateway, id)).or_insert(at);
+        let latest = health
+            .ok_at
+            .entry(gateway)
+            .or_default()
+            .entry(id)
+            .or_insert(at);
         if at > *latest {
             *latest = at;
         }
@@ -755,7 +799,8 @@ impl HealthSink for MemoryStore {
         self.health
             .lock()
             .ok_at
-            .get(&(gateway, id))
+            .get(&gateway)
+            .and_then(|workers| workers.get(&id))
             .is_some_and(|at| *at >= since)
     }
 }
@@ -776,6 +821,13 @@ impl LoadSource {
 struct Ranks {
     samples: BTreeMap<u16, LoadSample>,
     pushed_at: BTreeMap<u16, Instant>,
+}
+
+impl Ranks {
+    /// Whether the rank's own record arrived at or after `since`.
+    fn pushed_since(&self, rank: u16, since: Instant) -> bool {
+        self.pushed_at.get(&rank).is_some_and(|&at| at >= since)
+    }
 }
 
 /// The load table and the world's write side, behind one lock.
@@ -814,7 +866,8 @@ impl LoadSink for MemoryStore {
             ranks.pushed_at.insert(rank, received_at);
         }
         ranks.samples.insert(rank, sample);
-        if writer.fold_load(id, rank, Some(&sample)) {
+        if let Some(place) = writer.fold_load(id, rank, Some(&sample)) {
+            writer.recorded(place);
             let world = writer.folded_at(received_at);
             self.show(world);
         }
@@ -822,8 +875,7 @@ impl LoadSink for MemoryStore {
 
     fn report(
         &self,
-        id: WorkerId,
-        rows: &[(u16, LoadRow)],
+        answer: &[(WorkerId, u16, Option<LoadRow>)],
         polled_at: Instant,
         source: LoadSource,
     ) {
@@ -832,33 +884,75 @@ impl LoadSink for MemoryStore {
             ranks: table,
             writer,
         } = &mut *loads;
-        // A report that lands after its worker left (the poll was out when
-        // the row went) finds no entry and is dropped.
-        let Some(ranks) = table.get_mut(&id) else {
-            return;
-        };
-        // The report is folded whole before any publication: its ranks are
-        // read as one report left them.
-        let mut folded = false;
-        for &(rank, row) in rows {
-            let pushed_since = ranks
-                .pushed_at
-                .get(&rank)
-                .is_some_and(|&at| at >= polled_at);
-            if pushed_since {
+        // The answer is one engine's: its rows are written whole before
+        // the one judgment and the one publication, so its ranks are read
+        // as one answer left them. A caller's mix of engines judges each,
+        // and each engine is heard by its own ranks' rows.
+        let mut first: Option<(u32, bool)> = None;
+        let mut others: Vec<(u32, bool)> = Vec::new();
+        for &(id, rank, row) in answer {
+            // A report that lands after its worker left (the poll was out
+            // when the row went) finds no entry and is dropped.
+            let Some(ranks) = table.get_mut(&id) else {
+                continue;
+            };
+            // A rank that pushed since the poll began keeps its record,
+            // and its stream is heard: no word of the poll stands over it.
+            if ranks.pushed_since(rank, polled_at) {
                 continue;
             }
-            let age = Duration::from_millis(u64::from(row.report_age_ms));
-            let sample = LoadSample {
-                row,
-                received_at: polled_at,
-                sampled_at: polled_at.checked_sub(age).unwrap_or(polled_at),
-                source,
+            let (engine, heard) = match row {
+                Some(row) => {
+                    let age = Duration::from_millis(u64::from(row.report_age_ms));
+                    let sample = LoadSample {
+                        row,
+                        received_at: polled_at,
+                        sampled_at: polled_at.checked_sub(age).unwrap_or(polled_at),
+                        source,
+                    };
+                    ranks.samples.insert(rank, sample);
+                    let place = writer.fold_load(id, rank, Some(&sample));
+                    (place.and_then(|place| writer.engine_at(place)), true)
+                }
+                // A rank the answer omits keeps what is on file.
+                None => (writer.engine_of(id), false),
             };
-            ranks.samples.insert(rank, sample);
-            folded |= writer.fold_load(id, rank, Some(&sample));
+            let Some(engine) = engine else {
+                continue;
+            };
+            match &mut first {
+                None => first = Some((engine, heard)),
+                Some(seen) if seen.0 == engine => seen.1 |= heard,
+                Some(_) => match others.iter_mut().find(|seen| seen.0 == engine) {
+                    Some(seen) => seen.1 |= heard,
+                    None => others.push((engine, heard)),
+                },
+            }
         }
-        if folded {
+        let Some(first) = first else {
+            return;
+        };
+        let mut changed = false;
+        for (engine, heard) in std::iter::once(first).chain(others) {
+            changed |= if heard {
+                // A row was written: the engine is judged once, and the
+                // write is shown whether or not a verdict moved.
+                writer.judged(engine, true);
+                true
+            } else {
+                // No row came for the engine: the word that none came,
+                // unless a rank of it pushed since the poll began, whether
+                // the answer names that rank or not. The word is shown
+                // where it moves a verdict.
+                let pushed = writer.ranks_of(engine).any(|(id, rank)| {
+                    table
+                        .get(&id)
+                        .is_some_and(|ranks| ranks.pushed_since(rank, polled_at))
+                });
+                !pushed && writer.silence(engine)
+            };
+        }
+        if changed {
             let world = writer.folded_at(polled_at);
             self.show(world);
         }
@@ -913,12 +1007,15 @@ impl LoadSink for MemoryStore {
             writer,
         } = &mut *loads;
         if let Some(ranks) = table.get_mut(&id) {
-            let mut folded = false;
+            let mut folded = None;
             for &rank in ranks.samples.keys() {
-                folded |= writer.fold_load(id, rank, None);
+                folded = writer.fold_load(id, rank, None).or(folded);
             }
             *ranks = Ranks::default();
-            if folded {
+            if let Some(place) = folded {
+                if let Some(engine) = writer.engine_at(place) {
+                    writer.judged(engine, false);
+                }
                 let world = writer.folded();
                 self.show(world);
             }
@@ -1149,7 +1246,13 @@ impl LeasesStore for MemoryStore {
         Ok(())
     }
 
-    fn dispatched(&self, gateway: GatewayId, lease: LeaseId, _side: Side, at: Instant) -> bool {
+    fn dispatched(
+        &self,
+        gateway: GatewayId,
+        lease: LeaseId,
+        _dispatch: Dispatch,
+        at: Instant,
+    ) -> bool {
         let mut leases = self.leases.lock();
         let Some(record) = leases.records.get_mut(&(gateway, lease)) else {
             return false;
@@ -1174,7 +1277,15 @@ impl LeasesStore for MemoryStore {
         true
     }
 
-    fn released(&self, gateway: GatewayId, lease: LeaseId, _reason: ReleaseReason) -> bool {
+    fn released(
+        &self,
+        gateway: GatewayId,
+        lease: LeaseId,
+        _side: Option<Side>,
+        _reason: ReleaseReason,
+    ) -> bool {
+        // No side is read yet: a release of one side of a pair ends the
+        // whole lease. The step that issues a pair's lease reads it.
         self.leases
             .lock()
             .records
@@ -1223,6 +1334,7 @@ impl LeasesStore for MemoryStore {
     }
 
     fn drop_gateway(&self, gateway: GatewayId) -> usize {
+        self.forget_gateway(gateway);
         let mut leases = self.leases.lock();
         let before = leases.records.len();
         leases.records.retain(|(owner, _), _| *owner != gateway);

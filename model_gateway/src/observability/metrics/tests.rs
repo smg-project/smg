@@ -1401,6 +1401,7 @@ fn kept_worker_gauges_set_the_recorders_series() {
         Metrics::set_worker_requests_active("http://w1", 2);
         Metrics::set_worker_cb_consecutive_failures("http://w1", 1);
         Metrics::set_worker_cb_consecutive_successes("http://w1", 4);
+        Metrics::set_worker_routing_keys_active("http://w1", 5);
         assert_eq!(
             value("smg_worker_requests_active", "http://w1").as_deref(),
             Some("2")
@@ -1412,6 +1413,10 @@ fn kept_worker_gauges_set_the_recorders_series() {
         assert_eq!(
             value("smg_worker_cb_consecutive_successes", "http://w1").as_deref(),
             Some("4")
+        );
+        assert_eq!(
+            value("smg_worker_routing_keys_active", "http://w1").as_deref(),
+            Some("5")
         );
 
         workers.retire("http://w1", gone("http://w1"));
@@ -1665,10 +1670,12 @@ fn time_per_router_record_contended() {
 }
 
 /// The chat path's remaining per-request records (the selection, the
-/// cache-aware decision, the routing-key source, the admission gauges,
-/// the body path, the early release) render the same through kept
-/// handles as through a key built per record: the same series with the
-/// same values.
+/// cache-aware decision, the index lookup, the routing-key source, the
+/// admission gauges, the body path, the early release) render the same
+/// through kept handles as through a key built per record: the same
+/// series with the same values. A second pass through kept handles,
+/// under another recorder, renders them again: the reset between the
+/// passes dropped every handle of the first.
 #[test]
 fn the_per_request_records_render_the_same_through_kept_handles() {
     let records = || {
@@ -1695,6 +1702,9 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         Metrics::record_worker_prefix_hash_policy_branch("ring_hit");
         Metrics::record_cache_aware_match_ratio(0.25);
         Metrics::record_cache_aware_match_ratio(0.75);
+        Metrics::record_kv_index_lookup("chain", 0.000_002);
+        Metrics::record_kv_index_lookup("chain", 0.000_004);
+        Metrics::record_kv_index_lookup("reference", 0.000_008);
         Metrics::record_routing_key_source("header");
         Metrics::record_admission_queue_entered();
         Metrics::record_admission_inflight_acquired();
@@ -1719,6 +1729,12 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         handles::reset();
     });
     assert_eq!(sorted_series(&kept), sorted_series(&built));
+    let kept_again = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        records();
+        handles::reset();
+    });
+    assert_eq!(sorted_series(&kept_again), sorted_series(&built));
     for expected in [
         "smg_worker_selection_total{worker_type=\"regular\",connection_mode=\"grpc\",model=\"m1\",policy=\"cache_aware\"} 2",
         "smg_worker_selection_total{worker_type=\"prefill\",connection_mode=\"grpc\",model=\"m2\",policy=\"random\"} 1",
@@ -1728,6 +1744,9 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         "smg_consistent_hashing_policy_branch_total{branch=\"routing_key_hit\"} 1",
         "smg_prefix_hash_policy_branch_total{branch=\"ring_hit\"} 1",
         "smg_cache_aware_match_ratio_count 2",
+        "smg_kv_index_lookup_seconds_count{index=\"chain\"} 2",
+        "smg_kv_index_lookup_seconds_count{index=\"reference\"} 1",
+        "smg_kv_index_lookup_seconds_sum{index=\"reference\"} 0.000008",
         "smg_routing_key_source_total{source=\"header\"} 1",
         "smg_admission_queue_depth 1",
         "smg_admission_inflight 1",
@@ -1792,6 +1811,107 @@ fn kept_worker_outcome_counters_follow_the_workers_registrations() {
         handles::worker_set_changed();
         Metrics::record_worker_cb_outcome("http://w1", "success");
         assert_eq!(value("http://w1", "success").as_deref(), Some("1"));
+    });
+    handles::reset();
+}
+
+/// The KV-event set a batch moves, recorded through kept handles, renders
+/// exactly as it does with a key built per record: the same series with
+/// the same values, each worker's own.
+#[test]
+fn the_kv_event_set_renders_the_same_through_kept_handles() {
+    let records = || {
+        for worker in ["grpc://w:1", "grpc://w:2"] {
+            Metrics::record_kv_event_blocks(worker, "stored", 3);
+            Metrics::record_kv_event_blocks(worker, "stored", 2);
+            Metrics::record_kv_event_blocks(worker, "removed", 1);
+            Metrics::record_kv_event_batch(worker, "applied");
+            Metrics::record_kv_event_batch(worker, "applied");
+            Metrics::record_kv_event_batch(worker, "load_only");
+            Metrics::record_kv_event_apply(worker, 0.001);
+            Metrics::record_kv_event_lag(worker, 0.25);
+            Metrics::set_kv_index_blocks(worker, 9);
+            Metrics::set_kv_index_blocks(worker, 4);
+        }
+    };
+    let built = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(false));
+        records();
+        handles::reset();
+    });
+    let kept = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        records();
+        handles::reset();
+    });
+    assert_eq!(sorted_series(&kept), sorted_series(&built));
+    for expected in [
+        "smg_kv_event_blocks_total{worker=\"grpc://w:1\",op=\"stored\"} 5",
+        "smg_kv_event_blocks_total{worker=\"grpc://w:2\",op=\"removed\"} 1",
+        "smg_kv_event_batches_total{worker=\"grpc://w:1\",disposition=\"applied\"} 2",
+        "smg_kv_event_batches_total{worker=\"grpc://w:2\",disposition=\"load_only\"} 1",
+        "smg_kv_event_apply_seconds_count{worker=\"grpc://w:2\"} 1",
+        "smg_kv_event_lag_seconds_count{worker=\"grpc://w:1\"} 1",
+        "smg_kv_index_blocks{worker=\"grpc://w:1\"} 4",
+    ] {
+        assert!(
+            kept.lines().any(|line| line == expected),
+            "missing {expected} in:\n{kept}"
+        );
+    }
+}
+
+/// The KV-event set is per-worker series: through kept handles a batch's
+/// records land on the recorder's own series, a retirement drops the kept
+/// handles (a batch racing the removal feeds nothing), and a
+/// re-registration starts the counter over instead of feeding the handles
+/// built while the address was retired.
+#[test]
+fn kept_kv_event_handles_follow_the_workers_registrations() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(&workers),
+    );
+    workers.activate("grpc://w1");
+    // The rendered value of the worker's one series of a name.
+    let value = |name: &str| -> Option<String> {
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        rendered
+            .lines()
+            .find(|line| line.starts_with(&format!("{name}{{")))
+            .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
+    };
+    let batch = |blocks: usize| {
+        Metrics::record_kv_event_batch("grpc://w1", "applied");
+        Metrics::set_kv_index_blocks("grpc://w1", blocks);
+    };
+    handles::force_on_this_thread(Some(true));
+    metrics::with_local_recorder(&recorder, || {
+        batch(3);
+        batch(5);
+        assert_eq!(value("smg_kv_event_batches_total").as_deref(), Some("2"));
+        assert_eq!(value("smg_kv_index_blocks").as_deref(), Some("5"));
+
+        workers.retire("grpc://w1", gone("grpc://w1"));
+        handles::worker_set_changed();
+        batch(7);
+        assert_eq!(value("smg_kv_event_batches_total"), None);
+        assert_eq!(value("smg_kv_index_blocks"), None);
+
+        workers.activate("grpc://w1");
+        handles::worker_set_changed();
+        batch(2);
+        assert_eq!(value("smg_kv_event_batches_total").as_deref(), Some("1"));
+        assert_eq!(value("smg_kv_index_blocks").as_deref(), Some("2"));
     });
     handles::reset();
 }

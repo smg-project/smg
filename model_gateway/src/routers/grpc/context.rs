@@ -522,6 +522,30 @@ impl StageOutput for ClientSelection {
     );
 }
 
+impl StageOutput for ExecutionResult {
+    const NOT_COMPLETED: (&'static str, &'static str) =
+        ("no_execution_result", "No execution result");
+}
+
+impl StageOutput for DispatchMetadata {
+    const NOT_COMPLETED: (&'static str, &'static str) =
+        ("dispatch_metadata_not_set", "Dispatch metadata not set");
+}
+
+impl StageOutput for Arc<dyn Tokenizer> {
+    const NOT_COMPLETED: (&'static str, &'static str) = (
+        "tokenizer_not_cached",
+        "Tokenizer not cached in context - preparation stage may have been skipped",
+    );
+}
+
+impl StageOutput for StopSequenceDecoder {
+    const NOT_COMPLETED: (&'static str, &'static str) = (
+        "stop_decoder_not_initialized",
+        "Stop decoder not initialized",
+    );
+}
+
 impl<T: StageOutput> StageOutput for &T {
     const NOT_COMPLETED: (&'static str, &'static str) = T::NOT_COMPLETED;
 }
@@ -542,6 +566,14 @@ pub(crate) fn stage_output<T: StageOutput>(
         error!(function = function, "{message}");
         internal_error(code, message)
     })
+}
+
+/// The failure a response-processing stage `function` reports when the
+/// dispatch handed it another request kind's [`ResponseSpec`]: logged once
+/// under the stage that noticed, one code for every stage.
+pub(crate) fn wrong_response_spec(function: &'static str) -> axum::response::Response {
+    error!(function = function, "Wrong response spec");
+    internal_error("wrong_response_spec", "Wrong response spec")
 }
 
 /// Everything request building hands the dispatch phase.
@@ -2098,6 +2130,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_dispatch_phase_outputs_keep_their_codes() {
+        assert_eq!(
+            <ExecutionResult as StageOutput>::NOT_COMPLETED.0,
+            "no_execution_result"
+        );
+        assert_eq!(
+            <DispatchMetadata as StageOutput>::NOT_COMPLETED.0,
+            "dispatch_metadata_not_set"
+        );
+        assert_eq!(
+            <Arc<dyn Tokenizer> as StageOutput>::NOT_COMPLETED.0,
+            "tokenizer_not_cached"
+        );
+        assert_eq!(
+            <StopSequenceDecoder as StageOutput>::NOT_COMPLETED.0,
+            "stop_decoder_not_initialized"
+        );
+    }
+
     fn completion_prep(texts: &[&str], joined: Option<&str>) -> PreparationOutput {
         PreparationOutput::Completion {
             items: texts
@@ -2137,7 +2189,7 @@ mod tests {
         );
 
         let prefill_guard = PrefillLoadGuard::Unbounded {
-            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
         };
         assert_eq!(prefill.load(), 1);
         drop(prefill_guard);
@@ -2462,7 +2514,7 @@ mod tests {
         // the prefill side with its own guard when the prefill phase ends.
         let guards = LoadGuards::new(&pd_selection(&prefill, &decode), None);
         let prefill_guard = PrefillLoadGuard::Unbounded {
-            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
         };
         drop(prefill_guard);
         assert_eq!(

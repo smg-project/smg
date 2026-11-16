@@ -177,6 +177,7 @@ fn single_engine(profile: Profile) -> Engine {
             profile: 0,
             decode_profile: None,
             sessions: None,
+            overload: None,
         }],
         1,
         Needs::default(),
@@ -1186,6 +1187,7 @@ fn pair_engine(profiles: Vec<Profile>, decode_profile: u16) -> Engine {
             profile: 0,
             decode_profile: Some(decode_profile),
             sessions: None,
+            overload: None,
         }],
         1,
         Needs::default(),
@@ -2944,6 +2946,53 @@ fn a_pairs_decode_close_that_panics_inside_its_own_opens_unwinding_stops_at_the_
     assert_eq!(panicked.read(), (2, 1));
 }
 
+/// Both sides' closes panic on a pair decision's own way out. The decode
+/// side closes first, so the panic of its close goes on once that side is
+/// closed: the prefill side's closes run inside it, the one that panics
+/// there stops at the engine, and the decode close's panic is the one the
+/// host sees.
+#[test]
+fn a_pairs_prefill_close_that_panics_while_its_decode_sides_close_unwinds_stops_at_the_engine() {
+    let (prefill_panics, prefill_counts) = close_panics_once();
+    let (after_prefill, closed_after_prefill) = StoresAtItsOpen::stage(false);
+    let decode_panics = Box::new(ClosePanicsWith(2, AtomicBool::new(true)));
+    let (after_decode, closed_after_decode) = StoresAtItsOpen::stage(false);
+    let engine = pair_engine(
+        vec![
+            host_profile(vec![prefill_panics, after_prefill]),
+            host_profile(vec![decode_panics, after_decode]),
+        ],
+        1,
+    );
+    let payload = pair_decide_caught(&engine);
+    assert_eq!(
+        payload.downcast_ref::<u32>().copied(),
+        Some(2),
+        "the decode close's panic is the one the host sees"
+    );
+    assert_eq!(
+        closed_after_decode.read(),
+        (1, 1),
+        "the decode scope after the close that panicked is closed"
+    );
+    assert_eq!(
+        prefill_counts.read(),
+        (1, 1),
+        "the prefill scope is closed, and its close panicked"
+    );
+    assert_eq!(
+        closed_after_prefill.read(),
+        (1, 1),
+        "the prefill scope after it is still closed"
+    );
+    // The next pair decision opens and closes all four, and no close panics.
+    let next = pair_decide(&engine);
+    assert!(next.pick().is_some(), "the next decision picks");
+    assert_eq!(closed_after_decode.read(), (2, 2));
+    assert_eq!(prefill_counts.read(), (2, 2));
+    assert_eq!(closed_after_prefill.read(), (2, 2));
+}
+
 /// A panic payload whose own destructor panics, with a payload whose
 /// destructor panics in turn for as many drops as it counts.
 struct DropPanics(u8);
@@ -3185,6 +3234,157 @@ fn a_plugins_open_that_stops_half_way_undoes_itself() {
         Some(&102),
         "the plugin's pick leads: the least in flight"
     );
+}
+
+/// What the case below shares between its picker and the host's clock.
+#[derive(Debug, Default)]
+struct PastThePick {
+    /// The case wants a close's read of the clock to panic.
+    armed: AtomicBool,
+    /// The decision's pick ran: its thread's next read of the clock is a
+    /// close's.
+    picked: AtomicBool,
+}
+
+/// The built-in best picker, telling the clock when it ran.
+#[derive(Debug)]
+struct TellsThePick(Arc<PastThePick>);
+
+impl Lifecycle for TellsThePick {}
+
+impl smg_policy_controller::Picker for TellsThePick {
+    fn name(&self) -> &'static str {
+        "tells-the-pick"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: smg_policy_controller::TieBand,
+        out: &mut smg_policy_controller::Targets,
+    ) {
+        if self.0.armed.load(Ordering::Relaxed) {
+            self.0.picked.store(true, Ordering::Relaxed);
+        }
+        smg_policy_controller::Picker::pick(&Best, facts, candidates, kept, scores, band, out);
+    }
+}
+
+/// The plugin's own close runs each phase's destructor, the guest's code
+/// under the host's, and a destructor that runs out reads the host's clock
+/// for the breaker. So a close that stops half-way leaves its scope closed:
+/// every phase stops reading as open, and its place in the thread's decision
+/// is given back, before the first destructor runs, and a walk that does not
+/// return forgets the slot it marked for the rebuild. Here the clock panics
+/// at that read, and every later decision of the thread is a decision of its
+/// own that asks the plugin. Left open, the phase would read as open to the
+/// next decision: it would make no resource and ask the plugin nothing. With
+/// its place not given back, the later decisions would be one decision to
+/// the thread, under one number and one budget. The destructor runs out in
+/// each, and a plugin that failed a decision is not asked again in it: the
+/// second later decision would ask nothing.
+///
+/// The plugin is bound at one stage, so a decision closes its scope once.
+/// Bound at two, the engine closes the same bound set twice, and the second
+/// close forgets what the first left open.
+///
+/// A decision makes its instance under the init frame on the wall clock
+/// when the close before it could not. A try in which a decision asked
+/// nothing while its thread, or the thread of the decision before it, was
+/// off the CPU half that frame is made again, [`TRIES`] tries at most: the
+/// last try asserts whatever it read.
+#[test]
+fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
+    const LATER: u64 = 8;
+    let mut made = 0;
+    loop {
+        made += 1;
+        let shared = Arc::new(PastThePick::default());
+        let told = Arc::clone(&shared);
+        let deciding = std::thread::current().id();
+        let runtime = Arc::new(
+            Runtime::with_clock(&OpenDecisions::new(), move || {
+                // Past an armed pick the deciding thread reads the clock in
+                // a close alone: that read panics, once.
+                assert!(
+                    std::thread::current().id() != deciding
+                        || !told.picked.swap(false, Ordering::Relaxed),
+                    "the host's clock panics inside a close"
+                );
+                1_000_000
+            })
+            .expect("a runtime"),
+        );
+        // A destructor that fills without end runs out of its frame, and
+        // the fault's read of the clock is inside the close. At the slow
+        // calibration that frame is a hundred units of fuel: the fill runs
+        // out of fuel, not of time.
+        let mut filler = spec(
+            &format!("half-closed-{made}"),
+            guest::record_guest(),
+            mode::FILL_IN_DESTRUCTOR,
+        );
+        filler.fuel_per_micro = SLOW_CALIBRATION;
+        filler.budget_micros = SLOW_FRAME_MICROS;
+        // Every decision's destructor runs out: the failure rule is set out
+        // of reach, so the breaker stays shut through the later decisions.
+        filler.breaker = BreakerSpec {
+            failures: u32::MAX,
+            ..BreakerSpec::default()
+        };
+        let plugin = loaded(&runtime, filler);
+        let engine = single_engine(Profile {
+            name: "one-stage".into(),
+            filters: vec![],
+            scorers: vec![Weighted {
+                scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
+                weight: 1.0,
+            }],
+            picker: Box::new(TellsThePick(Arc::clone(&shared))),
+        });
+        let candidates = pool(3);
+        shared.armed.store(true, Ordering::Relaxed);
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decide(&engine, &candidates, 1)
+        }));
+        shared.armed.store(false, Ordering::Relaxed);
+        shared.picked.store(false, Ordering::Relaxed);
+        assert!(
+            stopped.is_err(),
+            "the plugin's close panicked at the clock: {:?}",
+            plugin.stats()
+        );
+        let mut silent = None;
+        let mut before_it = std::time::Duration::ZERO;
+        for later in 0..LATER {
+            let answered = plugin.stats().answered;
+            let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+            decide(&engine, &candidates, 2 + later);
+            let off_the_cpu = off_cpu_since(wall, cpu);
+            if plugin.stats().answered == answered {
+                silent = Some((later, off_the_cpu.max(before_it)));
+                break;
+            }
+            before_it = off_the_cpu;
+        }
+        let Some((later, off_the_cpu)) = silent else {
+            break;
+        };
+        assert!(
+            off_the_cpu >= INIT_FRAME / 2 && made < TRIES,
+            "every later decision asks the plugin as a decision of its own: decision {later} after the stop asked nothing (try {made}, a thread off the CPU {off_the_cpu:?}): {:?}",
+            plugin.stats()
+        );
+        made_again(
+            "a close that stops half-way",
+            &format!(
+                "decision {later} after the stop asked nothing with a thread off the CPU {off_the_cpu:?}"
+            ),
+        );
+    }
 }
 
 /// The plugin's own undo runs inside its open's unwinding too, by the walk

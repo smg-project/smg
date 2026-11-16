@@ -25,14 +25,32 @@
 
 pub mod admin;
 pub mod config;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Decide call's streams hand their requests to the deciders; that call is the step's next PR"
+    )
+)]
+mod deciders;
 pub mod election;
 mod gateways;
+mod lifecycle;
 pub mod metrics;
 mod principal;
 pub mod readiness;
+mod run;
 mod service;
 mod session;
 pub mod tls;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Decide call's streams read their frames through it; that call is the step's next PR"
+    )
+)]
+mod wire;
 
 use std::{future::Future, io, net::SocketAddr, pin::pin, sync::Arc};
 
@@ -53,6 +71,7 @@ pub use self::{
     election::{Election, LeaseError, LeasePlace},
     principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},
+    run::run,
     tls::TlsError,
 };
 use self::{
@@ -62,6 +81,7 @@ use self::{
     service::{Service, Shared},
 };
 use crate::{
+    catalog::Catalog,
     elector::{Elector, Fence},
     ingest::{
         loads::{LoadDriver, LoadDriverConfig},
@@ -79,18 +99,21 @@ pub const PROTOCOL_PACKAGE: &str = "smg.policy.v1";
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The gRPC service every scope is a part of (design 8: one service, four
-/// credentialed scopes), as the health service names it. A listener reports
-/// it `SERVING` while its replica leads, its door is open and its scope's
-/// work can be done there: on the control scope a registration is taken, on
-/// the gateway scope a decision is answered, on the ingestion scope a push is
-/// taken, on the replication scope a standby can follow. Any other listener
-/// reports it `NOT_SERVING`; `Leader` is every scope's and moves no
-/// listener's word.
+/// credentialed scopes), as the health service names it. Every listener
+/// reports it `NOT_SERVING` from its bind on, and no line reports it
+/// `SERVING` yet: `Session` being served moves no listener's word. The
+/// design's rule waits for the steps that serve a scope's work: `SERVING`
+/// while the listener's replica leads and its scope's work can be done
+/// there (on the gateway scope, a decision answered). `Leader` is every
+/// scope's and moves no listener's word.
 pub const SERVICE_NAME: &str = "smg.policy.v1.PolicyController";
 
 /// A controller with its listeners bound and nothing served yet.
 pub struct Controller {
     config: Config,
+    /// The stages a policy document may name, fixed at the bind: the stock
+    /// build's, or the host's own.
+    catalog: Catalog,
     phase: watch::Sender<Phase>,
     readiness: Readiness,
     metrics: Arc<metrics::Metrics>,
@@ -251,14 +274,29 @@ pub enum Error {
 }
 
 impl Controller {
+    /// [`Controller::bind_with`] over the stock build's stages.
+    pub async fn bind(config: Config) -> Result<Self, Error> {
+        Self::bind_with(config, Catalog::builtin()).await
+    }
+
     /// Validates the configuration, installs the process crypto provider,
     /// reads and parses every listener's TLS material, binds every address,
     /// opens the lease's place and builds the store. Nothing is served yet
     /// and no lease is taken, so a refusal arrives before a client can
-    /// connect.
-    pub async fn bind(config: Config) -> Result<Self, Error> {
+    /// connect. A policy document names the stages `catalog` holds: the
+    /// stock build's and the ones the host added.
+    pub async fn bind_with(config: Config, catalog: Catalog) -> Result<Self, Error> {
         config.validate()?;
         tls::install_crypto_provider();
+        // The stages a policy document may name in this build, the host's
+        // own among them.
+        info!(
+            controller_id = %config.controller_id,
+            filters = ?catalog.filters().collect::<Vec<_>>(),
+            scorers = ?catalog.scorers().collect::<Vec<_>>(),
+            pickers = ?catalog.pickers().collect::<Vec<_>>(),
+            "stages held"
+        );
         let mut listeners = Vec::with_capacity(config.listeners.len());
         for listener in &config.listeners {
             let name = listener.name.clone();
@@ -347,6 +385,7 @@ impl Controller {
         let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
         Ok(Self {
             config,
+            catalog,
             phase,
             readiness,
             metrics: Arc::new(metrics::Metrics::new()),
@@ -414,6 +453,13 @@ impl Controller {
             "identities are taken as told on this listener: nothing is verified, and whoever reaches it acts as any principal of its scopes"
         );
         Ok(())
+    }
+
+    /// The stages a policy document may name in this controller, fixed at
+    /// the bind. No call hands it a document yet, so a host judges one
+    /// against them here, as the controller will.
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
     }
 
     /// The store the ingestion drivers and the scopes' calls feed and read.
@@ -597,7 +643,9 @@ impl Controller {
             Leave::Task(Some(Err(join))) => Some(Error::Task(join.to_string())),
             Leave::Election => Some(Error::ElectionEnded),
         };
-        let deadline = tokio::time::Instant::now() + config.shutdown_grace;
+        // A grace period the clock cannot add to the present bounds nothing:
+        // the wait for the election thread below then has no deadline.
+        let deadline = tokio::time::Instant::now().checked_add(config.shutdown_grace);
         let result = if let Some(error) = error {
             error!(controller_id = %config.controller_id, %error, "the serve ended before the shutdown");
             tasks.abort_all();
@@ -642,14 +690,19 @@ impl Controller {
         // write, tried again a renew period later while it fails. Neither
         // leave ends the process before the release landed or was given
         // up, within the grace period: this one wait serves both.
-        if tokio::time::timeout_at(deadline, election.ended())
-            .await
-            .is_err()
-        {
-            warn!(
-                controller_id = %config.controller_id,
-                "the election thread outlived the grace period; a lease it holds expires by its duration"
-            );
+        match deadline {
+            Some(deadline) => {
+                if tokio::time::timeout_at(deadline, election.ended())
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        controller_id = %config.controller_id,
+                        "the election thread outlived the grace period; a lease it holds expires by its duration"
+                    );
+                }
+            }
+            None => election.ended().await,
         }
         if result.is_ok() {
             info!(controller_id = %config.controller_id, "stopped");
@@ -854,5 +907,71 @@ mod tests {
             record.holder.is_empty(),
             "the lease is released when the serve has returned: {record:?}"
         );
+    }
+
+    /// The largest grace period a caller can set is one the clock cannot
+    /// add to the present. A serve under it leaves as under any other, by a
+    /// signal and by a listener's error: it waits for the release, and the
+    /// lease is free when the serve has returned.
+    #[tokio::test]
+    async fn a_serve_under_a_grace_period_the_clock_cannot_hold_leaves_with_its_lease_released() {
+        for by_error in [false, true] {
+            let mut lease = MemoryLease::new();
+            let mut config = valid();
+            config.shutdown_grace = Duration::MAX;
+            let mut controller = Controller::bind(config).await.expect("the listeners bind");
+            controller.elector = Elector::new(
+                Box::new(ReleasesSlowly {
+                    lease: lease.clone(),
+                    slow: Duration::from_millis(500),
+                }),
+                "controller-0@127.0.0.1:1",
+                ElectionSettings {
+                    duration: Duration::from_millis(300),
+                    renew_period: Duration::from_millis(20),
+                    renew_deadline: Duration::from_millis(200),
+                },
+            )
+            .expect("the settings are in order");
+            let fence = controller.elector.fence();
+            let (leave, left) = oneshot::channel::<()>();
+            let serve = async {
+                if by_error {
+                    controller
+                        .serve_until(pending(), async move {
+                            let _ = left.await;
+                            Error::Task("a listener failed".to_owned())
+                        })
+                        .await
+                } else {
+                    controller
+                        .serve(async move {
+                            let _ = left.await;
+                        })
+                        .await
+                }
+            };
+            let told = async {
+                // The take lands, then the serve is told to leave.
+                while fence.term() == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                leave.send(()).expect("the serve waits for its leave");
+            };
+            let (served, ()) =
+                timeout(Duration::from_secs(60), async { tokio::join!(serve, told) })
+                    .await
+                    .expect("the serve ends");
+            if by_error {
+                assert!(matches!(served, Err(Error::Task(_))), "{served:?}");
+            } else {
+                assert!(served.is_ok(), "{served:?}");
+            }
+            let record = lease.read().expect("a read").expect("a record");
+            assert!(
+                record.holder.is_empty(),
+                "the lease is released when the serve has returned (by an error: {by_error}): {record:?}"
+            );
+        }
     }
 }

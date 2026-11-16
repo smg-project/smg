@@ -3,11 +3,13 @@
 //! one lease file, asked who leads by the generated client. One leads and
 //! the others name it by its id and its dialable address; the leader is
 //! killed, and a follower takes the lease under the next term once the
-//! record stood still for its duration; that leader is stopped, releases the
-//! lease and the last replica takes it. The case holds the run to order and
-//! terms, never to a clock: across every answer, no call sent after a
+//! record stood still for its duration; that leader is stopped beside the
+//! last follower, which leads under the next term; the replica left is
+//! stopped alone, releases the lease, and a replica started after it takes
+//! the released lease under the next term. The case holds the run to order
+//! and terms, never to a clock: across every answer, no call sent after a
 //! replica answered as the leader under a term is answered as the leader
-//! under a lower one, one replica's terms never fall, and the three logs
+//! under a lower one, one replica's terms never fall, and the replicas' logs
 //! hold one take a term. The promotion's time is read and printed; its bound
 //! is the settings' own with room for a loaded host.
 //!
@@ -64,6 +66,11 @@ fn short() -> ElectionSettings {
 /// A stopped replica's listeners stay open a second: it answers `Leader`
 /// through its own hand-over.
 const SETTLE_SECS: u64 = 1;
+
+/// What a stopped replica logs when its election thread did not end within
+/// the grace period: the release was given up, and the lease expires.
+const GIVEN_UP: &str =
+    "the election thread outlived the grace period; a lease it holds expires by its duration";
 
 fn start(id: &str, lease: &Path, settings: ElectionSettings) -> Replica {
     Replica::start(id, Lease::File(lease), settings, SETTLE_SECS).expect("the replica starts")
@@ -287,22 +294,38 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
     let successor = promoted(&mut record, &mut replicas, term, within).await;
     let after_kill = successor.returned.duration_since(at);
     writeln!(out, "PROMOTION_AFTER_KILL_MS {}", millis(after_kill)).expect("stdout");
-    let (mut leader, mut term) = agreed(&mut record, &mut replicas).await;
+    let (leader, term) = agreed(&mut record, &mut replicas).await;
     assert!(term > successor.info.term || replicas[leader].id == successor.replica);
     assert_eq!(readiness(&replicas[leader]).await.0, 200);
 
-    // THE STOP. The leader closes its fence, releases the lease and exits
-    // clean; the last replica takes the released lease. A leader stalled
-    // past the duration before its signal has lost the lease and none to
-    // release: its log says the lease moved, that stop tests nothing, and
-    // the leader after it is stopped beside a fresh follower.
+    // THE HAND-OVER AT A STOP. The leader is stopped beside the live
+    // follower, and the follower leads under a term above: it takes the
+    // released lease, or the one a leader held back past the duration lost
+    // before it read its stop. That leader has none to release and logs
+    // nothing, so its log cannot tell the two apart, and this stop is read
+    // by order alone: who leads next.
     let mut gone = vec![killed];
-    loop {
-        let mut stopped = replicas.remove(leader);
+    let mut stopped = replicas.remove(leader);
+    stopped.terminate().expect("SIGTERM");
+    promoted(&mut record, &mut replicas, term, within).await;
+    let status = stopped.exited().expect("the stopped leader exits");
+    assert!(
+        status.success(),
+        "a stopped leader exits clean, read {status}:\n{}",
+        stopped.log()
+    );
+    gone.push(stopped);
+
+    // THE RELEASE. The replica that is left runs alone, so nothing but its
+    // own release can move the lease. It closes its fence, releases the
+    // lease and exits clean, and the stop is read from what it left: the
+    // release in its log, and the record released under its term. A release
+    // given up at the grace period is in the log too: that stop tests
+    // nothing, and the replica started after it is stopped in its turn.
+    let term = loop {
+        let (alone, term) = agreed(&mut record, &mut replicas).await;
+        let mut stopped = replicas.remove(alone);
         stopped.terminate().expect("SIGTERM");
-        let at = Instant::now();
-        let successor = promoted(&mut record, &mut replicas, term, within).await;
-        let after_stop = successor.returned.duration_since(at);
         let status = stopped.exited().expect("the stopped leader exits");
         assert!(
             status.success(),
@@ -311,34 +334,52 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
         );
         let released = stopped.logged("the lease is released");
         assert!(
-            released || stopped.lost_its_lease(),
+            released || stopped.logged(GIVEN_UP),
             "the stopped leader released its lease:\n{}",
             stopped.log()
         );
-        if released {
-            writeln!(out, "PROMOTION_AFTER_STOP_MS {}", millis(after_stop)).expect("stdout");
-        }
-        gone.push(stopped);
-        if released {
-            break;
-        }
+        let left = stored(&lease);
         assert!(
-            gone.len() < 4,
-            "three leaders in a row lost the lease before their stop"
+            !released || (left.is_released() && left.term == term),
+            "a release leaves the record released under term {term}, read {left:?}"
+        );
+        gone.push(stopped);
+        assert!(
+            released || gone.len() < 5,
+            "three leaders in a row gave their release up at the grace period"
         );
         replicas.push(start(
-            &format!("replica-{}", gone.len() + 2),
+            &format!("replica-{}", gone.len() + 1),
             &lease,
             settings,
         ));
-        (leader, term) = agreed(&mut record, &mut replicas).await;
-    }
-    let (last, term) = agreed(&mut record, &mut replicas).await;
-    assert_eq!(last, 0, "one replica is left, and it leads");
-    assert_eq!(
-        readiness(&replicas[last]).await,
-        (200, r#"{"status":"ready","role":"leader"}"#.to_owned())
-    );
+        if released {
+            break term;
+        }
+    };
+
+    // The replica started after the release takes the released lease under
+    // the next term and leads alone. A host that held it past its own
+    // deadline between the answer and the probe reads follower until its
+    // next renewal lands, under the same term: the pair is read again.
+    let settled = Instant::now() + ROOM;
+    let last = loop {
+        let (last, taken) = agreed(&mut record, &mut replicas).await;
+        assert_eq!(
+            taken,
+            term + 1,
+            "the released lease is taken under the next term"
+        );
+        let probe = readiness(&replicas[last]).await;
+        if probe == (200, r#"{"status":"ready","role":"leader"}"#.to_owned()) {
+            break last;
+        }
+        assert!(
+            Instant::now() < settled,
+            "the last replica's probe never said leader: {probe:?}"
+        );
+    };
+    let term = term + 1;
     assert_eq!(stored(&lease).holder, replicas[last].identity());
     assert_eq!(stored(&lease).term, term);
 

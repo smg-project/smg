@@ -148,6 +148,15 @@ impl Health {
     }
 }
 
+/// A ratio as a permille field: the one rounding a report's ratio and a
+/// spec's usage threshold both take, so one rank's usage at or above a
+/// threshold in the document's unit is never read as under it. A mean of
+/// several ranks' rounded usages within a permille of the threshold can
+/// read on either side of it.
+pub fn permille(ratio: f64) -> u16 {
+    (ratio * 1000.0).round().clamp(0.0, 1000.0) as u16
+}
+
 /// One load row as the view carries it: the engine load record's routing
 /// core, in the record's own names, rounded to narrow fields by the host.
 /// Permille fields are the record's ratios times 1000.
@@ -353,7 +362,7 @@ pub struct NamedHolder {
     pub predicted_blocks: u32,
 }
 
-impl NamedAffinity<'_> {
+impl<'a> NamedAffinity<'a> {
     /// Row `index`'s entry: what the host said the row holds when it is
     /// named, nothing held otherwise.
     #[inline]
@@ -364,12 +373,89 @@ impl NamedAffinity<'_> {
         else {
             return AffinityFacts::default();
         };
-        let holder = self.holders[at];
+        self.holders[at].facts()
+    }
+
+    /// One pass's reads of the rows, walked beside the rows the pass asks.
+    #[inline]
+    pub(crate) fn walk(self) -> NamedWalk<'a> {
+        NamedWalk(Walk::new(self.holders))
+    }
+}
+
+impl NamedHolder {
+    /// The row's entry of a column: what it holds by both readings, and
+    /// nothing said of its age or its index.
+    #[inline]
+    fn facts(self) -> AffinityFacts {
         AffinityFacts {
-            overlap_blocks: holder.overlap_blocks,
-            predicted_blocks: holder.predicted_blocks,
+            overlap_blocks: self.overlap_blocks,
+            predicted_blocks: self.predicted_blocks,
             ..AffinityFacts::default()
         }
+    }
+}
+
+/// A forward cursor over a list its host keeps ascending by row, for one
+/// pass that asks its rows in order: a read is a compare, and each entry is
+/// passed once. A row before the cursor starts it over by a search, so rows
+/// asked in any order read as a search reads them.
+#[derive(Debug)]
+pub(crate) struct Walk<'a, T> {
+    list: &'a [T],
+    at: usize,
+    last: u32,
+}
+
+impl<'a, T: Copy> Walk<'a, T> {
+    pub(crate) fn new(list: &'a [T]) -> Self {
+        Self {
+            list,
+            at: 0,
+            last: 0,
+        }
+    }
+
+    /// The entry of row `index`, where the list names it; `row` reads an
+    /// entry's row.
+    #[inline]
+    pub(crate) fn find(&mut self, index: u32, row: impl Fn(&T) -> u32) -> Option<T> {
+        // The cursor stands at the first entry at or past the last row
+        // asked, so a row before that one is looked for again.
+        if index < self.last {
+            self.at = self.behind(index, &row);
+        }
+        self.last = index;
+        while let Some(entry) = self.list.get(self.at) {
+            let at = row(entry);
+            if at >= index {
+                return (at == index).then_some(*entry);
+            }
+            self.at += 1;
+        }
+        None
+    }
+
+    /// Where the entries at or past row `index` start: the search a row
+    /// behind the cursor costs, out of the walk's own line.
+    #[cold]
+    #[inline(never)]
+    fn behind(&self, index: u32, row: &impl Fn(&T) -> u32) -> usize {
+        self.list.partition_point(|entry| row(entry) < index)
+    }
+}
+
+/// One pass's reads of the rows a host named, in the pass's own order.
+#[derive(Debug)]
+pub(crate) struct NamedWalk<'a>(Walk<'a, NamedHolder>);
+
+impl NamedWalk<'_> {
+    /// Row `index`'s entry, as [`NamedAffinity::entry`] reads it.
+    #[inline]
+    pub(crate) fn entry(&mut self, index: u32) -> AffinityFacts {
+        self.0
+            .find(index, |holder| holder.row)
+            .map_or_else(AffinityFacts::default, NamedHolder::facts)
     }
 }
 
@@ -398,6 +484,36 @@ impl Feed<'_> {
         match self {
             Self::Column(column) => column[index as usize],
             Self::Named(named) => named.entry(index),
+        }
+    }
+}
+
+impl<'a> Feed<'a> {
+    /// One pass's reads of the feed: the column by index, or a walk of the
+    /// rows named. Taken where a pass starts, so no two passes share a
+    /// cursor.
+    pub(crate) fn reads(self) -> Reads<'a> {
+        match self {
+            Self::Column(column) => Reads::Column(column),
+            Self::Named(named) => Reads::Named(named.walk()),
+        }
+    }
+}
+
+/// What one pass reads of what the candidates hold: see [`Feed::reads`].
+#[derive(Debug)]
+pub(crate) enum Reads<'a> {
+    Column(&'a [AffinityFacts]),
+    Named(NamedWalk<'a>),
+}
+
+impl Reads<'_> {
+    /// Row `index`'s entry, as [`Feed::entry`] reads it.
+    #[inline]
+    pub(crate) fn entry(&mut self, index: u32) -> AffinityFacts {
+        match self {
+            Self::Column(column) => column[index as usize],
+            Self::Named(walk) => walk.entry(index),
         }
     }
 }
@@ -564,7 +680,8 @@ pub struct RequestFacts<'a> {
     /// decision is made over: the one column the affinity stages read, in
     /// the candidates' own order. It is EMPTY or holds exactly one entry a
     /// candidate; the engine refuses any other before a stage runs. An
-    /// empty column is the host's word that it holds nothing: it reads as
+    /// empty column is the host's word that it holds nothing, unless the
+    /// host names rows in its place ([`RequestFacts::named`]): it reads as
     /// nothing held for every candidate, under a profile that declared
     /// [`Needs::affinity`](crate::Needs::affinity) as under one that did
     /// not, and the engine neither refuses it nor counts it. A host that
@@ -606,6 +723,32 @@ const fn session_phase(phase: Phase) -> u64 {
         Phase::Decode => 3,
         Phase::Encode => 4,
     }
+}
+
+/// The fingerprint of the key whose session within a model and a phase is
+/// `session`: the formula of [`RequestFacts::session`] run backwards, each
+/// step of which is one-to-one. A host that is sent a session key as the
+/// session's value reads the key's fingerprint by it, so its record is the
+/// one the plain key gives: the session is `session` again, and a stage
+/// that reads the key itself reads the same key. `model` is the
+/// fingerprint of the model's name.
+///
+/// `0` for no session, and for the one value a model and a phase give the
+/// fingerprint no key has: neither is a key's session. The value `1` reads
+/// as the key the formula sends there by itself, not the one it lifts
+/// there.
+pub const fn key_of_session(session: u64, model: u64, phase: Phase) -> u64 {
+    if session == 0 {
+        return 0;
+    }
+    let mut h = session;
+    h ^= (h >> 31) ^ (h >> 62);
+    h = h.wrapping_mul(0x3196_42b2_d24d_8ec3);
+    h ^= (h >> 27) ^ (h >> 54);
+    h = h.wrapping_mul(0x96de_1b17_3f11_9089);
+    h ^= (h >> 30) ^ (h >> 60);
+    let scope = model ^ session_phase(phase).wrapping_mul(SESSION_MIX);
+    h ^ scope.wrapping_mul(SESSION_MIX)
 }
 
 impl<'a> RequestFacts<'a> {
@@ -846,6 +989,40 @@ mod tests {
         let _ = facts.affinity_at(1);
     }
 
+    /// A pass's walk of the rows named reads each row as the search does, in
+    /// whatever order the pass asks: ascending, a row twice, a row behind
+    /// the cursor.
+    #[test]
+    fn a_walk_of_the_rows_named_reads_each_row_as_the_search_does() {
+        let holders = [(1, 4, 0), (4, 9, 2), (5, 1, 7), (9, 3, 0)].map(
+            |(row, overlap_blocks, predicted_blocks)| NamedHolder {
+                row,
+                overlap_blocks,
+                predicted_blocks,
+            },
+        );
+        let named = NamedAffinity {
+            holders: &holders,
+            ..NamedAffinity::default()
+        };
+        let orders: [&[u32]; 4] = [
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            &[1, 1, 4, 4, 9, 9],
+            &[10, 9, 5, 4, 1, 0],
+            &[5, 0, 9, 4, 4, 1, 7, 10, 5],
+        ];
+        for order in orders {
+            let mut walk = named.walk();
+            for &row in order {
+                assert_eq!(walk.entry(row), named.entry(row), "row {row} of {order:?}");
+            }
+        }
+        // No row named: nothing held at any row.
+        let mut walk = NamedAffinity::default().walk();
+        assert_eq!(walk.entry(0), AffinityFacts::default());
+        assert_eq!(walk.entry(3), AffinityFacts::default());
+    }
+
     /// Rows named in the column's place read through the same accessor: a
     /// named row reads what the host said it holds, by both readings, and
     /// every other row nothing held. Beside a column the column is read.
@@ -952,6 +1129,55 @@ mod tests {
         .session();
         assert_eq!(lifted.get(), 1);
         assert!(!lifted.is_none());
+    }
+
+    /// The formula runs backwards: a session's value gives its key's
+    /// fingerprint within the same model and phase, on the contract's own
+    /// numbers and across keys, models and phases.
+    #[test]
+    fn a_sessions_value_gives_its_keys_fingerprint_back_within_its_model_and_phase() {
+        let phases = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
+        let contract: [u64; 4] = [
+            0x6e88_ff71_cc98_2a42,
+            0x619f_dbb0_c262_9a55,
+            0x3e92_fbbd_183d_f4b6,
+            0x3780_ba54_336a_57d0,
+        ];
+        let model = fingerprint(b"model-a");
+        for (phase, session) in phases.into_iter().zip(contract) {
+            let key = key_of_session(session, model, phase);
+            assert_eq!(key, 0xd449_9ecc_c740_2a12, "{phase:?}");
+        }
+        for (index, phase) in (0..4_000_u32).zip(phases.into_iter().cycle()) {
+            let name = format!("model-{}", index % 7);
+            let key = fingerprint(format!("key-{index}").as_bytes());
+            let session = RequestFacts {
+                model: &name,
+                session_key: Identity::hashed(key),
+                phase,
+                ..RequestFacts::default()
+            }
+            .session()
+            .get();
+            let read = key_of_session(session, fingerprint(name.as_bytes()), phase);
+            assert_eq!(read, key, "key-{index} under {name}, {phase:?}");
+        }
+        // No session has no key, and neither has the one value a model and
+        // a phase give the fingerprint no key has.
+        assert_eq!(key_of_session(0, model, Phase::Single), 0);
+        assert_eq!(
+            key_of_session(0xc771_96d2_b9cf_9497, model, Phase::Single),
+            0
+        );
+        // The value the formula lifts a zero result to reads as the key it
+        // sends there by itself, whose session it is too.
+        let sent = key_of_session(1, model, Phase::Single);
+        let lifted = RequestFacts {
+            model: "model-a",
+            session_key: Identity::hashed(sent),
+            ..RequestFacts::default()
+        };
+        assert_eq!((sent, lifted.session().get()), (0xbddd_7c85_982a_9f6f, 1));
     }
 
     #[test]

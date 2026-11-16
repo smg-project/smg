@@ -52,7 +52,7 @@ use crate::{
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
-        transforms::TransformError,
+        transforms::{rgb_pixels, TransformError},
     },
     EncoderDtype,
 };
@@ -353,7 +353,7 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
                 .map(|frame| RgbFrameRef {
                     width: frame.width(),
                     height: frame.height(),
-                    data: frame.as_raw(),
+                    data: rgb_pixels(frame),
                 })
                 .collect();
             return self.preprocess_sglang_video(&borrowed, clip);

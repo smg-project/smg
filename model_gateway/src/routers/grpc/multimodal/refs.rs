@@ -1212,7 +1212,8 @@ mod tests {
     /// is selected, in the media connector's own words under the router-side
     /// pipeline's code for the same media: an empty url, a data URL whose
     /// header names no base64 payload, an empty payload (a URL part's or a
-    /// base64 source's); a well-formed reference still forwards untouched.
+    /// base64 source's); a well-formed reference still forwards untouched, a
+    /// data URL with parameters before the marker among them.
     #[test]
     fn a_reference_no_engine_serves_is_refused_at_the_door() {
         let components = components(MmProcessingMode::Worker);
@@ -1237,6 +1238,10 @@ mod tests {
                 "data URL parse error: only base64 encoded data URLs are supported",
             ),
             (
+                image_url("data:image/png;base64;charset=x,AQ=="),
+                "data URL parse error: only base64 encoded data URLs are supported",
+            ),
+            (
                 image_url("data:image/png;base64,"),
                 "data URL parse error: empty payload",
             ),
@@ -1255,6 +1260,8 @@ mod tests {
         }
         for part in [
             image_url("data:image/png;base64,AQ=="),
+            image_url("data:image/png;charset=x;base64,AQ=="),
+            image_url("data:image/png;charset=x;name=a.png;base64,AQ=="),
             image_url("https://a/1.png"),
             base64_image("AQ=="),
         ] {
