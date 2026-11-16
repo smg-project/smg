@@ -1197,7 +1197,7 @@ impl JobQueue {
                     .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
                 let timeout_duration =
-                    Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
+                    workflow_wait(context.router_config.worker_startup_timeout_secs);
 
                 let workflow_data = create_worker_workflow_data(
                     (**config).clone(),
@@ -1369,7 +1369,7 @@ impl JobQueue {
                     .health_check
                     .drain_settle_secs
                     .max(MAX_DRAIN_WAIT_SECS);
-                let timeout_duration = Duration::from_secs(30 + drain_wait_secs);
+                let timeout_duration = workflow_wait(drain_wait_secs);
 
                 let result = engines
                     .worker_removal
@@ -1764,6 +1764,13 @@ impl JobQueue {
             );
         }
     }
+}
+
+/// How long a job waits for its workflow: the configured seconds and thirty
+/// more for the workflow's other steps. The sum saturates, so a wait written
+/// as the largest number stays the longest wait.
+fn workflow_wait(configured_secs: u64) -> Duration {
+    Duration::from_secs(configured_secs.saturating_add(30))
 }
 
 /// Stamp the router-config-derived fields onto a startup worker's spec: the
@@ -2496,6 +2503,22 @@ mod tests {
             spec_for("ipc:///tmp/smg/engine", &config).runtime_type,
             default_runtime
         );
+    }
+
+    /// A job's wait holds the thirty seconds on top of a number the sum fits,
+    /// and stays the longest wait from thirty under the largest number up: a
+    /// startup timeout or a drain settle written as "never" neither overflows
+    /// in the job's task nor wraps to a wait of seconds.
+    #[test]
+    fn a_jobs_wait_saturates_at_the_largest_number_of_seconds() {
+        assert_eq!(workflow_wait(1800), Duration::from_secs(1830));
+        assert_eq!(
+            workflow_wait(u64::MAX - 31),
+            Duration::from_secs(u64::MAX - 1)
+        );
+        for secs in [u64::MAX - 30, u64::MAX - 29, u64::MAX] {
+            assert_eq!(workflow_wait(secs), Duration::from_secs(u64::MAX), "{secs}");
+        }
     }
 
     /// Pending/processing statuses are the discovery reconciler's in-flight

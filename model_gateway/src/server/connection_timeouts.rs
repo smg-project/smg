@@ -54,7 +54,7 @@ use tokio::{
 use tower::Service;
 use tracing::debug;
 
-use crate::observability::metrics::Metrics;
+use crate::{deadline::deadline_after, observability::metrics::Metrics};
 
 /// The two connection-level bounds, each `None` when disabled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -385,18 +385,22 @@ impl<I> TimedConnection<I> {
         })
     }
 
-    /// The bound that applies to a wait, and when it expires.
+    /// The bound that applies to a wait, and when it expires. A bound past
+    /// the clock's range expires at the far future.
     fn deadline_for(&self, wait: &HeadWait) -> Option<(Instant, Timeout)> {
         let ConnectionTimeouts { header_read, idle } = self.timeouts;
         if !wait.keep_alive {
             // Nothing served yet: a complete request head is due within the
             // header-read bound of the accept, whatever the protocol.
-            return header_read.map(|bound| (wait.since + bound, Timeout::HeaderRead));
+            return header_read
+                .map(|bound| (deadline_after(wait.since, bound), Timeout::HeaderRead));
         }
-        let idle_at = idle.map(|bound| (wait.since + bound, Timeout::Idle));
+        let idle_at = idle.map(|bound| (deadline_after(wait.since, bound), Timeout::Idle));
         let head_at = match (self.protocol, header_read, wait.first_byte) {
             (Protocol::Http2, _, _) => None,
-            (_, Some(bound), Some(first_byte)) => Some((first_byte + bound, Timeout::HeaderRead)),
+            (_, Some(bound), Some(first_byte)) => {
+                Some((deadline_after(first_byte, bound), Timeout::HeaderRead))
+            }
             _ => None,
         };
         match (idle_at, head_at) {
@@ -1247,6 +1251,62 @@ mod tests {
         assert_eq!(
             connection(Protocol::Http2).deadline_for(&partial_next_head),
             idle
+        );
+    }
+
+    /// A bound written as the largest number of seconds expires thirty years
+    /// on, at each of the three sums, and a nearer bound still wins.
+    #[test]
+    fn a_bound_past_the_clocks_range_expires_thirty_years_on() {
+        const THIRTY_YEARS: Duration = Duration::from_secs(86_400 * 365 * 30);
+        let connection = |header_read_secs, idle_secs| {
+            let mut connection =
+                idle_connection(ConnectionTimeouts::from_secs(header_read_secs, idle_secs));
+            connection.protocol = Protocol::Http1;
+            connection
+        };
+        let now = Instant::now();
+        let far = now + THIRTY_YEARS;
+
+        // The accept's sum: nothing served yet.
+        let fresh = HeadWait {
+            since: now,
+            keep_alive: false,
+            started: 0,
+            first_byte: None,
+        };
+        assert_eq!(
+            connection(u64::MAX, 90).deadline_for(&fresh),
+            Some((far, Timeout::HeaderRead))
+        );
+
+        // The idle sum: between two requests.
+        let between_requests = HeadWait {
+            since: now,
+            keep_alive: true,
+            started: 1,
+            first_byte: None,
+        };
+        assert_eq!(
+            connection(1, u64::MAX).deadline_for(&between_requests),
+            Some((far, Timeout::Idle))
+        );
+
+        // The next head's sum: its first byte is in. Alone it stands at the
+        // far future, and beside an idle bound the nearer one wins.
+        let partial_next_head = HeadWait {
+            since: now,
+            keep_alive: true,
+            started: 1,
+            first_byte: Some(now),
+        };
+        assert_eq!(
+            connection(u64::MAX, 0).deadline_for(&partial_next_head),
+            Some((far, Timeout::HeaderRead))
+        );
+        assert_eq!(
+            connection(u64::MAX, 90).deadline_for(&partial_next_head),
+            Some((now + Duration::from_secs(90), Timeout::Idle))
         );
     }
 
