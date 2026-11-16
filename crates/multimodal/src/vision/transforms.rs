@@ -3364,6 +3364,14 @@ pub fn center_crop(image: &DynamicImage, crop_w: u32, crop_h: u32) -> DynamicIma
     }
 }
 
+/// The pixel bytes of `image`, exactly `3 * width * height` of them: a
+/// container may be longer than its image (`ImageBuffer::from_raw` takes any
+/// that is long enough), and the bytes behind the pixels are not the image.
+pub(crate) fn rgb_pixels(image: &RgbImage) -> &[u8] {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    &image.as_raw()[..3 * width * height]
+}
+
 /// The `width` x `height` crop of `image` at (`x`, `y`), clipped to the
 /// image as the generic crop clips it, as row copies out of the image's own
 /// bytes. The generic crop builds a zeroed image and copies pixel by pixel;
