@@ -161,6 +161,10 @@ impl MockEngine {
                 .await
                 .is_ok_and(|response| response.status().is_success())
             {
+                assert!(
+                    !served.is_finished(),
+                    "the mock engine's serve task ended before it joined the fleet"
+                );
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
