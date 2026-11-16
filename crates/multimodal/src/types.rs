@@ -1001,19 +1001,38 @@ mod tests {
                     );
                     return;
                 }
+                // The quiet window runs from just after the read that last
+                // saw progress to just before the current read, so the span
+                // it judges is never longer than the span between the two:
+                // a parent held off the core, inside a read or after it,
+                // must not turn an unobserved stretch into a deadlock.
+                let observed = Instant::now();
                 let blocked = match process_cpu_time(child.id()) {
                     Some(cpu) => {
                         if cpu > progressed.1 {
+                            // Stamped after the read: the child may have
+                            // accrued its last tick just before it.
                             progressed = (Instant::now(), cpu);
                         }
-                        progressed.0.elapsed() >= QUIET || started.elapsed() >= CEILING
+                        if observed.saturating_duration_since(progressed.0) >= QUIET {
+                            Some(format!(
+                                "no CPU accrued for {QUIET:?} (child CPU time {cpu:?})"
+                            ))
+                        } else if observed.duration_since(started) >= CEILING {
+                            Some(format!(
+                                "wall ceiling {CEILING:?} passed, child still on CPU ({cpu:?})"
+                            ))
+                        } else {
+                            None
+                        }
                     }
-                    None => started.elapsed() >= WALL_ONLY,
+                    None => (observed.duration_since(started) >= WALL_ONLY)
+                        .then(|| format!("{WALL_ONLY:?} of wall clock, no process table to read")),
                 };
-                if blocked {
+                if let Some(reason) = blocked {
                     child.kill().expect("kill blocked child");
                     child.wait().expect("reap child");
-                    panic!("shared capped decode blocked the vision pool");
+                    panic!("shared capped decode blocked the vision pool: {reason}");
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
