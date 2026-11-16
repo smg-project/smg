@@ -669,14 +669,14 @@ impl Engine {
         let Some(origins) = &self.structural_origins else {
             return true;
         };
-        let atom = self
-            .format
-            .structural_token_texts()
-            .iter()
-            .enumerate()
-            .filter(|(_, atom)| text.starts_with(atom.as_str()))
-            .max_by_key(|(_, atom)| atom.len());
-        atom.is_none_or(|(index, _)| origins.get(&self.cursor) == Some(&index))
+        let atoms = self.format.structural_token_texts();
+        if !atoms.iter().any(|atom| text.starts_with(atom.as_str())) {
+            return true;
+        }
+        // Authorize the recorded atom, not another declaration sharing its prefix.
+        origins
+            .get(&self.cursor)
+            .is_some_and(|&index| text.starts_with(atoms[index].as_str()))
     }
 
     fn prune_structural_origins(&mut self) {
@@ -1798,6 +1798,102 @@ mod tests {
         tagged::{Placement, Spelling},
         testing::{arguments_of, bytes, malformed, weather_declared},
     };
+
+    #[test]
+    fn bound_framing_uses_the_recorded_atom_with_overlapping_or_duplicate_declarations() {
+        for second_atom in ["<a>b", "<a>"] {
+            let format = Format::new("overlapping atoms")
+                .terminal("open", "<a>b thought")
+                .terminal("close", "</a>")
+                .state("content", Emits::Content)
+                .state("thought", Emits::Reasoning)
+                .transition("content", "open", "thought")
+                .transition("thought", "close", "content")
+                .structural_token("<a>")
+                .structural_token(second_atom);
+            format.validate().unwrap();
+            for (output, expected_content, expected_reasoning) in [
+                ("<a>b thoughtsecret</a>answer", "answer", "secret"),
+                ("<a>b", "", ""),
+            ] {
+                for verified in [false, true] {
+                    for cut in 0..=output.len() {
+                        let mut engine = Engine::new(format.clone(), Declared::default());
+                        engine.bind_structural_token_origins().unwrap();
+                        if verified {
+                            engine.note_structural_token_origin("<a>", 0..3).unwrap();
+                        }
+                        let mut events = Events::new();
+                        for text in [&output[..cut], &output[cut..]] {
+                            engine
+                                .feed(
+                                    Input::Delta {
+                                        token_ids: &[],
+                                        text,
+                                        spans: &[],
+                                    },
+                                    &mut events,
+                                )
+                                .unwrap();
+                        }
+                        engine
+                            .feed(
+                                Input::End {
+                                    finish: EngineFinish::Length,
+                                },
+                                &mut events,
+                            )
+                            .unwrap();
+                        let [content, reasoning, _, malformed] = kinds(events.as_slice());
+                        assert_eq!(
+                            content,
+                            if verified { expected_content } else { output },
+                            "atom={second_atom:?} verified={verified} cut={cut}"
+                        );
+                        assert_eq!(reasoning, if verified { expected_reasoning } else { "" });
+                        assert!(malformed.is_empty());
+                        assert_eq!(bytes(events.as_slice()), output);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_longer_verified_atom_does_not_authorize_a_shorter_terminal() {
+        let format = Format::new("short terminal")
+            .terminal("open", "<a>")
+            .state("content", Emits::Content)
+            .state("thought", Emits::Reasoning)
+            .transition("content", "open", "thought")
+            .structural_token("<a>")
+            .structural_token("<a>b");
+        format.validate().unwrap();
+        let mut engine = Engine::new(format, Declared::default());
+        engine.bind_structural_token_origins().unwrap();
+        engine.note_structural_token_origin("<a>b", 0..4).unwrap();
+        let mut events = Events::new();
+        engine
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: "<a>b",
+                    spans: &[],
+                },
+                &mut events,
+            )
+            .unwrap();
+        engine
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut events,
+            )
+            .unwrap();
+        assert_eq!(crate::testing::content(events.as_slice()), "<a>b");
+        assert!(crate::testing::reasoning(events.as_slice()).is_empty());
+    }
 
     #[test]
     fn bound_framing_does_not_fall_back_when_counting_spans_are_missing() {
