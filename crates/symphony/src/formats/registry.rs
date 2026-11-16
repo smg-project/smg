@@ -711,6 +711,8 @@ mod tests {
     /// The first turn below is an assistant turn of that template's recorded render, fed as the
     /// prompt up to its close mark; the second answer is one such a checkpoint gave a request
     /// with tools.
+    /// The ends of two more recorded renders pin where the replay starts: a generation prompt
+    /// at its last close mark, a continued final message at the one before its prefill.
     #[test]
     fn a_checkpoint_with_its_own_template_reads_with_the_table_that_template_writes() {
         use crate::{
@@ -796,6 +798,28 @@ mod tests {
         assert_eq!(format.name(), "qwen2.5");
         assert_eq!(format.turn_opener(), Some("<|close|>"));
         assert_eq!(format.replayed(opened), Replay::default());
+        // The end of a recorded generation prompt: the frame that names the answer's id holds
+        // the close mark too, as every frame's header does. The replay starts at the last one.
+        let generation = concat!(
+            "<|open|>exec<|.|>output<|close|>assistant<|:|>¶³<|open_end|><|open_end|>",
+            "<|open|>assistant<|:|>¶³<|close|>",
+        );
+        assert_eq!(format.replay(generation), "<|close|>");
+        assert_eq!(format.replayed(generation), Replay::default());
+        // The end of a recorded continued final message: the prefill after the last close mark
+        // is the text the answer goes on with.
+        let prefilled = concat!(
+            "<|open|>exec<|.|>output<|close|>assistant<|:|>¡°<|open_end|><|open_end|>",
+            "<|open|>assistant<|:|>¡°<|close|>The quick brown fox",
+        );
+        assert_eq!(format.replay(prefilled), "<|close|>The quick brown fox");
+        assert_eq!(
+            format.replayed(prefilled),
+            Replay {
+                begun: true,
+                ..Replay::default()
+            }
+        );
     }
 
     /// MiniMax-M3.1-Flash is a checkpoint of the MiniMax-M3 group (the
