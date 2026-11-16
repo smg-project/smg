@@ -94,8 +94,9 @@ impl Readiness {
     /// Resolves with `wanted` once the state is `wanted`, at once when it
     /// already is; `None` when the controller is gone before that. The
     /// state is read again at every move of the run loop and after every
-    /// election step; a fence that closes between two steps is seen at the
-    /// next.
+    /// election step; a fence that closes between two steps, or opens there
+    /// one renew deadline after a take, is seen at the next: a waiter for
+    /// the leader's state learns it up to a renew period late.
     pub async fn wait_for(&mut self, wanted: State) -> Option<State> {
         loop {
             if self.state() == wanted {

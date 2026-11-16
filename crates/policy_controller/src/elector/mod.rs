@@ -258,9 +258,9 @@ pub trait LeaseBackend: Send {
 /// readers keep a term in a narrower field than the record's, a membership
 /// life's number in twenty-four bits and a lease's id in thirty-one, and the
 /// narrower is the ceiling: a term a second lasts half a year under it. A
-/// word may not spend the last term: a caller refuses, at its wire, a term
-/// said whose next is not below the ceiling. A take that would reach the
-/// ceiling is an error.
+/// word may not spend the last term: a term said whose next is not below
+/// the ceiling is refused ([`term_said`]), by the elector and by every door
+/// in front of it. A take that would reach the ceiling is an error.
 pub const TERM_CEILING: u64 = 1 << 24;
 
 /// Why an election step failed.
@@ -671,8 +671,8 @@ impl Elector {
     /// Leave on a word from outside the election: a planned hand-over
     /// (`None`), or a term `above` that a caller says it saw. The term is
     /// counted among the terms this run saw, so its next take is above it;
-    /// a term said must leave one to take, so the caller refuses, at its
-    /// wire, a term whose next is not below [`TERM_CEILING`]. A term said
+    /// a term said must leave one to take, so one whose next is not below
+    /// [`TERM_CEILING`] is the term error, before it is counted. A term said
     /// while a take is in doubt, an attempt that reported an error and may
     /// have landed, stands: no step leads under a term below the highest
     /// its run saw, so the step that finds the attempt landed leaves the
@@ -690,6 +690,7 @@ impl Elector {
     /// closed, and every later [`Elector::tick`] tries the release again in
     /// place of a renewal, until it lands or the record moves.
     pub fn step_down(&mut self, above: Option<u64>, now: Instant) -> Result<bool, ElectError> {
+        term_said(above)?;
         self.stepped = Some(self.stepped.map_or(now, |at| at.max(now)));
         self.highest_term = self.highest_term.max(above.unwrap_or(0));
         let duration = match &self.held {
@@ -878,7 +879,7 @@ impl Elector {
         // A new term is the one after the highest this run saw, whatever the
         // record in front of it says: a record that vanished and came back
         // lower (a deleted object recreated, a lost file) never lowers it.
-        let next_term = self.highest_term + 1;
+        let next_term = self.highest_term.saturating_add(1);
         // A record that is gone after one was seen held: no release made it
         // so, and the holder of the record seen last may lead to its renew
         // deadline. This run waits that record's duration from its first
@@ -929,6 +930,14 @@ impl Elector {
             Some(record) if record.is_released() => {
                 let since = self.observed.as_ref().map_or(now, |o| o.since);
                 if now.saturating_duration_since(since) < record.duration() {
+                    // Inside its hold this run waits its turn: the record
+                    // is its own release inside a take's wait, or one a
+                    // later holder wrote, and neither is a record gone.
+                    if self.hold.is_some_and(|until| now < until) {
+                        return Ok(Tick::Waiting {
+                            term: self.highest_term,
+                        });
+                    }
                     return Ok(Tick::Gone { term: record.term });
                 }
                 (next_term, 0)
@@ -1036,6 +1045,16 @@ impl Elector {
             // Another write landed first and nothing is taken.
             Written::Moved => Ok(Tick::Raced),
         }
+    }
+}
+
+/// A term a caller says it saw must leave one to take: the term after it
+/// stays below [`TERM_CEILING`]. The elector refuses one that does not
+/// before it counts or writes it, and so does every door in front of it.
+pub fn term_said(above: Option<u64>) -> Result<(), ElectError> {
+    match above.map(|term| term.saturating_add(1)) {
+        Some(next) if next >= TERM_CEILING => Err(ElectError::Term(next)),
+        _ => Ok(()),
     }
 }
 
@@ -2278,6 +2297,21 @@ mod tests {
         assert!(released.is_released());
         assert_eq!(released.duration_ms, 2_000);
         assert!(!a.waits_to_lead());
+        // Its own next steps wait their turn: the release it reads is its
+        // own, and no record is gone.
+        assert_eq!(
+            a.tick(t0 + S + Duration::from_millis(1)).expect("a step"),
+            Tick::Waiting { term: 1 }
+        );
+        // A term said while it waits is the term its wait says, the
+        // release's own term below it.
+        assert!(!a
+            .step_down(Some(5), t0 + S + Duration::from_millis(2))
+            .expect("a word"));
+        assert_eq!(
+            a.tick(t0 + S + Duration::from_millis(3)).expect("a step"),
+            Tick::Waiting { term: 5 }
+        );
         // A word once the opening has passed finds no wait to hand on: no
         // holder this run never saw leads by then, and the release says no
         // duration.
@@ -2505,6 +2539,46 @@ mod tests {
         }
         let stored = lease.clone().read().expect("read").expect("the record");
         assert!(stored.is_released(), "nothing was written");
+    }
+
+    #[test]
+    fn a_take_over_the_largest_term_a_record_can_say_is_the_term_error() {
+        // A record no elector wrote says the largest term: the next term's
+        // sum stops there and never wraps to a term under the ceiling.
+        let free = LeaseRecord {
+            holder: String::new(),
+            ..held_by("x@host:9", u64::MAX, 0)
+        };
+        let mut lease = MemoryLease::new();
+        assert_eq!(lease.write(None, &free).expect("a write"), Written::Done);
+        let mut b = candidate(&lease, "b@host:2");
+        let refused = b
+            .tick(Instant::now() + S)
+            .expect_err("no term is left to take");
+        assert!(matches!(refused, ElectError::Term(u64::MAX)), "{refused}");
+        assert!(!b.is_holder());
+        let stored = lease.clone().read().expect("read").expect("the record");
+        assert!(stored.is_released(), "nothing was written");
+    }
+
+    #[test]
+    fn a_step_handed_an_earlier_instant_leaves_the_latest_one_standing() {
+        // The loop steps by the clock, which only grows. A caller that
+        // hands its own instants out of order takes nothing back: the
+        // wait's reader answers by the latest instant a step was handed.
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
+        assert!(a.waits_to_lead());
+        assert_eq!(
+            a.tick(t0 + 2 * S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        assert!(!a.waits_to_lead());
+        assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
+        assert!(!a.waits_to_lead(), "the opening stays passed");
     }
 
     #[test]
@@ -3687,6 +3761,34 @@ mod tests {
             b.tick(t0 + 3 * S).expect("follow"),
             Tick::Following { term: 1, .. }
         ));
+    }
+
+    #[test]
+    fn a_term_said_that_leaves_none_to_take_is_refused_before_it_is_counted() {
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + 3 * S;
+        a.lead_at(t0);
+        for said in [TERM_CEILING - 1, TERM_CEILING, u64::MAX] {
+            let refused = a
+                .step_down(Some(said), t0)
+                .expect_err("no term is left to take");
+            assert!(
+                matches!(refused, ElectError::Term(next) if next == said.saturating_add(1)),
+                "{refused}"
+            );
+        }
+        // Nothing was counted and nothing released: the holder leads on
+        // under its own term.
+        assert!(a.is_holder());
+        assert_eq!(a.fence().leader_term(t0), Some(1));
+        assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
+        // The highest term a word may say leaves the last one to take.
+        assert!(a
+            .step_down(Some(TERM_CEILING - 2), t0 + S)
+            .expect("the word"));
+        let released = a.observed().expect("the release").clone();
+        assert_eq!(released.term, TERM_CEILING - 2);
     }
 
     #[test]
