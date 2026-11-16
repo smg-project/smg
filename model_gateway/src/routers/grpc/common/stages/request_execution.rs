@@ -1291,11 +1291,18 @@ pub(crate) fn start_failure_response(
     response
 }
 
-/// The embed calls of a request, one per input, in flight together on the one
-/// worker and answered in the inputs' order (the wire takes one input per
-/// call). The first failure fails the request as a failed single call does,
-/// once every call has answered: a sibling in flight is never dropped
-/// mid-way, so the worker's own account of the calls it admitted stays whole.
+/// The embed calls a request holds open on its worker at once. A batch of
+/// this many inputs or fewer goes out whole; a longer one keeps this many in
+/// flight, wide enough that the engine still fills its own batches from
+/// them, and the worker's queue is no longer one request's to fill.
+pub(crate) const MAX_IN_FLIGHT_EMBED_CALLS: usize = 256;
+
+/// The embed calls of a request, one per input, at most
+/// [`MAX_IN_FLIGHT_EMBED_CALLS`] of them in flight together on the one worker
+/// and answered in the inputs' order (the wire takes one input per call). The
+/// first failure fails the request as a failed single call does, once every
+/// call has answered: a sibling in flight is never dropped mid-way, so the
+/// worker's own account of the calls it admitted stays whole.
 /// The worker's request count takes one per call, as the batched completions
 /// route counts its sub-requests.
 /// The circuit breaker takes one sample for the request, the worst answer by
@@ -1314,13 +1321,22 @@ async fn execute_embed(
     let client = &*clients.single_or_mismatch("execute_embed")?;
 
     let worker = workers.single();
-    let answers = join_all(requests.into_iter().map(|request| {
+    let calls = requests.into_iter().map(|request| {
         if let Some(worker) = worker {
             Metrics::record_worker_request(worker.url(), worker.model_id());
         }
         client.embed(request)
-    }))
-    .await;
+    });
+    // A batch within the window is one plain join, as a single input is: the
+    // window's queue is paid only by the batch that needs it.
+    let answers = if calls.len() <= MAX_IN_FLIGHT_EMBED_CALLS {
+        join_all(calls).await
+    } else {
+        futures::stream::iter(calls)
+            .buffered(MAX_IN_FLIGHT_EMBED_CALLS)
+            .collect()
+            .await
+    };
     // One breaker sample for the request, read from every answer: a worker
     // failure on any input counts whatever its place in the batch.
     if let Some(status) = worker.and_then(|worker| batch_breaker_status(&answers, worker.as_ref()))

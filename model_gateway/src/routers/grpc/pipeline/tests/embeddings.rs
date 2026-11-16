@@ -8,15 +8,22 @@
 //! text of every `Embed` call and answers a vector that names the call
 //! (`[ids.len(), ids[0]]`), its `prompt_tokens` the ids' count.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex, PoisonError,
+};
 
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{classify::ClassifyRequest, embedding::EmbeddingRequest};
 use serde_json::{json, Value};
+use tokio::sync::watch;
 use vllm_proto::vllm_engine_server::{VllmEngine, VllmEngineServer};
 
 use super::*;
-use crate::worker::BasicWorker;
+use crate::{
+    routers::grpc::common::stages::request_execution::MAX_IN_FLIGHT_EMBED_CALLS,
+    worker::BasicWorker,
+};
 
 /// The engine's answer to one call: the ids' count and the first id, as two
 /// dimensions a test reads the call back from.
@@ -40,6 +47,11 @@ struct EmbedStub {
     slow_ids: Option<Vec<u32>>,
     /// The ids of every call that ran to its answer, in the order they ended.
     finished: Arc<Mutex<Vec<Vec<u32>>>>,
+    /// The calls held at the gate now, and the most there were at once.
+    in_flight: Arc<AtomicUsize>,
+    most_in_flight: Arc<AtomicUsize>,
+    /// While it reads `false`, every call waits where it arrived.
+    gate: Option<watch::Receiver<bool>>,
 }
 
 #[tonic::async_trait]
@@ -66,6 +78,13 @@ impl VllmEngine for EmbedStub {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(tokenized.original_text);
+        let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+        if let Some(gate) = &self.gate {
+            let opened = gate.clone().wait_for(|open| *open).await.is_ok();
+            assert!(opened, "the test opens the gate before it lets go of it");
+        }
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
         if self.slow_ids.as_deref() == Some(tokenized.input_ids.as_slice()) {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -370,6 +389,41 @@ async fn a_batch_of_texts_is_one_call_per_text_answered_in_order() {
         sorted(bed.seen_texts()),
         sorted(texts.iter().map(|text| text.to_string()).collect()),
         "each call carries its own text"
+    );
+}
+
+/// A batch past the window keeps the window's count of calls in flight and
+/// never one more. The stub holds every call where it arrived, so its count
+/// is every call the gateway has open.
+#[tokio::test]
+async fn a_batch_past_the_window_keeps_the_window_of_calls_in_flight() {
+    let (open, gate) = watch::channel(false);
+    let stub = EmbedStub {
+        gate: Some(gate),
+        ..EmbedStub::default()
+    };
+    let bed = Bed::over(Endpoint::Embeddings, stub).await;
+    let inputs = vec![vec![1]; MAX_IN_FLIGHT_EMBED_CALLS + 44];
+
+    let window_read = async {
+        while bed.stub.in_flight.load(Ordering::SeqCst) < MAX_IN_FLIGHT_EMBED_CALLS {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // The window is full and no call ends: one past it arrives now.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        open.send(true).expect("the stub holds the gate");
+    };
+    let ((status, body), ()) = tokio::join!(
+        bed.embed(json!({"model": MODEL, "input": inputs})),
+        window_read
+    );
+
+    assert_eq!(status, http::StatusCode::OK, "{body}");
+    assert_eq!(items(&body).len(), inputs.len(), "one vector per input");
+    assert_eq!(
+        bed.stub.most_in_flight.load(Ordering::SeqCst),
+        MAX_IN_FLIGHT_EMBED_CALLS,
+        "the calls in flight at once"
     );
 }
 
