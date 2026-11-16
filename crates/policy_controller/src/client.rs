@@ -84,11 +84,13 @@ pub enum Error {
     /// welcome.
     #[error("the session answered the hello with no welcome: {0}")]
     NoWelcome(String),
-    /// The welcome came under a term below the client's floor. A gateway
-    /// rejects a frame below its floor, so the session is not taken.
-    #[error("the welcome's term {term} is below the floor {floor}")]
+    /// The session's first frame came under a term below the client's
+    /// floor. A gateway rejects a frame below its floor whatever it
+    /// carries: the session is not taken, and the address a `NotLeader`
+    /// names is not read.
+    #[error("the first frame's term {term} is below the floor {floor}")]
     BelowFloor {
-        /// The term the welcome came under.
+        /// The term the frame came under.
         term: u64,
         /// The floor the hello stated.
         floor: u64,
@@ -148,8 +150,8 @@ impl Session {
     /// Opens the stream with the hello as its first frame and takes the
     /// welcome: the call's answer and its first frame must come within
     /// `wait`. Returns the session and the term its welcome came under. A
-    /// welcome under a term below `floor` is refused: the contract has a
-    /// gateway reject a frame below its floor.
+    /// first frame under a term below `floor` is refused before its kind
+    /// is read: the contract has a gateway reject a frame below its floor.
     async fn open(
         stub: &mut Stub,
         gateway_id: &str,
@@ -171,11 +173,14 @@ impl Session {
         };
         let (answers, first) = answered("the session's welcome", wait, opened).await??;
         match first {
+            Some(ControllerFrame { term, .. }) if term < floor => {
+                Err(Error::BelowFloor { term, floor })
+            }
             Some(ControllerFrame {
                 term,
                 frame: Some(controller_frame::Frame::Welcome(welcome)),
                 ..
-            }) if term >= floor => Ok((
+            }) => Ok((
                 Self {
                     frames,
                     answers,
@@ -183,11 +188,6 @@ impl Session {
                 },
                 term,
             )),
-            Some(ControllerFrame {
-                term,
-                frame: Some(controller_frame::Frame::Welcome(_)),
-                ..
-            }) => Err(Error::BelowFloor { term, floor }),
             Some(ControllerFrame {
                 frame: Some(controller_frame::Frame::NotLeader(not_leader)),
                 ..
@@ -262,10 +262,10 @@ impl Client {
     /// time-outs, or none) as the gateway `gateway_id`, takes its term floor
     /// from the replica's `Leader` answer and opens the gateway's session.
     /// An id no metadata entry carries is refused before the dial; a replica
-    /// that does not lead is [`Error::NotLeader`]; a welcome under a term
-    /// below the floor is [`Error::BelowFloor`]. No wait for the replica
-    /// outlasts [`ANSWER_WAIT`]: a dial, a `Leader` ask or a welcome that
-    /// would is [`Error::NoAnswer`].
+    /// that does not lead is [`Error::NotLeader`]; a first frame of the
+    /// session below the floor is [`Error::BelowFloor`]. No wait for the
+    /// replica outlasts [`ANSWER_WAIT`]: a dial, a `Leader` ask or a
+    /// welcome that would is [`Error::NoAnswer`].
     pub async fn connect_with(endpoint: Endpoint, gateway_id: &str) -> Result<Self, Error> {
         Self::connect_within(endpoint, gateway_id, ANSWER_WAIT).await
     }
@@ -432,6 +432,7 @@ mod tests {
         PolicyControllerClient, Principal, Session, Stub, Welcome, ANSWER_WAIT, PRINCIPAL_ENTRY,
         PROTOCOL_VERSION,
     };
+    use crate::proto::NotLeader;
 
     /// The bound a case gives a wait it wants ended.
     const SHORT: Duration = Duration::from_millis(300);
@@ -521,9 +522,24 @@ mod tests {
     /// An answer of headers and one frame, a welcome under `term`, that
     /// never ends.
     fn welcome_under(term: u64) -> Body {
+        one_frame(term, controller_frame::Frame::Welcome(Welcome::default()))
+    }
+
+    /// An answer of headers and one frame, a `NotLeader` under `term` that
+    /// names a leader, that never ends.
+    fn not_leader_under(term: u64) -> Body {
+        let named = NotLeader {
+            leader_address: "http://127.0.0.1:9".to_owned(),
+            ..NotLeader::default()
+        };
+        one_frame(term, controller_frame::Frame::NotLeader(named))
+    }
+
+    /// An answer of headers and one frame under `term` that never ends.
+    fn one_frame(term: u64, frame: controller_frame::Frame) -> Body {
         let frame = ControllerFrame {
             term,
-            frame: Some(controller_frame::Frame::Welcome(Welcome::default())),
+            frame: Some(frame),
             ..ControllerFrame::default()
         };
         // A message on the wire: its flag, its length, its bytes.
@@ -672,6 +688,17 @@ mod tests {
     #[tokio::test]
     async fn a_welcome_under_a_term_below_the_floor_is_refused() {
         let (address, _serving) = answering(|| welcome_under(6)).await;
+        let mut stub = stub(address).await;
+        let opened = Session::open(&mut stub, "gateway-1", 7, ROOM).await;
+        assert!(
+            matches!(opened, Err(Error::BelowFloor { term: 6, floor: 7 })),
+            "{opened:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_not_leader_under_a_term_below_the_floor_is_refused_unread() {
+        let (address, _serving) = answering(|| not_leader_under(6)).await;
         let mut stub = stub(address).await;
         let opened = Session::open(&mut stub, "gateway-1", 7, ROOM).await;
         assert!(
