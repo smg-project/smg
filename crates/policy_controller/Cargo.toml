@@ -124,6 +124,11 @@ controller = [
     "dep:tracing-subscriber",
 ]
 
+# The reference client of the controller's protocol, for the crate's cases
+# and for examples: the generated client behind one type. It adds no
+# dependency to the controller's, and no shipped binary builds it.
+client = ["controller"]
+
 # The Kubernetes Lease backend of the elector.
 kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
 
@@ -189,7 +194,7 @@ required-features = ["kubernetes"]
 
 [[test]]
 name = "fleet"
-required-features = ["controller"]
+required-features = ["client"]
 
 [[test]]
 name = "ingest"

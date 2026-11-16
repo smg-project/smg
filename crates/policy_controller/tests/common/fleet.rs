@@ -1,9 +1,9 @@
 //! The end-to-end harness: a controller started on ephemeral loopback ports
 //! in the case's own process, a fleet of mock engines beside it, and one
 //! handle, [`Harness`], through which a case registers the fleet, feeds the
-//! store and asks the service. Included by path beside `common/engines.rs`
-//! and `common/net.rs` (the including binary names them `engines` and
-//! `net`).
+//! store and asks the service through the crate's reference client.
+//! Included by path beside `common/engines.rs` and `common/net.rs` (the
+//! including binary names them `engines` and `net`).
 //!
 //! Every fact the store holds of an engine came from that engine, through a
 //! sink. Loads are the controller's own load driver's: the harness writes no
@@ -22,6 +22,7 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc,
@@ -38,8 +39,11 @@ use openai_protocol::worker::RuntimeType;
 use parking_lot::Mutex;
 use smg_grpc_client::{vllm_engine::AbortOnDropStream, vllm_proto, VllmEngineClient};
 use smg_policy_controller::{
-    controller::{Config, Controller, Election, Error, Listener, Scope, State},
-    proto::{policy_controller_client::PolicyControllerClient, LeaderInfo, LeaderRequest},
+    client::Client,
+    controller::{
+        Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
+    },
+    proto::{LeaderInfo, Welcome},
     store::{
         Ask, GatewayId, HealthPolicy, HealthSink, MemoryStore, ViewBuffers, WorkerFacts,
         WorkerStatus, WorkersStore,
@@ -53,7 +57,6 @@ use tokio::{
     task::JoinSet,
     time::MissedTickBehavior,
 };
-use tonic::transport::Channel;
 
 use crate::{
     engines::{engine_config, eventually},
@@ -189,10 +192,22 @@ struct Probed {
     ids: Vec<WorkerId>,
 }
 
+/// A controller in the binary's default shape, served on ephemeral loopback
+/// ports in the case's own process. Its gateway listener takes a gateway's
+/// name as told: the reference client states its own on every call.
+pub struct Replica {
+    gateway: SocketAddr,
+    store: Arc<MemoryStore>,
+    readiness: Readiness,
+    stop: Option<oneshot::Sender<()>>,
+    serve: JoinSet<Result<(), Error>>,
+}
+
 /// The one handle a case holds: register, feed, ask.
 pub struct Harness {
+    replica: Replica,
     store: Arc<MemoryStore>,
-    client: PolicyControllerClient<Channel>,
+    client: Client,
     engines: Vec<Engine>,
     members: HashMap<WorkerId, (usize, u16)>,
     probed: Arc<Mutex<Vec<Probed>>>,
@@ -201,8 +216,6 @@ pub struct Harness {
     buffers: ViewBuffers,
     stop_feeds: watch::Sender<bool>,
     feeds: JoinSet<()>,
-    stop_serve: Option<oneshot::Sender<()>>,
-    serve: JoinSet<Result<(), Error>>,
 }
 
 /// Waits for `check` under the bound named `name`; the error names the
@@ -424,11 +437,10 @@ async fn probe(
     }
 }
 
-impl Harness {
-    /// Starts a controller in the binary's default shape on ephemeral
-    /// loopback ports, waits until it leads and connects the generated
-    /// client to its gateway listener.
-    pub async fn start() -> Result<Self, String> {
+impl Replica {
+    /// Binds and serves a controller named `id`. Replicas given one `lease`
+    /// file elect over it; with none the controller leads itself.
+    pub async fn start(id: &str, lease: Option<&Path>) -> Result<Self, String> {
         let listener = |name: &str, scopes: &[Scope]| Listener {
             name: name.to_owned(),
             addr: loopback(),
@@ -436,7 +448,7 @@ impl Harness {
             tls: None,
         };
         let config = Config {
-            controller_id: "fleet-controller".to_owned(),
+            controller_id: id.to_owned(),
             listeners: vec![
                 listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
                 listener("control", &[Scope::Control]),
@@ -446,22 +458,30 @@ impl Harness {
             shutdown_settle: Duration::ZERO,
             shutdown_grace: Duration::from_secs(5),
             load_poll_interval: POLL_INTERVAL,
-            election: Election::default(),
+            election: Election {
+                lease: lease.map_or(LeasePlace::Process, |file| {
+                    LeasePlace::File(file.to_owned())
+                }),
+                ..Election::default()
+            },
         };
-        let controller = bounded(
+        let mut controller = bounded(
             "the controller binds its listeners",
             ROOM,
             Controller::bind(config),
         )
         .await?
         .map_err(|error| error.to_string())?;
+        controller
+            .identity_as_told("gateway")
+            .map_err(|error| error.to_string())?;
         let gateway = controller
             .addresses()
             .of(Scope::Gateway)
             .ok_or("the controller has no gateway listener")?;
         let store = controller.store();
-        let mut readiness = controller.readiness();
-        let (stop_serve, stopped) = oneshot::channel::<()>();
+        let readiness = controller.readiness();
+        let (stop, stopped) = oneshot::channel::<()>();
         let mut serve = JoinSet::new();
         serve.spawn(async move {
             controller
@@ -470,25 +490,84 @@ impl Harness {
                 })
                 .await
         });
-        let state = bounded(
-            "the controller leads",
-            ROOM,
-            readiness.wait_for(State::Leader),
-        )
-        .await?;
-        if state != Some(State::Leader) {
-            return Err(format!("the controller ended as {state:?} before it led"));
+        Ok(Self {
+            gateway,
+            store,
+            readiness,
+            stop: Some(stop),
+            serve,
+        })
+    }
+
+    /// Waits, under a bound, until the controller leads or follows. A serve
+    /// that ended first fails the wait with the serve's own end.
+    pub async fn reaches(&mut self, state: State) -> Result<(), String> {
+        let name = if state == State::Leader {
+            "the controller leads"
+        } else {
+            "the controller follows"
+        };
+        let reached = bounded(name, ROOM, self.readiness.wait_for(state)).await?;
+        if reached == Some(state) {
+            return Ok(());
         }
+        let ended = self.ended().await;
+        Err(format!(
+            "the controller ended as {reached:?} before it was {state:?}: {ended}"
+        ))
+    }
+
+    /// How the serve ended, read under a bound: a serve that ends before
+    /// its stop is asked holds the reason in its own result.
+    async fn ended(&mut self) -> String {
+        match bounded("the serve ends", ROOM, self.serve.join_next()).await {
+            Ok(Some(Ok(Ok(())))) => "the serve ended clean".to_owned(),
+            Ok(Some(Ok(Err(error)))) => format!("the serve ended with: {error}"),
+            Ok(Some(Err(error))) => format!("the serve's task ended with: {error}"),
+            Ok(None) => "the serve's task is gone".to_owned(),
+            Err(bound) => bound,
+        }
+    }
+
+    /// The gateway listener's address.
+    pub fn gateway(&self) -> SocketAddr {
+        self.gateway
+    }
+
+    /// Stops the serve under a bound; it must end clean. A serve that
+    /// ended before its stop fails with its own end.
+    pub async fn stop(mut self) -> Result<(), String> {
+        let stop = self.stop.take().ok_or("the serve was stopped already")?;
+        if stop.send(()).is_err() {
+            let ended = self.ended().await;
+            return Err(format!("the serve ended before its stop: {ended}"));
+        }
+        bounded("the serve ends", ROOM, self.serve.join_next())
+            .await?
+            .ok_or("the serve's task is gone")?
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl Harness {
+    /// Starts a lone controller, waits until it leads and connects the
+    /// reference client to its gateway listener.
+    pub async fn start() -> Result<Self, String> {
+        let mut replica = Replica::start("fleet-controller", None).await?;
+        replica.reaches(State::Leader).await?;
+        let gateway = replica.gateway();
         let client = bounded(
             "the client connects to the gateway listener",
             ROOM,
-            PolicyControllerClient::connect(format!("http://{gateway}")),
+            Client::connect(&format!("http://{gateway}"), "fleet-gateway"),
         )
         .await?
         .map_err(|error| error.to_string())?;
         let (stop_feeds, _) = watch::channel(false);
         Ok(Self {
-            store,
+            store: Arc::clone(&replica.store),
+            replica,
             client,
             engines: Vec::new(),
             members: HashMap::new(),
@@ -498,21 +577,30 @@ impl Harness {
             buffers: ViewBuffers::default(),
             stop_feeds,
             feeds: JoinSet::new(),
-            stop_serve: Some(stop_serve),
-            serve,
         })
     }
 
-    /// Ask: who leads, as the generated client hears it on the gateway
+    /// Ask: who leads, as the reference client hears it on the gateway
     /// listener.
     pub async fn leader(&mut self) -> Result<LeaderInfo, String> {
-        let asked = self.client.leader(LeaderRequest {
-            model: String::new(),
-        });
-        bounded("the leader call answers", ROOM, asked)
+        bounded("the leader call answers", ROOM, self.client.leader())
             .await?
-            .map(tonic::Response::into_inner)
-            .map_err(|status| status.to_string())
+            .map_err(|error| error.to_string())
+    }
+
+    /// The welcome that answered the harness's client.
+    pub fn welcome(&self) -> &Welcome {
+        self.client.welcome()
+    }
+
+    /// The term floor the harness's client holds.
+    pub fn term_floor(&self) -> u64 {
+        self.client.term_floor()
+    }
+
+    /// The gateway listener's address.
+    pub fn gateway(&self) -> SocketAddr {
+        self.replica.gateway()
     }
 
     /// Register: starts one mock engine per shape and registers each of its
@@ -794,16 +882,6 @@ impl Harness {
                 self.kill(engine).await?;
             }
         }
-        let stop = self
-            .stop_serve
-            .take()
-            .ok_or("the serve was stopped already")?;
-        stop.send(())
-            .map_err(|()| "the serve ended before its stop".to_owned())?;
-        bounded("the serve ends", ROOM, self.serve.join_next())
-            .await?
-            .ok_or("the serve's task is gone")?
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())
+        self.replica.stop().await
     }
 }

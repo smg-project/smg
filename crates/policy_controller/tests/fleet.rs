@@ -35,12 +35,18 @@ use std::{
 };
 
 use engines::cpu_seconds;
-use fleet::{within, DialEnd, Harness, Shape, DIAL_TIMEOUT, POLL_INTERVAL, PROBE_INTERVAL, ROOM};
+use fleet::{
+    within, DialEnd, Harness, Replica, Shape, DIAL_TIMEOUT, POLL_INTERVAL, PROBE_INTERVAL, ROOM,
+};
 use net::vm_rss_kib;
 use smg_policy_controller::{
+    client::{self, blocking, Client},
+    controller::{State, PROTOCOL_VERSION},
+    proto::principal,
     store::WorkerStatus,
     view::{Role, SignalSource},
 };
+use tokio::sync::oneshot;
 
 const MODEL: &str = "fleet-model";
 
@@ -86,13 +92,45 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         let cpu = cpu_seconds();
         let mut harness = Harness::start().await.expect("the harness starts");
 
-        // Ask. The one call the service answers today, end to end.
+        // The session. The leader welcomed the client's hello under the name
+        // every call of the client states.
+        let welcome = harness.welcome();
+        assert_eq!(welcome.protocol, PROTOCOL_VERSION, "{welcome:?}");
+        assert_eq!(welcome.controller_id, "fleet-controller");
+        let told = welcome
+            .principal
+            .as_ref()
+            .expect("a welcome names its session's principal");
+        assert_eq!(
+            (told.subject.as_str(), told.scope(), told.method()),
+            (
+                "fleet-gateway",
+                principal::Scope::Gateway,
+                principal::Method::AsTold
+            ),
+            "{told:?}"
+        );
+        assert!(
+            welcome.grace_period_ms > 0 && welcome.leader_poll_ms > 0,
+            "a welcome names its periods: {welcome:?}"
+        );
+        assert!(
+            harness.term_floor() >= 1,
+            "the client's floor stands at an answered term before it asks again"
+        );
+
+        // Ask: who leads, end to end.
         let leader = harness.leader().await.expect("the leader call");
         assert!(leader.is_leader, "a lone controller leads: {leader:?}");
         assert_eq!(leader.controller_id, "fleet-controller");
         assert!(
             leader.term >= 1,
             "a leader answers under a term: {leader:?}"
+        );
+        assert_eq!(
+            harness.term_floor(),
+            leader.term,
+            "the client's floor is the leader's term"
         );
 
         // Register. Every rank is a row at once: none healthy before a
@@ -359,6 +397,104 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         writeln!(out, "FLEET_RSS_KIB {}", vm_rss_kib()).expect("stdout");
 
         harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// The blocking form of the reference client asks the same started
+/// controller from a thread that runs no runtime, and holds the same floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own() {
+    let case = async {
+        let harness = Harness::start().await.expect("the harness starts");
+        let address = format!("http://{}", harness.gateway());
+        let (answered, answer) = oneshot::channel();
+        std::thread::spawn(move || {
+            let asked =
+                blocking::Client::connect(&address, "blocking-gateway").and_then(|mut client| {
+                    let leader = client.leader()?;
+                    let subject = client
+                        .welcome()
+                        .principal
+                        .as_ref()
+                        .map(|told| told.subject.clone());
+                    Ok((leader, client.term_floor(), subject))
+                });
+            let _ = answered.send(asked.map_err(|error| error.to_string()));
+        });
+        let (leader, floor, subject) = tokio::time::timeout(ROOM, answer)
+            .await
+            .expect("the blocking client answers inside its bound")
+            .expect("the client's thread sends its answer")
+            .expect("the blocking client's calls");
+        assert!(leader.is_leader, "a lone controller leads: {leader:?}");
+        assert_eq!(leader.controller_id, "fleet-controller");
+        assert_eq!(floor, leader.term, "the floor is the leader's term");
+        assert_eq!(
+            subject.as_deref(),
+            Some("blocking-gateway"),
+            "the welcome names the gateway the client states"
+        );
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// A replica that does not lead refuses the client's session and names the
+/// leader: two controllers elect over one lease file, and the client dials
+/// each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_client_at_a_replica_that_does_not_lead_is_told_the_leader() {
+    let case = async {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lease = dir.path().join("lease");
+        let mut leader = Replica::start("replica-a", Some(&lease))
+            .await
+            .expect("the first replica starts");
+        leader
+            .reaches(State::Leader)
+            .await
+            .expect("the first replica leads");
+        let mut follower = Replica::start("replica-b", Some(&lease))
+            .await
+            .expect("the second replica starts");
+        follower
+            .reaches(State::Follower)
+            .await
+            .expect("the second replica follows");
+
+        let at_follower = format!("http://{}", follower.gateway());
+        let refused = tokio::time::timeout(ROOM, Client::connect(&at_follower, "pair-gateway"))
+            .await
+            .expect("the follower answers inside its bound");
+        let address = match refused {
+            Ok(welcomed) => Err(format!("it welcomed the gateway: {welcomed:?}")),
+            Err(client::Error::NotLeader(address)) => Ok(address),
+            Err(other) => Err(other.to_string()),
+        }
+        .expect("a replica that does not lead names the leader");
+        assert_eq!(
+            address,
+            leader.gateway().to_string(),
+            "the address is the leader's gateway listener"
+        );
+
+        let welcomed = tokio::time::timeout(
+            ROOM,
+            Client::connect(&format!("http://{address}"), "pair-gateway"),
+        )
+        .await
+        .expect("the leader answers inside its bound")
+        .expect("the leader welcomes the gateway its follower sent on");
+        assert_eq!(welcomed.welcome().controller_id, "replica-a");
+        drop(welcomed);
+
+        follower.stop().await.expect("the follower stops clean");
+        leader.stop().await.expect("the leader stops clean");
     };
     tokio::time::timeout(CASE, case)
         .await

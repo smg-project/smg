@@ -79,6 +79,8 @@
 pub mod affinity;
 pub mod builtins;
 pub mod catalog;
+#[cfg(feature = "client")]
+pub mod client;
 #[cfg(feature = "controller")]
 pub mod controller;
 pub mod decision;
