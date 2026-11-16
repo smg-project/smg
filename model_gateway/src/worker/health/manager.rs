@@ -61,6 +61,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT: usize = 32;
 const MAX_CONCURRENT_HEALTH_PROBES: usize = 128;
 
+/// The longest delay the schedule holds, and the longest probe interval or
+/// probe timeout the worker API takes: thirty years, which no process
+/// outlives. The schedule adds a delay to its clock, and the clock cannot
+/// hold every sum a caller's number makes.
+pub(crate) const MAX_PROBE_DELAY: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
+
 /// Result of a fan-out request to a single worker
 struct WorkerResponse {
     url: String,
@@ -419,12 +425,19 @@ fn schedule_at(
     match slot {
         ProbeSlot::Probe(interval) => {
             let delay = if immediate { Duration::ZERO } else { interval };
-            next_check.insert(worker_id, now + delay);
+            next_check.insert(worker_id, deadline_after(now, delay));
         }
         ProbeSlot::Unprobed | ProbeSlot::Removal => {
             next_check.remove(&worker_id);
         }
     }
+}
+
+/// `now + delay`, the delay capped at [`MAX_PROBE_DELAY`]: a deadline that
+/// far out never comes, and the sum of the clock and a longer delay may not
+/// exist.
+fn deadline_after(now: tokio::time::Instant, delay: Duration) -> tokio::time::Instant {
+    now + delay.min(MAX_PROBE_DELAY)
 }
 
 /// Background task body: deadline-driven probe loop + event subscription.
@@ -482,11 +495,9 @@ async fn run_health_loop(
             }
         }
 
-        let sleep_until = next_check
-            .values()
-            .min()
-            .copied()
-            .unwrap_or_else(|| now + Duration::from_secs(config.default_check_interval_secs));
+        let sleep_until = next_check.values().min().copied().unwrap_or_else(|| {
+            deadline_after(now, Duration::from_secs(config.default_check_interval_secs))
+        });
 
         tokio::select! {
             Some(completion) = probes.next(), if !probes.is_empty() => {
@@ -560,7 +571,7 @@ async fn run_health_loop(
                             let gap = Duration::from_secs(
                                 worker.metadata().health_config.timeout_secs.max(1),
                             );
-                            let due = tokio::time::Instant::now() + gap;
+                            let due = deadline_after(tokio::time::Instant::now(), gap);
                             next_check
                                 .entry(worker_id)
                                 .and_modify(|deadline| *deadline = (*deadline).min(due))
@@ -737,7 +748,7 @@ fn queue_due_probes(
         };
 
         let expected_revision = worker.revision();
-        next_check.insert(worker_id.clone(), now + interval);
+        next_check.insert(worker_id.clone(), deadline_after(now, interval));
         in_flight.insert(worker_id.clone());
         probes.push(Box::pin(async move {
             let probe_result = worker.check_health_async().await;
