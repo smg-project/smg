@@ -159,10 +159,9 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown}: {e}")))?;
+    let resp = req.send().await.map_err(|e| {
+        MetadataError::Failed(format!("Failed to connect to {shown}: {}", e.without_url()))
+    })?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(MetadataError::NotOffered);
     }
@@ -1349,5 +1348,22 @@ mod tests {
             )),
             "{err}"
         );
+    }
+
+    /// An address registered with a query, at a port nobody listens on: the
+    /// failure does not repeat the query. The HTTP client's own error text
+    /// ends with the request URL, the query kept.
+    #[tokio::test]
+    async fn a_refused_connection_goes_without_the_clients_url() {
+        use crate::worker::test_support::RefusedAddress;
+
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}?token=s3cret", refused.http_url());
+
+        let err = get_server_info(&http_client(), &url, None)
+            .await
+            .expect_err("nothing listens at the address");
+
+        assert!(!err.contains("s3cret"), "{err}");
     }
 }

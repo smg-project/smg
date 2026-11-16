@@ -49,7 +49,7 @@ pub(in crate::worker) async fn admin_http_post(
     match req.send().await {
         Ok(resp) if resp.status().is_success() => Ok(()),
         Ok(resp) => Err(failed(&url, operation, format!("HTTP {}", resp.status()))),
-        Err(e) => Err(failed(&url, operation, e.to_string())),
+        Err(e) => Err(failed(&url, operation, e.without_url().to_string())),
     }
 }
 
