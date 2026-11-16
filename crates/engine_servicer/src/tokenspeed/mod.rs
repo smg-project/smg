@@ -31,7 +31,7 @@ use tonic::service::Routes;
 use crate::{
     engine_link::{EngineLink, TokenizerSlot},
     health_probe,
-    kv_events::{record_with_queue, KvEventRelay, RankLoads},
+    kv_events::{record_with_queue, KvEventRelay, RankLoads, TOKENSPEED_DISABLED_MESSAGE},
     metrics::{Identity, ServicerMetrics},
     servicer::{self, Shared, WireState},
     ServicerConfig, ServicerError,
@@ -322,6 +322,11 @@ pub(super) struct State {
     /// How long `HealthCheck`'s probe waits for the scheduler
     /// ([`HEALTH_CHECK_TIMEOUT_ENV`]).
     pub(super) health_probe_timeout: Duration,
+    /// What `SubscribeKvEvents` is refused with when no publisher is
+    /// relayed: the launcher's line for a publisher it left off for the
+    /// model's sake (`kv_events_left_off` in the server args), else the
+    /// wire's standing text.
+    pub(super) kv_events_disabled: String,
 }
 
 impl WireState for State {
@@ -390,6 +395,15 @@ impl TokenSpeedServicerServer {
             config.servicer.metrics_bind_address.is_some(),
         )?;
         let encode_role = encode_role(&config.model)?;
+        let server_args: serde_json::Value =
+            serde_json::from_str(&config.model.server_args_json).unwrap_or_default();
+        let kv_events_disabled = server_args
+            .get("kv_events_left_off")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|left_off| !left_off.is_empty())
+            .unwrap_or(TOKENSPEED_DISABLED_MESSAGE)
+            .to_string();
         let state = Arc::new(State {
             model: config.model,
             shared: Shared::new(
@@ -401,6 +415,7 @@ impl TokenSpeedServicerServer {
             tokenizer: TokenizerSlot::new(),
             encode_role,
             health_probe_timeout: health_probe::timeout_from_env(HEALTH_CHECK_TIMEOUT_ENV),
+            kv_events_disabled,
         });
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));

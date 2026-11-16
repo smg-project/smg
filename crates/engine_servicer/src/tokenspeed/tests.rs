@@ -1752,7 +1752,7 @@ async fn control_rpcs_report_what_the_wire_cannot_carry() {
         .await
         .expect_err("no publisher");
     assert_eq!(events.code(), Code::Unimplemented);
-    assert_eq!(events.message(), kv_events::TOKENSPEED_DISABLED_MESSAGE);
+    assert_eq!(events.message(), TOKENSPEED_DISABLED_MESSAGE);
     let bundle = h
         .client
         .get_tokenizer(common::GetTokenizerRequest::default())
