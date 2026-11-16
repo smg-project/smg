@@ -2166,10 +2166,8 @@ impl StreamingProcessor {
     /// keeps the thinking block, its start, its signature and its stop, and no text); the stop
     /// reason when a `Finish` was among the events. The machine writes into the stream's `blocks`
     /// buffer, emptied here before the step: one buffer serves every step, as `buffer` does.
-    /// A step that is one text delta into the open text block, the steady state of a streamed
-    /// answer, goes straight from the borrowed text into the buffer ([`Self::write_text_delta`])
-    /// when the machine says it would send exactly that
-    /// ([`adapt::messages::Stream::direct_text_index`]): no owned event and no `String` per delta.
+    /// The step that is one text delta into the open text block does not come here:
+    /// `MessagesStream::read_chunk` writes it from the borrowed text.
     /// A `tool_use` block's `input_json_delta`s leave under the stream's object rule (`input`,
     /// [`ToolInput`]): the machine hands a call's fragments over as written, as the fold hands the
     /// buffered answer the whole value, and the gateway keeps the block an object on both,
@@ -2184,12 +2182,6 @@ impl StreamingProcessor {
         ),
         events: &[Event<'_>],
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
-        if let [Event::Content(text)] = events {
-            if let Some(index) = machine.direct_text_index(&text.text) {
-                Self::write_text_delta(tx, buffer, index, &text.text).await?;
-                return Ok(None);
-            }
-        }
         let mut stop = None;
         blocks.clear();
         for event in events {
@@ -2260,7 +2252,7 @@ impl StreamingProcessor {
 
     /// Write the `text_delta` event of `text` for the open block `index` into
     /// `buffer`, from the borrowed text: the common delta of a Symphony Messages
-    /// stream ([`Self::send_symphony_blocks`]), the same bytes as the event's
+    /// stream (`MessagesStream::read_chunk`), the same bytes as the event's
     /// frame; it leaves as [`Self::write_messages_event`]'s writes do.
     async fn write_text_delta(
         tx: &SseSender,
@@ -5543,25 +5535,37 @@ impl<'a> MessagesStream<'a> {
         let mut chunk_tokens = chunk.token_ids().len() as u32;
 
         if let Some((reader, machine)) = self.symphony.as_mut() {
-            let mut delta = std::mem::take(&mut self.delta);
             let mut events: Events<'_> = std::mem::take(&mut self.spare);
             let should_stop = reader.read(
                 &mut self.stop_decoder,
                 chunk.token_ids(),
-                &mut delta,
+                &mut self.delta,
                 &mut events,
             )?;
-            self.parsed_thinking_tokens += reasoning_text_tokens(events.as_slice());
-            self.symphony_stop = StreamingProcessor::send_symphony_blocks(
-                self.tx,
-                &mut self.sse_buffer,
-                (machine, &mut self.machine_blocks, &mut self.machine_input),
-                events.as_slice(),
-            )
-            .await?
-            .or_else(|| self.symphony_stop.take());
+            // One text delta into the open text block is the steady state of a streamed answer:
+            // it goes from the borrowed text into the buffer, with no owned event, no `String`
+            // and no pass through the machine, when the machine would send exactly that.
+            let direct = match events.as_slice() {
+                [Event::Content(text)] => machine
+                    .direct_text_index(&text.text)
+                    .map(|index| (index, &*text.text)),
+                _ => None,
+            };
+            if let Some((index, text)) = direct {
+                StreamingProcessor::write_text_delta(self.tx, &mut self.sse_buffer, index, text)
+                    .await?;
+            } else {
+                self.parsed_thinking_tokens += reasoning_text_tokens(events.as_slice());
+                self.symphony_stop = StreamingProcessor::send_symphony_blocks(
+                    self.tx,
+                    &mut self.sse_buffer,
+                    (machine, &mut self.machine_blocks, &mut self.machine_input),
+                    events.as_slice(),
+                )
+                .await?
+                .or_else(|| self.symphony_stop.take());
+            }
             self.spare = events.recycle();
-            self.delta = delta;
             if should_stop {
                 self.note_local_stop();
                 self.close_on_local_stop(chunk);

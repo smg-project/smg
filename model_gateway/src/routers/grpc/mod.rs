@@ -29,8 +29,9 @@ pub(crate) mod testing;
 #[cfg(any(test, feature = "test-util"))]
 pub mod tokenizer_cache;
 pub mod utils; // Used by routers/http and bindings/golang
-/// The stream state machines' benchmark seams: what `benches/stream_state_machines.rs` and
-/// `benches/forced_call_stream.rs` drive, compiled for the crate's test targets only.
+/// The stream state machines' benchmark seams: what `benches/stream_state_machines.rs`,
+/// `benches/forced_call_stream.rs` and `benches/symphony_messages_stream.rs` drive, compiled
+/// for the crate's test targets only.
 #[cfg(any(test, feature = "test-util"))]
 pub use regular::streaming::bench::{EngineScript, ForcedChat, StreamBench};
 pub(crate) mod wire;
