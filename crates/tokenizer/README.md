@@ -70,10 +70,10 @@ as of `tokenizer/src/*`.
   `apply_chat_template_with_encoding` the template's tokens are tokens and a spelling typed into
   a message, a tool, a document or a template argument stays text, also when it is typed in two
   parts the template joins. The second kind is recognised at load from the template itself and
-  only when the marks cover every control it writes on a few probe conversations and the
-  template does not search request text for one; any other checkpoint renders and encodes as
-  before. The flat `encode` of a rendered text reads a spelling
-  as its token.
+  only when the marks cover every control it writes on a few probe conversations, no constant
+  takes its value from a request argument, and the template does not search request text for
+  one; any other checkpoint renders and encodes as before. The flat `encode` of a rendered text
+  reads a spelling as its token.
 - GLM-5.3 and GLM-5.3-Flash use native Rust chat rendering when checkpoint metadata and
   the template matches the current official one. Any other template keeps MiniJinja.
 

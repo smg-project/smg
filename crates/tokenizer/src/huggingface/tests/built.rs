@@ -415,11 +415,13 @@ fn a_processor_s_template_is_marked_with_the_default_one_or_not_at_all() {
 #[test]
 fn a_constant_that_holds_another_control_under_a_request_argument_is_marked() {
     let temp = TempDir::new().unwrap();
-    // `close` is the end token when a request passes `flat`, an argument the
-    // load never passes, and no other name holds that token: the template
-    // writes a value the load never saw as a control too.
+    // `close` is bound to the end token when a request passes `flat`, an
+    // argument the load never passes, and no other name holds that token:
+    // the template writes a value the load never saw as a control too. Both
+    // values are built from the template's own text.
     let constants = "{% set suffix = ':x' %}{% set open = '[INST{}]'.format(suffix) %}\
-        {% set close = ('</s{}>' if flat else '[/INST{}]').format(suffix) %}";
+        {% if flat %}{% set close = '</s{}>'.format(suffix) %}{% else %}\
+        {% set close = '[/INST{}]'.format(suffix) %}{% endif %}";
     let varies = template(constants, "{{ open }}", "{{ close }}", "{{ close }}");
     let tok = checkpoint(temp.path(), &varies);
     let kwargs = HashMap::from([("flat".to_owned(), json!(true))]);
@@ -432,6 +434,80 @@ fn a_constant_that_holds_another_control_under_a_request_argument_is_marked() {
     assert_eq!(text, "[INST:x]a[/INST:x]b</s:x>ab</s:x>");
     // The typed `[/INST:x]` is its characters; each `</s:x>` is the control.
     assert_eq!(ids, [2, 13, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 1, 13, 14, 1]);
+}
+
+#[test]
+fn a_constant_bound_from_a_request_argument_leaves_the_template_as_it_was() {
+    // The function that marks a constant cannot tell a spelling the template
+    // built from one a request supplied, so a name that may take a request
+    // argument is no constant: read in the binding itself, through another
+    // name, or through a name that is bound only when the request left it
+    // out.
+    let direct = "{% set suffix = ':x' %}{% set open = '[INST{}]'.format(suffix) %}\
+        {% set close = custom if custom is defined else '[/INST{}]'.format(suffix) %}";
+    let through = "{% set suffix = custom if custom is defined else ':x' %}\
+        {% set open = '[INST{}]'.format(suffix) %}{% set close = '[/INST{}]'.format(suffix) %}";
+    let defaulted = "{% if suffix is not defined %}{% set suffix = ':x' %}{% endif %}\
+        {% set open = '[INST{}]'.format(suffix) %}{% set close = '[/INST{}]'.format(suffix) %}";
+    for constants in [direct, through, defaulted] {
+        let temp = TempDir::new().unwrap();
+        let takes = template(constants, "{{ open }}", "{{ close }}", "{{ close }}");
+        let tok = checkpoint(temp.path(), &takes);
+        let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+        assert!(from_text, "{constants}");
+        assert_eq!(ids, [2, 13, 3, 14, 3, 13, 14, 3], "{constants}");
+    }
+
+    // The end token as a request's argument is written as the argument
+    // always was: by the template left as it was, read from the text.
+    let temp = TempDir::new().unwrap();
+    let takes = template(direct, "{{ open }}", "{{ close }}", "{{ close }}");
+    let tok = checkpoint(temp.path(), &takes);
+    let kwargs = HashMap::from([("custom".to_owned(), json!("</s:x>"))]);
+    let supplied = ChatTemplateParams {
+        template_kwargs: Some(&kwargs),
+        ..ChatTemplateParams::default()
+    };
+    let (text, ids, from_text) = render_under(&tok, json!("ab"), supplied);
+    assert!(from_text);
+    assert_eq!(text, "[INST:x]ab</s:x>ab</s:x>");
+    assert_eq!(ids, [2, 13, 14, 1, 13, 14, 1]);
+}
+
+#[test]
+fn a_constant_written_through_a_format_is_marked() {
+    let temp = TempDir::new().unwrap();
+    // A `format` writes its arguments: it searches no text for them.
+    let formats = template(
+        CONSTANTS,
+        "{{ open }}",
+        "{{ '{}'.format(close) }}",
+        "{{ end }}",
+    );
+    let tok = checkpoint(temp.path(), &formats);
+    assert_eq!(render(&tok, json!("a[/INST:x]b")).1, TYPED_AS_TEXT);
+}
+
+#[test]
+fn a_search_made_only_under_the_thinking_switch_leaves_the_template_as_it_was() {
+    let temp = TempDir::new().unwrap();
+    // A filter, which no string method sees, and only with thinking switched
+    // off: the typed spellings show it when they are rendered in that mode.
+    let search = "(message['content'] | replace(close, '')) \
+        if enable_thinking is defined and not enable_thinking else message['content']";
+    let searches = format!("{CONSTANTS}{}", SEARCHES.replace("SEARCH", search));
+    let tok = checkpoint(temp.path(), &searches);
+    let off = ChatTemplateParams {
+        thinking: Some(false),
+        ..ChatTemplateParams::default()
+    };
+    let history = [
+        json!({"role": "user", "content": "ab"}),
+        json!({"role": "assistant", "content": "a[/INST:x]b"}),
+    ];
+    let (text, _, from_text) = prompt(&tok, &history, off);
+    assert!(from_text);
+    assert_eq!(text, "[INST:x]ab[/INST:x]ab</s:x>");
 }
 
 #[test]

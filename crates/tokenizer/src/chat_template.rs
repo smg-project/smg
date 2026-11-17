@@ -1812,32 +1812,36 @@ const CONTROL_CONSTANT: &str = "control_constant";
 const VALUE_SEPARATOR: u8 = 0x1f;
 
 /// The root `set` statements of `source`, a chat template, that bind a plain
-/// name: the name and the byte span of the expression, for the statements at
-/// the top level and under a top-level `if`, where a template binds the
-/// names its whole render reads. Empty when the template does not parse.
-fn root_sets(source: &str) -> Vec<(&str, usize, usize)> {
+/// name, in the template's order: the name, the byte span of the expression,
+/// and whether the statement stands under a top-level `if` (it may not
+/// run); for the statements at the top level and under a top-level `if`,
+/// where a template binds the names its whole render reads. Empty when the
+/// template does not parse.
+fn root_sets(source: &str) -> Vec<(&str, usize, usize, bool)> {
     let mut sets = Vec::new();
     if let Ok(ast) = parse(source, "chat", SyntaxConfig {}, WhitespaceConfig::default()) {
-        root_set_expressions(&ast, source, &mut sets);
+        root_set_expressions(&ast, source, false, &mut sets);
     }
     sets
 }
 
-/// [`root_sets`] of the statements under `stmt`.
+/// [`root_sets`] of the statements under `stmt`, itself under a top-level
+/// `if` or not (`conditional`).
 fn root_set_expressions<'a>(
     stmt: &Stmt<'a>,
     source: &'a str,
-    sets: &mut Vec<(&'a str, usize, usize)>,
+    conditional: bool,
+    sets: &mut Vec<(&'a str, usize, usize, bool)>,
 ) {
     match stmt {
         Stmt::Template(template) => {
             for child in &template.children {
-                root_set_expressions(child, source, sets);
+                root_set_expressions(child, source, conditional, sets);
             }
         }
         Stmt::IfCond(cond) => {
             for child in cond.true_body.iter().chain(&cond.false_body) {
-                root_set_expressions(child, source, sets);
+                root_set_expressions(child, source, true, sets);
             }
         }
         Stmt::Set(set) => {
@@ -1860,7 +1864,7 @@ fn root_set_expressions<'a>(
                 return;
             };
             let expression = rest[assign + 1..].trim_start();
-            sets.push((target.id, end - expression.len(), end));
+            sets.push((target.id, end - expression.len(), end, conditional));
         }
         _ => {}
     }
@@ -1873,7 +1877,7 @@ fn wrap_control_constants(source: &str, names: &HashSet<&str>) -> Option<String>
     let mut spans: Vec<(usize, usize)> = root_sets(source)
         .into_iter()
         .filter(|(name, ..)| names.contains(*name))
-        .map(|(_, start, end)| (start, end))
+        .map(|(_, start, end, _)| (start, end))
         .collect();
     if spans.is_empty() {
         return None;
@@ -1894,16 +1898,53 @@ fn wrap_control_constants(source: &str, names: &HashSet<&str>) -> Option<String>
     Some(wrapped)
 }
 
+/// The names among `sets`, the root `set` statements of `source`
+/// ([`root_sets`]), that no request reaches: every statement that binds one
+/// reads only literals and names that such statements bound at the top level
+/// before it. A control constant is one of them: the function that marks its
+/// value cannot tell a spelling the template built from one a request
+/// argument carried
+/// (`{% set close = custom if custom is defined else '</s>' %}`).
+fn request_free_names<'a>(
+    source: &'a str,
+    sets: &[(&'a str, usize, usize, bool)],
+) -> HashSet<&'a str> {
+    let env = Environment::new();
+    // `bound`: free and sure to be bound from here on, so a read of the
+    // name finds the template's value and never a request argument's.
+    let (mut free, mut bound, mut reached) = (HashSet::new(), HashSet::new(), HashSet::new());
+    for &(name, start, end, conditional) in sets {
+        let expression = format!("{{{{ {} }}}}", &source[start..end]);
+        let reads_free = env.template_from_str(&expression).is_ok_and(|template| {
+            template
+                .undeclared_variables(false)
+                .iter()
+                .all(|read| bound.contains(read.as_str()))
+        });
+        if reads_free && !reached.contains(name) {
+            free.insert(name);
+            if !conditional {
+                bound.insert(name);
+            }
+        } else {
+            free.remove(name);
+            bound.remove(name);
+            reached.insert(name);
+        }
+    }
+    free
+}
+
 /// Whether a call of the string method `method` with `args` searches a text
 /// for a value that holds a mark: the separator of a split, the prefix of a
 /// start test, the text a replacement takes out. Between marks a control
 /// spelling is no longer found in the text a request sends (see
-/// [`ChatTemplateState::marks_every_control`]). A `join` writes its
-/// argument's parts and a replacement writes its second argument: those are
-/// no searches.
+/// [`ChatTemplateState::marks_every_control`]). A `join` and a `format`
+/// write their arguments and a replacement writes its second argument:
+/// those are no searches.
 fn searches_for_a_mark(method: &str, args: &[Value]) -> bool {
     let sought = match method {
-        "join" => return false,
+        "join" | "format" => return false,
         "replace" => args.get(..1).unwrap_or_default(),
         _ => args,
     };
@@ -3717,13 +3758,14 @@ impl ChatTemplateState {
     /// The templates (this one, the `tool_use` one, the processor's) are
     /// marked together or not at all, and only when the marks are complete
     /// on the probe conversations ([`Self::marks_every_control`]): a template
-    /// that spells a control whole, builds one where it writes it, or
-    /// searches request text for one stays as it is, its prompts encoded
-    /// from their text as before. Every reading is made through copies of
-    /// the templates ([`Self::twin`]), so the render of a request carries
-    /// nothing for it. `controls`, the matcher over the added tokens, is
-    /// asked for only once a template has a control constant its source does
-    /// not spell, so a checkpoint without one never builds it.
+    /// that spells a control whole, builds one where it writes it, binds one
+    /// from a request argument, or searches request text for one stays as it
+    /// is, its prompts encoded from their text as before. Every reading is
+    /// made through copies of the templates ([`Self::twin`]), so the render
+    /// of a request carries nothing for it. `controls`, the matcher over the
+    /// added tokens, is asked for only once a template has a control
+    /// constant its source does not spell, so a checkpoint without one never
+    /// builds it.
     /// Returns whether the templates are now marked.
     pub(crate) fn mark_built_controls<'a>(
         &mut self,
@@ -3802,8 +3844,10 @@ impl ChatTemplateState {
     /// template builds the value. The template engine says them: a copy of
     /// the source that writes every root name behind the template's own
     /// output ([`VALUE_SEPARATOR`]) renders the turn. None when the source
-    /// spells one of them whole: that template is of the other kind, and it
-    /// says so here, before the matcher over the added tokens is asked for.
+    /// spells one of them whole, or when a statement that binds one may read
+    /// a request argument ([`request_free_names`]): that template is of the
+    /// other kind, and it says so here, before the matcher over the added
+    /// tokens is asked for.
     fn control_constants(
         &self,
         is_control: &dyn Fn(&str) -> bool,
@@ -3817,10 +3861,8 @@ impl ChatTemplateState {
             return Vec::new();
         };
         let source = template.source();
-        let mut names: Vec<&str> = root_sets(source)
-            .into_iter()
-            .map(|(name, ..)| name)
-            .collect();
+        let sets = root_sets(source);
+        let mut names: Vec<&str> = sets.iter().map(|(name, ..)| *name).collect();
         names.sort_unstable();
         names.dedup();
         // A template that binds no root name builds no constant: nothing is
@@ -3870,6 +3912,15 @@ impl ChatTemplateState {
         {
             return Vec::new();
         }
+        if !constants.is_empty() {
+            let free = request_free_names(source, &sets);
+            if constants
+                .iter()
+                .any(|(name, _)| !free.contains(name.as_str()))
+            {
+                return Vec::new();
+            }
+        }
         constants
     }
 
@@ -3898,8 +3949,9 @@ impl ChatTemplateState {
         let names: HashSet<&str> = constants.iter().map(|(name, _)| name.as_str()).collect();
         let mut marked = build_environment(wrap_control_constants(source, &names)?).ok()?;
         // The spellings the bare turn showed stand ready between marks. A
-        // name may hold another control under request arguments the load
-        // never passed: that one is marked as it comes.
+        // name may be bound to another control under request arguments the
+        // load never passed: that one is marked as it comes. Either is built
+        // from the template's own text (`request_free_names`).
         let ready: HashMap<String, Value> = constants
             .iter()
             .map(|(_, spelling)| (spelling.clone(), Value::from(marks::mark(spelling))))
@@ -3957,13 +4009,13 @@ impl ChatTemplateState {
     /// encoded as it was. A render this template refuses is not judged; the
     /// bare turn must render, and a control must be written.
     ///
-    /// On the same conversations with every spelling the template may hold
-    /// between marks (its constants', the special tokens') typed into every
-    /// string, `marked` must again write this template's text: a template
-    /// that looks for one of them in request text would no longer find the
-    /// spelling a request sends, and would keep text it drops today. The
-    /// string methods say the same of a search no typed string triggers
-    /// ([`searches_for_a_mark`], read by the caller).
+    /// On the same conversations in the same modes, with every spelling the
+    /// template may hold between marks (its constants', the special tokens')
+    /// typed into every string, `marked` must again write this template's
+    /// text: a template that looks for one of them in request text would no
+    /// longer find the spelling a request sends, and would keep text it
+    /// drops today. The string methods say the same of a search no typed
+    /// string triggers ([`searches_for_a_mark`], read by the caller).
     fn marks_every_control(
         &self,
         marked: &Self,
@@ -3979,14 +4031,40 @@ impl ChatTemplateState {
         } else {
             &[None]
         };
-        let mut writes_a_control = false;
-        for (index, probe) in probes(self.raw_tool_call_arguments, "probe")
+        let spellings: String = constants
             .iter()
+            .map(|(_, spelling)| spelling.as_str())
+            .chain(special_spellings(special_tokens))
+            .collect();
+        let typed_probes = probes(
+            self.raw_tool_call_arguments,
+            &format!("{spellings}probe{spellings}"),
+        );
+        let mut writes_a_control = false;
+        for (index, (probe, typed)) in probes(self.raw_tool_call_arguments, "probe")
+            .iter()
+            .zip(&typed_probes)
             .enumerate()
         {
             for prompt in [true, false] {
                 for thinking in switch {
                     let mode = (prompt, *thinking);
+                    if let Ok((expected, _)) = self.apply_with_continuation(
+                        &typed.messages,
+                        typed.params(special_tokens, now, mode),
+                    ) {
+                        let alike = marked
+                            .apply_with_continuation(
+                                &typed.messages,
+                                typed.params(&marked_tokens, now, mode),
+                            )
+                            .ok()
+                            .and_then(|(rendered, _)| marks::flatten(&rendered).ok())
+                            .is_some_and(|(text, _)| text == expected);
+                        if !alike {
+                            return false;
+                        }
+                    }
                     let Ok((expected, _)) = self.apply_with_continuation(
                         &probe.messages,
                         probe.params(special_tokens, now, mode),
@@ -4012,33 +4090,7 @@ impl ChatTemplateState {
                 }
             }
         }
-        if !writes_a_control {
-            return false;
-        }
-        let spellings: String = constants
-            .iter()
-            .map(|(_, spelling)| spelling.as_str())
-            .chain(special_spellings(special_tokens))
-            .collect();
-        let typed = format!("{spellings}probe{spellings}");
-        probes(self.raw_tool_call_arguments, &typed)
-            .iter()
-            .all(|probe| {
-                let Ok((expected, _)) = self.apply_with_continuation(
-                    &probe.messages,
-                    probe.params(special_tokens, now, with_prompt),
-                ) else {
-                    return true;
-                };
-                marked
-                    .apply_with_continuation(
-                        &probe.messages,
-                        probe.params(&marked_tokens, now, with_prompt),
-                    )
-                    .ok()
-                    .and_then(|(rendered, _)| marks::flatten(&rendered).ok())
-                    .is_some_and(|(text, _)| text == expected)
-            })
+        writes_a_control
     }
 
     /// [`Self::set`] and [`Self::mark_controls`] as one step: the template
