@@ -150,7 +150,10 @@ impl TokenCounts {
     /// no higher than the completion count. A speculative step that lands
     /// past the token limit can be counted whole as reasoning while the
     /// completion count stops at the limit, and a part above the whole is
-    /// no count a client can meter by.
+    /// no count a client can meter by. Each choice's count arrives here
+    /// already read within its own frame's completion count; this bound
+    /// holds the request's sum where the completion count is not the
+    /// frames' own (a generate stream counts the ids it delivered).
     fn reasoning_within_completion(self) -> u32 {
         self.reasoning.min(self.completion)
     }

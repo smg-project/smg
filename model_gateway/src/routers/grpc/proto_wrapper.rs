@@ -443,10 +443,15 @@ macro_rules! engine_response_basics {
             wire_field!(self, c => c.cached_tokens)
         }
 
-        /// Get reasoning tokens.
+        /// Get reasoning tokens: the engine's own count where its wire carries
+        /// one, no higher than the completion count of the same frame. A
+        /// speculative step that lands past the token limit is counted whole
+        /// as reasoning while the completion count stops at the limit; read
+        /// here, every sum, settlement and answer takes a count that was
+        /// possible for its choice. Zero on a wire that carries none.
         pub fn reasoning_tokens(&self) -> u32 {
             match self {
-                Self::Sglang(c) => c.reasoning_tokens,
+                Self::Sglang(c) => c.reasoning_tokens.min(c.completion_tokens),
                 Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
             }
         }

@@ -328,6 +328,9 @@ struct GenerateMetaInfo<'a> {
     logprobs: Option<GenerateLogprobs<'a>>,
     completion_tokens: u32,
     cached_tokens: u32,
+    /// No higher than `completion_tokens` beside it: the stream's own count
+    /// of the ids it delivered for the choice, where the engine's frame
+    /// counts its own.
     reasoning_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     e2e_latency: Option<f64>,
@@ -1007,7 +1010,9 @@ impl StreamingProcessor {
                                 logprobs: None,
                                 completion_tokens: current_completion_tokens,
                                 cached_tokens: chunk.cached_tokens(),
-                                reasoning_tokens: chunk.reasoning_tokens(),
+                                reasoning_tokens: chunk
+                                    .reasoning_tokens()
+                                    .min(current_completion_tokens),
                                 e2e_latency: None,
                             },
                             index,
@@ -1050,7 +1055,9 @@ impl StreamingProcessor {
                                 logprobs: None,
                                 completion_tokens,
                                 cached_tokens: complete.cached_tokens(),
-                                reasoning_tokens: complete.reasoning_tokens(),
+                                reasoning_tokens: complete
+                                    .reasoning_tokens()
+                                    .min(completion_tokens),
                                 e2e_latency: Some(e2e_latency),
                             },
                             index,
@@ -1304,7 +1311,9 @@ impl StreamingProcessor {
                                 }),
                                 completion_tokens: current_completion_tokens,
                                 cached_tokens: chunk.cached_tokens(),
-                                reasoning_tokens: chunk.reasoning_tokens(),
+                                reasoning_tokens: chunk
+                                    .reasoning_tokens()
+                                    .min(current_completion_tokens),
                                 e2e_latency: None,
                             },
                             index,
@@ -1356,7 +1365,9 @@ impl StreamingProcessor {
                                 }),
                                 completion_tokens,
                                 cached_tokens: complete.cached_tokens(),
-                                reasoning_tokens: complete.reasoning_tokens(),
+                                reasoning_tokens: complete
+                                    .reasoning_tokens()
+                                    .min(completion_tokens),
                                 e2e_latency: Some(e2e_latency),
                             },
                             index,
