@@ -402,6 +402,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   field (#5092). Two different texts are refused as a value (`invalid_value`; `param` names the
   message). Breaking: the `ChatMessage::Assistant` field `reasoning_content: Option<String>` is now
   `reasoning: AssistantReasoning`, whose `text` is that option.
+- A Messages answer with a content block of a kind this build does not read (a web fetch, code
+  execution, bash or text editor result, a container upload, or any block the public API adds)
+  parses, the block kept as written in `ContentBlock::Other`, as `ToolUseCaller::Other` keeps an
+  unknown caller. A whole answer with such a block failed: the provider route answered a 502, and
+  a streamed thread turn was left unstored. Breaking: `ContentBlock` gains `Other(Value)`.
 - `EmbeddingRequest` and `ClassifyRequest` keep the fields they do not model in a flattened
   `other` map, as `ChatCompletionRequest` and `CompletionRequest` do, so the HTTP relay forwards an
   embeddings or classify body as the client wrote it (`truncate_prompt_tokens`,
