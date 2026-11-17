@@ -4033,13 +4033,12 @@ mod tests {
     /// A pair's decode profile is a decode row of the pair binding's glob,
     /// whatever phases the binding covers: an engine built by hand may bind
     /// a pair for the prefill phase alone, and a decode decision of that
-    /// model carries the pair's decode profile.
+    /// model carries the pair's decode profile. A pair bound off the prefill
+    /// phase starts no pair: it writes no decode row.
     #[test]
     fn a_pairs_decode_profile_is_a_needs_row_of_the_pairs_glob() {
         #[derive(Debug)]
         struct Fed;
-
-        impl Lifecycle for Fed {}
 
         impl Filter for Fed {
             fn name(&self) -> &'static str {
@@ -4082,6 +4081,27 @@ mod tests {
         );
         assert_eq!(engine.needs_for("pd/x", Phase::Decode), decode);
         assert_eq!(engine.needs_rows(), [("pd/*", Phase::Decode, decode)]);
+        // No prefill lookup resolves to a pair bound for another phase.
+        let fed = Profile {
+            filters: vec![Box::new(Fed)],
+            ..least_requests_profile()
+        };
+        let engine = Engine::new(
+            vec![least_requests_profile(), fed],
+            vec![Binding {
+                model: "pd/*".into(),
+                phases: vec![Phase::Encode],
+                plan: Plan::PdPair,
+                profile: 0,
+                decode_profile: Some(1),
+                sessions: None,
+                overload: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        assert_eq!(engine.needs_for("pd/x", Phase::Decode), Needs::default());
+        assert!(engine.needs_rows().is_empty(), "{:?}", engine.needs_rows());
     }
 
     #[test]

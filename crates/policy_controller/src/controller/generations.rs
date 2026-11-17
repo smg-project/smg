@@ -1761,6 +1761,22 @@ pub(crate) mod tests {
             .expect("the refusal waits on no pass")
             .expect("a verdict");
         assert_eq!(refused.would_run, Err(SpecRejected::TooLarge(over)));
+        // The guard is read ahead of the size: where nothing stands a guard
+        // names no standing digest, under the bound and over it.
+        let guard = format!("sha256:{}", "0".repeat(64));
+        let small = generations.dry_run(&guard, LEAST_LOAD.as_bytes(), Format::Yaml);
+        assert!(
+            matches!(small, Err(Unanswered::Guarded(0, None))),
+            "{small:?}"
+        );
+        let document = vec![b'#'; usize::try_from(over).expect("the bound fits")];
+        let large = generations
+            .dry_run_in_turn(guard, document, Format::Yaml)
+            .await;
+        assert!(
+            matches!(large, Err(Unanswered::Guarded(0, None))),
+            "{large:?}"
+        );
     }
 
     /// A guard longer than a digest's text takes no turn: it names no
@@ -2159,6 +2175,9 @@ pub(crate) mod tests {
         assert_eq!(path(unknown, Format::Json), "colour");
         let missing = r#"{"apiVersion":"smg.policy/v1"}"#;
         assert_eq!(path(missing, Format::Json), "profiles");
+        // A key a nested map wants is joined to the map's own path.
+        let nested = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{}}}"#;
+        assert_eq!(path(nested, Format::Json), "profiles.p.pick");
     }
 
     /// A need the contract's row has no flag for writes no row: the engine
@@ -2204,6 +2223,104 @@ pub(crate) mod tests {
         let engine = spec.validate_in(&stages, &[]).expect("validates");
         assert_eq!(engine.needs_rows().len(), 4, "the column in every phase");
         assert_eq!(needs_summary(&engine), proto::NeedsSummary::default());
+    }
+
+    /// The summary tells each row under its own role and each need under
+    /// its own flag: a pair's prefill row and its decode row part, a row of
+    /// media alone is told, and a sessions rule's key is a row of its
+    /// binding in every phase it covers.
+    #[test]
+    fn the_summary_tells_each_role_and_each_flag_apart() {
+        /// Keeps every worker and reads what it is built to read.
+        #[derive(Debug)]
+        struct Reads(&'static str, crate::Needs);
+
+        impl Filter for Reads {
+            fn name(&self) -> &'static str {
+                self.0
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn needs(&self) -> crate::Needs {
+                self.1
+            }
+        }
+
+        let tokens = crate::Needs {
+            token_hashes: true,
+            ..crate::Needs::default()
+        };
+        let media = crate::Needs {
+            media: true,
+            ..crate::Needs::default()
+        };
+        let mut stages = Catalog::builtin();
+        stages
+            .filter("tokens", move || Box::new(Reads("tokens", tokens)))
+            .expect("a free name")
+            .filter("media", move || Box::new(Reads("media", media)))
+            .expect("a free name");
+        let document = r#"{
+          "apiVersion": "smg.policy/v1",
+          "view": { "headers": ["x-session-id"] },
+          "profiles": {
+            "prefill": { "filter": ["tokens"], "pick": "random" },
+            "decode": { "filter": ["media"], "pick": "random" },
+            "quiet": { "pick": "random" }
+          },
+          "bindings": [
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" } },
+            { "match": { "model": "chat/*" }, "profile": "quiet", "sessions": { "sticky_header": "x-session-id", "ttl_s": 600 } },
+            { "match": { "model": "*" }, "profile": "quiet" }
+          ]
+        }"#;
+        let spec: PolicySpec = serde_json::from_str(document).expect("a document");
+        let engine = spec.validate_in(&stages, &[]).expect("validates");
+        let rows = needs_summary(&engine).models;
+        let row = |model: &str, role: proto::Role| {
+            rows.iter()
+                .find(|row| row.model == model && row.role == i32::from(role))
+                .cloned()
+        };
+        let told = |model: &str, role: proto::Role| proto::ModelNeeds {
+            model: model.to_owned(),
+            role: role.into(),
+            ..proto::ModelNeeds::default()
+        };
+        assert_eq!(
+            row("pd/*", proto::Role::Prefill),
+            Some(proto::ModelNeeds {
+                token_hashes: true,
+                ..told("pd/*", proto::Role::Prefill)
+            })
+        );
+        assert_eq!(
+            row("pd/*", proto::Role::Decode),
+            Some(proto::ModelNeeds {
+                media: true,
+                ..told("pd/*", proto::Role::Decode)
+            })
+        );
+        // The sessions rule reads its key under the view's headers, in
+        // every phase its binding covers.
+        for role in [
+            proto::Role::Single,
+            proto::Role::Prefill,
+            proto::Role::Decode,
+            proto::Role::Encode,
+        ] {
+            assert_eq!(
+                row("chat/*", role),
+                Some(proto::ModelNeeds {
+                    headers: true,
+                    ..told("chat/*", role)
+                })
+            );
+        }
+        assert_eq!(rows.len(), 6, "{rows:?}");
     }
 
     /// A dry run answers what an apply would do at that instant and applies,
@@ -2507,6 +2624,44 @@ pub(crate) mod tests {
         }
         text.push_str(last);
         text.into_bytes()
+    }
+
+    /// The Numbers table's dry-run row: one dry run that would run (parse,
+    /// digest, validate, the feed before and after) by the document's size,
+    /// with the bytes of the needs diff it answers.
+    #[test]
+    #[ignore = "a measurement for the Numbers table, run by name"]
+    fn a_dry_runs_time_by_the_documents_size() {
+        use prost::Message as _;
+
+        const ROUNDS: usize = 15;
+        let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
+        let mut out = std::io::stdout().lock();
+        for size in [2 << 10, 64 << 10, bound - 128] {
+            let (document, bindings) = document_of(size);
+            let (_store, generations) = generations();
+            assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+            let mut micros = Vec::with_capacity(ROUNDS);
+            let mut diff = 0;
+            for _ in 0..ROUNDS {
+                let began = Instant::now();
+                let dry = generations
+                    .dry_run("", &document, Format::Yaml)
+                    .expect("no guard");
+                micros.push(began.elapsed().as_micros());
+                assert_eq!(dry.would_run.map(|(number, _)| number), Ok(2));
+                diff = dry.needs.map_or(0, |needs| needs.encoded_len());
+            }
+            micros.sort_unstable();
+            writeln!(
+                out,
+                "DRY bytes={} bindings={bindings} rounds={ROUNDS} median_us={} worst_us={} diff_bytes={diff}",
+                document.len(),
+                micros[ROUNDS / 2],
+                micros[ROUNDS - 1]
+            )
+            .expect("stdout");
+        }
     }
 
     /// The Numbers table's apply rows: one apply (parse, digest, validate,
