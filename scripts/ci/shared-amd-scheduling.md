@@ -16,8 +16,11 @@ HTTP/gRPC tests with a six-hour job timeout. A manual runtime selection excludes
 unselected engine waves before runner allocation; per-model filters still run
 inside each selected job.
 
-Monday 09:45 AMD PD and ordinary AMD jobs share the same machines and lease with
-the benchmark. Deferred Sunday AMD work can also reach Monday. These waves do
+Monday 07:17 AMD BFCL (when `SMG_RUN_AMD_BFCL` and automatic AMD selection are
+enabled), Monday 09:45 AMD PD and ordinary AMD jobs share the same machines and
+lease with the benchmark. BFCL currently declares five AMD model rows with
+360-minute job caps; it can add substantial queue contention. Deferred Sunday
+AMD work can also reach Monday. These waves do
 not reserve hosts or guarantee queue ordering, a new 24-hour queue allowance,
 or completion on Monday. Work can continue in later legal windows after actual
 Router cleanup and lease admission. The longest retained job in three Sunday
