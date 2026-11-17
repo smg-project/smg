@@ -11,7 +11,7 @@
 //! allocator), so the decode pin counts the large buffers only, per decoder: the TurboJPEG
 //! binding decodes a frame of 256 KiB or more into a buffer from the pool, the fallback
 //! decoder allocates its own. A PNG of an eight-bit layout decodes into a pool buffer under
-//! either.
+//! either, and an alpha channel composited over white is written into one.
 //! The warm pass returns its buffers the way a request does (the frame dropped, the wire
 //! payload sent), so the pins hold the steady state of the buffer pool: a decoded frame or a
 //! wire the pool serves counts no large buffer.
@@ -420,8 +420,8 @@ const PINS: &[Pin] = &[
     Pin {
         class: "png-rgba",
         decode_large: Frames {
-            fallback: 2,
-            turbo: 2,
+            fallback: 1,
+            turbo: 1,
         },
         copy: (1, 1),
         preprocess_calls: Calls {
