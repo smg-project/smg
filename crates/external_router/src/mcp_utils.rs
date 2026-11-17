@@ -1110,6 +1110,42 @@ mod tests {
         );
     }
 
+    /// A server registered after start-up, the way the gateway registers every one of its
+    /// servers, answers for its builtin type; a second server that claims the type does not
+    /// take it; after a shutdown no connected server answers.
+    #[tokio::test]
+    async fn a_builtin_server_registered_after_start_up_is_found_by_its_type() {
+        let builtin = |name: &str, url: String| McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Streamable {
+                url,
+                token: None,
+                headers: HashMap::new(),
+            },
+            proxy: None,
+            required: false,
+            tools: None,
+            builtin_type: Some(BuiltinToolType::WebSearchPreview),
+            builtin_tool_name: Some("echo".to_string()),
+            internal: false,
+        };
+        let orchestrator = McpOrchestrator::new(McpConfig::default()).await.unwrap();
+        let found = || orchestrator.find_builtin_server(BuiltinToolType::WebSearchPreview);
+        assert_eq!(found(), None);
+
+        for name in ["first", "second"] {
+            let url = serve_local_mcp_server(LocalServer::default()).await;
+            orchestrator
+                .connect_static_server(&builtin(name, url))
+                .await
+                .expect("the server connects");
+        }
+        assert_eq!(found(), Some(("first".to_string(), "echo".to_string())));
+
+        orchestrator.shutdown().await;
+        assert_eq!(found(), None);
+    }
+
     /// A refresh publishes its tools before its success. The server refuses
     /// the first listing, then says its tools changed. A reader on its own
     /// thread takes the tools at the first moment it finds no listing error,

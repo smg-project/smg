@@ -3002,6 +3002,62 @@ mod tests {
         );
     }
 
+    /// A session that may route a builtin tool asks for the server of each builtin type, four
+    /// lookups. Each reads an index by type and none walks the server map, so the session's
+    /// allocation calls are the same on a host of any width.
+    #[tokio::test]
+    async fn a_session_that_routes_a_builtin_tool_walks_no_sharded_map() {
+        let server = |name: &str, port: u16| McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Sse {
+                url: format!("http://localhost:{port}/sse"),
+                token: None,
+                headers: Default::default(),
+            },
+            proxy: None,
+            required: false,
+            tools: None,
+            builtin_type: None,
+            builtin_tool_name: None,
+            internal: false,
+        };
+        let orchestrator = McpOrchestrator::new(McpConfig {
+            servers: vec![
+                server("wiki-server", 3000),
+                McpServerConfig {
+                    builtin_type: Some(BuiltinToolType::WebSearchPreview),
+                    builtin_tool_name: Some("brave_web_search".to_string()),
+                    ..server("search-server", 3002)
+                },
+            ],
+            ..Default::default()
+        })
+        .await
+        .expect("orchestrator");
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(
+                "search-server",
+                test_tool("brave_web_search"),
+            ));
+        let bindings = vec![McpServerBinding {
+            label: "search".to_string(),
+            server_key: "search-server".to_string(),
+            allowed_tools: None,
+            list_error: None,
+        }];
+
+        let before = counting_alloc::calls();
+        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        let calls = counting_alloc::calls() - before;
+
+        assert_eq!(session.mcp_tools().len(), 1);
+        assert!(
+            calls < 40,
+            "allocation calls: {calls} for a session that binds a builtin server"
+        );
+    }
+
     /// Allocation calls of the tool descriptors above, today.
     const PINNED_DESCRIPTOR_CALLS: usize = 4643;
 
