@@ -209,14 +209,19 @@ impl GenerateStreamUsage {
         *count
     }
 
-    /// Records an index's `Complete`; the index's completion count.
+    /// Records an index's `Complete`; the index's completion count. The
+    /// reasoning count is kept no higher than that count: the terminal frame
+    /// can count more tokens than the stream delivered for the index, and
+    /// the settlement sums what is kept here.
     fn record_complete(&mut self, complete: &ProtoGenerateComplete) -> u32 {
         let index = complete.index();
+        let delivered = self.completion.get(&index).copied().unwrap_or(0);
         self.prompt = complete.prompt_tokens();
         self.cached = self.cached.max(complete.cached_tokens());
-        self.reasoning.insert(index, complete.reasoning_tokens());
+        self.reasoning
+            .insert(index, complete.reasoning_tokens().min(delivered));
         self.completed.insert(index);
-        self.completion.get(&index).copied().unwrap_or(0)
+        delivered
     }
 
     /// The completion tokens counted so far across every index.
