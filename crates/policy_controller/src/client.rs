@@ -214,13 +214,17 @@ impl Session {
 
     /// Queues one frame after the hello, numbered next and stating `floor`,
     /// within `wait`: a queue the peer stopped draining is a wait for the
-    /// peer. A stream that ended tells the status it ended with.
+    /// peer. A stream that ended tells the status it ended with, and once
+    /// that status was read no frame is numbered or queued.
     async fn send(
         &mut self,
         floor: &mut u64,
         frame: gateway_frame::Frame,
         wait: Duration,
     ) -> Result<(), Error> {
+        if let Some(status) = &self.ended {
+            return Err(status.clone().into());
+        }
         let frame = numbered(self.seq + 1, *floor, frame);
         match answered("the session's queue", wait, self.frames.send(frame)).await? {
             Ok(()) => {
@@ -402,9 +406,10 @@ impl Client {
     /// floor. The client decides nothing and keeps no lease: the report is
     /// its caller's. The frame is queued within the client's bound and
     /// leaves when the connection sends it: a queue with no room in time
-    /// is [`Error::NoAnswer`]. A session the controller ended tells the
-    /// status it ended with here ([`Error::Status`]), the same at each
-    /// report: an `Ok` one after a clean end.
+    /// is [`Error::NoAnswer`]. Once the session's end was read, by
+    /// [`Client::session_end`] or by a report that found the queue closed,
+    /// each report tells the status it ended with ([`Error::Status`]) and
+    /// queues nothing: an `Ok` one after a clean end.
     pub async fn dispatched(&mut self, report: Dispatched) -> Result<(), Error> {
         self.report(gateway_frame::Frame::Dispatched(report)).await
     }
@@ -1192,17 +1197,16 @@ mod tests {
                 "{ask} reads the status the stream ended with: {ended:?}"
             );
         }
-        // The connection drops the ended call's request, which closes the
-        // session's queue: a report made after that tells the same status.
-        timeout(ROOM, session.frames.closed())
-            .await
-            .expect("the ended call's queue closes");
+        // A report made straight after tells the same status and takes no
+        // number, whether or not the connection has dropped the ended
+        // call's request yet.
         let report = gateway_frame::Frame::Released(Released::default());
         let reported = session.send(&mut floor, report, ROOM).await;
         assert!(
             matches!(&reported, Err(Error::Status(status)) if status.code() == Code::InvalidArgument),
             "a report into the ended session tells the status it ended with: {reported:?}"
         );
+        assert_eq!(session.seq, 1, "a refused report takes no number");
     }
 
     #[tokio::test]
@@ -1220,6 +1224,12 @@ mod tests {
                 .expect("the stream's end is read");
             assert_eq!(ended.code(), Code::Ok, "{ask} reads a clean end: {ended:?}");
         }
+        let report = gateway_frame::Frame::Released(Released::default());
+        let reported = session.send(&mut floor, report, ROOM).await;
+        assert!(
+            matches!(&reported, Err(Error::Status(status)) if status.code() == Code::Ok),
+            "a report into a cleanly ended session tells its Ok status: {reported:?}"
+        );
     }
 
     #[tokio::test]
@@ -1249,6 +1259,28 @@ mod tests {
             [(1, 0), (2, 0), (3, 0), (4, 9)],
             "the hello, then each report numbered after the last and stating the floor of its minute"
         );
+    }
+
+    #[tokio::test]
+    async fn a_report_after_a_kept_end_is_refused_while_the_queue_still_takes_frames() {
+        let (address, _serving, _kept) = keeping().await;
+        let mut stub = stub(address).await;
+        let (mut session, _) = Session::open(&mut stub, "gateway-1", 0, ROOM)
+            .await
+            .expect("the welcome opens the session");
+        // The minute after the end is read and before the connection drops
+        // the ended call's request: the status is kept and the queue still
+        // takes frames. This peer never ends the stream, so the case keeps
+        // the status itself.
+        session.ended = Some(Status::invalid_argument("the frame reads wrong"));
+        let mut floor = 0;
+        let report = gateway_frame::Frame::Released(Released::default());
+        let reported = session.send(&mut floor, report, ROOM).await;
+        assert!(
+            matches!(&reported, Err(Error::Status(status)) if status.code() == Code::InvalidArgument),
+            "a report after a kept end tells its status and queues nothing: {reported:?}"
+        );
+        assert_eq!(session.seq, 1, "a refused report takes no number");
     }
 
     #[test]
