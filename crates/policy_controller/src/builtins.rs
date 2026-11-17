@@ -1085,6 +1085,10 @@ fn draw_in_band(
 /// finds the rows drawn. Returns how many of `picks` it filled, in slot
 /// order: none where the band is not flat, and the slots it leaves are drawn
 /// one by one.
+///
+/// Inlined into the ranked push's two bodies, a pass's and a draw's, as it
+/// was into the one body before a draw had its own.
+#[inline(always)]
 fn draw_flat(
     draw: &mut Draw,
     scores: &[f32],
