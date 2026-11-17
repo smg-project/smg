@@ -70,8 +70,9 @@ starts with less than 30 s of it left, and one that starts is capped by what is 
 are counted in name order: the id whose turn the budget cut and the ids behind it keep the
 time's verdict, their lines saying so, and the report is written. The
 count cannot see a change that runs the same instructions slower, a load that misses or a
-branch that stops predicting: where the function moved too, such a row reads as a placement
-up to twice its threshold, by name, in the summary. A placement is still a row to read.
+branch that stops predicting: where the function moved too, or for an id that times a whole
+pass on any level count, such a row reads as a placement up to twice its threshold, by name,
+in the summary. A placement is still a row to read.
 
 An id that times a whole pass, many functions over many pages as a decision of the policy
 engine is, is marked in its gate entry: `whole_pass = true`. Its time follows which of the
@@ -81,7 +82,8 @@ same count is not there to read: a pull request read two decide ids 11.9 and 15.
 6 and 2 instructions more an iteration, 0.03 and 0.04 % of their counts, and the same two
 sources built without the alignment read them 3.8 and 5.1 % faster (2026-11-16). For a marked
 id the placement's first fact is a level count: the two counts within half a percent of each
-other (`LEVEL_COUNT`), each executable's own two counts the same. No function's address is
+other (`LEVEL_COUNT`) at the last batch all four counts ran, each executable's own two counts
+the same. No function's address is
 asked, since any line of the pass can move. The ceiling of twice the threshold holds as for
 every id, and a count that moved further leaves the failure as before: work inserted into
 the decision read the same two ids 16.2 and 11.3 % slower on counts 3.1 and 3.4 % higher.
@@ -1028,8 +1030,11 @@ class Row:
     @property
     def counted(self) -> Counted | None:
         """What the count read: every batch both executables ran but the first, decided at
-        the last one that differs, or at the last one when none does. None when a side was
-        not read, or when the first batch is the only one both ran."""
+        the last one that differs, or at the last one when none does. Two counts that differ
+        are decided among the batches all four counts ran: a second count that ended a batch
+        early leaves the batches past it counted once. None when a side was not read, when
+        the first batch is the only one both ran, or when the counts differ only past what a
+        second count ran."""
         sides = [(self.counts or {}).get(side) or {} for side in SIDES]
         if any("batches" not in side for side in sides):
             return None
@@ -1040,6 +1045,12 @@ class Row:
         if n is None:
             n = min(len(base), len(pr)) - 1
             return Counted("same", 2**n, base[n], pr[n])
+        seconds = [side.get("again") for side in sides]
+        if all(seconds):
+            ran = min(len(base), len(pr), *(len(again) for again in seconds))
+            n = differs_at(base[:ran], pr[:ran])
+            if n is None:
+                return None
         for label, side in zip(("base", "pull request"), sides):
             first, again = side["batches"], side.get("again") or []
             own = differs_at(first, again)
@@ -1136,7 +1147,8 @@ def regression_or_suspect(row: Row) -> str:
     otherwise suspect. A regression is a placement, where the code sits in the bench executable
     and not work the change adds, on three facts: the two executables run it in the same
     instruction count, its measured function starts elsewhere, and the change is within twice
-    the threshold."""
+    the threshold. An id that times a whole pass is one on two: a level count, and the change
+    within twice the threshold."""
     if not row.separated:
         return "suspect (runs overlap)"
     if row.confirmed is False:
@@ -1265,7 +1277,10 @@ def fmt_count(row: Row) -> str:
             for label, side in zip(("base", "pull request"), sides)
             if "error" in side
         ]
-        why = "; ".join(errors) or "the first batch alone ran on both sides"
+        ran = min(len(side.get("batches") or []) for side in sides)
+        alone = "the first batch alone ran on both sides"
+        short = "a second count ended before the batches that differ"
+        why = "; ".join(errors) or (short if ran >= 2 else alone)
         return f" The count was not read ({why}): the time alone decides."
     counts = f"{counted.base:,} instructions on the base and {counted.pr:,} on the pull request"
     batch = f"a batch of {counted.iterations:,} iterations"
@@ -1319,7 +1334,8 @@ def fmt_ceiling(row: Row) -> str:
 
 def fmt_same_count(row: Row, counted: Counted) -> str:
     """The sentences of a row the two executables run in the same instruction count: a
-    placement, or which of its two other facts leaves the failure."""
+    placement, or which of its two other facts leaves the failure (for an id that times a
+    whole pass the one other fact, the ceiling)."""
     same = (
         " The two executables run it in the same instruction count in every batch after the "
         f"first, {counted.base:,} over the {counted.iterations:,} iterations of the last "

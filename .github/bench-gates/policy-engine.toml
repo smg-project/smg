@@ -120,8 +120,9 @@
 # when each side happens to repeat itself, as not steady otherwise. `decide/manual_keyed_miss/8` and
 # `spec/parse_validate` differ between two counts of one binary by 0.03 to 3.3 %. Each keeps the time's
 # verdict. The count does not see a change that runs the same instructions slower (a load that misses, a
-# branch that stops predicting): where its measured function moved too, such a row reads as a placement up
-# to twice its threshold, by name, in the summary. A placement is still a row to read.
+# branch that stops predicting): where its measured function moved too, or for a marked id on any level
+# count, such a row reads as a placement up to twice its threshold, by name, in the summary. A placement is
+# still a row to read.
 #
 # A build that starts every function on a page of its own was read on the same pairs and not taken. The pull
 # request's head against its parent reads level under it (-2.2 to +4.1 % on the seven rows, fifteen runs a
@@ -159,6 +160,15 @@ note = "5.1 % in one of three jobs on the hosted runner"
 pattern = "^policy_engine/view_build/64$"
 threshold = 0.15
 note = "6.9 and 8.2 % in two of three jobs on the hosted runner"
+
+# Nine decide ids make no pass over the pool and carry no mark: under `passthrough`, `power_of_two`,
+# `random` and `round_robin` at 64 and 512 workers the decision is made by the rows its picker draws, and
+# the keyed hit decides on its pin. The mark's evidence was read on decisions that score the pool, so
+# these keep the rule of one function until a reading of their own.
+[[gate]]
+pattern = "^policy_engine/decide/((passthrough|power_of_two|random|round_robin)/(64|512)|manual_keyed_hit/8)$"
+threshold = 0.10
+note = "identical build 4.6 % or less on the hosted runner; no pass over the pool"
 
 [[gate]]
 pattern = "^policy_engine/decide/"
