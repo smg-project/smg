@@ -466,7 +466,14 @@ fn run(
         // own time, after the period or after a step that took longer than
         // the period, fits in the deadline.
         let began = Instant::now();
-        match elector.tick(began) {
+        let ticked = elector.tick(began);
+        // The standing's term is the highest this replica saw or was told,
+        // read before anybody is named: the loop's one reader of a term. The
+        // elector counts the term of every record a step read, whatever the
+        // step then answered, an error too, and its own lead's term: no
+        // holder restored under a lower term is named.
+        seen.term = seen.term.max(elector.highest_term());
+        match ticked {
             Ok(tick) => {
                 failing = false;
                 seen.looked = true;
@@ -535,22 +542,10 @@ fn run(
                     Some(record) => {
                         fallen = false;
                         seen.holder.clone_from(&record.holder);
-                        seen.term = record.term;
                     }
-                    None => {
-                        seen.holder.clear();
-                        // A step that names nobody still read a term: the
-                        // tick says a gone record's or a wait's, and the
-                        // record says a release's, read at the look that
-                        // lost the lease. The standing counts both, so a
-                        // holder restored under a lower term is not named.
-                        if let Tick::Gone { term } | Tick::Waiting { term } = &tick {
-                            seen.term = seen.term.max(*term);
-                        }
-                        if let Some(record) = elector.observed() {
-                            seen.term = seen.term.max(record.term);
-                        }
-                    }
+                    // A step that names nobody still read a term: it was
+                    // counted above with every step's.
+                    None => seen.holder.clear(),
                 }
                 report(
                     &elector,
@@ -574,7 +569,6 @@ fn run(
                 seen.holder.clear();
             }
         }
-        seen.term = seen.term.max(elector.fence().term());
         standing.send_replace(seen.clone());
         // A step that took the period or more is followed at once, never
         // sooner. A word to leave is taken when it comes, and the wait for
@@ -595,12 +589,13 @@ fn run(
                     if left {
                         leading = false;
                     }
-                    let told = above.unwrap_or(0);
                     // A lease this replica left names nobody, and so does a
-                    // term above the one the holder is named under.
-                    if left || told > seen.term {
+                    // term above the one the holder is named under: the
+                    // elector counted the term said.
+                    let highest = elector.highest_term();
+                    if left || highest > seen.term {
                         seen.holder.clear();
-                        seen.term = seen.term.max(told);
+                        seen.term = seen.term.max(highest);
                         standing.send_replace(seen.clone());
                     }
                 }
@@ -2030,7 +2025,17 @@ mod tests {
     struct Losable {
         lease: MemoryLease,
         landed: Arc<AtomicU32>,
-        ahead: Arc<Mutex<VecDeque<LeaseRecord>>>,
+        ahead: Arc<Mutex<VecDeque<Ahead>>>,
+        fails: Arc<AtomicBool>,
+    }
+
+    /// What another hand does to a [`Losable`] store ahead of the
+    /// candidate's next calls, in order: the first waits for its call.
+    enum Ahead {
+        /// Before a read: a record stored, or nothing at this read.
+        Read(Option<LeaseRecord>),
+        /// Before a write: a record stored, so the write comes back moved.
+        Write(LeaseRecord),
     }
 
     impl Losable {
@@ -2052,7 +2057,18 @@ mod tests {
         /// Records no candidate wrote, stored one before each of the next
         /// reads, in order.
         fn put_before_the_next_looks(&self, records: impl IntoIterator<Item = LeaseRecord>) {
-            self.ahead.lock().extend(records);
+            self.ahead(records.into_iter().map(|record| Ahead::Read(Some(record))));
+        }
+
+        /// What another hand does ahead of the next calls, in order.
+        fn ahead(&self, steps: impl IntoIterator<Item = Ahead>) {
+            self.ahead.lock().extend(steps);
+        }
+
+        /// Every write fails from here as a store that is away, and stores
+        /// nothing, until a case says otherwise.
+        fn fail_writes(&self, fail: bool) {
+            self.fails.store(fail, Ordering::SeqCst);
         }
 
         fn landed(&self) -> u32 {
@@ -2062,8 +2078,14 @@ mod tests {
 
     impl LeaseBackend for Losable {
         fn read(&mut self) -> Result<Option<LeaseRecord>, ElectError> {
-            let next = self.ahead.lock().pop_front();
-            if let Some(record) = next {
+            let next = {
+                let mut ahead = self.ahead.lock();
+                match ahead.front() {
+                    Some(Ahead::Read(_)) => ahead.pop_front(),
+                    _ => None,
+                }
+            };
+            if let Some(Ahead::Read(Some(record))) = next {
                 self.put(&record);
             }
             self.lease.read()
@@ -2074,6 +2096,22 @@ mod tests {
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
         ) -> Result<Written, ElectError> {
+            if self.fails.load(Ordering::SeqCst) {
+                return Err(ElectError::Io {
+                    place: self.place(),
+                    source: std::io::Error::other("the store is away"),
+                });
+            }
+            let next = {
+                let mut ahead = self.ahead.lock();
+                match ahead.front() {
+                    Some(Ahead::Write(_)) => ahead.pop_front(),
+                    _ => None,
+                }
+            };
+            if let Some(Ahead::Write(rival)) = next {
+                self.put(&rival);
+            }
             let written = self.lease.write(expected, record)?;
             if written == Written::Done {
                 self.landed.fetch_add(1, Ordering::SeqCst);
@@ -2384,6 +2422,92 @@ mod tests {
         assert_eq!(fallen, 1, "{text}");
     }
 
+    /// The same release seen only where a renewal's write came back moved.
+    /// It lands between the holder's read and its write, and the lease is
+    /// read again: the elector observes that record, so the standing counts
+    /// its term as at a plain read.
+    #[test]
+    fn a_release_read_again_after_a_moved_write_stands_over_a_holder_restored_under_it() {
+        let store = Losable::default();
+        let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", brisk())
+            .expect("the settings are in order");
+        let fence = holder.fence();
+        let (standing, stood) = watch::channel(Standing::default());
+        let looping = looping(holder, standing);
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        // The release under term nine is stored before the renewal's write;
+        // the read after that write finds it, and the look after that one
+        // finds a holder restored under term seven.
+        store.ahead([
+            Ahead::Write(LeaseRecord {
+                term: 9,
+                ..LeaseRecord::default()
+            }),
+            Ahead::Read(None),
+            Ahead::Read(Some(LeaseRecord {
+                holder: "x@127.0.0.1:9".to_owned(),
+                term: 7,
+                duration_ms: 60_000,
+                ..LeaseRecord::default()
+            })),
+        ]);
+        until("the look at the restored holder", || {
+            stood.borrow().holder == "x@127.0.0.1:9"
+                || looping.said("the lease's term is under the highest")
+        });
+        assert_eq!(
+            *stood.borrow(),
+            Standing {
+                holder: String::new(),
+                term: 9,
+                looked: true,
+            }
+        );
+        let (fallen, text) = looping.stopped_with("the lease's term is under the highest");
+        assert_eq!(fallen, 1, "{text}");
+    }
+
+    /// A step that read a term and then failed. A follower reads a release
+    /// under term nine and its take's write fails, step after step: each
+    /// step is an error, and the elector counted the term it read. The
+    /// standing counts it with every step's, while the steps fail.
+    #[test]
+    fn a_term_read_at_a_step_that_then_failed_is_counted_while_the_steps_fail() {
+        let store = Losable::default();
+        store.put(&LeaseRecord {
+            holder: "x@127.0.0.1:9".to_owned(),
+            term: 3,
+            duration_ms: 60_000,
+            ..LeaseRecord::default()
+        });
+        let follower = Elector::new(Box::new(store.clone()), "b@127.0.0.1:2", brisk())
+            .expect("the settings are in order");
+        let (standing, mut stood) = watch::channel(Standing::default());
+        let looping = looping(follower, standing);
+        until("the holder is followed", || stood.borrow().term == 3);
+        store.fail_writes(true);
+        store.put_before_the_next_looks([LeaseRecord {
+            term: 9,
+            ..LeaseRecord::default()
+        }]);
+        until("the failing streak", || {
+            looping.said("an election step failed")
+        });
+        looks(&mut stood, 2);
+        assert_eq!(
+            *stood.borrow(),
+            Standing {
+                holder: String::new(),
+                term: 9,
+                looked: true,
+            }
+        );
+        let (failed, text) = looping.stopped_with("an election step failed");
+        assert_eq!(failed, 1, "{text}");
+    }
+
     /// A record lost under a live holder, by no release. The holder's fence
     /// is open until its own next step reads the lease; a replica that saw
     /// the record held waits that record's duration from its first sight of
@@ -2451,24 +2575,38 @@ mod tests {
         // and nobody named: the old holder first, the standby second.
         let (mut samples, mut both, mut unnamed) = (0_u32, 0_u32, (false, false));
         // The first take, under whatever later term: how long after the
-        // loss, its term, whether the standby's, and when it was seen.
+        // loss its read was asked for, its term, whether the standby's, and
+        // that instant. A fence answers a term only inside its window, so
+        // that instant is no sooner than the take, and a stop between a
+        // read and the line that dates it lengthens nothing.
         let mut taken: Option<(Duration, u64, bool, Instant)> = None;
         while taken.is_none_or(|(_, _, _, seen)| seen.elapsed() < settings.renew_deadline) {
-            let before = leader_fence.leader_term(Instant::now());
-            let between = follower_fence.leader_term(Instant::now());
-            let after = leader_fence.leader_term(Instant::now());
+            let asked_before = Instant::now();
+            let before = leader_fence.leader_term(asked_before);
+            let asked_between = Instant::now();
+            let between = follower_fence.leader_term(asked_between);
+            let asked_after = Instant::now();
+            let after = leader_fence.leader_term(asked_after);
             samples += 1;
             both += u32::from(before.is_some() && between.is_some() && before == after);
             unnamed.0 |= before.is_none() && led.borrow().holder.is_empty();
             unnamed.1 |= between.is_none() && followed.borrow().holder.is_empty();
             // The loop runs to its end whatever that term: the bound on it is
             // read after the count of two open fences, never ahead of it.
-            let later = [before, between, after]
-                .into_iter()
-                .flatten()
-                .find(|term| *term > 1);
-            if let (None, Some(term)) = (taken, later) {
-                taken = Some((lost.elapsed(), term, between == Some(term), Instant::now()));
+            let later = [
+                (before, asked_before),
+                (between, asked_between),
+                (after, asked_after),
+            ]
+            .into_iter()
+            .find_map(|(term, asked)| term.filter(|term| *term > 1).map(|term| (term, asked)));
+            if let (None, Some((term, asked))) = (taken, later) {
+                taken = Some((
+                    asked.duration_since(lost),
+                    term,
+                    between == Some(term),
+                    asked,
+                ));
             }
             assert!(
                 lost.elapsed() < Duration::from_secs(20),
@@ -2509,12 +2647,14 @@ mod tests {
         .expect("stdout");
         assert!(named_nobody, "{taker} named a holder through its wait");
         // The bound on the clock once more: the other replica follows the
-        // taker from its first look after the take. A host that held the
-        // test past the lease's duration handed the lease on, and the
-        // other replica then reads a later term: the wait ends on that too.
+        // taker from its first look after the take, under the take's term:
+        // a look from before the loss names the old holder under term 1
+        // and ends nothing. A host that held the test past the lease's
+        // duration handed the lease on, and the other replica then reads a
+        // later term: the wait ends on that too.
         until("the other replica follows the taker", || {
             let look = other.borrow();
-            look.holder == taker || look.term > 2
+            (look.holder == taker && look.term == 2) || look.term > 2
         });
         let read = other.borrow().term;
         bound!(
