@@ -39,10 +39,9 @@ use tracing::{debug, error, info, warn};
 use super::index_backend::KvIndex;
 use crate::{
     observability::metrics::Metrics,
-    policies::utils::PeriodicTask,
     worker::{
-        identity::endpoint::Endpoint, load::monitor::WorkerMonitor, registry::WorkerRegistry,
-        ConnectionMode, Worker, UNKNOWN_MODEL_ID,
+        identity::endpoint::Endpoint, load::monitor::WorkerMonitor, periodic_task::PeriodicTask,
+        registry::WorkerRegistry, ConnectionMode, Worker, UNKNOWN_MODEL_ID,
     },
 };
 

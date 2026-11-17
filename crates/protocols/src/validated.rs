@@ -681,20 +681,31 @@ pub fn undecodable_content_encoding(req: &Request) -> Option<String> {
         .find(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
 }
 
-/// The most of a refused coding the 415 message echoes: a header value is
-/// the client's own text, cut here so that the message stays one line.
+/// The most of a client's header value a refusal's message echoes: the
+/// value is the client's own text, cut here so that the message stays one
+/// line.
 #[cfg(feature = "axum")]
-const CONTENT_ENCODING_ECHO_CHARS: usize = 64;
+const HEADER_ECHO_CHARS: usize = 64;
+
+/// A header value as a refusal's message echoes it: a value longer than the
+/// echo bound, counted in characters, is cut there and the cut marked.
+#[cfg(feature = "axum")]
+pub fn header_echo(value: &str) -> String {
+    let mut chars = value.chars();
+    let mut shown: String = chars.by_ref().take(HEADER_ECHO_CHARS).collect();
+    if chars.next().is_some() {
+        shown.push_str("...");
+    }
+    shown
+}
 
 /// The message of the 415 a JSON body under an encoding the gateway does
-/// not decode is answered with; a coding longer than the echo bound is cut
-/// there and the cut marked.
+/// not decode is answered with; the coding is echoed as [`header_echo`]
+/// shows it.
 #[cfg(feature = "axum")]
 pub fn content_encoding_message(encoding: &str) -> String {
-    let mut chars = encoding.chars();
-    let shown: String = chars.by_ref().take(CONTENT_ENCODING_ECHO_CHARS).collect();
-    let cut = if chars.next().is_some() { "..." } else { "" };
-    format!("Content-Encoding `{shown}{cut}` is not decoded: send the JSON body unencoded")
+    let echo = header_echo(encoding);
+    format!("Content-Encoding `{echo}` is not decoded: send the JSON body unencoded")
 }
 
 /// The 415 with its `Accept-Encoding: identity`, the header by which a
@@ -1205,27 +1216,27 @@ mod tests {
             content_encoding_message("gzip"),
             "Content-Encoding `gzip` is not decoded: send the JSON body unencoded"
         );
-        let at_the_bound = "y".repeat(CONTENT_ENCODING_ECHO_CHARS);
+        let at_the_bound = "y".repeat(HEADER_ECHO_CHARS);
         assert!(
             content_encoding_message(&at_the_bound).contains(&format!("`{at_the_bound}`")),
             "a coding at the bound is echoed whole"
         );
-        let long = "x".repeat(CONTENT_ENCODING_ECHO_CHARS + 1);
+        let long = "x".repeat(HEADER_ECHO_CHARS + 1);
         assert_eq!(
             content_encoding_message(&long),
             format!(
                 "Content-Encoding `{}...` is not decoded: send the JSON body unencoded",
-                "x".repeat(CONTENT_ENCODING_ECHO_CHARS)
+                "x".repeat(HEADER_ECHO_CHARS)
             )
         );
         // The bound counts characters, not bytes: an obs-text byte of the header
         // reaches the helper as the three-byte replacement character.
-        let accented = "é".repeat(CONTENT_ENCODING_ECHO_CHARS + 1);
+        let accented = "é".repeat(HEADER_ECHO_CHARS + 1);
         assert_eq!(
             content_encoding_message(&accented),
             format!(
                 "Content-Encoding `{}...` is not decoded: send the JSON body unencoded",
-                "é".repeat(CONTENT_ENCODING_ECHO_CHARS)
+                "é".repeat(HEADER_ECHO_CHARS)
             ),
             "the cut is counted in characters"
         );

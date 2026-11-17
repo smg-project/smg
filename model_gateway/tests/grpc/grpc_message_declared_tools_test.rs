@@ -199,7 +199,12 @@ fn chat_request(extra: Value) -> ChatCompletionRequest {
 async fn chat(gateway: &Gateway, extra: Value) -> Chat {
     let stream = extra["stream"] == true;
     let request = chat_request(extra);
-    let body = read(gateway.router.route_chat(None, &tenant(), request, MODEL)).await;
+    let body = read(
+        gateway
+            .router
+            .route_chat(None, &tenant(), Arc::new(request), MODEL),
+    )
+    .await;
     let arguments = |args: &str| match args {
         "" => Value::Null,
         args => serde_json::from_str(args).unwrap(),

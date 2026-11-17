@@ -55,7 +55,7 @@ impl GenerateResponseProcessingStage {
 
         let execution_result = stage_output(ctx.response.execution_result.take(), FUNCTION)?;
 
-        let dispatch = stage_output(ctx.dispatch.as_ref(), FUNCTION)?.clone();
+        let dispatch = stage_output(ctx.dispatch.take(), FUNCTION)?;
 
         let tokenizer = stage_output(ctx.tokenizer_arc(), FUNCTION)?;
 

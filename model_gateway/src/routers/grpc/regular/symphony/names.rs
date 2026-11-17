@@ -390,9 +390,10 @@ fn checked_names(
 /// message). The grammar built for the request takes it OR'd with the request's
 /// thinking switch, so the tag and the engine read the prompt the same way: a JSON answer the
 /// switch would place at the first token follows the thought's close instead of streaming as
-/// reasoning. `None` when no table reads the response, leaving the switch's answer as it was;
-/// where a table reads, no legacy parser is built to be asked about the prompt: the table's
-/// replay answers, alone for the family whose legacy rule set the switch aside
+/// reasoning. A prompt that closed the thought itself overrules the switch
+/// ([`PromptThought::or_switch`]). `None` when no table reads the response, leaving the switch's
+/// answer as it was; where a table reads, no legacy parser is built to be asked about the prompt:
+/// the table's replay answers, alone for the family whose legacy rule set the switch aside
 /// ([`PromptThought::alone`]).
 pub(crate) fn reasoning_open(
     parser: ParserChoice,
@@ -432,7 +433,8 @@ pub(crate) struct PromptThought {
     /// The prompt leaves the model inside its thought.
     pub open: bool,
     /// The prompt closed the thought itself and wrote what the template writes after the close
-    /// (thinking switched off), so the tag owes none of it ([`Format::thought_closed`]).
+    /// (thinking switched off), so the tag owes none of it ([`Format::thought_closed`]) and the
+    /// model starts past the thought, whatever the request's thinking switch says.
     pub closed: bool,
     /// The replay decides alone, without the request's thinking switch: Gemma 4 prefills an open
     /// thought channel only after a tool response, so thinking enabled on a new turn says nothing
@@ -449,9 +451,11 @@ pub(crate) type PromptReplay = Option<PromptThought>;
 impl PromptThought {
     /// Whether the prompt leaves the model inside its thought, as request building decides it:
     /// the replay's answer, or the request's thinking `switch` where the replay does not decide
-    /// alone.
+    /// alone. A prompt that closed the thought is past it whatever the switch says: a template
+    /// may close the thought for a request that names no switch while the switch's default says
+    /// thinking.
     pub fn or_switch(self, switch: impl FnOnce() -> bool) -> bool {
-        self.open || (!self.alone && switch())
+        !self.closed && (self.open || (!self.alone && switch()))
     }
 }
 
@@ -1034,6 +1038,11 @@ mod tests {
         assert!(!unopened.open && !unopened.alone);
         assert!(unopened.or_switch(|| true));
         assert!(!unopened.or_switch(|| false));
+        // A prompt that closed the thought itself is past it, whatever the switch says.
+        let closed = read("qwen3", "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        assert!(closed.closed && !closed.open && !closed.alone);
+        assert!(!closed.or_switch(|| true));
+        assert!(!closed.or_switch(|| false));
         // Gemma 4 prefills an open thought channel only after a tool response: its table's
         // replay decides alone, and thinking enabled on a new turn does not open the thought.
         let channel = read("gemma4", "<|turn>model\n<|channel>thought\n");

@@ -437,30 +437,11 @@ pub(crate) struct Replay {
 
 /// A literal that starts the model's turn in the prompt, and the state the output starts in after
 /// it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Anchor {
     text: String,
     state: usize,
-    finder: memchr::memmem::Finder<'static>,
 }
-
-impl Anchor {
-    fn new(text: &str, state: usize) -> Self {
-        Self {
-            text: text.to_string(),
-            state,
-            finder: memchr::memmem::Finder::new(text).into_owned(),
-        }
-    }
-}
-
-impl PartialEq for Anchor {
-    fn eq(&self, other: &Self) -> bool {
-        self.text == other.text && self.state == other.state
-    }
-}
-
-impl Eq for Anchor {}
 
 /// The unopened row: the state the output starts in when the prompt opens no turn for the model,
 /// and the text that ends a turn the model wrote in the prompt, after which the turn opener would
@@ -760,7 +741,10 @@ impl Format {
     /// where several match at one place.
     #[must_use]
     pub fn turn_anchor(mut self, text: &str) -> Self {
-        self.anchors.push(Anchor::new(text, 0));
+        self.anchors.push(Anchor {
+            text: text.to_string(),
+            state: 0,
+        });
         self
     }
 
@@ -769,7 +753,10 @@ impl Format {
     #[must_use]
     pub fn turn_anchor_starting_in(mut self, text: &str, state: &str) -> Self {
         let state = self.state_named(state);
-        self.anchors.push(Anchor::new(text, state));
+        self.anchors.push(Anchor {
+            text: text.to_string(),
+            state,
+        });
         self
     }
 
@@ -1311,39 +1298,80 @@ impl Format {
 
     /// The last turn anchor in `prompt` and where it starts, found as `finditer` finds the
     /// alternation of the anchors: the earliest match, the first anchor in the table's order
-    /// where several match there, then on from that match's end. A generation prompt ends with an
-    /// anchor, so the prompt's tail is searched first: no match crosses a place that no anchor's
-    /// occurrence crosses, so from such a place the matches are the whole scan's, and where an
-    /// anchor starts in the tail the scan starts at the last such place before it. Any other
-    /// prompt is scanned from its start: each anchor's next occurrence is searched for again only
+    /// where several match there, then on from that match's end. Where the anchors start with
+    /// one byte, the last place an anchor starts at is found by that byte from the prompt's end;
+    /// where they start with different bytes, by each anchor's first byte in the prompt's tail
+    /// alone, where a generation prompt holds its anchor. No match crosses a place that no
+    /// anchor the scan would take crosses, so the scan starts at such a place at or before the
+    /// one found and its matches are the whole scan's. A prompt dense in the anchors' one byte
+    /// near its end is scanned from its start, as is one whose tail holds none of the anchors
+    /// that start with different bytes: each anchor's next occurrence is searched for again only
     /// once the matches have passed it, so the prompt costs one pass per anchor. An anchor with
     /// no text never matches.
     fn last_anchor(&self, prompt: &str) -> Option<(usize, &Anchor)> {
         let bytes = prompt.as_bytes();
         let anchors = || self.anchors.iter().filter(|anchor| !anchor.text.is_empty());
         let longest = anchors().map(|anchor| anchor.text.len()).max()?;
-        let tail = bytes.len().saturating_sub(4 * longest);
-        // Each anchor's last match in the tail: one that starts after it overlaps it, so none
-        // starts `longest` past the last of them.
-        let matched = anchors().filter_map(|anchor| anchor.finder.find_iter(&bytes[tail..]).last());
-        if let Some(last) = matched.max().map(|at| tail + at) {
-            // An occurrence that starts before `from` and ends after it lies within its own
-            // length of `from` on both sides: the scan starts before every one of those.
+        let first = anchors().next()?.text.as_bytes()[0];
+        let mixed = anchors().any(|anchor| anchor.text.as_bytes()[0] != first);
+        // The anchor the scan takes where it stands at `at`.
+        let taken =
+            |at: usize| anchors().find(|anchor| bytes[at..].starts_with(anchor.text.as_bytes()));
+        // The last place in `low..high` that `anchor` starts at, read back by its first byte.
+        let last_in = |anchor: &Anchor, low: usize, high: usize| {
+            let text = anchor.text.as_bytes();
+            memchr::memrchr_iter(text[0], &bytes[low..high])
+                .map(|at| low + at)
+                .find(|&at| bytes[at..].starts_with(text))
+        };
+        let last = 'last: {
+            if mixed {
+                let tail = bytes.len().saturating_sub(4 * longest);
+                let in_tail = anchors()
+                    .filter_map(|anchor| last_in(anchor, tail, bytes.len()))
+                    .max();
+                if in_tail.is_none() && tail == 0 {
+                    return None;
+                }
+                break 'last in_tail;
+            }
+            // A place that starts no anchor costs about as much as 384 bytes of one anchor's
+            // pass from the start: once the places read so far stand denser than one in 384
+            // bytes an anchor, past an anchor's length from the end, the passes cost less.
+            for (passed, at) in memchr::memrchr_iter(first, bytes).enumerate() {
+                if taken(at).is_some() {
+                    break 'last Some(at);
+                }
+                let back = bytes.len() - at;
+                if back > longest && passed > back * self.anchors.len() / 384 {
+                    break 'last None;
+                }
+            }
+            return None;
+        };
+        if let Some(last) = last {
+            // An anchor that crosses `from` starts within its own length before it.
             let mut from = last;
-            while let Some(crossing) = anchors()
-                .filter_map(|anchor| {
-                    let reach = anchor.text.len() - 1;
-                    let start = from.saturating_sub(reach);
-                    let window = &bytes[start..bytes.len().min(from + reach)];
-                    anchor.finder.find(window).map(|at| start + at)
-                })
-                .min()
-            {
-                from = crossing;
+            if mixed {
+                while let Some(crossing) = anchors()
+                    .filter_map(|anchor| {
+                        last_in(anchor, from.saturating_sub(anchor.text.len() - 1), from)
+                    })
+                    .min()
+                {
+                    from = crossing;
+                }
+            } else {
+                while let Some(crossing) = (from.saturating_sub(longest - 1)..from).find(|&at| {
+                    bytes[at] == first
+                        && taken(at).is_some_and(|anchor| at + anchor.text.len() > from)
+                }) {
+                    from = crossing;
+                }
             }
             let mut found = None;
-            while from < bytes.len().min(last + longest) {
-                match anchors().find(|anchor| bytes[from..].starts_with(anchor.text.as_bytes())) {
+            while from <= last {
+                match taken(from) {
                     Some(anchor) => {
                         found = Some((from, anchor));
                         from += anchor.text.len();
@@ -1352,9 +1380,6 @@ impl Format {
                 }
             }
             return found;
-        }
-        if tail == 0 {
-            return None;
         }
         let find = |anchor: &Anchor, from: usize| {
             if anchor.text.is_empty() {
@@ -2541,7 +2566,7 @@ mod tests {
             last
         }
         // Anchors that overlap themselves and each other, in both orders.
-        let tables: [&[&str]; 9] = [
+        let tables: [&[&str]; 12] = [
             &["aa"],
             &["ab", "a"],
             &["a", "ab"],
@@ -2551,15 +2576,19 @@ mod tests {
             &["ab", "ba", "b"],
             &["abc", "bca", "cab"],
             &["abab", "bc", "c"],
+            &["aba", "ab"],
+            &["abab", "a"],
+            &["aab", "aba", "a"],
         ];
-        // Tails that hold no anchor, as long as the search's first windows and longer, some of
-        // characters of several bytes, so that a window starts inside one.
+        // Frames that hold no anchor, some of characters of several bytes, and one dense in the
+        // letter most anchors start with.
         let frames = [
             ("", ""),
             ("", "-----"),
             ("--", "-------------"),
             ("｜", "｜｜｜｜"),
             ("", "｜｜｜｜｜｜｜｜｜｜｜"),
+            ("a-", "-a-a-a-a-a-a-a-a-"),
         ];
         for anchors in tables {
             let format = anchors.iter().fold(

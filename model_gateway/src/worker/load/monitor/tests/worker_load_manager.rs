@@ -68,3 +68,50 @@ fn test_select_and_increment_lowest_dp_load_none_worker() {
     let result = manager.select_and_increment_lowest_dp_load(&worker, 1);
     assert_eq!(result, None);
 }
+
+/// The update line names each worker's address masked. The map is keyed by
+/// the address as registered, which may hold a credential in its userinfo or
+/// a token in its query; the loads are cached under the addresses as they
+/// are.
+#[test]
+#[tracing_test::traced_test]
+fn the_update_line_names_each_address_masked() {
+    let credentialed = "grpc://user:s3cret@10.0.0.7:9000?token=t0ken";
+    let plain = "grpc://10.0.0.8:9000";
+    let manager = WorkerLoadManager::new();
+    manager.update_dp_loads(&HashMap::from([
+        (credentialed.to_string(), HashMap::from([(0, 3)])),
+        (plain.to_string(), HashMap::from([(1, 5)])),
+    ]));
+
+    logs_assert(|lines: &[&str]| {
+        let written: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|line| line.contains("update_dp_loads"))
+            .collect();
+        let [line] = written.as_slice() else {
+            return Err(format!(
+                "{} update lines, wanted one: {written:?}",
+                written.len()
+            ));
+        };
+        for hidden in ["s3cret", "t0ken", "user:"] {
+            if line.contains(hidden) {
+                return Err(format!("the update line shows `{hidden}`: {line}"));
+            }
+        }
+        for shown in [
+            "\"grpc://***@10.0.0.7:9000\": {0: 3}",
+            "\"grpc://10.0.0.8:9000\": {1: 5}",
+        ] {
+            if !line.contains(shown) {
+                return Err(format!("the update line does not write `{shown}`: {line}"));
+            }
+        }
+        Ok(())
+    });
+    let cached = manager.dp_cached_loads.read();
+    assert_eq!(cached.get(credentialed), Some(&HashMap::from([(0, 3)])));
+    assert_eq!(cached.get(plain), Some(&HashMap::from([(1, 5)])));
+}

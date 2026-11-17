@@ -367,7 +367,7 @@ struct Setup {
 /// pressure, a live rate on three of four) and up to three requests in flight
 /// on each, as `policy_selection`'s fed pool has them.
 fn feed_loads(policy: &CacheAwarePolicy, workers: &[Arc<dyn Worker>], rng: &mut Rng) -> TestFeed {
-    let feed = TestFeed::attached_to(policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     let reports: HashMap<String, WorkerLoadResponse> = workers
         .iter()
         .map(|worker| {

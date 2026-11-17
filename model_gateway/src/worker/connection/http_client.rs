@@ -13,10 +13,7 @@ use std::{
 use openai_protocol::worker::HttpPoolConfig;
 use tracing::{debug, warn};
 
-use crate::{
-    config::RouterConfig,
-    server::{http_client, http_client_builder},
-};
+use crate::worker::connection::client_factory::{http_client, http_client_builder};
 
 /// Default pool settings for worker-directed HTTP clients.
 const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
@@ -89,28 +86,36 @@ struct ClientKey {
     http2: bool,
 }
 
+/// What the host fixes for every worker-directed client, filled from its own
+/// configuration. A worker's pool settings may replace the two timeouts.
+pub struct WorkerHttpClientSettings {
+    /// PEM client certificate and key presented to workers, when set.
+    pub client_identity: Option<Vec<u8>>,
+    /// PEM CA certificates trusted for worker connections.
+    pub ca_certificates: Vec<Vec<u8>>,
+    /// Whether every client is tuned for HTTP/2 upstreams.
+    pub upstream_http2: bool,
+    /// Total request timeout of a client, in seconds.
+    pub request_timeout_secs: u64,
+    /// Idle timeout of a pooled connection, in seconds; zero keeps idle
+    /// connections indefinitely.
+    pub pool_idle_timeout_secs: u64,
+}
+
 /// Cache of worker-directed HTTP clients, keyed by effective client-level
 /// config. Entries are weak: pool settings can be worker-supplied, so a
 /// client lives exactly as long as some worker holds its handle, dead entries
 /// are pruned on the next build, and cardinality is bounded by live distinct
 /// configs — a churning fleet cannot grow the map.
 pub struct WorkerHttpClientCache {
-    client_identity: Option<Vec<u8>>,
-    ca_certificates: Vec<Vec<u8>>,
-    upstream_http2: bool,
-    request_timeout_secs: u64,
-    pool_idle_timeout_secs: u64,
+    settings: WorkerHttpClientSettings,
     clients: Mutex<HashMap<ClientKey, Weak<reqwest::Client>>>,
 }
 
 impl WorkerHttpClientCache {
-    pub fn new(router_config: &RouterConfig) -> Self {
+    pub fn new(settings: WorkerHttpClientSettings) -> Self {
         Self {
-            client_identity: router_config.client_identity.clone(),
-            ca_certificates: router_config.ca_certificates.clone(),
-            upstream_http2: router_config.upstream_http2,
-            request_timeout_secs: router_config.request_timeout_secs,
-            pool_idle_timeout_secs: router_config.upstream_pool_idle_timeout_secs,
+            settings,
             clients: Mutex::new(HashMap::new()),
         }
     }
@@ -137,7 +142,7 @@ impl WorkerHttpClientCache {
     fn key(&self, pool_config: &HttpPoolConfig, http2: bool) -> ClientKey {
         let timeout_secs = pool_config
             .timeout_secs
-            .unwrap_or(self.request_timeout_secs);
+            .unwrap_or(self.settings.request_timeout_secs);
         let connect_timeout_secs = connect_timeout_secs_below(
             pool_config
                 .connect_timeout_secs
@@ -151,7 +156,7 @@ impl WorkerHttpClientCache {
                 .unwrap_or(DEFAULT_POOL_MAX_IDLE_PER_HOST),
             pool_idle_timeout_secs: pool_config
                 .pool_idle_timeout_secs
-                .unwrap_or(self.pool_idle_timeout_secs),
+                .unwrap_or(self.settings.pool_idle_timeout_secs),
             timeout_secs,
             http2,
         }
@@ -167,7 +172,8 @@ impl WorkerHttpClientCache {
     }
 
     fn build(&self, key: &ClientKey) -> Result<reqwest::Client, String> {
-        let has_tls = self.client_identity.is_some() || !self.ca_certificates.is_empty();
+        let has_tls =
+            self.settings.client_identity.is_some() || !self.settings.ca_certificates.is_empty();
 
         // Idle pooled connections must expire before the backend server's
         // keep-alive closes them (vLLM/SGLang default: 5s), or checkout races
@@ -177,12 +183,14 @@ impl WorkerHttpClientCache {
             secs => Some(Duration::from_secs(secs)),
         };
         let identity = self
+            .settings
             .client_identity
             .as_deref()
             .map(reqwest::Identity::from_pem)
             .transpose()
             .map_err(|e| format!("Failed to create client identity: {e}"))?;
         let ca_certificates = self
+            .settings
             .ca_certificates
             .iter()
             .map(|pem| reqwest::Certificate::from_pem(pem))
@@ -198,7 +206,7 @@ impl WorkerHttpClientCache {
                 .tcp_nodelay(true)
                 .tcp_keepalive(Some(Duration::from_secs(30)));
 
-            if self.upstream_http2 {
+            if self.settings.upstream_http2 {
                 builder = tune_http2(builder);
             }
             if key.http2 {
@@ -403,9 +411,10 @@ pub(crate) mod no_root_store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RouterConfig;
 
     fn cache(config: RouterConfig) -> WorkerHttpClientCache {
-        WorkerHttpClientCache::new(&config)
+        WorkerHttpClientCache::new(config.worker_http_client_settings())
     }
 
     fn http2_cache() -> WorkerHttpClientCache {
