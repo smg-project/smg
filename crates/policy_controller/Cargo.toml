@@ -167,8 +167,21 @@ kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
 wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
+# A case's hold of the gRPC plugin runtime's I/O thread, the stand-in for a
+# host that takes the thread's core. The package's own tests and benches
+# turn it on through the dev-dependency on the package itself; no build of
+# a product has it.
+test-util = []
 
 [dev-dependencies]
+# The package itself with `test-util`, for its own tests and benches alone.
+# Without `default-features = false` the default set would reach every test
+# target whatever features a run selected, and a run with no default
+# features would not be one. The key is not the package's name: on a build
+# line cargo reads `smg-policy-controller/<feature>` as a dependency of that
+# name first, and the controller image's line, which names its features so,
+# would turn them on for this test edge alone and build no binary.
+smg-policy-controller-test-util = { package = "smg-policy-controller", path = ".", default-features = false, features = ["test-util"] }
 criterion = "0.8"
 # The Kubernetes elector's tests run its client against a service in the
 # test's process that plays one Lease, and its three-process cell against

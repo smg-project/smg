@@ -98,8 +98,10 @@
 //! such turns. One edge starts an outage and a streak anew: the end of a
 //! call that stood a minute, which only the plugin makes. An event sent
 //! does not, and two outages with less than a minute of standing between
-//! them are one line. The process's panic hook writes its own line to
-//! stderr at every panicked turn. Each profile
+//! them are one line. So a plugin whose calls all end inside a minute is
+//! one outage for its life, and a server that ends every call by age past
+//! a minute says one line an age. The process's panic hook writes its own
+//! line to stderr at every panicked turn. Each profile
 //! that binds the plugin holds one [`Bound`] set, taken from its engine
 //! build's [`Binder`]: one adapter of a build forwards, so an event reaches
 //! the plugin once per engine.

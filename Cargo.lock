@@ -8125,6 +8125,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.11.0",
  "smg-grpc-client",
+ "smg-policy-controller",
  "tempfile",
  "thiserror 2.0.21",
  "thread_local",
