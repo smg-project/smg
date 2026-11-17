@@ -585,13 +585,8 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("bitcpm-cann-3b-unquantized", GenerationPrompt::Plain),
     ("caprl-internvl3.5-8b", GenerationPrompt::Plain),
     ("cogalign-llava-ov-0-5b", GenerationPrompt::Plain),
-    ("cosmos-reason1-7b", GenerationPrompt::Plain),
     (
         "deep-ignorance-unfiltered-instruct-test",
-        GenerationPrompt::Plain,
-    ),
-    (
-        "deephermes-financial-fundamentals-prediction-specialist-atropos",
         GenerationPrompt::Plain,
     ),
     ("dogr", GenerationPrompt::Plain),
@@ -600,17 +595,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
         "falcon-h1-tiny-multilingual-100m-instruct",
         GenerationPrompt::Plain,
     ),
-    ("falcon-h1-tiny-r-0.6b", GenerationPrompt::Plain),
-    ("falcon-h1-tiny-r-90m", GenerationPrompt::Plain),
     ("granite-speech-3.2-8b", GenerationPrompt::Plain),
     ("granite-vision-3.1-2b-preview", GenerationPrompt::Plain),
     ("granite-vision-3.2-2b", GenerationPrompt::Plain),
     ("granite-vision-3.3-2b", GenerationPrompt::Plain),
-    ("hunyuan-a13b-instruct", GenerationPrompt::Plain),
-    ("openmath-nemotron-14b", GenerationPrompt::Plain),
-    ("openmath-nemotron-14b-kaggle", GenerationPrompt::Plain),
-    ("openreasoning-nemotron-1.5b", GenerationPrompt::Plain),
-    ("openreasoning-nemotron-14b", GenerationPrompt::Plain),
     // Python calls: Olmo 3 has no thought; LFM2.5's template adds nothing to the turn opener in
     // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", GenerationPrompt::Plain),
