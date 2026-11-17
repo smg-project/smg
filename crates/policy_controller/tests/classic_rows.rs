@@ -93,7 +93,10 @@ struct Owed {
 /// under each of its policies; one of them has no preset here yet. A
 /// request placed by its routing key on the hash ring keeps its worker over
 /// the thresholds there; its rows are refused by their module until a key
-/// keeps its ring worker here ([`ring`]).
+/// keeps its ring worker here ([`ring`]). Those entries do not expire by
+/// themselves, since the module refuses a ring row before it builds an
+/// engine: the change that keeps a key on its ring worker deletes them
+/// together with that guard.
 const OWED: &[Owed] = &[
     Owed {
         row: "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",

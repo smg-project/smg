@@ -1,9 +1,11 @@
 //! The engine's cost per decision: the view build and the decision at 8, 64
 //! and 512 candidates, per preset, the least-load decision with a credit
-//! held per row, a keyed decision on its pin and off it, and the spec's
-//! parse-and-validate time at apply. Ids: `policy_engine/view_build/<n>`,
+//! held per row, the steer of a pool over its thresholds on every row, a
+//! keyed decision on its pin and off it, and the spec's parse-and-validate
+//! time at apply. Ids: `policy_engine/view_build/<n>`,
 //! `policy_engine/decide/<preset>/<n>`,
 //! `policy_engine/decide/least_load_credited/<n>`,
+//! `policy_engine/decide/all_vetoed/<n>`,
 //! `policy_engine/decide/manual_keyed_hit/8`,
 //! `policy_engine/decide/manual_keyed_miss/8` and
 //! `policy_engine/spec/parse_validate`. The view is built from the synthetic
@@ -30,8 +32,8 @@ use criterion::{
 };
 use placed::page_start_buffer;
 use smg_policy_controller::{
-    Constraints, Identity, Lease, Lifecycle, ModelFingerprint, PolicySpec, PoolFacts, RequestFacts,
-    Scratch, Side, Target, PRESETS,
+    Constraints, Decision, Identity, Lease, Lifecycle, ModelFingerprint, PolicySpec, PoolFacts,
+    RequestFacts, Scratch, Side, Target, PRESETS,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -128,6 +130,52 @@ fn decide(c: &mut Criterion) {
                     now_micros: 1_000_000,
                     ..RequestFacts::default()
                 };
+                engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
+            });
+        });
+    }
+    // The all-vetoed rule's own path: every row over its thresholds, so the
+    // profile's filters leave nobody, run once more with the overload veto
+    // lifted, and the decision steers to the fewest requests in flight.
+    //
+    // The ids stand only on an engine that steers such a pool. The bench
+    // gate builds its base side from the base's engine and these sources;
+    // an engine without the rule sheds the pool, and a shed is no base to
+    // time a steer against. That side lists no such id, and the gate reads
+    // an id with no base as new.
+    let engine = engine_of("least_load");
+    for &n in &SIZES {
+        let fleet = fleet(n);
+        let mut view = Vec::with_capacity(n);
+        build_view(&fleet, &mut view);
+        for row in &mut view {
+            row.health.overloaded = true;
+        }
+        let mut scratch = Scratch::new();
+        let pool = PoolFacts {
+            pool_size: n as u32,
+            generation: 1,
+            ..PoolFacts::default()
+        };
+        let cx = Constraints::default();
+        let asked = RequestFacts {
+            model: "m",
+            prompt_tokens: 512,
+            now_micros: 1_000_000,
+            ..RequestFacts::default()
+        };
+        let steers = matches!(
+            engine.decide(&asked, &pool, &view, &cx, &mut scratch),
+            Decision::Pick(_)
+        );
+        if !steers {
+            continue;
+        }
+        group.bench_with_input(BenchmarkId::new("all_vetoed", n), &n, |b, _| {
+            let mut seed = 0u64;
+            b.iter(|| {
+                seed += 1;
+                let facts = RequestFacts { seed, ..asked };
                 engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
             });
         });

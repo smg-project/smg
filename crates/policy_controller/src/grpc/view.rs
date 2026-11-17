@@ -6,7 +6,7 @@
 //! the engine's types as the WIT is are a later step.
 
 use crate::{
-    decision::{Decision, Target, Trace},
+    decision::{Decision, Lifted, Target, Trace},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
     plugins::config::{Exposure, Reveal},
     proto,
@@ -384,6 +384,15 @@ fn trace(t: &Trace) -> proto::Trace {
         fallback: false,
         affinity_source: 0,
         drew_first: t.drew_first(),
+        lifted: lifted(t.lifted) as i32,
+    }
+}
+
+/// The contract's word for the veto the all-vetoed rule lifted.
+const fn lifted(mark: Lifted) -> proto::LiftedVeto {
+    match mark {
+        Lifted::None => proto::LiftedVeto::None,
+        Lifted::Overload => proto::LiftedVeto::Overload,
     }
 }
 
@@ -968,6 +977,25 @@ mod tests {
         };
         let wire = super::trace(&drawn);
         assert_eq!((wire.survivors, wire.drew_first), (None, true));
+    }
+
+    /// The trace a plugin is shown carries the veto the all-vetoed rule
+    /// lifted, and none for a pick no rule made.
+    #[test]
+    fn the_views_trace_carries_the_lifted_veto() {
+        use crate::decision::{Lifted, Trace};
+        let steered = Trace {
+            lifted: Lifted::Overload,
+            ..Trace::default()
+        };
+        assert_eq!(
+            super::trace(&steered).lifted,
+            proto::LiftedVeto::Overload as i32
+        );
+        assert_eq!(
+            super::trace(&Trace::default()).lifted,
+            proto::LiftedVeto::None as i32
+        );
     }
 
     /// A measurement for the Numbers table, not a check: run in release

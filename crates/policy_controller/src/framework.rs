@@ -715,6 +715,12 @@ fn only(classes: &[u32]) -> Option<u32> {
 /// Returns the name of the stage that emptied the pool, if one did (design
 /// 4.2: a shed names it): a pool with no candidate was emptied by no stage,
 /// a prefill whose classes hold no decode by the partners.
+///
+/// A pool a hard filter empties is put to the set's all-vetoed rule before
+/// its stage is returned ([`vetoed::emptied`]). Where the rule steers, the
+/// rows it kept stay in `buf.kept` behind the stage's name, and the plan's
+/// home for an emptied pool tells the two by them ([`single_emptied`]): no
+/// caller holds anything for the rule past this call.
 fn filter(
     profile: &Profile,
     facts: &RequestFacts<'_>,
@@ -727,6 +733,7 @@ fn filter(
         class,
         partnered,
         encode,
+        ..
     } = set;
     let kept = &mut buf.kept;
     kept.clear();
@@ -771,7 +778,7 @@ fn filter(
     for hard in profile.filters.iter().filter(|f| !f.soft()) {
         hard.retain(facts, candidates, cx, kept);
         if kept.is_empty() {
-            return Some(hard.name());
+            return Some(vetoed::emptied(hard.name(), profile, facts, cx, buf, set));
         }
     }
     for soft in profile.filters.iter().filter(|f| f.soft()) {
@@ -788,74 +795,52 @@ fn filter(
 }
 
 /// The single plan's opening for a request a sessions rule pins or places:
-/// the profile's filters over the whole pool, the survivors left in
+/// the profile's filters over the set's whole pool, the survivors left in
 /// `buf.kept`. `Some` is the plan's answer when a filter leaves nobody
-/// ([`opening_emptied`]).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the profile run's inputs and the engine"
-)]
+/// ([`single_emptied`]).
 fn single_survivors(
-    engine: &Engine,
     profile: &Profile,
     index: u16,
     facts: &RequestFacts<'_>,
     pool: &PoolFacts<'_>,
-    candidates: &[Candidate],
+    set: Set<'_>,
     cx: &Constraints<'_>,
     buf: &mut Buffers,
 ) -> Option<Decision> {
-    let set = Set {
-        candidates,
-        class: None,
-        partnered: None,
-        encode: false,
-    };
     let emptied_by = filter(profile, facts, cx, buf, set)?;
-    Some(opening_emptied(
-        engine, index, facts, pool, candidates, emptied_by, cx, buf,
+    Some(single_emptied(
+        index,
+        facts,
+        pool,
+        set.candidates,
+        emptied_by,
+        buf,
     ))
 }
 
-/// The answer of an opening whose filters left nobody: the plan's shed
-/// ([`single_emptied`]), put to the binding's all-vetoed rule
-/// ([`Engine::emptied_single`]), the two steps a plain pass takes in its
-/// own text ([`run_single`]). An opening takes them in one cold call out of
-/// line: its decision goes on to a pin or an assignment, and by the
-/// instruction count that path is shorter with this branch outside it.
+/// What the single plan decides over a pool its filter half emptied: the
+/// shed that names the stage, or the all-vetoed rule's pick where the rule
+/// left the rows it kept in `buf.kept` ([`vetoed::steered`]). Every path of
+/// the plan ends here when a stage leaves nobody, a plain request
+/// ([`run_single`]) and the two a sessions rule or an assignment places
+/// ([`single_survivors`]): what the plan asks of an emptied pool has this
+/// one home.
+///
+/// Cold and out of line, its arguments in the order the shed takes them: a
+/// pass that keeps a row sets up nothing for this call.
 #[cold]
 #[inline(never)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the emptied pass's inputs and the engine"
-)]
-fn opening_emptied(
-    engine: &Engine,
-    index: u16,
-    facts: &RequestFacts<'_>,
-    pool: &PoolFacts<'_>,
-    candidates: &[Candidate],
-    emptied_by: &'static str,
-    cx: &Constraints<'_>,
-    buf: &mut Buffers,
-) -> Decision {
-    let shed = single_emptied(index, facts, pool, candidates, emptied_by);
-    engine.emptied_single(shed, facts, pool, candidates, cx, buf)
-}
-
-/// What the single plan decides over a pool its filter half emptied: the
-/// shed that names the stage. Every path of the plan ends here when a stage
-/// leaves nobody, a plain request ([`run_single`]) and the two a sessions
-/// rule or an assignment places ([`single_survivors`], by
-/// [`opening_emptied`]): what the plan asks of an emptied pool has this one
-/// home.
 fn single_emptied(
     index: u16,
     facts: &RequestFacts<'_>,
     pool: &PoolFacts<'_>,
     candidates: &[Candidate],
     emptied_by: &'static str,
+    buf: &mut Buffers,
 ) -> Decision {
+    if !buf.kept.is_empty() {
+        return vetoed::steered(index, facts, pool, candidates, buf);
+    }
     shed(
         reason_of(emptied_by),
         emptied_by,
@@ -863,6 +848,8 @@ fn single_emptied(
     )
 }
 
+/// The trace of a decision that counted its pool: `kept` holds every
+/// survivor of the filters, and `scores` the scores of the set compared.
 fn trace_of(
     profile: u16,
     facts: &RequestFacts<'_>,
@@ -1053,6 +1040,30 @@ struct Set<'a> {
     /// The `epd` plan's filters apply: the pool is the encode pool and the
     /// rows' compatibility and vision bits are read.
     encode: bool,
+    /// What the binding says of a pool the overload veto empties
+    /// ([`AllVetoed`]): the filter half puts such a pool to the rule by this
+    /// word ([`vetoed::emptied`]).
+    vetoed: AllVetoed,
+}
+
+impl<'a> Set<'a> {
+    /// One side of a pair: `candidates` narrowed by the classes a chosen
+    /// prefill pairs with or by the partnered list. A side sheds a pool the
+    /// overload veto empties: the pair plan does not enter the all-vetoed
+    /// rule.
+    const fn side(
+        candidates: &'a [Candidate],
+        class: Option<&'a [u32]>,
+        partnered: Option<&'a [u32]>,
+    ) -> Self {
+        Self {
+            candidates,
+            class,
+            partnered,
+            encode: false,
+            vetoed: AllVetoed::Shed,
+        }
+    }
 }
 
 /// The `epd` plan's vision rule: a request carrying images takes an encoder
@@ -1115,18 +1126,12 @@ fn run_profile(
 /// The single plan's whole pass for a plain request (an `epd` plan's encode
 /// item among them, its rules in `set`): the filter half of the profile's
 /// run, then the scoring half; a pool the filters emptied ends in the
-/// plan's one home for it ([`single_emptied`]), and that shed is put to
-/// the binding's all-vetoed rule ([`Engine::emptied_single`]): the pass
-/// takes the engine for that branch and carries nothing else of the rule.
-/// Inlined, as the profile's run was in the decision before a draw could
-/// stand in front of it.
+/// plan's one home for it ([`single_emptied`]). The filter half has put
+/// such a pool to the binding's all-vetoed rule by then, so the pass holds
+/// nothing for the rule. Inlined, as the profile's run was in the decision
+/// before a draw could stand in front of it.
 #[inline(always)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the profile run's inputs and the engine"
-)]
 fn run_single(
-    engine: &Engine,
     profile: &Profile,
     index: u16,
     facts: &RequestFacts<'_>,
@@ -1137,8 +1142,7 @@ fn run_single(
 ) -> Decision {
     let candidates = set.candidates;
     if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
-        let shed = single_emptied(index, facts, pool, candidates, emptied_by);
-        return engine.emptied_single(shed, facts, pool, candidates, cx, buf);
+        return single_emptied(index, facts, pool, candidates, emptied_by, buf);
     }
     score_survivors(profile, index, facts, pool, candidates, buf)
 }
@@ -1218,8 +1222,8 @@ fn order_joined(
 /// ([`Picker::joined_by_named`]), the rows a host named join the rows drawn
 /// before the scorers run ([`order_joined`]). A draw that keeps nobody says
 /// nothing of the pool: the decision widens to the whole pass
-/// ([`run_single`]), which alone sheds and names a stage; the engine rides
-/// for that pass's all-vetoed rule and for nothing else.
+/// ([`run_single`]), which alone sheds, names a stage and asks the
+/// all-vetoed rule.
 ///
 /// Whatever follows the draw reads the seed's stream past the values the
 /// draw read. The stream is continued, never restarted: a pass behind
@@ -1230,10 +1234,6 @@ fn order_joined(
 /// Out of line, so a decision that draws nothing keeps the engine's decision
 /// path as it was.
 #[inline(never)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the profile run's inputs and the engine"
-)]
 fn run_drawn(
     profile: &Profile,
     index: u16,
@@ -1242,7 +1242,6 @@ fn run_drawn(
     set: Set<'_>,
     cx: &Constraints<'_>,
     buf: &mut Buffers,
-    engine: &Engine,
 ) -> Decision {
     let candidates = set.candidates;
     buf.reserve(candidates.len());
@@ -1318,13 +1317,34 @@ fn run_drawn(
             });
         }
     }
-    let mut decision = run_single(engine, profile, index, after, pool, set, cx, buf);
+    let mut decision = run_single(profile, index, after, pool, set, cx, buf);
     match &mut decision {
         Decision::Pick(pick) => pick.trace.seed = facts.seed,
         Decision::Shed(shed) => shed.trace.seed = facts.seed,
         Decision::Queue(queue) => queue.trace.seed = facts.seed,
     }
     decision
+}
+
+/// The whole pass of an encode item of the `epd` plan: the plan's rules
+/// filter the encode pool before the profile's ([`filter`]). Out of line,
+/// so the decision's entry builds one set for every other request and the
+/// flag is this call's alone.
+#[inline(never)]
+fn run_encode(
+    profile: &Profile,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    set: Set<'_>,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+) -> Decision {
+    let set = Set {
+        encode: true,
+        ..set
+    };
+    run_single(profile, index, facts, pool, set, cx, buf)
 }
 
 /// The plan: the sequence of profiles a request runs.
@@ -1524,8 +1544,9 @@ struct Entry {
     /// declared.
     placing: Assignment,
     /// What a decision of the binding does when the overload veto leaves it
-    /// no worker ([`AllVetoed`]): the document's word, or the default. Read
-    /// where a pass left nobody and nowhere else.
+    /// no worker ([`AllVetoed`]): the document's word, or the default. A
+    /// decision copies it into its set ([`Set`]), and the filter half reads
+    /// it where a hard filter left nobody and nowhere else.
     vetoed: AllVetoed,
 }
 
@@ -2239,9 +2260,10 @@ impl Engine {
     /// by the rows it draws where the pool is large enough, and by the whole
     /// pass under that size or when the draw keeps nobody. A picker the rows
     /// named join ([`Picker::joined_by_named`]) draws for a request that
-    /// names rows and for no other. A pass whose filters leave nobody is put
-    /// to the binding's all-vetoed rule: the request goes to the least-vetoed
-    /// worker, or is shed where the binding says so. The request's affinity
+    /// names rows and for no other. A pass the overload veto leaves nobody is
+    /// put to the binding's all-vetoed rule: the request goes to the
+    /// least-vetoed worker, or is shed where the binding says so. A pool the
+    /// other hard filters empty keeps its shed. The request's affinity
     /// column is empty or holds one entry a candidate; any other is
     /// refused, as a decline under the stage name `affinity-column`. Rows
     /// named in the column's place ([`NamedAffinity`]) are read as the host
@@ -2271,8 +2293,19 @@ impl Engine {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
         let Entry {
-            binding, placing, ..
+            binding,
+            placing,
+            vetoed,
         } = entry;
+        // The single plan's rows, under the binding's word for a pool the
+        // overload veto empties: every path below filters this set.
+        let set = Set {
+            candidates,
+            class: None,
+            partnered: None,
+            encode: false,
+            vetoed: *vetoed,
+        };
         let marks = self.marks[usize::from(index)];
         let _opened = if marks.asks_nothing_first() {
             None
@@ -2293,41 +2326,34 @@ impl Engine {
             // or under none.
             let pinned_first = binding.sessions.is_some() && !facts.session_key.is_none();
             if marks.by_assignment() && binding.plan == Plan::Single && !pinned_first {
-                return self.assign(
-                    profile, index, *placing, facts, pool, candidates, cx, scratch,
-                );
+                return self.assign(profile, index, *placing, facts, pool, set, cx, scratch);
             }
             opened
         };
         if let Some(rule) = binding.sessions {
             if binding.plan == Plan::Single && !facts.session_key.is_none() {
                 return self.decide_session(
-                    profile, index, &rule, *placing, facts, pool, candidates, cx, scratch,
+                    profile, index, &rule, *placing, facts, pool, set, cx, scratch,
                 );
             }
         }
-        let encode = matches!(
-            (binding.plan, facts.phase),
-            (Plan::Epd { .. }, Phase::Encode)
-        );
-        let set = Set {
-            candidates,
-            class: None,
-            partnered: None,
-            encode,
-        };
         let buf = &mut scratch.single;
         // An encode item's rules are the whole pass's own: it never draws.
+        if matches!(
+            (binding.plan, facts.phase),
+            (Plan::Epd { .. }, Phase::Encode)
+        ) {
+            return run_encode(profile, index, facts, pool, set, cx, buf);
+        }
         // A picker the rows named join draws for a request that names rows.
         let draw = marks.draw();
         if draw != 0
-            && !encode
             && candidates.len() >= DRAW_FROM
             && (draw == Marks::DRAWS_FIRST || facts.named.is_some())
         {
-            return run_drawn(profile, index, facts, pool, set, cx, buf, self);
+            return run_drawn(profile, index, facts, pool, set, cx, buf);
         }
-        run_single(self, profile, index, facts, pool, set, cx, buf)
+        run_single(profile, index, facts, pool, set, cx, buf)
     }
 
     /// A keyed decision under a sessions rule (design 4.6 and the host's
@@ -2352,14 +2378,13 @@ impl Engine {
         placing: Assignment,
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
+        set: Set<'_>,
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
+        let candidates = set.candidates;
         let buf = &mut scratch.single;
-        if let Some(answer) =
-            single_survivors(self, profile, index, facts, pool, candidates, cx, buf)
-        {
+        if let Some(answer) = single_survivors(profile, index, facts, pool, set, cx, buf) {
             return answer;
         }
         let key = facts.session();
@@ -2465,14 +2490,13 @@ impl Engine {
         assignment: Assignment,
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
+        set: Set<'_>,
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
+        let candidates = set.candidates;
         let buf = &mut scratch.single;
-        if let Some(answer) =
-            single_survivors(self, profile, index, facts, pool, candidates, cx, buf)
-        {
+        if let Some(answer) = single_survivors(profile, index, facts, pool, set, cx, buf) {
             return answer;
         }
         self.place(profile, index, assignment, facts, pool, candidates, buf)
@@ -2643,12 +2667,7 @@ impl Engine {
             binding.profile,
             &prefill_facts,
             pool,
-            Set {
-                candidates: prefills,
-                class: None,
-                partnered: Some(&scratch.classes),
-                encode: false,
-            },
+            Set::side(prefills, None, Some(&scratch.classes)),
             cx,
             &mut scratch.single,
         );
@@ -2685,12 +2704,7 @@ impl Engine {
                             &prefill_facts,
                             cx,
                             &mut scratch.single,
-                            Set {
-                                candidates: prefills,
-                                class: None,
-                                partnered: None,
-                                encode: false,
-                            },
+                            Set::side(prefills, None, None),
                         )
                         .unwrap_or("none");
                         return shed(reason_of(stage), stage, prefill_shed.trace);
@@ -2708,12 +2722,7 @@ impl Engine {
                         &decode_facts,
                         decode_cx,
                         &mut scratch.decode,
-                        Set {
-                            candidates: decodes,
-                            class: None,
-                            partnered: Some(&scratch.classes),
-                            encode: false,
-                        },
+                        Set::side(decodes, None, Some(&scratch.classes)),
                     )
                     .filter(|&stage| stage != "none")
                     {
@@ -2742,12 +2751,7 @@ impl Engine {
                 decode_index,
                 &decode_facts,
                 pool,
-                Set {
-                    candidates: decodes,
-                    class: Some(pools.table.of(&class)),
-                    partnered: None,
-                    encode: false,
-                },
+                Set::side(decodes, Some(pools.table.of(&class)), None),
                 decode_cx,
                 &mut scratch.decode,
             );
@@ -7148,11 +7152,10 @@ mod tests {
     /// The whole pass of the engine's profile over `pool`, as a decision
     /// under [`DRAW_FROM`] rows runs it.
     fn whole_pass(engine: &Engine, facts: &RequestFacts<'_>, pool: &[Candidate]) -> Decision {
-        let (index, profile) = engine
-            .profile_for(facts.model, Phase::Single)
-            .expect("a profile");
+        let (entry, index, profile) = engine
+            .resolve(facts.model, Phase::Single)
+            .expect("a binding");
         run_single(
-            engine,
             profile,
             index,
             facts,
@@ -7162,6 +7165,7 @@ mod tests {
                 class: None,
                 partnered: None,
                 encode: false,
+                vetoed: entry.vetoed,
             },
             &Constraints::default(),
             &mut Buffers::default(),

@@ -225,12 +225,11 @@ A limit is a recorded row the replay does not decide as recorded, with the reaso
 fails once the reason no longer holds.
 
 - `power_of_two.json`: none. All 44 rows replay.
-- `all_vetoed.json`: four rows are owed, the two rows each of the `prefix_hash` and the `bucket` policy (a pool over
-  on every worker, with shedding off and on). The gateway answers them as it answers every other policy; the crate
-  has no `bucket` preset yet, so it cannot build that policy's rows, and the `prefix_hash` rows wait for the sheet's
-  module. The other 38 rows replay. Nine of them, the eight
-  ring rows and the keyed round robin row, replay with the crate's rule for a routing key under the ring.
-  Until its module lands the replay owes this sheet (`OWED_SHEETS` in `tests/classic_rows.rs`).
+- `all_vetoed.json`: ten rows are owed. Two are the rows of the `bucket` policy (a pool over on every worker, with
+  shedding off and on). The gateway answers them as it answers every other policy; the crate has no `bucket`
+  preset yet, so it cannot build them. Eight are the ring rows: the crate does not keep a routing key on its ring
+  worker yet, and their module refuses them by name. The other 32 rows replay, the keyed round robin row among
+  them.
 - `pair_index.json`: none. All 23 rows replay.
 - `encode_pair.json`: none is recorded yet. The module that replays it arrives with the crate's encoder lists
   and its rule for encode items; until then the replay owes this sheet.

@@ -3,17 +3,16 @@
 //! the veto that steers requests away from a busy worker has nowhere to
 //! steer them. A binding answers in one of two ways ([`AllVetoed`]): the
 //! request goes to the least-vetoed worker, or it is shed. One function
-//! holds the rule ([`emptied`]). The single plan asks it in the branch that
-//! built a shed, so a pass that keeps a worker carries nothing for it.
+//! holds the rule ([`emptied`]). The filter half of a pass asks it where a
+//! hard filter leaves nobody, by the word the pass's set carries, so a pass
+//! that keeps a worker holds nothing for the rule and runs none of it.
 
-use super::{
-    filter, single_emptied, trace_of, Buffers, Engine, Filter, Picker, Plan, Profile, Scorer, Set,
-};
+use super::{filter, trace_of, Buffers, Engine, Filter, Picker, Profile, Scorer, Set};
 use crate::{
     builtins::{Best, LeastRequests, NotOverloaded},
-    decision::{Decision, Pick, Targets},
+    decision::{Decision, Lifted, Pick, Targets, Trace},
     sessions::SessionVerdict,
-    view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts},
+    view::{Candidate, Constraints, PoolFacts, RequestFacts},
 };
 
 /// What a binding does with a pool whose every usable worker the overload
@@ -33,60 +32,16 @@ impl Engine {
     /// Makes the binding at `at`, in the spec's order, shed a pool the
     /// overload veto empties ([`AllVetoed::Shed`]). The validator calls it
     /// for a binding whose document says so; every other binding steers.
+    /// The index is the validator's own, taken where the binding is built:
+    /// one the engine does not hold is a bug, and a debug build refuses it.
+    /// A host that builds its bindings itself has no door to the word yet:
+    /// such an engine steers.
     pub(crate) fn shed_when_all_vetoed(&mut self, at: usize) {
-        if let Some(entry) = self.bindings.get_mut(at) {
+        let entry = self.bindings.get_mut(at);
+        debug_assert!(entry.is_some(), "binding {at} is not built");
+        if let Some(entry) = entry {
             entry.vetoed = AllVetoed::Shed;
         }
-    }
-
-    /// The answer of a single-plan decision whose filters left nobody: the
-    /// shed its pass built, or what the binding's rule makes of it
-    /// ([`emptied`]). The binding is resolved again here, so a pass carries
-    /// nothing for this branch: the rule, the profile and whether the
-    /// request is an encode item of the `epd` plan are read from that walk.
-    ///
-    /// Cold and out of line: a decision whose filters keep a row never comes
-    /// here.
-    #[cold]
-    #[inline(never)]
-    pub(super) fn emptied_single(
-        &self,
-        shed: Decision,
-        facts: &RequestFacts<'_>,
-        pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
-        cx: &Constraints<'_>,
-        buf: &mut Buffers,
-    ) -> Decision {
-        let Decision::Shed(refused) = &shed else {
-            return shed;
-        };
-        let Some((entry, index, profile)) = self.resolve(facts.model, facts.phase) else {
-            return shed;
-        };
-        // The set as the decision built it: the single plan's rows, under
-        // the `epd` plan's rules when the request is an encode item.
-        let set = Set {
-            candidates,
-            class: None,
-            partnered: None,
-            encode: matches!(
-                (entry.binding.plan, facts.phase),
-                (Plan::Epd { .. }, Phase::Encode)
-            ),
-        };
-        emptied(
-            entry.vetoed,
-            refused.emptied_by,
-            profile,
-            index,
-            facts,
-            pool,
-            set,
-            cx,
-            buf,
-        )
-        .unwrap_or(shed)
     }
 }
 
@@ -106,57 +61,86 @@ fn veto_ran(profile: &Profile, emptied_by: &str) -> bool {
     false
 }
 
-/// The rule's answer to a pool the filters emptied at the stage
-/// `emptied_by`; `None` when the shed that pass built stands.
+/// The rule, asked by the filter half where a hard filter leaves a pass
+/// nobody: the stage whose shed stands, with `buf.kept` empty, or the stage
+/// `emptied_by` with the rows the rule kept in `buf.kept`, for the plan's
+/// pick among them ([`steered`]).
 ///
 /// Under [`AllVetoed::Steer`], when the overload veto stood in that pass,
 /// the profile's filters run again with the veto lifted. The rows they keep
-/// are the usable ones, every one over its thresholds, and the request goes
-/// to the least-vetoed of them: the fewest requests in flight, ties drawn by
-/// the decision's seed, the next fewest as alternates. So a hard filter
+/// are the usable ones, every one over its thresholds. So a hard filter
 /// listed behind the overload filter does not hide such a pool, and the
 /// answer does not turn on the order a document lists its filters in. The
-/// retry's lists are set aside for that pass: a worker an earlier attempt
-/// tried is taken again when it holds the fewest requests, since every other
-/// worker is refused too. The pick is the engine's rule and no stage of the
-/// profile makes it, so a document cannot put a scorer where a safety
-/// default stands. It pins no session key.
+/// retry's tried list is set aside for that pass, as the gateway's fallback
+/// sets it aside: a worker an earlier attempt tried is taken again when it
+/// holds the fewest requests. The host's list of workers it just failed to
+/// reach stays: the soft filter passes over such a worker while another
+/// usable one stands, and takes it as the last resort.
 ///
-/// The shed stands for a binding that sheds ([`AllVetoed::Shed`]), for a
-/// pool emptied before the veto ran and for a decision whose host lifted
-/// the veto itself. A pool nobody is usable in even with the veto lifted is
-/// shed at the stage that says why.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the profile run's inputs, as run_profile takes them"
-)]
-fn emptied(
-    rule: AllVetoed,
+/// The shed stands for a set that sheds ([`AllVetoed::Shed`]: a binding's
+/// word, each side of a pair, and the rule's own second pass), for a pool
+/// emptied before the veto ran and for a pool the veto refused no row of,
+/// as under a veto its host lifted: none of them is filtered a second
+/// time. A pool nobody is usable in even with the veto lifted is shed at
+/// the stage that says why.
+///
+/// Cold and out of line: a pass whose filters keep a row never comes here.
+#[cold]
+#[inline(never)]
+pub(super) fn emptied(
     emptied_by: &'static str,
     profile: &Profile,
-    index: u16,
     facts: &RequestFacts<'_>,
-    pool: &PoolFacts<'_>,
-    set: Set<'_>,
     cx: &Constraints<'_>,
     buf: &mut Buffers,
-) -> Option<Decision> {
-    if rule == AllVetoed::Shed || cx.overload_lifted || !veto_ran(profile, emptied_by) {
-        return None;
+    set: Set<'_>,
+) -> &'static str {
+    if set.vetoed == AllVetoed::Shed || !veto_ran(profile, emptied_by) {
+        return emptied_by;
     }
-    let candidates = set.candidates;
+    // A veto that refused no row gains nobody when it is lifted: the shed
+    // stands, for this one look at the rows. A veto its host lifted refused
+    // none.
+    if !set
+        .candidates
+        .iter()
+        .any(|row| !NotOverloaded.keep(facts, row, cx))
+    {
+        return emptied_by;
+    }
     let lifted = Constraints {
         overload_lifted: true,
-        excluded: &[],
         ..*cx
     };
     let whole = RequestFacts {
         tried: &[],
         ..*facts
     };
-    if let Some(stage) = filter(profile, &whole, &lifted, buf, set) {
-        return Some(single_emptied(index, facts, pool, candidates, stage));
-    }
+    // The second pass is put to no rule: its set sheds, so the rule is asked
+    // once a decision. Where that pass leaves nobody either, its own stage
+    // stands. The rows it keeps are the rule's, behind the stage the veto's
+    // pass named.
+    let again = Set {
+        vetoed: AllVetoed::Shed,
+        ..set
+    };
+    filter(profile, &whole, &lifted, buf, again).unwrap_or(emptied_by)
+}
+
+/// The rule's pick among the rows its lifted pass kept (`buf.kept`): the
+/// least-vetoed worker, which is the fewest requests in flight, ties drawn
+/// by the decision's seed, the next fewest as alternates. The pick is the
+/// engine's rule and no stage of the profile makes it, so a document cannot
+/// put a scorer where a safety default stands. It pins no session key, and
+/// its trace says the veto it lifted ([`Lifted::Overload`]): the mark a host
+/// counts its steered picks from.
+pub(super) fn steered(
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    candidates: &[Candidate],
+    buf: &mut Buffers,
+) -> Decision {
     buf.scores.clear();
     buf.scores.resize(buf.kept.len(), 0.0);
     let band = LeastRequests.score(facts, candidates, &buf.kept, &mut buf.scores);
@@ -169,12 +153,15 @@ fn emptied(
         band,
         &mut targets,
     );
-    let trace = trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores);
-    Some(Decision::Pick(Pick {
+    let trace = Trace {
+        lifted: Lifted::Overload,
+        ..trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores)
+    };
+    Decision::Pick(Pick {
         targets,
         trace,
         session_verdict: SessionVerdict::None,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -186,13 +173,14 @@ mod tests {
 
     use crate::{
         builtins::{Best, NotOverloaded},
-        decision::{Decision, ShedReason},
-        framework::{Binding, Engine, Filter, Plan, Profile, Scratch, DRAW_FROM},
+        decision::{Decision, Lifted, ShedReason},
+        framework::{Binding, Engine, Filter, PairPools, Plan, Profile, Scratch, DRAW_FROM},
         lease::{Lease, Lifecycle, Side},
         sessions::SessionVerdict,
         spec::{Needs, OverloadSpec, PolicySpec},
         view::{
-            Candidate, Constraints, Health, Identity, Phase, PoolFacts, RequestFacts, WorkerId,
+            Candidate, Constraints, Health, Identity, NamedAffinity, NamedHolder, Phase, PoolFacts,
+            RequestFacts, WorkerId,
         },
     };
 
@@ -262,6 +250,19 @@ mod tests {
             &Constraints::default(),
             &mut Scratch::new(),
         )
+    }
+
+    /// Refuses every row and counts the rows it was asked about.
+    #[derive(Debug)]
+    struct Refuses(Arc<AtomicUsize>);
+    impl Filter for Refuses {
+        fn name(&self) -> &'static str {
+            "refuses"
+        }
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            false
+        }
     }
 
     /// The positions a pick names, best first.
@@ -451,9 +452,8 @@ mod tests {
         assert_eq!(order(&decide(&engine, &facts(1), &pool))[0], 1);
     }
 
-    /// The retry's lists do not narrow the steer: a worker an earlier
-    /// attempt tried, or the host just failed to reach, is taken again when
-    /// it holds the fewest requests.
+    /// The retry's tried list does not narrow the steer: a worker an earlier
+    /// attempt tried is taken again when it holds the fewest requests.
     #[test]
     fn a_tried_worker_is_taken_again_when_it_holds_the_fewest() {
         let engine = engine_of("round_robin", false);
@@ -465,18 +465,59 @@ mod tests {
             ..facts(1)
         };
         assert_eq!(order(&decide(&engine, &retry, &pool)), vec![1, 2, 0]);
-        let excluded = Constraints {
-            excluded: &tried,
-            ..Constraints::default()
+    }
+
+    /// The host's list of workers it just failed to reach stays in the
+    /// lifted pass: the steer passes over such a worker while another usable
+    /// one stands, whatever it holds, and takes it as the last resort.
+    #[test]
+    fn a_worker_the_host_failed_to_reach_is_the_steers_last_resort() {
+        let engine = engine_of("round_robin", false);
+        let pool = [over(0, 3), over(1, 1), over(2, 2)];
+        let steer = |unreachable: &[WorkerId]| {
+            let cx = Constraints {
+                excluded: unreachable,
+                ..Constraints::default()
+            };
+            let decision = engine.decide(
+                &facts(1),
+                &PoolFacts::default(),
+                &pool,
+                &cx,
+                &mut Scratch::new(),
+            );
+            order(&decision)
         };
-        let decision = engine.decide(
-            &facts(1),
-            &PoolFacts::default(),
-            &pool,
-            &excluded,
-            &mut Scratch::new(),
-        );
-        assert_eq!(order(&decision), vec![1, 2, 0]);
+        assert_eq!(steer(&[WorkerId(101)]), vec![2, 0]);
+        assert_eq!(steer(&[WorkerId(101), WorkerId(102)]), vec![0]);
+        let every = [WorkerId(100), WorkerId(101), WorkerId(102)];
+        assert_eq!(steer(&every), vec![1, 2, 0]);
+    }
+
+    /// A steered pick says the veto the rule lifted, the mark a host counts
+    /// such picks from. A pick the profile's own stages made says
+    /// none, and so does the shed of a binding that sheds.
+    #[test]
+    fn a_steered_pick_says_the_veto_it_lifted() {
+        let engine = engine_of("round_robin", false);
+        let steered = decide(&engine, &facts(1), &[over(0, 3), over(1, 1)]);
+        assert_eq!(steered.trace().lifted, Lifted::Overload);
+        let mut under = over(1, 1);
+        under.health.overloaded = false;
+        let kept = decide(&engine, &facts(1), &[over(0, 3), under]);
+        assert_eq!(kept.trace().lifted, Lifted::None);
+        let shedding = engine_of("round_robin", true);
+        let shed = decide(&shedding, &facts(1), &[over(0, 3), over(1, 1)]);
+        assert_eq!(shed.trace().lifted, Lifted::None);
+    }
+
+    /// A binding the engine does not hold cannot be told to shed: the index
+    /// is the validator's own, and a debug build refuses any other.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "is not built"))]
+    fn a_binding_the_engine_does_not_hold_is_refused_in_a_debug_build() {
+        let mut engine = engine_of("round_robin", false);
+        engine.shed_when_all_vetoed(7);
     }
 
     /// A host's lift puts the decision outside the veto: the filter keeps
@@ -532,6 +573,54 @@ mod tests {
                     "{preset}, seed {seed}"
                 );
             }
+        }
+    }
+
+    /// A request that names rows ends in the same rule. Under a picker the
+    /// rows named join, the draw is asked for such a request: the rows it
+    /// names are refused as every other row is, the whole pass keeps nobody
+    /// either, and the binding's word answers: the fewest in flight, which
+    /// no name stands on, or the shed.
+    #[test]
+    fn a_request_that_names_rows_ends_in_the_same_rule() {
+        let rows = u32::try_from(DRAW_FROM).expect("a small count") + 4;
+        // The fewest requests in flight stand on the last row; the host
+        // names two others.
+        let pool: Vec<Candidate> = (0..rows).map(|at| over(at, rows - at)).collect();
+        static HASHES: [u64; 16] = [0; 16];
+        let holders = [
+            NamedHolder {
+                row: 3,
+                overlap_blocks: 12,
+                predicted_blocks: 0,
+            },
+            NamedHolder {
+                row: 7,
+                overlap_blocks: 8,
+                predicted_blocks: 0,
+            },
+        ];
+        let steering = engine_of("cache_aware", false);
+        let shedding = engine_of("cache_aware", true);
+        for seed in 1..=8 {
+            let naming = RequestFacts {
+                block_hashes: &HASHES,
+                prompt_tokens: 256,
+                named: Some(NamedAffinity {
+                    holders: &holders,
+                    ..NamedAffinity::default()
+                }),
+                ..facts(seed)
+            };
+            let steered = decide(&steering, &naming, &pool);
+            assert_eq!(order(&steered).first(), Some(&(rows - 1)), "seed {seed}");
+            let pick = steered.pick().expect("a pick");
+            assert_eq!(pick.trace.survivors.get(), Some(rows), "seed {seed}");
+            assert_eq!(
+                shed_of(&decide(&shedding, &naming, &pool)),
+                (ShedReason::Saturated, "not-overloaded"),
+                "seed {seed}"
+            );
         }
     }
 
@@ -591,23 +680,76 @@ mod tests {
         }
     }
 
+    /// Each side of a pair sheds a pool the overload veto empties: the pair
+    /// plan does not enter the rule. Under a binding that steers, a prefill
+    /// side over its thresholds on every worker is shed at the veto, and the
+    /// filter listed behind the veto is asked about no prefill.
+    #[test]
+    fn a_pairs_side_sheds_at_the_veto_and_is_filtered_once() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let prefill_side = Profile {
+            name: "counted".into(),
+            filters: vec![
+                Box::new(NotOverloaded),
+                Box::new(Refuses(Arc::clone(&asked))),
+            ],
+            scorers: vec![],
+            picker: Box::new(Best),
+        };
+        let decode_side = Profile {
+            name: "plain".into(),
+            filters: vec![Box::new(NotOverloaded)],
+            scorers: vec![],
+            picker: Box::new(Best),
+        };
+        let engine = Engine::new(
+            vec![prefill_side, decode_side],
+            vec![Binding {
+                model: "*".into(),
+                phases: vec![],
+                plan: Plan::PdPair,
+                profile: 0,
+                decode_profile: Some(1),
+                sessions: None,
+                overload: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        let paired = |mut worker: Candidate| {
+            worker.pair_class = 1;
+            worker
+        };
+        let prefills = [paired(over(0, 1)), paired(over(1, 2))];
+        let mut free = paired(over(0, 0));
+        free.health.overloaded = false;
+        let decodes = [free];
+        let decision = engine.decide_pair(
+            &facts(1),
+            &PoolFacts::default(),
+            PairPools {
+                prefills: &prefills,
+                decodes: &decodes,
+                ..PairPools::default()
+            },
+            &Constraints::default(),
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        assert_eq!(
+            shed_of(&decision),
+            (ShedReason::Saturated, "not-overloaded")
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), 0);
+    }
+
     /// A shed the veto had no part in is not filtered a second time: a pool
-    /// emptied before the veto ran, and a decision whose host lifted the
-    /// veto itself, cost the one pass they cost without the rule.
+    /// emptied before the veto ran, a decision whose host lifted the veto
+    /// itself and a pool the veto refused no row of cost the one pass they
+    /// cost without the rule. A pool the veto refused one row of is filtered
+    /// again, and sheds at the stage behind the veto.
     #[test]
     fn a_shed_the_veto_had_no_part_in_costs_one_pass() {
-        /// Refuses every row and counts the rows it was asked about.
-        #[derive(Debug)]
-        struct Refuses(Arc<AtomicUsize>);
-        impl Filter for Refuses {
-            fn name(&self) -> &'static str {
-                "refuses"
-            }
-            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
-                self.0.fetch_add(1, Ordering::Relaxed);
-                false
-            }
-        }
         let counted = |veto_first: bool| {
             let asked = Arc::new(AtomicUsize::new(0));
             let refuses: Box<dyn Filter> = Box::new(Refuses(Arc::clone(&asked)));
@@ -661,6 +803,28 @@ mod tests {
         );
         assert_eq!(shed_of(&decision), (ShedReason::NoEndpoints, "refuses"));
         assert_eq!(asked.load(Ordering::Relaxed), pool.len());
+        // Listed behind it, with nobody over its thresholds: the veto ran
+        // and refused no row.
+        let (engine, asked) = counted(true);
+        let mut under = pool;
+        for worker in &mut under {
+            worker.health.overloaded = false;
+        }
+        assert_eq!(
+            shed_of(&decide(&engine, &facts(1), &under)),
+            (ShedReason::NoEndpoints, "refuses")
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), under.len());
+        // One row over its thresholds: the veto refused it, so the lifted
+        // pass asks the filter behind the veto about both rows.
+        let (engine, asked) = counted(true);
+        let mut mixed = under;
+        mixed[0].health.overloaded = true;
+        assert_eq!(
+            shed_of(&decide(&engine, &facts(1), &mixed)),
+            (ShedReason::NoEndpoints, "refuses")
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), 1 + mixed.len());
     }
 
     /// The by-assignment path (a picker that leaves the placement to its
