@@ -631,18 +631,23 @@ struct Witness {
 impl Witness {
     fn start() -> Self {
         let (end, ended) = mpsc::channel();
+        // The first nap begins here, before the cell can run, and each nap
+        // begins where the one before it ended: no instant of the cell is
+        // outside a nap, the witness thread's own start with it.
+        let mut began = Instant::now();
         let naps = thread::spawn(move || {
             let nap = Duration::from_millis(5);
             let mut longest = Duration::ZERO;
             loop {
-                let began = Instant::now();
                 let over = ended.recv_timeout(nap) != Err(mpsc::RecvTimeoutError::Timeout);
+                let woke = Instant::now();
                 // The nap its end cut short counts too: a cell the host held
                 // can end before its witness wakes.
-                longest = longest.max(began.elapsed().saturating_sub(nap));
+                longest = longest.max(woke.duration_since(began).saturating_sub(nap));
                 if over {
                     return longest;
                 }
+                began = woke;
             }
         });
         Self { end, naps }

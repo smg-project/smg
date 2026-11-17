@@ -1208,18 +1208,23 @@ mod tests {
     impl Witness {
         fn start() -> Self {
             let (end, ended) = mpsc::channel();
+            // The first nap begins here, before the case can run, and each
+            // nap begins where the one before it ended: no instant of the
+            // case is outside a nap, the witness thread's own start with it.
+            let mut began = Instant::now();
             let naps = thread::spawn(move || {
                 let nap = Duration::from_millis(5);
                 let mut longest = Duration::ZERO;
                 loop {
-                    let began = Instant::now();
                     let over = ended.recv_timeout(nap) != Err(mpsc::RecvTimeoutError::Timeout);
+                    let woke = Instant::now();
                     // The nap its end cut short counts too: a case the host
                     // held can end before its witness wakes.
-                    longest = longest.max(began.elapsed().saturating_sub(nap));
+                    longest = longest.max(woke.duration_since(began).saturating_sub(nap));
                     if over {
                         return longest;
                     }
+                    began = woke;
                 }
             });
             Self { end, naps }
@@ -1291,6 +1296,15 @@ mod tests {
 
     #[test]
     fn a_look_that_fails_names_nobody_until_one_lands() {
+        unheld(
+            "a look that fails",
+            Duration::from_millis(600),
+            a_failed_look_names_nobody,
+        );
+    }
+
+    /// One try of the case above: 600 ms of room, the lease's duration.
+    fn a_failed_look_names_nobody() {
         let lease = MemoryLease::new();
         let settings = ElectionSettings {
             duration: Duration::from_millis(600),
@@ -1320,9 +1334,18 @@ mod tests {
         });
         let following =
             start(follower, Arc::new(MemoryStore::new()), follower_standing).expect("a thread");
+        // The bound on the clock, here and at the last wait: the holder
+        // kept its lease. A host that held it past the lease's duration,
+        // right after a look of the follower's, handed the lease to the
+        // follower: its standing then reads the next term, and the wait
+        // ends on that too.
         wait_for("the follower's look", fences, || {
-            followed.borrow().holder == "a@127.0.0.1:1"
+            followed.borrow().holder == "a@127.0.0.1:1" || followed.borrow().term > 1
         });
+        bound!(
+            followed.borrow().term == 1,
+            "the follower took the lease before its first look landed"
+        );
 
         // The follower's store goes away. The second publish from here is
         // of a step that began after it did: that look failed, and it names
@@ -1346,8 +1369,12 @@ mod tests {
         // The store is back: the next look names the holder again.
         away.store(false, Ordering::SeqCst);
         wait_for("a look that lands", fences, || {
-            followed.borrow().holder == "a@127.0.0.1:1"
+            followed.borrow().holder == "a@127.0.0.1:1" || followed.borrow().term > 1
         });
+        bound!(
+            followed.borrow().term == 1,
+            "the follower took the lease before a look landed"
+        );
         following.stop();
         ended(following);
         leading.stop();
@@ -1935,6 +1962,15 @@ mod tests {
 
     #[test]
     fn a_late_renewal_logs_one_line_a_streak_and_one_more_when_renewals_turn_late_again() {
+        unheld(
+            "a late renewal's lines",
+            Duration::from_millis(300),
+            late_renewals_log_one_line_a_streak,
+        );
+    }
+
+    /// One try of the case above: 300 ms of room, three renew periods.
+    fn late_renewals_log_one_line_a_streak() {
         // A slow write takes four periods under a deadline of four: every
         // renewal of a slow streak lands on a fence that had closed. A fast
         // one lands a period after the stamp before it, three periods inside
@@ -1976,7 +2012,9 @@ mod tests {
         writes(3);
         slow.store(false, Ordering::SeqCst);
         let (late, text) = looping.stopped_with("a renewal landed on a fence that had closed");
-        assert_eq!(late, 2, "{text}");
+        // The bound on the clock: every fast renewal landed inside the
+        // deadline. A host that held one past it made one more late line.
+        bound!(late == 2, "{late} late lines:\n{text}");
     }
 
     /// A lease in this process that a case can lose: after `lose` it holds
@@ -1993,12 +2031,15 @@ mod tests {
             self.lease.lose();
         }
 
-        /// A record no candidate wrote, stored over the one there.
+        /// A record no candidate wrote, stored over the one there. A live
+        /// holder's renewal can land between the read and the write, and
+        /// the write is then turned away: both are made again.
         fn put(&self, record: &LeaseRecord) {
             let mut lease = self.lease.clone();
-            let stored = lease.read().expect("a read");
-            let written = lease.write(stored.as_ref(), record);
-            assert_eq!(written.expect("a write"), Written::Done);
+            until("a record stored over the one there", || {
+                let stored = lease.read().expect("a read");
+                lease.write(stored.as_ref(), record).expect("a write") == Written::Done
+            });
         }
 
         fn landed(&self) -> u32 {
@@ -2290,6 +2331,16 @@ mod tests {
     /// reads the first take by either.
     #[test]
     fn a_record_lost_under_a_live_holder_is_taken_only_after_its_duration() {
+        unheld(
+            "a lost record",
+            Duration::from_millis(400),
+            a_lost_record_is_waited_out,
+        );
+    }
+
+    /// One try of the case above: 400 ms of room, the renew deadline, the
+    /// shortest stop that breaks one of its bounds.
+    fn a_lost_record_is_waited_out() {
         let store = Losable::default();
         let settings = ElectionSettings {
             duration: Duration::from_millis(800),
@@ -2319,6 +2370,14 @@ mod tests {
         // The loss, right after one of the holder's steps.
         let renewals = store.landed();
         until("a renewal", || store.landed() > renewals);
+        // The bound on the clock: the holder led to the loss. A host that
+        // held it a renew deadline closed its fence, and one that held it
+        // past the lease's duration handed the lease on: the record lost
+        // is then of a later term.
+        bound!(
+            leader_fence.leader_term(Instant::now()) == Some(1),
+            "the holder did not lead under term 1 at the loss"
+        );
         let lost = Instant::now();
         store.lose();
         // Both fences through the loss, the first read on both sides of the
@@ -2327,10 +2386,10 @@ mod tests {
         // inside that. `unnamed` is each replica seen with its fence closed
         // and nobody named: the old holder first, the standby second.
         let (mut samples, mut both, mut unnamed) = (0_u32, 0_u32, (false, false));
-        // The first take: how long after the loss, whether the standby's,
-        // and when it was seen.
-        let mut taken: Option<(Duration, bool, Instant)> = None;
-        while taken.is_none_or(|(_, _, seen)| seen.elapsed() < settings.renew_deadline) {
+        // The first take, under whatever later term: how long after the
+        // loss, its term, whether the standby's, and when it was seen.
+        let mut taken: Option<(Duration, u64, bool, Instant)> = None;
+        while taken.is_none_or(|(_, _, _, seen)| seen.elapsed() < settings.renew_deadline) {
             let before = leader_fence.leader_term(Instant::now());
             let between = follower_fence.leader_term(Instant::now());
             let after = leader_fence.leader_term(Instant::now());
@@ -2338,8 +2397,14 @@ mod tests {
             both += u32::from(before.is_some() && between.is_some() && before == after);
             unnamed.0 |= before.is_none() && led.borrow().holder.is_empty();
             unnamed.1 |= between.is_none() && followed.borrow().holder.is_empty();
-            if taken.is_none() && [before, between, after].contains(&Some(2)) {
-                taken = Some((lost.elapsed(), between == Some(2), Instant::now()));
+            // The loop runs to its end whatever that term: the bound on it is
+            // read after the count of two open fences, never ahead of it.
+            let later = [before, between, after]
+                .into_iter()
+                .flatten()
+                .find(|term| *term > 1);
+            if let (None, Some(term)) = (taken, later) {
+                taken = Some((lost.elapsed(), term, between == Some(term), Instant::now()));
             }
             assert!(
                 lost.elapsed() < Duration::from_secs(20),
@@ -2347,19 +2412,14 @@ mod tests {
             );
             thread::sleep(Duration::from_micros(200));
         }
-        let (took, by_standby, _) = taken.expect("a replica leads under the next term");
+        let (took, term, by_standby, _) = taken.expect("a replica leads under a later term");
         let (taker, named_nobody, other) = if by_standby {
             (standby, unnamed.1, &led)
         } else {
             (holder, unnamed.0, &followed)
         };
-        // The page's row reads this line.
-        writeln!(
-            std::io::stdout(),
-            "LOST_RECORD samples={samples} both_open={both} took_ms={} by={taker}",
-            took.as_millis()
-        )
-        .expect("stdout");
+        // No hold excuses two open fences or a take sooner than the lost
+        // record's duration: both are read before the bound.
         assert_eq!(
             both, 0,
             "two open fences in {both} of {samples} samples after the loss"
@@ -2368,10 +2428,35 @@ mod tests {
             took >= settings.duration,
             "{taker} led {took:?} after the loss, sooner than the lost record's duration"
         );
+        // The other bound on the clock: the first take read is the next
+        // term's. A host that held the test past the lease's duration
+        // handed the lease on once more before a fence was read under
+        // that term, and the first take read is then a later one.
+        bound!(
+            term == 2,
+            "the first take read after the loss leads under term {term}"
+        );
+        // The page's row reads this line.
+        writeln!(
+            std::io::stdout(),
+            "LOST_RECORD samples={samples} both_open={both} took_ms={} by={taker}",
+            took.as_millis()
+        )
+        .expect("stdout");
         assert!(named_nobody, "{taker} named a holder through its wait");
+        // The bound on the clock once more: the other replica follows the
+        // taker from its first look after the take. A host that held the
+        // test past the lease's duration handed the lease on, and the
+        // other replica then reads a later term: the wait ends on that too.
         until("the other replica follows the taker", || {
-            other.borrow().holder == taker
+            let look = other.borrow();
+            look.holder == taker || look.term > 2
         });
+        let read = other.borrow().term;
+        bound!(
+            read == 2,
+            "the other replica reads term {read}, past the taker's"
+        );
         following.stop();
         ended(following);
         leading.stop();
@@ -2480,6 +2565,15 @@ mod tests {
 
     #[test]
     fn two_candidates_over_one_lease_lead_follow_and_hand_over_at_a_stop() {
+        unheld(
+            "two candidates over one lease",
+            Duration::from_millis(600),
+            two_candidates_hand_over_at_a_stop,
+        );
+    }
+
+    /// One try of the case above: 600 ms of room, the lease's duration.
+    fn two_candidates_hand_over_at_a_stop() {
         let lease = MemoryLease::new();
         // The order of the design's settings at a fifth of their size.
         let settings = ElectionSettings {
@@ -2515,13 +2609,16 @@ mod tests {
         wait_for("the second's first look", fences, || {
             second_stood.borrow().looked
         });
-        assert_eq!(
-            *second_stood.borrow(),
-            Standing {
-                holder: "a@127.0.0.1:1".to_owned(),
-                term: 1,
-                looked: true,
-            }
+        // The bound on the clock: the first kept its lease to the second's
+        // look. A host that held it past the lease's duration handed the
+        // lease to the second, under the next term.
+        let (holder, term) = {
+            let look = second_stood.borrow();
+            (look.holder.clone(), look.term)
+        };
+        bound!(
+            holder == "a@127.0.0.1:1" && term == 1,
+            "the second's first look names {holder:?} under term {term}"
         );
         assert_eq!(second_store.term(), 0, "a follower holds no term");
 
