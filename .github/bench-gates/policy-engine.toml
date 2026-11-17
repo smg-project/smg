@@ -7,8 +7,9 @@
 # the decision per preset at the same sizes (`policy_engine/decide/<preset>/<n>`), the least-load decision
 # with a credit held per row (`policy_engine/decide/least_load_credited/<n>`), a keyed decision under the
 # manual preset on its pin and off it at 8 workers (`policy_engine/decide/manual_keyed_hit/8`,
-# `policy_engine/decide/manual_keyed_miss/8`) and the spec's parse-and-validate time
-# (`policy_engine/spec/parse_validate`): 33 single-threaded rows, deterministic by construction (a fresh
+# `policy_engine/decide/manual_keyed_miss/8`), the spec's parse-and-validate time
+# (`policy_engine/spec/parse_validate`) and one validation by its index keys
+# (`policy_engine/spec/validate_index/<keys>`): 36 single-threaded rows, deterministic by construction (a fresh
 # seed per iteration), about five minutes a run, so three interleaved runs a side fit the job's budget.
 #
 # From sixteen workers on, a decision under `passthrough`, `random`, `round_robin` or `power_of_two` is made by
