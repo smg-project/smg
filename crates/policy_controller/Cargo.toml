@@ -333,6 +333,10 @@ name = "power_of_two"
 harness = false
 
 [[bench]]
+name = "prefix_hash"
+harness = false
+
+[[bench]]
 name = "draw"
 harness = false
 

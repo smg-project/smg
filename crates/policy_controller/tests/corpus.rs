@@ -37,7 +37,7 @@ fn expected_document(item: &str) -> Option<&str> {
 const NOT_IN_BUILD: &[(&str, &str)] = &[
     (
         "27-cli-prefix-hash-boundaries.md",
-        "the consistent-hash prefix key",
+        "the consistent-hash boundary levels",
     ),
     (
         // The document also names the prefix-affinity accounting, its

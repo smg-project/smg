@@ -101,6 +101,18 @@ impl Default for Gates {
     }
 }
 
+/// How many whole blocks of `block_size` lie within the first `tokens`
+/// tokens of a request hashed in `kind`: the tokens over the block size,
+/// under the text kind their characters over the character block size. A
+/// block size is one at least.
+pub(crate) fn blocks_within(tokens: u32, kind: HashKind, block_size: u32) -> u32 {
+    let units = match kind {
+        HashKind::Token => tokens,
+        HashKind::Text => tokens.saturating_mul(CHARS_PER_TOKEN),
+    };
+    units / block_size
+}
+
 impl Gates {
     /// The gates of a profile from the parameters its affinity stages wrote
     /// and the view's block size.
@@ -181,6 +193,13 @@ impl Gates {
         }
     }
 
+    /// How many whole blocks of the request lie within its first `tokens`
+    /// tokens ([`blocks_within`]), at the block size the request was
+    /// counted with.
+    pub(crate) fn whole_blocks(&self, tokens: u32, facts: &RequestFacts<'_>) -> u32 {
+        blocks_within(tokens, facts.hash_kind, self.block_size_of(facts))
+    }
+
     /// The request's size in blocks: its token count over the block size
     /// (the text kind's characters over the character block size, as
     /// `tokens_of` reads them back), never under one and never under the
@@ -188,11 +207,7 @@ impl Gates {
     /// request's hashes alone would understate it and overstate every
     /// holder's share.
     fn request_blocks(&self, facts: &RequestFacts<'_>) -> u32 {
-        let units = match facts.hash_kind {
-            HashKind::Token => facts.prompt_tokens,
-            HashKind::Text => facts.prompt_tokens.saturating_mul(CHARS_PER_TOKEN),
-        };
-        let from_tokens = (units / self.block_size_of(facts)).max(1);
+        let from_tokens = self.whole_blocks(facts.prompt_tokens, facts).max(1);
         let from_hashes = u32::try_from(facts.block_hashes.len()).unwrap_or(u32::MAX);
         from_tokens.max(from_hashes)
     }

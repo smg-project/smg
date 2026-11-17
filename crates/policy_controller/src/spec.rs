@@ -30,7 +30,7 @@ use serde::{
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    affinity::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
+    affinity::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
     builtins::{
         FewestSessions, LeastLoad, LeastRequests, ResidentWork, SampledBest, SessionAffinity,
         DEFAULT_MEAN_PREFILL_TOKENS,
@@ -39,7 +39,7 @@ use crate::{
     framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
     ring::ConsistentHash,
     sessions::SessionRule,
-    view::{permille, Phase},
+    view::{permille, HashKind, Phase},
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -562,22 +562,25 @@ impl Default for BucketParams {
     }
 }
 
-/// The bounded-load rule of the consistent-hash scorer: a ring owner loaded
-/// this far past the mean passes the request on.
+/// The bounded-load rule of the consistent-hash scorer: a ring owner whose
+/// requests in flight are past both parts of the rule over the candidates'
+/// mean, the request being placed counted in the mean, is passed over, and
+/// the profile's next stage places the request.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoundedLoadParams {
     /// The relative part of the rule; at least 1 (default 1.25).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1.0))]
-    pub factor: Option<f32>,
+    pub factor: Option<f64>,
     /// The absolute part of the rule, in requests (default 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abs_margin: Option<u32>,
 }
 
-/// The consistent-hash scorer: a per-model ring keyed by the routing key or
-/// by the request's prefix, with a bounded-load rule.
+/// The consistent-hash scorer: a per-model ring keyed by the routing key
+/// and, under `prefix_tokens`, by the prefix of a request that carries none,
+/// with a bounded-load rule.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConsistentHashParams {
@@ -585,8 +588,10 @@ pub struct ConsistentHashParams {
     #[serde(default = "one")]
     #[schemars(extend("exclusiveMinimum" = 0))]
     pub weight: f32,
-    /// How many prefix tokens hash when the ring keys by prefix; above zero
-    /// (default 256).
+    /// The depth in tokens at which a request with no routing key is keyed
+    /// by its prefix: the last whole block at or under the depth, so at
+    /// least one block of the view's block size and at most the blocks a
+    /// request carries. Absent, such a request has no key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub prefix_tokens: Option<u32>,
@@ -1662,11 +1667,11 @@ impl At {
     }
 
     /// A written number passes `ok`, or is refused for `reason`.
-    fn number(
+    fn number<T: Copy + fmt::Display>(
         &self,
         name: &str,
-        value: Option<f32>,
-        ok: fn(f32) -> bool,
+        value: Option<T>,
+        ok: fn(T) -> bool,
         reason: &'static str,
     ) -> Result<(), SpecError> {
         match value {
@@ -1699,7 +1704,8 @@ fn unit_interval(v: f32) -> bool {
     v.is_finite() && (0.0..=1.0).contains(&v)
 }
 
-fn at_least_one(v: f32) -> bool {
+fn at_least_one<T: Into<f64>>(v: T) -> bool {
+    let v: f64 = v.into();
     v.is_finite() && v >= 1.0
 }
 
@@ -1990,6 +1996,38 @@ impl Deferred {
     }
 }
 
+/// A consistent-hash stage's prefix depth against the view that carries a
+/// request's block hashes. The key is the last whole block at or under
+/// `prefix_tokens`: the depth holds at least one block of the view's block
+/// size, and no more blocks than a request carries into the view.
+fn check_prefix_depth(
+    stage: &ScoreStage,
+    gates: Gates,
+    view: &ViewSpec,
+    at: &At,
+) -> Result<(), SpecError> {
+    let ScoreStage::ConsistentHash(ConsistentHashParams {
+        prefix_tokens: Some(tokens),
+        ..
+    }) = stage
+    else {
+        return Ok(());
+    };
+    match tokens / gates.block_size {
+        0 => Err(at.bad(
+            "prefix_tokens",
+            tokens,
+            "at least one block of view.block_size",
+        )),
+        blocks if blocks > view.max_block_hashes => Err(at.bad(
+            "prefix_tokens",
+            tokens,
+            "at most view.max_block_hashes blocks of view.block_size",
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn built_scorer(scorer: impl Scorer + 'static) -> Resolved<Box<dyn Scorer>> {
     Resolved::Built(Box::new(scorer))
 }
@@ -2037,10 +2075,13 @@ fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
         ScoreStage::KvPressure(_) => built_scorer(KvPressure),
         ScoreStage::WarmupSlice(p) => built_scorer(WarmupSlice::new(p, gates)),
         ScoreStage::Bucket(_) => Resolved::NotInBuild("the bucket scorer"),
-        ScoreStage::ConsistentHash(p) if p.prefix_tokens.is_some() => {
-            Resolved::NotInBuild("the consistent-hash prefix key")
+        ScoreStage::ConsistentHash(p) => {
+            let ring = ConsistentHash::new(p.bounded_load.as_ref());
+            built_scorer(match p.prefix_tokens {
+                Some(tokens) => ring.keyed_by_prefix(tokens, gates),
+                None => ring,
+            })
         }
-        ScoreStage::ConsistentHash(p) => built_scorer(ConsistentHash::new(p.bounded_load.as_ref())),
         ScoreStage::ResidentWork(p) => built_scorer(ResidentWork::new(p.request_tokens)),
     }
 }
@@ -2174,13 +2215,59 @@ fn added_weight(written: &serde_json::Value, at: &At) -> Result<f32, SpecError> 
     Ok(weight)
 }
 
+/// How deep the stages of one generation read a request's block hashes, in
+/// the depths' own order: a deeper read holds every shallower one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum HashDepth {
+    /// No stage reads them.
+    #[default]
+    Unread,
+    /// The deepest prefix a stage keys at, in tokens.
+    Tokens(u32),
+    /// A stage reads the list whole, as far as the view's cap carries it.
+    Whole,
+}
+
+impl HashDepth {
+    /// What a stage that declares `needs` reads when it names no depth of
+    /// its own: the list whole where it declares the request's hashes.
+    fn of(needs: Needs) -> Self {
+        if needs.token_hashes || needs.text_hashes {
+            Self::Whole
+        } else {
+            Self::Unread
+        }
+    }
+
+    /// What a built scorer reads: a consistent-hash stage keyed by a prefix
+    /// reads as deep as its `prefix_tokens`, any other stage as its `needs`
+    /// declare.
+    fn of_scorer(stage: &ScoreStage, needs: Needs) -> Self {
+        match stage {
+            ScoreStage::ConsistentHash(ConsistentHashParams {
+                prefix_tokens: Some(tokens),
+                ..
+            }) => Self::Tokens(*tokens),
+            _ => Self::of(needs),
+        }
+    }
+
+    /// This depth or `other`, the deeper.
+    fn deepen(&mut self, other: Self) {
+        *self = (*self).max(other);
+    }
+}
+
 /// One profile's stages, built when this build carries every one of them.
+/// `depth` is deepened to what the built stages read of a request's block
+/// hashes.
 fn check_profile(
     name: &str,
     p: &ProfileSpec,
     view: &ViewSpec,
     catalog: &Catalog,
     deferred: &mut Deferred,
+    depth: &mut HashDepth,
 ) -> Result<Option<Profile>, SpecError> {
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
@@ -2202,17 +2289,32 @@ fn check_profile(
         let stage = match scored(entry, name, &entry_at, catalog)? {
             Scored::Typed(stage) => stage,
             Scored::Built(weighted) => {
+                depth.deepen(HashDepth::of(weighted.scorer.needs()));
                 scorers.push(weighted);
                 continue;
             }
         };
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
-        match scorer_of(&stage, gates) {
-            Resolved::Built(scorer) => scorers.push(Weighted {
-                scorer,
-                weight: stage.weight(),
-            }),
+        check_prefix_depth(&stage, gates, view, &stage_at)?;
+        let resolved = match &stage {
+            // A view's boundaries are where the prefix ring keys, the
+            // deepest one a request reaches first.
+            ScoreStage::ConsistentHash(p)
+                if p.prefix_tokens.is_some() && !view.boundaries.is_empty() =>
+            {
+                Resolved::NotInBuild("the consistent-hash boundary levels")
+            }
+            _ => scorer_of(&stage, gates),
+        };
+        match resolved {
+            Resolved::Built(scorer) => {
+                depth.deepen(HashDepth::of_scorer(&stage, scorer.needs()));
+                scorers.push(Weighted {
+                    scorer,
+                    weight: stage.weight(),
+                });
+            }
             Resolved::NotInBuild(what) => {
                 complete = false;
                 deferred.note(stage_at.0, what);
@@ -2242,12 +2344,17 @@ fn check_profile(
         });
     }
     Ok(match picker {
-        Some(picker) if complete => Some(Profile {
-            name: name.to_string(),
-            filters,
-            scorers,
-            picker,
-        }),
+        Some(picker) if complete => {
+            // A filter and a picker name no depth of their own.
+            let unkeyed = filters.iter().map(|filter| filter.needs());
+            depth.deepen(HashDepth::of(unkeyed.fold(picker.needs(), Needs::or)));
+            Some(Profile {
+                name: name.to_string(),
+                filters,
+                scorers,
+                picker,
+            })
+        }
         _ => None,
     })
 }
@@ -2641,13 +2748,14 @@ fn session_rule(
 
 /// The ten preset names of today, as whole profiles. The ones whose stages
 /// this build does not carry yet answer `UnknownPreset`.
-pub const PRESETS: [&str; 8] = [
+pub const PRESETS: [&str; 9] = [
     "random",
     "round_robin",
     "passthrough",
     "power_of_two",
     "least_load",
     "consistent_hashing",
+    "prefix_hash",
     "manual",
     "cache_aware",
 ];
@@ -2741,6 +2849,31 @@ impl PolicySpec {
             "consistent_hashing" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec!["consistent-hash".into()],
+                pick: "best".into(),
+            },
+            // The ring owner of the request's key: its routing key, else its
+            // prefix at 256 tokens. An owner past the bounded-load rule is
+            // passed over and a request with no key has no owner: the
+            // fewest requests in flight take both. The ring's weight is by
+            // arithmetic: an owner leads the ring's next member by a
+            // quarter of the stage's score and the count ranges over one
+            // whole score, so any weight past four keeps a kept owner above
+            // the least loaded worker. The pick names no sample: the owner
+            // must be among the rows scored, so the pool is read whole.
+            "prefix_hash" => ProfileSpec {
+                filter: standard_filters(),
+                score: vec![
+                    ScoreStage::ConsistentHash(ConsistentHashParams {
+                        weight: 8.0,
+                        prefix_tokens: Some(256),
+                        bounded_load: Some(BoundedLoadParams {
+                            factor: Some(1.25),
+                            abs_margin: Some(10),
+                        }),
+                    })
+                    .into(),
+                    "least-requests".into(),
+                ],
                 pick: "best".into(),
             },
             // Sticky sessions over a random assignment: a key stays with the
@@ -2889,6 +3022,17 @@ impl PolicySpec {
         catalog: &Catalog,
         denied_headers: &[&str],
     ) -> Result<Engine, SpecError> {
+        let (engine, _) = self.built(catalog, denied_headers)?;
+        Ok(engine)
+    }
+
+    /// [`PolicySpec::validate_in`], and beside the engine how deep its
+    /// stages read a request's block hashes.
+    fn built(
+        &self,
+        catalog: &Catalog,
+        denied_headers: &[&str],
+    ) -> Result<(Engine, HashDepth), SpecError> {
         if let Some(kind) = &self.kind {
             return Err(SpecError::Kind(kind.clone()));
         }
@@ -2912,6 +3056,7 @@ impl PolicySpec {
         check_view(&self.view, denied_headers)?;
         check_index(&self.index, &self.view)?;
         let mut deferred = Deferred::default();
+        let mut depth = HashDepth::default();
         // What no stage declares: the sessions rules' counts and the view's
         // headers. The engine folds every profile's stages in.
         let mut needs = Needs::default();
@@ -2920,7 +3065,15 @@ impl PolicySpec {
         // positions only once nothing is deferred.
         let mut by_assignment = Vec::new();
         for (name, profile) in &self.profiles {
-            if let Some(built) = check_profile(name, profile, &self.view, catalog, &mut deferred)? {
+            let built = check_profile(
+                name,
+                profile,
+                &self.view,
+                catalog,
+                &mut deferred,
+                &mut depth,
+            )?;
+            if let Some(built) = built {
                 if built.picker.by_assignment() {
                     by_assignment.push(name.as_str());
                 }
@@ -2972,7 +3125,8 @@ impl PolicySpec {
             });
         }
         needs.headers |= !self.view.headers.is_empty();
-        Ok(Engine::new(profiles, bindings, self.generation, needs))
+        let engine = Engine::new(profiles, bindings, self.generation, needs);
+        Ok((engine, depth))
     }
 
     /// A document of this version with the given profiles and nothing else
@@ -3136,15 +3290,20 @@ impl io::Write for HashWriter<'_> {
 /// and one load reads the pair.
 ///
 /// It also holds what a store derives under, beside the engine: the
-/// document's pairing mode ([`AppliedSpec::pairing`]).
+/// document's pairing mode ([`AppliedSpec::pairing`]). And it says how deep
+/// a host hashes a request for it ([`AppliedSpec::block_hashes_read`]).
 #[derive(Debug)]
 pub struct AppliedSpec {
     engine: Engine,
     /// The digest of the document the engine was validated from; none for
     /// the unbound start, which has no document.
     digest: Option<Digest>,
-    /// The document's `view.max_block_hashes`.
+    /// How deep the engine's stages read a request's block hashes.
+    depth: HashDepth,
+    /// The document's `view.max_block_hashes`: no read is past it.
     max_block_hashes: u32,
+    /// The view's block size: a request that names none is counted by it.
+    block_size: u32,
     pairing: Pairing,
 }
 
@@ -3160,13 +3319,8 @@ impl AppliedSpec {
         document: &PolicySpec,
         denied_headers: &[&str],
     ) -> Result<Self, SpecError> {
-        let engine = document.validate_with(denied_headers)?;
-        Ok(Self {
-            engine,
-            digest: Some(document.digest()?),
-            max_block_hashes: document.view.max_block_hashes,
-            pairing: document.plans.pd_pair.pairing,
-        })
+        let built = document.built(&STOCK, denied_headers)?;
+        Ok(Self::of(document, document.digest()?, built))
     }
 
     /// [`AppliedSpec::validate`] over the stages `catalog` holds, under a
@@ -3179,13 +3333,21 @@ impl AppliedSpec {
         digest: Digest,
         catalog: &Catalog,
     ) -> Result<Self, SpecError> {
-        let engine = document.validate_in(catalog, &[])?;
-        Ok(Self {
+        let built = document.built(catalog, &[])?;
+        Ok(Self::of(document, digest, built))
+    }
+
+    /// The generation of `document` under its `digest`: the engine it
+    /// validated into, with the depth of that engine's stages.
+    fn of(document: &PolicySpec, digest: Digest, (engine, depth): (Engine, HashDepth)) -> Self {
+        Self {
             engine,
             digest: Some(digest),
+            depth,
             max_block_hashes: document.view.max_block_hashes,
+            block_size: Gates::of(None, None, document.view.block_size).block_size,
             pairing: document.plans.pd_pair.pairing,
-        })
+        }
     }
 
     /// The generation a store holds before any document is applied: number
@@ -3197,7 +3359,9 @@ impl AppliedSpec {
         Self {
             engine: Engine::new(Vec::new(), Vec::new(), 0, Needs::default()),
             digest: None,
+            depth: HashDepth::Unread,
             max_block_hashes: ViewSpec::default().max_block_hashes,
+            block_size: Gates::default().block_size,
             pairing: Pairing::default(),
         }
     }
@@ -3222,12 +3386,40 @@ impl AppliedSpec {
         &self.engine
     }
 
-    /// How many of a request's prefix block hashes a decision under this
-    /// generation reads: the document's `view.max_block_hashes`. A host
-    /// hands the engine the first that many of a longer list.
+    /// The most prefix block hashes of one request a decision under this
+    /// generation reads: the document's `view.max_block_hashes`. What a
+    /// decision reads of a request is [`Self::block_hashes_read`], this
+    /// many at most.
     #[must_use]
     pub fn max_block_hashes(&self) -> usize {
         usize::try_from(self.max_block_hashes).unwrap_or(usize::MAX)
+    }
+
+    /// How many of a request's prefix block hashes a decision under this
+    /// generation reads, for a request counted in `kind` by blocks of
+    /// `block_size`, `0` for the view's size. The generation's depth is in
+    /// tokens, the deepest `prefix_tokens` of its consistent-hash stages,
+    /// and the blocks are the request's own, counted as the key counts
+    /// them. A stage that declares the request's hashes and names no depth
+    /// reads to the cap ([`Self::max_block_hashes`]), which no depth is
+    /// past, and a generation with no such stage reads none. A host hashes
+    /// that many blocks of a request and no more, and hands the engine the
+    /// first that many of a longer list.
+    #[must_use]
+    pub fn block_hashes_read(&self, kind: HashKind, block_size: u32) -> usize {
+        let blocks = match self.depth {
+            HashDepth::Unread => 0,
+            HashDepth::Tokens(tokens) => {
+                let block_size = if block_size > 0 {
+                    block_size
+                } else {
+                    self.block_size
+                };
+                blocks_within(tokens, kind, block_size).min(self.max_block_hashes)
+            }
+            HashDepth::Whole => self.max_block_hashes,
+        };
+        usize::try_from(blocks).unwrap_or(usize::MAX)
     }
 
     /// What the host must feed under this generation
@@ -3248,29 +3440,182 @@ impl AppliedSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Candidate, Constraints, Filter, Lifecycle, RequestFacts, Targets, TieBand};
 
     #[test]
-    fn an_applied_generation_keeps_its_views_cap_on_block_hashes() {
-        let mut document = PolicySpec::preset("random").expect("a preset of this build");
-        document.generation = 1;
-        let cap = |document: &PolicySpec| {
-            AppliedSpec::validate(document)
-                .expect("the preset validates")
-                .max_block_hashes()
+    fn an_applied_generation_reads_block_hashes_as_deep_as_its_stages_do() {
+        use HashKind::{Text, Token};
+        let preset = |name: &str| {
+            let mut document = PolicySpec::preset(name).expect("a preset of this build");
+            document.generation = 1;
+            document
         };
-        assert_eq!(cap(&document), 256);
-        document.view.max_block_hashes = 128;
-        assert_eq!(cap(&document), 128);
+        let applied = |document: &PolicySpec| {
+            AppliedSpec::validate(document).expect("the document validates")
+        };
+        // No stage of the random preset reads the hashes, and the unbound
+        // start has no stage.
+        let random = applied(&preset("random"));
+        assert_eq!(random.block_hashes_read(Token, 0), 0);
+        assert_eq!(random.block_hashes_read(Text, 0), 0);
+        assert_eq!(AppliedSpec::unbound().block_hashes_read(Token, 0), 0);
         assert_eq!(AppliedSpec::unbound().max_block_hashes(), 256);
+        // A prefix key 256 tokens deep, in the request's own blocks: 16 of
+        // the view's 16 tokens, 32 of a request counted by 8 and 8 of one
+        // counted by 32, and of a text its 1,024 characters in blocks of
+        // the size it was counted by. The cap stays the document's.
+        let mut keyed = preset("prefix_hash");
+        let ring = applied(&keyed);
+        assert_eq!(ring.block_hashes_read(Token, 0), 16);
+        assert_eq!(ring.block_hashes_read(Token, 8), 32);
+        assert_eq!(ring.block_hashes_read(Token, 32), 8);
+        assert_eq!(ring.block_hashes_read(Text, 0), 64);
+        assert_eq!(ring.block_hashes_read(Text, 64), 16);
+        assert_eq!(ring.max_block_hashes(), 256);
+        // A request that names no block size is counted by the view's, and
+        // no depth is past the view's cap.
+        keyed.view.block_size = Some(32);
+        keyed.view.max_block_hashes = 24;
+        let ring = applied(&keyed);
+        assert_eq!(ring.max_block_hashes(), 24);
+        assert_eq!(ring.block_hashes_read(Token, 0), 8);
+        assert_eq!(ring.block_hashes_read(Text, 0), 24);
         // The controller's door builds a generation under a digest it took
-        // already: that builder keeps the cap too.
+        // already: that builder keeps the depth too.
         #[cfg(feature = "controller")]
         {
-            let digest = document.digest().expect("the document digests");
-            let applied = AppliedSpec::validate_digested(&document, digest, &Catalog::builtin())
+            let digest = keyed.digest().expect("the document digests");
+            let applied = AppliedSpec::validate_digested(&keyed, digest, &Catalog::builtin())
                 .expect("the preset validates");
-            assert_eq!(applied.max_block_hashes(), 128);
+            assert_eq!(applied.block_hashes_read(Token, 0), 8);
         }
+        // A stage with no depth of its own reads to the view's cap.
+        let mut held = preset("cache_aware");
+        assert_eq!(applied(&held).block_hashes_read(Token, 0), 256);
+        held.view.max_block_hashes = 128;
+        assert_eq!(applied(&held).block_hashes_read(Text, 4), 128);
+        // A generation reads as deep as the deepest of its profiles.
+        let two = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":[{"consistent-hash":{"prefix_tokens":256}}],"pick":"best"},"q":{"score":[{"consistent-hash":{"prefix_tokens":512}}],"pick":"best"}},"bindings":[{"match":{"model":"a*"},"profiles":{"single":"p"}},{"match":{"model":"*"},"profiles":{"single":"q"}}]}"#,
+        );
+        assert_eq!(applied(&two).block_hashes_read(Token, 0), 32);
+    }
+
+    /// A guest stage of each kind, under the name it is registered by, that
+    /// declares the request's token hashes and names no depth.
+    #[derive(Debug)]
+    struct ReadsHashes(&'static str);
+
+    impl ReadsHashes {
+        fn declared() -> Needs {
+            Needs {
+                token_hashes: true,
+                ..Needs::default()
+            }
+        }
+    }
+
+    impl Lifecycle for ReadsHashes {}
+
+    impl Filter for ReadsHashes {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            true
+        }
+
+        fn needs(&self) -> Needs {
+            Self::declared()
+        }
+    }
+
+    impl Scorer for ReadsHashes {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+
+        fn needs(&self) -> Needs {
+            Self::declared()
+        }
+    }
+
+    impl Picker for ReadsHashes {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn pick(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            _: &[f32],
+            _: TieBand,
+            _: &mut Targets,
+        ) {
+        }
+
+        fn needs(&self) -> Needs {
+            Self::declared()
+        }
+    }
+
+    #[test]
+    fn a_stage_that_names_no_depth_reads_the_block_hashes_to_the_cap() {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter("hashing-filter", || Box::new(ReadsHashes("hashing-filter")))
+            .and_then(|catalog| {
+                catalog.scorer("hashing-scorer", || Box::new(ReadsHashes("hashing-scorer")))
+            })
+            .and_then(|catalog| {
+                catalog.picker("hashing-picker", || Box::new(ReadsHashes("hashing-picker")))
+            })
+            .expect("three free names");
+        let depth = |profile: &str| {
+            let document = doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{profile}}}}}"#
+            ));
+            let (_, depth) = document
+                .built(&catalog, &[])
+                .expect("the document validates");
+            depth
+        };
+        assert_eq!(depth(r#"{"pick":"random"}"#), HashDepth::Unread);
+        // A guest of each kind declares the hashes and names no depth.
+        for profile in [
+            r#"{"filter":["hashing-filter"],"pick":"random"}"#,
+            r#"{"score":["hashing-scorer"],"pick":"best"}"#,
+            r#"{"pick":"hashing-picker"}"#,
+        ] {
+            assert_eq!(depth(profile), HashDepth::Whole, "{profile}");
+        }
+        // A prefix key reads to its own depth, and beside a stage that
+        // reads the list whole the generation reads it whole.
+        let key = r#"{"consistent-hash":{"prefix_tokens":256}}"#;
+        assert_eq!(
+            depth(&format!(r#"{{"score":[{key}],"pick":"best"}}"#)),
+            HashDepth::Tokens(256)
+        );
+        assert_eq!(
+            depth(&format!(
+                r#"{{"score":[{key},"hashing-scorer"],"pick":"best"}}"#
+            )),
+            HashDepth::Whole
+        );
     }
 
     fn doc(text: &str) -> PolicySpec {
@@ -3329,7 +3674,12 @@ mod tests {
             let engine = spec.validate().expect(name);
             let load_aware = ["least_load", "power_of_two", "cache_aware"].contains(&name);
             assert_eq!(engine.needs().loads, load_aware, "{name}");
-            assert_eq!(engine.needs().ring, name == "consistent_hashing", "{name}");
+            let ring = ["consistent_hashing", "prefix_hash"].contains(&name);
+            assert_eq!(engine.needs().ring, ring, "{name}");
+            // A request's block hashes are fed where a stage reads them: the
+            // affinity stage and the ring's prefix form.
+            let hashes = ["cache_aware", "prefix_hash"].contains(&name);
+            assert_eq!(engine.needs().token_hashes, hashes, "{name}");
             assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
             // The affinity column is fed where an affinity stage reads it
             // and nowhere else: a preset without one declares no column.
@@ -4240,10 +4590,6 @@ mod tests {
                 "prefix-affinity",
             ),
             (r#"{"bucket":{"abs_threshold":32}}"#, "bucket"),
-            (
-                r#"{"consistent-hash":{"prefix_tokens":512,"bounded_load":{"factor":1.5,"abs_margin":4}}}"#,
-                "consistent-hash",
-            ),
         ];
         for (score, name) in with_params {
             let (path, what) = not_in_build(&spec_with_score(score));
@@ -4255,16 +4601,70 @@ mod tests {
         let resident = spec_with_score(r#"{"resident-work":{"request_tokens":512}}"#);
         assert!(resident.validate().expect("validates").needs().loads);
         // The consistent-hash scorer is in the build with its bounded-load
-        // rule; the prefix key form waits for the block hashes in the view.
+        // rule and with its prefix form, which reads the request's block
+        // hashes; without the form it asks for none.
         let bounded = spec_with_score(r#"{"consistent-hash":{"bounded_load":{"factor":1.5}}}"#);
-        assert!(bounded.validate().expect("validates").needs().ring);
-        assert_eq!(
-            not_in_build(&spec_with_score(
-                r#"{"consistent-hash":{"prefix_tokens":512}}"#
-            ))
-            .1,
-            "the consistent-hash prefix key"
+        let needs = bounded.validate().expect("validates").needs();
+        assert!(needs.ring && !needs.token_hashes && !needs.text_hashes);
+        let prefix = spec_with_score(
+            r#"{"consistent-hash":{"prefix_tokens":512,"bounded_load":{"factor":1.5,"abs_margin":4}}}"#,
         );
+        let needs = prefix.validate().expect("validates").needs();
+        assert!(needs.ring && needs.token_hashes && needs.text_hashes);
+        // Under a view that names boundaries the prefix ring keys at the
+        // deepest one a request reaches, which this build does not carry.
+        let levelled = doc(
+            r#"{"apiVersion":"smg.policy/v1","view":{"boundaries":[256,1024]},"profiles":{"p":{"score":[{"consistent-hash":{"prefix_tokens":512}}],"pick":"best"}}}"#,
+        );
+        assert_eq!(
+            not_in_build(&levelled),
+            (
+                "profiles.p.score[0].consistent-hash".to_string(),
+                "the consistent-hash boundary levels"
+            )
+        );
+        // A ring with no prefix form reads no boundary and builds there.
+        let plain = doc(
+            r#"{"apiVersion":"smg.policy/v1","view":{"boundaries":[256,1024]},"profiles":{"p":{"score":[{"consistent-hash":{"bounded_load":{"factor":1.5}}}],"pick":"best"}}}"#,
+        );
+        assert!(plain.validate().expect("validates").needs().ring);
+    }
+
+    /// The prefix depth is held to the view that carries the hashes: at
+    /// least one block of the view's block size, at most the blocks a
+    /// request carries.
+    #[test]
+    fn a_prefix_depth_the_view_cannot_carry_is_refused() {
+        let spec = |view: &str, tokens: u32| {
+            doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","view":{view},"profiles":{{"p":{{"score":[{{"consistent-hash":{{"prefix_tokens":{tokens}}}}}],"pick":"best"}}}}}}"#
+            ))
+        };
+        let refused = |view: &str, tokens: u32| match spec(view, tokens).validate() {
+            Err(SpecError::BadField { path, reason, .. }) => {
+                assert_eq!(
+                    path, "profiles.p.score[0].consistent-hash.prefix_tokens",
+                    "{view} {tokens}"
+                );
+                reason
+            }
+            other => panic!("{view} {tokens}: validated as {other:?}"),
+        };
+        let under = "at least one block of view.block_size";
+        let over = "at most view.max_block_hashes blocks of view.block_size";
+        // The default view: blocks of 16 tokens, 256 of them a request.
+        for tokens in [16, 256, 4096, 4111] {
+            assert!(spec("{}", tokens).validate().is_ok(), "{tokens}");
+        }
+        assert_eq!(refused("{}", 15), under);
+        assert_eq!(refused("{}", 4112), over);
+        // The view's own block size and its cap move both edges.
+        let view = r#"{"block_size":64,"max_block_hashes":4}"#;
+        for tokens in [64, 256, 319] {
+            assert!(spec(view, tokens).validate().is_ok(), "{tokens}");
+        }
+        assert_eq!(refused(view, 63), under);
+        assert_eq!(refused(view, 320), over);
     }
 
     #[test]

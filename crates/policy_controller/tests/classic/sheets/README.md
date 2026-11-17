@@ -26,6 +26,7 @@ after each thing its load monitor is handed about the worker.
 crates/policy_controller/tests/classic/sheets/
   power_of_two.json        one sheet per policy: its recorded rows
   manual.json
+  prefix_hash.json
   pair_index.json
   all_vetoed.json
   encode_pair.json
@@ -34,6 +35,7 @@ crates/policy_controller/tests/classic/sheets/
 model_gateway/src/         each recorder, a test module beside the code it runs
   policies/classic_rows.rs                                                  power_of_two.json
   policies/classic_manual_rows.rs                                           manual.json
+  policies/classic_prefix_hash_rows.rs                                      prefix_hash.json
   policies/classic_all_vetoed_rows.rs                                       all_vetoed.json
   worker/pd/pairing/classic_pair_rows.rs                                    pair_index.json
   routers/grpc/common/stages/worker_selection/classic_encode_pair_rows.rs   encode_pair.json
@@ -109,6 +111,23 @@ must replay pick for pick, a pool runs under `power_of_two:least_requests`, whic
 flight with no draw and no state. Where a row must show whether a side's policy was asked at all, that side runs
 under `random`: where the gateway places by its own rule, one pair takes every draw.
 
+The rows of `prefix_hash.json` are sequence rows and two kinds of counted row. A row names the policy's
+configuration in the gateway's own spelling: how many tokens of a prompt it hashes and the two margins of its load
+bound. A prompt is written as runs of consecutive token ids, `[first, count]` each. A request carries one as
+`tokens`, or as `text` (each id spelled as four hex digits, so the policy's four characters a token read the same
+span), a routing `key`, or nothing to hash, with the workers an earlier attempt `tried`. A step is a pick, new loads
+for every worker (`loads`) or which workers are ready (`ready`). A ring row names a request (`ring`) and lists its
+workers in that request's ring order, found as a ring key's order is: the worker the request lands on with every
+worker ready and idle, then with the members found so far down. A pairs row (`prompts` with `differ_at`) places
+pairs of prompts on an idle pool and counts the pairs whose two prompts took one worker, then the pairs that took
+two: prompt `i` of the row is `tokens` ids from `1000000 + 1000 * i` on, and its twin holds `2000000000 + i` at the
+one place `differ_at`. Where the row's prompts are `text`, each is carried as text: prompt `i` is ids from
+`1000 * i` on, and its twin holds `65000 + i`. A spread row (`prompts` without `differ_at`) places `count` such
+prompts once each and counts what each worker took, the largest count first, since two rings give one worker
+different shares. Both are written as counts over `draws` and compared as a drawn row's shares are. Nothing in them
+draws: the recorder runs each twice and stops if the runs differ. No row ties the fewest requests: between equal
+loads the gateway takes the first worker of its pool, which is the pool's order and no rule of the policy.
+
 `pair_index.json` holds a third kind, which picks nothing:
 
 - **pair row:** a prefill pool and a decode pool, with what each worker offers a partner as the gateway derives it
@@ -145,6 +164,7 @@ directory. The sha256 is of the file as committed.
 |---|---|---|---|---|---|
 | `power_of_two.json` | power of two, under each of its four load metrics | `1b141d03b5ca9097f54f0ebc4b95d72e810a62c3` | 44: 24 sequence, 20 drawn | `602e1fe790cc5368ad05de2297b6e482b7a8893704ee448699ec467df9e0d87c` | `classic_rows.rs` |
 | `manual.json` | manual, under each of its assignment modes | `1b141d03b5ca9097f54f0ebc4b95d72e810a62c3` | 14: 9 sequence, 5 drawn | `d34189025a50a7a31f925c632ce1964a09dac0baab89370e6e87c5c842db9a5a` | `classic_manual_rows.rs` |
+| `prefix_hash.json` | prefix hash: a key from a prompt's prefix, from a routing key and from nothing; the load bound and where a passed key goes; how deep the key reads | `d92647556e91a3601ef647f12ae5784df2080dc3` | 33: 25 sequence, 8 drawn | `ad116fc0ba1a5d001644ed00e616665ffe4b67fc1eecdcb28353498dd61b5fff` | `classic_prefix_hash_rows.rs` |
 | `all_vetoed.json` | every policy, over a pool whose every usable worker is over its overload thresholds; a routing key under consistent hashing whose own worker is over them | `d9f8018881cc54c9b0f6e993849a59f8f7c54ab5` | 42: 38 sequence, 4 drawn | `e5496add4cc24e8438e60849570c6f0113f3537eeb2010f448fb8af5a432527b` | `classic_all_vetoed_rows.rs` |
 | `pair_index.json` | the prefill and decode pair index, on both pair wires under each pairing mode | `64ff5a437b5007af5079f0492b46f4e5a712b66f` | 23 pair rows | `383783a8a28bdc3d0753111fbb84df4be2713fe332b448938b9cb75f44dec694` | `classic_pair_rows.rs` |
 | `encode_pair.json` | a request with encode items: the pair, the encoders offered and each item's encoder | `4ba2a6431357be5411a2383cdc4916b41471d722` | 52: 52 sequence, 0 drawn | `988bf253da9310aeedd08ec2704d8e01ecc4a1210453353723ba0faa9001de33` | `classic_encode_pair_rows.rs` |
@@ -165,6 +185,7 @@ CLASSIC_ROWS_OUT=$PWD/crates/policy_controller/tests/classic/sheets CLASSIC_ROWS
 |---|---|
 | `power_of_two.json` | `policies::classic_rows` |
 | `manual.json` | `policies::classic_manual_rows` |
+| `prefix_hash.json` | `policies::classic_prefix_hash_rows` |
 | `all_vetoed.json` | `policies::classic_all_vetoed_rows` |
 | `pair_index.json` | `worker::pd::pairing::classic_pair_rows` |
 | `encode_pair.json` | `worker_selection::classic_encode_pair_rows` |
@@ -201,7 +222,8 @@ fails once the reason no longer holds.
 - `power_of_two.json`: none. All 44 rows replay.
 - `all_vetoed.json`: four rows are owed, the two rows each of the `prefix_hash` and the `bucket` policy (a pool over
   on every worker, with shedding off and on). The gateway answers them as it answers every other policy; the crate
-  has no preset of either name yet, so it cannot build the rows. The other 38 rows replay. Nine of them, the eight
+  has no `bucket` preset yet, so it cannot build that policy's rows, and the `prefix_hash` rows wait for the sheet's
+  module. The other 38 rows replay. Nine of them, the eight
   ring rows and the keyed round robin row, replay with the crate's rule for a routing key under the ring.
   Until its module lands the replay owes this sheet (`OWED_SHEETS` in `tests/classic_rows.rs`).
 - `pair_index.json`: none. All 23 rows replay.
@@ -225,3 +247,9 @@ fails once the reason no longer holds.
 - `manual.json`: one row is owed, `manual-one-key-pins-apart-under-the-prefill-and-the-decode-role`. The gateway
   keeps a key's pins apart under each role of a prefill and decode pair. The crate refuses a sessions rule under a
   pair plan today, so it cannot build the row; the other 13 rows replay.
+- `prefix_hash.json`: two rows are decided apart, each by the key this crate reads, and the replay names both with
+  the outcome the crate gives. The gateway hashes a prompt's own tokens. A key here is the hash of a request's last
+  whole block of the view's block size, made by the host that feeds the request. So the tokens past that block are
+  outside the key (`the-last-token-of-a-prompt-under-256-tokens-is-in-the-key`), and a request under one block has
+  no key and is placed as one with nothing to hash, on the fewest requests
+  (`a-ten-token-prompt-keeps-its-key-s-worker-over-the-fewest-requests`). The other 31 rows replay.
