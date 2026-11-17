@@ -23,14 +23,17 @@
 
 use std::borrow::Cow;
 
-use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
+use image::{DynamicImage, GenericImageView, RgbImage};
 use ndarray::{Array3, IxDyn};
 
-use crate::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
-    scratch,
-    transforms::{self, TransformError},
+use crate::{
+    buffer_pool,
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
+        scratch,
+        transforms::{self, TransformError},
+    },
 };
 
 /// CLIP normalization mean values.
@@ -231,15 +234,25 @@ impl Phi3VisionProcessor {
         // Pad height to multiple of 336
         let padded = self.padding_336(resized.into_rgb8());
 
-        // Transpose back if needed (transpose is self-inverse)
+        // Transpose back if needed (transpose is self-inverse). The image has
+        // then been read for the last time and its buffer is offered to the
+        // pool. A padded canvas came from the pool; an image that needed no
+        // padding still has the resize's buffer, which the pool frees unless
+        // it is of one of its classes.
         DynamicImage::ImageRgb8(if transposed {
-            transforms::transpose_rgb(&padded)
+            let turned = transforms::transpose_rgb(&padded);
+            buffer_pool::recycle(padded.into_raw());
+            turned
         } else {
             padded
         })
     }
 
-    /// Pad image height to multiple of 336 (centered, white padding).
+    /// Pad image height to multiple of 336 (centered, white padding). An image
+    /// already whole tiles high comes back as given. A padded one has its
+    /// pixels in a buffer from the pool's `take` (a plain allocation outside
+    /// the pooled range), which its last reader offers back to the pool:
+    /// `process_single_image`, or the transpose back.
     #[expect(
         clippy::unused_self,
         reason = "method logically belongs to the processor; keeps API consistent"
@@ -254,15 +267,23 @@ impl Phi3VisionProcessor {
 
         let top_padding = (target_h - height) / 2;
 
-        // Create white-padded image
-        let mut padded = RgbImage::from_pixel(width, target_h, Rgb([255, 255, 255]));
-
-        // Copy original image to center: the two have one width, so its
-        // rows are one block of the canvas.
+        // The canvas is a buffer of the pool, so its bytes are a previous
+        // request's and every one of them is written here: the image's rows
+        // are one block in its middle (the two have one width), and the band
+        // above them and the band below are white.
+        let rows = image.as_raw();
         let top = top_padding as usize * width as usize * 3;
-        let canvas: &mut [u8] = &mut padded;
-        canvas[top..top + image.as_raw().len()].copy_from_slice(image.as_raw());
-        padded
+        let mut canvas = buffer_pool::take(width as usize * target_h as usize * 3);
+        let (above, rest) = canvas.split_at_mut(top);
+        let (middle, below) = rest.split_at_mut(rows.len());
+        above.fill(255);
+        middle.copy_from_slice(rows);
+        below.fill(255);
+        #[expect(
+            clippy::expect_used,
+            reason = "the canvas holds exactly width * target_h * 3 bytes by construction"
+        )]
+        RgbImage::from_raw(width, target_h, canvas).expect("padded canvas size")
     }
 
     /// Create global image by bicubic interpolation to 336x336.
@@ -316,6 +337,10 @@ impl Phi3VisionProcessor {
         // 3. To tensor [0, 1] and normalize, in torchvision's steps (the
         //    reference composes `ToTensor` and `Normalize`: three roundings)
         let tensor = transforms::to_tensor_then_normalize(&hd_image, &self.mean, &self.std);
+        // The HD image has been read for the last time: its buffer is offered
+        // to the pool, which keeps a padding's canvas for the next request
+        // (`padding_336` says what the buffer of an unpadded image is).
+        buffer_pool::recycle_image(hd_image);
 
         // 4. The global image (336x336) comes first
         let tile = TILE_SIZE as usize;
@@ -443,8 +468,10 @@ impl VisionPreProcessor for Phi3VisionProcessor {
 
 #[cfg(test)]
 mod tests {
+    use image::Rgb;
+
     use super::*;
-    use crate::test_support::create_test_image;
+    use crate::test_support::{create_test_image, lcg_bytes};
 
     #[test]
     fn test_phi3_vision_processor_default() {
@@ -823,5 +850,50 @@ mod tests {
         let processor = Phi3VisionProcessor::new();
         let result = processor.preprocess(&[]);
         assert!(matches!(result, Err(TransformError::EmptyBatch)));
+    }
+
+    /// The padded canvas is a buffer of the pool. Its bytes are a previous
+    /// request's (the sentinel in a debug build), so the image's rows and
+    /// the two white bands must cover every one of them; and a request
+    /// returns the buffer, for a wide image (the canvas is the HD image) and
+    /// for a tall one (the canvas is transposed back, then returned).
+    #[test]
+    fn the_padded_canvas_is_taken_from_the_pool_and_returned_to_it() {
+        static POOL: buffer_pool::BufferPool = buffer_pool::BufferPool::new();
+        buffer_pool::with_pool(&POOL, || {
+            let processor = Phi3VisionProcessor::with_config(4);
+            // 672x378 pads to 672x672: 147 white rows above and 147 below.
+            let rows = RgbImage::from_raw(672, 378, lcg_bytes(672 * 378 * 3, 7)).expect("672x378");
+            let mut expected = RgbImage::from_pixel(672, 672, Rgb([255, 255, 255]));
+            image::imageops::replace(&mut expected, &rows, 0, 147);
+            let class = buffer_pool::allocation_capacity(expected.as_raw().len());
+            for round in 0..2 {
+                let canvas = processor.padding_336(rows.clone());
+                assert!(
+                    canvas.as_raw() == expected.as_raw(),
+                    "round {round}: pixels differ"
+                );
+                assert_eq!(
+                    POOL.held(),
+                    0,
+                    "round {round}: the canvas is out of the pool"
+                );
+                buffer_pool::recycle(canvas.into_raw());
+                assert_eq!(
+                    POOL.held(),
+                    class,
+                    "round {round}: the canvas is idle in the pool"
+                );
+            }
+            for (width, height) in [(1920, 1080), (1080, 1920)] {
+                let image = create_test_image(width, height, Rgb([90, 120, 150]));
+                processor.preprocess(&[&image]).expect("a photo");
+                assert_eq!(
+                    POOL.held(),
+                    class,
+                    "{width}x{height}: the request returned the canvas"
+                );
+            }
+        });
     }
 }
