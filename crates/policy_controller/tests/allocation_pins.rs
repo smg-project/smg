@@ -3,8 +3,12 @@
 //! of 64 and of 512 rows, a decision over rows with a credit held in the
 //! least-load tally, and a pair decision allocate nothing (design 4.4: a
 //! scorer or picker allocates nothing per decision; the host keeps one scratch
-//! per thread so the framework allocates nothing after the first). A separate
-//! executable, so it can declare the counting allocator the pins need.
+//! per thread so the framework allocates nothing after the first). The
+//! store's pins stand beside them: a build from the store allocates nothing
+//! after the first, and two membership writes are held to each other, a
+//! write that moves an offer to one that moves none and a registration into
+//! 512 workers to one into 8. A separate executable, so it can declare the
+//! counting allocator the pins need.
 
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
@@ -488,7 +492,7 @@ fn a_write_that_moves_an_offer_allocates_what_a_write_that_moves_none_does() {
 }
 
 #[test]
-fn a_registration_into_a_standing_pool_allocates_its_list_once() {
+fn a_registrations_allocations_do_not_follow_the_fleet() {
     // A membership write walks every member into its pool's list. A
     // standing pool's list starts at the pool's last length and one more,
     // so what a registration allocates does not follow the fleet: one into

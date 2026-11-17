@@ -20,14 +20,16 @@
 //! writes a publication derives nothing: it is one small object, a pointer
 //! per pool, and new rows for each pool a write was folded into.
 //!
-//! **A pair class is a fact of the rows.** A membership write derives each
-//! model's pair classes from what its prefills and decodes report
-//! ([`PairClasses`]) before any row is built: a worker's row carries its one
+//! **A pair class is a fact of the rows.** A model's pair classes come from
+//! what its prefills and decodes report ([`PairClasses`]), and a membership
+//! write holds them before any row is built: a worker's row carries its one
 //! class, and the model's table says which classes pair. The table names
 //! classes, never rows, so a pool with another gateway's host-local rows
-//! left out reads the same table. A write that moves no member and no
-//! member's offer carries the last write's classes and reads no member's
-//! facts for them.
+//! left out reads the same table. A write that moves one worker or its
+//! offer derives the classes for that worker alone, in the models it left
+//! and joined, from what the writer keeps of each model's derivation. A
+//! write that moves no member and no member's offer carries the last
+//! write's classes and reads no member's facts for them.
 //!
 //! A row in a pool is the candidate row itself. Its fixed fields are
 //! written when the membership's first world is built. Its moving facts
@@ -239,8 +241,10 @@ struct PoolShape {
     locals: Box<[(u32, GatewayId)]>,
     /// The pair classes of the pool's model, on its prefill pool where the
     /// model has a decode too: a pair build reads them by the one lookup
-    /// that finds its two pools. Counted: a membership write that moves no
-    /// offer hands them to the shape it derives ([`Classes::Carry`]).
+    /// that finds its two pools. Counted: a membership write hands them to
+    /// the shape it derives where they stand, a write that moves no offer
+    /// ([`Classes::Carry`]) and a written worker's derive that leaves them
+    /// as they were ([`Classes::Written`]).
     pairs: Option<Arc<PairClasses>>,
 }
 
@@ -949,9 +953,8 @@ pub(super) enum Classes {
         joined: Option<WorkerId>,
     },
     /// No member joined or left and no member's offer moved
-    /// ([`same_offer`]): the classes are the last write's, carried. A
-    /// derivation reads the written member's facts, so a write that moves
-    /// none of them pays for none.
+    /// ([`same_offer`]): the classes are the last write's, carried, and no
+    /// member's facts are read for them.
     Carry,
 }
 

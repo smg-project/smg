@@ -786,7 +786,9 @@ impl Offered {
 
 /// The working lists of one classing of the offers, kept from one to the
 /// next: after the first of a size a derivation allocates the classes it
-/// hands back, and a whole one a list of the decode offers beside them.
+/// hands back and, where a side stands refused, that side's refusal,
+/// written out to be compared with the last one. A whole derivation
+/// allocates a list of the decode offers beside them.
 #[derive(Default)]
 struct Work {
     numbering: Numbering,
