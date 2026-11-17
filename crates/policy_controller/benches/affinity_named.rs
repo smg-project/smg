@@ -1,8 +1,8 @@
 //! The cost of one decision over the rows a host names in the affinity
 //! column's place: the `cache_aware` preset over `common`'s settled fleet,
 //! the holders of its column named as a host names them (the deepest first,
-//! at most the picker's sample) and no column fed, at 8, 64 and 512
-//! candidates. Ids: `policy_affinity_named/decide/cache_aware/<n>`; the same
+//! at most the picker's sample) and no column fed, at 8, 64, 128, 512 and
+//! 1,024 candidates. Ids: `policy_affinity_named/decide/cache_aware/<n>`; the same
 //! decision over the column is `policy_affinity/decide/cache_aware/<n>` of
 //! the `affinity` target. The settled fleet warms nobody, so no warming row
 //! is named. A bench target of its own: a row added to the gated `affinity`
@@ -26,7 +26,7 @@ use smg_policy_controller::{
     Constraints, NamedAffinity, NamedHolder, Phase, PoolFacts, RequestFacts, Scratch,
 };
 
-const SIZES: [usize; 3] = [8, 64, 512];
+const SIZES: [usize; 5] = [8, 64, 128, 512, 1024];
 
 fn facts(seed: u64, holders: &[NamedHolder]) -> RequestFacts<'_> {
     RequestFacts {
@@ -64,7 +64,7 @@ fn decide(c: &mut Criterion) {
                 predicted_blocks: entry.predicted_blocks,
             })
             .collect();
-        let cap = engine.needs_for("m", Phase::Single).sample as usize;
+        let cap = engine.sample_for("m", Phase::Single) as usize;
         if cap > 0 && holders.len() > cap {
             holders.sort_by_key(|holder| std::cmp::Reverse(holder.overlap_blocks));
             let edge = holders[cap].overlap_blocks;

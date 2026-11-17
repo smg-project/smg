@@ -780,7 +780,7 @@
       "type": "object",
       "properties": {
         "sample": {
-          "description": "How many rows the picker draws where the host names the request's\nholders and the pool's warming rows: a pool of more than twice this\nmany rows is decided by that sample and the named rows, any other by\nthe whole pool. From 1 to 64.",
+          "description": "How many rows the picker draws where the host names the request's\nholders and the pool's warming rows: a pool of more than twice this\nmany rows, and of at least 16, is decided by that sample and the\nnamed rows, any other by the whole pool. From 1 to 64.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,

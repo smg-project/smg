@@ -18,7 +18,7 @@ use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::{
     decision::{Target, Targets, MAX_TARGETS},
-    framework::{Filter, Narrowed, Picker, Scorer, TieBand, DRAW_BOUND},
+    framework::{top_drawn, top_pass, Filter, Narrowed, Picker, Scorer, TieBand, DRAW_BOUND},
     lease::{Lease, Lifecycle, Membership, Side},
     spec::Needs,
     view::{Candidate, Constraints, LoadRow, ModelFingerprint, PoolFacts, RequestFacts, WorkerId},
@@ -1131,6 +1131,10 @@ fn draw_in_band(
 /// finds the rows drawn. Returns how many of `picks` it filled, in slot
 /// order: none where the band is not flat, and the slots it leaves are drawn
 /// one by one.
+///
+/// Inlined into the ranked push's two bodies, a pass's and a draw's, as it
+/// was into the one body before a draw had its own.
+#[inline(always)]
 fn draw_flat(
     draw: &mut Draw,
     scores: &[f32],
@@ -1195,8 +1199,9 @@ fn draw_flat(
 /// rows on, a slot costs the passes of [`draw_in_band`] and one value of the
 /// draw; where that band's rows score alike, its slots are drawn by rank in
 /// one count ([`draw_flat`]). The taken slots
-/// live in a fixed array: nothing is allocated.
-fn push_ranked(
+/// live in a fixed array: nothing is allocated. `DRAWN` is the order of a
+/// draw: the five best are read with no branch on a score ([`top_drawn`]).
+fn push_ranked<const DRAWN: bool>(
     mut draw: Draw,
     candidates: &[Candidate],
     kept: &[u32],
@@ -1205,25 +1210,12 @@ fn push_ranked(
     out: &mut Targets,
 ) {
     let slots = MAX_TARGETS.min(kept.len());
-    let mut best_five: [(usize, f32); MAX_TARGETS + 1] =
-        [(usize::MAX, f32::NEG_INFINITY); MAX_TARGETS + 1];
-    let mut len = 0usize;
-    for (i, &s) in scores.iter().enumerate() {
-        if len == best_five.len() && s <= best_five[len - 1].1 {
-            continue;
-        }
-        let mut at = if len < best_five.len() {
-            len += 1;
-            len - 1
-        } else {
-            best_five.len() - 1
-        };
-        while at > 0 && s > best_five[at - 1].1 {
-            best_five[at] = best_five[at - 1];
-            at -= 1;
-        }
-        best_five[at] = (i, s);
-    }
+    let mut best_five = [(usize::MAX, f32::NEG_INFINITY); MAX_TARGETS + 1];
+    let len = if DRAWN {
+        top_drawn(scores, &mut best_five)
+    } else {
+        top_pass(scores, &mut best_five)
+    };
     let mut taken = [usize::MAX; MAX_TARGETS];
     let mut filled = 0usize;
     while filled < slots
@@ -1335,17 +1327,19 @@ impl Picker for Best {
         band: TieBand,
         out: &mut Targets,
     ) {
-        push_ranked(Draw::new(facts.seed), candidates, kept, scores, band, out);
+        push_ranked::<false>(Draw::new(facts.seed), candidates, kept, scores, band, out);
     }
 }
 
 /// The best of a sample: `best` over the rows it draws first. Where the
 /// host named the request's holders and the pool's warming rows
 /// ([`NamedAffinity`](crate::NamedAffinity)) and the pool holds more than
-/// twice the sample, it draws `sample` rows the filters keep, uniformly and
-/// with replacement (a repeat or a refused row costs one of its `2 * sample`
+/// twice the sample, and at least the sixteen rows the engine asks a draw
+/// from, it draws `sample` rows the filters keep, uniformly and with
+/// replacement (a repeat or a refused row costs one of its `2 * sample`
 /// draws), the named rows join them, and the highest combined score among
-/// those wins. Any other pool is read whole, as `best` reads it.
+/// those wins. Any other pool is read whole, as `best` reads it, and so is
+/// a pool whose sample holds no row.
 #[derive(Debug)]
 pub struct SampledBest {
     sample: u32,
@@ -1376,7 +1370,21 @@ impl Picker for SampledBest {
         band: TieBand,
         out: &mut Targets,
     ) {
-        push_ranked(Draw::new(facts.seed), candidates, kept, scores, band, out);
+        push_ranked::<false>(Draw::new(facts.seed), candidates, kept, scores, band, out);
+    }
+
+    /// The pick over the rows drawn and joined, which stand in the draw's
+    /// order: their five best are read as a draw's.
+    fn order_drawn(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        push_ranked::<true>(Draw::new(facts.seed), candidates, kept, scores, band, out);
     }
 
     fn draws_first(&self) -> bool {
@@ -1388,9 +1396,12 @@ impl Picker for SampledBest {
     }
 
     /// At most `2 * sample` uniform draws until `sample` rows are kept; a
-    /// repeat is dropped. A pool of at most twice the sample and
-    /// [`DRAW_BOUND`] refused rows each leave the decision to the whole
-    /// pass. Whether the host named rows is the engine's to ask
+    /// repeat and a row the filters refuse are dropped, each at the cost
+    /// of its draw. The draws are the picker's own bound: it counts no
+    /// refused rows against [`DRAW_BOUND`], which is sized for a draw of
+    /// one or two. A pool of at most twice the sample, and a sample that
+    /// holds no row, leave the decision to the whole pass. Whether the
+    /// host named rows is the engine's to ask
     /// ([`Picker::joined_by_named`]).
     fn draw_first(
         &self,
@@ -1405,22 +1416,13 @@ impl Picker for SampledBest {
         if candidates.len() <= 2 * sample {
             return false;
         }
-        let mut refused = 0;
         for _ in 0..2 * sample {
             if kept.len() == sample {
                 break;
             }
             let row = draw.below(candidates.len()) as u32;
-            if kept.contains(&row) {
-                continue;
-            }
-            if keep(&candidates[row as usize]) {
+            if !kept.contains(&row) && keep(&candidates[row as usize]) {
                 kept.push(row);
-            } else {
-                refused += 1;
-                if refused == DRAW_BOUND {
-                    return false;
-                }
             }
         }
         !kept.is_empty()
@@ -1876,7 +1878,7 @@ impl Picker for CountFirst {
         // The narrowing leaves one count, and among equal counts the pick is
         // the best picker's.
         if kept.windows(2).all(|pair| count(pair[0]) == count(pair[1])) {
-            return push_ranked(draw, candidates, kept, scores, band, out);
+            return push_ranked::<false>(draw, candidates, kept, scores, band, out);
         }
         // Rows that were never narrowed: the same rule a slot, among the
         // fewest in flight of the rows left. Every row here came with a
@@ -4289,8 +4291,9 @@ mod tests {
 
     /// A sampled `best` draws over a pool of more than twice its sample and
     /// over no smaller one: it keeps `sample` rows the filters keep, none
-    /// twice, and hands the decision to the whole pass at [`DRAW_BOUND`]
-    /// refused rows. Whether the host named rows is the engine's to ask.
+    /// twice, and counts no refused rows: its draws are its bound, and a
+    /// sample that holds no row hands the decision to the whole pass.
+    /// Whether the host named rows is the engine's to ask.
     #[test]
     fn a_sampled_best_draws_its_sample_from_a_pool_over_twice_it() {
         let picker = SampledBest::new(8);
@@ -4329,14 +4332,59 @@ mod tests {
             (false, Vec::new(), false)
         );
         assert!(draws(&request, 17, &mut |_| true).0);
-        // Every row refused: the bound of refused rows ends the draw.
+        // Every row refused: each of the sixteen draws asks, and the sample
+        // that holds no row hands the decision to the whole pass.
         let mut asked = 0u32;
         let (drew, ..) = draws(&request, 64, &mut |_| {
             asked += 1;
             false
         });
         assert!(!drew);
-        assert_eq!(asked, DRAW_BOUND);
+        assert_eq!(asked, 16);
+    }
+
+    /// Under a filter that refuses a third and a half of the pool, the rows
+    /// a sampled `best` keeps hold even shares: each row the filter keeps
+    /// is kept as often as any other, within six deviations of a count that
+    /// size, and no refused row is kept.
+    #[test]
+    fn a_sampled_best_keeps_even_shares_under_a_filter_that_refuses() {
+        let picker = SampledBest::new(8);
+        let pool: Vec<Candidate> = (0..64).map(|i| candidate(i, 0)).collect();
+        for one_in in [3u32, 2] {
+            let mut counts = [0u32; 64];
+            for seed in 0..4_000u64 {
+                let facts = RequestFacts {
+                    seed,
+                    ..RequestFacts::default()
+                };
+                let (mut kept, mut draw) = (Vec::new(), Draw::new(seed));
+                picker.draw_first(
+                    &facts,
+                    &PoolFacts::default(),
+                    &pool,
+                    &mut |row| row.position % one_in != 0,
+                    &mut kept,
+                    &mut draw,
+                );
+                for row in kept {
+                    counts[row as usize] += 1;
+                }
+            }
+            let open = 64 - 64u32.div_ceil(one_in);
+            let even = f64::from(counts.iter().sum::<u32>()) / f64::from(open);
+            for (row, &count) in (0u32..).zip(&counts) {
+                if row % one_in == 0 {
+                    assert_eq!(count, 0, "one in {one_in} refused: row {row} was kept");
+                    continue;
+                }
+                let off = (f64::from(count) - even).abs();
+                assert!(
+                    off < 6.0 * even.sqrt(),
+                    "one in {one_in} refused: row {row} is {off:.0} off an even {even:.0}"
+                );
+            }
+        }
     }
 
     /// A sampled `best` reads at most twice its sample of the stream's
