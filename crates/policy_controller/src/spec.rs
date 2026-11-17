@@ -2921,7 +2921,8 @@ impl io::Write for HashWriter<'_> {
 }
 
 /// One generation as a store applies it: the engine validated from a
-/// document, with the generation's number and its needs.
+/// document, with the generation's number, its needs and its view's cap on
+/// a request's block hashes.
 ///
 /// One invariant: **a decision reads its rows, its engine and its number
 /// in one load.** A store publishes every world under one of these
@@ -2946,6 +2947,8 @@ pub struct AppliedSpec {
     /// The digest of the document the engine was validated from; none for
     /// the unbound start, which has no document.
     digest: Option<Digest>,
+    /// The document's `view.max_block_hashes`.
+    max_block_hashes: u32,
 }
 
 impl AppliedSpec {
@@ -2964,6 +2967,7 @@ impl AppliedSpec {
         Ok(Self {
             engine,
             digest: Some(document.digest()?),
+            max_block_hashes: document.view.max_block_hashes,
         })
     }
 
@@ -2981,6 +2985,7 @@ impl AppliedSpec {
         Ok(Self {
             engine,
             digest: Some(digest),
+            max_block_hashes: document.view.max_block_hashes,
         })
     }
 
@@ -2992,6 +2997,7 @@ impl AppliedSpec {
         Self {
             engine: Engine::new(Vec::new(), Vec::new(), 0, Needs::default()),
             digest: None,
+            max_block_hashes: ViewSpec::default().max_block_hashes,
         }
     }
 
@@ -3015,6 +3021,14 @@ impl AppliedSpec {
         &self.engine
     }
 
+    /// How many of a request's prefix block hashes a decision under this
+    /// generation reads: the document's `view.max_block_hashes`. A host
+    /// hands the engine the first that many of a longer list.
+    #[must_use]
+    pub fn max_block_hashes(&self) -> usize {
+        usize::try_from(self.max_block_hashes).unwrap_or(usize::MAX)
+    }
+
     /// What the host must feed under this generation
     /// ([`Engine::needs`]).
     #[must_use]
@@ -3026,6 +3040,30 @@ impl AppliedSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_applied_generation_keeps_its_views_cap_on_block_hashes() {
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        document.generation = 1;
+        let cap = |document: &PolicySpec| {
+            AppliedSpec::validate(document)
+                .expect("the preset validates")
+                .max_block_hashes()
+        };
+        assert_eq!(cap(&document), 256);
+        document.view.max_block_hashes = 128;
+        assert_eq!(cap(&document), 128);
+        assert_eq!(AppliedSpec::unbound().max_block_hashes(), 256);
+        // The controller's door builds a generation under a digest it took
+        // already: that builder keeps the cap too.
+        #[cfg(feature = "controller")]
+        {
+            let digest = document.digest().expect("the document digests");
+            let applied = AppliedSpec::validate_digested(&document, digest, &Catalog::builtin())
+                .expect("the preset validates");
+            assert_eq!(applied.max_block_hashes(), 128);
+        }
+    }
 
     fn doc(text: &str) -> PolicySpec {
         serde_json::from_str(text).expect("a well-formed document")

@@ -442,18 +442,26 @@ pub(crate) fn contained(f: impl FnOnce()) {
     }
 }
 
+/// The payloads [`release`] frees in a row: the caught one, then the
+/// payload each drop before it raised. Two free a payload whose drop
+/// panics once; the bound is what ends a drop that always raises another.
+const RELEASE_DEPTH: usize = 4;
+
 /// Frees a caught payload the engine does not resume. A payload's own
 /// destructor can panic, and a panic let out here would end the process or
 /// take the first panic's place: the drop runs under a catch of its own.
-/// Only the payload of a drop that panicked is forgotten, since its drop
-/// could panic in turn.
+/// The payload of a drop that panicked is freed the same way, down to
+/// [`RELEASE_DEPTH`] payloads in a row. Only the one past that depth is
+/// forgotten, since its drop could panic in turn.
 #[cold]
 #[inline(never)]
-fn release(payload: Box<dyn std::any::Any + Send>) {
-    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)));
-    if let Err(again) = dropped {
-        std::mem::forget(again);
+pub(crate) fn release(payload: Box<dyn std::any::Any + Send>) {
+    let mut next = Some(payload);
+    for _ in 0..RELEASE_DEPTH {
+        let Some(payload) = next.take() else { return };
+        next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))).err();
     }
+    std::mem::forget(next);
 }
 
 /// Per-decision scratch the framework owns; kept by the host per thread so a
@@ -7016,5 +7024,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `release` frees a caught payload whole. Where a payload's drop
+    /// panics, the payload of that panic is freed the same way, so a storm
+    /// of such faults leaves none alive. A chain of drops that each raise
+    /// the next is freed down to the depth, and the one payload past it is
+    /// forgotten.
+    #[test]
+    fn a_storm_of_payloads_whose_drop_panics_leaves_none_alive() {
+        use std::{
+            panic::resume_unwind,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        static ALIVE: AtomicUsize = AtomicUsize::new(0);
+
+        /// A payload counted while it is alive, whose drop raises the next
+        /// of its chain `left` times. No hook runs for a payload raised by
+        /// `resume_unwind`, so a storm writes nothing.
+        struct Chained {
+            left: usize,
+        }
+
+        impl Chained {
+            fn boxed(left: usize) -> Box<Self> {
+                ALIVE.fetch_add(1, Ordering::Relaxed);
+                Box::new(Self { left })
+            }
+        }
+
+        impl Drop for Chained {
+            fn drop(&mut self) {
+                ALIVE.fetch_sub(1, Ordering::Relaxed);
+                if self.left > 0 {
+                    resume_unwind(Self::boxed(self.left - 1));
+                }
+            }
+        }
+
+        for _ in 0..100_000 {
+            release(Chained::boxed(1));
+        }
+        assert_eq!(
+            ALIVE.load(Ordering::Relaxed),
+            0,
+            "payloads alive after a storm of drops that panic"
+        );
+        // The two chains by their numbers, never by the constant: a depth
+        // one off either way fails one of them, and a payload past the
+        // depth that is dropped where it should be forgotten fails the
+        // second at once, since the last of a chain raises nothing.
+        release(Chained::boxed(3));
+        assert_eq!(
+            ALIVE.load(Ordering::Relaxed),
+            0,
+            "a chain of the depth's four payloads is freed whole"
+        );
+        release(Chained::boxed(4));
+        assert_eq!(
+            ALIVE.load(Ordering::Relaxed),
+            1,
+            "a chain one past the depth ends there, with one payload forgotten"
+        );
     }
 }
