@@ -113,11 +113,10 @@ pub const fn bool_to_static_str(b: bool) -> &'static str {
 }
 
 pub mod metrics_labels {
-    /// The `model` label of a request that names no served model: an unknown
-    /// name refused with 404, or a value past the model-label cap. One fixed
-    /// value, as the `path` label is `other` for an unmatched route, so a
-    /// client cannot mint label values.
-    pub const MODEL_OTHER: &str = "other";
+    // The words the worker crate defines, at the path they had here: the
+    // model label's `other` and the circuit breaker's two outcomes.
+    pub use smg_worker::metrics_labels::{CB_FAILURE, CB_SUCCESS, MODEL_OTHER};
+    use smg_worker::worker::{ConnectionMode, WorkerType};
 
     // Router types
     pub const ROUTER_OPENAI: &str = "openai";
@@ -131,9 +130,9 @@ pub mod metrics_labels {
     pub const BACKEND_HARMONY: &str = "harmony";
 
     // Connection modes
-    pub const CONNECTION_HTTP: &str = "http";
-    pub const CONNECTION_GRPC: &str = "grpc";
-    pub const CONNECTION_ZMQ: &str = "zmq";
+    pub const CONNECTION_HTTP: &str = ConnectionMode::Http.as_str();
+    pub const CONNECTION_GRPC: &str = ConnectionMode::Grpc.as_str();
+    pub const CONNECTION_ZMQ: &str = ConnectionMode::Zmq.as_str();
 
     // Endpoints
     pub const ENDPOINT_CHAT: &str = "chat";
@@ -158,10 +157,10 @@ pub mod metrics_labels {
     pub const CONNECTION_WEBRTC: &str = "webrtc";
 
     // Worker types
-    pub const WORKER_REGULAR: &str = "regular";
-    pub const WORKER_PREFILL: &str = "prefill";
-    pub const WORKER_DECODE: &str = "decode";
-    pub const WORKER_ENCODE: &str = "encode";
+    pub const WORKER_REGULAR: &str = WorkerType::Regular.as_str();
+    pub const WORKER_PREFILL: &str = WorkerType::Prefill.as_str();
+    pub const WORKER_DECODE: &str = WorkerType::Decode.as_str();
+    pub const WORKER_ENCODE: &str = WorkerType::Encode.as_str();
     pub const WORKER_HTTP: &str = "http";
     pub const WORKER_GRPC: &str = "grpc";
 
@@ -234,10 +233,6 @@ pub mod metrics_labels {
     pub const CB_CLOSED: &str = "closed";
     pub const CB_OPEN: &str = "open";
     pub const CB_HALF_OPEN: &str = "half_open";
-
-    // Circuit breaker outcomes
-    pub const CB_SUCCESS: &str = "success";
-    pub const CB_FAILURE: &str = "failure";
 
     // Router error types
     pub const ERROR_NO_WORKERS: &str = "no_workers";

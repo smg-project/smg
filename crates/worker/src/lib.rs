@@ -10,6 +10,10 @@
 //! shares with a host's configuration. The gateway re-exports each item at
 //! the path it had there.
 //!
+//! [`metrics_labels`] holds the metric label values the worker's writers
+//! share with a host's; [`worker::WorkerType::as_str`] and
+//! [`worker::ConnectionMode::as_str`] spell the two that a type carries.
+//!
 //! The `runtime` feature adds the worker's runtime, for the process that
 //! hosts the workers. Its first part is `connection`: the HTTP client factory
 //! and the cache of worker-directed clients.
@@ -23,6 +27,7 @@ pub const UNKNOWN_MODEL_ID: &str = "unknown";
 #[cfg(feature = "runtime")]
 pub mod connection;
 pub mod labels;
+pub mod metrics_labels;
 pub mod model_card;
 pub mod model_type;
 pub mod models;

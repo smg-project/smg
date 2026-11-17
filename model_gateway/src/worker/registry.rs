@@ -30,13 +30,13 @@ use openai_protocol::{
     worker::{TagVocabulary, WorkerStatus},
 };
 use rustc_hash::FxBuildHasher;
-use smg_worker::settings::RetryConfig;
+use smg_worker::{metrics_labels, settings::RetryConfig};
 use symphony::grammar::GrammarStart;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::Metrics,
     worker::{
         connection::engine::EngineConnector,
         health::circuit_breaker::CircuitState,

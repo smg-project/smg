@@ -31,7 +31,7 @@ pub use crate::worker::{
     runtime::{RoutingState, StallReason, WorkerRuntime},
 };
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::Metrics,
     worker::{
         connection::{
             engine::{EngineConnection, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR},
@@ -960,11 +960,7 @@ pub(crate) trait ConnectionModeExt {
 
 impl ConnectionModeExt for ConnectionMode {
     fn as_metric_label(&self) -> &'static str {
-        match self {
-            ConnectionMode::Http => metrics_labels::CONNECTION_HTTP,
-            ConnectionMode::Grpc => metrics_labels::CONNECTION_GRPC,
-            ConnectionMode::Zmq => metrics_labels::CONNECTION_ZMQ,
-        }
+        self.as_str()
     }
 }
 
@@ -975,12 +971,7 @@ pub(crate) trait WorkerTypeExt {
 
 impl WorkerTypeExt for WorkerType {
     fn as_metric_label(&self) -> &'static str {
-        match self {
-            WorkerType::Regular => metrics_labels::WORKER_REGULAR,
-            WorkerType::Prefill => metrics_labels::WORKER_PREFILL,
-            WorkerType::Decode => metrics_labels::WORKER_DECODE,
-            WorkerType::Encode => metrics_labels::WORKER_ENCODE,
-        }
+        self.as_str()
     }
 }
 
