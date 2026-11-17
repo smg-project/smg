@@ -4,12 +4,13 @@
 //!
 //! One invariant: a standby is sent only the history it stands in, by the
 //! replica the fence calls leader, and a write never waits for a standby.
-//! The log judges the first ([`Log::holds`] at the hello and [`Log::read`]
-//! at every batch, each from the standby's place with its term). The fence
-//! judges the second, at the hello and at every poll. The stream's shape
-//! gives the third: no task and no channel stand between the log and the
-//! socket, so a write of the store waits for the copy of one batch under
-//! the log's lock and for nothing else.
+//! The log judges the first ([`Log::holds`] at the hello, [`Log::first`]
+//! for a standby that applied nothing, and [`Log::read`] at every batch,
+//! each from the standby's place with its term). The fence judges the
+//! second, at the hello and at every poll. The stream's shape gives the
+//! third: no task and no channel stand between the log and the socket, so a
+//! write of the store waits for the copy of one batch under the log's lock
+//! and for nothing else.
 //!
 //! The load rows are journaled where the lease is shared, and nowhere else
 //! ([`journaled`]): a controller that leads itself over a lease in its own
@@ -68,22 +69,17 @@ const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 /// the log carries the watched kinds alone, and a load write tells nothing
 /// and wakes nobody.
 ///
-/// Where the lease lives in the process the log's places start after a
-/// number drawn once a run. A term is taken again at each start there, so a
-/// place and its term would name the writes of two runs alike: a watcher
-/// that resumed at a place of the run before would be held, and never told
-/// this run's first writes. After a draw that place is outside this run's
-/// log, and its watcher is told to start again. No standby follows such a
-/// log, so a drawn start meets no leader's event. Where the lease is shared
-/// the log starts at the start, where a standby joins it: the term is the
-/// guard there, for as long as the lease's record lives.
+/// The log's places start after a number drawn once a run, wherever the
+/// lease lives. A later run can take a term again: at each start where the
+/// lease lives in the process, and where a shared lease's record was lost
+/// with no replica of the run before left to take. A place and its term
+/// would then name the writes of two runs alike: a reader that resumed at a
+/// place of the run before would be held, and never told this run's first
+/// writes. After a draw that place is outside this run's log, and its
+/// reader is told to start again. A standby that applied nothing names no
+/// place of any run: it joins at the drawn start ([`Feed::join`]).
 pub(crate) fn journaled(place: &LeasePlace) -> (Arc<MemoryStore>, watch_workers::Feed) {
-    let first = if place.is_shared() {
-        0
-    } else {
-        RandomState::new().hash_one(0u8) % FIRST_PLACES
-    };
-    journaled_from(place, first)
+    journaled_from(place, RandomState::new().hash_one(0u8) % FIRST_PLACES)
 }
 
 /// The same with the log's places starting after `first`: zero in the
@@ -93,13 +89,8 @@ pub(crate) fn journaled_from(
     first: u64,
 ) -> (Arc<MemoryStore>, watch_workers::Feed) {
     let loads = if place.is_shared() { LOAD_EVENTS } else { 0 };
-    let feed = watch_workers::Feed::of(Log::new(WATCHED_EVENTS, loads));
-    if first != 0 {
-        feed.log.restart(Position {
-            seq: first,
-            term: 0,
-        });
-    }
+    let log = Log::new(WATCHED_EVENTS, loads).starting_after(first);
+    let feed = watch_workers::Feed::of(log);
     let journal: Arc<dyn Journal> = Arc::<Log>::clone(&feed.log);
     (Arc::new(MemoryStore::journaled(journal)), feed)
 }
@@ -353,8 +344,10 @@ struct Feed {
 impl Feed {
     /// A standby's feed from the place its hello names, and how its stream
     /// starts: open where the log holds the place under its term, else
-    /// with the word to re-sync. A bound of zero is the log's own, and no
-    /// bound is above it.
+    /// with the word to re-sync. A standby that applied nothing names the
+    /// place before every write: it stands at the log's first place, after
+    /// the number the run drew, while the log retains every write since. A
+    /// bound of zero is the log's own, and no bound is above it.
     fn join(
         log: Arc<Log>,
         fence: Arc<Fence>,
@@ -368,7 +361,11 @@ impl Feed {
             0 => ring,
             most => u64::from(most).min(ring),
         };
-        let end = if log.holds(Kinds::All, place) {
+        let (place, held) = match log.first(Kinds::All) {
+            Some(first) if place == Position::default() => (first, true),
+            _ => (place, log.holds(Kinds::All, place)),
+        };
+        let end = if held {
             End::Open
         } else {
             End::Resync(not_held(place))
@@ -634,15 +631,20 @@ mod tests {
     }
 
     impl Leader {
-        /// The take, not yet told to the store.
+        /// The take, not yet told to the store, over a log whose places
+        /// start at the start: the cases' tables read them from one.
         fn elected() -> Self {
+            Self::over(journaled_from(&LeasePlace::File("shared".into()), 0))
+        }
+
+        /// The same over a store and its feed as a run builds them.
+        fn over((store, feed): (Arc<MemoryStore>, watch_workers::Feed)) -> Self {
             let mut elector = Elector::alone(IDENTITY, ElectionSettings::default())
                 .expect("the default settings are in order");
             let at = Instant::now();
             let Ok(Tick::Acquired { term }) = elector.tick(at) else {
                 panic!("a free lease is taken at the first tick");
             };
-            let (store, feed) = journaled_from(&LeasePlace::File("shared".into()), 0);
             Self {
                 elector,
                 store,
@@ -1120,6 +1122,72 @@ mod tests {
                 _ => panic!("{place:?} is no place to join at"),
             }
         }
+    }
+
+    /// A shared lease whose record was lost counts its terms again, so two
+    /// runs lead under one term. Each run's log starts after a number of
+    /// its own: a standby's place of the run before, or a watcher's, names
+    /// no write of this run and is told to start again, where one count of
+    /// places would have continued it.
+    #[test]
+    fn a_place_of_the_run_before_under_an_equal_term_is_told_to_start_again() {
+        let run = || {
+            let leader = Leader::over(journaled(&LeasePlace::File("shared".into())));
+            leader.store.set_term(leader.term);
+            leader.writes(3);
+            leader
+        };
+        let (before, after) = (run(), run());
+        let held = before.log.head(Kinds::All);
+        let head = after.log.head(Kinds::All);
+        assert_eq!(held.term, head.term, "one term, two runs");
+        let join = |place| {
+            Feed::join(
+                Arc::clone(&after.log),
+                after.elector.fence(),
+                after.term,
+                place,
+                0,
+                after.at,
+            )
+        };
+        match join(held).1 {
+            End::Resync(status) => assert_eq!(status.code(), Code::FailedPrecondition),
+            _ => panic!("{held:?} is a place of the run before, this run's head is {head:?}"),
+        }
+        assert!(matches!(join(head).1, End::Open));
+        // The log is a watcher's judge as well, and a load row's place is
+        // one it holds: this run's head, and no place of the run before.
+        assert!(after.log.holds(Kinds::Watched, head), "{head:?}");
+        assert!(!after.log.holds(Kinds::Watched, held), "{held:?}");
+
+        // A standby that applied nothing names no place of either run: it
+        // stands at this run's first place and reads its writes from there.
+        let first = after
+            .log
+            .first(Kinds::All)
+            .expect("every write is retained");
+        assert_eq!(first.term, 0, "{first:?}");
+        let (mut feed, end) = join(START);
+        assert!(matches!(end, End::Open));
+        assert_eq!(feed.place, first);
+        let sent = batch(feed.look(after.at));
+        assert_eq!((sent.first_seq, sent.term), (first.seq + 1, after.term));
+        assert_eq!(cases(&sent), ["term", "membership", "load", "load", "load"]);
+        // Position zero under a named term states a place, and no run wrote
+        // one there: it is no standby that applied nothing.
+        let named = Position {
+            seq: 0,
+            term: head.term,
+        };
+        assert!(matches!(join(named).1, End::Resync(_)));
+        // A log that restarted at a snapshot's place is no longer its
+        // store's whole history: that standby starts from a snapshot.
+        after.log.restart(Position {
+            seq: head.seq + 9,
+            term: head.term + 1,
+        });
+        assert!(matches!(join(START).1, End::Resync(_)));
     }
 
     #[test]

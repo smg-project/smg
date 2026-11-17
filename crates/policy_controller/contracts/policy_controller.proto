@@ -452,12 +452,13 @@ message WatchWorkersRequest {
   // answers one SnapshotRequired and ends the stream, never a silent skip or
   // replay (replicas match by position and term: the replication contract's
   // rejoin check); a synced standby behind it holds the stream and delivers
-  // as it applies. Where the lease is not shared a term is taken again at
-  // each start, so each run's log starts at a place drawn below 2^48: the
+  // as it applies. Each run of a controller starts its log at a place drawn
+  // below 2^48. A later run can take a term again, at each start where the
+  // lease is not shared and where a shared lease's record was lost, and the
   // draw keeps a position of another run outside the positions this run
   // holds, under its first or ahead of its head, but for a chance of 4,096
-  // in 2^48 a resume. Where the lease is shared the term is the guard, for
-  // as long as the lease's record lives.
+  // in 2^48 a resume, or of 69,632 where the lease is shared and the log
+  // holds the load rows' positions too.
   // membership_epoch moves only on a membership change and is no resume point.
   uint64 resume_seq = 2;
   // INVALID_ARGUMENT, by this field's name, where the controller tells no
@@ -1189,7 +1190,10 @@ message ReplicaHello {
   // continuation: two replicas that agree on a position and its term share
   // the prefix before it. A standby seeds both from a snapshot's
   // `replication_seq` and `replication_term`; a non-zero `last_applied_seq`
-  // with a zero term is answered resync_required as well.
+  // with a zero term is answered resync_required as well. A standby that
+  // applied nothing states zero for both: it is continued from the leader's
+  // first write, at the position after the place the leader's run drew,
+  // while the leader's log retains every write since.
   uint64 last_applied_term = 5;
 }
 

@@ -398,15 +398,20 @@ async fn a_standby_is_sent_the_log_from_its_place_and_told_to_resync_from_any_ot
         let id = writes(&leader.store, 3);
         let base = snapshot(leader.replication).await.expect("a snapshot");
         let term = base.replication_term;
-        assert_eq!((base.replication_seq, base.term), (5, term));
+        assert_eq!(base.term, term);
         assert_ne!(term, 0, "the leader's place stands under its term");
+        // The run drew where its places start. The take, the registration
+        // and three load rows stand after that place.
+        let start = base.replication_seq - 5;
+        assert_ne!(start, 0, "a run draws where its places start");
+        let nth = |write: u64| start + write;
 
         // A standby with nothing: the take, the registration, the rows.
         let mut fresh = replicate(leader.replication, place(0, 0))
             .await
             .expect("a stream");
         let first = fresh.batch().await;
-        assert_eq!((first.first_seq, first.term), (1, term));
+        assert_eq!((first.first_seq, first.term), (nth(1), term));
         assert_eq!(
             cases(&first.events),
             ["term", "membership", "load", "load", "load"]
@@ -414,11 +419,11 @@ async fn a_standby_is_sent_the_log_from_its_place_and_told_to_resync_from_any_ot
         let Some(Sent::Membership(registered)) = &first.events[1].event else {
             panic!("the registration");
         };
-        assert_eq!((registered.seq, registered.term), (2, term));
+        assert_eq!((registered.seq, registered.term), (nth(2), term));
         assert!(matches!(&registered.event, Some(Event::Registered(row)) if row.id == id.0));
 
         // A standby at the snapshot's place reads what was written since.
-        let mut joined = replicate(leader.replication, place(5, term))
+        let mut joined = replicate(leader.replication, place(nth(5), term))
             .await
             .expect("a stream");
         let counted = LoadRow {
@@ -430,7 +435,7 @@ async fn a_standby_is_sent_the_log_from_its_place_and_told_to_resync_from_any_ot
             .store
             .record(id, 0, counted, Instant::now(), LoadSource::Stream);
         let next = joined.batch().await;
-        assert_eq!((next.first_seq, next.term), (6, term));
+        assert_eq!((next.first_seq, next.term), (nth(6), term));
         assert_eq!(cases(&next.events), ["load"]);
         let Some(Sent::Load(told)) = &next.events[0].event else {
             panic!("the load row");
@@ -443,15 +448,15 @@ async fn a_standby_is_sent_the_log_from_its_place_and_told_to_resync_from_any_ot
         );
         // An idle second: the leader says where its head stands.
         let beat = joined.beat().await;
-        assert_eq!((beat.first_seq, beat.term), (7, term));
+        assert_eq!((beat.first_seq, beat.term), (nth(7), term));
 
         // A position past the head and a position that names no term: each
         // is told to re-sync.
         for refused in [
-            place(70, term),
+            place(nth(70), term),
             proto::ReplicaHello {
                 last_applied_term: 0,
-                ..place(5, term)
+                ..place(nth(5), term)
             },
         ] {
             let mut stream = replicate(leader.replication, refused.clone())
@@ -468,7 +473,7 @@ async fn a_standby_is_sent_the_log_from_its_place_and_told_to_resync_from_any_ot
         // A standby that saw a later term than this replica leads under.
         let later = proto::ReplicaHello {
             term_seen: term + 1,
-            ..place(5, term)
+            ..place(nth(5), term)
         };
         let Err(deposed) = replicate(leader.replication, later).await else {
             panic!("a standby that saw a later term is not served");
@@ -493,7 +498,7 @@ async fn a_standby_is_sent_the_log_from_its_place_and_told_to_resync_from_any_ot
         // it states: a deposed leader restores no standby.
         let ahead = proto::ReplicaHello {
             term_seen: term,
-            ..place(5, term + 1)
+            ..place(nth(5), term + 1)
         };
         let Err(deposed) = replicate(leader.replication, ahead).await else {
             panic!("a standby ahead of this replica's term is not served");
@@ -504,7 +509,7 @@ async fn a_standby_is_sent_the_log_from_its_place_and_told_to_resync_from_any_ot
         joined
             .frames
             .send(proto::ReplicaFrame {
-                frame: Some(Frame::Hello(place(6, term))),
+                frame: Some(Frame::Hello(place(nth(6), term))),
             })
             .await
             .expect("the stream's own channel");
@@ -528,7 +533,8 @@ async fn a_standby_that_acknowledges_nothing_is_cut_at_its_backlog() {
         let mut steady = replicate(leader.replication, hello.clone())
             .await
             .expect("a stream");
-        let mut head = 2;
+        let base = snapshot(leader.replication).await.expect("a snapshot");
+        let mut head = base.replication_seq;
         for _ in 0..8 {
             for count in 0..100 {
                 leader
@@ -610,7 +616,8 @@ async fn a_standby_behind_wide_replacements_catches_up_in_messages_the_transport
         let mut standby = replicate(leader.replication, place(0, 0))
             .await
             .expect("a stream");
-        let events = standby.until(258).await;
+        let base = snapshot(leader.replication).await.expect("a snapshot");
+        let events = standby.until(base.replication_seq).await;
         assert_eq!(events.len(), 258);
         let bytes: usize = events.iter().map(prost::Message::encoded_len).sum();
         assert!(bytes > 4 * 1024 * 1024, "{bytes}");
