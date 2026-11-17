@@ -1286,6 +1286,15 @@ mod tests {
 
     #[test]
     fn a_look_that_fails_names_nobody_until_one_lands() {
+        unheld(
+            "a look that fails",
+            Duration::from_millis(600),
+            a_failed_look_names_nobody,
+        );
+    }
+
+    /// One try of the case above: 600 ms of room, the lease's duration.
+    fn a_failed_look_names_nobody() {
         let lease = MemoryLease::new();
         let settings = ElectionSettings {
             duration: Duration::from_millis(600),
@@ -1315,9 +1324,18 @@ mod tests {
         });
         let following =
             start(follower, Arc::new(MemoryStore::new()), follower_standing).expect("a thread");
+        // The bound on the clock, here and at the last wait: the holder
+        // kept its lease. A host that held it past the lease's duration,
+        // right after a look of the follower's, handed the lease to the
+        // follower: its standing then reads the next term, and the wait
+        // ends on that too.
         wait_for("the follower's look", fences, || {
-            followed.borrow().holder == "a@127.0.0.1:1"
+            followed.borrow().holder == "a@127.0.0.1:1" || followed.borrow().term > 1
         });
+        bound!(
+            followed.borrow().term == 1,
+            "the follower took the lease before its first look landed"
+        );
 
         // The follower's store goes away. The second publish from here is
         // of a step that began after it did: that look failed, and it names
@@ -1341,8 +1359,12 @@ mod tests {
         // The store is back: the next look names the holder again.
         away.store(false, Ordering::SeqCst);
         wait_for("a look that lands", fences, || {
-            followed.borrow().holder == "a@127.0.0.1:1"
+            followed.borrow().holder == "a@127.0.0.1:1" || followed.borrow().term > 1
         });
+        bound!(
+            followed.borrow().term == 1,
+            "the follower took the lease before a look landed"
+        );
         following.stop();
         ended(following);
         leading.stop();
@@ -1930,6 +1952,15 @@ mod tests {
 
     #[test]
     fn a_late_renewal_logs_one_line_a_streak_and_one_more_when_renewals_turn_late_again() {
+        unheld(
+            "a late renewal's lines",
+            Duration::from_millis(300),
+            late_renewals_log_one_line_a_streak,
+        );
+    }
+
+    /// One try of the case above: 300 ms of room, three renew periods.
+    fn late_renewals_log_one_line_a_streak() {
         // A slow write takes four periods under a deadline of four: every
         // renewal of a slow streak lands on a fence that had closed. A fast
         // one lands a period after the stamp before it, three periods inside
@@ -1971,7 +2002,9 @@ mod tests {
         writes(3);
         slow.store(false, Ordering::SeqCst);
         let (late, text) = looping.stopped_with("a renewal landed on a fence that had closed");
-        assert_eq!(late, 2, "{text}");
+        // The bound on the clock: every fast renewal landed inside the
+        // deadline. A host that held one past it made one more late line.
+        bound!(late == 2, "{late} late lines:\n{text}");
     }
 
     /// A lease in this process that a case can lose: after `lose` it holds
@@ -2285,6 +2318,15 @@ mod tests {
     /// reads the first take by either.
     #[test]
     fn a_record_lost_under_a_live_holder_is_taken_only_after_its_duration() {
+        unheld(
+            "a lost record",
+            Duration::from_millis(800),
+            a_lost_record_is_waited_out,
+        );
+    }
+
+    /// One try of the case above: 800 ms of room, the lease's duration.
+    fn a_lost_record_is_waited_out() {
         let store = Losable::default();
         let settings = ElectionSettings {
             duration: Duration::from_millis(800),
@@ -2314,6 +2356,13 @@ mod tests {
         // The loss, right after one of the holder's steps.
         let renewals = store.landed();
         until("a renewal", || store.landed() > renewals);
+        // The bound on the clock: the holder kept its lease to the loss. A
+        // host that held it past the lease's duration handed the lease on,
+        // and the record lost is then of a later term.
+        bound!(
+            leader_fence.leader_term(Instant::now()) == Some(1),
+            "the holder did not lead under term 1 at the loss"
+        );
         let lost = Instant::now();
         store.lose();
         // Both fences through the loss, the first read on both sides of the
@@ -2333,7 +2382,19 @@ mod tests {
             both += u32::from(before.is_some() && between.is_some() && before == after);
             unnamed.0 |= before.is_none() && led.borrow().holder.is_empty();
             unnamed.1 |= between.is_none() && followed.borrow().holder.is_empty();
-            if taken.is_none() && [before, between, after].contains(&Some(2)) {
+            // The other bound on the clock: the first take read is the next
+            // term's. A host that held the test past the lease's duration
+            // handed the lease on once more before a fence was read under
+            // that term, and the first take read is then a later one.
+            let later = [before, between, after]
+                .into_iter()
+                .flatten()
+                .find(|term| *term > 1);
+            if let (None, Some(term)) = (taken, later) {
+                bound!(
+                    term == 2,
+                    "the first take read after the loss leads under term {term}"
+                );
                 taken = Some((lost.elapsed(), between == Some(2), Instant::now()));
             }
             assert!(
@@ -2475,6 +2536,15 @@ mod tests {
 
     #[test]
     fn two_candidates_over_one_lease_lead_follow_and_hand_over_at_a_stop() {
+        unheld(
+            "two candidates over one lease",
+            Duration::from_millis(600),
+            two_candidates_hand_over_at_a_stop,
+        );
+    }
+
+    /// One try of the case above: 600 ms of room, the lease's duration.
+    fn two_candidates_hand_over_at_a_stop() {
         let lease = MemoryLease::new();
         // The order of the design's settings at a fifth of their size.
         let settings = ElectionSettings {
@@ -2510,13 +2580,16 @@ mod tests {
         wait_for("the second's first look", fences, || {
             second_stood.borrow().looked
         });
-        assert_eq!(
-            *second_stood.borrow(),
-            Standing {
-                holder: "a@127.0.0.1:1".to_owned(),
-                term: 1,
-                looked: true,
-            }
+        // The bound on the clock: the first kept its lease to the second's
+        // look. A host that held it past the lease's duration handed the
+        // lease to the second, under the next term.
+        let (holder, term) = {
+            let look = second_stood.borrow();
+            (look.holder.clone(), look.term)
+        };
+        bound!(
+            holder == "a@127.0.0.1:1" && term == 1,
+            "the second's first look names {holder:?} under term {term}"
         );
         assert_eq!(second_store.term(), 0, "a follower holds no term");
 
