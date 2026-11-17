@@ -846,13 +846,15 @@ impl McpOrchestrator {
                         if let Some((client, config)) = found {
                             // The tool listing first: when it fails nothing
                             // changes and the other two listings are not
-                            // made. Each kind is cleared only when its own
-                            // listing succeeded, so a prompt or resource
-                            // listing that fails keeps what the server had.
-                            // The tool clear drops the aliases that targeted
-                            // the server, so the rebuild is what a connect
-                            // does: the tools, then the config's aliases and
-                            // argument mappings.
+                            // made. Prompts and resources are cleared only
+                            // when their own listing succeeded, so one that
+                            // fails keeps what the server had. The tools are
+                            // swapped in place: the listing goes in, then
+                            // what the server no longer lists goes out with
+                            // the aliases that target it, so a reader finds
+                            // every tool both listings hold. The config's
+                            // aliases and argument mappings go over the
+                            // result, as at a connect.
                             let key = request.server_key.as_str();
                             let Ok(tools) =
                                 tools_of(client.as_ref(), key, ToolCategory::Static).await
@@ -872,10 +874,14 @@ impl McpOrchestrator {
                                 Some(entry) if Arc::ptr_eq(&entry.client, &client) => entry,
                                 _ => continue,
                             };
-                            tool_inventory.clear_server_tool_entries(key);
+                            let listed: HashSet<String> = tools
+                                .iter()
+                                .map(|entry| entry.tool_name().to_string())
+                                .collect();
                             for entry in tools {
                                 tool_inventory.insert_entry(entry);
                             }
+                            tool_inventory.retain_server_tool_entries(key, &listed);
                             if let Some(prompts) = prompts {
                                 tool_inventory.clear_server_prompts(key);
                                 install_prompts(&tool_inventory, key, prompts);

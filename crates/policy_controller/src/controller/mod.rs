@@ -2,10 +2,12 @@
 //! the load driver over it, the election, the gRPC listeners with their
 //! scopes, the service and the health service on each, the admin listener,
 //! readiness and the drain. The service answers `Leader`, a gateway's
-//! `Session` and, on the leader, the control scope's registration calls,
-//! and the run loop sweeps the gateways that are gone; the scopes' other
-//! call bodies arrive with the gateway, ingestion and control scope PRs,
-//! the other ingestion drivers with their move out of the gateway. In the
+//! `Session` and its `Decide` streams, whose decisions run on the
+//! controller's deciding threads, and, on the leader, the control scope's
+//! registration calls, and the run loop sweeps the gateways that are gone;
+//! the scopes' other call bodies arrive with the gateway, ingestion and
+//! control scope PRs, the other ingestion drivers with their move out of
+//! the gateway. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document, watches the file and
 //! answers `GetPolicySpec` ([`Controller::spec_file`]).
@@ -27,13 +29,7 @@
 
 pub mod admin;
 pub mod config;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Decide call's streams hand their requests to the deciders; that call is the step's next PR"
-    )
-)]
+mod decide;
 mod deciders;
 pub mod election;
 mod gateways;
@@ -48,13 +44,6 @@ mod service;
 mod session;
 mod spec_file;
 pub mod tls;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Decide call's streams read their frames through it; that call is the step's next PR"
-    )
-)]
 mod wire;
 mod worker_wire;
 
@@ -559,7 +548,8 @@ impl Controller {
     /// lease before the settle window, so a follower takes it within one
     /// renew period; the listeners keep accepting for the settle window,
     /// stop accepting, and close within the rest of the grace period, their
-    /// streams with them.
+    /// streams with them. An open `Decide` stream ends `UNAVAILABLE` when
+    /// they stop accepting: it does not hold the close to the grace period.
     ///
     /// Every listener's health service reports the overall status (service
     /// `""`) as the readiness and [`SERVICE_NAME`] as `NOT_SERVING`, but a
@@ -601,7 +591,9 @@ impl Controller {
             ..
         } = self;
         let store = Arc::clone(&shared.store);
-        let (stop, _held) = watch::channel(false);
+        // The listeners' close is one word, and an open decide stream hears
+        // it too: the word is `Shared`'s.
+        let stop = shared.stop.clone();
         let mut tasks: JoinSet<Result<(), Error>> = JoinSet::new();
         let mut reporters = Vec::with_capacity(listeners.len());
         // The reporters of the listeners whose door a caller can pass: the

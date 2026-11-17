@@ -734,12 +734,13 @@ pub(crate) mod tests {
     use std::{
         fmt::Write as _,
         io::Write as _,
-        sync::atomic::AtomicBool,
+        sync::{atomic::AtomicBool, OnceLock, Weak},
         thread,
         time::{Duration, Instant},
     };
 
     use super::*;
+    use crate::{Candidate, Constraints, Filter, RequestFacts};
 
     /// A document in the form of the design's example: no `generation` line.
     pub(crate) const LEAST_LOAD: &str = "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    score: [least-load]\n    pick: best\n";
@@ -1195,6 +1196,69 @@ pub(crate) mod tests {
             applying.join().expect("the apply's thread"),
             Ok(Applied::Generation(2))
         );
+    }
+
+    /// The number moves under the document's lock: an apply calls the
+    /// store's entry with the lock held, so no reader finds the new number
+    /// beside the old document. The store lets an old generation go inside
+    /// its entry, and the one let go here holds a filter of the case's own
+    /// that writes down, at its end, whether the lock was held.
+    #[test]
+    fn the_stores_entry_is_called_under_the_documents_lock() {
+        /// Keeps every worker, and tells at its end how it found the lock.
+        #[derive(Debug)]
+        struct LetGo {
+            door: Arc<OnceLock<Weak<Generations>>>,
+            found: Arc<Mutex<Vec<bool>>>,
+        }
+
+        impl Filter for LetGo {
+            fn name(&self) -> &'static str {
+                "let-go"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+        }
+
+        impl Drop for LetGo {
+            fn drop(&mut self) {
+                if let Some(door) = self.door.get().and_then(Weak::upgrade) {
+                    self.found.lock().push(door.held.try_lock().is_none());
+                }
+            }
+        }
+
+        let door = Arc::new(OnceLock::new());
+        let found = Arc::new(Mutex::new(Vec::new()));
+        let mut stages = Catalog::builtin();
+        {
+            let (door, found) = (Arc::clone(&door), Arc::clone(&found));
+            let build = move || -> Box<dyn Filter> {
+                Box::new(LetGo {
+                    door: Arc::clone(&door),
+                    found: Arc::clone(&found),
+                })
+            };
+            stages.filter("let-go", build).expect("a free name");
+        }
+        let store = Arc::new(MemoryStore::new());
+        let generations = Arc::new(Generations::new(store, Arc::new(stages)));
+        door.set(Arc::downgrade(&generations)).expect("set once");
+
+        // The store keeps the generation before the standing one: the third
+        // apply lets the first go.
+        for (number, pick) in (1..).zip(["random", "round-robin", "best"]) {
+            let document = format!(
+                "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [let-go]\n    pick: {pick}\n"
+            );
+            assert_eq!(
+                yaml(&generations, document),
+                Ok(Applied::Generation(number))
+            );
+        }
+        assert_eq!(*found.lock(), [true], "the first generation's end");
     }
 
     /// The validator's word comes before the digest's. A `kind` line is in

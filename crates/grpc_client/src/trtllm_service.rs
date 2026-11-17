@@ -316,7 +316,9 @@ impl TrtllmServiceClient {
             top_p_min: None,
             top_p_reset_ids: None,
             top_p_decay: None,
-            seed: request.seed.map(seed_bits),
+            seed: request
+                .sampling_seed
+                .or_else(|| request.seed.map(seed_bits)),
             temperature: Some(request.temperature.unwrap_or(1.0)),
             min_tokens: request.min_tokens,
             beam_search_diversity_rate: None,
@@ -587,7 +589,9 @@ impl TrtllmServiceClient {
             top_p_min: None,
             top_p_reset_ids: None,
             top_p_decay: None,
-            seed: request.seed.map(seed_bits),
+            seed: request
+                .sampling_seed
+                .or_else(|| request.seed.map(seed_bits)),
             temperature: Some(request.temperature.unwrap_or(1.0)),
             min_tokens: request.min_tokens,
             beam_search_diversity_rate: None,
@@ -839,6 +843,34 @@ mod tests {
             TrtllmServiceClient::build_sampling_config_from_chat(&unset).seed,
             None
         );
+    }
+
+    /// A chat or completion request's `sampling_seed` reaches the sampling config whole, as on the
+    /// plain route, and wins over `seed` when a request sets both; `seed` alone still arrives.
+    #[test]
+    fn chat_and_completion_sampling_seed_reaches_the_engine_request() {
+        let chat = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a chat request");
+            TrtllmServiceClient::build_sampling_config_from_chat(&request).seed
+        };
+        let completion = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "prompt": "hi", "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a completion request");
+            TrtllmServiceClient::build_sampling_config_from_completion(&request).seed
+        };
+        let both =
+            |sampling_seed, seed| (chat(sampling_seed, seed), completion(sampling_seed, seed));
+        assert_eq!(both(Some(7), None), (Some(7), Some(7)));
+        assert_eq!(both(Some(7), Some(42)), (Some(7), Some(7)));
+        assert_eq!(both(Some(u64::MAX), None), (Some(u64::MAX), Some(u64::MAX)));
+        assert_eq!(both(None, Some(42)), (Some(42), Some(42)));
+        assert_eq!(both(None, None), (None, None));
     }
 
     #[test]

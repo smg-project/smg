@@ -16,8 +16,8 @@ instead ([`wasm-guest-policy`](../wasm/wasm-guest-policy)).
 
 - `Pack`, a scorer (`src/main.rs`): among the workers the profile's filters
   kept, the one with the most requests running, by its engine's own load
-  report, scores highest. Light traffic fills one worker before it opens the
-  next, and whole workers stay idle.
+  report, scores highest. Light traffic fills one worker, the next opens
+  when a filter drops the first, and whole workers stay idle.
 - `stages()`: the stock build's catalog with `Pack` added under the name
   `pack`.
 - `main`: the crate's command line and run loop over those stages.
@@ -27,9 +27,11 @@ instead ([`wasm-guest-policy`](../wasm/wasm-guest-policy)).
   rows, and the decision picks the busy worker, then the idle one once the
   prober takes the busy one out. A worker with no report yet counts as idle,
   and an idle fleet ties. A gateway's veto takes its worker out for that
-  gateway alone. A controller bound with these stages takes the document,
-  and the stock one refuses it by the scorer's name. The built binary's
-  start-up line names `pack` among its scorers.
+  gateway alone. A worker whose queue reaches its overload threshold is
+  passed over, and the idle one opens. The catalog a controller is bound
+  with validates the document, and the stock controller's refuses it by the
+  scorer's name. The built binary's start-up line names `pack` among its
+  scorers.
 - `Cargo.toml`: one dependency, the crate with its `controller` feature.
 
 ## Write, register, run
@@ -56,9 +58,9 @@ fn main() -> Result<ExitCode, CatalogError> {
 ```
 
 The closure is a factory. The catalog calls it once at registration, to read
-the stage's name, and drops that stage. The controller calls it again each
-time it validates a policy document, once for each place the document names
-the stage, so every generation of the policy gets stages of its own. Keep the
+the stage's name, and drops that stage. Each validation of a policy document
+over the catalog calls it again, once for each place the document names the
+stage, so every generation of the policy gets stages of its own. Keep the
 factory cheap: its first call runs in `main`, before the command line is
 read. State that must outlive a generation rides the closure.
 
@@ -89,7 +91,7 @@ feeds a store through the same doors and reads the decision.
 apiVersion: smg.policy/v1
 profiles:
   default:
-    filter: [healthy]
+    filter: [healthy, not-overloaded]
     score: [pack]
     pick: best
 ```
@@ -100,14 +102,18 @@ your binary's: read them in `main`, from the environment or a file, and move
 them into the factory. The command line is the crate's, and it refuses a flag
 it does not know.
 
-The stock `not-overloaded` filter is not in this document. It drops a worker
-over the overload thresholds. Add it where the store judges overload, and
-`pack` stops filling a worker there.
+The stock `not-overloaded` filter is where `pack` stops filling a worker. It
+drops a worker whose engine the store judges overloaded: the queue or the
+KV-cache usage in its load reports stands at or over a threshold. The
+threshold is the worker's own, named at its registration, or its pool's,
+from the policy document applied to the store: 8 queued requests and a usage
+of 0.8 where the document names none. The example's test registers each
+worker with a queue threshold of its own.
 
-The stock controller refuses this document by the scorer's name. The
+The stock build's catalog refuses this document by the scorer's name. The
 published schema (`crates/policy_controller/policyspec.schema.json`) lists
 the stock build's stages, so the document fails that schema too and
-validates in this controller.
+validates over this build's catalog.
 
 ## Build and run
 
@@ -133,6 +139,17 @@ smg-policy-controller = { git = "https://github.com/smg-project/smg", features =
 - `kubernetes`: the Lease election the Helm chart's replicas use.
 - The default features hold the WebAssembly plugin host.
 
+The build wants the Rust release this repository pins (`rust-toolchain.toml`)
+and `protoc` with the well-known types on its include path: the crate and the
+gRPC client it links compile their contracts in their build scripts.
+
+`own-repository.sh <directory>` writes this example as such a repository: its
+source, document and tests, a manifest with the line above, and this
+checkout's toolchain pin and lock file. `cargo test` passes there. With
+`--snapshot` the git source is a snapshot of this checkout, written beside
+the copy. CI builds and tests the example that way, against the change under
+test.
+
 ## The image
 
 The repository's Dockerfile builds any workspace package that depends on the
@@ -143,8 +160,18 @@ docker build --file docker/policy-controller.Dockerfile \
   --build-arg PACKAGE=policy-controller-example --tag policy-controller-example .
 ```
 
-The Helm chart runs the image that `policyController.image.repository` and
-`policyController.image.tag` name.
+CI builds this image beside the stock controller's, starts it and reads
+`pack` in its start-up line. It pushes neither.
+
+`PACKAGE` names a package of the workspace the file builds in. A repository
+of your own copies the file: it reads `rust-toolchain.toml` and `Cargo.lock`
+at the root of its build context, and it builds a package that depends on
+the crate.
+
+The Helm chart runs `registry/repository:tag` from
+`policyController.image.registry`, `policyController.image.repository` and
+`policyController.image.tag`. A registry left empty is the router's, and a
+repository of your own needs its tag.
 
 ## What it leaves out
 
@@ -159,6 +186,6 @@ The Helm chart runs the image that `policyController.image.repository` and
   version, as the stock controller does.
 - Data the store does not feed yet. The table above names each field that
   reads as its default.
-- A decision through the controller. No call hands the controller a policy
-  document yet, so it holds `pack` and judges a document against it, and
-  runs no decision with it. The tests run `pack` over the store's rows.
+- A decision through the started controller. The tests validate the
+  document over the controller's catalog and run `pack` over the store's
+  rows. No case asks the started controller for a decision yet.

@@ -1586,6 +1586,39 @@ async fn a_parser_override_from_a_label_update_must_be_known() {
     );
 }
 
+/// A parser name the engine reports at a refresh is refused like one a
+/// request carries: the job fails with the door's sentence, which does not
+/// repeat the name, and the worker is left as it was.
+#[tokio::test]
+async fn a_refreshed_parser_name_with_a_control_character_is_refused() {
+    for label in ["tool_parser", "reasoning_parser"] {
+        let worker = discovered(
+            WorkerSpec::new("http://w:8000"),
+            labels_of(&[("served_model_name", "m")]),
+        );
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let fresh = labels_of(&[("served_model_name", "m"), (label, "p\nINJECTED")]);
+        let mut refresh = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh);
+
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut refresh)
+            .await
+            .expect_err("the reported name is refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Step failed: update_worker_properties - models[].{label} must not contain \
+                 control characters"
+            )
+        );
+        let kept = app_ctx
+            .worker_registry
+            .get_by_url("http://w:8000")
+            .expect("the worker stays registered");
+        assert!(Arc::ptr_eq(&kept, &worker), "the worker was left as it was");
+    }
+}
+
 /// An external worker's cards come from the provider's model list, not
 /// from labels: a label update leaves them as they are, whether the
 /// worker serves one model or several.

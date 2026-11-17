@@ -12,10 +12,9 @@ use std::{
 };
 
 use clap::Parser;
-use tokio::{
-    runtime::{Builder, Runtime},
-    signal::unix::{signal, SignalKind},
-};
+use tokio::runtime::{Builder, Runtime};
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -175,6 +174,10 @@ struct Cli {
     /// it writes, and one that does not run is rejected whole and the
     /// running generation stays. With no file the controller runs no policy
     /// spec.
+    ///
+    /// YAML reads as JSON does: text that looks like a number or a boolean
+    /// is quoted where a field takes text, and a key with no value is null,
+    /// which no list or map is: write `[]` or `{}`, or leave the key out.
     #[arg(long, value_name = "PATH", help_heading = "Policy Spec")]
     spec_file: Option<PathBuf>,
 
@@ -411,8 +414,10 @@ fn truthy(value: Option<&OsStr>) -> bool {
 /// Resolves on SIGTERM (the orchestrator's stop) or SIGINT (a terminal's).
 /// A handler that cannot be installed is logged and its signal waits
 /// forever, so the other one still stops the process; a failure of both
-/// leaves the controller serving until it is killed.
+/// leaves the controller serving until it is killed. A host that is not
+/// Unix has no SIGTERM: the terminal's interrupt alone stops it there.
 async fn signals() {
+    #[cfg(unix)]
     let mut term = match signal(SignalKind::terminate()) {
         Ok(term) => Some(term),
         Err(error) => {
@@ -420,6 +425,7 @@ async fn signals() {
             None
         }
     };
+    #[cfg(unix)]
     let term = async {
         match term.as_mut() {
             Some(term) => {
@@ -428,6 +434,8 @@ async fn signals() {
             None => pending::<()>().await,
         }
     };
+    #[cfg(not(unix))]
+    let term = pending::<()>();
     let interrupt = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             warn!(%error, "no SIGINT handler; SIGTERM alone stops the controller");
@@ -463,6 +471,20 @@ fn runtime(worker_threads: Option<u16>) -> std::io::Result<Runtime> {
         }
         None => Runtime::new(),
     }
+}
+
+/// How long the process's end waits on a blocking call that has not
+/// returned. A look at a spec file answers in well under a millisecond on a
+/// file system that answers at all.
+const END_WAIT: Duration = Duration::from_secs(1);
+
+/// Ends the runtime once the serve has ended. A dropped runtime waits
+/// without end on a blocking call that has not returned, as a look at a
+/// file system that stopped answering: this waits [`END_WAIT`] and leaves
+/// it, so the process ends at its own stop and not at its supervisor's
+/// kill.
+fn end(runtime: Runtime) {
+    runtime.shutdown_timeout(END_WAIT);
 }
 
 /// Binds the controller over `catalog`, names the listeners that take
@@ -517,7 +539,7 @@ pub fn run(catalog: Catalog) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(async {
+    let code = runtime.block_on(async {
         let bound = bind(
             config,
             catalog,
@@ -538,7 +560,9 @@ pub fn run(catalog: Catalog) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
-    })
+    });
+    end(runtime);
+    code
 }
 
 #[cfg(test)]
@@ -546,6 +570,8 @@ mod tests {
     use std::{
         ffi::OsStr,
         path::{Path, PathBuf},
+        sync::mpsc,
+        thread,
         time::Duration,
     };
 
@@ -1070,6 +1096,32 @@ mod tests {
         .is_err());
     }
 
+    /// A blocking call that has not returned does not hold the runtime's
+    /// end, as it holds a dropped runtime's.
+    #[test]
+    fn the_runtimes_end_waits_on_no_blocked_call() {
+        let runtime = super::runtime(Some(1)).expect("a runtime");
+        let (started, start) = mpsc::channel::<()>();
+        let (release, blocked) = mpsc::channel::<()>();
+        runtime.spawn_blocking(move || {
+            let _ = started.send(());
+            // Returns when `release` goes, at the case's end.
+            let _ = blocked.recv();
+        });
+        start
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocking call starts");
+
+        let (ended, end) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            super::end(runtime);
+            let _ = ended.send(());
+        });
+        let waited = end.recv_timeout(super::END_WAIT + Duration::from_secs(4));
+        drop(release);
+        waited.expect("the end returns with a call still blocked");
+    }
+
     #[test]
     fn the_deciding_threads_take_the_operators_count_inside_their_range() {
         let default = config(&[]).expect("parsed");
@@ -1140,6 +1192,19 @@ mod tests {
         assert!(truthy(one));
         assert!(!set(None));
         assert!(!truthy(None));
+    }
+
+    /// The flag's long help says how YAML reads: an operator meets the rule
+    /// before a start refuses a number where a field takes text.
+    #[test]
+    fn the_spec_files_help_says_how_yaml_reads() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        // The help wraps where the terminal does.
+        let words = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("quoted where a field takes text"), "{help}");
+        assert!(words.contains("a key with no value is null"), "{help}");
     }
 
     #[test]

@@ -15,11 +15,12 @@ use std::time::{Duration, Instant};
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
-        WorkersStore, PUBLISH_WINDOW,
+        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers, PairingDescriptor,
+        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow, PairPools, PolicySpec,
-    PoolFacts, RequestFacts, Role, Scratch, Side, SignalSource, Target, WorkerId, PRESETS,
+    PoolFacts, RequestFacts, Role, Scratch, Side, SignalSource, Target, WireModes, WorkerId,
+    PRESETS,
 };
 
 #[global_allocator]
@@ -381,6 +382,64 @@ fn a_build_from_the_store_after_the_first_allocates_nothing() {
 }
 
 #[test]
+fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
+    // Two prefills of two transports; of 64 decodes every fourth names no
+    // transport and pairs with both: three decode classes in two lists.
+    let store = MemoryStore::new();
+    let register = |key: String, role: Role, transport: Option<&str>| {
+        store.upsert(WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            role,
+            wire_modes: WireModes::GRPC,
+            models: vec!["m".to_string()],
+            dp_size: 1,
+            pairing: transport.map(|transport| PairingDescriptor {
+                transport: Some(transport.to_string()),
+                ..PairingDescriptor::default()
+            }),
+            ..WorkerFacts::default()
+        });
+    };
+    for (index, transport) in ["tx-a", "tx-b"].into_iter().enumerate() {
+        register(
+            format!("grpc://p{index}:9000"),
+            Role::Prefill,
+            Some(transport),
+        );
+    }
+    for index in 0..64 {
+        let transport = [Some("tx-a"), Some("tx-b"), Some("tx-a"), None][index % 4];
+        register(format!("grpc://d{index}:9000"), Role::Decode, transport);
+    }
+    let ask = Ask {
+        gateway: GatewayId(1),
+        now: Instant::now(),
+        pinned: None,
+        affinity: true,
+    };
+    let mut out = PairBuffers::default();
+    // The first build sizes the host's buffers: the rows, the columns and
+    // the table.
+    store.build_pair("m", &ask, &mut out).expect("both pools");
+    let (built, allocations) = allocations_during(|| store.build_pair("m", &ask, &mut out));
+    let sizes = built.map(|(prefill, decode)| (prefill.pool_size, decode.pool_size));
+    assert_eq!(sizes, Some((2, 64)));
+    let pools = out.pools();
+    assert_eq!(
+        (pools.prefill_affinity.len(), pools.decode_affinity.len()),
+        (2, 64)
+    );
+    // Each prefill class lists its transport's decodes and the silent ones.
+    let world = store.world();
+    let classes = world.pairs("m").expect("the model's classes");
+    assert_eq!((classes.classes(), classes.entries()), (2, 4));
+    assert_eq!(pools.table.validate(), Ok(()));
+    assert_eq!(allocations, 0, "a pair build through the door allocated");
+}
+
+#[test]
 fn a_record_inside_the_window_allocates_nothing_and_a_publication_derives_nothing() {
     let (store, ids, opened) = store_of(64);
     // Inside the window the store's making opened: on file and folded,
@@ -400,4 +459,25 @@ fn a_record_inside_the_window_allocates_nothing_and_a_publication_derives_nothin
     let ((), allocations) = allocations_during(|| store.publish(due));
     assert_eq!(allocations, 3, "a publication of one pool's rows");
     assert_eq!(store.publish_due(), None);
+}
+
+/// A validation builds an index key's error path at the key's refusal
+/// alone: keys that pass add no allocation, so a spec of a thousand keys
+/// more allocates nothing more.
+#[test]
+fn index_keys_that_pass_add_no_allocation_to_a_validation() {
+    // A process's first validation builds the stock catalog, once: unmeasured.
+    let first = PolicySpec::preset("round_robin").expect("a preset");
+    assert!(first.validate().is_ok(), "the preset validates");
+    let allocations = |keys: u32| {
+        let mut spec = PolicySpec::preset("round_robin").expect("a preset");
+        for key in 0..keys {
+            spec.index
+                .insert(format!("model-{key:04}*"), Default::default());
+        }
+        let (engine, allocations) = allocations_during(|| spec.validate());
+        assert!(engine.is_ok(), "{keys} keys validate");
+        allocations
+    };
+    assert_eq!(allocations(2_000), allocations(1_000));
 }

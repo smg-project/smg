@@ -63,8 +63,9 @@ pub(super) fn model_info(state: &State) -> trt::GetModelInfoResponse {
 
 /// `GetServerInfo`: the engine's version and backend as the launcher reports
 /// them (the handshake's version is the fallback), the parallel sizes, the
-/// handshake's figures filling what the launcher left at 0, and the
-/// vocabulary of structural-tag nodes the launcher read off its xgrammar.
+/// handshake's figures filling what the launcher left at 0, the vocabulary of
+/// structural-tag nodes the launcher read off its xgrammar, and where the
+/// engine starts a grammar.
 pub(super) fn server_info(state: &State) -> trt::GetServerInfoResponse {
     let model = &state.model;
     let ready = state.shared.ready();
@@ -118,6 +119,7 @@ pub(super) fn server_info(state: &State) -> trt::GetServerInfoResponse {
             )
         },
         structural_tag_vocabulary: model.structural_tag_vocabulary.clone(),
+        constrained_decoding_start: super::constrained_decoding_start(model).to_string(),
     }
 }
 

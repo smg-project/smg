@@ -5,7 +5,9 @@
 //! mounted ConfigMap's file is a link), and applies its document as the
 //! source's first ([`Generations`]). A file that cannot be read, a file over
 //! the bound (refused by its size, unread) and a document that does not run
-//! each refuse the start.
+//! each refuse the start. So does a pipe, a device or a directory, unread:
+//! the file is opened without waiting, where an open of a pipe waits for a
+//! writer, and only what the opened file says is a regular file is read.
 //!
 //! The watch is a poll. A second after each look ended the path is resolved
 //! and the file's identity read: where the path leads once every link is
@@ -54,6 +56,9 @@ const START_READS: usize = 3;
 /// How many looks in a row find the file moved before the watch tells it as
 /// a file that does not stand still.
 const RESTLESS_LOOKS: u32 = 5;
+
+/// What a read says of an opened file that is no regular file.
+const NOT_A_FILE: &str = "the path leads to no regular file";
 
 /// What one look at the path found.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,20 +115,36 @@ fn identity(path: &Path) -> io::Result<Identity> {
     })
 }
 
+/// Opens the file without waiting. An open of a pipe waits for a writer
+/// otherwise, a start's without end.
+fn open(path: &Path) -> io::Result<fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let opened = rustix::io::retry_on_intr(|| rustix::fs::open(path, flags, Mode::empty()))?;
+    Ok(opened.into())
+}
+
 /// The file's bytes, whole. A file over the bound is refused by its size,
-/// unread.
+/// unread, and one that is no regular file by its kind, unread: a read of a
+/// pipe or of a terminal's device waits on a writer.
 fn read(identity: &Identity) -> Result<Vec<u8>, SpecRejected> {
     if identity.len > MAX_DOCUMENT_BYTES {
         return Err(SpecRejected::TooLarge(identity.len));
     }
     let unreadable = |error: io::Error| SpecRejected::Unreadable(error.to_string());
-    let file = fs::File::open(&identity.resolved).map_err(unreadable)?;
+    let file = open(&identity.resolved).map_err(unreadable)?;
+    // The opened file has the word, not the path a look found: the name may
+    // have turned between the two.
+    if !file.metadata().map_err(unreadable)?.is_file() {
+        return Err(SpecRejected::Unreadable(NOT_A_FILE.to_owned()));
+    }
     let mut bytes = Vec::with_capacity(usize::try_from(identity.len).unwrap_or(0));
     // One byte past the bound and no more. A file that grew since the look
-    // is another file at the look after the read. A source whose size a look
-    // cannot read (a device, a pipe) and that streams past the bound hands
-    // the door one byte over it and is refused by its size, never cut to a
-    // prefix that may parse.
+    // is another file at the look after the read. A file whose size a look
+    // cannot read (one the kernel writes as it is read) and that streams
+    // past the bound hands the door one byte over it and is refused by its
+    // size, never cut to a prefix that may parse.
     file.take(MAX_DOCUMENT_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(unreadable)?;
@@ -266,7 +287,9 @@ impl SpecFile {
     /// Looks at the file a [`POLL`] after each look ended, until `stop`
     /// turns. A look reads the file system, so each runs off the runtime's
     /// workers, one at a time. The stop ends the watch at once: a look in
-    /// flight ends by itself and nothing waits on it.
+    /// flight ends by itself and the watch does not wait on it. The runtime
+    /// that ran it does, at its own end: the controller's `run` bounds that
+    /// wait.
     pub(crate) async fn run(self, stop: watch::Receiver<bool>) -> Result<(), JoinError> {
         self.run_looking(stop, look).await
     }
@@ -304,6 +327,7 @@ impl SpecFile {
 #[cfg(test)]
 mod tests {
     use std::{
+        process::Command,
         sync::{
             atomic::{AtomicUsize, Ordering},
             mpsc,
@@ -482,6 +506,68 @@ mod tests {
         assert_eq!((bed.generation(), bed.rejected()), (0, 0));
     }
 
+    /// A start on `other` is refused as no regular file, and so is the
+    /// watched file once its name turns to `other`: one rejected state, the
+    /// running generation kept. The start and the looks run on a thread of
+    /// their own and are waited five seconds on the real clock, so a source
+    /// that waits on `other` fails the case where it would hang it.
+    #[cfg(unix)]
+    fn refused_as_no_file(bed: Bed, other: PathBuf) {
+        let (answer, answered) = mpsc::channel();
+        thread::spawn(move || {
+            let started = bed.start_on(&other);
+            let bound = bed.generations.bound();
+            // The watched file's name turns to the other.
+            let mut file = bed.start();
+            fs::rename(&other, &bed.path).expect("the rename");
+            let watched = settle(&mut file);
+            let next = file.poll();
+            let counts = (bed.rejected(), bed.generation());
+            let _ = answer.send((started, bound, watched, next, counts));
+        });
+        let (started, bound, watched, next, counts) = answered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the start and the looks answer: none waits on the file");
+        let refused = || SpecRejected::Unreadable(NOT_A_FILE.to_owned());
+        assert_eq!(started, Err(refused()));
+        assert!(!bound, "a refused start binds nothing");
+        assert_eq!(watched, Err(refused()));
+        assert_eq!(next, Look::Same, "a rejected state is one event");
+        assert_eq!(counts, (1, 1));
+    }
+
+    /// A pipe is refused by its kind, at the start and under the watch: it
+    /// is opened without waiting and never read. This one has no writer,
+    /// and an open that waits for one fails the case.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_is_refused_by_its_kind_unread() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let pipe = bed.dir.path().join("pipe.yaml");
+        let made = Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "mkfifo: {made}");
+        refused_as_no_file(bed, pipe);
+    }
+
+    /// A device is refused as a pipe is, behind a link: a terminal's own
+    /// end gives a read nothing and holds it, and the zero device's bytes
+    /// never end.
+    #[cfg(unix)]
+    #[test]
+    fn a_device_is_refused_by_its_kind_unread() {
+        use std::os::unix::fs::symlink;
+
+        for device in ["/dev/ptmx", "/dev/zero"] {
+            let bed = bed(LEAST_LOAD.as_bytes());
+            let link = bed.dir.path().join("device.yaml");
+            symlink(device, &link).expect("the link");
+            refused_as_no_file(bed, link);
+        }
+    }
+
     /// The identity reads the file's change time: an edit in place that
     /// keeps the file's size and puts its modified time back is a new
     /// identity. The change time has the file system's grain, so the edit
@@ -529,22 +615,6 @@ mod tests {
         let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
         fs::write(&bed.path, vec![b'#'; bound + 5]).expect("the file grows");
         assert_eq!(read(&looked).map(|bytes| bytes.len()), Ok(bound + 1));
-    }
-
-    /// A source whose size a look cannot read (a device, a pipe) and that
-    /// streams past the bound is refused by its size: the read hands the
-    /// door one byte over the bound, never a prefix that may parse.
-    #[cfg(unix)]
-    #[test]
-    fn a_stream_past_the_bound_is_refused_by_its_size() {
-        let bed = bed(b"");
-        let zeros = Path::new("/dev/zero");
-        assert_eq!(identity(zeros).expect("the device").len, 0);
-        assert_eq!(
-            bed.start_on(zeros),
-            Err(SpecRejected::TooLarge(MAX_DOCUMENT_BYTES + 1))
-        );
-        assert!(!bed.generations.bound());
     }
 
     /// The identity reads where the path leads: a link turned to another
@@ -1018,6 +1088,40 @@ mod tests {
         assert_eq!((bed.rejected(), bed.generation()), (1, 1));
     }
 
+    /// A read ends a run of moving looks as a look at the file last read
+    /// does: the look after the read that finds the file moved is the first
+    /// of a new run, and the fifth of that run tells it.
+    #[test]
+    fn a_read_ends_the_restless_count() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let mut file = bed.start();
+        // A writer that grows the file before every look.
+        let mut writes = 0;
+        let mut restless = |file: &mut SpecFile| {
+            file.poll_looking(|path| {
+                writes += 1;
+                let grown = format!("{RANDOM}#{}\n", "x".repeat(writes));
+                fs::write(path, grown).expect("the file");
+                look(path)
+            })
+        };
+
+        for _ in 1..RESTLESS_LOOKS {
+            assert_eq!(restless(&mut file), Look::Settling);
+        }
+        // It rests one look short of being told, and is read.
+        assert_eq!(file.poll(), Look::Read(Ok(Applied::Generation(2))));
+        for _ in 1..RESTLESS_LOOKS {
+            assert_eq!(restless(&mut file), Look::Settling, "the run began again");
+        }
+        assert_eq!(
+            restless(&mut file),
+            Look::Restless,
+            "the fifth look in a row"
+        );
+        assert_eq!((bed.rejected(), bed.generation()), (1, 2));
+    }
+
     /// Waits on the real clock, five seconds at most, until look `n` is in
     /// flight.
     async fn in_flight(looks: &AtomicUsize, n: usize) {
@@ -1107,5 +1211,35 @@ mod tests {
         stop.send_replace(true);
         ended(&mut watching).await.expect("the loop's last join");
         release.send(()).expect("the look waits");
+    }
+
+    /// The stop ends the loop between two looks as it ends it with a look
+    /// in flight: at once. The held clock has not moved when the loop has
+    /// ended, and no look followed the stop.
+    #[tokio::test(start_paused = true)]
+    async fn the_stop_ends_the_watch_between_two_looks() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let file = bed.start();
+        let began = tokio::time::Instant::now();
+        let looks = Arc::new(AtomicUsize::new(0));
+        let counted = {
+            let looks = Arc::clone(&looks);
+            move |path: &Path| {
+                looks.fetch_add(1, Ordering::SeqCst);
+                look(path)
+            }
+        };
+        let (stop, stopped) = watch::channel(false);
+        let mut watching = JoinSet::new();
+        watching.spawn(file.run_looking(stopped, counted));
+
+        // One look, and half a poll into the wait for the next.
+        sleep(POLL * 3 / 2).await;
+        assert_eq!(looks.load(Ordering::SeqCst), 1);
+        let stopped_at = began.elapsed();
+        stop.send_replace(true);
+        ended(&mut watching).await.expect("the loop's last join");
+        assert_eq!(began.elapsed(), stopped_at, "the loop waited no poll out");
+        assert_eq!(looks.load(Ordering::SeqCst), 1, "no look after the stop");
     }
 }

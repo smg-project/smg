@@ -297,9 +297,11 @@ message RequestFacts {
   // Wire-only, foreign hosts only (a front with text and no tokenizer): the
   // controller hashes it into `block_hashes` before any stage sees the view,
   // bounded by `view.max_prompt_text_bytes`, a field of the spec still to
-  // come with the step that hashes text. A controller that does not hash
-  // it yet keeps none of it: it answers the request `Busy` with no reason
-  // and never decides it as a request with no prefix.
+  // come with the step that hashes text: a text over the cap is read to the
+  // cap and its tail is not read, and a cap of 0 takes no text. A
+  // controller that does not hash it yet keeps none of it: it answers the
+  // request `Busy` with no reason and never decides it as a request with no
+  // prefix.
   bytes prompt_text = 18;
   // The size in tokens of one of the request's blocks as the host counted
   // them: an index's learned block size on an event-fed request, the
@@ -604,9 +606,9 @@ message LifecycleEvent {
   // events it refused at a full queue. A gap is events the plugin never
   // received (refused at a full queue, or in flight on a stream that
   // ended), and a plugin that keeps a ledger of leases treats it as a loss.
-  // A gap's size is exact and its place is not: events raised before the
-  // loss can arrive behind it. A loss after the last event sent shows at
-  // the next event.
+  // A gap sits where the loss fell: every event raised before it arrives
+  // ahead of the gap. A loss after the last event raised shows at the next
+  // event.
   uint64 seq = 1;
   oneof event {
     Issued issued = 2;

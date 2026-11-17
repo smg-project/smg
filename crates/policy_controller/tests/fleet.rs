@@ -1,24 +1,25 @@
 //! The end-to-end case, the harness first: a controller on ephemeral ports,
 //! a fleet of mock engines and the generated client, in one process. The
-//! fleet registers; the controller's own load driver polls it; a probe turn
-//! of the case asks each engine its health and writes what it heard; and
-//! the pool is read back as a decision's view reads it: every rank a row,
-//! healthy by its probe, its load from a poll, an engine that holds
-//! requests reading them. That engine's KV events follow: a subscriber of
-//! the case hands each batch of its stream to the sink, and its row's index
-//! holds every block the events left the engine holding. Then one engine is
-//! killed: the first dial that hears it dead writes it, and the pool reads
-//! its rows unhealthy and every other row healthy. Next, an engine stops
-//! answering with its sockets open: a probe turn waits out its dial bound,
-//! writes it and goes on. Last, the gateway sends requests of its own and
-//! reports each on its session: the store holds the completion of the engine
-//! that answered, none of class ok for the dead and the hung one, and nothing
-//! of it for another gateway; a frame that reads wrong ends the session of
-//! the gateway that sent it.
+//! fleet registers, an engine of one rank through the control scope's call;
+//! the controller's own load driver polls it; a probe turn of the case asks
+//! each engine its health and writes what it heard; and the pool is read
+//! back as a decision's view reads it: every rank a row, healthy by its
+//! probe, its load from a poll, an engine that holds requests reading them.
+//! That engine's KV events follow: a subscriber of the case hands each batch
+//! of its stream to the sink, and its row's index holds every block the
+//! events left the engine holding. Then one engine is killed: the first dial
+//! that hears it dead writes it, and the pool reads its rows unhealthy and
+//! every other row healthy. Next, an engine stops answering with its sockets
+//! open: a probe turn waits out its dial bound, writes it and goes on. Last,
+//! the gateway sends requests of its own and reports each on its session:
+//! the store holds the completion of the engine that answered, none of class
+//! ok for the dead and the hung one, and nothing of it for another gateway;
+//! a frame that reads wrong ends the session of the gateway that sent it.
 //!
-//! No decision is asked yet: the service answers `Leader` and takes the
-//! session's reports, and the case asserts both end to end. The decisions
-//! take the views' place when the service answers them.
+//! No decision is asked yet: of a gateway's calls the service answers
+//! `Leader` and takes the session's reports, and the case asserts both end
+//! to end. The decisions take the views' place when the service answers
+//! them.
 //!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
@@ -531,24 +532,18 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ended.message().contains("Released.what"),
             "the refusal names the field: {ended:?}"
         );
-        // The session tells the status it ended with at each ask, and to a
-        // report once the connection has dropped the ended call's request.
+        // The session tells the status it ended with at each ask, and to
+        // each report from the first read on.
         let again = other.session_end().await.expect("the end is told again");
         assert_eq!(
             again.code(),
             Code::InvalidArgument,
             "a second ask reads the status the session ended with: {again:?}"
         );
-        let told = tokio::time::timeout(ROOM, async {
-            loop {
-                match other.released(Released::default()).await {
-                    Ok(()) => tokio::time::sleep(POLL_INTERVAL / 10).await,
-                    Err(error) => break error,
-                }
-            }
-        })
-        .await
-        .expect("a report into the ended session is refused");
+        let told = other
+            .released(Released::default())
+            .await
+            .expect_err("a report into the ended session is refused");
         assert!(
             matches!(&told, client::Error::Status(status) if status.code() == Code::InvalidArgument),
             "a report into the ended session tells the status it ended with: {told:?}"

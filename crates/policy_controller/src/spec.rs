@@ -1374,7 +1374,6 @@ pub struct BindingSpec {
     /// The profiles per side: `single`, or every side of the plan
     /// (`prefill` and `decode`; `encode` too under `epd`), each named.
     #[serde(
-        default,
         deserialize_with = "keyed_once",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
@@ -1691,17 +1690,24 @@ fn check_view(view: &ViewSpec, denied: &[&str]) -> Result<(), SpecError> {
 
 fn check_index(index: &BTreeMap<String, IndexSpec>, view: &ViewSpec) -> Result<(), SpecError> {
     for (model, spec) in index {
-        let at = At::new(format!("index.{model}"));
+        // The key's path is built at a refusal alone: a key that passes
+        // formats nothing.
+        let at = || At::new(format!("index.{model}"));
         if !glob_ok(model) {
             return Err(SpecError::BadField {
-                path: at.0,
+                path: at().0,
                 value: model.clone(),
                 reason: "an id, `prefix*`, `*suffix` or `*`",
             });
         }
-        at.nonzero("ttl_s", Some(spec.ttl_s))?;
-        at.nonzero("max_size", Some(spec.max_size))?;
-        at.nonzero("sweep_s", Some(spec.sweep_s))?;
+        let counts = [
+            ("ttl_s", u64::from(spec.ttl_s)),
+            ("max_size", spec.max_size),
+            ("sweep_s", u64::from(spec.sweep_s)),
+        ];
+        if let Some((name, zero)) = counts.into_iter().find(|(_, count)| *count == 0) {
+            return Err(at().bad(name, zero, "above zero"));
+        }
         if spec.kind == IndexKind::Hash && view.boundaries.is_empty() {
             return Err(SpecError::HashIndexNeedsBoundaries {
                 model: model.clone(),
@@ -3018,6 +3024,9 @@ impl io::Write for HashWriter<'_> {
 /// It carries the document's digest beside the number ([`Digest`]): the
 /// number says which generation a replica runs, the digest which document,
 /// and one load reads the pair.
+///
+/// It also holds what a store derives under, beside the engine: the
+/// document's pairing mode ([`AppliedSpec::pairing`]).
 #[derive(Debug)]
 pub struct AppliedSpec {
     engine: Engine,
@@ -3026,6 +3035,7 @@ pub struct AppliedSpec {
     digest: Option<Digest>,
     /// The document's `view.max_block_hashes`.
     max_block_hashes: u32,
+    pairing: Pairing,
 }
 
 impl AppliedSpec {
@@ -3045,6 +3055,7 @@ impl AppliedSpec {
             engine,
             digest: Some(document.digest()?),
             max_block_hashes: document.view.max_block_hashes,
+            pairing: document.plans.pd_pair.pairing,
         })
     }
 
@@ -3063,18 +3074,21 @@ impl AppliedSpec {
             engine,
             digest: Some(digest),
             max_block_hashes: document.view.max_block_hashes,
+            pairing: document.plans.pd_pair.pairing,
         })
     }
 
     /// The generation a store holds before any document is applied: number
     /// 0, an engine with no profile and no binding, which declines every
-    /// decision by name as an engine declines a model no binding covers.
+    /// decision by name as an engine declines a model no binding covers,
+    /// and the pairing mode a document that names none has.
     #[must_use]
     pub fn unbound() -> Self {
         Self {
             engine: Engine::new(Vec::new(), Vec::new(), 0, Needs::default()),
             digest: None,
             max_block_hashes: ViewSpec::default().max_block_hashes,
+            pairing: Pairing::default(),
         }
     }
 
@@ -3111,6 +3125,13 @@ impl AppliedSpec {
     #[must_use]
     pub fn needs(&self) -> Needs {
         self.engine.needs()
+    }
+
+    /// The mode a store derives its pair classes under while this
+    /// generation stands: the document's `plans.pd-pair.pairing`.
+    #[must_use]
+    pub fn pairing(&self) -> Pairing {
+        self.pairing
     }
 }
 
@@ -3447,6 +3468,36 @@ mod tests {
         assert_eq!(read.profiles.len(), 2);
         assert_eq!(read.index.len(), 1);
         assert_eq!(read.bindings[0].profiles["single"], "p");
+    }
+
+    /// The YAML form of the three maps is refused in the same words: its
+    /// reader hands a key written twice to the map's own read, which kept
+    /// the last of the two before.
+    #[test]
+    fn a_map_key_written_twice_in_yaml_is_refused_by_name() {
+        let documents = [
+            (
+                "apiVersion: smg.policy/v1\nprofiles:\n  p: {pick: random}\n  p: {pick: round-robin}\n",
+                "p",
+            ),
+            (
+                "apiVersion: smg.policy/v1\nindex:\n  \"a*\": {}\n  \"a*\": {ttl_s: 1}\nprofiles:\n  p: {pick: random}\n",
+                "a*",
+            ),
+            (
+                "apiVersion: smg.policy/v1\nprofiles:\n  p: {pick: random}\nbindings:\n  - match: {model: \"*\"}\n    profiles: {single: p, single: p}\n",
+                "single",
+            ),
+        ];
+        for (document, key) in documents {
+            let refused = serde_yaml::from_str::<PolicySpec>(document)
+                .expect_err("a key written twice")
+                .to_string();
+            assert!(
+                refused.contains(&format!("the key `{key}` is written twice")),
+                "{refused}"
+            );
+        }
     }
 
     #[test]
@@ -3947,8 +3998,17 @@ mod tests {
             ))
         };
         assert_eq!(bad_field(&with_index(r#"{"a*b":{}}"#, "{}")), "index.a*b");
+        // Each count is above zero, refused by its own name, the first
+        // written in the type's order where two are zero.
+        for count in ["ttl_s", "max_size", "sweep_s"] {
+            let index = format!(r#"{{"*":{{"{count}":0}}}}"#);
+            assert_eq!(
+                bad_field(&with_index(&index, "{}")),
+                format!("index.*.{count}")
+            );
+        }
         assert_eq!(
-            bad_field(&with_index(r#"{"*":{"ttl_s":0}}"#, "{}")),
+            bad_field(&with_index(r#"{"*":{"sweep_s":0,"ttl_s":0}}"#, "{}")),
             "index.*.ttl_s"
         );
         assert_eq!(
@@ -5133,5 +5193,21 @@ mod tests {
         let applied = AppliedSpec::validate_digested(&document, handed, &Catalog::builtin())
             .expect("a preset validates");
         assert_eq!(applied.digest(), Some(handed));
+    }
+
+    /// A digest handed on moves nothing else of the generation: its pairing
+    /// mode is the document's, as where the generation digests the document
+    /// itself.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_generation_under_a_handed_digest_takes_its_documents_pairing_mode() {
+        let mut document = PolicySpec::preset("least_load").expect("a preset");
+        document.plans.pd_pair.pairing = Pairing::Strict;
+        let digest = document.digest().expect("a digest");
+        let handed = AppliedSpec::validate_digested(&document, digest, &Catalog::builtin())
+            .expect("a preset validates");
+        assert_eq!(handed.pairing(), Pairing::Strict);
+        let own = AppliedSpec::validate(&document).expect("a preset validates");
+        assert_eq!(own.pairing(), Pairing::Strict);
     }
 }

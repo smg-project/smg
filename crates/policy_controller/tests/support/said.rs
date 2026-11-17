@@ -28,10 +28,42 @@ impl tracing::Subscriber for Said {
         }
         let mut fields = Fields(event.metadata().level().to_string());
         event.record(&mut fields);
-        self.0.lock().expect("the kept lines").push(fields.0);
+        let line = fields.0;
+        let trapped = {
+            let mut trap = TRAP.lock().expect("the trap");
+            let hit = trap
+                .as_ref()
+                .is_some_and(|(named, text)| line.contains(named) && line.contains(text));
+            if hit {
+                trap.take().map(|(named, _)| named)
+            } else {
+                None
+            }
+        };
+        self.0.lock().expect("the kept lines").push(line);
+        assert!(
+            trapped.is_none(),
+            "the subscriber panics at a line a case armed: {trapped:?}"
+        );
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The line the subscriber panics at, once: what names a plugin, and a text.
+static TRAP: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// Arms the subscriber to panic once, on the thread that says it, at the
+/// next line that names `plugin` and holds `text`: a case's way to make the
+/// host's own telling of a failure panic where it is told.
+pub fn panic_once_at(plugin: &str, text: &str) {
+    said();
+    *TRAP.lock().expect("the trap") = Some((format!("plugin=\"{plugin}\""), text.to_owned()));
+}
+
+/// Whether the panic a case armed has been made.
+pub fn trap_spent() -> bool {
+    TRAP.lock().expect("the trap").is_none()
 }
 
 /// The warnings this test process logs, for the cases that read a line of

@@ -114,13 +114,6 @@ struct Row {
     replaced: Vec<Weak<Replaced>>,
     /// Held for as long as this presence lasts: a [`Presence`] waits for
     /// its drop.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "a decide stream subscribes to it; the Decide call is the step's next PR"
-        )
-    )]
     ended: watch::Sender<()>,
 }
 
@@ -169,23 +162,9 @@ impl Drop for Seat {
 }
 
 /// A gateway's presence as a decide stream holds it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Decide call holds one a decide stream; that call is the step's next PR"
-    )
-)]
 #[derive(Clone)]
 pub(crate) struct Presence(watch::Receiver<()>);
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Decide call ends a decide stream on it; that call is the step's next PR"
-    )
-)]
 impl Presence {
     /// Resolves when the presence ended.
     pub(crate) async fn ended(&mut self) {
@@ -328,13 +307,6 @@ impl Gateways {
 
     /// The gateway's presence at `now` for a decide stream's open: `None`
     /// when it is not present. No decision asks: a stream's open and end do.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Decide call asks it at a decide stream's open; that call is the step's next PR"
-        )
-    )]
     pub(crate) fn presence(&self, gateway: GatewayId, now: Instant) -> Option<Presence> {
         let mut table = self.table.lock();
         Self::observe(&mut table, self.fence.leader_term(now), now);
