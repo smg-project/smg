@@ -91,7 +91,11 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
 from smg_grpc_servicer.sglang import METRICS_HOST_ENV, METRICS_PORT_ENV
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.lora import PreloadedLoras
-from smg_grpc_servicer.sglang.model_artifacts import prepare_model_metadata, tokenizer_dir_for
+from smg_grpc_servicer.sglang.model_artifacts import (
+    local_metadata_source,
+    prepare_model_metadata,
+    tokenizer_dir_for,
+)
 from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, media_warmup, warmup_inputs, warmup_wire
 
 logger = logging.getLogger(__name__)
@@ -622,7 +626,7 @@ class SglangLauncher(RustLauncher):
             configure_threads()
             return {
                 "smg_media_processor": {
-                    "model_dir": str(args.model_path),
+                    "model_dir": local_metadata_source(str(args.model_path)),
                     "model_id": str(args.model_path),
                     "encoder_dtype": dtype,
                     "source": "env",

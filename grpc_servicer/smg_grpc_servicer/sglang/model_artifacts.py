@@ -53,6 +53,12 @@ def prepare_model_metadata(server_args: Any) -> None:
                 ) from error
 
 
+def local_metadata_source(source: str) -> str:
+    """Use the object storage metadata cache; keep local paths and Hub IDs as given."""
+    storage = _object_storage_model(source)
+    return storage.get_path(source) if storage is not None else source
+
+
 def tokenizer_dir_for(server_args: Any) -> str | None:
     """Resolve the selected tokenizer to its local files, including the S3 cache."""
     args = EngineConfigView(server_args).server_args

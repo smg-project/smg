@@ -100,6 +100,19 @@ def test_local_tokenizer_override_is_kept_when_weights_are_remote(storage, tmp_p
     assert model_artifacts.tokenizer_dir_for(args) == str(tmp_path)
 
 
+def test_native_media_reads_model_metadata_with_a_separate_tokenizer(storage, monkeypatch):
+    from smg_grpc_servicer.sglang import mm_defaults
+
+    monkeypatch.setenv("SMG_SGLANG_MM_PROCESSOR", "smg")
+    monkeypatch.setenv("SMG_SGLANG_MM_DTYPE", "bfloat16")
+    monkeypatch.setattr(mm_defaults, "configure_threads", lambda: None)
+    args = _args("s3://bucket/vision-model", "s3://bucket/tokenizer")
+    model_artifacts.prepare_model_metadata(args)
+    options = rust.SglangLauncher().server_extras(args, model_artifacts.tokenizer_dir_for(args))
+    assert options["smg_media_processor"]["model_dir"] == storage.model.get_path(args.model_path)
+    assert options["smg_media_processor"]["model_id"] == args.model_path
+
+
 @pytest.mark.parametrize("source", ["org/model", "/local/model"])
 def test_non_object_storage_sources_keep_the_existing_resolver(monkeypatch, source):
     calls = []
