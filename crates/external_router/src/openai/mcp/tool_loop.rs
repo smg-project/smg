@@ -812,7 +812,7 @@ async fn send_tool_call_completion_events(
         return false;
     }
 
-    // Event 2: response.output_item.done (with completed tool call)
+    // Event 2: response.output_item.done (with the call's final item)
     let done_payload = json!({
         "type": OutputItemEvent::DONE,
         "sequence_number": *sequence_number,
