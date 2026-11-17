@@ -303,7 +303,10 @@ impl Roles {
         for class in classes {
             class.changes_from(PLANE, &mut points);
         }
-        #[expect(clippy::stable_sort_primitive)]
+        #[expect(
+            clippy::stable_sort_primitive,
+            reason = "the stable sort merges sorted tables"
+        )]
         points.sort();
         points.dedup();
         points.pop_if(|code| *code == limit);

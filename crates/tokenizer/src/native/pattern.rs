@@ -32,13 +32,15 @@
 //! pieces are the same and no character is interpreted op by op. A scanner
 //! reads a character's classes as role bits ([`scan::Roles`]). The classes
 //! are the parser's, so the matchers cannot read a category differently.
+//! The byte-level split is matched the same way, by [`byte_split::Scanner`]
+//! in the walk over a pipeline's stages.
 //!
 //! Character categories come from [`super::unicode`], generated from that
 //! same engine, so `\p{L}` or `\s` cannot mean one thing here and another
 //! there.
 
 use super::{
-    block, cased, chain,
+    block, byte_split, cased, chain,
     scan::{Bits, Roles, WordScan},
     unicode,
 };
@@ -284,7 +286,7 @@ impl Class {
 
     /// Whether two finished classes are the same set: the same categories,
     /// exclusions, negation and (sorted, merged) ranges.
-    fn same_set(&self, other: &Self) -> bool {
+    pub(super) fn same_set(&self, other: &Self) -> bool {
         self.negated == other.negated
             && self.categories == other.categories
             && self.without == other.without
@@ -673,6 +675,17 @@ pub(crate) struct Pattern {
     /// How the pattern is matched: by the scanner of its template's shape,
     /// else by the program.
     matcher: Matcher,
+    /// The scanner of the byte-level split, when the pattern is that split
+    /// ([`byte_split`]). The walk over a pipeline's stages matches by it
+    /// ([`Self::split_matches`]); the iterator and [`Self::for_each_match`]
+    /// keep the program for this pattern and hold no test for the scanner,
+    /// so a pipeline whose only stage is the split, which takes the
+    /// single-stage loop, still runs the program. It is no variant of
+    /// [`Matcher`] and no arm of the iterator: a fourth variant cost the
+    /// template scanners' loops 1 to 2 % more instructions on a text beyond
+    /// ASCII, and one more test a piece in the iterator cost a pattern the
+    /// program runs 0.6 % (both counted).
+    byte_split: Option<Box<byte_split::Scanner>>,
     /// What the pattern is as a stage of a three-stage chain, when it is
     /// one (see [`chain`]).
     part: Option<chain::Part>,
@@ -700,7 +713,10 @@ pub(crate) struct Pattern {
 /// shapes in use, the program for every other pattern.
 #[derive(Debug, Clone)]
 enum Matcher {
-    /// The compiled program, interpreted (see [`Pattern::match_at`]).
+    /// The compiled program, interpreted (see [`Pattern::match_at`]). The
+    /// byte-level split is of this variant too: its scanner stands in for
+    /// the program in the walk over a pipeline's stages
+    /// (`Pattern::split_matches`).
     Program,
     /// The GPT-4 family's template.
     Template(Scanner),
@@ -887,7 +903,8 @@ impl Pattern {
     /// unit run is unbounded by construction and no start skip covers it, so
     /// one that falls short of its minimum is rescanned the same way from
     /// every start, as its first op too. The template scanners hold no such
-    /// run.
+    /// run. The byte-level split answers by its program, though its scanner
+    /// holds none either: no vocabulary runs that split over the image.
     pub(super) fn rescans_a_run(&self) -> bool {
         matches!(self.matcher, Matcher::Program)
             && self.program.iter().enumerate().any(|(i, op)| match op {
@@ -931,6 +948,12 @@ impl Pattern {
                 None => Matcher::Program,
             },
         };
+        let byte_split = match matcher {
+            Matcher::Program => {
+                byte_split::Scanner::recognize(&root, &parser.classes).map(Box::new)
+            }
+            _ => None,
+        };
         let part = chain::Part::recognize(&root);
         let end_anchored = holds_end(&root);
         let reads_word_boundary = holds_word_boundary(&root);
@@ -950,6 +973,7 @@ impl Pattern {
             program,
             firsts,
             matcher,
+            byte_split,
             part,
             end_anchored,
             reads_word_boundary,
@@ -1090,6 +1114,7 @@ impl Pattern {
     pub(super) fn program_only(&self) -> Self {
         Self {
             matcher: Matcher::Program,
+            byte_split: None,
             ..self.clone()
         }
     }
@@ -1097,7 +1122,7 @@ impl Pattern {
     /// Whether a scanner matches this pattern (else the program does).
     #[cfg(test)]
     pub(super) fn has_scanner(&self) -> bool {
-        !matches!(self.matcher, Matcher::Program)
+        !matches!(self.matcher, Matcher::Program) || self.byte_split.is_some()
     }
 
     /// The matches in `text`, leftmost first, each continuing after the last.
@@ -1110,6 +1135,26 @@ impl Pattern {
             choices: [Choice::default(); MAX_CHOICES],
             memo: RunMemo::default(),
         }
+    }
+
+    /// Whether the pattern is the byte-level split, which has a scanner
+    /// ([`Self::split_matches`]).
+    pub(super) fn has_byte_split(&self) -> bool {
+        self.byte_split.is_some()
+    }
+
+    /// The matches in `text` by the byte-level split's scanner, leftmost
+    /// first, when the pattern is that split: what [`Self::find_iter`]
+    /// yields by the program. The walk over a pipeline's stages takes them
+    /// from here; the iterator itself keeps the program.
+    #[inline(always)]
+    pub(super) fn split_matches<'p, 't>(
+        &'p self,
+        text: &'t str,
+    ) -> Option<byte_split::Matches<'p, 't>> {
+        self.byte_split
+            .as_ref()
+            .map(|scanner| scanner.matches(&self.classes, text))
     }
 
     /// Whether an all-ASCII text has a walk of its own here
@@ -4939,7 +4984,6 @@ mod tests {
         const TWO_OR_MORE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{2,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
         const LEAD_IN_RUN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]*\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
         for pattern in [
-            GPT2,
             DIGITS,
             CJK,
             DEEPSEEK,
@@ -4955,6 +4999,45 @@ mod tests {
                 ),
                 "{pattern}"
             );
+        }
+        // The byte-level split has a scanner of its own, not this one.
+        let split = Pattern::parse(GPT2).expect("parses");
+        assert!(matches!(split.matcher, Matcher::Program) && split.byte_split.is_some());
+    }
+
+    /// The byte-level split takes its scanner, and a pattern one step away
+    /// from it keeps the program: the clitics as a group, no clitic, a
+    /// clitic that begins with another character, the last two alternatives
+    /// the other way round, a bounded digit run, a digit or a letter run
+    /// without its lead-in, a lead-in run, a possessive run, a run after
+    /// the punctuation, and one alternative fewer.
+    #[test]
+    fn the_byte_level_split_takes_its_scanner_and_no_near_miss_does() {
+        let parsed = Pattern::parse(GPT2).expect("parses");
+        let scanner = parsed
+            .byte_split
+            .as_ref()
+            .expect("the byte-level split takes its scanner");
+        assert_eq!(scanner.clitics(), 7);
+        const CLITICS: &str = "'s|'t|'re|'ve|'m|'ll|'d";
+        const RUNS: &str = r" ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+        assert_eq!(format!("{CLITICS}|{RUNS}"), GPT2);
+        for near_miss in [
+            format!("(?i:{CLITICS})|{RUNS}"),
+            RUNS.to_string(),
+            format!("{CLITICS}|`s|{RUNS}"),
+            GPT2.replace(r"\s+(?!\S)|\s+", r"\s+|\s+(?!\S)"),
+            GPT2.replace(r" ?\p{N}+", r" ?\p{N}{1,3}"),
+            GPT2.replace(r" ?\p{N}+", r"\p{N}+"),
+            GPT2.replace(r" ?\p{L}+", r"\p{L}+"),
+            GPT2.replace(r" ?\p{L}+", r" *\p{L}+"),
+            GPT2.replace(r" ?\p{L}+", r" ?\p{L}++"),
+            GPT2.replace(r"[^\s\p{L}\p{N}]+", r"[^\s\p{L}\p{N}]+[\r\n]*"),
+            GPT2.replace(r"|\s+(?!\S)", ""),
+        ] {
+            assert_ne!(near_miss, GPT2);
+            let parsed = Pattern::parse(&near_miss).expect("parses");
+            assert!(!parsed.has_scanner(), "{near_miss}");
         }
     }
 
@@ -5375,6 +5458,89 @@ mod tests {
                     "the engine; pattern {pattern:?} text {text:?}"
                 );
             }
+        }
+    }
+
+    /// The byte-level split's scanner cuts as its program and as the engine
+    /// do, the scanner through its own iterator: text built of
+    /// ASCII letters, digits and punctuation, of every kind of white space
+    /// in runs (last in the text and before a non-space among them), of
+    /// clitics in both cases, of letters and digits beyond ASCII and above
+    /// the plane, of marks and other characters no class but the
+    /// punctuation's holds; fixed texts where one rule gives way to the
+    /// next; and the empty text.
+    #[test]
+    fn the_byte_level_scanner_agrees_with_the_program_and_the_engine() {
+        const PARTS: &[&str] = &[
+            " ", "  ", "   ", "\t", "\t\t", "\n", "\n\n", "\r", "\r\n", " \n", "\n ", " \t ",
+            "\u{B}", "\u{C}", "\u{1C}", "\u{85}", "\u{A0}", "\u{1680}", "\u{2003}", "\u{2028}",
+            "\u{2029}", "\u{202F}", "\u{205F}", "\u{3000}", "'", "''", "'s", "'S", "'t", "'T",
+            "'re", "'RE", "'rE", "'ve", "'VE", "'m", "'M", "'ll", "'LL", "'l", "'d", "'D", "'x",
+            "'ſ", "a", "b", "s", "t", "I", "Word", "word", "ABC", "é", "ß", "ſ", "Ω", "中", "文",
+            "ก", "𐍈", "𝐀", "0", "1", "22", "333", "4444", "٣", "²", "½", "𝟗", ".", ",", "!", "?",
+            ":", ";", "-", "_", "\"", "(", ")", "[", "]", "{", "}", "/", "...", "\u{301}",
+            "\u{93E}", "😀", "\u{200D}", "\u{FE0F}",
+        ];
+        const TEXTS: &[&str] = &[
+            "", " ", "  ", "\n", "\t\n ", "a", " a", "  a", "a ", "a  ", "a \n", "a\n\n", "\t\ta",
+            " \ta", "a \t", "1", " 1", "  1", "1 ", " .", "  .", ". ", "'", "' ", " '", "'s",
+            " 's", "'S", "''s", "I'm", "x'ſ", "a1b2", " a1 b2 ", "é ٣ ½", "中 文", "𝐀𝟗", "😀 ",
+        ];
+        let parsed = Pattern::parse(GPT2).expect("parses");
+        let program = parsed.program_only();
+        let check = |text: &str| {
+            let expected = oracle_matches(GPT2, text);
+            assert_eq!(
+                program.find_iter(text).collect::<Vec<_>>(),
+                expected,
+                "the program; text {text:?}"
+            );
+            let scanned = parsed.split_matches(text).expect("the split's scanner");
+            assert_eq!(
+                scanned.collect::<Vec<_>>(),
+                expected,
+                "the scanner; text {text:?}"
+            );
+        };
+        for text in TEXTS {
+            check(text);
+        }
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for round in 0..4000 {
+            let text: String = (0..1 + round % 40)
+                .map(|_| PARTS[(pseudo_random(&mut state) % PARTS.len() as u64) as usize])
+                .collect();
+            check(&text);
+        }
+    }
+
+    /// The same scanner under other classes, where a character holds
+    /// several roles: a lead-in that is also of its run, runs that share
+    /// characters, a lookahead class that holds characters of its own run,
+    /// and characters no class holds. The engine's order decides each time.
+    #[test]
+    fn the_byte_level_scanner_agrees_with_the_engine_where_classes_overlap() {
+        const OVERLAPPING: &str = "ab|ac|[ab]?[bc]+|[cd]?[de]+|[ef]?[fg]+|[gh]+(?![hi])|[hi]+";
+        const ALPHABET: [char; 11] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', ' '];
+        let parsed = Pattern::parse(OVERLAPPING).expect("parses");
+        let program = parsed.program_only();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for round in 0..4000 {
+            let text: String = (0..1 + round % 24)
+                .map(|_| ALPHABET[(pseudo_random(&mut state) % ALPHABET.len() as u64) as usize])
+                .collect();
+            let expected = oracle_matches(OVERLAPPING, &text);
+            assert_eq!(
+                program.find_iter(&text).collect::<Vec<_>>(),
+                expected,
+                "the program; text {text:?}"
+            );
+            let scanned = parsed.split_matches(&text).expect("the scanner");
+            assert_eq!(
+                scanned.collect::<Vec<_>>(),
+                expected,
+                "the scanner; text {text:?}"
+            );
         }
     }
 
