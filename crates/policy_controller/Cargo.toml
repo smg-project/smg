@@ -260,6 +260,12 @@ required-features = ["controller"]
 name = "decision"
 harness = false
 
+# One validation by a spec's index keys. Apart from `decision`: that binary
+# is a pull-request gate's, and a row added to it moves its other rows.
+[[bench]]
+name = "spec_index"
+harness = false
+
 [[bench]]
 name = "pair_table"
 harness = false

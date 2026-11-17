@@ -1374,7 +1374,6 @@ pub struct BindingSpec {
     /// The profiles per side: `single`, or every side of the plan
     /// (`prefill` and `decode`; `encode` too under `epd`), each named.
     #[serde(
-        default,
         deserialize_with = "keyed_once",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
@@ -1691,17 +1690,24 @@ fn check_view(view: &ViewSpec, denied: &[&str]) -> Result<(), SpecError> {
 
 fn check_index(index: &BTreeMap<String, IndexSpec>, view: &ViewSpec) -> Result<(), SpecError> {
     for (model, spec) in index {
-        let at = At::new(format!("index.{model}"));
+        // The key's path is built at a refusal alone: a key that passes
+        // formats nothing.
+        let at = || At::new(format!("index.{model}"));
         if !glob_ok(model) {
             return Err(SpecError::BadField {
-                path: at.0,
+                path: at().0,
                 value: model.clone(),
                 reason: "an id, `prefix*`, `*suffix` or `*`",
             });
         }
-        at.nonzero("ttl_s", Some(spec.ttl_s))?;
-        at.nonzero("max_size", Some(spec.max_size))?;
-        at.nonzero("sweep_s", Some(spec.sweep_s))?;
+        let counts = [
+            ("ttl_s", u64::from(spec.ttl_s)),
+            ("max_size", spec.max_size),
+            ("sweep_s", u64::from(spec.sweep_s)),
+        ];
+        if let Some((name, zero)) = counts.into_iter().find(|(_, count)| *count == 0) {
+            return Err(at().bad(name, zero, "above zero"));
+        }
         if spec.kind == IndexKind::Hash && view.boundaries.is_empty() {
             return Err(SpecError::HashIndexNeedsBoundaries {
                 model: model.clone(),
@@ -3464,6 +3470,36 @@ mod tests {
         assert_eq!(read.bindings[0].profiles["single"], "p");
     }
 
+    /// The YAML form of the three maps is refused in the same words: its
+    /// reader hands a key written twice to the map's own read, which kept
+    /// the last of the two before.
+    #[test]
+    fn a_map_key_written_twice_in_yaml_is_refused_by_name() {
+        let documents = [
+            (
+                "apiVersion: smg.policy/v1\nprofiles:\n  p: {pick: random}\n  p: {pick: round-robin}\n",
+                "p",
+            ),
+            (
+                "apiVersion: smg.policy/v1\nindex:\n  \"a*\": {}\n  \"a*\": {ttl_s: 1}\nprofiles:\n  p: {pick: random}\n",
+                "a*",
+            ),
+            (
+                "apiVersion: smg.policy/v1\nprofiles:\n  p: {pick: random}\nbindings:\n  - match: {model: \"*\"}\n    profiles: {single: p, single: p}\n",
+                "single",
+            ),
+        ];
+        for (document, key) in documents {
+            let refused = serde_yaml::from_str::<PolicySpec>(document)
+                .expect_err("a key written twice")
+                .to_string();
+            assert!(
+                refused.contains(&format!("the key `{key}` is written twice")),
+                "{refused}"
+            );
+        }
+    }
+
     #[test]
     fn the_pair_presets_put_the_admission_filters_in_front_of_each_side() {
         let spec = PolicySpec::pair_presets("least_load", "power_of_two").expect("pair");
@@ -3962,8 +3998,17 @@ mod tests {
             ))
         };
         assert_eq!(bad_field(&with_index(r#"{"a*b":{}}"#, "{}")), "index.a*b");
+        // Each count is above zero, refused by its own name, the first
+        // written in the type's order where two are zero.
+        for count in ["ttl_s", "max_size", "sweep_s"] {
+            let index = format!(r#"{{"*":{{"{count}":0}}}}"#);
+            assert_eq!(
+                bad_field(&with_index(&index, "{}")),
+                format!("index.*.{count}")
+            );
+        }
         assert_eq!(
-            bad_field(&with_index(r#"{"*":{"ttl_s":0}}"#, "{}")),
+            bad_field(&with_index(r#"{"*":{"sweep_s":0,"ttl_s":0}}"#, "{}")),
             "index.*.ttl_s"
         );
         assert_eq!(
