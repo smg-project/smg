@@ -123,7 +123,7 @@ spec:
       {{- if $controller.affinity }}
       affinity:
         {{- toYaml $controller.affinity | nindent 8 }}
-      {{- else if gt (int $controller.replicas) 1 }}
+      {{- else if gt (int (include "smg.policyControllerReplicaCount" $)) 1 }}
       {{- /* No affinity of the operator's and more than one replica: prefer
            one replica a node. */}}
       affinity:

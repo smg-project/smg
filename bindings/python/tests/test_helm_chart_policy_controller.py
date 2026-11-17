@@ -759,6 +759,14 @@ def test_replicas_prefer_a_node_each_unless_an_affinity_is_given():
     )["spec"]["template"]["spec"]["affinity"]
     assert list(own) == ["nodeAffinity"]
 
+    # With the schema's check skipped, a count given as text that the
+    # manifest's reader takes as two prefers a node each as the number does.
+    for count in ("2e0", " 2"):
+        text = one(
+            render(*ELECTED, f"policyController.replicas={count}", skip_schema=True), "Deployment"
+        )["spec"]
+        assert text["template"]["spec"]["affinity"] == pair["template"]["spec"]["affinity"], count
+
 
 @needs_helm
 def test_the_election_names_its_lease_and_the_pods_own_address():
@@ -924,8 +932,10 @@ def test_with_the_election_off_an_upgrade_ends_the_old_pod_first():
         "rollingUpdate": {"maxSurge": "25%", "maxUnavailable": "25%"},
     }
     elected = one(render(*ELECTED), "Deployment")["spec"]["strategy"]
+    lone = one(render(*ON), "Deployment")["spec"]["strategy"]
     for live in (served, elected):
-        patched = {**live, **LONE_STRATEGY}
+        # The rendered strategy over the live one: a null takes its field off.
+        patched = {**live, **lone}
         assert {field: value for field, value in patched.items() if value is not None} == {
             "type": "Recreate"
         }, live
