@@ -562,22 +562,25 @@ impl Default for BucketParams {
     }
 }
 
-/// The bounded-load rule of the consistent-hash scorer: a ring owner loaded
-/// this far past the mean passes the request on.
+/// The bounded-load rule of the consistent-hash scorer: a ring owner whose
+/// requests in flight are past both parts of the rule over the candidates'
+/// mean, the request being placed counted in the mean, is passed over, and
+/// the profile's next stage places the request.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoundedLoadParams {
     /// The relative part of the rule; at least 1 (default 1.25).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1.0))]
-    pub factor: Option<f32>,
+    pub factor: Option<f64>,
     /// The absolute part of the rule, in requests (default 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abs_margin: Option<u32>,
 }
 
-/// The consistent-hash scorer: a per-model ring keyed by the routing key or
-/// by the request's prefix, with a bounded-load rule.
+/// The consistent-hash scorer: a per-model ring keyed by the routing key
+/// and, under `prefix_tokens`, by the prefix of a request that carries none,
+/// with a bounded-load rule.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConsistentHashParams {
@@ -585,8 +588,10 @@ pub struct ConsistentHashParams {
     #[serde(default = "one")]
     #[schemars(extend("exclusiveMinimum" = 0))]
     pub weight: f32,
-    /// How many prefix tokens hash when the ring keys by prefix; above zero
-    /// (default 256).
+    /// The depth in tokens at which a request with no routing key is keyed
+    /// by its prefix: the last whole block at or under the depth, so at
+    /// least one block of the view's block size and at most the blocks a
+    /// request carries. Absent, such a request has no key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub prefix_tokens: Option<u32>,
@@ -1657,11 +1662,11 @@ impl At {
     }
 
     /// A written number passes `ok`, or is refused for `reason`.
-    fn number(
+    fn number<T: Copy + fmt::Display>(
         &self,
         name: &str,
-        value: Option<f32>,
-        ok: fn(f32) -> bool,
+        value: Option<T>,
+        ok: fn(T) -> bool,
         reason: &'static str,
     ) -> Result<(), SpecError> {
         match value {
@@ -1694,7 +1699,8 @@ fn unit_interval(v: f32) -> bool {
     v.is_finite() && (0.0..=1.0).contains(&v)
 }
 
-fn at_least_one(v: f32) -> bool {
+fn at_least_one<T: Into<f64>>(v: T) -> bool {
+    let v: f64 = v.into();
     v.is_finite() && v >= 1.0
 }
 
@@ -1985,6 +1991,38 @@ impl Deferred {
     }
 }
 
+/// A consistent-hash stage's prefix depth against the view that carries a
+/// request's block hashes. The key is the last whole block at or under
+/// `prefix_tokens`: the depth holds at least one block of the view's block
+/// size, and no more blocks than a request carries into the view.
+fn check_prefix_depth(
+    stage: &ScoreStage,
+    gates: Gates,
+    view: &ViewSpec,
+    at: &At,
+) -> Result<(), SpecError> {
+    let ScoreStage::ConsistentHash(ConsistentHashParams {
+        prefix_tokens: Some(tokens),
+        ..
+    }) = stage
+    else {
+        return Ok(());
+    };
+    match tokens / gates.block_size {
+        0 => Err(at.bad(
+            "prefix_tokens",
+            tokens,
+            "at least one block of view.block_size",
+        )),
+        blocks if blocks > view.max_block_hashes => Err(at.bad(
+            "prefix_tokens",
+            tokens,
+            "at most view.max_block_hashes blocks of view.block_size",
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn built_scorer(scorer: impl Scorer + 'static) -> Resolved<Box<dyn Scorer>> {
     Resolved::Built(Box::new(scorer))
 }
@@ -2032,10 +2070,13 @@ fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
         ScoreStage::KvPressure(_) => built_scorer(KvPressure),
         ScoreStage::WarmupSlice(p) => built_scorer(WarmupSlice::new(p, gates)),
         ScoreStage::Bucket(_) => Resolved::NotInBuild("the bucket scorer"),
-        ScoreStage::ConsistentHash(p) if p.prefix_tokens.is_some() => {
-            Resolved::NotInBuild("the consistent-hash prefix key")
+        ScoreStage::ConsistentHash(p) => {
+            let ring = ConsistentHash::new(p.bounded_load.as_ref());
+            built_scorer(match p.prefix_tokens {
+                Some(tokens) => ring.keyed_by_prefix(tokens, gates),
+                None => ring,
+            })
         }
-        ScoreStage::ConsistentHash(p) => built_scorer(ConsistentHash::new(p.bounded_load.as_ref())),
         ScoreStage::ResidentWork(p) => built_scorer(ResidentWork::new(p.request_tokens)),
     }
 }
@@ -2203,7 +2244,18 @@ fn check_profile(
         };
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
-        match scorer_of(&stage, gates) {
+        check_prefix_depth(&stage, gates, view, &stage_at)?;
+        let resolved = match &stage {
+            // A view's boundaries are where the prefix ring keys, the
+            // deepest one a request reaches first.
+            ScoreStage::ConsistentHash(p)
+                if p.prefix_tokens.is_some() && !view.boundaries.is_empty() =>
+            {
+                Resolved::NotInBuild("the consistent-hash boundary levels")
+            }
+            _ => scorer_of(&stage, gates),
+        };
+        match resolved {
             Resolved::Built(scorer) => scorers.push(Weighted {
                 scorer,
                 weight: stage.weight(),
@@ -2636,13 +2688,14 @@ fn session_rule(
 
 /// The ten preset names of today, as whole profiles. The ones whose stages
 /// this build does not carry yet answer `UnknownPreset`.
-pub const PRESETS: [&str; 8] = [
+pub const PRESETS: [&str; 9] = [
     "random",
     "round_robin",
     "passthrough",
     "power_of_two",
     "least_load",
     "consistent_hashing",
+    "prefix_hash",
     "manual",
     "cache_aware",
 ];
@@ -2736,6 +2789,31 @@ impl PolicySpec {
             "consistent_hashing" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec!["consistent-hash".into()],
+                pick: "best".into(),
+            },
+            // The ring owner of the request's key: its routing key, else its
+            // prefix at 256 tokens. An owner past the bounded-load rule is
+            // passed over and a request with no key has no owner: the
+            // fewest requests in flight take both. The ring's weight is by
+            // arithmetic: an owner leads the ring's next member by a
+            // quarter of the stage's score and the count ranges over one
+            // whole score, so any weight past four keeps a kept owner above
+            // the least loaded worker. The pick names no sample: the owner
+            // must be among the rows scored, so the pool is read whole.
+            "prefix_hash" => ProfileSpec {
+                filter: standard_filters(),
+                score: vec![
+                    ScoreStage::ConsistentHash(ConsistentHashParams {
+                        weight: 8.0,
+                        prefix_tokens: Some(256),
+                        bounded_load: Some(BoundedLoadParams {
+                            factor: Some(1.25),
+                            abs_margin: Some(10),
+                        }),
+                    })
+                    .into(),
+                    "least-requests".into(),
+                ],
                 pick: "best".into(),
             },
             // Sticky sessions over a random assignment: a key stays with the
@@ -3324,7 +3402,12 @@ mod tests {
             let engine = spec.validate().expect(name);
             let load_aware = ["least_load", "power_of_two", "cache_aware"].contains(&name);
             assert_eq!(engine.needs().loads, load_aware, "{name}");
-            assert_eq!(engine.needs().ring, name == "consistent_hashing", "{name}");
+            let ring = ["consistent_hashing", "prefix_hash"].contains(&name);
+            assert_eq!(engine.needs().ring, ring, "{name}");
+            // A request's block hashes are fed where a stage reads them: the
+            // affinity stage and the ring's prefix form.
+            let hashes = ["cache_aware", "prefix_hash"].contains(&name);
+            assert_eq!(engine.needs().token_hashes, hashes, "{name}");
             assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
             // The affinity column is fed where an affinity stage reads it
             // and nowhere else: a preset without one declares no column.
@@ -4235,10 +4318,6 @@ mod tests {
                 "prefix-affinity",
             ),
             (r#"{"bucket":{"abs_threshold":32}}"#, "bucket"),
-            (
-                r#"{"consistent-hash":{"prefix_tokens":512,"bounded_load":{"factor":1.5,"abs_margin":4}}}"#,
-                "consistent-hash",
-            ),
         ];
         for (score, name) in with_params {
             let (path, what) = not_in_build(&spec_with_score(score));
@@ -4250,16 +4329,70 @@ mod tests {
         let resident = spec_with_score(r#"{"resident-work":{"request_tokens":512}}"#);
         assert!(resident.validate().expect("validates").needs().loads);
         // The consistent-hash scorer is in the build with its bounded-load
-        // rule; the prefix key form waits for the block hashes in the view.
+        // rule and with its prefix form, which reads the request's block
+        // hashes; without the form it asks for none.
         let bounded = spec_with_score(r#"{"consistent-hash":{"bounded_load":{"factor":1.5}}}"#);
-        assert!(bounded.validate().expect("validates").needs().ring);
-        assert_eq!(
-            not_in_build(&spec_with_score(
-                r#"{"consistent-hash":{"prefix_tokens":512}}"#
-            ))
-            .1,
-            "the consistent-hash prefix key"
+        let needs = bounded.validate().expect("validates").needs();
+        assert!(needs.ring && !needs.token_hashes && !needs.text_hashes);
+        let prefix = spec_with_score(
+            r#"{"consistent-hash":{"prefix_tokens":512,"bounded_load":{"factor":1.5,"abs_margin":4}}}"#,
         );
+        let needs = prefix.validate().expect("validates").needs();
+        assert!(needs.ring && needs.token_hashes && needs.text_hashes);
+        // Under a view that names boundaries the prefix ring keys at the
+        // deepest one a request reaches, which this build does not carry.
+        let levelled = doc(
+            r#"{"apiVersion":"smg.policy/v1","view":{"boundaries":[256,1024]},"profiles":{"p":{"score":[{"consistent-hash":{"prefix_tokens":512}}],"pick":"best"}}}"#,
+        );
+        assert_eq!(
+            not_in_build(&levelled),
+            (
+                "profiles.p.score[0].consistent-hash".to_string(),
+                "the consistent-hash boundary levels"
+            )
+        );
+        // A ring with no prefix form reads no boundary and builds there.
+        let plain = doc(
+            r#"{"apiVersion":"smg.policy/v1","view":{"boundaries":[256,1024]},"profiles":{"p":{"score":[{"consistent-hash":{"bounded_load":{"factor":1.5}}}],"pick":"best"}}}"#,
+        );
+        assert!(plain.validate().expect("validates").needs().ring);
+    }
+
+    /// The prefix depth is held to the view that carries the hashes: at
+    /// least one block of the view's block size, at most the blocks a
+    /// request carries.
+    #[test]
+    fn a_prefix_depth_the_view_cannot_carry_is_refused() {
+        let spec = |view: &str, tokens: u32| {
+            doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","view":{view},"profiles":{{"p":{{"score":[{{"consistent-hash":{{"prefix_tokens":{tokens}}}}}],"pick":"best"}}}}}}"#
+            ))
+        };
+        let refused = |view: &str, tokens: u32| match spec(view, tokens).validate() {
+            Err(SpecError::BadField { path, reason, .. }) => {
+                assert_eq!(
+                    path, "profiles.p.score[0].consistent-hash.prefix_tokens",
+                    "{view} {tokens}"
+                );
+                reason
+            }
+            other => panic!("{view} {tokens}: validated as {other:?}"),
+        };
+        let under = "at least one block of view.block_size";
+        let over = "at most view.max_block_hashes blocks of view.block_size";
+        // The default view: blocks of 16 tokens, 256 of them a request.
+        for tokens in [16, 256, 4096, 4111] {
+            assert!(spec("{}", tokens).validate().is_ok(), "{tokens}");
+        }
+        assert_eq!(refused("{}", 15), under);
+        assert_eq!(refused("{}", 4112), over);
+        // The view's own block size and its cap move both edges.
+        let view = r#"{"block_size":64,"max_block_hashes":4}"#;
+        for tokens in [64, 256, 319] {
+            assert!(spec(view, tokens).validate().is_ok(), "{tokens}");
+        }
+        assert_eq!(refused(view, 63), under);
+        assert_eq!(refused(view, 320), over);
     }
 
     #[test]

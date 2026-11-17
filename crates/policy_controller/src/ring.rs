@@ -20,6 +20,15 @@
 //! pool: a lookup walks past the members that are not candidates of the
 //! decision, so the owner is the first candidate clockwise whatever else the
 //! ring holds, which is what a ring per model answers.
+//!
+//! Under the prefix form ([`ConsistentHash::keyed_by_prefix`]) a request
+//! with no routing key is keyed by its prefix: the hash of its last whole
+//! block at or under the form's depth in tokens. A block hash names the
+//! prefix that ends with its block, so the key is one read and requests that
+//! share that much of a prompt share an owner. The depth counts in the
+//! blocks the request was hashed by, text windows at four characters a token
+//! under the text kind. A request that carries no whole block has no key,
+//! and the tokens past a request's last whole block are not in its key.
 
 use std::{
     cell::RefCell,
@@ -31,6 +40,7 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
+    affinity::Gates,
     decision::MAX_TARGETS,
     framework::{Scorer, TieBand},
     lease::{Lifecycle, Membership},
@@ -279,23 +289,43 @@ thread_local! {
 
 /// A member that is no candidate of this decision.
 const FREE: u32 = u32::MAX;
-/// The member was passed over by the bounded-load rule.
-const PASSED: u32 = 1 << 31;
 /// The member was ranked already.
 const TAKEN: u32 = 1 << 30;
-const MARKS: u32 = PASSED | TAKEN;
+
+/// The key of a request's prefix at a depth of `tokens`: the hash of its
+/// last whole block at or under that depth, `0` where it carries no block
+/// that shallow. A request shorter than the depth is keyed at its own last
+/// whole block, and so is one whose hashes the host capped short of the
+/// depth.
+fn prefix_key(tokens: u32, gates: Gates, facts: &RequestFacts<'_>) -> u64 {
+    let depth = gates.whole_blocks(tokens, facts) as usize;
+    depth
+        .min(facts.block_hashes.len())
+        .checked_sub(1)
+        .map_or(0, |last| facts.block_hashes[last])
+}
 
 /// The consistent-hash scorer: the ring owner of the decision's key first,
 /// the ring's next members after it, every other survivor at zero; a keyless
-/// decision scores every survivor equal, so the picker's draw places it. With
-/// a bounded-load rule an owner whose in-flight count is past `factor` times
-/// the survivors' mean plus `abs_margin` is passed over for the next member;
-/// when every survivor is past it, the plain owner stands.
+/// decision scores every survivor equal, so the profile's next stage places
+/// it, or the picker's draw. With a bounded-load rule an owner whose
+/// in-flight count is past both `factor` times the survivors' mean and
+/// `abs_margin` over it, the mean counting the request being placed, is
+/// passed over: the decision is scored as a keyless one. The ring's next
+/// members follow an owner that keeps its key, and they take the key of an
+/// owner that is no survivor, a worker that is down or was tried.
+///
+/// The owner must be among the rows scored, so the scorer answers for the
+/// pool whole and never row by row ([`Scorer::row_wise`]): a profile that
+/// names it runs its whole pass, with no rows drawn first and no sample.
 #[derive(Debug)]
 pub struct ConsistentHash {
     /// `(factor, abs_margin)` of the bounded-load rule, when the spec writes
     /// one.
-    bounded: Option<(f32, u32)>,
+    bounded: Option<(f64, u32)>,
+    /// The prefix form: the depth in tokens a request with no routing key
+    /// is keyed at, and the gates that hold the view's block size.
+    prefix: Option<(u32, Gates)>,
     ring: RwLock<Ring>,
 }
 
@@ -304,7 +334,46 @@ impl ConsistentHash {
         Self {
             bounded: bounded
                 .map(|rule| (rule.factor.unwrap_or(1.25), rule.abs_margin.unwrap_or(10))),
+            prefix: None,
             ring: RwLock::new(Ring::new()),
+        }
+    }
+
+    /// The prefix form: a request with no routing key is keyed by its
+    /// prefix, the hash of its last whole block at or under `tokens`, at the
+    /// block size `gates` reads for the request.
+    #[must_use]
+    pub fn keyed_by_prefix(mut self, tokens: u32, gates: Gates) -> Self {
+        self.prefix = Some((tokens, gates));
+        self
+    }
+
+    /// Whether the key's owner among the survivors holds more requests than
+    /// `bound`. `slots` is as [`Self::fill`] left it.
+    fn passed_over(
+        ring: &Ring,
+        key: u64,
+        candidates: &[Candidate],
+        kept: &[u32],
+        slots: &[u32],
+        bound: f64,
+    ) -> bool {
+        ring.walk(key, |member| match slots[member as usize] {
+            FREE => Probe::Skip,
+            slot => {
+                let owner = &candidates[kept[slot as usize] as usize];
+                Probe::Take(f64::from(owner.in_flight) > bound)
+            }
+        })
+        .unwrap_or(false)
+    }
+
+    /// The decision's key, `0` for none: the routing key, and under the
+    /// prefix form the request's prefix where it carries no routing key.
+    fn key_of(&self, facts: &RequestFacts<'_>) -> u64 {
+        match (facts.session_key.hash, self.prefix) {
+            (0, Some((tokens, gates))) => prefix_key(tokens, gates, facts),
+            (key, _) => key,
         }
     }
 
@@ -330,49 +399,23 @@ impl ConsistentHash {
 
     /// One walk from the key: the members that are survivors are ranked in
     /// ring order into `out`, the owner at `1.0` and each next member a step
-    /// below, at most [`MAX_TARGETS`] of them; under `bound` a survivor past
-    /// it is passed over. Returns how many were ranked.
-    fn rank(
-        ring: &Ring,
-        key: u64,
-        candidates: &[Candidate],
-        kept: &[u32],
-        slots: &mut [u32],
-        out: &mut [f32],
-        bound: Option<f32>,
-    ) -> usize {
+    /// below, at most [`MAX_TARGETS`] of them.
+    fn rank(ring: &Ring, key: u64, survivors: usize, slots: &mut [u32], out: &mut [f32]) {
         let mut found = 0usize;
-        let mut passed = 0usize;
         ring.walk(key, |member| {
             let slot = slots[member as usize];
             if slot == FREE || slot & TAKEN != 0 {
                 return Probe::Skip;
             }
-            let index = (slot & !MARKS) as usize;
-            if let Some(bound) = bound {
-                if slot & PASSED != 0 {
-                    return Probe::Skip;
-                }
-                if candidates[kept[index] as usize].in_flight as f32 > bound {
-                    slots[member as usize] = slot | PASSED;
-                    passed += 1;
-                    return if passed == kept.len() {
-                        Probe::Stop
-                    } else {
-                        Probe::Skip
-                    };
-                }
-            }
             slots[member as usize] = slot | TAKEN;
-            out[index] = 1.0 - found as f32 / MAX_TARGETS as f32;
+            out[slot as usize] = 1.0 - found as f32 / MAX_TARGETS as f32;
             found += 1;
-            if found == MAX_TARGETS || found + passed == kept.len() {
+            if found == MAX_TARGETS || found == survivors {
                 Probe::Take(())
             } else {
                 Probe::Skip
             }
         });
-        found
     }
 }
 
@@ -411,7 +454,7 @@ impl Scorer for ConsistentHash {
         out: &mut [f32],
     ) -> TieBand {
         out.fill(0.0);
-        let key = facts.session_key.hash;
+        let key = self.key_of(facts);
         if key == 0 || kept.is_empty() {
             return TieBand::NORMALIZED;
         }
@@ -435,29 +478,34 @@ impl Scorer for ConsistentHash {
                 ring = self.ring.read();
                 Self::fill(&ring, candidates, kept, &mut slots);
             }
-            let bound = self.bounded.map(|(factor, margin)| {
-                let total: f32 = kept
+            if let Some((factor, margin)) = self.bounded {
+                // Both margins over the mean, the request being placed
+                // counted in it: the larger of the two is the bound. The
+                // product is taken as written, in 64-bit floats: an owner
+                // at the bound's edge stands or falls by its last bit.
+                let total: u64 = kept
                     .iter()
-                    .map(|&k| candidates[k as usize].in_flight as f32)
+                    .map(|&k| u64::from(candidates[k as usize].in_flight))
                     .sum();
-                factor * (total / kept.len() as f32) + margin as f32
-            });
-            if Self::rank(&ring, key, candidates, kept, &mut slots, out, bound) == 0 {
-                // Every survivor is past the bound: the plain owner stands.
-                for slot in slots.iter_mut() {
-                    if *slot != FREE {
-                        *slot &= !PASSED;
-                    }
+                let mean = (total as f64 + 1.0) / kept.len() as f64;
+                let bound = (mean * factor).max(mean + f64::from(margin));
+                if Self::passed_over(&ring, key, candidates, kept, &slots, bound) {
+                    return;
                 }
-                Self::rank(&ring, key, candidates, kept, &mut slots, out, None);
             }
+            Self::rank(&ring, key, kept.len(), &mut slots, out);
         });
         TieBand::NORMALIZED
     }
 
     fn needs(&self) -> Needs {
+        // The prefix form reads the request's block hashes, in the kind the
+        // host hashes by.
+        let hashes = self.prefix.is_some();
         Needs {
             ring: true,
+            token_hashes: hashes,
+            text_hashes: hashes,
             ..Needs::default()
         }
     }
@@ -615,8 +663,19 @@ mod tests {
 
     fn scored(scorer: &ConsistentHash, facts: &RequestFacts<'_>, pool: &[Candidate]) -> Vec<f32> {
         let kept: Vec<u32> = (0..pool.len() as u32).collect();
-        let mut out = vec![0.0; pool.len()];
-        scorer.score(facts, pool, &kept, &mut out);
+        scored_among(scorer, facts, pool, &kept)
+    }
+
+    /// The scores of the rows `kept` names, as a profile's filters leave a
+    /// pool: one score a kept row.
+    fn scored_among(
+        scorer: &ConsistentHash,
+        facts: &RequestFacts<'_>,
+        pool: &[Candidate],
+        kept: &[u32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0; kept.len()];
+        scorer.score(facts, pool, kept, &mut out);
         out
     }
 
@@ -861,50 +920,248 @@ mod tests {
     }
 
     #[test]
-    fn the_bounded_load_rule_passes_an_overloaded_owner_on_and_falls_back_when_every_survivor_is_over(
-    ) {
-        let bounded = ConsistentHash::new(Some(&BoundedLoadParams {
-            factor: Some(1.0),
-            abs_margin: Some(0),
-        }));
-        let plain = ConsistentHash::new(None);
-        let pool: Vec<Candidate> = (0..4).map(|i| candidate(i, 0)).collect();
-        let owner = leader(&scored(&plain, &keyed(5), &pool));
-        let successor = pool
-            .iter()
-            .position(|c| scored(&plain, &keyed(5), &pool)[c.position as usize] == 0.75)
-            .expect("the successor");
-        let mut loaded = pool.clone();
-        loaded[owner].in_flight = 8;
-        let scores = scored(&bounded, &keyed(5), &loaded);
-        assert_eq!(leader(&scores), successor, "the owner is past the bound");
-        assert_eq!(scores[owner], 0.0, "a passed owner ranks nowhere");
-        // Every survivor strictly above the bound: with every candidate at
-        // 8 the mean is 8, so a factor of 1 passes nobody; half the mean
-        // (bound 4) passes everyone, and the plain order is restored.
-        for c in &mut loaded {
-            c.in_flight = 8;
-        }
-        let half = ConsistentHash::new(Some(&BoundedLoadParams {
-            factor: Some(0.5),
-            abs_margin: Some(0),
-        }));
-        let all_over = scored(&half, &keyed(5), &loaded);
-        assert_eq!(
-            leader(&all_over),
-            owner,
-            "every survivor is past the bound: the plain owner stands"
-        );
-        assert_eq!(
-            all_over[owner], 1.0,
-            "the plain order is restored, not an empty one"
-        );
-        assert_eq!(all_over[successor], 0.75, "and the successor ranks next");
-    }
-
-    #[test]
     fn the_scorer_declares_the_ring_need() {
         assert!(ConsistentHash::new(None).needs().ring);
         assert!(!ConsistentHash::new(None).needs().loads);
+    }
+
+    /// A request of these block hashes, sixteen tokens a block, with no
+    /// routing key.
+    fn hashed(hashes: &[u64]) -> RequestFacts<'_> {
+        RequestFacts {
+            model: "m",
+            block_hashes: hashes,
+            prompt_tokens: 16 * hashes.len() as u32,
+            ..RequestFacts::default()
+        }
+    }
+
+    fn prefixed(tokens: u32) -> ConsistentHash {
+        ConsistentHash::new(None).keyed_by_prefix(tokens, Gates::default())
+    }
+
+    #[test]
+    fn the_prefix_key_is_the_last_whole_block_at_or_under_the_depth() {
+        let hashes = [11, 22, 33, 44, 55, 66];
+        let gates = Gates::default();
+        // Blocks of 16 tokens: a depth of 64 tokens ends with the fourth
+        // block, and a depth inside a block keys on the block before it.
+        assert_eq!(prefix_key(64, gates, &hashed(&hashes)), 44);
+        assert_eq!(prefix_key(79, gates, &hashed(&hashes)), 44);
+        assert_eq!(prefix_key(80, gates, &hashed(&hashes)), 55);
+        // A request shorter than the depth keys on its own last block. A
+        // request with no whole block has no key, and neither has a depth
+        // under one block.
+        assert_eq!(prefix_key(256, gates, &hashed(&hashes)), 66);
+        assert_eq!(prefix_key(256, gates, &hashed(&[])), 0);
+        assert_eq!(prefix_key(15, gates, &hashed(&hashes)), 0);
+        // The block size the request was counted with leads the view's.
+        let learned = RequestFacts {
+            block_size: 32,
+            ..hashed(&hashes)
+        };
+        assert_eq!(prefix_key(64, gates, &learned), 22);
+        // Under the text kind the depth is in windows at four characters a
+        // token: 64 tokens are 256 characters, sixteen windows of sixteen.
+        let windows: Vec<u64> = (1..=20).collect();
+        let text = RequestFacts {
+            hash_kind: crate::view::HashKind::Text,
+            ..hashed(&windows)
+        };
+        assert_eq!(prefix_key(64, gates, &text), 16);
+    }
+
+    #[test]
+    fn under_the_prefix_form_requests_that_share_a_prefix_share_an_owner() {
+        let scorer = prefixed(64);
+        let pool: Vec<Candidate> = (0..8).map(|i| candidate(i, 0)).collect();
+        // The same first four blocks under two tails.
+        let one = [11, 22, 33, 44, 55];
+        let other = [11, 22, 33, 44, 99, 77];
+        let scores = scored(&scorer, &hashed(&one), &pool);
+        let owner = leader(&scores);
+        assert_eq!(scores[owner], 1.0);
+        assert_eq!(leader(&scored(&scorer, &hashed(&other), &pool)), owner);
+        // The key is the block's hash: a routing key of that value has the
+        // same owner under the plain form.
+        let plain = ConsistentHash::new(None);
+        assert_eq!(leader(&scored(&plain, &keyed(44), &pool)), owner);
+    }
+
+    #[test]
+    fn a_routing_key_leads_the_prefix_and_the_plain_form_reads_no_prefix() {
+        let pool: Vec<Candidate> = (0..8).map(|i| candidate(i, 0)).collect();
+        let hashes = [11, 22, 33, 44];
+        let plain = ConsistentHash::new(None);
+        let by_prefix = leader(&scored(&prefixed(64), &hashed(&hashes), &pool));
+        // A routing key whose owner is another worker than the prefix's.
+        let (key, by_key) = (1..)
+            .map(|key| (key, leader(&scored(&plain, &keyed(key), &pool))))
+            .find(|&(_, owner)| owner != by_prefix)
+            .expect("a key with another owner");
+        let both = RequestFacts {
+            session_key: Identity::hashed(key),
+            ..hashed(&hashes)
+        };
+        assert_eq!(leader(&scored(&prefixed(64), &both, &pool)), by_key);
+        // Without the form a request with no routing key has no key, and
+        // under it a request with no whole block has none: every survivor
+        // scores equal.
+        for scores in [
+            scored(&plain, &hashed(&hashes), &pool),
+            scored(&prefixed(64), &hashed(&[]), &pool),
+        ] {
+            assert!(scores.iter().all(|&score| score == 0.0), "{scores:?}");
+        }
+    }
+
+    fn bounded(factor: f64, abs_margin: u32) -> ConsistentHash {
+        ConsistentHash::new(Some(&BoundedLoadParams {
+            factor: Some(factor),
+            abs_margin: Some(abs_margin),
+        }))
+    }
+
+    /// Whether the owner of key 5 keeps it under `rule` over a pool that
+    /// holds `loads`, listed in the key's ring order, the owner first. An
+    /// owner passed over leaves the decision scored as a keyless one, and
+    /// an owner that keeps its key leaves it scored as with no rule.
+    fn keeps(rule: &ConsistentHash, loads: &[u32]) -> bool {
+        let plain = ConsistentHash::new(None);
+        let mut pool: Vec<Candidate> = (0..loads.len() as u32).map(|i| candidate(i, 0)).collect();
+        let ranks = scored(&plain, &keyed(5), &pool);
+        let mut order: Vec<usize> = (0..pool.len()).collect();
+        order.sort_by(|&a, &b| ranks[b].total_cmp(&ranks[a]));
+        for (&place, &load) in order.iter().zip(loads) {
+            pool[place].in_flight = load;
+        }
+        let scores = scored(rule, &keyed(5), &pool);
+        let kept = scores[order[0]] == 1.0;
+        assert!(
+            if kept {
+                scores == ranks
+            } else {
+                scores.iter().all(|&score| score == 0.0)
+            },
+            "{loads:?}: {scores:?}"
+        );
+        kept
+    }
+
+    #[test]
+    fn an_owner_past_both_margins_of_the_bounded_load_rule_is_passed_over() {
+        let rule = bounded(1.25, 10);
+        // The bound is the larger margin: past one alone the owner keeps
+        // its key, past both it is passed over.
+        assert!(keeps(&rule, &[12, 1, 2, 0]), "the relative margin alone");
+        assert!(
+            keeps(&rule, &[130, 100, 110, 90]),
+            "the absolute margin alone"
+        );
+        assert!(!keeps(&rule, &[140, 100, 110, 90]), "both margins");
+        // At the bound the owner keeps its key; one request past it, not.
+        assert!(keeps(&rule, &[14, 1, 0, 0]));
+        assert!(!keeps(&rule, &[15, 1, 0, 2]));
+        // The spec's two numbers move the bound, and their defaults are
+        // the rule's own.
+        assert!(!keeps(&bounded(2.0, 4), &[14, 3, 4, 5]));
+        assert!(keeps(&rule, &[14, 3, 4, 5]));
+        let defaults = ConsistentHash::new(Some(&BoundedLoadParams::default()));
+        assert!(keeps(&defaults, &[14, 1, 0, 0]));
+        assert!(!keeps(&defaults, &[15, 1, 0, 2]));
+        // An idle pool passes no owner over, under the tightest rule.
+        assert!(keeps(&bounded(1.0, 0), &[0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn the_bounded_load_rule_counts_the_request_being_placed_in_the_mean() {
+        let rule = bounded(1.25, 10);
+        // Two workers: with the request counted the mean of 21 and 0 is 11
+        // and the bound 21, which the owner is at; without it the bound
+        // would be 20.5 and the owner past it.
+        assert!(keeps(&rule, &[21, 0]));
+        assert!(!keeps(&rule, &[22, 0]));
+    }
+
+    #[test]
+    fn the_bounded_load_rule_reads_its_factor_at_the_spec_s_width() {
+        // No binary fraction is 1.3. Two workers hold 52 and 27: with the
+        // request the mean is 40 and the bound 52, which the owner is at.
+        // A factor read through a narrower float falls short of 1.3 and
+        // passes this owner over.
+        let rule = bounded(1.3, 10);
+        assert!(keeps(&rule, &[52, 27]));
+        assert!(!keeps(&rule, &[53, 27]));
+        // And 1.2 the other way. Three workers hold 14, 9 and 11: a third
+        // of 35 times 1.2 is 14 on paper and a hair under it as the product
+        // is computed, so the owner is passed over. A narrower 1.2 lies
+        // over 1.2 and keeps it.
+        assert!(!keeps(&bounded(1.2, 2), &[14, 9, 11]));
+    }
+
+    /// A scorer under the default rule whose ring knows four workers, and
+    /// the ring order of `key` over them, the owner first.
+    fn taught(key: u64) -> (ConsistentHash, Vec<usize>) {
+        let rule = bounded(1.25, 10);
+        let idle: Vec<Candidate> = (0..4).map(|i| candidate(i, 0)).collect();
+        let ranks = scored(&rule, &keyed(key), &idle);
+        let mut order: Vec<usize> = (0..4).collect();
+        order.sort_by(|&a, &b| ranks[b].total_cmp(&ranks[a]));
+        (rule, order)
+    }
+
+    /// Whether `rule` passes over the owner of `key` among the workers a
+    /// filter leaves when it takes `filtered` out of four that hold `loads`.
+    fn passes_over(rule: &ConsistentHash, key: u64, loads: [u32; 4], filtered: usize) -> bool {
+        let pool: Vec<Candidate> = (0..4).map(|i| candidate(i, loads[i as usize])).collect();
+        let kept: Vec<u32> = (0..4).filter(|&i| i as usize != filtered).collect();
+        let scores = scored_among(rule, &keyed(key), &pool, &kept);
+        scores.iter().all(|&score| score == 0.0)
+    }
+
+    #[test]
+    fn the_bounded_load_rule_reads_the_owner_s_own_row_behind_a_filtered_worker() {
+        // Worker 0 is filtered and stands ahead of the owner in the pool:
+        // the owner's place among the survivors is not its row.
+        let key = (1..)
+            .find(|&key| taught(key).1[0] != 0)
+            .expect("a key that worker 0 does not own");
+        let (rule, order) = taught(key);
+        let mut loads = [0; 4];
+        loads[order[0]] = 100;
+        assert!(passes_over(&rule, key, loads, 0));
+    }
+
+    #[test]
+    fn the_bounded_load_rule_holds_the_owner_among_the_survivors_to_the_bound() {
+        // The ring's first member for the key is filtered: the next one
+        // owns the key, and it is past the bound.
+        let (rule, order) = taught(5);
+        let mut loads = [0; 4];
+        loads[order[1]] = 100;
+        assert!(passes_over(&rule, 5, loads, order[0]));
+    }
+
+    #[test]
+    fn the_bounded_load_rule_takes_its_mean_over_the_survivors_alone() {
+        let (rule, order) = taught(5);
+        let last = order[3];
+        // The thousand requests of a filtered worker stay out of the sum:
+        // over the three survivors the bound is under the owner's 30.
+        let mut loads = [0; 4];
+        (loads[order[0]], loads[last]) = (30, 1_000);
+        assert!(passes_over(&rule, 5, loads, last));
+        // And the filtered worker is no part of the count: 16 over three
+        // is a bound of 15 and a third, and over four it would be 14.
+        loads[order[0]] = 15;
+        assert!(!passes_over(&rule, 5, loads, last));
+    }
+
+    #[test]
+    fn the_prefix_form_declares_the_request_s_hashes() {
+        let needs = prefixed(256).needs();
+        assert!(needs.ring && needs.token_hashes && needs.text_hashes);
+        let plain = ConsistentHash::new(None).needs();
+        assert!(plain.ring && !plain.token_hashes && !plain.text_hashes);
     }
 }
