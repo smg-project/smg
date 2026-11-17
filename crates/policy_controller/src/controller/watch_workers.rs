@@ -120,9 +120,8 @@ impl Feed {
         let log = {
             let landed = Arc::clone(&landed);
             // One wake of one task, whatever the count of watches. While
-            // that task is busy or not started the wake is kept, once. The
-            // place told is not read here: the task reads the head itself.
-            Arc::new(log.on_watched(move |_| landed.notify_one()))
+            // that task is busy or not started the wake is kept, once.
+            Arc::new(log.on_watched(move || landed.notify_one()))
         };
         Self {
             log,
