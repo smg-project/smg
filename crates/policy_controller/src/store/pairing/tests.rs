@@ -341,6 +341,36 @@ fn a_key_names_the_group_a_worker_pairs_in() {
 }
 
 #[test]
+fn a_normalized_descriptor_holds_no_blank_value() {
+    let written = PairingDescriptor {
+        protocol: Some(String::new()),
+        transport: Some(" a ".to_string()),
+        version: Some(" ".to_string()),
+        kv_layout: [
+            Some("16".to_string()),
+            Some("\t".to_string()),
+            None,
+            Some(" f ".to_string()),
+        ],
+    };
+    assert!(!written.is_normalized());
+    let read = written.normalized();
+    assert_eq!(
+        read,
+        PairingDescriptor {
+            protocol: None,
+            transport: Some("a".to_string()),
+            version: None,
+            kv_layout: [Some("16".to_string()), None, None, Some("f".to_string())],
+        }
+    );
+    assert!(read.is_normalized());
+    // A descriptor that holds no blank comes back as it is.
+    assert_eq!(read.clone().normalized(), read);
+    assert!(PairingDescriptor::default().is_normalized());
+}
+
+#[test]
 fn only_http_alone_is_the_plain_side_of_the_wire_fact() {
     assert!(!runtime_specific(WireModes::HTTP));
     let (http, grpc, zmq) = (WireModes::HTTP, WireModes::GRPC, WireModes::ZMQ);

@@ -25,6 +25,7 @@ use crate::{
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore},
         loads::{LoadSample, LoadSink, LoadSource, PollMode},
+        pairing::PairingDescriptor,
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionsStore},
         workers::{
@@ -559,7 +560,10 @@ impl Workers {
 }
 
 impl WorkersStore for MemoryStore {
-    fn upsert(&self, facts: WorkerFacts) -> MembershipChange {
+    fn upsert(&self, mut facts: WorkerFacts) -> MembershipChange {
+        // A blank value of a descriptor is no report: the row of record holds
+        // what the pairing rule reads.
+        facts.pairing = facts.pairing.map(PairingDescriptor::normalized);
         let mut workers = self.workers.lock();
         let now = Instant::now();
         if let Some(old_id) = workers.by_key.get(&facts.key).copied() {
@@ -671,13 +675,20 @@ impl WorkersStore for MemoryStore {
     fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
         let mut workers = self.workers.lock();
         let row = workers.guarded(id, revision)?;
-        if let Some(labels) = patch.labels {
+        // Every field is named: one more stops the build here until the
+        // carry below is asked of it.
+        let WorkerPatch {
+            labels,
+            priority,
+            overload,
+        } = patch;
+        if let Some(labels) = labels {
             row.row.facts.labels = labels;
         }
-        if let Some(priority) = patch.priority {
+        if let Some(priority) = priority {
             row.row.facts.priority = priority;
         }
-        if let Some(overload) = patch.overload {
+        if let Some(overload) = overload {
             row.row.facts.overload = overload;
         }
         row.row.revision += 1;

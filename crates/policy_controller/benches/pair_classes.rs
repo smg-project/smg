@@ -5,7 +5,8 @@
 //!   pools;
 //! - `policy_pairs/membership_write/<fleet>`: one membership write of a
 //!   store that holds the fleet, under the default mode: a registration
-//!   refreshed, every pool derived again with its classes, and published;
+//!   refreshed with the offer it had, every pool derived again, its classes
+//!   carried, and published;
 //! - `policy_pairs/apply_mode/<fleet>`: one generation of another mode
 //!   applied to a store that holds the fleet: the standing membership
 //!   derived again under it and published once;

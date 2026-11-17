@@ -180,17 +180,14 @@ fn ask_at(opened: Instant, affinity: bool) -> Ask {
 }
 
 impl Fixture {
-    fn new(n: usize) -> Self {
+    fn new(n: usize, out: ViewBuffers) -> Self {
         let (store, ids, opened) = pool_of(n);
         Self {
             n,
             store,
             ids,
             window: Cell::new(opened),
-            out: ViewBuffers {
-                candidates: page_start_buffer(n),
-                affinity: page_start_buffer(n),
-            },
+            out,
         }
     }
 
@@ -828,7 +825,22 @@ fn pair_writes(c: &mut Criterion) {
 }
 
 fn store_view(c: &mut Criterion) {
-    let mut fixtures: Vec<Fixture> = SIZES.iter().map(|&n| Fixture::new(n)).collect();
+    // Every size's buffers are placed before the first store is built. A
+    // count's runner bounds the program break, and the stores cross that
+    // bound: a buffer asked for after them is mapped on its own and never
+    // starts a page.
+    let placed: Vec<ViewBuffers> = SIZES
+        .iter()
+        .map(|&n| ViewBuffers {
+            candidates: page_start_buffer(n),
+            affinity: page_start_buffer(n),
+        })
+        .collect();
+    let mut fixtures: Vec<Fixture> = SIZES
+        .iter()
+        .zip(placed)
+        .map(|(&n, out)| Fixture::new(n, out))
+        .collect();
     floor(c, &mut fixtures);
     view_build(c, &mut fixtures);
     load_write(c, &mut fixtures);

@@ -581,7 +581,8 @@ pub struct Candidate {
     /// classes a prefill class pairs with is the pair table's to say
     /// ([`PairTable`](crate::PairTable)); with no table a decode pairs with a
     /// prefill of the same class. The store derives the classes and their
-    /// table at each membership write
+    /// table where a membership write moves a member or an offer, and again
+    /// under a generation of another pairing mode
     /// ([`store::pairing`](crate::store::pairing)); a host that builds its
     /// own rows keys it by the open prefill a decode partners with.
     pub pair_class: u32,

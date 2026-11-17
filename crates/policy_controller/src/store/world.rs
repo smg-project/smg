@@ -13,9 +13,12 @@
 //! What a membership write derives (where each pool stands, each pool's
 //! shape) is built once and shared by every world until the next membership
 //! write. A world's epoch is the membership's and is the one thing to
-//! compare: a world's identity moves with every publication. Between two
-//! membership writes a publication derives nothing: it is one small object,
-//! a pointer per pool, and new rows for each pool a write was folded into.
+//! compare between two worlds' pools: a world's identity moves with every
+//! publication. The pair classes are derived with the shapes where a write
+//! moves a member or an offer, and once more where a generation moves the
+//! pairing mode: a new world of the same epoch. Between two membership
+//! writes a publication derives nothing: it is one small object, a pointer
+//! per pool, and new rows for each pool a write was folded into.
 //!
 //! **A pair class is a fact of the rows.** A membership write derives each
 //! model's pair classes from what its prefills and decodes report
@@ -268,8 +271,9 @@ const fn phase_of(role: Role) -> Phase {
 }
 
 /// What one membership write derives: where each pool stands in a world's
-/// rows, and each pool's shape. Built once per membership write and shared
-/// by every world published until the next.
+/// rows, and each pool's shape. Built once per membership write, and once
+/// more where a generation moves the pairing mode, and shared by every
+/// world published until the next.
 #[derive(Default)]
 struct Derived {
     /// The pools by model, then by role: each an index into a world's rows.
@@ -576,9 +580,11 @@ impl std::fmt::Debug for World {
 
 impl World {
     /// The store's epoch at the membership write this world's pools were
-    /// derived by: the one thing to compare between two worlds. A status
-    /// change moves the store's epoch and no world's, and a publication
-    /// between two membership writes is a new world of the same epoch.
+    /// derived by: the one thing to compare between two worlds' pools. A
+    /// status change moves the store's epoch and no world's, and a
+    /// publication between two membership writes is a new world of the same
+    /// epoch. The pair classes move once more, at a generation of another
+    /// pairing mode ([`World::pairs`]).
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -609,10 +615,12 @@ impl World {
         self.pool(model, role).map(|(rows, _)| rows.len())
     }
 
-    /// The pair classes of `model` as this world's membership write derived
-    /// them, with the table a pair decision reads beside the two pools
+    /// The pair classes of `model` as this world's pools were derived, with
+    /// the table a pair decision reads beside the two pools
     /// ([`PairClasses::table`]); `None` when the model has no prefill or no
-    /// decode.
+    /// decode. A membership write derives them, and so does a generation of
+    /// another pairing mode at the same epoch: the epoch alone does not key
+    /// the classes a reader keeps across worlds.
     pub fn pairs(&self, model: &str) -> Option<&PairClasses> {
         self.derived.pairs(model).map(|classes| &**classes)
     }

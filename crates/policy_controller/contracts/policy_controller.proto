@@ -506,10 +506,12 @@ message Reachability {
 }
 
 // What one PD worker offers a rendezvous partner, and the store's class.
-// The store derives the class at each membership change; a registration
-// hands none in. pair_class is the worker's one class on its side, 0
-// outside any pairing: the decodes a prefill pairs with are the snapshot's
-// PairRow.decodes.
+// The store derives the class where the membership moves a member or an
+// offer, and again when a generation moves the pairing mode: the classes
+// then move at the same membership epoch and no watch event says so. A
+// registration hands none in. pair_class is the worker's one class on its
+// side, 0 outside any pairing: the decodes a prefill pairs with are the
+// snapshot's PairRow.decodes.
 message PairingDescriptor {
   string protocol = 1;
   string connector = 2;

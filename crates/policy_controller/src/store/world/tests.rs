@@ -3134,6 +3134,46 @@ fn a_write_that_moves_no_offer_carries_each_models_own_classes() {
     assert_eq!(classes_of(&after, "other"), second);
 }
 
+#[test]
+fn a_blank_value_of_a_descriptor_is_dropped_at_the_door() {
+    // The fleet of `two_classes` written with blanks: a blank protocol and
+    // version on every worker, each transport between blanks, and a blank
+    // one where the fleet names none.
+    let blanked = MemoryStore::new();
+    let ids: Vec<WorkerId> = PAIR_FLEET
+        .iter()
+        .map(|&(key, role, transport)| {
+            let transport = transport.map_or_else(|| " ".to_string(), |name| format!(" {name} "));
+            let facts = WorkerFacts {
+                pairing: Some(PairingDescriptor {
+                    protocol: Some(String::new()),
+                    transport: Some(transport),
+                    version: Some(String::new()),
+                    kv_layout: [Some(" ".to_string()), None, None, None],
+                }),
+                ..pair_facts(key, role, None)
+            };
+            blanked.upsert(facts).id()
+        })
+        .collect();
+    let plain = MemoryStore::new();
+    two_classes(&plain);
+    // Two blank protocols settle no pair: the transports decide, as where no
+    // worker sets a protocol.
+    assert_eq!(pair_rows(&blanked), pair_rows(&plain));
+    assert_eq!(blanked.world().pairs(MODEL), plain.world().pairs(MODEL));
+    // The row of record holds each value as the rule reads it.
+    let first = ids.first().copied().expect("a worker");
+    let row = WorkersStore::get(&blanked, first).expect("the row");
+    assert_eq!(
+        row.facts.pairing,
+        Some(PairingDescriptor {
+            transport: Some("tx-a".to_string()),
+            ..PairingDescriptor::default()
+        })
+    );
+}
+
 // ------------------------------------------------------ the overload verdict
 
 /// A generation whose one binding hands every pool the block `overload`.

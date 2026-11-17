@@ -1,5 +1,6 @@
 //! The pair classes (design 4.1 and 5.1): which decodes a prefill may hand
-//! its KV blocks to, decided once per membership write and read by every
+//! its KV blocks to, decided where a membership write moves a member or an
+//! offer and where a generation moves the pairing mode, and read by every
 //! pair decision as a class on its rows and a table of classes.
 //!
 //! One invariant: **a worker has one class, and which classes pair is a
@@ -54,7 +55,10 @@ pub const LAYOUT_FACTS: [(&str, &str); 4] = [
 
 /// What one prefill or decode worker offers a rendezvous partner, beside
 /// its runtime (the row's engine kind). A field left `None` is one the
-/// worker does not report.
+/// worker does not report. A blank value is no report either, and the rule
+/// never meets one: the store's door hands it a normalized descriptor
+/// ([`PairingDescriptor::normalized`]), as the gateway's own derive drops a
+/// blank label where it makes a worker's descriptor.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PairingDescriptor {
     /// The protocol an operator set. Two workers that both set one are
@@ -66,6 +70,42 @@ pub struct PairingDescriptor {
     pub version: Option<String>,
     /// The KV layout facts, in the order of [`LAYOUT_FACTS`].
     pub kv_layout: [Option<String>; 4],
+}
+
+impl PairingDescriptor {
+    /// The descriptor as the rule reads it: every blank value dropped and
+    /// every name read past the blanks around it. The store's door makes a
+    /// worker's descriptor so, once a write.
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        normalize(&mut self.protocol);
+        normalize(&mut self.transport);
+        normalize(&mut self.version);
+        self.kv_layout.iter_mut().for_each(normalize);
+        self
+    }
+
+    /// Whether no value is blank or stands between blanks.
+    fn is_normalized(&self) -> bool {
+        [&self.protocol, &self.transport, &self.version]
+            .into_iter()
+            .chain(&self.kv_layout)
+            .flatten()
+            .all(|value| !value.is_empty() && value.trim().len() == value.len())
+    }
+}
+
+/// One value of a descriptor, normalized in place.
+fn normalize(value: &mut Option<String>) {
+    let Some(text) = value else {
+        return;
+    };
+    let read = text.trim();
+    if read.is_empty() {
+        *value = None;
+    } else if read.len() != text.len() {
+        *text = read.to_string();
+    }
 }
 
 /// The descriptor of a worker that has none: it reports nothing.
@@ -100,25 +140,32 @@ type Offer<'a> = (bool, Option<&'a str>, &'a PairingDescriptor);
 /// writes as the empty string. Two unknown runtimes are compared so and
 /// never as strings: the C library's compare of two empty strings that
 /// hold no buffer takes a slow path (about 200 ns by a probe, where two
-/// strings of four bytes take 3).
+/// strings of four bytes take 3). An engine kind is a kind's name, which
+/// the load ingest parses as written too, so it is read as written: a
+/// descriptor's free text is what the door normalizes.
 pub(crate) fn known(runtime: &str) -> Option<&str> {
     (!runtime.is_empty()).then_some(runtime)
 }
 
 impl<'a> Member<'a> {
     /// A member from the facts of its row: a row with no descriptor reports
-    /// nothing.
+    /// nothing, and a row's descriptor comes normalized from the door.
     pub fn new(
         id: WorkerId,
         wires: WireModes,
         runtime: &'a str,
         descriptor: Option<&'a PairingDescriptor>,
     ) -> Self {
+        let descriptor = descriptor.unwrap_or(&NO_DESCRIPTOR);
+        debug_assert!(
+            descriptor.is_normalized(),
+            "a descriptor reaches the rule normalized"
+        );
         Self {
             id,
             wires,
             runtime,
-            descriptor: descriptor.unwrap_or(&NO_DESCRIPTOR),
+            descriptor,
         }
     }
 
@@ -149,8 +196,8 @@ pub enum Mismatch {
     Version,
     /// Both sides report the named KV layout fact and disagree.
     KvLayout(&'static str),
-    /// A component one side does not report, refused under
-    /// [`Pairing::Strict`] alone.
+    /// A component one side does not report, or a runtime or a transport
+    /// that neither side names, refused under [`Pairing::Strict`] alone.
     Unknown(&'static str),
 }
 
@@ -382,8 +429,8 @@ impl PairClasses {
     /// side's classes are numbered from `1` in the order their first worker
     /// is given, and a worker that pairs with nobody is class `0` and takes
     /// no number. The table lists, for each prefill class, the decode
-    /// classes it pairs with: a list names every decode class, so the
-    /// table numbers densely, as the engine asks of a host
+    /// classes it pairs with: every decode class is named by some list, so
+    /// the table numbers densely, as the engine asks of a host
     /// ([`PairTable::new`]). Where both pools hold workers on one side of
     /// the wire's fact and no pair is made there, that side's [`Refusal`]
     /// names the two pools' keys and what they disagree on.

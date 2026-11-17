@@ -135,8 +135,10 @@ pub struct WorkerFacts {
     pub zone: Option<String>,
     /// What the worker offers a prefill-decode partner, when the handshake
     /// learned any of it. The store derives the pair classes from it, with
-    /// the engine kind as the runtime, at each membership write
-    /// ([`pairing`](super::pairing)): a registration hands no class in.
+    /// the engine kind as the runtime, where a membership write moves a
+    /// member or an offer and where a generation moves the pairing mode
+    /// ([`pairing`](super::pairing)): a registration hands no class in. The
+    /// door drops a blank value and reads a name past its blanks.
     pub pairing: Option<PairingDescriptor>,
     /// The engine's admission window (maximum running requests); `None`
     /// when it reports none.
