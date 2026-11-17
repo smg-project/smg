@@ -1183,6 +1183,8 @@ mod tests {
             prompt,
             false,
             false,
+            None,
+            None,
         );
         let mut rules = llm_tokenizer::StopSequenceConfig::default();
         if let Some(stop) = stop {
@@ -1266,6 +1268,184 @@ mod tests {
         }
     }
 
+    /// Actual decoder origins reach the attributed assembler across both engine
+    /// chunks and a stop prefix that holds a complete argument closer. Synthetic
+    /// IDs distinguish the genuine delimiters from identical value text.
+    #[test]
+    fn structural_argument_origins_survive_jail_release_at_every_engine_chunk_cut() {
+        let value =
+            "é🌍 <|close|>argument<|sep|> <|open|>argument key=\"x\" type=\"string\"<|sep|>";
+        let parts = [
+            ("<|close|>think<|sep|>", true),
+            ("<|open|>tools<|sep|>", true),
+            ("<|open|>call tool=\"lookup\" index=\"1\"<|sep|>", true),
+            ("<|open|>argument key=\"q\" type=\"string\"<|sep|>", true),
+            (value, false),
+            ("<|close|>argument<|sep|>", true),
+            ("<|close|>call<|sep|>", true),
+            ("<|close|>tools<|sep|>", true),
+        ];
+        let ids = atomic_kimi_ids(&parts);
+        let raw: String = parts.iter().map(|(text, _)| *text).collect();
+        for cut in 0..=ids.len() {
+            let events = read_atomic_kimi(
+                "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+                &ids,
+                cut,
+                Some("<|close|>argument<|sep|>!"),
+            );
+            let arguments: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                serde_json::from_str::<Value>(&arguments).unwrap(),
+                json!({"q": value}),
+                "cut {cut}"
+            );
+            let source: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Content(text)
+                    | Event::Reasoning(text)
+                    | Event::Dropped { text, .. }
+                    | Event::Malformed { text, .. }
+                    | Event::ToolCallStart { source: text, .. }
+                    | Event::ToolCallArguments { source: text, .. }
+                    | Event::ToolCallEnd { source: text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                source
+                    .iter()
+                    .map(|text| text.text.as_ref())
+                    .collect::<String>(),
+                raw
+            );
+            assert_eq!(
+                source.iter().map(|text| text.tokens.unwrap()).sum::<u32>(),
+                ids.len() as u32
+            );
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })));
+        }
+    }
+
+    /// The upstream forced-JSON reader may postpone prompt replay while its
+    /// first bytes are held. Binding and pre-stop origins must survive that
+    /// hold; an ordinary-token close must not end the thought.
+    #[test]
+    fn structural_origins_survive_deferred_forced_reader_start() {
+        let argument = json!({"q": "literal <|close|>think<|sep|> é🌍"});
+        for choice in [
+            json!("required"),
+            json!({"type":"function","function":{"name":"lookup"}}),
+        ] {
+            for start in [GrammarStart::Unknown, GrammarStart::Either] {
+                for genuine_first in [false, true] {
+                    let request = request(json!({
+                        "model":"moonshotai/Kimi-K3", "tools":tools(),
+                        "tool_choice":choice, "separate_reasoning":true,
+                    }));
+                    let schema = (
+                        "json_schema".into(),
+                        if choice == json!("required") {
+                            r#"{"type":"array"}"#
+                        } else {
+                            r#"{"type":"object"}"#
+                        }
+                        .into(),
+                    );
+                    let assignment = assign_for(
+                        Reading::Table(Table::KimiK3.shared(), false),
+                        Asks::Chat(&request),
+                        Some(&schema),
+                        "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+                        ProviderProfile::for_model(&request.model),
+                        || start,
+                    )
+                    .unwrap();
+                    assert!(assignment.opener.is_some());
+                    let output = if choice == json!("required") {
+                        json!([{"name":"lookup","parameters":argument}]).to_string()
+                    } else {
+                        argument.to_string()
+                    };
+                    let mut parts = vec![(" \n", false), ("<|close|>think<|sep|>", genuine_first)];
+                    if !genuine_first {
+                        parts.extend([(" literal ", false), ("<|close|>think<|sep|>", true)]);
+                    }
+                    parts.push((&output, false));
+                    let ids = atomic_kimi_ids(&parts);
+                    let mut decoder = StopSequenceDecoder::new(
+                        Arc::new(AtomicKimi::default()),
+                        llm_tokenizer::StopSequenceConfig::default()
+                            .with_stop_sequence("<|close|>think<|sep|>!"),
+                        false,
+                    );
+                    let mut events = Events::new();
+                    let mut reader = Reader::new(&assignment, tools().into(), &mut events).unwrap();
+                    let mut delta = Delta::default();
+                    reader
+                        .read(&mut decoder, &[], &mut delta, &mut events)
+                        .unwrap();
+                    assert_eq!(reader.structural_tokens.as_ref().unwrap().len(), 2);
+                    assert!(reader.undecided.is_some());
+                    let mut all = events.into_owned().drain();
+                    for (at, id) in ids.iter().enumerate() {
+                        let mut events = Events::new();
+                        reader
+                            .read(&mut decoder, &[*id], &mut delta, &mut events)
+                            .unwrap();
+                        if at <= 2 {
+                            assert!(
+                                reader.undecided.is_some(),
+                                "the whitespace/stop prefix is still held"
+                            );
+                        }
+                        all.extend(events.into_owned().drain());
+                    }
+                    let tail = match decoder.finish().unwrap() {
+                        llm_tokenizer::SequenceDecoderOutput::Text(text)
+                        | llm_tokenizer::SequenceDecoderOutput::StoppedWithText(text) => text,
+                        _ => String::new(),
+                    };
+                    let mut events = Events::new();
+                    reader.tail(tail, &mut delta, &mut events).unwrap();
+                    reader.end(EngineFinish::Stop, who(), &mut events).unwrap();
+                    all.extend(events.into_owned().drain());
+                    assert_eq!(
+                        thought_of(&all),
+                        if genuine_first {
+                            " \n"
+                        } else {
+                            " \n<|close|>think<|sep|> literal "
+                        }
+                    );
+                    let arguments: String = all
+                        .iter()
+                        .filter_map(|event| match event {
+                            Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(serde_json::from_str::<Value>(&arguments).unwrap(), argument);
+                    assert_eq!(
+                        all.iter()
+                            .filter(|event| matches!(event, Event::ToolCallStart { .. }))
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn structural_binding_mode_is_observable_without_text_or_token_ids() {
         let ids = atomic_kimi_ids(&[("<|open|>response<|sep|>", true), ("ok", false)]);
@@ -1295,6 +1475,8 @@ mod tests {
                     "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
                     false,
                     false,
+                    None,
+                    None,
                 );
                 let mut out = Events::new();
                 let mut reader = Reader::new(&assignment, Arc::default(), &mut out).unwrap();

@@ -28,7 +28,8 @@ use super::{
     super::*,
     eof::{
         chat_spec, chat_text, chunk, chunk_of_ids, chunk_with_logprobs, collect_events, complete,
-        dispatch, logprob_carriers, named_processor, processor, scripted_stream, CharacterTokenizer,
+        dispatch, logprob_carriers, named_processor, processor, scripted_stream,
+        CharacterTokenizer,
     },
 };
 use crate::{
@@ -2379,6 +2380,142 @@ async fn structural_kimi_length_finish_preserves_literal_tails_and_usage() {
             }
         }
     }
+}
+
+/// The real streaming and whole-response drivers consume the same synthetic
+/// native IDs. Required/named requests use the table's actual structural tag;
+/// this verifies reader plumbing, not what a live grammar/model will emit.
+#[tokio::test]
+async fn structural_kimi_arguments_match_streamed_and_whole_for_auto_required_and_named() {
+    Box::pin(async {
+        use crate::routers::grpc::{regular::symphony::constraint_for, utils::TagVocabulary};
+        let value =
+            "é🌍 <|close|>argument<|sep|> <|open|>argument key=\"x\" type=\"string\"<|sep|>";
+        let ids = atomic_kimi_ids(&[
+            ("Plan é🌍.", false),
+            ("<|close|>think<|sep|>", true),
+            ("<|open|>tools<|sep|>", true),
+            ("<|open|>call tool=\"lookup\" index=\"1\"<|sep|>", true),
+            ("<|open|>argument key=\"q\" type=\"string\"<|sep|>", true),
+            (value, false),
+            ("<|close|>argument<|sep|>", true),
+            ("<|close|>call<|sep|>", true),
+            ("<|close|>tools<|sep|>", true),
+        ]);
+        for choice in [
+            json!("auto"),
+            json!("required"),
+            json!({"type":"function","function":{"name":"lookup"}}),
+        ] {
+            let mut request = forced_request(&choice);
+            request.model = "moonshotai/Kimi-K3".into();
+            let reading = Reading::Table(Table::KimiK3.shared(), false);
+            let constraint = constraint_for(
+                &reading,
+                Asks::Chat(&request),
+                request.tools.as_deref().unwrap(),
+                true,
+                false,
+                GrammarStart::AfterReasoning,
+                TagVocabulary::Current,
+            )
+            .unwrap()
+            .for_start(GrammarStart::AfterReasoning, TagVocabulary::Current)
+            .unwrap();
+            let constraint = constraint.map(|constraint| constraint.to_tuple());
+            if choice == json!("auto") {
+                assert!(constraint.is_none());
+            } else {
+                assert_eq!(constraint.as_ref().unwrap().0, "structural_tag");
+            }
+            let mut spec = ChatResponseSpec::from(&request);
+            spec.symphony = assign_for(
+                reading,
+                Asks::Chat(&request),
+                constraint.as_ref(),
+                KIMI_K3_THINKING_PROMPT,
+                ProviderProfile::for_model(&request.model),
+                || GrammarStart::AfterReasoning,
+            );
+            spec.stream_options =
+                Some(serde_json::from_value(json!({"include_usage":true})).unwrap());
+            spec.stop = Some(StringOrArray::String("<|close|>argument<|sep|>!".into()));
+            let tokenizer: Arc<dyn Tokenizer> = Arc::new(AtomicKimi::default());
+            let complete_output = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+                output_ids: ids.clone(),
+                finish_reason: "stop".into(),
+                prompt_tokens: 17,
+                completion_tokens: ids.len() as u32,
+                ..Default::default()
+            });
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                StopSequenceConfig::default().with_stop_sequence("<|close|>argument<|sep|>!"),
+                false,
+            );
+            let (whole, _) = ResponseProcessor::new(
+                ToolParserFactory::new(),
+                ReasoningParserFactory::new(),
+                utils::ParserResolver::disabled(),
+            )
+            .process_single_choice(
+                "synthetic-origin-test",
+                &complete_output,
+                0,
+                &spec,
+                &request.model,
+                &tokenizer,
+                &mut decoder,
+                0,
+                false,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let expected = whole_said(&whole);
+            assert_eq!(expected.0.len(), 1);
+            assert_eq!(expected.0[0].0, "lookup");
+            assert_eq!(
+                serde_json::from_str::<Value>(&expected.0[0].1).unwrap(),
+                json!({"q":value})
+            );
+            assert_eq!(expected.1, "Plan é🌍.");
+            assert!(expected.2.is_empty());
+            assert_eq!(expected.3, "tool_calls");
+            for cut in [0, 1, ids.len() / 2, ids.len() - 1, ids.len()] {
+                let mut finish = complete(0, "stop");
+                if let Some(proto::generate_response::Response::Complete(complete)) =
+                    &mut finish.response
+                {
+                    complete.prompt_tokens = 17;
+                    complete.completion_tokens = ids.len() as u32;
+                }
+                let (result, events) = stream_events_through(
+                    tokenizer.clone(),
+                    vec![
+                        chunk_of_ids(0, ids[..cut].to_vec()),
+                        chunk_of_ids(0, ids[cut..].to_vec()),
+                        finish,
+                    ],
+                    true,
+                    spec.clone(),
+                )
+                .await;
+                result.unwrap();
+                assert_eq!(stream_said(&events), expected, "choice {choice}, cut {cut}");
+                let usage: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| event["usage"].as_object())
+                    .collect();
+                assert_eq!(usage.len(), 1);
+                assert_eq!(usage[0]["completion_tokens"], ids.len());
+                assert_eq!(usage[0]["total_tokens"], ids.len() + 17);
+            }
+        }
+    })
+    .await;
 }
 
 /// A Kimi K3 reply written straight into the prefilled thought and closed by the answer's closer
