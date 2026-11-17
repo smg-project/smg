@@ -582,6 +582,7 @@ fn config() -> Config {
         shutdown_settle: Duration::from_millis(50),
         shutdown_grace: Duration::from_secs(5),
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
+        decide_shards: 2,
         election: Election::default(),
     }
 }

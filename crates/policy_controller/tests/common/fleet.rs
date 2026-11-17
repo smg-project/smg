@@ -680,6 +680,7 @@ impl Replica {
                 listener("replication", &[Scope::Replication]),
             ],
             admin: loopback(),
+            decide_shards: Config::default_decide_shards(),
             shutdown_settle: Duration::ZERO,
             shutdown_grace: Duration::from_secs(5),
             load_poll_interval: POLL_INTERVAL,

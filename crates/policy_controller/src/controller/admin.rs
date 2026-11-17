@@ -19,7 +19,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::json;
 
-use super::{metrics::Metrics, readiness::Readiness, PROTOCOL_PACKAGE};
+use super::{deciders::Counts, metrics::Metrics, readiness::Readiness, PROTOCOL_PACKAGE};
 use crate::ingest::loads::Stats;
 
 /// What `/version` answers.
@@ -47,6 +47,8 @@ pub(crate) struct Admin {
     pub(crate) metrics: Arc<Metrics>,
     /// The load driver's counts, rendered with the metrics.
     pub(crate) loads: Arc<Stats>,
+    /// The decide call's counts, rendered with the metrics.
+    pub(crate) decides: Arc<Counts>,
 }
 
 /// The admin routes over their state.
@@ -95,7 +97,7 @@ async fn metrics(AxumState(admin): AxumState<Admin>) -> Response {
         )],
         admin
             .metrics
-            .render(|| admin.readiness.state(), &admin.loads),
+            .render(|| admin.readiness.state(), &admin.loads, &admin.decides),
     )
         .into_response()
 }
@@ -149,6 +151,7 @@ mod tests {
             readiness: reader,
             metrics: Arc::new(metrics),
             loads: Arc::new(Stats::default()),
+            decides: Arc::default(),
         });
 
         let (status, _, body) = get(app.clone(), "/readiness").await;
@@ -195,6 +198,7 @@ mod tests {
             readiness: reader,
             metrics: Arc::new(metrics),
             loads: Arc::new(Stats::default()),
+            decides: Arc::default(),
         });
 
         let (status, content_type, body) = get(app.clone(), "/version").await;

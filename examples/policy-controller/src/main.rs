@@ -364,6 +364,7 @@ mod tests {
                 listener("replication", &[Scope::Replication]),
             ],
             admin: loopback,
+            decide_shards: Config::default_decide_shards(),
             shutdown_settle: Config::DEFAULT_SHUTDOWN_SETTLE,
             shutdown_grace: Config::DEFAULT_SHUTDOWN_GRACE,
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,

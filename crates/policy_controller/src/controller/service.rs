@@ -4,20 +4,20 @@
 //!
 //! `Leader` is served, on every listener and by every replica, to a caller
 //! with a principal or with none. `Session` is served to a gateway
-//! ([`session`](super::session)), and the control scope's three
-//! registration calls by the leader. `GetPolicySpec` is served on the
-//! control scope by a controller given a spec source. Every other call is
-//! refused:
+//! ([`session`]), and the control scope's three registration calls by the
+//! leader. `GetPolicySpec` is served on the control scope by a controller
+//! given a spec source. Every other call is refused:
 //! `PERMISSION_DENIED` where the listener mounts none of the call's scopes
 //! (the contract: the scope does not cover the RPC), `UNAUTHENTICATED`
 //! where it does and the listener's layer placed no principal on the call
-//! ([`principal`](super::principal)), `UNIMPLEMENTED` where one stands and
+//! ([`principal`]), `UNIMPLEMENTED` where one stands and
 //! no step serves the call yet. The step that serves a call replaces that
 //! call's one line here, behind [`Service::admit`], acts for the principal
 //! it hands back and for no other peer, and adds what it reads to
 //! [`Shared`], which [`Shared::new`] alone builds.
 
 use std::{
+    io,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -28,6 +28,7 @@ use tonic::{service::Routes, Code, Request, Response, Status, Streaming};
 
 use super::{
     config::Scope,
+    deciders::{self, Deciders, Reads},
     election::{split_identity, Standing},
     gateways::Gateways,
     generations::Generations,
@@ -73,6 +74,8 @@ pub(crate) struct Shared {
     /// The membership door over that store: the control scope's
     /// registration calls.
     pub(crate) door: Door,
+    /// The threads the decisions run on, a model's on one.
+    pub(crate) deciders: Deciders,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -93,7 +96,11 @@ impl Shared {
     /// it can, so the other builders do not change. The identity and the
     /// fence are `elector`'s, so no instance answers under an identity
     /// another fence guards. A spec document names the stages `catalog`
-    /// holds.
+    /// holds. `deciders` is how many threads decide.
+    ///
+    /// # Errors
+    ///
+    /// A deciding thread could not be started.
     pub(crate) fn new(
         controller_id: String,
         address: String,
@@ -101,14 +108,26 @@ impl Shared {
         standing: watch::Receiver<Standing>,
         store: Arc<MemoryStore>,
         catalog: Arc<Catalog>,
-    ) -> Self {
+        deciders: usize,
+    ) -> io::Result<Self> {
         let gateways = Arc::new(Gateways::new(
             session::GRACE_PERIOD,
             session::PRESENT_MAX,
             elector.fence(),
             Arc::clone(&store),
         ));
-        Self {
+        let deciders = Deciders::start(
+            deciders,
+            deciders::QUEUE_DEPTH,
+            &Reads {
+                store: Arc::clone(&store),
+                fence: elector.fence(),
+                standing: standing.clone(),
+                clock: Arc::new(Instant::now),
+                counts: Arc::default(),
+            },
+        )?;
+        Ok(Self {
             controller_id,
             address,
             identity: elector.identity().to_owned(),
@@ -119,7 +138,8 @@ impl Shared {
             store,
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
-        }
+            deciders,
+        })
     }
 
     /// Who leads, given `leading`, one read of the fence: the term this
@@ -610,14 +630,18 @@ mod tests {
         )
         .expect("the default settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let shared = Arc::new(Shared::new(
-            ID.to_owned(),
-            ADDRESS.to_owned(),
-            &elector,
-            stood,
-            Arc::new(MemoryStore::new()),
-            Arc::new(Catalog::builtin()),
-        ));
+        let shared = Arc::new(
+            Shared::new(
+                ID.to_owned(),
+                ADDRESS.to_owned(),
+                &elector,
+                stood,
+                Arc::new(MemoryStore::new()),
+                Arc::new(Catalog::builtin()),
+                2,
+            )
+            .expect("the deciders start"),
+        );
         (elector, standing, Service::new(scopes.to_vec(), shared))
     }
 
@@ -667,14 +691,18 @@ mod tests {
             .expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
         let store = Arc::new(MemoryStore::new());
-        let shared = Arc::new(Shared::new(
-            ID.to_owned(),
-            ADDRESS.to_owned(),
-            &elector,
-            stood,
-            Arc::clone(&store),
-            Arc::new(Catalog::builtin()),
-        ));
+        let shared = Arc::new(
+            Shared::new(
+                ID.to_owned(),
+                ADDRESS.to_owned(),
+                &elector,
+                stood,
+                Arc::clone(&store),
+                Arc::new(Catalog::builtin()),
+                2,
+            )
+            .expect("the deciders start"),
+        );
         let service = Service::new(vec![Scope::Gateway], shared);
         let mut running = election::start(elector, store, standing).expect("a thread");
         let mut last = 0;
@@ -1056,14 +1084,18 @@ mod tests {
         let (standing, stood) = watch::channel(Standing::default());
         let service = Service::new(
             vec![Scope::Gateway],
-            Arc::new(Shared::new(
-                ID.to_owned(),
-                ADDRESS.to_owned(),
-                &elector,
-                stood,
-                Arc::new(MemoryStore::new()),
-                Arc::new(Catalog::builtin()),
-            )),
+            Arc::new(
+                Shared::new(
+                    ID.to_owned(),
+                    ADDRESS.to_owned(),
+                    &elector,
+                    stood,
+                    Arc::new(MemoryStore::new()),
+                    Arc::new(Catalog::builtin()),
+                    2,
+                )
+                .expect("the deciders start"),
+            ),
         );
 
         // The other replica holds the lease under term 1; this one's look

@@ -25,9 +25,9 @@
 //! with none.
 //!
 //! One arm a kind of frame. `Hello` is served here, and the lifecycle's
-//! three frames in [`lifecycle`](super::lifecycle). The other kinds are
-//! refused by name until the step that serves each adds its arm, as the
-//! service refuses an unserved call.
+//! three frames in [`lifecycle`]. The other kinds are refused by name
+//! until the step that serves each adds its arm, as the service refuses an
+//! unserved call.
 //!
 //! The session's loop is polled with the stream it answers on, so no task
 //! outlives its stream: a gateway that stops reading its stream stops its
@@ -552,7 +552,9 @@ mod tests {
             stood,
             Arc::new(MemoryStore::new()),
             Arc::new(crate::Catalog::builtin()),
-        );
+            2,
+        )
+        .expect("the deciders start");
         if let Some(ceiling) = ceiling {
             shared.gateways = Arc::new(Gateways::new(
                 GRACE_PERIOD,

@@ -36,7 +36,8 @@
 //! A request that carries its prompt as text is checked like any other and
 //! says so ([`Checked::has_text`]): the controller is to hash the text into
 //! block hashes before any stage reads the view, and its decider has no
-//! decision for it until a step does.
+//! decision for it until a step does. Until one reads the text it is
+//! dropped at the check, so a frame that waits in a queue holds none.
 //!
 //! An answer carries no lease here: a decision is written as the engine
 //! made it, and the call that issues leases adds them.
@@ -73,6 +74,8 @@ pub(crate) struct Checked {
     /// the session's value; `0` for one that carries it plain or carries
     /// none.
     session_key: u64,
+    /// Whether the frame carried its prompt as text.
+    text: bool,
 }
 
 impl Checked {
@@ -80,7 +83,9 @@ impl Checked {
     /// hold. A frame with no facts, or with no constraints, reads as one
     /// that leaves every field of them unset.
     pub(crate) fn new(request: proto::DecideRequest) -> Result<Self, Refusal> {
-        let facts = request.facts.unwrap_or_default();
+        let mut facts = request.facts.unwrap_or_default();
+        // The prompt as text is said and not kept: no step reads it yet.
+        let text = !mem::take(&mut facts.prompt_text).is_empty();
         let phase = match proto::Phase::try_from(facts.phase) {
             Ok(proto::Phase::Unspecified | proto::Phase::Single) => Phase::Single,
             Ok(proto::Phase::Prefill) => Phase::Prefill,
@@ -121,6 +126,7 @@ impl Checked {
             phase,
             hash_kind,
             session_key,
+            text,
         })
     }
 
@@ -144,10 +150,10 @@ impl Checked {
         Duration::from_micros(u64::from(self.facts.budget_micros))
     }
 
-    /// Whether the request carries its prompt as text, for the controller
+    /// Whether the request carried its prompt as text, for the controller
     /// to hash.
-    pub(crate) fn has_text(&self) -> bool {
-        !self.facts.prompt_text.is_empty()
+    pub(crate) const fn has_text(&self) -> bool {
+        self.text
     }
 
     /// How many block hashes the frame carries: a read hands the engine
@@ -770,6 +776,8 @@ mod tests {
         assert_eq!(stating(0), (None, WireModes::NONE));
     }
 
+    /// The text is said and dropped at the check: the frame a queue holds
+    /// keeps none of it, its buffer neither.
     #[test]
     fn a_frame_that_carries_its_prompt_as_text_is_checked_and_says_so() {
         let plain = Checked::new(full()).expect("a frame the record holds");
@@ -777,6 +785,7 @@ mod tests {
         let text = Checked::new(with(|facts| facts.prompt_text = b"hello".to_vec()))
             .expect("text is no field out of its range");
         assert!(text.has_text());
+        assert_eq!(text.facts.prompt_text.capacity(), 0);
     }
 
     #[test]
