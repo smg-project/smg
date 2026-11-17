@@ -2026,12 +2026,15 @@ mod tests {
             self.lease.lose();
         }
 
-        /// A record no candidate wrote, stored over the one there.
+        /// A record no candidate wrote, stored over the one there. A live
+        /// holder's renewal can land between the read and the write, and
+        /// the write is then turned away: both are made again.
         fn put(&self, record: &LeaseRecord) {
             let mut lease = self.lease.clone();
-            let stored = lease.read().expect("a read");
-            let written = lease.write(stored.as_ref(), record);
-            assert_eq!(written.expect("a write"), Written::Done);
+            until("a record stored over the one there", || {
+                let stored = lease.read().expect("a read");
+                lease.write(stored.as_ref(), record).expect("a write") == Written::Done
+            });
         }
 
         fn landed(&self) -> u32 {
