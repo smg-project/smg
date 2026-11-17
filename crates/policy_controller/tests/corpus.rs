@@ -49,8 +49,9 @@ const NOT_IN_BUILD: &[(&str, &str)] = &[
     ),
 ];
 
-/// The corpus's size: an item that leaves the directory, or takes an
-/// extension the walk does not read, is a defect.
+/// The corpus's size: an item that leaves the directory or arrives in it,
+/// or takes an extension the walk does not read, is a defect, told after
+/// the report of the items that stand.
 const ITEMS: usize = 28;
 
 enum Verdict {
@@ -98,7 +99,6 @@ fn the_step_2_corpus_parses_and_every_item_names_its_verdict() {
         .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
         .collect();
     items.sort();
-    assert_eq!(items.len(), ITEMS, "the items under {}", dir.display());
 
     let (mut documents, mut accepted, mut not_in_build) = (0usize, 0usize, 0usize);
     let mut defects = Vec::new();
@@ -148,6 +148,13 @@ fn the_step_2_corpus_parses_and_every_item_names_its_verdict() {
                 "{item}: listed as not in this build, and no such item"
             ));
         }
+    }
+    if items.len() != ITEMS {
+        defects.push(format!(
+            "{} items under {}, and the corpus holds {ITEMS}",
+            items.len(),
+            dir.display()
+        ));
     }
     println!();
     println!(
