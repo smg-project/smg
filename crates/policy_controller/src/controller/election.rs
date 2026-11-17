@@ -2575,24 +2575,38 @@ mod tests {
         // and nobody named: the old holder first, the standby second.
         let (mut samples, mut both, mut unnamed) = (0_u32, 0_u32, (false, false));
         // The first take, under whatever later term: how long after the
-        // loss, its term, whether the standby's, and when it was seen.
+        // loss its read was asked for, its term, whether the standby's, and
+        // that instant. A fence answers a term only inside its window, so
+        // that instant is no sooner than the take, and a stop between a
+        // read and the line that dates it lengthens nothing.
         let mut taken: Option<(Duration, u64, bool, Instant)> = None;
         while taken.is_none_or(|(_, _, _, seen)| seen.elapsed() < settings.renew_deadline) {
-            let before = leader_fence.leader_term(Instant::now());
-            let between = follower_fence.leader_term(Instant::now());
-            let after = leader_fence.leader_term(Instant::now());
+            let asked_before = Instant::now();
+            let before = leader_fence.leader_term(asked_before);
+            let asked_between = Instant::now();
+            let between = follower_fence.leader_term(asked_between);
+            let asked_after = Instant::now();
+            let after = leader_fence.leader_term(asked_after);
             samples += 1;
             both += u32::from(before.is_some() && between.is_some() && before == after);
             unnamed.0 |= before.is_none() && led.borrow().holder.is_empty();
             unnamed.1 |= between.is_none() && followed.borrow().holder.is_empty();
             // The loop runs to its end whatever that term: the bound on it is
             // read after the count of two open fences, never ahead of it.
-            let later = [before, between, after]
-                .into_iter()
-                .flatten()
-                .find(|term| *term > 1);
-            if let (None, Some(term)) = (taken, later) {
-                taken = Some((lost.elapsed(), term, between == Some(term), Instant::now()));
+            let later = [
+                (before, asked_before),
+                (between, asked_between),
+                (after, asked_after),
+            ]
+            .into_iter()
+            .find_map(|(term, asked)| term.filter(|term| *term > 1).map(|term| (term, asked)));
+            if let (None, Some((term, asked))) = (taken, later) {
+                taken = Some((
+                    asked.duration_since(lost),
+                    term,
+                    between == Some(term),
+                    asked,
+                ));
             }
             assert!(
                 lost.elapsed() < Duration::from_secs(20),
@@ -2633,12 +2647,14 @@ mod tests {
         .expect("stdout");
         assert!(named_nobody, "{taker} named a holder through its wait");
         // The bound on the clock once more: the other replica follows the
-        // taker from its first look after the take. A host that held the
-        // test past the lease's duration handed the lease on, and the
-        // other replica then reads a later term: the wait ends on that too.
+        // taker from its first look after the take, under the take's term:
+        // a look from before the loss names the old holder under term 1
+        // and ends nothing. A host that held the test past the lease's
+        // duration handed the lease on, and the other replica then reads a
+        // later term: the wait ends on that too.
         until("the other replica follows the taker", || {
             let look = other.borrow();
-            look.holder == taker || look.term > 2
+            (look.holder == taker && look.term == 2) || look.term > 2
         });
         let read = other.borrow().term;
         bound!(
