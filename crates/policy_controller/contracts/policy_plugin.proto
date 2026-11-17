@@ -597,10 +597,14 @@ message Signal {
 // the controller's (bit 63 clear): a gateway-minted fallback id is re-minted
 // when the controller first learns the lease, its origin kept LOCAL.
 message LifecycleEvent {
-  // Monotonic per Observe stream. The host numbers what the stream owed:
-  // the events it sent and the events it refused at a full queue. A gap is
-  // events the host refused, and a plugin that keeps a ledger of leases
-  // treats it as a loss.
+  // Monotonic for the plugin's life, across every Observe stream the host
+  // opens to it. The host numbers what it owed: the events it sent and the
+  // events it refused at a full queue. A gap is events the plugin never
+  // received (refused at a full queue, or in flight on a stream that
+  // ended), and a plugin that keeps a ledger of leases treats it as a loss.
+  // A gap's size is exact and its place is not: events raised before the
+  // loss can arrive behind it. A loss after the last event sent shows at
+  // the next event.
   uint64 seq = 1;
   oneof event {
     Issued issued = 2;

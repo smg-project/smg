@@ -92,6 +92,12 @@ pub struct Script {
     pub counters: Vec<(u32, u64)>,
     /// Keeps nothing it is sent: a bench's frames and events are millions.
     pub forget: bool,
+    /// With `EndStream`: the status's words a `Decide` stream ends with,
+    /// when not empty; a clean end otherwise.
+    pub end_status: String,
+    /// When not empty: the `Observe` call is answered at its next message
+    /// with an Ack that carries these words.
+    pub observe_ack: String,
 }
 
 impl Default for Script {
@@ -106,6 +112,8 @@ impl Default for Script {
             implements: ALL,
             counters: Vec::new(),
             forget: false,
+            end_status: String::new(),
+            observe_ack: String::new(),
         }
     }
 }
@@ -334,8 +342,13 @@ impl PolicyPlugin for Shared {
                         }
                         if script.behaviour == Behaviour::EndStream {
                             // The response stream ends with its sender, after
-                            // the delay an answer would wait.
+                            // the delay an answer would wait: cleanly, or
+                            // with the status the script names.
                             pause(script.delay).await;
+                            if !script.end_status.is_empty() {
+                                let status = Status::internal(script.end_status);
+                                let _ = tx.send(Err(status)).await;
+                            }
                             return;
                         }
                         let Some(decision) = answered else {
@@ -375,6 +388,14 @@ impl PolicyPlugin for Shared {
                     lock(&self.seen).events.push(event);
                 }
                 Some(proto::observe_request::Request::Event(_)) | None => {}
+            }
+            let words = lock(&self.script).observe_ack.clone();
+            if !words.is_empty() {
+                return Ok(Response::new(proto::Ack {
+                    frames,
+                    accepted: frames,
+                    error: words,
+                }));
             }
         }
         lock(&self.seen).acked_observes += 1;

@@ -4,14 +4,20 @@
 //! I/O thread never waits on a decision.
 
 use std::{
+    any::Any,
     error::Error,
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
+    panic::{self, AssertUnwindSafe},
     path::PathBuf,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::sync_channel,
         Arc, Weak,
     },
+    task::{Context, Poll},
     thread,
     time::{Duration, Instant},
 };
@@ -239,8 +245,9 @@ impl Peer {
 pub(crate) trait LaneEvents: Send + Sync {
     /// A `Decide` stream settled (the hello acked).
     fn connected(&self);
-    /// A stream failed to open, ended or erred.
-    fn stream_failed(&self, why: &str);
+    /// A stream failed to open, ended or erred, at the instant its lane
+    /// dated the failure by: the one its pause runs from.
+    fn stream_failed(&self, why: &str, at: Instant);
     /// An answer for a decision nobody waits for any more.
     fn late_answer(&self);
     /// The `Observe` stream failed to open or ended.
@@ -575,14 +582,16 @@ impl Lane {
         self.ready.notify_all();
     }
 
-    fn fail(&self, why: Fault) {
-        *self.state.lock() = LaneState::Failed(why, Instant::now());
+    fn fail(&self, why: Fault) -> Instant {
+        let at = Instant::now();
+        *self.state.lock() = LaneState::Failed(why, at);
         self.ready.notify_all();
         // Every frame in flight went with the stream.
         for pending in &mut self.pending.lock().0 {
             pending.broken = pending.id != 0;
         }
         self.answered.notify_all();
+        at
     }
 
     fn deliver(&self, decision: proto::PluginDecision) {
@@ -833,6 +842,31 @@ async fn run_commands(
     streams
 }
 
+/// A future whose panic is its output: the task that awaits it goes on.
+struct Caught<F>(Pin<Box<F>>);
+
+impl<F: Future> Future for Caught<F> {
+    type Output = thread::Result<F::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let turn = self.0.as_mut();
+        match panic::catch_unwind(AssertUnwindSafe(|| turn.poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Err(panicked) => Poll::Ready(Err(panicked)),
+        }
+    }
+}
+
+/// The words a panic carried, when it carried words.
+fn panic_text(panicked: &(dyn Any + Send)) -> &str {
+    panicked
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panicked.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a panic with no words")
+}
+
 /// An error with its sources: a transport error names its cause there.
 fn chain(error: &dyn Error) -> String {
     let mut text = error.to_string();
@@ -957,9 +991,9 @@ async fn run_lane(lane: Arc<Lane>) {
             // reads the host's clock, and whatever that does, the lane
             // reads as failed and is asked for again.
             let said = why.to_string();
-            lane.fail(why);
+            let at = lane.fail(why);
             if let Some(events) = lane.events() {
-                events.stream_failed(&said);
+                events.stream_failed(&said, at);
             }
             return;
         }
@@ -983,9 +1017,9 @@ async fn run_lane(lane: Arc<Lane>) {
     };
     // A status's text is the plugin's: cut. The state first, as above.
     let why = bounded(why);
-    lane.fail(Fault::Stream(why.clone()));
+    let at = lane.fail(Fault::Stream(why.clone()));
     if let Some(events) = lane.events() {
-        events.stream_failed(&why);
+        events.stream_failed(&why, at);
     }
 }
 
@@ -993,15 +1027,37 @@ async fn run_observe(lane: Arc<ObserveLane>) {
     let Some(mut queue) = lane.queue.lock().take() else {
         return;
     };
-    let peer = &lane.peer;
-    // One line per outage: the first failure after a call that carried an
-    // event.
-    let mut reported = false;
     // The events sent, one count for the plugin's life. An event's number
     // is that count plus the events the queue refused: both only grow, so a
     // number never goes down, on one stream or across two, and a gap is
     // what the plugin lost.
     let mut sent = 0_u64;
+    // A turn that panicked did so in the host's own code (the plugin's
+    // telling of a failure). The queue and the count are held here, outside
+    // the turn: the events raised meanwhile wait in the queue, the numbers
+    // go on, and the stream is asked for again a pause later. No decision
+    // asks for this stream, as one does for a `Decide` stream.
+    while let Err(panicked) = Caught(Box::pin(observe_streams(&lane, &mut queue, &mut sent))).await
+    {
+        tracing::error!(
+            error = panic_text(&*panicked),
+            "a plugin's observe task panicked"
+        );
+        tokio::time::sleep(RECONNECT_PAUSE).await;
+    }
+}
+
+/// The `Observe` calls of one plugin, each opened when the one before it
+/// ended, until the plugin is dropped.
+async fn observe_streams(
+    lane: &ObserveLane,
+    queue: &mut mpsc::Receiver<proto::ObserveRequest>,
+    sent: &mut u64,
+) {
+    let peer = &lane.peer;
+    // One line per outage: the first failure after a call that carried an
+    // event.
+    let mut reported = false;
     loop {
         if lane.events.strong_count() == 0 {
             return;
@@ -1049,8 +1105,8 @@ async fn run_observe(lane: Arc<ObserveLane>) {
                         if let Some(proto::observe_request::Request::Event(numbered)) =
                             event.request.as_mut()
                         {
-                            sent += 1;
-                            numbered.seq = sent + lane.refused.load(Ordering::Relaxed);
+                            *sent += 1;
+                            numbered.seq = *sent + lane.refused.load(Ordering::Relaxed);
                         }
                         if tx.send(event).await.is_err() {
                             return true;
@@ -1102,8 +1158,8 @@ mod tests {
     use tokio::{sync::mpsc, task::JoinSet};
 
     use super::{
-        run_commands, Command, Lane, LaneEvents, Peer, Runtime, SendError, Wait, Witness,
-        PROMISE_MICROS, WINDOW,
+        run_commands, Command, Lane, LaneEvents, ObserveLane, Peer, Runtime, SendError, Wait,
+        Witness, PROMISE_MICROS, WINDOW,
     };
     use crate::{grpc::config::Transport, plugins::OpenDecisions, proto};
 
@@ -1115,16 +1171,16 @@ mod tests {
 
     impl LaneEvents for Counted {
         fn connected(&self) {}
-        fn stream_failed(&self, _why: &str) {}
+        fn stream_failed(&self, _why: &str, _at: Instant) {}
         fn late_answer(&self) {
             self.late.fetch_add(1, Ordering::Relaxed);
         }
         fn observe_failed(&self, _why: &str) {}
     }
 
-    /// A lane nothing listens behind, not asked to connect yet.
-    fn cold_lane(events: &Arc<Counted>) -> Lane {
-        let peer = Arc::new(Peer {
+    /// A peer nothing listens behind.
+    fn nowhere() -> Arc<Peer> {
+        Arc::new(Peer {
             name: "p".to_owned(),
             transport: Transport::Unix {
                 path: PathBuf::from("/nonexistent/p.sock"),
@@ -1135,7 +1191,12 @@ mod tests {
             counters: Vec::new(),
             connect: Duration::from_secs(1),
             answer_bytes: super::answer_bytes(128, 0),
-        });
+        })
+    }
+
+    /// A lane nothing listens behind, not asked to connect yet.
+    fn cold_lane(events: &Arc<Counted>) -> Lane {
+        let peer = nowhere();
         let events: Arc<dyn LaneEvents> = Arc::clone(events) as _;
         let weak: Weak<dyn LaneEvents> = Arc::downgrade(&events);
         Lane::new(peer, weak, Arc::new(Witness::new()))
@@ -1324,34 +1385,46 @@ mod tests {
 
     /// An answer's arrival is a run of the I/O thread: the gap it came
     /// across is kept for the frame that waited, and a frame sent after
-    /// it starts in time. Nothing ticks here: no I/O thread runs.
+    /// it starts in time. Nothing ticks here: no I/O thread runs, and this
+    /// thread stands for it. A try whose runner held the thread past the
+    /// promise between the arrival and the next frame says nothing of the
+    /// witness and is made again.
     #[test]
     fn an_arriving_answer_stamps_the_witness_and_keeps_the_gap_before_it() {
         let events = Arc::new(Counted::default());
-        let (lane, _rx) = open_lane(&events, 16);
-        let first = lane.next_id();
-        let sent = lane
-            .send(first, proto::PluginDecide::default())
-            .expect("sent");
-        std::thread::sleep(Duration::from_micros(PROMISE_MICROS + 2_000));
-        lane.deliver(answer(first));
-        // The first frame is still in its place: this one starts no
-        // promise of its own.
-        let after = lane
-            .send(lane.next_id(), proto::PluginDecide::default())
-            .expect("sent");
-        assert!(
-            !lane.witness.stalled_between(after, after),
-            "the delivery was a run of the thread"
-        );
-        let soon = Instant::now() + Duration::from_secs(5);
-        let Wait::Answered(arrived, _) = lane.wait_answer(first, soon) else {
-            panic!("the first frame was answered");
-        };
-        assert!(
-            lane.witness.stalled_between(sent, arrived),
-            "the answer came across a gap past the promise"
-        );
+        let until = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (lane, _rx) = open_lane(&events, 16);
+            let first = lane.next_id();
+            let sent = lane
+                .send(first, proto::PluginDecide::default())
+                .expect("sent");
+            std::thread::sleep(Duration::from_micros(PROMISE_MICROS + 2_000));
+            let before = Instant::now();
+            lane.deliver(answer(first));
+            // The first frame is still in its place: this one starts no
+            // promise of its own.
+            let after = lane
+                .send(lane.next_id(), proto::PluginDecide::default())
+                .expect("sent");
+            if after.saturating_duration_since(before) > Duration::from_micros(PROMISE_MICROS) {
+                assert!(Instant::now() < until, "the runner held every try");
+                continue;
+            }
+            assert!(
+                !lane.witness.stalled_between(after, after),
+                "the delivery was a run of the thread"
+            );
+            let soon = Instant::now() + Duration::from_secs(5);
+            let Wait::Answered(arrived, _) = lane.wait_answer(first, soon) else {
+                panic!("the first frame was answered");
+            };
+            assert!(
+                lane.witness.stalled_between(sent, arrived),
+                "the answer came across a gap past the promise"
+            );
+            break;
+        }
     }
 
     /// The ticker stamps the witness while a frame is in flight and
@@ -1472,5 +1545,79 @@ mod tests {
             .expect("the loop's task")
             .expect("the loop ends with its commands");
         assert_eq!(streams.len(), 1, "the witness's ticker alone is left");
+    }
+
+    /// What an `Observe` lane tells its plugin, with a first telling that
+    /// panics.
+    #[derive(Default)]
+    struct PanicsOnce {
+        told: AtomicU64,
+    }
+
+    impl LaneEvents for PanicsOnce {
+        fn connected(&self) {}
+        fn stream_failed(&self, _why: &str, _at: Instant) {}
+        fn late_answer(&self) {}
+        fn observe_failed(&self, _why: &str) {
+            let earlier = self.told.fetch_add(1, Ordering::Relaxed);
+            assert_ne!(earlier, 0, "the first telling panics");
+        }
+    }
+
+    /// An `Observe` task that panics is not the end of the plugin's events.
+    /// Here the connect finds no socket and the plugin's own telling of that
+    /// panics, once. The queue keeps its receiver across the panic, so an
+    /// event raised after it is taken, and the stream is asked for again a
+    /// pause later: the second telling stands.
+    #[tokio::test]
+    async fn an_observe_task_that_panics_is_started_again() {
+        let (commands, taken) = mpsc::unbounded_channel();
+        let mut looping = JoinSet::new();
+        looping.spawn(run_commands(taken, Arc::new(Witness::new())));
+        let events = Arc::new(PanicsOnce::default());
+        let listener: Arc<dyn LaneEvents> = Arc::clone(&events) as _;
+        let (queue, raised) = mpsc::channel(4);
+        let lane = ObserveLane::new(
+            nowhere(),
+            Arc::downgrade(&listener),
+            raised,
+            Arc::new(AtomicU64::new(0)),
+        );
+        assert!(commands.send(Command::Observe(Arc::new(lane))).is_ok());
+        for telling in 1..=2 {
+            let mut waits = 0;
+            while events.told.load(Ordering::Relaxed) < telling {
+                waits += 1;
+                assert!(waits < 10_000, "telling {telling} never came");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            // The first telling panicked: the queue still has its receiver.
+            assert!(
+                queue.try_send(proto::ObserveRequest::default()).is_ok(),
+                "the queue lost its receiver with the task that panicked"
+            );
+        }
+    }
+
+    /// An answer that lands in its place as the wait runs out is read: the
+    /// wait's last look is at the place, after the deadline. Here the answer
+    /// is written with no wake, so the waiting thread finds it by that look
+    /// alone.
+    #[test]
+    fn an_answer_that_lands_as_the_wait_runs_out_is_read() {
+        let events = Arc::new(Counted::default());
+        let (lane, _rx) = open_lane(&events, 16);
+        let id = lane.next_id();
+        lane.send(id, proto::PluginDecide::default()).expect("sent");
+        let until = Instant::now() + Duration::from_millis(200);
+        let waited = std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| lane.wait_answer(id, until));
+            std::thread::sleep(Duration::from_millis(20));
+            if let Some(place) = lane.pending.lock().place(id) {
+                place.answer = Some((lane.witness.stamp(), answer(id)));
+            }
+            waiting.join()
+        });
+        assert_eq!(waited.ok().and_then(answered), Some(id));
     }
 }

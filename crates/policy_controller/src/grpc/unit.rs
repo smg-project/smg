@@ -7,10 +7,15 @@
 //! plugin's time is not the deciding thread's CPU. An opening writes the
 //! one line every plugin kind writes.
 
-use std::cell::{Cell, RefCell};
+use std::{
+    cell::{Cell, RefCell},
+    time::Instant,
+};
 
+use parking_lot::Mutex;
 use thread_local::ThreadLocal;
 
+use super::runtime::RECONNECT_PAUSE;
 use crate::plugins::{
     breaker::{Breaker, Latency},
     config::BreakerSpec,
@@ -27,6 +32,9 @@ pub(crate) struct Unit {
     /// Per thread: the plugin's part in the decision open there, and what
     /// that decision charged the plugin ([`Unit::charge`]): its sample.
     part: ThreadLocal<Cell<(Part, u64)>>,
+    /// When a stream's failure last counted: a plugin's streams are one
+    /// lane to the breaker.
+    outage: Mutex<Option<Instant>>,
 }
 
 impl Unit {
@@ -36,6 +44,7 @@ impl Unit {
             breaker: Breaker::new(spec),
             latency: ThreadLocal::new(),
             part: ThreadLocal::new(),
+            outage: Mutex::new(None),
         }
     }
 
@@ -69,6 +78,23 @@ impl Unit {
         if self.breaker.failure(now_micros) {
             self.opened("failures");
         }
+    }
+
+    /// A stream's failure, dated `at` by its own lane: the instant its pause
+    /// runs from. The breaker hears a plugin's streams as one lane: at most
+    /// one failure a pause, which is all one lane can raise. So the streams
+    /// that end together at a restart are one failure, one deciding thread
+    /// and sixteen count the same at any phases, and a plugin that stays away
+    /// counts once a pause. A lane's next failure is dated a whole pause
+    /// after its last, so it is at or past the window by arithmetic.
+    pub(crate) fn stream_failed(&self, at: Instant, now: impl FnOnce() -> u64) {
+        let mut counted = self.outage.lock();
+        if counted.is_some_and(|last| at.saturating_duration_since(last) < RECONNECT_PAUSE) {
+            return;
+        }
+        *counted = Some(at);
+        drop(counted);
+        self.report(now());
     }
 
     /// Whether the plugin already failed decision `decision` on this thread;
@@ -150,6 +176,8 @@ impl Unit {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::Unit;
     use crate::plugins::{breaker::Latency, config::BreakerSpec};
 
@@ -260,5 +288,31 @@ mod tests {
         }
         assert!(unit.is_open(5));
         assert_eq!(unit.opens(), 1);
+    }
+
+    /// The breaker hears a plugin's streams as one lane: at most one failure
+    /// a pause. Two threads' streams end together, and each is asked for
+    /// again a pause after its own failure: the first at 100, 200 and 300
+    /// ms, the second, whose decisions come later, at 151 and 251. Under a
+    /// threshold of four the count reads one thread's: closed through 251,
+    /// open at 300. Counted by half a pause, the second thread's reopens
+    /// count too and the breaker opens at 251.
+    #[test]
+    fn the_streams_of_one_plugin_count_as_one_lane_at_any_phases() {
+        let unit = Unit::new(
+            "unit",
+            BreakerSpec {
+                failures: 4,
+                window_micros: 60_000_000,
+                cooldown_micros: 60_000_000,
+            },
+        );
+        let start = Instant::now();
+        for millis in [0, 1, 100, 151, 200, 251] {
+            unit.stream_failed(start + Duration::from_millis(millis), || 5);
+        }
+        assert_eq!(unit.opens(), 0, "three pauses, three failures");
+        unit.stream_failed(start + Duration::from_millis(300), || 5);
+        assert_eq!(unit.opens(), 1, "the fourth pause's failure opens");
     }
 }
