@@ -377,6 +377,61 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             );
         }
 
+        // Two draws compared by the loads the engines told: under the
+        // power-of-two preset no pick names the engine that holds requests.
+        // Unread, the loads leave the busy row one pick in six, so 64 asks
+        // miss it less than once in 100,000 runs.
+        harness
+            .apply("power_of_two")
+            .expect("a preset of this build applies");
+        for n in 0..ASKS {
+            let pick = picked(&mut harness, nth("two", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(
+                pick.engine, busy,
+                "of two draws the better load is taken: {pick:?}"
+            );
+        }
+
+        // The first row the filters keep, in the host's order: under the
+        // passthrough preset every pick names the view's first row, and an
+        // ask that names it tried is answered with the view's second.
+        harness
+            .apply("passthrough")
+            .expect("a preset of this build applies");
+        let pool = harness.view(MODEL, Role::Single).expect("the view");
+        let listed: Vec<(usize, u16)> = pool.iter().map(|row| (row.engine, row.rank)).collect();
+        let first = picked(&mut harness, nth("through", 0))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            Some((first.engine, first.rank)),
+            listed.first().copied(),
+            "a passthrough pick is the first row the host lists: {first:?} of {listed:?}"
+        );
+        for n in 1..8 {
+            let again = picked(&mut harness, nth("through", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, first,
+                "a passthrough pick is one row whatever its seed"
+            );
+        }
+        let mut retry = nth("through", 8);
+        let facts = retry.facts.as_mut().expect("the ask states facts");
+        facts.tried = vec![first.id];
+        facts.attempt = 1;
+        let next = picked(&mut harness, retry)
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            Some((next.engine, next.rank)),
+            listed.get(1).copied(),
+            "past its tried first row a passthrough pick is the second: {next:?} of {listed:?}"
+        );
+
         // A rotation names every row before it names one again: under the
         // round-robin preset two turns of asks name each row twice.
         harness
