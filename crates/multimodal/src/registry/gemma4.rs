@@ -52,10 +52,7 @@ impl Gemma4Spec {
     }
 
     fn unsupported(modality: Modality) -> ModelRegistryError {
-        ModelRegistryError::UnsupportedModality {
-            spec: "gemma4",
-            modality,
-        }
+        ModelRegistryError::unsupported("gemma4", modality)
     }
 
     /// One replacement per image: `[begin] + n x <|image|> + [end]`.
@@ -352,10 +349,7 @@ impl ModelProcessorSpec for Gemma4Spec {
                     },
                 )?,
             )),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

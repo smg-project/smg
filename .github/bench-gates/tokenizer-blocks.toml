@@ -1,0 +1,32 @@
+# Regression gate for `cargo bench -p llm-tokenizer --bench encode_blocks`, the second row of the matrix in
+# .github/workflows/benchmark-tokenizer.yml, run on pull requests through scripts/bench_gate.py. The first
+# row gates the gateway's tokenizer_benchmark with tokenizer.toml, which records how a threshold is chosen
+# and the placement every row is built with (every function on a 64-byte boundary).
+#
+# The gate runs the whole file, one row: `encode_blocks/long_words`, a 10 KB text of long words through the
+# public encode path. The row is a pin. The native encoder's pre-tokenizer marks the piece starts of 64
+# bytes at a time (crates/tokenizer/src/native/block.rs) from flag bytes that a plain loop writes. The
+# compiler emits that loop as vector compares and nothing in the source asks for vectors, so a toolchain or
+# a change that leaves the loop scalar fails no test. Built with the loop and SLP vectorizers off
+# (`-C no-vectorize-loops -C no-vectorize-slp`), this row reads 2.5 times slower.
+#
+# Threshold: 10 %, the floor of tokenizer.toml's method and the threshold of its encode rows, which time
+# the same encoder (0.8 to 3.3 % on an identical build, 1.4 to 5.3 % across builds). The row guards a
+# factor of 2.5, so no spread of that size decides its verdict. Every job uploads bench-gate/results.json
+# with the raw per-run medians of both sides; the row's own spread on the hosted runner is read from those.
+#
+# The gate fails an id only when every pull-request run is slower than every base run, so one slow run
+# cannot fail the job.
+
+repeats = 3
+filter = "^encode_blocks/"
+
+# The files that feed this binary beyond the measured crate's sources: the base side is built with them as
+# the pull request has them (bench_gate.py build --sources-from), so the two binaries differ in the measured
+# code alone. The manifest is named because it declares the bench target.
+sources = ["crates/tokenizer/benches/encode_blocks.rs", "crates/tokenizer/Cargo.toml"]
+
+[[gate]]
+pattern = "^encode_blocks/long_words$"
+threshold = 0.10
+note = "2.5 times slower with the flag loop not vectorized"

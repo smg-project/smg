@@ -59,6 +59,10 @@ ON = ("policyController.enabled=true",)
 ELECTED = (*ON, "policyController.election.enabled=true")
 # The spellings of an election that is off.
 OFF = ((), ("policyController.election.enabled=false",), ("policyController.election=null",))
+# The strategy of a controller with the election off: no pod more at a
+# time, so the old pod is told to stop before the new one is made. The type
+# is the rolling update's, as with the election on.
+LONE_STRATEGY = {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}}
 # The variable the elected controller's address is read from: the kubelet
 # writes the pod's address in place of $(POD_IP).
 POD_IP = {"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}
@@ -755,6 +759,14 @@ def test_replicas_prefer_a_node_each_unless_an_affinity_is_given():
     )["spec"]["template"]["spec"]["affinity"]
     assert list(own) == ["nodeAffinity"]
 
+    # With the schema's check skipped, a count given as text that the
+    # manifest's reader takes as two prefers a node each as the number does.
+    for count in ("2e0", " 2"):
+        text = one(
+            render(*ELECTED, f"policyController.replicas={count}", skip_schema=True), "Deployment"
+        )["spec"]
+        assert text["template"]["spec"]["affinity"] == pair["template"]["spec"]["affinity"], count
+
 
 @needs_helm
 def test_the_election_names_its_lease_and_the_pods_own_address():
@@ -905,18 +917,57 @@ def test_the_rollout_follows_the_election():
 
 
 @needs_helm
+def test_with_the_election_off_an_upgrade_tells_the_old_pod_to_stop_first():
+    """Off, every pod leads alone, and the server's own strategy starts the
+    new pod beside the old one: two leaders until the new one is ready. The
+    lone controller rolls with no pod more at a time. Its strategy keeps the
+    rolling update's type and names both of its fields, as the elected one
+    does. The API refuses those fields beside Recreate, and a server-side
+    apply takes off a live object only what it put there: the server's own,
+    on a Deployment that named no strategy, would stay. So no upgrade
+    between the three strategies has a field to take off."""
+    for off in OFF:
+        assert one(render(*ON, *off), "Deployment")["spec"]["strategy"] == LONE_STRATEGY, off
+    served = {
+        "type": "RollingUpdate",
+        "rollingUpdate": {"maxSurge": "25%", "maxUnavailable": "25%"},
+    }
+    elected = one(render(*ELECTED), "Deployment")["spec"]["strategy"]
+    lone = one(render(*ON), "Deployment")["spec"]["strategy"]
+    for rendered in (lone, elected):
+        for live in (served, lone, elected):
+            # An apply that takes nothing off: a live field the manifest
+            # does not name stays beside the ones it names.
+            fields = {**live["rollingUpdate"], **rendered["rollingUpdate"]}
+            applied = {**live, **rendered, "rollingUpdate": fields}
+            assert applied == rendered, (rendered, live)
+            assert applied["type"] == "RollingUpdate", (rendered, live)
+
+
+@needs_helm
+def test_no_hook_delays_the_stop_signal():
+    """The lone controller's order rests on the stop signal reaching the old
+    pod at its delete: the old pod decides nothing from that signal on. A
+    preStop hook runs before the signal, and the old pod would lead beside
+    the new one for the hook's length: the container names no hook, with
+    the election on or off."""
+    for values in (ON, ELECTED):
+        assert "lifecycle" not in container(render(*values)), values
+
+
+@needs_helm
 def test_with_the_election_off_nothing_of_it_is_rendered():
-    """A release that does not turn the election on renders what it rendered
-    before the election, in each spelling of off: no object of the
-    election, and on the controller's Deployment of one replica no strategy,
-    no account, no variable and neither flag."""
+    """A release that does not turn the election on renders, in each spelling
+    of off, no object of the election, and on the controller's Deployment
+    of one replica the lone controller's strategy, no account, no variable
+    and neither flag."""
     for off in OFF:
         documents = render(*ON, *off)
         kinds = sorted(document["kind"] for document in of_the_controller(documents))
         assert kinds == ["Deployment", "Service"], off
         deployment = one(documents, "Deployment")["spec"]
         assert deployment["replicas"] == 1, off
-        assert "strategy" not in deployment, off
+        assert deployment["strategy"] == LONE_STRATEGY, off
         pod = deployment["template"]["spec"]
         assert "serviceAccountName" not in pod, off
         assert "serviceAccount" not in pod, off
@@ -927,10 +978,13 @@ def test_with_the_election_off_nothing_of_it_is_rendered():
 
 
 @needs_helm
-def test_more_than_one_replica_needs_the_election():
+def test_more_than_one_replica_needs_the_election(tmp_path):
     """With the election off every replica is a controller of its own: two
     would each lead alone. The render refuses them in each spelling of off
-    and says the two ways out; with the election on they render."""
+    and says the two ways out; with the election on they render. The
+    refusal reads the count as written, and judges it as a reader of the
+    manifest takes it: a number from a values file, a fraction above one,
+    and a text that reads there as a number above one."""
     for off in OFF:
         for replicas in (2, 3):
             refused = render_error(*ON, f"policyController.replicas={replicas}", *off)
@@ -940,18 +994,42 @@ def test_more_than_one_replica_needs_the_election():
             ) in refused, off
     pair = one(render(*ELECTED, "policyController.replicas=2"), "Deployment")["spec"]
     assert pair["replicas"] == 2
+    # A number from a values file, whole or a fraction above one: the
+    # refusal reads it as written.
+    values = tmp_path / "values.yaml"
+    for replicas, skip_schema in ((2, False), (2.5, True)):
+        values.write_text(yaml.safe_dump({"policyController": {"replicas": replicas}}))
+        refused = render_error(*ON, files=(values,), skip_schema=skip_schema)
+        assert (
+            f"policyController.replicas is {replicas} with policyController.election.enabled off"
+        ) in refused, replicas
+    # A text the manifest's reader takes as a number above one is refused as
+    # that number is. With the election on it is written as asked, for the
+    # API to judge.
+    for count in ("2e0", " 2"):
+        asked = f"policyController.replicas={count}"
+        refused = render_error(*ON, asked, skip_schema=True)
+        assert (
+            f"policyController.replicas is {count} with policyController.election.enabled off"
+        ) in refused, count
+        written = one(render(*ELECTED, asked, skip_schema=True), "Deployment")["spec"]["replicas"]
+        assert written == yaml.safe_load(f"count: {count}")["count"], count
 
 
 @needs_helm
-def test_a_replica_count_the_schema_refuses_is_written_as_asked():
+def test_a_replica_count_the_schema_refuses_is_written_as_asked(tmp_path):
     """With the schema's check skipped the helper compares the count and
     writes the value as the values hold it. A null stays the API's default
-    of one replica and a fraction stays for the API to refuse: neither is
-    written as zero."""
+    of one replica and a fraction, as text or as a number, stays for the API
+    to refuse: neither is written as zero or as its whole part."""
     unset = render(*ON, "policyController.replicas=null", skip_schema=True)
     assert one(unset, "Deployment")["spec"]["replicas"] is None
     fraction = render(*ON, "policyController.replicas=1.5", skip_schema=True)
     assert one(fraction, "Deployment")["spec"]["replicas"] == 1.5
+    values = tmp_path / "values.yaml"
+    values.write_text(yaml.safe_dump({"policyController": {"replicas": 1.5}}))
+    number = render(*ON, files=(values,), skip_schema=True)
+    assert one(number, "Deployment")["spec"]["replicas"] == 1.5
 
 
 @pytest.fixture
@@ -1020,7 +1098,7 @@ def test_the_chart_refuses_what_the_controller_refuses_at_start():
         unknown = render_error(*ON, f"policyController.identityAsTold={names}", skip_schema=True)
         assert "policyController.identityAsTold names" in unknown
         assert "none of the chart's listeners (gateway, control, replication)" in unknown
-    assert "policyController.identityAsTold is gateway" in render_error(
+    assert 'policyController.identityAsTold is "gateway"' in render_error(
         *ON, "policyController.identityAsTold=gateway", skip_schema=True
     )
     # The names the schema takes render the same with its check skipped.
@@ -1028,6 +1106,25 @@ def test_the_chart_refuses_what_the_controller_refuses_at_start():
         render(*ON, "policyController.identityAsTold={replication,gateway}", skip_schema=True)
     )["args"]
     assert told[told.index("--identity-as-told") + 1] == "gateway,replication"
+    # A null is the value left out, with the check skipped too.
+    unset = render(*ON, "policyController.identityAsTold=null", skip_schema=True)
+    assert "--identity-as-told" not in container(unset)["args"]
+
+
+@needs_helm
+@pytest.mark.parametrize("written", ["false", "0", '""', "{}"])
+def test_a_told_value_that_is_no_list_is_refused_though_it_reads_as_empty(
+    written: str, tmp_path: Path
+):
+    """With the schema's check skipped, a value that is no list is refused as
+    it was written. One that reads as empty never renders as no listener
+    told: null alone is the value left out."""
+    values = tmp_path / "values.yaml"
+    values.write_text(f"policyController:\n  identityAsTold: {written}\n")
+    refused = render_error(*ON, files=(values,), skip_schema=True)
+    assert f"policyController.identityAsTold is {written}: a list of listeners' names" in refused
+    # The schema refuses each first.
+    assert "policyController.identityAsTold" in render_error(*ON, files=(values,))
 
 
 def schema_block() -> dict:
@@ -1381,6 +1478,9 @@ def test_the_image_job_starts_on_what_these_cases_read():
         # stock one: its package and what the package compiles.
         REPO / "examples" / "policy-controller" / "Cargo.toml",
         REPO / "examples" / "policy-controller" / "src" / "main.rs",
+        # The cargo configuration the build reads: the allocator of an arm64
+        # binary takes its page size from it.
+        REPO / ".cargo" / "config.toml",
     ] + [
         path
         for path in sorted(CHART.rglob("*"))
@@ -1934,3 +2034,30 @@ def test_a_lease_deleted_under_running_pods_leaves_them_ready_and_nobody_leading
         for pod in pods:
             pod.end()
         stand_in.close()
+
+
+def test_the_image_job_builds_the_example_for_both_platforms_and_pushes_nothing():
+    """The example controller's image is built by the image's file with the
+    package argument naming the example: once for the runner's platform and
+    once for arm64 by the file's own cross build, behind an emulation step,
+    since the final stage runs the binary. No step of the job pushes an image
+    or logs in to a registry."""
+    document = yaml.safe_load(IMAGE_WORKFLOW.read_text())
+    steps = document["jobs"]["image"]["steps"]
+    package = "--build-arg PACKAGE=policy-controller-example"
+    builds = [at for at, step in enumerate(steps) if package in step.get("run", "")]
+    assert len(builds) == 2, f"{len(builds)} step(s) build the example's image"
+    for at in builds:
+        assert "--file docker/policy-controller.Dockerfile" in steps[at]["run"]
+    (cross,) = [at for at in builds if "--platform" in steps[at]["run"]]
+    assert "--platform linux/arm64" in steps[cross]["run"]
+    emulated = [
+        at
+        for at, step in enumerate(steps)
+        if step.get("uses", "").startswith("docker/setup-qemu-action@")
+    ]
+    assert emulated and emulated[0] < cross, "the arm64 build's final stage runs the binary"
+    for step in steps:
+        told = step.get("run", "") + " " + step.get("uses", "")
+        for word in ("docker push", "--push", "docker login", "login-action"):
+            assert word not in told, f"the step {step.get('name')!r} holds {word!r}"

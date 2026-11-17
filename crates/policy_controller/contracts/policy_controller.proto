@@ -60,33 +60,38 @@
 // tells it; on Session, the NotLeader frame ahead
 // of the status), a first frame that is not Hello or a second Hello, no
 // protocol version in common, a floor above the term, a revision or
-// digest guard, a Decide stream of a gateway that is not present where
-// the controller leads (at its open, at its first request under a term,
-// and an open one when the presence ends), or a rejoin position not
-// held under its term (a resync_required batch precedes it; the rejoin
-// opens a new Replicate stream); INVALID_ARGUMENT a spec, registration
-// or patch rejected (the field path in ApplyResult.issues, and at the
-// head of a refused registration's or patch's status message), a
+// digest guard, a Decide stream of a gateway that is not present where the
+// controller leads (at its open, at its first request under a term, and an
+// open one when the presence ends), a rejoin position not held under its
+// term (a resync_required batch precedes it; the rejoin opens a new
+// Replicate stream), or a replication call on a controller whose lease
+// lives in its own process (it has no standby); INVALID_ARGUMENT a spec,
+// registration or patch rejected (the field path in ApplyResult.issues, and
+// at the head of a refused registration's or patch's status message), a
 // Dispatched, Completed or Released whose side, class, reason or number
 // reads wrong, a Released that names neither a lease nor a ticket (the
 // field's name in the message), or a DecideRequest field out of its range
 // in this protocol version (the status message names the field, and the
-// stream closes); RESOURCE_EXHAUSTED a relay over its per-subscriber
-// budget or a standby over its backlog (a resync_required batch precedes
-// it), a Hello past the controller's ceiling of present gateways, a
-// Decide stream past its gateway's Welcome.max_decide_streams, a Session
-// frame over the transport's limit of 4 MiB a message, or a Decide frame
-// over 64 KiB as encoded; ALREADY_EXISTS a Hello whose id collides with
-// another present gateway's, refused while that one stands, or an add of
-// a registered URL; NOT_FOUND a replace of an absent URL, or no worker
-// under the id; DEADLINE_EXCEEDED a Session stream that said no Hello
-// within 5 s of its open; UNAVAILABLE a standby not yet synced, or a
-// Decide stream open when the controller closes its listeners at its
-// shutdown (its gateway opens the next one on the leader);
+// stream closes); RESOURCE_EXHAUSTED a relay over its per-subscriber budget
+// or a standby over its backlog (a resync_required batch precedes it), a
+// complete snapshot above one message, a Hello past the controller's
+// ceiling of present gateways, a Decide stream past its gateway's
+// Welcome.max_decide_streams, a Session frame over the transport's limit of
+// 4 MiB a message, or a Decide frame over 64 KiB as encoded; ALREADY_EXISTS
+// a Hello whose id collides with another present gateway's, refused while
+// that one stands, or an add of a registered URL; NOT_FOUND a replace of an
+// absent URL, or no worker under the id; DEADLINE_EXCEEDED a Session stream
+// that said no Hello within 5 s of its open; UNAVAILABLE a standby not yet
+// synced, a leader that does not write under its term (the moment after its
+// take, and for as long as its log followed a term at or above the one it
+// took), or a Decide stream open when the controller closes its listeners
+// at its shutdown (its gateway opens the next one on the leader);
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read
 // under a term the election left before its seat was taken, or a session
 // a newer one of its gateway replaced, or a worker row that moved under a
-// membership call (a second writer: read the row again); OUT_OF_RANGE and
+// membership call (a second writer: read the row again); UNIMPLEMENTED a
+// call, a frame kind or a mode this build does not serve, by its name;
+// OUT_OF_RANGE and
 // DATA_LOSS raised by no handler, forwarded as RelayResync. The
 // transport answers OUT_OF_RANGE itself to a request over its limit of
 // 4 MiB on a call of one request message; on a Session or Decide stream
@@ -517,6 +522,10 @@ message WorkerRow {
   // engine, the registration key for a single rank.
   string engine = 24;
   HealthPolicy health_policy = 25;
+  // How long ago the row was admitted, at the send. Set in a snapshot's
+  // rows, where a standby restores the instant from it; 0 in an event's
+  // row, which is admitted where it is applied.
+  uint64 admitted_age_ms = 26;
 }
 
 // A host-local wire is reachable from one gateway only.
@@ -808,6 +817,10 @@ message Snapshot {
   // The term the event at `replication_seq` was written under; present with
   // it, zero with it.
   uint64 replication_term = 18;
+  // The membership epoch at `replication_seq`; present with it. A standby
+  // restored from the snapshot numbers its next membership change after it,
+  // as the leader does.
+  uint64 membership_epoch = 19;
 }
 
 // The health precedence's inputs.
@@ -826,6 +839,9 @@ message LoadSample {
   fixed64 worker_id = 1;
   uint32 dp_rank = 2;
   LoadRow load = 3;
+  // Whether the report counts resident tokens: the row's 0 is both "none"
+  // and "not counted". The host's own reading, in no plugin's view.
+  bool resident_counted = 4;
 }
 
 message SessionRow {
@@ -950,6 +966,8 @@ message ApplyRequest {
   bytes document = 1;
   // `yaml` or `json`.
   string format = 2;
+  // A write states its mode: none, or a number that is no mode, is
+  // INVALID_ARGUMENT by the field's name.
   ApplyMode mode = 3;
   // The digest of the generation the caller edited; FAILED_PRECONDITION when
   // another apply landed first.
@@ -1106,6 +1124,9 @@ message ReplicationBatch {
   // current term: a catch-up batch splits at a term boundary, so a standby
   // records each position under its write term.
   uint64 term = 2;
+  // No events: the leader's heartbeat, one a second on an idle stream.
+  // `first_seq` is then the position after the leader's head and `term` the
+  // head's: a standby that applied `first_seq - 1` stands at the head.
   repeated ReplicationEvent events = 3;
   // The standby's backlog was cut, or its `last_applied_seq` is not held
   // under `last_applied_term`: re-sync from GetSnapshot (its `replication_seq`
@@ -1125,8 +1146,17 @@ message ReplicationEvent {
     GenerationEvent generation = 6;
     IdAssignment ids = 7;
     LeaseEnd lease_end = 8;
+    // The first position of a term: the leader's take, journaled before its
+    // first write under the term. It changes no row; a standby journals the
+    // position. An event with no case set is one the reader's build does not
+    // know: a standby never skips it, it leaves the synced state at that
+    // position.
+    TermStart term_start = 9;
   }
 }
+
+// The start of the term its batch is written under.
+message TermStart {}
 
 // A generation as the leader applied it (the status, the document the
 // gateways receive), so a standby serves GetPolicySpec and RollbackPolicySpec

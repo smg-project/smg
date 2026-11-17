@@ -283,7 +283,7 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
         let refused = client
             .get_snapshot(SnapshotRequest::default())
             .await
-            .expect_err("no step serves the call");
+            .expect_err("no step or no follower serves the call");
         assert_eq!(refused.code(), snapshot, "GetSnapshot on {listener}");
     }
 

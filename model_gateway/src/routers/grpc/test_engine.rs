@@ -9,7 +9,7 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tonic::transport::server::{Router, TcpIncoming};
 
 /// A mock engine serving `model_id` on a loopback port, as its URL and its
@@ -71,4 +71,31 @@ pub(crate) async fn serve_on_loopback(router: Router) -> (SocketAddr, JoinHandle
             .expect("the test's engine server");
     });
     (addr, server)
+}
+
+/// `router` served on `listener`, a socket the caller bound, until `stopped`
+/// resolves (its sender sends or is dropped), as the server task: a worker
+/// that goes away in the case. The task then stops listening, closes every
+/// connection it serves with a GOAWAY and ends once they are closed, so on a
+/// port that stays reserved after it the next dial is refused.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bounded test fixture; the task ends at the caller's signal or with the test"
+)]
+pub(crate) fn serve_until(
+    router: Router,
+    listener: TcpListener,
+    stopped: oneshot::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        router
+            .serve_with_incoming_shutdown(
+                TcpIncoming::from(listener).with_nodelay(Some(true)),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .expect("the test's engine server");
+    })
 }

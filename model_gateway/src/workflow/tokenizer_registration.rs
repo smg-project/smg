@@ -25,7 +25,7 @@ use wfaas::{
     WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
 };
 
-use super::data::TokenizerWorkflowData;
+use super::data::{require_app_context, TokenizerWorkflowData};
 use crate::{
     app_context::AppContext,
     config::{TokenizerCacheConfig, TEMPLATE_PARSER},
@@ -272,12 +272,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         context: &mut WorkflowContext<TokenizerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let config = &context.data.config;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.app_context.as_ref())?.clone();
 
         info!(
             "Loading tokenizer '{}' (id: {}) from source: {}{}",

@@ -11,6 +11,8 @@ use crate::{
     view::{WireModes, WorkerId},
 };
 
+mod written;
+
 const MODES: [Pairing; 3] = [Pairing::Off, Pairing::Lenient, Pairing::Strict];
 const COMPARING: [Pairing; 2] = [Pairing::Lenient, Pairing::Strict];
 
@@ -368,6 +370,29 @@ fn a_normalized_descriptor_holds_no_blank_value() {
     // A descriptor that holds no blank comes back as it is.
     assert_eq!(read.clone().normalized(), read);
     assert!(PairingDescriptor::default().is_normalized());
+}
+
+/// A worker of a descriptor that names `transport` as it is written, with
+/// no door before the rule.
+fn as_written(transport: &str) -> PairingDescriptor {
+    PairingDescriptor {
+        transport: Some(transport.to_string()),
+        ..PairingDescriptor::default()
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a descriptor reaches the rule normalized")]
+fn a_blank_value_stops_the_rule_in_a_debug_build() {
+    let _member = Member::new(WorkerId(1), WireModes::GRPC, "", Some(&as_written("")));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a descriptor reaches the rule normalized")]
+fn a_padded_value_stops_the_rule_in_a_debug_build() {
+    let _member = Member::new(WorkerId(1), WireModes::GRPC, "", Some(&as_written(" a ")));
 }
 
 #[test]

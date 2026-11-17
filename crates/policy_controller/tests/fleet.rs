@@ -16,10 +16,14 @@
 //! ok for the dead and the hung one, and nothing of it for another gateway;
 //! a frame that reads wrong ends the session of the gateway that sent it.
 //!
-//! No decision is asked yet: of a gateway's calls the service answers
-//! `Leader` and takes the session's reports, and the case asserts both end
-//! to end. The decisions take the views' place when the service answers
-//! them.
+//! The gateway asks its first decisions end to end: with a preset of the
+//! build applied in the case's process, since no call applies a spec yet,
+//! the reference client asks on its decide stream and each pick names a
+//! rank of the fleet. The call's bounds are the client's own door: an id at
+//! the range's end is answered, a frame past the size leaves cut at its
+//! tail, and a frame the call refuses ends the stream, the next ask opening
+//! a new one. The views the case still reads from the store give way to
+//! decisions next.
 //!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
@@ -49,10 +53,14 @@ use fleet::{
     ROOM,
 };
 use net::vm_rss_kib;
+use prost::Message as _;
 use smg_policy_controller::{
-    client::{self, blocking, Client},
+    client::{self, blocking, Answer, Client},
     controller::{State, PROTOCOL_VERSION},
-    proto::{completed::Class, principal, released, Completed, Released, Side},
+    proto::{
+        completed::Class, decision::Outcome, principal, released, Completed, DecideRequest,
+        Decision, Released, RequestFacts, ShedReason, Side,
+    },
     store::{LaneCounts, WorkerStatus},
     view::{Role, SignalSource},
 };
@@ -92,6 +100,41 @@ const FLEET: [Shape; 5] = [
 
 /// The requests the case holds on one engine.
 const HELD: u32 = 3;
+
+/// The largest `DecideRequest` as encoded, as the contract states it.
+const FRAME: usize = 64 * 1024;
+
+/// An ask for the fleet's model named `id`. It brings the budget of a
+/// client's own patience: an ask that states none has none left.
+fn ask(id: &[u8]) -> DecideRequest {
+    DecideRequest {
+        request_id: id.to_vec(),
+        facts: Some(RequestFacts {
+            model: MODEL.to_owned(),
+            budget_micros: 5_000_000,
+            ..RequestFacts::default()
+        }),
+        constraints: None,
+    }
+}
+
+/// Asks, and reads the pick's first target as the engine and the rank of
+/// the fleet it names.
+async fn picked(harness: &mut Harness, ask: DecideRequest) -> Result<(usize, u16), String> {
+    let answer = harness.client().decide(ask).await;
+    let Ok(Answer::Decision(Decision {
+        outcome: Some(Outcome::Pick(pick)),
+        ..
+    })) = &answer
+    else {
+        return Err(format!("no pick: {answer:?}"));
+    };
+    let target = pick.targets.first().ok_or("a pick with no target")?;
+    match harness.named(target.id) {
+        Some((engine, rank)) if target.dp_rank == u32::from(rank) => Ok((engine, rank)),
+        _ => Err(format!("a target that is no row of the fleet: {target:?}")),
+    }
+}
 
 /// The whole case's bound: its waits sum to seconds on an idle host.
 const CASE: Duration = Duration::from_secs(180);
@@ -196,6 +239,53 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .collect();
         two.sort_unstable();
         assert_eq!(two, [0, 1], "each rank of one engine is a row of its own");
+
+        // Decide. A preset of the build is applied in the case's process,
+        // since no call applies a spec yet. The gateway asks on its decide
+        // stream, and the pick names a rank of the fleet.
+        harness
+            .apply("random")
+            .expect("a preset of this build applies");
+        picked(&mut harness, ask(b"first"))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert!(
+            harness.term_floor() >= leader.term,
+            "an answer's term never lowers the floor"
+        );
+        // The call's bounds are the client's own door. An id at the end of
+        // its range is answered.
+        picked(&mut harness, ask(&[7; 256]))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        // A frame past the size leaves cut at its tail, and the cut is
+        // counted: eight bytes a hash.
+        let mut long = ask(b"long");
+        let facts = long.facts.as_mut().expect("the ask states facts");
+        facts.block_hashes = (0u64..).take(8_300).collect();
+        let over = long.encoded_len() - FRAME;
+        picked(&mut harness, long)
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            harness.client().hashes_cut(),
+            over.div_ceil(8),
+            "{over} bytes over"
+        );
+        // A frame the call refuses ends the stream by the field's name, and
+        // the next ask opens a new one.
+        let mut wrong = ask(b"wrong");
+        wrong.facts.as_mut().expect("the ask states facts").phase = 99;
+        let refused = harness.client().decide(wrong).await;
+        assert!(
+            matches!(&refused, Err(client::Error::Status(status))
+                if status.code() == Code::InvalidArgument
+                    && status.message().contains("facts.phase")),
+            "{refused:?}"
+        );
+        picked(&mut harness, ask(b"after"))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
 
         // The loads follow the fleet: requests held on one engine reach its
         // row from that engine's own report, and no other row.
@@ -633,7 +723,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
 
         harness.stop().await.expect("a clean stop");
     };
-    tokio::time::timeout(CASE, case)
+    tokio::time::timeout(CASE, Box::pin(case))
         .await
         .expect("the case ends inside its outer bound");
 }
@@ -655,11 +745,12 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
                         .principal
                         .as_ref()
                         .map(|told| told.subject.clone());
-                    Ok((leader, client.term_floor(), subject))
+                    let decided = client.decide(ask(b"blocking"))?;
+                    Ok((leader, client.term_floor(), subject, decided))
                 });
             let _ = answered.send(asked.map_err(|error| error.to_string()));
         });
-        let (leader, floor, subject) = tokio::time::timeout(ROOM, answer)
+        let (leader, floor, subject, decided) = tokio::time::timeout(ROOM, answer)
             .await
             .expect("the blocking client answers inside its bound")
             .expect("the client's thread sends its answer")
@@ -671,6 +762,13 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
             subject.as_deref(),
             Some("blocking-gateway"),
             "the welcome names the gateway the client states"
+        );
+        // Nothing was applied to this controller: no generation binds the
+        // model, and the answer is the engine's own shed.
+        assert!(
+            matches!(&decided, Answer::Decision(Decision { outcome: Some(Outcome::Shed(shed)), .. })
+                if shed.reason() == ShedReason::PolicyDeclined && shed.emptied_by == "binding"),
+            "{decided:?}"
         );
         harness.stop().await.expect("a clean stop");
     };

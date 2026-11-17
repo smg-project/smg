@@ -32,7 +32,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     affinity::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
     builtins::{
-        FewestSessions, LeastLoad, LeastRequests, ResidentWork, SessionAffinity,
+        FewestSessions, LeastLoad, LeastRequests, ResidentWork, SampledBest, SessionAffinity,
         DEFAULT_MEAN_PREFILL_TOKENS,
     },
     catalog::{Catalog, Found},
@@ -87,7 +87,8 @@ pub const SCORERS: [&str; 10] = [
 /// The pickers of v1; `count-first` and `power-of-two-count-first` compare
 /// the requests in flight before the score; `manual` leaves the placement
 /// to the binding's sessions rule, by its assignment; `best-with-temperature`
-/// takes its temperature and is written in the parameter form.
+/// takes its temperature and is written in the parameter form, as `best` is
+/// when it takes a sample.
 pub const PICKERS: [&str; 9] = [
     "best",
     "round-robin",
@@ -107,6 +108,10 @@ static STOCK: LazyLock<Catalog> = LazyLock::new(Catalog::builtin);
 /// A sampling picker compares its draws by the profile's scorers, so it
 /// needs at least one.
 const SAMPLING_PICKERS: [&str; 2] = ["power-of-two", "power-of-two-count-first"];
+
+/// The most rows the `best` picker's sample may hold: a row joins the
+/// sample after a search of the rows already in it.
+const MAX_SAMPLE: u32 = 64;
 
 /// The side names a binding's `profiles` map may use.
 const SIDES: [&str; 4] = ["single", "prefill", "decode", "encode"];
@@ -151,6 +156,19 @@ pub struct Needs {
     /// candidate and nothing is refused. What holds a host to the need is
     /// the builder of its view, by a case of its own.
     pub affinity: bool,
+    /// The sample of a picker that decides a large pool by a draw of this
+    /// many rows and the rows the host names; `0` for none. A host that can
+    /// name the request's holders and the pool's warming rows
+    /// ([`NamedAffinity`](crate::NamedAffinity)) hands those in the
+    /// column's place, each list capped at this many rows: the holders by
+    /// depth, whole depth groups from the deepest while they fit and the
+    /// group at the cap's edge by a uniform draw from the decision's seed;
+    /// the warming rows by that draw over their whole list. A host that
+    /// cannot fills the column, and the pool is read whole. The cap of a
+    /// decision is its own profile's, which
+    /// [`Engine::needs_for`](crate::Engine::needs_for) says: the engine's
+    /// summary holds the largest sample of every profile.
+    pub sample: u32,
 }
 
 impl Needs {
@@ -169,6 +187,7 @@ impl Needs {
             active_sessions: self.active_sessions || other.active_sessions,
             session_in_flight: self.session_in_flight || other.session_in_flight,
             affinity: self.affinity || other.affinity,
+            sample: self.sample.max(other.sample),
         }
     }
 }
@@ -600,6 +619,18 @@ pub struct ResidentWorkParams {
     pub request_tokens: u32,
 }
 
+/// The `best` picker's parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BestParams {
+    /// How many rows the picker draws where the host names the request's
+    /// holders and the pool's warming rows: a pool of more than twice this
+    /// many rows is decided by that sample and the named rows, any other by
+    /// the whole pool. From 1 to 64.
+    #[schemars(range(min = 1, max = 64))]
+    pub sample: u32,
+}
+
 /// The `best-with-temperature` picker's parameters.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -943,6 +974,7 @@ impl JsonSchema for ScoreSpec {
 #[derive(Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum PickStage {
+    Best(BestParams),
     BestWithTemperature(BestWithTemperatureParams),
 }
 
@@ -950,6 +982,7 @@ impl PickStage {
     /// The picker's name, as the document spells it.
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Best(_) => "best",
             Self::BestWithTemperature(_) => "best-with-temperature",
         }
     }
@@ -995,6 +1028,11 @@ impl Serialize for PickSpec {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Name(name) => serializer.serialize_str(name),
+            Self::Params(PickStage::Best(p)) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("best", p)?;
+                map.end()
+            }
             Self::Params(PickStage::BestWithTemperature(p)) => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("best-with-temperature", p)?;
@@ -1006,11 +1044,12 @@ impl Serialize for PickSpec {
 
 /// The one picker of a pick entry's map, read by its key.
 fn picker_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<PickStage, A::Error> {
-    const WITH_PARAMETERS: [&str; 1] = ["best-with-temperature"];
+    const WITH_PARAMETERS: [&str; 2] = ["best", "best-with-temperature"];
     let Some(key) = map.next_key::<String>()? else {
         return Err(de::Error::custom("a pick entry names one picker"));
     };
     let stage = match key.as_str() {
+        "best" => PickStage::Best(map.next_value()?),
         "best-with-temperature" => PickStage::BestWithTemperature(map.next_value()?),
         other => return Err(de::Error::unknown_variant(other, &WITH_PARAMETERS)),
     };
@@ -1539,6 +1578,60 @@ pub enum SpecError {
     NoCanonicalForm(String),
 }
 
+impl SpecError {
+    /// The field of the document the error is about, as a path from the
+    /// document's root in the document's own names (`profiles.default.pick`,
+    /// `bindings[2].match.model`): what a `SpecIssue` carries. It names the
+    /// field to edit: an unknown stage is at the list that names it, a
+    /// binding's error at the binding's field, and a path the validator
+    /// built is handed back as it stands. Empty where the error is about no
+    /// one field of a document.
+    pub fn field_path(&self) -> String {
+        match self {
+            Self::Kind(_) => "kind".to_owned(),
+            Self::ApiVersion(_) => "apiVersion".to_owned(),
+            Self::UnknownFilter { profile, .. } => format!("profiles.{profile}.filter"),
+            Self::UnknownScorer { profile, .. } | Self::PickerRunsNoScorer { profile, .. } => {
+                format!("profiles.{profile}.score")
+            }
+            Self::UnknownPicker { profile, .. } | Self::PickerNeedsScorer { profile, .. } => {
+                format!("profiles.{profile}.pick")
+            }
+            Self::UnknownProfile { index, .. } => format!("bindings[{index}]"),
+            Self::NoProfile { index }
+            | Self::ProfileUnderPlan { index, .. }
+            | Self::ProfileTwice { index } => format!("bindings[{index}].profile"),
+            Self::SideUnnamed { index, side, .. } => format!("bindings[{index}].profiles.{side}"),
+            Self::UnknownSide { index, side } | Self::SideNotInPlan { index, side, .. } => {
+                format!("bindings[{index}].profiles.{side}")
+            }
+            Self::PlanPhases { index, .. } => format!("bindings[{index}].match.phase"),
+            Self::BadModelGlob { index, .. } => format!("bindings[{index}].match.model"),
+            // The one sessions refusal that is about the binding's plan.
+            Self::BadSessions {
+                index,
+                name: "plan",
+                ..
+            } => format!("bindings[{index}].plan"),
+            Self::BadSessions { index, name, .. } => format!("bindings[{index}].sessions.{name}"),
+            Self::NoBindings { .. } => "bindings".to_owned(),
+            Self::IndexOverlap { first, .. } => format!("index.{first}"),
+            Self::HashIndexNeedsBoundaries { model } => format!("index.{model}.kind"),
+            Self::TooManyProfiles { .. } | Self::Empty => "profiles".to_owned(),
+            Self::TooManyHeaders { .. } => "view.headers".to_owned(),
+            Self::BadField { path, .. }
+            | Self::NotInBuild { path, .. }
+            | Self::DeniedHeader { path, .. }
+            | Self::HeaderNotAllowed { path, .. }
+            | Self::Duplicate { path, .. }
+            | Self::UnknownProfileAt { path, .. }
+            | Self::CanaryForm { path, .. }
+            | Self::Reserved { path, .. } => path.clone(),
+            Self::UnknownPreset(_) | Self::NoCanonicalForm(_) => String::new(),
+        }
+    }
+}
+
 /// A field path under construction, for the messages.
 struct At(String);
 
@@ -1971,6 +2064,16 @@ fn picker_of(
                 })
             }
         },
+        PickSpec::Params(PickStage::Best(p)) => {
+            if !(1..=MAX_SAMPLE).contains(&p.sample) {
+                return Err(at.sub("pick").sub("best").bad(
+                    "sample",
+                    p.sample,
+                    "a whole number from 1 to 64",
+                ));
+            }
+            Resolved::Built(Box::new(SampledBest::new(p.sample)))
+        }
         PickSpec::Params(PickStage::BestWithTemperature(p)) => {
             if !at_or_above_zero(p.temperature) {
                 return Err(at.sub("pick").sub("best-with-temperature").bad(
@@ -2667,7 +2770,9 @@ impl PolicySpec {
                     "kv-pressure".into(),
                     "least-load".into(),
                 ],
-                pick: "best".into(),
+                // A large pool is decided by a draw of sixteen rows and the
+                // rows the host names: its holders and its warming rows.
+                pick: PickStage::Best(BestParams { sample: 16 }).into(),
             },
             other => return Err(SpecError::UnknownPreset(other.to_string())),
         };
@@ -4025,6 +4130,25 @@ mod tests {
         assert_eq!(hashed.index["chat-*"].sweep_s, 120);
     }
 
+    /// A zero count of an index key is refused whole: by its path, its
+    /// value and its reason.
+    #[test]
+    fn a_zero_count_of_an_index_key_is_refused_by_path_value_and_reason() {
+        for count in ["ttl_s", "max_size", "sweep_s"] {
+            let spec = doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","index":{{"*":{{"{count}":0}}}},"profiles":{{"p":{{"pick":"best"}}}}}}"#
+            ));
+            assert_eq!(
+                spec.validate().err(),
+                Some(SpecError::BadField {
+                    path: format!("index.*.{count}"),
+                    value: "0".to_owned(),
+                    reason: "above zero",
+                })
+            );
+        }
+    }
+
     #[test]
     fn the_power_of_two_preset_has_four_forms_by_its_load_metric() {
         let form = |metric| {
@@ -4890,6 +5014,257 @@ mod tests {
         );
     }
 
+    /// Every refusal names the field it is about, in the document's own
+    /// names; a path the validator built is handed back as it stands.
+    #[test]
+    fn every_refusal_names_its_field() {
+        let word = || "x".to_owned();
+        let profile = || "default".to_owned();
+        let built = || "a.b[0]".to_owned();
+        let rows = [
+            (SpecError::Kind(word()), "kind"),
+            (SpecError::ApiVersion(word()), "apiVersion"),
+            (
+                SpecError::UnknownFilter {
+                    profile: profile(),
+                    name: word(),
+                },
+                "profiles.default.filter",
+            ),
+            (
+                SpecError::UnknownScorer {
+                    profile: profile(),
+                    name: word(),
+                },
+                "profiles.default.score",
+            ),
+            (
+                SpecError::PickerRunsNoScorer {
+                    profile: profile(),
+                    picker: word(),
+                },
+                "profiles.default.score",
+            ),
+            (
+                SpecError::UnknownPicker {
+                    profile: profile(),
+                    name: word(),
+                },
+                "profiles.default.pick",
+            ),
+            (
+                SpecError::PickerNeedsScorer {
+                    profile: profile(),
+                    picker: word(),
+                },
+                "profiles.default.pick",
+            ),
+            (
+                SpecError::UnknownProfile {
+                    index: 2,
+                    name: word(),
+                },
+                "bindings[2]",
+            ),
+            (SpecError::NoProfile { index: 2 }, "bindings[2].profile"),
+            (
+                SpecError::ProfileUnderPlan {
+                    index: 2,
+                    plan: "pd-pair",
+                },
+                "bindings[2].profile",
+            ),
+            (SpecError::ProfileTwice { index: 2 }, "bindings[2].profile"),
+            (
+                SpecError::SideUnnamed {
+                    index: 2,
+                    plan: "pd-pair",
+                    side: "decode",
+                },
+                "bindings[2].profiles.decode",
+            ),
+            (
+                SpecError::UnknownSide {
+                    index: 2,
+                    side: "left".to_owned(),
+                },
+                "bindings[2].profiles.left",
+            ),
+            (
+                SpecError::SideNotInPlan {
+                    index: 2,
+                    plan: "single",
+                    side: "decode".to_owned(),
+                },
+                "bindings[2].profiles.decode",
+            ),
+            (
+                SpecError::PlanPhases {
+                    index: 2,
+                    plan: "pd-pair",
+                    side: "decode",
+                },
+                "bindings[2].match.phase",
+            ),
+            (
+                SpecError::BadModelGlob {
+                    index: 2,
+                    model: word(),
+                },
+                "bindings[2].match.model",
+            ),
+            (
+                SpecError::BadSessions {
+                    index: 2,
+                    name: "plan",
+                    reason: "so",
+                },
+                "bindings[2].plan",
+            ),
+            (
+                SpecError::BadSessions {
+                    index: 2,
+                    name: "sweep_s",
+                    reason: "so",
+                },
+                "bindings[2].sessions.sweep_s",
+            ),
+            (SpecError::NoBindings { profiles: 2 }, "bindings"),
+            (
+                SpecError::IndexOverlap {
+                    first: "a*".to_owned(),
+                    second: "*b".to_owned(),
+                },
+                "index.a*",
+            ),
+            (
+                SpecError::HashIndexNeedsBoundaries {
+                    model: "a*".to_owned(),
+                },
+                "index.a*.kind",
+            ),
+            (
+                SpecError::TooManyProfiles {
+                    count: 70_000,
+                    max: u16::MAX,
+                },
+                "profiles",
+            ),
+            (SpecError::Empty, "profiles"),
+            (
+                SpecError::TooManyHeaders {
+                    count: 300,
+                    max: 256,
+                },
+                "view.headers",
+            ),
+            (
+                SpecError::BadField {
+                    path: built(),
+                    value: word(),
+                    reason: "so",
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::NotInBuild {
+                    path: built(),
+                    what: "it",
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::DeniedHeader {
+                    path: built(),
+                    name: word(),
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::HeaderNotAllowed {
+                    path: built(),
+                    name: word(),
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::Duplicate {
+                    path: built(),
+                    name: word(),
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::UnknownProfileAt {
+                    path: built(),
+                    name: word(),
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::CanaryForm {
+                    path: built(),
+                    count: 2,
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::Reserved {
+                    path: built(),
+                    reason: "so",
+                },
+                "a.b[0]",
+            ),
+            (SpecError::UnknownPreset(word()), ""),
+            (SpecError::NoCanonicalForm(word()), ""),
+        ];
+        for (error, path) in rows {
+            assert_eq!(error.field_path(), path, "{error}");
+        }
+    }
+
+    /// The path is the validator's own finding's: a document refused for a
+    /// stage, a weight, a binding or its version reads the field to edit.
+    #[test]
+    fn a_refused_document_reads_the_field_to_edit() {
+        let refused = |document: &str| {
+            let document: PolicySpec = serde_yaml::from_str(document).expect("a document");
+            document.validate().expect_err("refused").field_path()
+        };
+        let profile =
+            |stages: &str| format!("apiVersion: smg.policy/v1\nprofiles:\n  default:\n{stages}");
+        assert_eq!(
+            refused(&profile("    filter: [nowhere]\n    pick: random\n")),
+            "profiles.default.filter"
+        );
+        assert_eq!(
+            refused(&profile("    pick: nothing\n")),
+            "profiles.default.pick"
+        );
+        let weight = refused(&profile(
+            "    score: [{ least-load: { weight: -1.0 } }]\n    pick: best\n",
+        ));
+        assert!(weight.starts_with("profiles.default.score[0]"), "{weight}");
+        let bound = |binding: &str| {
+            refused(&format!(
+                "{}bindings:\n  - {binding}\n",
+                profile("    pick: random\n")
+            ))
+        };
+        assert_eq!(
+            bound("{ match: { model: \"*\" }, profile: nowhere }"),
+            "bindings[0]"
+        );
+        assert_eq!(
+            bound("{ match: { model: \"a*b*\" }, profile: default }"),
+            "bindings[0].match.model"
+        );
+        assert_eq!(
+            refused("apiVersion: smg.policy/v9\nprofiles:\n  default:\n    pick: random\n"),
+            "apiVersion"
+        );
+    }
+
     #[test]
     fn a_document_built_in_code_is_this_version_and_validates() {
         let mut profiles = spec_with_binding(r#"{"profile":"p"}"#).profiles;
@@ -5209,5 +5584,37 @@ mod tests {
         assert_eq!(handed.pairing(), Pairing::Strict);
         let own = AppliedSpec::validate(&document).expect("a preset validates");
         assert_eq!(own.pairing(), Pairing::Strict);
+    }
+
+    /// `best` takes a sample in the parameter form and stays the unit by its
+    /// name: the sample is a whole number from 1 to 64 and the profile's
+    /// need, and the cache-aware preset states sixteen.
+    #[test]
+    fn the_best_picker_takes_a_sample_in_the_parameter_form() {
+        let sampled = spec_with_pick(r#"{"best":{"sample":16}}"#);
+        let engine = sampled.validate().expect("validates");
+        assert_eq!(engine.needs().sample, 16);
+        let written = serde_json::to_string(&sampled).expect("serializes");
+        assert!(
+            written.contains(r#""pick":{"best":{"sample":16}}"#),
+            "{written}"
+        );
+        assert_eq!(doc(&written), sampled);
+        // By its name it is the unit: the whole pool, and no sample needed.
+        let unit = spec_with_pick(r#""best""#);
+        assert_eq!(unit.validate().expect("validates").needs().sample, 0);
+        for sample in [0, 65] {
+            let pick = format!(r#"{{"best":{{"sample":{sample}}}}}"#);
+            assert_eq!(
+                bad_field(&spec_with_pick(&pick)),
+                "profiles.p.pick.best.sample"
+            );
+        }
+        let err = parse_error(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":{"best":{"draws":4}}}}}"#,
+        );
+        assert!(err.contains("unknown field `draws`"), "{err}");
+        let preset = PolicySpec::preset("cache_aware").expect("a preset");
+        assert_eq!(preset.validate().expect("validates").needs().sample, 16);
     }
 }

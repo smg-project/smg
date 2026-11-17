@@ -59,6 +59,13 @@ use crate::{
 /// - A query carrying a `@rank` suffix selects only that rank. Without one, a
 ///   base address selects its plain registration and every expanded rank.
 ///
+/// On a network address a trailing `@digits` is always a rank: the URL check
+/// refuses the suffix on a posted address. A socket path may end the same way
+/// by itself. There a query that writes a suffix names one path and selects
+/// only the worker whose URL writes it the same way: `w@0` and `w@00` are two
+/// sockets. A query without a suffix selects the worker at that path and the
+/// workers that carry the data-parallel rank their URL ends in.
+///
 /// The group is read from what is registered, never from the gateway's global
 /// DP setting: a rank exists in the registry or it does not, and a removal
 /// must find the same set either way.
@@ -66,6 +73,12 @@ use crate::{
 /// An address neither side can parse selects nothing rather than falling back
 /// to a string comparison that could match the wrong backend.
 pub(crate) fn find_workers_by_url(registry: &WorkerRegistry, url: &str) -> Vec<Arc<dyn Worker>> {
+    /// What follows an address's last `@`, as it is written: a rank reads
+    /// `@0` and `@00` alike, a socket path does not.
+    fn suffix_as_written(url: &str) -> Option<&str> {
+        url.trim().rsplit_once('@').map(|(_, suffix)| suffix)
+    }
+
     let Ok((query, query_rank)) = Endpoint::parse_with_rank(url) else {
         return Vec::new();
     };
@@ -82,6 +95,12 @@ pub(crate) fn find_workers_by_url(registry: &WorkerRegistry, url: &str) -> Vec<A
             }
             if query.scheme().is_some() && query.scheme() != registered.scheme() {
                 return false;
+            }
+            if registered.is_ipc() {
+                return match query_rank {
+                    Some(_) => suffix_as_written(url) == suffix_as_written(worker.url()),
+                    None => registered_rank.is_none() || registered_rank == worker.dp_rank(),
+                };
             }
             query_rank.is_none() || query_rank == registered_rank
         })
@@ -118,10 +137,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
                 Arc::new(FindWorkersToRemoveStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
+            .with_retry(single_attempt()),
         )
         .add_step(
             StepDefinition::new(
@@ -136,10 +152,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
             // without visibility into runtime config and would
             // preemptively fail the workflow for legitimately long
             // drain windows, leaving workers stuck in `Draining`.
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["find_workers_to_remove"]),
         )
         .add_step(
@@ -149,10 +162,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
                 Arc::new(RemoveFromWorkerRegistryStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["drain_workers"]),
         )
         .add_step(
@@ -163,10 +173,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
             )
             // The old 10s override was too short for large cache cleanup.
             // Inherit the workflow default after the worker is deregistered.
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["remove_from_worker_registry"]),
         )
         .add_step(
@@ -176,10 +183,7 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
                 Arc::new(ReleaseTokenizerStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             // On the registry step, not the policy cleanup: the release reads
             // what that step settled, and a cleanup that fails or times out
             // must not hold it back (a failed step's dependents never run).
@@ -206,10 +210,7 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
                 Arc::new(FindWorkerToUpdateStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            }),
+            .with_retry(single_attempt()),
         )
         .add_step(
             StepDefinition::new(
@@ -233,10 +234,7 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
                 Arc::new(UpdateWorkerPropertiesStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["rediscover_labels"]),
         )
         .add_step(
@@ -246,10 +244,7 @@ pub fn create_worker_update_workflow() -> WorkflowDefinition<WorkerUpdateWorkflo
                 Arc::new(UpdatePoliciesForWorkerStep),
             )
             .with_timeout(Duration::from_secs(10))
-            .with_retry(RetryPolicy {
-                max_attempts: 1,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
-            })
+            .with_retry(single_attempt())
             .depends_on(&["update_worker_properties"]),
         )
 }
@@ -289,6 +284,14 @@ pub fn create_worker_update_workflow_data(
         refresh_discovered_labels: false,
         fresh_engine_labels: None,
         snapshot: None,
+    }
+}
+
+/// One attempt and no wait: a step given this policy is not run again.
+fn single_attempt() -> RetryPolicy {
+    RetryPolicy {
+        max_attempts: 1,
+        backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
     }
 }
 
@@ -427,6 +430,38 @@ mod dp_removal_tests {
                 "https://worker:3000@0",
             ]
         );
+    }
+
+    /// A socket path may itself end in `@` and digits. On a worker that
+    /// carries no data-parallel rank those characters are the path's own:
+    /// the path without them is another socket, a path that writes the
+    /// digits another way is a third, and none of them selects another
+    /// worker, a real rank included. A real rank still leaves with its base.
+    #[test]
+    fn a_socket_path_that_ends_like_a_rank_is_its_own_address() {
+        let registry = WorkerRegistry::new();
+        register(&registry, "ipc:///tmp/w", None);
+        register(&registry, "ipc:///tmp/w@0", None);
+        register(&registry, "ipc:///tmp/w@00", None);
+        register(&registry, "ipc:///tmp/g", Some(0));
+        register(&registry, "ipc:///tmp/g", Some(1));
+        register(&registry, "ipc:///tmp/g@00", None);
+        // A rank on a network address is selected by its base with or
+        // without its data-parallel metadata.
+        register(&registry, "grpc://10.0.0.7:8000@1", None);
+
+        for (query, selected) in [
+            ("ipc:///tmp/w", vec!["ipc:///tmp/w"]),
+            ("ipc:///tmp/w@0", vec!["ipc:///tmp/w@0"]),
+            ("ipc:///tmp/w@00", vec!["ipc:///tmp/w@00"]),
+            ("ipc:///tmp/g", vec!["ipc:///tmp/g@0", "ipc:///tmp/g@1"]),
+            ("ipc:///tmp/g@1", vec!["ipc:///tmp/g@1"]),
+            ("ipc:///tmp/g@0", vec!["ipc:///tmp/g@0"]),
+            ("ipc:///tmp/g@00", vec!["ipc:///tmp/g@00"]),
+            ("grpc://10.0.0.7:8000", vec!["grpc://10.0.0.7:8000@1"]),
+        ] {
+            assert_eq!(urls(&registry, query), selected, "{query}");
+        }
     }
 
     #[test]

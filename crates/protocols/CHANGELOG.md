@@ -331,6 +331,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `null` metadata reads as the empty map (`deserialize_null_as_empty_map`, a map twin of
   `deserialize_null_as_empty_vec`), and `IncompleteReason`, `#[non_exhaustive]`, gains
   `MaxMessages` and `Steered`.
+- A Messages search result's text items are written with their `type`, which the public API
+  requires of them, in a message and in a tool result alike. They were read into untagged text
+  blocks, so a forwarded search result lost the `type` of each item. An item read without one
+  still reads, as text, and an item of another type is refused. Breaking:
+  `SearchResultBlock.content` holds the new `SearchResultTextBlock`, whose type is
+  `SearchResultTextType`.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
@@ -350,14 +356,6 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `text_tokens` in the completion details. A usage the gateway builds is written as before.
   Breaking: `PromptTokenUsageInfo` gains `text_tokens`, `image_tokens` and `cache_write_tokens`,
   and `CompletionTokensDetails` gains `text_tokens`, all `Option<u32>`.
-- A Responses function tool declared with `async`, `defer_loading`, `output_schema` or
-  `allowed_callers`, and a custom tool declared with `async` or `allowed_callers`, as the public
-  API's tools take them, parse and are forwarded as given. The crate refused each as an unknown
-  field. The function tool's four keys are validated for shape as the custom tool's typed fields
-  are (`invalid_type` otherwise). `FunctionTool::chat_function` leaves the four keys out of the
-  copy a chat template renders, and `FunctionTool::allows_direct_calls` and
-  `CustomTool::allows_direct_calls` say whether the model may call a tool itself. Breaking:
-  `CustomTool` gains `r#async: Option<bool>` and `allowed_callers: Option<Vec<String>>`.
 - A Messages tool block keeps its `caller`, as the public API writes it and takes it back: a
   `server_tool_use` or `web_search_tool_result` block in an answer, and a replayed `tool_use`,
   `server_tool_use` or `web_search_tool_result` block in a request. The usage's `server_tool_use`
@@ -367,6 +365,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `WebSearchToolResultBlock` and the `ContentBlock::ServerToolUse` and
   `ContentBlock::WebSearchToolResult` variants gain `caller`, and `ServerToolUsage` gains
   `web_fetch_requests`.
+- A Responses function tool declared with `async`, `defer_loading`, `output_schema` or
+  `allowed_callers`, and a custom tool declared with `async` or `allowed_callers`, as the public
+  API's tools take them, parse and are forwarded as given. The crate refused each as an unknown
+  field. The function tool's four keys are validated for shape as the custom tool's typed fields
+  are (`invalid_type` otherwise). `FunctionTool::chat_function` leaves the four keys out of the
+  copy a chat template renders, and `FunctionTool::allows_direct_calls` and
+  `CustomTool::allows_direct_calls` say whether the model may call a tool itself. Breaking:
+  `CustomTool` gains `r#async: Option<bool>` and `allowed_callers: Option<Vec<String>>`.
 - An Interactions request keeps the fields the gateway does not model (`continuation_token`,
   `safety_settings`, `service_tier`, `webhook_config`, `environment`, `labels`, `cached_content`,
   and any the API adds), forwarded to the upstream as written, as the Messages request's `other`
@@ -411,9 +417,20 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   field (#5092). Two different texts are refused as a value (`invalid_value`; `param` names the
   message). Breaking: the `ChatMessage::Assistant` field `reasoning_content: Option<String>` is now
   `reasoning: AssistantReasoning`, whose `text` is that option.
+- A Messages answer with a content block of a kind this build does not read (a web fetch, code
+  execution, bash or text editor result, a container upload, or any block the public API adds)
+  parses, the block kept as written in `ContentBlock::Other`, as `ToolUseCaller::Other` keeps an
+  unknown caller. A whole answer with such a block failed: the provider route answered a 502, and
+  a streamed thread turn was left unstored. Breaking: `ContentBlock` gains `Other(Value)`.
 - `EmbeddingRequest` and `ClassifyRequest` keep the fields they do not model in a flattened
   `other` map, as `ChatCompletionRequest` and `CompletionRequest` do, so the HTTP relay forwards an
   embeddings or classify body as the client wrote it (`truncate_prompt_tokens`,
   `add_special_tokens`, `normalize`, `priority`, `extra_body`, ...). The relay re-serializes the
   typed body and dropped every key the types did not declare. Breaking: the two structs gain the
   field `other: serde_json::Map<String, Value>`.
+- A Messages conversation that replays the public API's server tool results (`web_fetch_tool_result`,
+  `code_execution_tool_result`, `bash_code_execution_tool_result`,
+  `text_editor_code_execution_tool_result`) or sends a `container_upload` block is accepted, and the
+  blocks are forwarded as written. Each was an unknown variant of `InputContentBlock`, which refused
+  the whole request, a token count included. Breaking: `InputContentBlock` gains the five variants,
+  and the crate gains `ServerToolResultBlock` and `ContainerUploadParam`.

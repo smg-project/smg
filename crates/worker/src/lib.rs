@@ -5,6 +5,10 @@
 //!
 //! `openai-protocol` re-exports these, and [`UNKNOWN_MODEL_ID`], at the paths
 //! they had there.
+//!
+//! [`settings`] and [`labels`] hold the vocabulary the worker's own code
+//! shares with a host's configuration. The gateway re-exports each item at
+//! the path it had there.
 
 /// Default model identifier used when no model is specified.
 ///
@@ -12,7 +16,9 @@
 /// throughout the codebase for consistency.
 pub const UNKNOWN_MODEL_ID: &str = "unknown";
 
+pub mod labels;
 pub mod model_card;
 pub mod model_type;
 pub mod models;
+pub mod settings;
 pub mod worker;

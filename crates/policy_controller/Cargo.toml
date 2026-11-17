@@ -256,6 +256,10 @@ required-features = ["controller"]
 name = "replicas"
 required-features = ["controller"]
 
+[[test]]
+name = "replication"
+required-features = ["controller"]
+
 [[bench]]
 name = "decision"
 harness = false
@@ -331,6 +335,11 @@ harness = false
 [[bench]]
 name = "pair_classes"
 harness = false
+
+[[bench]]
+name = "decide_stream"
+harness = false
+required-features = ["controller"]
 
 [lints]
 workspace = true

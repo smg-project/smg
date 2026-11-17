@@ -30,8 +30,8 @@ use crate::{
     lease::{Lifecycle, Membership},
     spec::{AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams},
     view::{
-        AffinityFacts, Candidate, Feed, HashKind, NamedAffinity, Phase, RequestFacts, Walk,
-        WorkerId,
+        mean_in_flight, AffinityFacts, Candidate, Feed, HashKind, NamedAffinity, Phase,
+        RequestFacts, Walk, WorkerId,
     },
     Draw,
 };
@@ -67,8 +67,9 @@ const DEFAULT_BLOCK_SIZE: u32 = 16;
 /// a held prefix is priced by.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Gates {
-    /// A holder loaded past this multiple of the kept rows' mean in flight
-    /// AND past the absolute margin above it spills.
+    /// A holder loaded past this multiple of the mean in flight (the kept
+    /// rows', or the drawn rows' behind a draw) AND past the absolute
+    /// margin above it spills.
     pub rel: f32,
     /// The absolute margin's configured part, in requests; the margin is
     /// capped at the larger of the count's natural swing at the mean and
@@ -165,7 +166,7 @@ impl Gates {
     }
 
     /// Whether a candidate with `load` requests in flight is over the spill
-    /// gate at the kept rows' mean `avg`.
+    /// gate at the mean `avg`.
     fn over(&self, load: f32, avg: f32, held_tokens: f32) -> bool {
         load > avg * self.rel && load > avg + self.margin(avg, held_tokens)
     }
@@ -275,16 +276,12 @@ impl Pass<'_> {
     }
 }
 
-/// The mean of the kept rows' in-flight counts.
-fn mean_in_flight(candidates: &[Candidate], kept: &[u32]) -> f32 {
-    if kept.is_empty() {
-        return 0.0;
-    }
-    let sum: u64 = kept
-        .iter()
-        .map(|&i| u64::from(candidates[i as usize].in_flight))
-        .sum();
-    sum as f32 / kept.len() as f32
+/// The mean in flight the spill gate reads: the drawn rows' where the
+/// engine set it
+/// ([`NamedAffinity::mean_in_flight`]),
+/// else the kept rows'.
+fn spill_mean(drawn: Option<f32>, candidates: &[Candidate], kept: &[u32]) -> f32 {
+    drawn.unwrap_or_else(|| mean_in_flight(candidates, kept))
 }
 
 /// Every row scores alike: the stage has nothing to say about this request.
@@ -337,11 +334,13 @@ impl PrefixAffinity {
         index.max(predicted)
     }
 
-    /// The stage's scores over what its two passes read of the kept rows;
-    /// `holds` is whether anybody holds anything. `reads` hands each pass a
+    /// The stage's scores over what its two passes read of the kept rows.
+    /// `feed` says whether anybody holds anything and carries the drawn
+    /// rows' mean where the engine set one. `reads` hands each pass a
     /// reader of its own: a column's is a read by index, and the rows a
-    /// host named are walked beside the kept rows. One body a feed, the
-    /// feed chosen where the body is entered.
+    /// host named are walked beside the kept rows of a pool read whole and
+    /// searched a row behind a draw. One body a feed, the feed chosen
+    /// where the body is entered.
     #[inline(always)]
     fn rank<R: FnMut(u32) -> AffinityFacts>(
         &self,
@@ -349,10 +348,11 @@ impl PrefixAffinity {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        holds: bool,
+        feed: Feed<'_>,
         reads: impl Fn() -> R,
     ) -> TieBand {
         let request_blocks = self.gates.request_blocks(facts);
+        let holds = !feed.is_empty();
         // Nobody holding anything, the deepest match is zero without a
         // pass; any other feed answers for every kept row.
         let best = if holds {
@@ -364,7 +364,7 @@ impl PrefixAffinity {
         } else {
             0
         };
-        let avg = mean_in_flight(candidates, kept);
+        let avg = spill_mean(feed.drawn_mean(), candidates, kept);
         // A decode worker prefills nothing again: its held prefix is not
         // priced.
         let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
@@ -393,7 +393,8 @@ impl PrefixAffinity {
     }
 
     /// The stage's scores over the rows a host named: a holder reads its
-    /// depth, and each pass walks the holders beside its kept rows. Out of
+    /// depth. Each pass walks the holders beside its kept rows where the
+    /// pool is read whole, and searches them a row behind a draw. Out of
     /// line: see [`Scorer::score`] of this stage.
     #[inline(never)]
     fn rank_named(
@@ -404,8 +405,14 @@ impl PrefixAffinity {
         out: &mut [f32],
         named: NamedAffinity<'_>,
     ) -> TieBand {
-        let holds = !named.holders.is_empty();
-        self.rank(facts, candidates, kept, out, holds, || {
+        if named.drawn() {
+            // Behind a draw the rows stand in the draw's order: each is
+            // read by a search, and no cursor is kept.
+            return self.rank(facts, candidates, kept, out, Feed::Named(named), || {
+                move |i: u32| named.entry(i)
+            });
+        }
+        self.rank(facts, candidates, kept, out, Feed::Named(named), || {
             let mut walk = named.walk();
             move |i: u32| walk.entry(i)
         })
@@ -417,6 +424,12 @@ impl Lifecycle for PrefixAffinity {}
 impl Scorer for PrefixAffinity {
     fn name(&self) -> &'static str {
         "prefix-affinity"
+    }
+
+    /// Row by row, unless the fleet's KV gate is configured: that gate
+    /// reads every row.
+    fn row_wise(&self) -> bool {
+        !self.gates.kv_configured()
     }
 
     fn score(
@@ -437,8 +450,7 @@ impl Scorer for PrefixAffinity {
             return self.rank_named(facts, candidates, kept, out, named);
         }
         let column = facts.affinity;
-        let holds = !column.is_empty();
-        self.rank(facts, candidates, kept, out, holds, || {
+        self.rank(facts, candidates, kept, out, Feed::Column(column), || {
             |i: u32| column[i as usize]
         })
     }
@@ -473,6 +485,12 @@ impl Lifecycle for KvPressure {}
 impl Scorer for KvPressure {
     fn name(&self) -> &'static str {
         "kv-pressure"
+    }
+
+    /// The stage orders nothing: the gate it configures is read by the
+    /// profile's affinity stages, which answer for it.
+    fn row_wise(&self) -> bool {
+        true
     }
 
     fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
@@ -597,14 +615,20 @@ impl WarmupSlice {
             rows: named.warming,
             thin: named.thin,
         };
-        self.turn(facts, candidates, kept, out, Feed::Named(named), warm)
+        // Behind a draw the pass reads the rows named by a search: one
+        // body a read, the read chosen where the body is entered.
+        if named.drawn() {
+            return self.turn::<true>(facts, candidates, kept, out, Feed::Named(named), warm);
+        }
+        self.turn::<false>(facts, candidates, kept, out, Feed::Named(named), warm)
     }
 
     /// One pass where somebody warms: the request is a miss the slice may
     /// take or a hit the divert may take, and the row that takes it scores
-    /// alone.
+    /// alone. `DRAWN` is a pass behind a draw: it reads the rows named by a
+    /// search and keeps no cursor.
     #[inline(always)]
-    fn turn(
+    fn turn<const DRAWN: bool>(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
@@ -617,7 +641,7 @@ impl WarmupSlice {
         let mut reads = feed.reads();
         let best = kept
             .iter()
-            .map(|&i| reads.entry(i).overlap_blocks)
+            .map(|&i| feed.read::<DRAWN>(&mut reads, i).overlap_blocks)
             .max()
             .unwrap_or(0);
         let thin_overlap = best as f32 / request_blocks as f32 <= self.miss_share
@@ -632,9 +656,9 @@ impl WarmupSlice {
             draw: Draw::new(facts.seed ^ 0x77a7_2d5e_6f1c_3b09),
         };
         let slot = if thin_overlap {
-            self.slice(&mut pass)
+            self.slice::<DRAWN>(&mut pass)
         } else if warm.thin() {
-            self.divert(&mut pass, facts.now_micros)
+            self.divert::<DRAWN>(&mut pass, facts.now_micros)
         } else {
             None
         };
@@ -682,8 +706,13 @@ impl WarmupSlice {
     /// A thin worker is one whatever the fleet's age; workers warming only
     /// because they are young are ones only when the fleet is not all
     /// young. A host that named the rows ruled the same where it derived
-    /// them, and the pass walks its list beside the kept rows.
-    fn warming<'a>(&'a self, warm: Warm<'a>, feed: Feed<'a>) -> impl FnMut(u32) -> bool + 'a {
+    /// them: the pass walks its list beside the kept rows of a pool read
+    /// whole, and searches it a row behind a draw (`DRAWN`).
+    fn warming<'a, const DRAWN: bool>(
+        &'a self,
+        warm: Warm<'a>,
+        feed: Feed<'a>,
+    ) -> impl FnMut(u32) -> bool + 'a {
         let mut reads = feed.reads();
         let mut named = Walk::new(match warm {
             Warm::Named { rows, .. } => rows,
@@ -702,14 +731,15 @@ impl WarmupSlice {
                     !young_all && self.is_young(held)
                 }
             }
+            Warm::Named { rows, .. } if DRAWN => rows.binary_search(&i).is_ok(),
             Warm::Named { .. } => named.find(i, |&row| row).is_some(),
         }
     }
 
     /// The slot of the kept row the slice sends this miss to, if it is due.
-    fn slice(&self, pass: &mut Pass<'_>) -> Option<usize> {
-        let avg = mean_in_flight(pass.candidates, pass.kept);
-        let mut warming = self.warming(pass.warm, pass.feed);
+    fn slice<const DRAWN: bool>(&self, pass: &mut Pass<'_>) -> Option<usize> {
+        let avg = spill_mean(pass.feed.drawn_mean(), pass.candidates, pass.kept);
+        let mut warming = self.warming::<DRAWN>(pass.warm, pass.feed);
         let slot =
             pass.least_loaded(|i, c| warming(i) && !self.gates.over(c.in_flight as f32, avg, 0.0))?;
         let seen = self.misses.fetch_add(1, Ordering::Relaxed);
@@ -717,7 +747,7 @@ impl WarmupSlice {
     }
 
     /// The slot of the kept row a hit is diverted to, if one is due.
-    fn divert(&self, pass: &mut Pass<'_>, now: u64) -> Option<usize> {
+    fn divert<const DRAWN: bool>(&self, pass: &mut Pass<'_>, now: u64) -> Option<usize> {
         if self.divert_every == 0 {
             return None;
         }
@@ -749,7 +779,7 @@ impl WarmupSlice {
         } else {
             let mut reads = feed.reads();
             kept.iter()
-                .filter(|&&i| reads.entry(i).overlap_blocks == best)
+                .filter(|&&i| feed.read::<DRAWN>(&mut reads, i).overlap_blocks == best)
                 .map(|&i| candidates[i as usize].in_flight)
                 .min()
         };
@@ -759,12 +789,12 @@ impl WarmupSlice {
         // warming rows are the thin, so a warming row here is a thin one.
         let slot = {
             let mut until = self.divert_until.lock();
-            let (mut warming, mut held) = (self.warming(warm, feed), feed.reads());
+            let (mut warming, mut held) = (self.warming::<DRAWN>(warm, feed), feed.reads());
             let slot = pass.least_loaded(|i, c| {
                 warming(i)
                     && !(c.in_flight > 0 && until.get(&c.id).is_some_and(|&t| now < t))
                     && !(holder_load.is_some_and(|h| c.in_flight >= h)
-                        && held.entry(i).overlap_blocks != best)
+                        && feed.read::<DRAWN>(&mut held, i).overlap_blocks != best)
             })?;
             until.insert(
                 candidates[kept[slot] as usize].id,
@@ -801,6 +831,13 @@ impl Scorer for WarmupSlice {
         "warmup-slice"
     }
 
+    /// Row by row, unless the fleet's KV gate is configured: that gate
+    /// reads every row. What the stage reads of the pool (its level, who
+    /// warms) comes from the host's feed, never from the rows handed.
+    fn row_wise(&self) -> bool {
+        !self.gates.kv_configured()
+    }
+
     fn score(
         &self,
         facts: &RequestFacts<'_>,
@@ -830,7 +867,7 @@ impl Scorer for WarmupSlice {
         let Some(warm) = self.ruled(column) else {
             return neutral(out);
         };
-        self.turn(facts, candidates, kept, out, Feed::Column(column), warm)
+        self.turn::<false>(facts, candidates, kept, out, Feed::Column(column), warm)
     }
 
     fn needs(&self) -> Needs {
@@ -1552,6 +1589,7 @@ mod tests {
             holders,
             warming,
             thin,
+            mean_in_flight: None,
         }
     }
 
@@ -1837,5 +1875,149 @@ mod tests {
             ),
             (0, 0)
         );
+    }
+
+    /// Behind a draw the rows handed are the drawn rows and the rows a host
+    /// named. The gate's mean is the drawn rows' alone: a busy holder lifts
+    /// a mean taken over the rows handed, and passes the gate it is judged
+    /// by.
+    #[test]
+    fn the_spill_gate_reads_the_drawn_rows_mean_where_the_engine_set_one() {
+        // The holder has 8 in flight and the two drawn rows 2 each. Over the
+        // rows handed the mean is 4: 8 is not past 4 + 4, the holder stays.
+        // Over the drawn rows it is 2: 8 is past 1.5 times 2 and past 2 + 4,
+        // the holder spills.
+        let pool = rows(&[candidate(0, 8, 0), candidate(1, 2, 0), candidate(2, 2, 0)]);
+        let stage = affinity(None);
+        let holders = [holder(0, 8)];
+        let held = named(&holders, &[], false);
+        assert_eq!(
+            scores_named(&stage, &facts(16), &pool, held),
+            vec![1.0, 0.5, 0.5]
+        );
+        let behind_a_draw = NamedAffinity {
+            mean_in_flight: Some(2.0),
+            ..held
+        };
+        assert_eq!(
+            scores_named(&stage, &facts(16), &pool, behind_a_draw),
+            vec![0.0, 0.5, 0.5]
+        );
+        // The slice's gate reads the same mean: a warming row that busy
+        // takes a miss by the mean of the rows handed, and none by the
+        // drawn rows'.
+        let warming = named(&[], &[0], true);
+        assert_eq!(
+            scores_named(&warmup(1.0, 0), &facts(16), &pool, warming),
+            vec![1.0, 0.0, 0.0]
+        );
+        let behind_a_draw = NamedAffinity {
+            mean_in_flight: Some(2.0),
+            ..warming
+        };
+        let slice = warmup(1.0, 0);
+        assert_eq!(
+            scores_named(&slice, &facts(16), &pool, behind_a_draw),
+            vec![1.0, 1.0, 1.0]
+        );
+        assert_eq!(slice.misses.load(Ordering::Relaxed), 0);
+    }
+
+    /// Behind a draw the rows handed stand in the draw's order, and both
+    /// stages read the rows a host named by a search: no pass looks behind
+    /// a cursor, where the walk of a whole read asked in that order does,
+    /// and the two read the same scores.
+    #[test]
+    fn behind_a_draw_the_stages_search_the_rows_named_and_keep_no_cursor() {
+        use crate::view::LOOKS_BEHIND;
+        let pool: Vec<Held> = (0..6).map(|row| candidate(row, 2, 0)).collect();
+        let pool = rows(&pool);
+        // A draw's order. The holders are shallow, so the slice takes the
+        // miss and asks its warming rows.
+        let order = [4u32, 1, 5, 0, 3, 2];
+        let holders = [holder(1, 4), holder(4, 4), holder(5, 3)];
+        let whole = named(&holders, &[0, 3], true);
+        // The mean of the rows handed, so both reads judge by one mean.
+        let drawn = NamedAffinity {
+            mean_in_flight: Some(2.0),
+            ..whole
+        };
+        let (prefix, slice) = (affinity(None), warmup(1.0, 0));
+        for stage in [&prefix as &dyn Scorer, &slice] {
+            let [by_walk, by_search] = [whole, drawn].map(|named| {
+                LOOKS_BEHIND.with(|looks| looks.set(0));
+                let facts = RequestFacts {
+                    named: Some(named),
+                    ..facts(16)
+                };
+                let mut out = vec![0.0; order.len()];
+                stage.score(&facts, &pool, &order, &mut out);
+                (out, LOOKS_BEHIND.with(std::cell::Cell::get))
+            });
+            assert_eq!(by_search.0, by_walk.0, "{}", stage.name());
+            assert!(by_walk.1 > 0, "{}: a walk looks behind", stage.name());
+            assert_eq!(by_search.1, 0, "{}: a search keeps no cursor", stage.name());
+        }
+    }
+
+    /// A hit the slice diverts behind a draw reads the rows named by a
+    /// search too: its holders' load, its warming rows and a busy warming
+    /// row's entry look behind no cursor, where a whole read asked in that
+    /// order does, and the two divert to the same row.
+    #[test]
+    fn behind_a_draw_a_diverted_hit_searches_the_rows_named_and_keeps_no_cursor() {
+        use crate::view::LOOKS_BEHIND;
+        // Rows 1 and 4 hold the request deep. Of the thin rows 3 and 0 are
+        // busier than the holders, so the entry of each is read, and row 2
+        // takes the hit.
+        let pool: Vec<Held> = (0..)
+            .zip([6, 5, 1, 6, 5, 1])
+            .map(|(row, busy)| candidate(row, busy, 0))
+            .collect();
+        let pool = rows(&pool);
+        // A draw's order: each of the three reads meets a row behind the
+        // one before it.
+        let order = [4u32, 1, 5, 3, 0, 2];
+        let holders = [holder(1, 12), holder(4, 12)];
+        let whole = named(&holders, &[0, 2, 3], true);
+        let drawn = NamedAffinity {
+            mean_in_flight: Some(4.0),
+            ..whole
+        };
+        let [by_walk, by_search] = [whole, drawn].map(|named| {
+            LOOKS_BEHIND.with(|looks| looks.set(0));
+            let facts = RequestFacts {
+                named: Some(named),
+                ..facts(16)
+            };
+            let mut out = vec![0.0; order.len()];
+            // A stage of its own a read: a diversion reserves its row's
+            // window. Its first hit is due.
+            warmup(0.25, 1).score(&facts, &pool, &order, &mut out);
+            (out, LOOKS_BEHIND.with(std::cell::Cell::get))
+        });
+        assert_eq!(by_walk.0, [0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(by_search.0, by_walk.0);
+        assert!(by_walk.1 > 0, "the walk looks behind");
+        assert_eq!(by_search.1, 0, "a search keeps no cursor");
+    }
+
+    #[test]
+    fn the_affinity_stages_answer_row_by_row_unless_the_fleet_kv_gate_is_configured() {
+        let kv = KvPressureParams {
+            spread: Some(0.3),
+            ..KvPressureParams::default()
+        };
+        let plain = Gates::of(None, None, Some(16));
+        let gated = Gates::of(None, Some(&kv), Some(16));
+        for (gates, row_wise) in [(plain, true), (gated, false)] {
+            let affinity = PrefixAffinity::new(&PrefixAffinityParams::default(), gates);
+            let slice = WarmupSlice::new(&WarmupSliceParams::default(), gates);
+            assert_eq!(
+                (affinity.row_wise(), slice.row_wise()),
+                (row_wise, row_wise)
+            );
+        }
+        assert!(KvPressure.row_wise());
     }
 }

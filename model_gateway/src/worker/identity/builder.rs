@@ -8,6 +8,7 @@ use openai_protocol::{
         WorkerStatus,
     },
 };
+use smg_worker::settings::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS;
 use tokio::sync::mpsc;
 
 use super::{
@@ -16,7 +17,6 @@ use super::{
     metadata::DecodingLabels,
 };
 use crate::{
-    config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     observability::metrics::Metrics,
     routers::grpc::backend_client::BackendClient,
     worker::{

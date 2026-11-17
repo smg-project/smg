@@ -83,4 +83,9 @@ pub trait Journal: Send + Sync {
 
     /// The last write of `kinds` told, with its term.
     fn head(&self, kinds: Kinds) -> Position;
+
+    /// The term the journal followed, `None` while the store leads the
+    /// journal's term: from a take that starts the term until the store
+    /// follows another history. A take that starts no term changes nothing.
+    fn followed(&self) -> Option<u64>;
 }

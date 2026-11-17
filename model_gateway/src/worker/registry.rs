@@ -30,12 +30,12 @@ use openai_protocol::{
     worker::{TagVocabulary, WorkerStatus},
 };
 use rustc_hash::FxBuildHasher;
+use smg_worker::settings::RetryConfig;
 use symphony::grammar::GrammarStart;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::{
-    config::types::RetryConfig,
     observability::metrics::{metrics_labels, Metrics},
     worker::{
         health::circuit_breaker::CircuitState,

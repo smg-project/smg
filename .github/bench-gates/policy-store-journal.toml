@@ -1,0 +1,57 @@
+# Regression gate for `cargo bench -p smg-policy-controller --bench store_journal`, run by
+# .github/workflows/benchmark-policy-store-journal.yml on pull requests through scripts/bench_gate.py.
+#
+# The gate runs the twenty-nine single-threaded rows of the store's journal. Twenty-seven are at 8, 64 and 512
+# workers, each beside its twin on a store with no journal (`plain`): one load record's write with a journal of
+# every kind (`policy_store_journal/load_write/journaled/<n>`) and with one of the watched kinds alone
+# (`.../load_write/watched/<n>`), one status write (`.../status_write/<kind>/<n>`), one membership write
+# (`.../member_write/<kind>/<n>`) and a decision's view build beside a journaled store
+# (`.../view_build/<kind>/<n>`). Two read a batch out of the log, 16 and 256 events
+# (`policy_store_journal/read/<events>`).
+#
+# The filter leaves out the binary's other rows: the cut's rows (`policy_store_journal/cut/`) and the write beside
+# a draining reader (`policy_store_journal/load_write_drained/`), which is for a run pinned to two cores.
+#
+# Threshold (the method is described in tokenizer.toml): the identical-build spread, read through this gate as
+# three base and three pull-request runs of one build pinned to one core, the base a copy of the binary with one
+# byte appended, on a shared many-core build host. Two readings, both passed (0 failed, 0 suspect of 29 ids). The
+# table's is the quieter one, of an earlier build of this bench at a load of 28 to 93:
+#
+#   rows                                identical build   threshold
+#   load_write/                         1.2 - 8.9 %       20 %
+#   status_write/                       1.2 - 14.2 %      30 %
+#   member_write/                       5.1 - 7.4 %       15 %
+#   view_build/                         0.6 - 5.5 %       15 %
+#   read/                               2.4 - 3.1 %       10 %
+#
+# The threshold is the smallest multiple of 5 % that is at least twice the family's largest identical-build
+# spread, never under 10 %. On top of it the gate fails an id only when every pull-request run is slower than
+# every base run (scripts/bench_gate.py). The busier reading, of this change's own build at a load of 101 to 155,
+# read 2.1 to 24.0 % and is not the table's: that rule is what holds a row there.
+
+repeats = 3
+filter = "^policy_store_journal/(load_write|status_write|member_write|view_build|read)/"
+
+sources = [
+    "crates/policy_controller/benches/store_journal.rs",
+]
+
+[[gate]]
+pattern = "^policy_store_journal/status_write/"
+threshold = 0.30
+note = "identical build 1.2 - 14.2 %"
+
+[[gate]]
+pattern = "^policy_store_journal/load_write/"
+threshold = 0.20
+note = "identical build 1.2 - 8.9 %"
+
+[[gate]]
+pattern = "^policy_store_journal/(member_write|view_build)/"
+threshold = 0.15
+note = "identical build 0.6 - 7.4 %"
+
+[[gate]]
+pattern = "^policy_store_journal/"
+threshold = 0.10
+note = "identical build 2.4 - 3.1 %"
