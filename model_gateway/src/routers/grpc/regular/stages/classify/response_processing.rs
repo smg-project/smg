@@ -21,7 +21,9 @@ use crate::routers::{
     error,
     grpc::{
         common::stages::ProcessStage,
-        context::{DispatchContext, ExecutionResult, FinalResponse, WorkerSelection},
+        context::{
+            wrong_response_spec, DispatchContext, ExecutionResult, FinalResponse, WorkerSelection,
+        },
         spec::ResponseSpec,
     },
 };
@@ -121,13 +123,8 @@ impl ProcessStage for ClassifyResponseProcessingStage {
         spec: ResponseSpec,
     ) -> Result<Option<Response>, Response> {
         if !matches!(spec, ResponseSpec::Classify) {
-            error!(
-                function = "ClassifyResponseProcessingStage::process",
-                "Wrong response spec"
-            );
-            return Err(error::internal_error(
-                "wrong_response_spec",
-                "Wrong response spec",
+            return Err(wrong_response_spec(
+                "ClassifyResponseProcessingStage::process",
             ));
         }
 
