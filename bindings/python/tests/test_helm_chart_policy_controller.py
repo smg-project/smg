@@ -587,12 +587,18 @@ def test_the_document_reaches_the_file_as_the_values_hold_it(tmp_path):
         "empty": {"list": [], "map": {}},
     }
 
-    def file(document: dict) -> dict:
+    def file(document: dict) -> str:
         documents = render(*ON, files=(spec_values(tmp_path, document),))
-        return yaml.safe_load(one(documents, "ConfigMap")["data"]["spec.yaml"])
+        return one(documents, "ConfigMap")["data"]["spec.yaml"]
 
-    assert file(carried) == carried
-    assert file({**carried, "generation": 7}) == {**carried, "generation": 7}
+    written = file(carried)
+    assert yaml.safe_load(written) == carried
+    numbered = file({**carried, "generation": 7})
+    assert yaml.safe_load(numbered) == {**carried, "generation": 7}
+    # By value a whole number equals its float form. The text of its line
+    # holds the form: the controller's reader takes no float there.
+    assert "\n  whole: 67108864\n" in written
+    assert "\ngeneration: 7\n" in numbered
 
 
 @needs_helm
@@ -2204,8 +2210,9 @@ def example_values(directory: Path, document: dict, name: str) -> Path:
 class Mount:
     """A directory laid out as a kubelet lays a ConfigMap volume: each key's
     file is a link through ``..data``, itself a link to the directory of the
-    version in use. An update writes a new directory and turns ``..data`` to
-    it by one rename: a reader finds one version whole, or the other."""
+    version in use. An update writes a new directory, turns ``..data`` to it
+    by one rename and takes the old directory away: a reader finds one
+    version whole or the other, and a file it holds may go from under it."""
 
     def __init__(self, directory: Path, config: dict):
         self.directory = directory
@@ -2225,6 +2232,9 @@ class Mount:
         staged = self.directory / "..data_tmp"
         staged.symlink_to(version.name)
         staged.replace(self.directory / "..data")
+        # The kubelet takes the old version away once the link is turned.
+        if self._versions > 1:
+            shutil.rmtree(self.directory / f"..version-{self._versions - 1}")
 
 
 class DocumentedPod:
