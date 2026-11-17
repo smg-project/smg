@@ -548,7 +548,8 @@ impl Controller {
     /// lease before the settle window, so a follower takes it within one
     /// renew period; the listeners keep accepting for the settle window,
     /// stop accepting, and close within the rest of the grace period, their
-    /// streams with them.
+    /// streams with them. An open `Decide` stream ends `UNAVAILABLE` when
+    /// they stop accepting: it does not hold the close to the grace period.
     ///
     /// Every listener's health service reports the overall status (service
     /// `""`) as the readiness and [`SERVICE_NAME`] as `NOT_SERVING`, but a
@@ -590,7 +591,9 @@ impl Controller {
             ..
         } = self;
         let store = Arc::clone(&shared.store);
-        let (stop, _held) = watch::channel(false);
+        // The listeners' close is one word, and an open decide stream hears
+        // it too: the word is `Shared`'s.
+        let stop = shared.stop.clone();
         let mut tasks: JoinSet<Result<(), Error>> = JoinSet::new();
         let mut reporters = Vec::with_capacity(listeners.len());
         // The reporters of the listeners whose door a caller can pass: the

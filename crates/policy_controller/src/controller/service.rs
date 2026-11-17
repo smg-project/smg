@@ -80,6 +80,9 @@ pub(crate) struct Shared {
     pub(crate) deciders: Deciders,
     /// The decide streams each gateway holds open.
     pub(crate) streams: Arc<Streams>,
+    /// The run loop's word that the listeners close: `true` from the end
+    /// of the drain's settle window on. An open decide stream ends at it.
+    pub(crate) stop: watch::Sender<bool>,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -144,6 +147,7 @@ impl Shared {
             hello_deadline: session::HELLO_DEADLINE,
             deciders,
             streams: Arc::new(Streams::new(decide::MAX_STREAMS)),
+            stop: watch::Sender::new(false),
         })
     }
 

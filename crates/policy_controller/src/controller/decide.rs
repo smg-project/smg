@@ -12,12 +12,21 @@
 //! and it ends, in the same words, when the sweep lets the gateway go. A
 //! session that ends changes nothing for a stream inside the grace period.
 //!
+//! A stream ends with the listeners: at the drain's word it ends
+//! `UNAVAILABLE`, so a gateway that holds its streams open does not hold a
+//! drain to its grace period.
+//!
 //! A stream's place in that table is of one term. A replica that does not
 //! lead has no session and no table to ask: a stream opens there, and each
 //! request on it is answered `Busy` for the leader that is elsewhere. The
 //! first request the replica would decide, once it leads, asks the table
 //! as an open does, and so does the first one after the term under a
 //! stream changed. No decision asks otherwise.
+//!
+//! A decision leaves under the fence (design 5.3): it waits in its
+//! stream's queue for as long as the gateway reads nothing, so the stream
+//! reads the fence where it sends one. Past the term a decision was made
+//! under, `Busy` for the leader that is elsewhere leaves in its place.
 //!
 //! The reader is the stream itself and never waits for a decision: a frame
 //! is stamped with its receipt, checked ([`Checked`]) and handed to its
@@ -64,7 +73,7 @@ use super::{
     wire::{self, Checked, Refusal},
 };
 use crate::{
-    proto::{self, busy::Reason},
+    proto::{self, busy::Reason, decide_answer::Answer},
     store::GatewayId,
 };
 
@@ -79,9 +88,14 @@ pub(crate) const MAX_STREAMS: u32 = 256;
 /// The answer to a decide stream of a gateway that is not present.
 pub(crate) const NO_SESSION: &str = "no session of this gateway stands on this controller: a decide stream is a present gateway's (say Hello on a Session stream first)";
 
+/// The last word of a decide stream that is open when the listeners close.
+pub(crate) const CLOSING: &str =
+    "this controller closes its listeners: open the decide stream on the leader (ask Leader)";
+
 type Out = Result<proto::DecideAnswer, Status>;
 
-/// Resolves when a stream's presence ends.
+/// Resolves at an end that reaches a stream from outside it: its
+/// presence's, or the listeners' close.
 type Gone = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// The end of `presence`, for the stream that holds it.
@@ -154,6 +168,8 @@ pub(crate) struct Answers<S = Streaming<proto::DecideRequest>> {
     /// Resolves when the presence the stream holds ends, and never while
     /// it holds none.
     gone: Gone,
+    /// Resolves at the listeners' close ([`Shared::stop`]).
+    closing: Gone,
     /// The requests the gateway may still send.
     credit: u32,
     /// The answers that left since the last `Credit` frame, each to a
@@ -193,6 +209,10 @@ pub(crate) fn serve<S>(
             shared.streams.cap
         ))
     })?;
+    let mut stop = shared.stop.subscribe();
+    let closing = Box::pin(async move {
+        let _ = stop.wait_for(|stop| *stop).await;
+    });
     let (sender, decided) = mpsc::channel(WINDOW as usize);
     Ok(Answers {
         shared,
@@ -202,6 +222,7 @@ pub(crate) fn serve<S>(
         sender,
         placed,
         gone,
+        closing,
         credit: WINDOW,
         left: 0,
         deciding: 0,
@@ -233,6 +254,24 @@ impl<S> Answers<S> {
     fn leave(&mut self, answer: proto::DecideAnswer, spent: bool) -> Poll<Option<Out>> {
         self.left += u32::from(spent);
         Poll::Ready(Some(Ok(answer)))
+    }
+
+    /// A decider's answer as it is sent: a decision leaves under the fence
+    /// (design 5.3). It waited in the stream's queue for as long as its
+    /// gateway read nothing, so the fence is read here, after the
+    /// decider's reads. Past the term it was made under, `Busy` leaves in
+    /// its place, as it does from a decider whose second read finds the
+    /// fence moved. Nothing is recorded for a decision yet, so nothing is
+    /// taken back.
+    fn fenced(&self, answer: proto::DecideAnswer) -> proto::DecideAnswer {
+        if !matches!(answer.answer, Some(Answer::Decision(_))) {
+            return answer;
+        }
+        let deciders = &self.shared.deciders;
+        if self.shared.fence.leader_term(deciders.now()) == Some(answer.term) {
+            return answer;
+        }
+        deciders.busy(answer.request_id, Reason::NotLeader)
     }
 
     /// One frame of the gateway: handed to its model's decider, or answered
@@ -309,8 +348,12 @@ where
         if this.ended {
             return Poll::Ready(None);
         }
+        let placed = this.placed;
         if this.gone.as_mut().poll(cx).is_ready() {
             return this.end(Status::failed_precondition(NO_SESSION));
+        }
+        if this.closing.as_mut().poll(cx).is_ready() {
+            return this.end(Status::unavailable(CLOSING));
         }
         // Half a window of answers left: the credit their requests spent
         // goes back in one frame.
@@ -324,7 +367,7 @@ where
         }
         // The gateway's frames, without waiting, until one is the reader's
         // own to answer. A place one of them takes is polled for its end
-        // from the stream's next poll on, which its own answer brings.
+        // before the stream sleeps.
         while this.own.is_none() {
             let Some(inbound) = this.inbound.as_mut() else {
                 break;
@@ -348,6 +391,7 @@ where
         // requests answered here never holds a decision back.
         if let Poll::Ready(Some(answer)) = this.decided.poll_recv(cx) {
             this.deciding -= 1;
+            let answer = this.fenced(answer);
             return this.leave(answer, true);
         }
         if let Some((answer, spent)) = this.own.take() {
@@ -358,6 +402,12 @@ where
         if this.inbound.is_none() && this.deciding == 0 {
             this.ended = true;
             return Poll::Ready(None);
+        }
+        // A place taken in this poll has not been polled for its end: it
+        // is now, so the sweep's word wakes a stream whose request is still
+        // with its decider.
+        if this.placed != placed && this.gone.as_mut().poll(cx).is_ready() {
+            return this.end(Status::failed_precondition(NO_SESSION));
         }
         Poll::Pending
     }
@@ -392,7 +442,7 @@ mod tests {
     };
     use tonic_prost::ProstCodec;
 
-    use super::{serve, Streams, MAX_STREAMS, NO_SESSION, WINDOW};
+    use super::{serve, Streams, CLOSING, MAX_STREAMS, NO_SESSION, WINDOW};
     use crate::{
         controller::{
             config::Scope,
@@ -828,6 +878,40 @@ mod tests {
         bed.decides(&mut stream, 2, 1).await;
     }
 
+    /// The listeners' close ends an open stream: a gateway that holds its
+    /// streams open does not hold a drain to its grace period.
+    #[tokio::test]
+    async fn an_open_stream_ends_at_the_listeners_close() {
+        let closing = (Code::Unavailable, CLOSING.to_owned());
+        let bed = bed().await;
+        let _seat = bed.welcomed(NAME, 1);
+        let mut asked = bed.opened(NAME).await;
+        let mut idle = bed.opened(NAME).await;
+        bed.decides(&mut asked, 1, 1).await;
+        // The word wakes a stream that waits for its next frame and one
+        // that read none.
+        bed.shared.stop.send_replace(true);
+        assert_eq!(asked.status().await, closing);
+        assert_eq!(idle.status().await, closing);
+        // A stream that opens after the word ends at its first poll.
+        let mut late = bed.opened(NAME).await;
+        assert_eq!(late.status().await, closing);
+    }
+
+    /// Under no lead a stream holds no place, and ends at the listeners'
+    /// close the same.
+    #[tokio::test]
+    async fn a_stream_under_no_lead_ends_at_the_listeners_close() {
+        let mut bed = bed().await;
+        assert!(bed.elector.release().expect("the release"));
+        let mut stream = bed.opened(NAME).await;
+        stream.send(frame(1, 1)).await;
+        assert_eq!(busy(&stream.answer().await), Reason::NotLeader);
+        bed.shared.stop.send_replace(true);
+        let closing = (Code::Unavailable, CLOSING.to_owned());
+        assert_eq!(stream.status().await, closing);
+    }
+
     /// At a take every gone gateway's period starts again, and a stream's
     /// open may be the table's first read under the new term.
     #[tokio::test]
@@ -965,6 +1049,28 @@ mod tests {
         assert_eq!(present.status().await, no_session);
     }
 
+    /// A gateway let go while its stream's first request under a term is
+    /// with its decider: the stream ends at the sweep, not at that answer.
+    #[tokio::test]
+    async fn a_place_taken_at_a_request_ends_its_stream_while_the_request_is_decided() {
+        let (step, at_read, release) = hold();
+        let mut bed = bed_with((1, 8), None, [step]).await;
+        assert!(bed.elector.release().expect("the release"));
+        // Opened under no lead, the stream holds no place.
+        let mut stream = bed.opened(NAME).await;
+        bed.takes(2);
+        let seat = bed.welcomed(NAME, 2);
+        // Its first request takes the place and waits at its decider.
+        stream.send(frame(1, 1)).await;
+        held(at_read).await;
+        seat.end(bed.now());
+        bed.at(GRACE_PERIOD);
+        assert_eq!(bed.shared.gateways.sweep(bed.now()), 1);
+        let no_session = (Code::FailedPrecondition, NO_SESSION.to_owned());
+        assert_eq!(stream.status().await, no_session);
+        release.send(()).expect("the decider waits for the case");
+    }
+
     /// Under no lead a request spends a credit as any other, and its
     /// answer gives it back.
     #[tokio::test]
@@ -1072,7 +1178,8 @@ mod tests {
     /// it leaves first.
     #[tokio::test]
     async fn a_decision_made_leaves_before_an_answer_of_the_streams_own() {
-        let bed = bed_with((1, 8), None, []).await;
+        let (step, at_read, release) = hold();
+        let bed = bed_with((1, 8), None, [step]).await;
         let _seat = bed.welcomed(NAME, 1);
         let gateway = told(NAME);
         let (frames, inbound) = mpsc::channel::<Result<proto::DecideRequest, Status>>(4);
@@ -1084,14 +1191,16 @@ mod tests {
             Ok(stream) => stream,
             Err(status) => panic!("a present gateway's stream opens: {status:?}"),
         };
-        // One poll hands the first request to its decider; no answer is
-        // there yet.
+        // One poll hands the first request to its decider, which the case
+        // holds at its first read: no answer is there yet.
         frames
             .send(Ok(frame(1, 1)))
             .await
             .expect("the stream's side is open");
         let mut cx = Context::from_waker(Waker::noop());
         assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
+        held(at_read).await;
+        release.send(()).expect("the decider waits for the case");
         // The one decider answers a request of the case's own after it:
         // the first one's answer waits in the stream's queue by then.
         let (sender, mut answers) = mpsc::channel(1);
@@ -1127,6 +1236,75 @@ mod tests {
             (busy(&second), second.request_id.as_slice()),
             (Reason::BudgetGoneOnArrival, &[3][..])
         );
+    }
+
+    /// A decision waits in its stream's queue for as long as its gateway
+    /// reads nothing, so the fence is read where one is sent, and the term
+    /// it must show is the decision's own. One made inside the renew
+    /// deadline and sent past it leaves as `Busy` for the leader that is
+    /// elsewhere, and so does one sent once the replica leads under the
+    /// next term. Each is counted at that reason.
+    #[tokio::test]
+    async fn a_decision_leaves_as_busy_once_the_fence_no_longer_shows_its_term() {
+        let (step, at_read, release) = hold();
+        let mut bed = bed_with((1, 8), None, [step]).await;
+        let _seat = bed.welcomed(NAME, 1);
+        let gateway = told(NAME);
+        let (frames, inbound) = mpsc::channel::<Result<proto::DecideRequest, Status>>(4);
+        let mut stream = match serve(
+            Arc::clone(&bed.shared),
+            &gateway,
+            ReceiverStream::new(inbound),
+        ) {
+            Ok(stream) => stream,
+            Err(status) => panic!("a present gateway's stream opens: {status:?}"),
+        };
+        // One poll hands two requests to their decider, held at its first
+        // read. Released, it decides both under the open fence of term 1.
+        for id in [1, 2] {
+            frames
+                .send(Ok(frame(id, 1)))
+                .await
+                .expect("the stream's side is open");
+        }
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
+        held(at_read).await;
+        release.send(()).expect("the decider waits for the case");
+        // The one decider answers a request of the case's own after them:
+        // both decisions wait in the stream's queue by then.
+        let (sender, mut answers) = mpsc::channel(1);
+        let job = Job {
+            request: Checked::new(frame(3, 3)).expect("a frame the record holds"),
+            gateway: gateway.gateway(),
+            received: bed.now(),
+            answers: sender,
+        };
+        assert!(bed.shared.deciders.submit(job).is_none());
+        let other = timeout(PATIENCE, answers.recv()).await;
+        assert!(matches!(other, Ok(Some(_))), "{other:?}");
+        let mut next = async || match timeout(PATIENCE, stream.next()).await {
+            Ok(Some(Ok(answer))) => answer,
+            other => panic!("an answer within the case's patience: {other:?}"),
+        };
+        // The clock passes the renew deadline before the stream is polled
+        // again: the fence shows no term.
+        bed.at(PATIENT.renew_deadline + Duration::from_secs(1));
+        let first = next().await;
+        assert_eq!(
+            (busy(&first), first.request_id.as_slice(), first.term),
+            (Reason::NotLeader, &[1][..], 1)
+        );
+        // The replica gives its lease up and takes it again under term 2:
+        // the fence shows a term, and not the second decision's.
+        assert!(bed.elector.release().expect("the release"));
+        bed.takes(2);
+        let second = next().await;
+        assert_eq!(
+            (busy(&second), second.request_id.as_slice(), second.term),
+            (Reason::NotLeader, &[2][..], 2)
+        );
+        assert_eq!(bed.busied(Reason::NotLeader), 2);
     }
 
     /// The controller stops for a deciding thread that ended. Until it has,

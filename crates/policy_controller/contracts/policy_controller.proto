@@ -80,7 +80,9 @@
 // another present gateway's, refused while that one stands, or an add of
 // a registered URL; NOT_FOUND a replace of an absent URL, or no worker
 // under the id; DEADLINE_EXCEEDED a Session stream that said no Hello
-// within 5 s of its open; UNAVAILABLE a standby not yet synced;
+// within 5 s of its open; UNAVAILABLE a standby not yet synced, or a
+// Decide stream open when the controller closes its listeners at its
+// shutdown (its gateway opens the next one on the leader);
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read
 // under a term the election left before its seat was taken, or a session
 // a newer one of its gateway replaced, or a worker row that moved under a
