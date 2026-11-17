@@ -3830,6 +3830,101 @@ mod tests {
         assert_eq!(engine.needs_for_phase(Phase::Prefill), Needs::default());
     }
 
+    /// The needs rows are what a host must feed: a host that feeds, for a
+    /// model and a phase, every row whose glob matches the model feeds what
+    /// the decision of that model and phase reads, with no copy of the
+    /// bindings' order or of the pair's rule. A pair's decode profile is a
+    /// decode row of the pair binding's glob, two bindings of one glob write
+    /// one row a phase, and nothing to feed is no row.
+    #[test]
+    fn the_needs_rows_feed_what_every_decision_reads() {
+        /// What a host feeds for `model` and `phase`: the union of the rows
+        /// whose glob matches.
+        fn fed(engine: &Engine, model: &str, phase: Phase) -> Needs {
+            engine
+                .needs_rows()
+                .into_iter()
+                .filter(|(glob, at, _)| {
+                    let matches = match (glob.strip_prefix('*'), glob.strip_suffix('*')) {
+                        _ if *glob == "*" => true,
+                        (Some(suffix), _) => model.ends_with(suffix),
+                        (_, Some(prefix)) => model.starts_with(prefix),
+                        _ => *glob == model,
+                    };
+                    matches && *at == phase
+                })
+                .fold(Needs::default(), |fed, (_, _, needs)| fed.or(needs))
+        }
+        let loads = Needs {
+            loads: true,
+            ..Needs::default()
+        };
+        let headers = Needs {
+            headers: true,
+            ..Needs::default()
+        };
+        let phases = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
+
+        // A decode-phase binding before a pair binding, and a catch-all that
+        // reads nothing: the pair's decode profile is a row of the pair's
+        // glob, and the catch-all writes none.
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "decode-only": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" },
+            "prefill": { "filter": ["healthy"], "pick": "round-robin" },
+            "pair-decode": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
+            "default": { "filter": ["healthy"], "pick": "round-robin" }
+          },
+          "bindings": [
+            { "match": { "model": "*", "phase": ["decode"] }, "profile": "decode-only" },
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "pair-decode" } },
+            { "match": { "model": "*" }, "profile": "default" }
+          ]
+        }"#;
+        let engine = doc(text).validate().expect("validates");
+        assert_eq!(
+            engine.needs_rows(),
+            [
+                ("*", Phase::Decode, loads),
+                ("pd/*", Phase::Decode, headers)
+            ]
+        );
+        for model in ["pd/x", "other"] {
+            for phase in phases {
+                assert_eq!(
+                    fed(&engine, model, phase),
+                    engine.needs_for(model, phase),
+                    "{model} {phase:?}"
+                );
+            }
+        }
+
+        // Two bindings of one glob write one row a phase. The first decides
+        // the single phase and reads the headers there: the union feeds the
+        // loads over its word, and never under it.
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "keyed": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
+            "loaded": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" }
+          },
+          "bindings": [
+            { "match": { "model": "m", "phase": ["single"] }, "profile": "keyed" },
+            { "match": { "model": "m" }, "profile": "loaded" }
+          ]
+        }"#;
+        let engine = doc(text).validate().expect("validates");
+        assert_eq!(engine.needs_for("m", Phase::Single), headers);
+        assert_eq!(
+            engine.needs_rows(),
+            phases.map(|phase| match phase {
+                Phase::Single => ("m", phase, headers.or(loads)),
+                _ => ("m", phase, loads),
+            })
+        );
+    }
+
     #[test]
     fn a_document_round_trips_and_names_its_mistakes() {
         let text = r#"{
