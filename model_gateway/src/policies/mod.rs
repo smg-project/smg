@@ -16,6 +16,15 @@ use crate::{
 mod bucket;
 mod cache_aware;
 mod cache_namespace;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_all_vetoed_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_manual_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_rows;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;

@@ -3801,3 +3801,7 @@ mod native_loads_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_overload_rows;
