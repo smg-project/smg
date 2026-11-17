@@ -82,13 +82,15 @@ same count is not there to read: a pull request read two decide ids 11.9 and 15.
 6 and 2 instructions more an iteration, 0.03 and 0.04 % of their counts, and the same two
 sources built without the alignment read them 3.8 and 5.1 % faster (2026-11-16). For a marked
 id the placement's first fact is a level count: the two counts within half a percent of each
-other (`LEVEL_COUNT`) at the last batch all four counts ran, each executable's own two counts
-the same. No function's address is
-asked, since any line of the pass can move. The ceiling of twice the threshold holds as for
-every id, and a count that moved further leaves the failure as before: work inserted into
-the decision read the same two ids 16.2 and 11.3 % slower on counts 3.1 and 3.4 % higher.
-Half a percent of a count carries a twentieth of a 10 % threshold by itself: the rest of
-such a time is not work.
+other (`LEVEL_COUNT`) at the last batch that differs among those all four counts ran, each
+executable's own two counts the same. A batch a second count did not run grants no level
+count, and it refuses one where the first counts differ last there, further apart than the
+level: work that grows with the iterations can read under the level one batch early. No
+function's address is asked, since any line of the pass can move. The ceiling of twice the
+threshold holds as for every id, and a count that moved further leaves the failure as before:
+work inserted into the decision read the same two ids 16.2 and 11.3 % slower on counts 3.1 and
+3.4 % higher. Half a percent of a count carries a twentieth of a 10 % threshold by itself: the
+rest of such a time is not work.
 
 Usage:
     bench_gate.py build --out FILE [--name BENCH] [--gates FILE [--sources-from REV]]
@@ -926,7 +928,8 @@ class Counted:
 
     # "same": every batch both executables ran after the first is equal. "moved": one
     # differs, and each executable counted the same twice. "unsteady": one differs, and so
-    # do an executable's own two counts.
+    # do an executable's own two counts. "once": the last that differs is one a second
+    # count did not run, and it reads beyond the level (`Row.beyond_once`).
     state: str
     # The harness's warm-up doubles a batch: 1, 2, 4, ... iterations.
     iterations: int
@@ -1090,11 +1093,14 @@ class Row:
     @property
     def level_count(self) -> bool:
         """Whether the count read level on the two executables: the same, or moved by no more
-        than `LEVEL_COUNT` of the base's with each executable's own two counts the same."""
+        than `LEVEL_COUNT` of the base's with each executable's own two counts the same, and
+        by no more where the first counts differ last at a batch a second count did not run."""
         counted = self.counted
         if counted is None or counted.state == "unsteady":
             return False
         if counted.state == "moved" and not self.counted_twice:
+            return False
+        if self.beyond_once is not None:
             return False
         return abs(counted.pr - counted.base) <= LEVEL_COUNT * counted.base
 
@@ -1103,6 +1109,22 @@ class Row:
         """Whether each executable was counted a second time, which two counts that differ
         ask before either is read."""
         return all(((self.counts or {}).get(side) or {}).get("again") for side in SIDES)
+
+    @property
+    def beyond_once(self) -> Counted | None:
+        """The last batch of the first counts that differs, where a second count did not run
+        it and the two read further apart than `LEVEL_COUNT`; None otherwise. It is the batch
+        that would decide the row had every count run it, and no second count says that each
+        executable counts it the same twice: it grants no level count, and it refuses one, since
+        work that grows with the iterations can read under the level one batch early."""
+        if not self.counted_twice:
+            return None
+        sides = [self.counts[side] for side in SIDES]
+        base, pr = (side["batches"] for side in sides)
+        n, ran = differs_at(base, pr), min(len(side["again"]) for side in sides)
+        if n is None or n < ran or abs(pr[n] - base[n]) <= LEVEL_COUNT * base[n]:
+            return None
+        return Counted("once", 2**n, base[n], pr[n])
 
     @property
     def placed(self) -> bool:
@@ -1314,6 +1336,14 @@ def fmt_level_count(row: Row, counted: Counted, differs: str, twice: str) -> str
         return (
             f" The count moved too: {differs}. A level count is two counts of each executable "
             "that agree, and a second one was not read: the failure stands."
+        )
+    once = row.beyond_once
+    if once is not None:
+        return (
+            f" The count is level where all four counts ran: {differs}{twice}, within {level}. "
+            f"Past it the first counts read {once.base:,} and {once.pr:,} over a batch of "
+            f"{once.iterations:,} iterations ({(once.pr - once.base) / once.base:+.3%}), beyond "
+            "the level, and a second count did not run that batch: the failure stands."
         )
     if not row.placed:
         return f" The count is level: {differs}{twice}, within {level}.{fmt_ceiling(row)}"

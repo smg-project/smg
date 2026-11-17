@@ -84,20 +84,21 @@
 # PASS under it with one placement: `decide/cache_aware/8`, +10.4 % against 10 %, 4,001 instructions an
 # iteration on both sides, the decision at 0x0c0 of its page in one binary and at 0x240 in the other.
 #
-# A whole pass. The `decide/` ids time a whole decision: about 150 code lines of 64 bytes over 16 to 20
-# pages, where a set of the processor's op cache holds four or five. Every build leaves some sets over,
-# and each change to the binary draws again which. A change to the decision itself moves its count by a
-# few instructions, so the same count is not there to read and the three facts never hold. A pull request
-# read the affinity gate's `decide/cache_aware/8` and `/64` 15.2 and 11.9 % slower on 2 and 6 instructions
-# more an iteration, 0.04 and 0.03 % of their counts; their op-cache misses a decision went from 58 to 78
-# and from 115 to 343, and the same two sources built without the alignment read them 5.1 and 3.8 %
-# faster (2026-11-16). So the `decide/` entries below carry `whole_pass = true`: such an id is a placement
-# on a level count, the two counts within half a percent of each other with each binary's own two the
-# same, and a change within twice its threshold. No function's address is asked, since any line of the
-# pass can move. A count that moved further leaves the failure: work inserted into the decision (16
-# dependent multiply-adds and 2 more a candidate, never committed) read the same two ids 11.3 and 16.2 %
-# slower on counts 3.4 and 3.1 % higher, 159 and 663 instructions an iteration, and both failed; the id at
-# 512 rows read 20.1 % slower, beyond twice its threshold, and was not counted.
+# A whole pass. The `decide/` ids that score the pool time a whole decision: about 150 code lines of 64
+# bytes over 16 to 20 pages, where a set of the processor's op cache holds four or five. Every build
+# leaves some sets over, and each change to the binary draws again which. A change to the decision itself
+# moves its count by a few instructions, so the same count is not there to read and the three facts never
+# hold. A pull request read the affinity gate's `decide/cache_aware/8` and `/64` 15.2 and 11.9 % slower on
+# 2 and 6 instructions more an iteration, 0.04 and 0.03 % of their counts; their op-cache misses a
+# decision went from 58 to 78 and from 115 to 343, and the same two sources built without the alignment
+# read them 5.1 and 3.8 % faster (2026-11-16). So the `decide/` entries below carry `whole_pass = true`,
+# all but the nine that make no pass over the pool: such an id is a placement on a level count, the two
+# counts within half a percent of each other with each binary's own two the same, and a change within
+# twice its threshold. No function's address is asked, since any line of the pass can move. A count that
+# moved further leaves the failure: work inserted into the decision (16 dependent multiply-adds and 2 more
+# a candidate, never committed) read the same two ids 11.3 and 16.2 % slower on counts 3.4 and 3.1 %
+# higher, 159 and 663 instructions an iteration, and both failed; the id at 512 rows read 20.1 % slower,
+# beyond twice its threshold, and was not counted.
 #
 # Read on this file's 33 ids, both binaries from paths of one length as the gate runs them, 2 to 3 s a count:
 #
