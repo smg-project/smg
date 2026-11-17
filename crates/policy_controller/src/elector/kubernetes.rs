@@ -327,6 +327,12 @@ pub(in crate::elector) mod tests {
 
     const S: Duration = Duration::from_secs(1);
 
+    /// How far ahead of the clock a case that steps through a wait starts its
+    /// instants: the elector dates a first sight at the later of the caller's
+    /// instant and its own clock, and an instant the real clock overtakes
+    /// moves the wait.
+    const AHEAD: Duration = S.saturating_mul(3_600);
+
     /// One `Lease` on an API server in this process: the three calls the
     /// backend makes, the resource version that makes a write conditional,
     /// and the answers a real server gives.
@@ -589,7 +595,7 @@ pub(in crate::elector) mod tests {
         assert!(empty.is_released());
         assert_eq!(empty.term, 0);
         let mut a = cell.candidate("a@host:1");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         // Term zero is no holder's word, and an apply that replaces the
         // object leaves this shape under a live leader: the fence stays
@@ -699,7 +705,7 @@ pub(in crate::elector) mod tests {
         let cell = Cell::new();
         let mut a = cell.candidate("a@host:1");
         cell.server.state.lock().lost_answers = 1;
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         let err = a.tick(t0).expect_err("the answer was lost");
         assert!(
             err.to_string()
@@ -780,7 +786,7 @@ pub(in crate::elector) mod tests {
         let cell = Cell::new();
         let mut a = cell.candidate("a@host:1");
         let mut b = cell.candidate("b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         assert_eq!(
             b.tick(t0 + S / 2).expect("follow"),

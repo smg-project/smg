@@ -1147,6 +1147,90 @@ mod tests {
         }
     }
 
+    /// How many times a case that bounds the loop on the real clock is made.
+    /// A try whose bound fails where its witness says the host held this
+    /// process says so and is made again. No witness passes a run: the last
+    /// try stands whatever its witness says, so a loop that fails by itself
+    /// fails each try, and the case.
+    const TRIES: u32 = 3;
+
+    /// A bound on the real clock that did not hold: the one failure a hold
+    /// of the host explains, so the one [`unheld`] makes a try again for.
+    struct Late(String);
+
+    /// `assert!` for a bound on the real clock: the try unwinds as [`Late`]
+    /// with no line of the panic hook's, and [`unheld`] says its words.
+    macro_rules! bound {
+        ($met:expr, $($said:tt)+) => {
+            if !$met {
+                let said = format!("{}:{}: {}", file!(), line!(), format_args!($($said)+));
+                std::panic::resume_unwind(Box::new(Late(said)));
+            }
+        };
+    }
+
+    /// A witness of the host's holds beside such a case: a thread that naps
+    /// 5 ms at a time and keeps the longest it overslept. A host that holds
+    /// this process holds its witness too.
+    struct Witness {
+        end: mpsc::Sender<()>,
+        naps: thread::JoinHandle<Duration>,
+    }
+
+    impl Witness {
+        fn start() -> Self {
+            let (end, ended) = mpsc::channel();
+            let naps = thread::spawn(move || {
+                let nap = Duration::from_millis(5);
+                let mut longest = Duration::ZERO;
+                loop {
+                    let began = Instant::now();
+                    let over = ended.recv_timeout(nap) != Err(mpsc::RecvTimeoutError::Timeout);
+                    // The nap its end cut short counts too: a case the host
+                    // held can end before its witness wakes.
+                    longest = longest.max(began.elapsed().saturating_sub(nap));
+                    if over {
+                        return longest;
+                    }
+                }
+            });
+            Self { end, naps }
+        }
+
+        /// Ends the witness: the longest hold it saw.
+        fn held(self) -> Duration {
+            drop(self.end);
+            self.naps.join().expect("the witness returns")
+        }
+    }
+
+    /// Runs `case`, whose bounds on the real clock ([`bound!`]) leave the
+    /// loop `room`. A host that holds this process longer breaks such a
+    /// bound with no fault of the loop's, so a try whose bound fails where
+    /// the witness saw a hold of half the room is made again, [`TRIES`] at
+    /// most. No hold explains any other failure: it fails the case at once.
+    fn unheld(name: &str, room: Duration, case: fn()) {
+        for tried in 1..=TRIES {
+            let witness = Witness::start();
+            let failed = std::panic::catch_unwind(case);
+            let held = witness.held();
+            let Err(failure) = failed else {
+                return;
+            };
+            let late = match failure.downcast::<Late>() {
+                Ok(late) => late,
+                Err(failure) => std::panic::resume_unwind(failure),
+            };
+            assert!(held >= room / 2 && tried < TRIES, "{}", late.0);
+            writeln!(
+                std::io::stdout(),
+                "{name}: made again in this run: the host held the test {held:?}: {}",
+                late.0
+            )
+            .expect("the test's output");
+        }
+    }
+
     /// A lease whose reads fail while `away` is set.
     struct Away {
         lease: MemoryLease,
@@ -1598,6 +1682,15 @@ mod tests {
 
     #[test]
     fn a_leader_whose_renewals_take_under_the_margin_never_closes_its_fence() {
+        unheld(
+            "a slow store under the margin",
+            Duration::from_secs(1),
+            renewals_under_the_margin,
+        );
+    }
+
+    /// One try of the case above: a second of room.
+    fn renewals_under_the_margin() {
         // The fence's margin is the smaller of the deadline less the period
         // and half the deadline, both 2.5 s here. Every write takes 1.5 s.
         // That is over half the margin: steps that began a period after the
@@ -1614,18 +1707,31 @@ mod tests {
             "SLOW_STORE samples={samples} closed={closed} unnamed={unnamed}"
         )
         .expect("the test's output");
-        assert_eq!((closed, unnamed), (0, 0), "of {samples} samples");
-        // And no step met the store sooner than a period after the step
-        // before it began: a hold only parts two writes further.
-        assert!(slow.began.len() >= 4, "the take and three renewals");
+        // No step met the store sooner than a period after the step before
+        // it began. A hold only parts two writes further, so no hold
+        // excuses this floor: it is read before the bounds.
         for pair in slow.began.windows(2) {
             let apart = pair[1].duration_since(pair[0]);
             assert!(apart >= period * 9 / 10, "two writes {apart:?} apart");
         }
+        bound!(
+            (closed, unnamed) == (0, 0),
+            "{closed} closed and {unnamed} unnamed of {samples} samples"
+        );
+        bound!(slow.began.len() >= 4, "the take and three renewals");
     }
 
     #[test]
     fn the_loop_holds_the_fence_just_under_the_margin_and_follows_a_slow_step_at_once() {
+        unheld(
+            "a slow store just under the margin",
+            Duration::from_millis(500),
+            just_under_the_margin,
+        );
+    }
+
+    /// One try of the case above: half a second of room.
+    fn just_under_the_margin() {
         // A write of three quarters of the margin, 1.5 s under 2 s: half a
         // second of room for a held host. A wait that put any share of the
         // step's own time on top of the period would land the renewal after
@@ -1633,10 +1739,11 @@ mod tests {
         // after it.
         let slow =
             led_over_a_slow_store(Duration::from_millis(2000), Duration::from_millis(1500), 1);
-        assert_eq!(
-            (slow.closed, slow.unnamed),
-            (0, 0),
-            "of {} samples",
+        bound!(
+            (slow.closed, slow.unnamed) == (0, 0),
+            "{} closed and {} unnamed of {} samples",
+            slow.closed,
+            slow.unnamed,
             slow.samples
         );
 
@@ -2054,6 +2161,15 @@ mod tests {
 
     #[test]
     fn a_holder_whose_record_is_emptied_logs_that_it_is_gone_and_no_fallen_term() {
+        unheld(
+            "an emptied record",
+            Duration::from_millis(500),
+            an_emptied_record_is_gone,
+        );
+    }
+
+    /// One try of the case above, inside the wait: half a second of room.
+    fn an_emptied_record_is_gone() {
         let settings = ElectionSettings {
             duration: Duration::from_millis(600),
             renew_period: Duration::from_millis(20),
@@ -2072,13 +2188,30 @@ mod tests {
         // holder's step reads a loss to nobody, the next one a record that
         // is gone: one line, and none of a fallen term, which never comes
         // back. The case ends inside the wait.
+        let emptied = Instant::now();
         store.put(&LeaseRecord::default());
-        until("the look at the loss", || stood.borrow().holder.is_empty());
+        // The look at the loss names nobody under the term it held. Past
+        // the wait the holder takes again, under the next term: the wait
+        // ends on that too, and the bound below tells the two apart.
+        until("the look at the loss", || {
+            let look = stood.borrow();
+            look.holder.is_empty() || look.term > 1
+        });
         looks(&mut stood, 5);
-        assert_eq!(stood.borrow().term, 1);
+        let term = stood.borrow().term;
         let (gone, text) = looping.stopped_with("the lease's record is gone or names no holder");
-        assert_eq!(gone, 1, "{text}");
+        // No hold explains a fallen term, which never comes back: its line
+        // is read before the bound.
         assert!(!text.contains("the lease's term fell"), "{text}");
+        // The bound on the clock: the case ended inside the wait. A host
+        // that held it past the wait's end let the holder take again.
+        let took = emptied.elapsed();
+        bound!(
+            took < settings.duration,
+            "the case ended {took:?} after the record was emptied, outside the wait"
+        );
+        assert_eq!(term, 1);
+        assert_eq!(gone, 1, "{text}");
     }
 
     /// A lease lost to another holder names that holder on the standing at
@@ -2262,6 +2395,15 @@ mod tests {
 
     #[test]
     fn a_release_that_fails_is_tried_again_a_renew_period_after_it_began() {
+        unheld(
+            "a release that fails",
+            Duration::from_secs(1),
+            failed_releases_tried_again,
+        );
+    }
+
+    /// One try of the case above: a second of room on each upper bound.
+    fn failed_releases_tried_again() {
         // Every write fails, and the first takes the whole period: three
         // writes and no more, and the lease is left to expire by its
         // duration.
@@ -2281,12 +2423,12 @@ mod tests {
         // THE MOST, each with a second of room on this period. The write
         // that took the period is followed at once: the pause never adds
         // to a stall. And no pause follows the last attempt.
-        assert!(
+        bound!(
             stop.releases[1] < period + period / 2,
             "the second release began {:?} after the stop",
             stop.releases[1]
         );
-        assert!(
+        bound!(
             stop.took < period * 2 + period / 2,
             "the thread ended {:?} after its stop",
             stop.took
@@ -2300,12 +2442,12 @@ mod tests {
         // No failure: one write, and the thread ends with no pause.
         let stop = stopped_over(0, Duration::ZERO, period);
         assert_eq!(stop.releases.len(), 1);
-        assert!(
+        assert!(stop.free);
+        bound!(
             stop.took < period,
             "the thread ended {:?} after its stop",
             stop.took
         );
-        assert!(stop.free);
     }
 
     #[test]
