@@ -33,14 +33,22 @@ def readme() -> list[str]:
     return (SHEETS / "README.md").read_text().splitlines()
 
 
+def once(names: list[str], where: str) -> None:
+    assert len(set(names)) == len(names), f"{where} names a sheet twice: {sorted(names)}"
+
+
 def table() -> dict[str, dict[str, str]]:
-    return {row["sheet"]: row.groupdict() for line in readme() if (row := ROW.match(line))}
+    rows = [row.groupdict() for line in readme() if (row := ROW.match(line))]
+    once([row["sheet"] for row in rows], "the table")
+    return {row["sheet"]: row for row in rows}
 
 
 def test_every_sheet_has_a_row_and_every_row_a_sheet_and_a_recorder():
     rows = table()
     assert sorted(rows) == sorted(path.name for path in SHEETS.glob("*.json"))
-    placed = {at["sheet"]: at["path"] for line in readme() if (at := PLACED.match(line))}
+    layout = [at.groupdict() for line in readme() if (at := PLACED.match(line))]
+    once([at["sheet"] for at in layout], "the layout")
+    placed = {at["sheet"]: at["path"] for at in layout}
     assert sorted(placed) == sorted(rows), "the layout and the table name different sheets"
     for name, row in rows.items():
         recorder = GATEWAY / placed[name]
@@ -66,9 +74,11 @@ def test_a_row_states_its_sheets_commit_row_counts_and_sha256():
             )
             assert len(names) == int(row["verdicts"]), name
         elif row["pairs"] is None:
-            kinds = [next(iter(outcome)) for outcome in outcomes]
-            assert set(kinds) <= {"sequence", "counts"}, f"{name}: a row that is no pick"
-            drawn = kinds.count("counts")
+            kinds = [set(outcome) for outcome in outcomes]
+            assert all(kind in ({"sequence"}, {"counts"}) for kind in kinds), (
+                f"{name}: a row that is no pick"
+            )
+            drawn = kinds.count({"counts"})
             stated = (int(row["rows"]), int(row["sequence"]), int(row["drawn"]))
             assert (len(names), len(names) - drawn, drawn) == stated, name
         else:

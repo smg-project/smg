@@ -1,4 +1,4 @@
-# 07. The gRPC stress bed's gateway
+# 07. The gRPC stress script's gateway
 
 Dialect: CLI argv.
 

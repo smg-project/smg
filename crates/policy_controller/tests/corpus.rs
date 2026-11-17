@@ -8,7 +8,9 @@
 //! field the corpus writes) and validate, or be refused only because this
 //! build lacks a stage, a plan, a matcher or a binding rule; any other
 //! refusal, and an item with no document, is a corpus or a validator
-//! defect. The per-item verdicts are printed as the corpus report.
+//! defect. An item refused for a form this build lacks is named in
+//! [`NOT_IN_BUILD`], and the test fails once it validates. The per-item
+//! verdicts are printed as the corpus report.
 
 use std::{
     fs,
@@ -25,6 +27,21 @@ fn expected_document(item: &str) -> Option<&str> {
     let end = body.find("```")?;
     Some(body[..end].trim_start_matches('\n'))
 }
+
+/// The items whose document names a form this build lacks, each with the
+/// validator's words for it. The test fails when a listed item validates,
+/// so an entry leaves with the change that builds its form, and when any
+/// other item is refused in those words.
+const NOT_IN_BUILD: &[(&str, &str)] = &[
+    (
+        "27-cli-prefix-hash-boundaries.md",
+        "the consistent-hash prefix key",
+    ),
+    (
+        "28-cli-cache-aware-hash-index-full.md",
+        "the prefix-affinity decay",
+    ),
+];
 
 enum Verdict {
     NoDocument,
@@ -91,11 +108,19 @@ fn the_step_2_corpus_parses_and_every_item_names_its_verdict() {
             Verdict::Accepted(summary) => {
                 documents += 1;
                 accepted += 1;
+                if NOT_IN_BUILD.iter().any(|(item, _)| *item == name) {
+                    defects.push(format!(
+                        "{name}: listed as not in this build, and it validates"
+                    ));
+                }
                 format!("ACCEPTED {summary}")
             }
             Verdict::NotInBuild(path, what) => {
                 documents += 1;
                 not_in_build += 1;
+                if !NOT_IN_BUILD.contains(&(name.as_str(), what)) {
+                    defects.push(format!("{name}: not listed as not in this build: {what}"));
+                }
                 format!("WELL-FORMED, not in this build: {what} ({path})")
             }
             Verdict::Refused(why) => {
@@ -105,6 +130,14 @@ fn the_step_2_corpus_parses_and_every_item_names_its_verdict() {
             }
         };
         println!("| {name} | {line} |");
+    }
+    for (item, _) in NOT_IN_BUILD {
+        let listed = |path: &PathBuf| path.file_name().is_some_and(|name| name == *item);
+        if !items.iter().any(listed) {
+            defects.push(format!(
+                "{item}: listed as not in this build, and no such item"
+            ));
+        }
     }
     println!();
     println!(
