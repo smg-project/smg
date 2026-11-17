@@ -2339,12 +2339,16 @@ async fn accepted_large_frame_uses_output_silence_not_input_timeout() {
     let (request, aux) = large_request("queued");
     let asked = std::time::Instant::now();
     let mut stream = client.submit_with_aux(request, aux).await.unwrap();
-    assert!(tokio::time::timeout(TIMEOUT, stream.next())
+    let error = tokio::time::timeout(TIMEOUT, stream.next())
         .await
         .unwrap()
         .unwrap()
-        .is_err());
+        .expect_err("the stalled request ends with an error");
     let given_up_after = asked.elapsed();
+    assert!(
+        matches!(&error, Error::Shared(shared) if matches!(**shared, Error::EngineCoreDead)),
+        "{error:?}"
+    );
     assert!(
         given_up_after >= SEND_WINDOW * 2,
         "queue admission finished despite the stalled receiver, and the client was \
