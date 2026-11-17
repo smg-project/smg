@@ -1478,78 +1478,52 @@ impl RequestContext {
     }
 
     /// Get Arc clone of chat request (panics if not chat)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn chat_request_arc(&self) -> Arc<ChatCompletionRequest> {
-        match &self.input.request_type {
-            RequestType::Chat(req) => Arc::clone(req),
-            _ => panic!("Expected chat request"),
-        }
+        let RequestType::Chat(req) = &self.input.request_type else {
+            expected_shape("chat")
+        };
+        Arc::clone(req)
     }
 
     /// Get Arc clones of the transcription request and its audio (panics if
     /// not a transcription request).
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn transcription_input_arc(&self) -> (Arc<TranscriptionRequest>, Arc<AudioFile>) {
-        match &self.input.request_type {
-            RequestType::Transcription { request, audio } => {
-                (Arc::clone(request), Arc::clone(audio))
-            }
-            _ => panic!("Expected transcription request"),
-        }
+        let RequestType::Transcription { request, audio } = &self.input.request_type else {
+            expected_shape("transcription")
+        };
+        (Arc::clone(request), Arc::clone(audio))
     }
 
     /// Get Arc clone of generate request (panics if not generate)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn generate_request_arc(&self) -> Arc<GenerateRequest> {
-        match &self.input.request_type {
-            RequestType::Generate(req) => Arc::clone(req),
-            _ => panic!("Expected generate request"),
-        }
+        let RequestType::Generate(req) = &self.input.request_type else {
+            expected_shape("generate")
+        };
+        Arc::clone(req)
     }
 
     /// Get Arc clone of completion request (panics if not completion)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn completion_request_arc(&self) -> Arc<CompletionRequest> {
-        match &self.input.request_type {
-            RequestType::Completion(req) => Arc::clone(req),
-            _ => panic!("Expected completion request"),
-        }
+        let RequestType::Completion(req) = &self.input.request_type else {
+            expected_shape("completion")
+        };
+        Arc::clone(req)
     }
 
     /// Get Arc clone of responses request (panics if not responses)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn responses_request_arc(&self) -> Arc<ResponsesRequest> {
-        match &self.input.request_type {
-            RequestType::Responses(req) => Arc::clone(req),
-            _ => panic!("Expected responses request"),
-        }
+        let RequestType::Responses(req) = &self.input.request_type else {
+            expected_shape("responses")
+        };
+        Arc::clone(req)
     }
 
     /// Get Arc clone of messages request (panics if not messages)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn messages_request_arc(&self) -> Arc<CreateMessageRequest> {
-        match &self.input.request_type {
-            RequestType::Messages(req) => Arc::clone(req),
-            _ => panic!("Expected messages request"),
-        }
+        let RequestType::Messages(req) = &self.input.request_type else {
+            expected_shape("messages")
+        };
+        Arc::clone(req)
     }
 
     /// Check if request is streaming (captured at construction).
@@ -1564,6 +1538,18 @@ impl RequestContext {
     pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {
         self.state.tokenizer.clone()
     }
+}
+
+/// The typed accessors' refusal: the caller read a request shape the context
+/// does not hold. The shape is fixed at construction, so a wrong read is a
+/// programming error, never a request's. The panic names the accessor's line.
+#[expect(
+    clippy::panic,
+    reason = "typed accessor: caller guarantees variant via RequestType construction"
+)]
+#[track_caller]
+fn expected_shape(shape: &str) -> ! {
+    panic!("Expected {shape} request")
 }
 
 impl WorkerSelection {
