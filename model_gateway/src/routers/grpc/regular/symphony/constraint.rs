@@ -232,23 +232,37 @@ pub(crate) fn keeps_references(schema: &ToolConstraint, tools: &[Tool]) -> bool 
 }
 
 /// The text of every reference written in `schema`: each `$ref`, `$dynamicRef` and
-/// `$recursiveRef`.
+/// `$recursiveRef` that stands where a schema does. The values of `const`, `enum`, `default`
+/// and `examples` are data, and a member named like a reference there is none. The members of
+/// `properties`, `patternProperties`, `$defs`, `definitions`, `dependentSchemas` and
+/// `dependencies` are schemas under names of their own, so a property named `default` is read.
+/// Any other keyword is followed, so one this does not know cannot hide a reference.
 fn references_in(schema: &Value) -> Vec<&str> {
     let mut found = Vec::new();
-    let mut pending = vec![schema];
-    while let Some(value) = pending.pop() {
+    // Each value still to read, with whether its members are schemas under names of their own.
+    let mut pending = vec![(schema, false)];
+    while let Some((value, named)) = pending.pop() {
         match value {
+            Value::Object(members) if named => {
+                pending.extend(members.values().map(|member| (member, false)));
+            }
             Value::Object(members) => {
                 for (key, member) in members {
                     match (key.as_str(), member) {
                         ("$ref" | "$dynamicRef" | "$recursiveRef", Value::String(reference)) => {
                             found.push(reference.as_str());
                         }
-                        _ => pending.push(member),
+                        ("const" | "enum" | "default" | "examples", _) => {}
+                        (
+                            "properties" | "patternProperties" | "$defs" | "definitions"
+                            | "dependentSchemas" | "dependencies",
+                            _,
+                        ) => pending.push((member, true)),
+                        _ => pending.push((member, false)),
                     }
                 }
             }
-            Value::Array(items) => pending.extend(items),
+            Value::Array(items) => pending.extend(items.iter().map(|item| (item, false))),
             _ => {}
         }
     }
@@ -1682,6 +1696,8 @@ mod tests {
     /// nothing else. A reference to an entry of `definitions` or to the tool's own root under
     /// that list, one that resolves nowhere, one that is no local pointer, and one whose target
     /// the schema carries with another value are not kept.
+    /// A member named like a reference inside data (`const`, `enum`, `default`, `examples`) is
+    /// none; a property named like one of those keywords is still read.
     #[test]
     fn a_schema_keeps_a_reference_whose_target_it_carries() {
         let tool = |parameters: &Value| -> Tool {
@@ -1739,6 +1755,51 @@ mod tests {
             !keeps_references(&listed(&parameters, other), &[tool(&parameters)]),
             "another value under the name"
         );
+        for (parameters, list) in [
+            (
+                json!({"type": "object", "examples": [{"$ref": "literal"}]}),
+                true,
+            ),
+            (
+                json!({"type": "object", "default": {"$ref": "literal"}}),
+                true,
+            ),
+            (
+                json!({"type": "object", "properties": {"kind": {"const": {"$ref": "literal"}}}}),
+                true,
+            ),
+            (
+                json!({"type": "object", "properties": {"kind": {"enum": [{"$ref": "literal"}]}}}),
+                true,
+            ),
+            (
+                json!({
+                    "type": "object",
+                    "properties": {"default": {"$ref": "#/definitions/place"}},
+                    "definitions": {"place": {"type": "string"}},
+                }),
+                false,
+            ),
+            (
+                json!({
+                    "type": "object",
+                    "properties": {"examples": {"$ref": "#/definitions/place"}},
+                    "definitions": {"place": {"type": "string"}},
+                }),
+                false,
+            ),
+        ] {
+            let tools = [tool(&parameters)];
+            assert!(
+                keeps_references(&own(&parameters), &tools),
+                "{parameters}: a named function"
+            );
+            assert_eq!(
+                keeps_references(&listed(&parameters, json!({})), &tools),
+                list,
+                "{parameters}: a list of tools"
+            );
+        }
         let plain = json!({"type": "object"});
         assert!(
             keeps_references(

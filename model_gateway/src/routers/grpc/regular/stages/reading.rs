@@ -1079,7 +1079,8 @@ mod tests {
     /// of `definitions`, which it builds and leaves pointing nowhere, since it lifts the tools'
     /// `$defs` and nothing else. The table's tag reads each tool's parameters apart. Where every
     /// reference keeps its target the schema goes out: one definition under the name, and a
-    /// named function, whose parameters are the schema as they are.
+    /// named function, whose parameters are the schema as they are. A member named like a
+    /// reference inside the data of `examples` is none, and the schema goes out.
     #[test]
     fn a_required_call_the_schema_cannot_spell_keeps_the_tables_tag() {
         let tokenizer = hiding(&["<think>", "</think>"]);
@@ -1121,6 +1122,17 @@ mod tests {
                 "a named function, the same reference",
                 &named,
                 vec![tool("lookup", "definitions", "string")],
+                true,
+            ),
+            (
+                "a member named like a reference inside `examples`",
+                &required,
+                vec![
+                    json!({"type": "function", "function": {"name": "lookup", "parameters": {
+                        "type": "object",
+                        "examples": [{"$ref": "literal"}],
+                    }}}),
+                ],
                 true,
             ),
         ] {
