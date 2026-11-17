@@ -75,6 +75,7 @@ pub fn serial() -> Serial {
 }
 
 /// The guard of [`serial`].
+#[must_use = "launches run one at a time, and picked ports are kept, only while the guard lives"]
 pub struct Serial(MutexGuard<'static, ()>);
 
 impl Drop for Serial {
