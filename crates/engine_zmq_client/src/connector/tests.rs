@@ -2324,7 +2324,12 @@ async fn an_engine_lost_while_the_handshake_waited_for_the_others_ends_the_link(
     ));
 }
 
-/// Local admission completes before receipt; output silence still detects stalls.
+/// Local admission completes before receipt; output silence still detects
+/// stalls. The client is given up on a whole silence window after the ask at
+/// the soonest, not at the input-death window, a quarter as long. The case
+/// reads when the give-up came and takes no sample of the client in
+/// between: the silence count starts inside the submit, and on a starved
+/// host the submit returns too late for a sample timed from its return.
 #[tokio::test]
 async fn accepted_large_frame_uses_output_silence_not_input_timeout() {
     let (client, _engine, _ns) = connect().await;
@@ -2332,17 +2337,19 @@ async fn accepted_large_frame_uses_output_silence_not_input_timeout() {
     client.set_input_death_timeout(SEND_WINDOW / 2);
     client.set_silence_death_timeout(SEND_WINDOW * 2);
     let (request, aux) = large_request("queued");
+    let asked = std::time::Instant::now();
     let mut stream = client.submit_with_aux(request, aux).await.unwrap();
-    tokio::time::sleep(SEND_WINDOW).await;
-    assert!(
-        client.is_alive(),
-        "queue admission finished despite the stalled receiver"
-    );
     assert!(tokio::time::timeout(TIMEOUT, stream.next())
         .await
         .unwrap()
         .unwrap()
         .is_err());
+    let given_up_after = asked.elapsed();
+    assert!(
+        given_up_after >= SEND_WINDOW * 2,
+        "queue admission finished despite the stalled receiver, and the client was \
+         given up on after {given_up_after:?}: sooner than a silence window"
+    );
     assert!(
         !client.is_alive(),
         "unanswered queued requests still trigger output silence"
