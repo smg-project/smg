@@ -4,8 +4,10 @@
 //!
 //! `Leader` is served, on every listener and by every replica, to a caller
 //! with a principal or with none. `Session` is served to a gateway
-//! ([`session`](super::session)). `GetPolicySpec` is served on the control
-//! scope by a controller given a spec source. Every other call is refused:
+//! ([`session`](super::session)), and the control scope's three
+//! registration calls by the leader. `GetPolicySpec` is served on the
+//! control scope by a controller given a spec source. Every other call is
+//! refused:
 //! `PERMISSION_DENIED` where the listener mounts none of the call's scopes
 //! (the contract: the scope does not cover the RPC), `UNAUTHENTICATED`
 //! where it does and the listener's layer placed no principal on the call
@@ -20,14 +22,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use prost::Message as _;
 use tokio::sync::watch;
-use tonic::{service::Routes, Request, Response, Status, Streaming};
+use tonic::{service::Routes, Code, Request, Response, Status, Streaming};
 
 use super::{
     config::Scope,
     election::{split_identity, Standing},
     gateways::Gateways,
     generations::Generations,
+    membership::Door,
     principal::{self, Layer, Principal},
     session, PROTOCOL_VERSION,
 };
@@ -66,6 +70,9 @@ pub(crate) struct Shared {
     pub(crate) generations: Arc<Generations>,
     /// How long a `Session` stream may stand with no `Hello`.
     pub(crate) hello_deadline: Duration,
+    /// The membership door over that store: the control scope's
+    /// registration calls.
+    pub(crate) door: Door,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -108,6 +115,7 @@ impl Shared {
             fence: elector.fence(),
             standing,
             generations: Arc::new(Generations::new(Arc::clone(&store), catalog)),
+            door: Door::new(Arc::clone(&store)),
             store,
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
@@ -243,6 +251,28 @@ impl Call {
 /// serves the call names its own stream.
 type Unserved<T> = Streaming<T>;
 
+/// `google.rpc.Status`: what every gRPC client decodes a status's details
+/// as. It says the code and the message again and holds each detail as an
+/// [`Any`].
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<Any>,
+}
+
+/// `google.protobuf.Any`: a message under its type's URL.
+#[derive(Clone, PartialEq, prost::Message)]
+struct Any {
+    #[prost(string, tag = "1")]
+    type_url: String,
+    #[prost(bytes = "vec", tag = "2")]
+    value: Vec<u8>,
+}
+
 /// One listener's instance of the service.
 pub(crate) struct Service {
     /// The scopes this listener mounts.
@@ -310,6 +340,37 @@ impl Service {
             "{} is not served by a controller started with no spec file",
             call.name()
         )))
+    }
+
+    /// The term this replica leads under at `now`: what a write is admitted
+    /// under. A replica that does not lead refuses the write: its status
+    /// details are a `google.rpc.Status`, the form every gRPC client decodes
+    /// them as, holding a `NotLeader` that names the holder as `Leader` does
+    /// (no address: no leader known). That address is the holder's gateway
+    /// listener; a control client finds the leader's control listener by
+    /// the health service's word.
+    pub(crate) fn leading(&self, now: Instant) -> Result<u64, Status> {
+        const REFUSAL: &str = "this replica does not lead";
+        if let Some(term) = self.shared.fence.leader_term(now) {
+            return Ok(term);
+        }
+        let named = proto::NotLeader {
+            leader_address: self.leader_info(now).address,
+            successor_id: String::new(),
+        };
+        let details = RpcStatus {
+            code: Code::FailedPrecondition as i32,
+            message: REFUSAL.to_owned(),
+            details: vec![Any {
+                type_url: "type.googleapis.com/smg.policy.v1.NotLeader".to_owned(),
+                value: named.encode_to_vec(),
+            }],
+        };
+        Err(Status::with_details(
+            Code::FailedPrecondition,
+            REFUSAL,
+            details.encode_to_vec().into(),
+        ))
     }
 
     /// The `Leader` call's answer at `now`: [`Shared::leader`] at one read
@@ -387,21 +448,33 @@ impl PolicyController for Service {
         &self,
         request: Request<proto::RegisterWorkerRequest>,
     ) -> Result<Response<proto::WorkerEvent>, Status> {
-        self.unserved(Call::RegisterWorker, &request)
+        let by = self.admit(Call::RegisterWorker, &request)?;
+        self.shared
+            .door
+            .register(by, || self.leading(Instant::now()), request.get_ref())
+            .map(Response::new)
     }
 
     async fn patch_worker(
         &self,
         request: Request<proto::PatchWorkerRequest>,
     ) -> Result<Response<proto::WorkerEvent>, Status> {
-        self.unserved(Call::PatchWorker, &request)
+        let by = self.admit(Call::PatchWorker, &request)?;
+        self.shared
+            .door
+            .patch(by, || self.leading(Instant::now()), request.get_ref())
+            .map(Response::new)
     }
 
     async fn deregister_worker(
         &self,
         request: Request<proto::DeregisterWorkerRequest>,
     ) -> Result<Response<proto::WorkerEvent>, Status> {
-        self.unserved(Call::DeregisterWorker, &request)
+        let by = self.admit(Call::DeregisterWorker, &request)?;
+        self.shared
+            .door
+            .deregister(by, || self.leading(Instant::now()), request.get_ref())
+            .map(Response::new)
     }
 
     async fn get_snapshot(
@@ -493,6 +566,7 @@ mod tests {
     };
 
     use http::uri::PathAndQuery;
+    use prost::Message as _;
     use tokio::{net::TcpListener, sync::watch, task::JoinSet};
     use tonic::{
         client::Grpc,
@@ -501,7 +575,7 @@ mod tests {
     };
     use tonic_prost::ProstCodec;
 
-    use super::{Call, Service, Shared};
+    use super::{Call, RpcStatus, Service, Shared};
     use crate::{
         catalog::Catalog,
         controller::{
@@ -807,6 +881,15 @@ mod tests {
             .collect()
     }
 
+    /// The calls a step serves, beside `Leader`. Each is the leader's to
+    /// answer: a replica that never took the lease refuses it as a write.
+    const fn served(call: Call) -> bool {
+        matches!(
+            call,
+            Call::RegisterWorker | Call::PatchWorker | Call::DeregisterWorker
+        )
+    }
+
     /// Every method of the contract, called by its own name over a socket
     /// on a listener of each scope set, three ways: a name stated to a
     /// listener with no layer, a name stated to one that takes identities
@@ -814,8 +897,9 @@ mod tests {
     /// way; any other answers in its own name: denied off the listener's
     /// scopes, and on them unauthenticated to a caller the layer did not
     /// place. To the caller it placed, a call no step serves is
-    /// unimplemented, and `Session` is reached: the empty message is no
-    /// `Hello`. The names are read from the contract, so a method added
+    /// unimplemented, `Session` is reached (the empty message is no
+    /// `Hello`), and a registration call is refused by a replica that does
+    /// not lead. The names are read from the contract, so a method added
     /// there joins the case, and fails it until the table holds its call.
     #[tokio::test]
     async fn every_method_of_the_contract_answers_by_its_calls_scopes_and_its_callers_principal() {
@@ -898,6 +982,11 @@ mod tests {
                         Code::Unimplemented,
                         format!("{method} is not served by a controller started with no spec file"),
                     )
+                } else if layer == Layer::AsTold && stated && call.is_some_and(served) {
+                    (
+                        Code::FailedPrecondition,
+                        "this replica does not lead".to_owned(),
+                    )
                 } else if layer == Layer::AsTold && stated {
                     (
                         Code::Unimplemented,
@@ -906,7 +995,7 @@ mod tests {
                 } else {
                     (Code::Unauthenticated, NO_PRINCIPAL.to_owned())
                 };
-                let status = answered.expect_err("no step serves the call");
+                let status = answered.expect_err("no listener here serves the call");
                 assert_eq!(
                     (status.code(), status.message().to_owned()),
                     expected,
@@ -1055,6 +1144,44 @@ mod tests {
         // lags the take still answers as the leader.
         standing.send_replace(Standing::default());
         assert_eq!(service.leader_info(taken), answer(ID, ADDRESS, 1, true));
+    }
+
+    #[test]
+    fn a_replica_that_does_not_lead_refuses_a_write_in_the_form_every_client_decodes() {
+        let (_elector, standing, service) = service(&[Scope::Control]);
+        standing.send_replace(saw("controller-1@10.0.0.8:30100", 4));
+        let refused = service
+            .leading(Instant::now())
+            .expect_err("this replica follows");
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (Code::FailedPrecondition, "this replica does not lead")
+        );
+        // The details are a `google.rpc.Status`: the code and the message
+        // again, and the `NotLeader` under its type's URL.
+        let details = RpcStatus::decode(refused.details()).expect("a google.rpc.Status");
+        assert_eq!(
+            (details.code, details.message.as_str()),
+            (
+                Code::FailedPrecondition as i32,
+                "this replica does not lead"
+            )
+        );
+        let [detail] = details.details.as_slice() else {
+            panic!("one detail: {details:?}");
+        };
+        assert_eq!(
+            detail.type_url,
+            "type.googleapis.com/smg.policy.v1.NotLeader"
+        );
+        let named = proto::NotLeader::decode(detail.value.as_slice()).expect("a NotLeader");
+        assert_eq!(
+            named,
+            proto::NotLeader {
+                leader_address: "10.0.0.8:30100".to_owned(),
+                successor_id: String::new(),
+            }
+        );
     }
 
     #[test]

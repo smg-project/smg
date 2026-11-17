@@ -1,0 +1,1511 @@
+//! The one conversion between the store's worker rows and the contract's
+//! (design 5.2): a registration call's answer, a watch's page and the
+//! replication stream carry one row. This half takes the store's row to the
+//! wire's, and a registration or a patch off the wire into the store's
+//! words; the wire's row back into the store's is the standby's half.
+//!
+//! A request field the store cannot hold is refused by its path
+//! ([`Refused`]), never dropped. So is a field past its bound, and last a
+//! row past [`ROW_BYTES`] whole: an answer's two rows and a snapshot's page
+//! then fit a frame.
+
+use std::collections::BTreeMap;
+
+use prost::Message as _;
+
+use crate::{
+    proto::{self, worker_event::Event},
+    store::{
+        HealthPolicy, Overload, Reachability, Signals, WorkerFacts, WorkerPatch, WorkerRow,
+        WorkerStatus,
+    },
+    view::{Role, WireModes, WorkerId},
+};
+
+/// A request field the door refuses: its path in the request, and why.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Refused {
+    pub(crate) path: &'static str,
+    pub(crate) why: &'static str,
+}
+
+const fn refused(path: &'static str, why: &'static str) -> Refused {
+    Refused { path, why }
+}
+
+/// The bounds of what a row states (contract: `WorkerSpec`). A row tells
+/// its URL three times, a replacement's answer carries two rows and a
+/// snapshot pages at 128 rows: under these each fits a frame of 4 MiB.
+///
+/// A URL's bytes.
+const URL_BYTES: usize = 2_048;
+/// The bytes of a name: a runtime, a zone, a model id.
+const NAME_BYTES: usize = 256;
+/// A label's key, in bytes.
+const KEY_BYTES: usize = 128;
+/// A label's value, in bytes.
+const VALUE_BYTES: usize = 4_096;
+/// The labels of one row.
+const LABELS: usize = 128;
+/// The row whole on the wire, as [`weight`] measures it.
+const ROW_BYTES: usize = 16 * 1024;
+
+/// The contract's status of a row.
+pub(crate) const fn status(status: WorkerStatus) -> proto::WorkerStatus {
+    match status {
+        WorkerStatus::Pending => proto::WorkerStatus::Pending,
+        WorkerStatus::Ready => proto::WorkerStatus::Ready,
+        WorkerStatus::NotReady => proto::WorkerStatus::NotReady,
+        WorkerStatus::Failed => proto::WorkerStatus::Failed,
+        WorkerStatus::Draining => proto::WorkerStatus::Draining,
+    }
+}
+
+/// The health bits a status sets, as a candidate row reads them: only a
+/// ready worker is healthy, and a draining one says so.
+pub(crate) const fn health_bits(status: WorkerStatus) -> u32 {
+    match status {
+        WorkerStatus::Ready => proto::HealthFlag::Healthy as u32,
+        WorkerStatus::Draining => proto::HealthFlag::Draining as u32,
+        WorkerStatus::Pending | WorkerStatus::NotReady | WorkerStatus::Failed => 0,
+    }
+}
+
+const fn role(role: Role) -> proto::Role {
+    match role {
+        Role::Single => proto::Role::Single,
+        Role::Prefill => proto::Role::Prefill,
+        Role::Decode => proto::Role::Decode,
+        Role::Encode => proto::Role::Encode,
+    }
+}
+
+const fn health_policy(policy: HealthPolicy) -> proto::HealthPolicy {
+    proto::HealthPolicy {
+        failure_threshold: policy.failure_threshold,
+        success_threshold: policy.success_threshold,
+        check_interval_ms: policy.check_interval_ms,
+        timeout_ms: policy.timeout_ms,
+        disabled: !policy.probes,
+    }
+}
+
+fn reachable(from: Reachability) -> proto::Reachability {
+    use proto::reachability::Scope;
+    proto::Reachability {
+        scope: Some(match from {
+            Reachability::Any => Scope::Any(true),
+            // The store keeps the verified subject's fingerprint, never its
+            // text.
+            Reachability::Gateway(gateway) => Scope::GatewayId(format!("{:016x}", gateway.0)),
+        }),
+    }
+}
+
+/// The wire's row of a store row. The pairing descriptor is not told here:
+/// its conversion arrives with the store's typed descriptor.
+pub(crate) fn row(row: &WorkerRow) -> proto::WorkerRow {
+    told(row.id, &row.facts, row.status, row.revision)
+}
+
+/// The wire's row of a row's parts: its numbers ([`numbers`]) with its text
+/// laid over them.
+fn told(id: WorkerId, facts: &WorkerFacts, state: WorkerStatus, revision: u64) -> proto::WorkerRow {
+    let mut row = proto::WorkerRow {
+        registration_key: facts.key.clone(),
+        url: facts.key.clone(),
+        runtime: facts.engine_kind.clone(),
+        models: facts.models.clone(),
+        labels: facts
+            .labels
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        zone: facts.zone.clone().unwrap_or_default(),
+        reachable: Some(reachable(facts.reachable_from)),
+        policy: facts.labels.get("policy").cloned().unwrap_or_default(),
+        engine: facts.engine.clone(),
+        ..numbers(id, facts, state, revision)
+    };
+    // A scrape reads the row's engine kind as its family.
+    if let Some(signals) = row.signals.as_mut().filter(|signals| signals.scrape) {
+        signals.scrape_family.clone_from(&facts.engine_kind);
+    }
+    row
+}
+
+/// The fields of the wire's row that are no text. Nothing is allocated to
+/// tell them, so [`weight`] reads a row's numbers here with no row built.
+fn numbers(
+    id: WorkerId,
+    facts: &WorkerFacts,
+    state: WorkerStatus,
+    revision: u64,
+) -> proto::WorkerRow {
+    proto::WorkerRow {
+        id: id.0,
+        incarnation: facts.incarnation,
+        // The wire enum's numbers are the store's bits: one wire reads as
+        // its own value, several as their sum.
+        wire: i32::from(facts.wire_modes.bits()),
+        role: role(facts.role) as i32,
+        dp_size: u32::from(facts.dp_size),
+        status: status(state) as i32,
+        revision,
+        health: health_bits(state),
+        overload: Some(proto::OverloadThresholds {
+            queue_limit: facts.overload.waiting_requests,
+            kv_usage_permille: facts.overload.kv_usage_permille.map(u32::from),
+        }),
+        signals: Some(proto::Signals {
+            events: facts.signals.events,
+            loads: facts.signals.loads,
+            scrape: facts.signals.scrape_interval_ms > 0,
+            scrape_interval_ms: facts.signals.scrape_interval_ms,
+            scrape_family: String::new(),
+        }),
+        kv_block_size: facts.kv_block_size.unwrap_or(0),
+        max_running: facts.max_running.unwrap_or(0),
+        dp_rank: u32::from(facts.dp_rank),
+        health_policy: Some(health_policy(facts.health)),
+        ..Default::default()
+    }
+}
+
+/// A new key's row.
+pub(crate) fn registered(new: &WorkerRow) -> Event {
+    Event::Registered(row(new))
+}
+
+/// A row whose facts changed in place.
+pub(crate) fn relabelled(now: &WorkerRow) -> Event {
+    Event::Relabelled(row(now))
+}
+
+/// A key's new incarnation beside the one it replaced; `state_carried`
+/// where the old one's status came over at the write.
+pub(crate) fn replaced(old: &WorkerRow, new: &WorkerRow, state_carried: bool) -> Event {
+    Event::Replaced(proto::Replaced {
+        old: Some(row(old)),
+        new: Some(row(new)),
+        state_carried,
+    })
+}
+
+/// A removal, told from the row as it last stood.
+pub(crate) fn removed(last: &WorkerRow) -> Event {
+    Event::Removed(proto::Removed {
+        worker_id: last.id.0,
+        registration_key: last.facts.key.clone(),
+        revision: last.revision,
+        draining: last.status == WorkerStatus::Draining,
+    })
+}
+
+/// A status change.
+pub(crate) fn status_changed(id: WorkerId, from: WorkerStatus, to: WorkerStatus) -> Event {
+    Event::Status(proto::StatusChanged {
+        worker_id: id.0,
+        old: status(from) as i32,
+        new: status(to) as i32,
+        health: health_bits(to),
+    })
+}
+
+/// The event in its envelope: the log position it was written at (`0` while
+/// no log numbers one), the membership epoch and the leader's term.
+pub(crate) fn event(
+    event: Event,
+    seq: u64,
+    membership_epoch: u64,
+    term: u64,
+) -> proto::WorkerEvent {
+    proto::WorkerEvent {
+        seq,
+        membership_epoch,
+        event: Some(event),
+        term,
+    }
+}
+
+/// The bytes the wire's row of these facts takes, with the numbers the
+/// controller gives a row (its id, incarnation, revision and status) and
+/// the overload block a patch may state at their widest: a status change,
+/// a later revision or a patched block adds no byte. Summed with no row
+/// built and nothing allocated: the numbers as [`numbers`] tells them, then
+/// each text as the wire frames it, under the contract's field numbers.
+/// `labels` are the row's own, or the ones a patch would leave: nothing is
+/// copied to weigh the row it would make.
+fn weight(facts: &WorkerFacts, labels: &BTreeMap<String, String>) -> usize {
+    use prost::encoding::{btree_map, encoded_len_varint, string};
+    // A length's own bytes, and a text under its tag: nothing when empty.
+    let length = |bytes: usize| encoded_len_varint(u64::try_from(bytes).unwrap_or(u64::MAX));
+    let text = |tag: u32, text: &String| {
+        if text.is_empty() {
+            0
+        } else {
+            string::encoded_len(tag, text)
+        }
+    };
+    let mut row = numbers(WorkerId(u64::MAX), facts, WorkerStatus::Ready, u64::MAX);
+    row.incarnation = u64::MAX;
+    row.overload = Some(proto::OverloadThresholds {
+        queue_limit: Some(u32::MAX),
+        kv_usage_permille: Some(1_000),
+    });
+    // A scrape's family stands in the signals block: its bytes, and one
+    // more where they take the block's length past a byte.
+    let signals = row.signals.as_ref().map_or(0, prost::Message::encoded_len);
+    let family = if facts.signals.scrape_interval_ms > 0 {
+        text(5, &facts.engine_kind)
+    } else {
+        0
+    };
+    // From any gateway is a flag in its block, from one its sixteen digits.
+    let reachable = match facts.reachable_from {
+        Reachability::Any => 4,
+        Reachability::Gateway(_) => 20,
+    };
+    row.encoded_len()
+        + (family + length(signals + family) - length(signals))
+        + reachable
+        + text(2, &facts.key)
+        + text(4, &facts.key)
+        + text(7, &facts.engine_kind)
+        + text(24, &facts.engine)
+        + facts.zone.as_ref().map_or(0, |zone| text(11, zone))
+        + labels.get("policy").map_or(0, |policy| text(20, policy))
+        + string::encoded_len_repeated(8, &facts.models)
+        + btree_map::encoded_len(string::encoded_len, string::encoded_len, 10, labels)
+}
+
+/// Refuses, by `path`, facts whose row under `labels` passes [`ROW_BYTES`].
+fn fits(
+    facts: &WorkerFacts,
+    labels: &BTreeMap<String, String>,
+    path: &'static str,
+) -> Result<(), Refused> {
+    if weight(facts, labels) > ROW_BYTES {
+        return Err(refused(path, "a row is at most 16384 bytes on the wire"));
+    }
+    Ok(())
+}
+
+/// The bounds of one label wherever it enters a row: a registration's
+/// (`spec.labels`) and a patch's (`labels`).
+fn label(name: &str, value: &str, path: &'static str) -> Result<(), Refused> {
+    if name.len() > KEY_BYTES {
+        return Err(refused(path, "a label's key is at most 128 bytes"));
+    }
+    if value.len() > VALUE_BYTES {
+        return Err(refused(path, "a label's value is at most 4096 bytes"));
+    }
+    Ok(())
+}
+
+/// Whether a stated name holds a blank or a control character.
+fn blank(name: &str) -> bool {
+    name.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// `value`, or `default` where the wire's zero says unset.
+const fn or_default(value: u32, default: u32) -> u32 {
+    if value == 0 {
+        default
+    } else {
+        value
+    }
+}
+
+/// The store's thresholds of the contract's block: a field the registration
+/// sets is its own, an unset one takes the store's default field.
+fn overload(block: &proto::OverloadThresholds, path: &'static str) -> Result<Overload, Refused> {
+    let default = Overload::default();
+    let kv_usage_permille = match block.kv_usage_permille {
+        None => default.kv_usage_permille,
+        Some(permille) => Some(
+            u16::try_from(permille)
+                .ok()
+                .filter(|permille| *permille <= 1_000)
+                .ok_or_else(|| refused(path, "a permille is at most 1000"))?,
+        ),
+    };
+    Ok(Overload {
+        kv_usage_permille,
+        waiting_requests: block.queue_limit.or(default.waiting_requests),
+    })
+}
+
+/// The facts of the row a registration states, laid over `standing` (the
+/// facts of the key's standing row, which keep what the registration leaves
+/// unsaid) or over the store's defaults. Two facts are the registration's,
+/// whole, whatever stood: the labels, and the health policy, so nobody's
+/// "do not check" outlives the registration that said it. The incarnation
+/// is the caller's to number.
+///
+/// A name is taken as written, so one that holds a blank or a control
+/// character is refused, never mended: the URL, the runtime and each model
+/// id key the store's rows, its pools and its classes.
+///
+/// One rank a registration: the contract's call answers one row, so a stated
+/// width above one is refused until a call can answer a row a rank.
+pub(crate) fn facts(
+    spec: &proto::WorkerSpec,
+    standing: Option<&WorkerFacts>,
+) -> Result<WorkerFacts, Refused> {
+    if spec.url.is_empty() {
+        return Err(refused("spec.url", "a registration names its worker's URL"));
+    }
+    if spec.url.len() > URL_BYTES {
+        return Err(refused("spec.url", "a URL is at most 2048 bytes"));
+    }
+    if blank(&spec.url) {
+        return Err(refused(
+            "spec.url",
+            "a URL holds no blank and no control character",
+        ));
+    }
+    if spec.runtime.len() > NAME_BYTES {
+        return Err(refused("spec.runtime", "a runtime is at most 256 bytes"));
+    }
+    if blank(&spec.runtime) {
+        return Err(refused(
+            "spec.runtime",
+            "a runtime holds no blank and no control character",
+        ));
+    }
+    if spec.models.iter().any(|model| model.len() > NAME_BYTES) {
+        return Err(refused("spec.models", "a model id is at most 256 bytes"));
+    }
+    if spec
+        .models
+        .iter()
+        .any(|model| model.is_empty() || blank(model))
+    {
+        return Err(refused(
+            "spec.models",
+            "a model id is not empty and holds no blank and no control character",
+        ));
+    }
+    let wire_modes = match proto::WireMode::try_from(spec.wire) {
+        Ok(proto::WireMode::Http) => WireModes::HTTP,
+        Ok(proto::WireMode::Grpc) => WireModes::GRPC,
+        // A host-local wire is reachable from the one gateway that holds its
+        // socket, and no field of a registration names a gateway.
+        Ok(proto::WireMode::Zmq) => {
+            return Err(refused(
+                "spec.wire",
+                "a host-local wire is one gateway's and a registration names none: not served by this build",
+            ));
+        }
+        Ok(proto::WireMode::Unspecified) | Err(_) => {
+            return Err(refused("spec.wire", "a registration names its one wire"));
+        }
+    };
+    let role = match proto::Role::try_from(spec.role) {
+        Ok(proto::Role::Single) => Role::Single,
+        Ok(proto::Role::Prefill) => Role::Prefill,
+        Ok(proto::Role::Decode) => Role::Decode,
+        Ok(proto::Role::Encode) => Role::Encode,
+        Ok(proto::Role::Unspecified) | Err(_) => {
+            return Err(refused("spec.role", "a registration names its role"));
+        }
+    };
+    if spec.dp_size > 1 {
+        return Err(refused(
+            "spec.dp_size",
+            "a registration makes one rank; a width above one is not served by this build",
+        ));
+    }
+    if !spec.topology.is_empty() {
+        return Err(refused(
+            "spec.topology",
+            "no row holds a topology in this build",
+        ));
+    }
+    if spec.pairing.is_some() {
+        return Err(refused(
+            "spec.pairing",
+            "a pairing descriptor is not served by this build",
+        ));
+    }
+    if spec.zone.len() > NAME_BYTES {
+        return Err(refused("spec.zone", "a zone is at most 256 bytes"));
+    }
+    if spec.labels.len() > LABELS {
+        return Err(refused("spec.labels", "a row holds at most 128 labels"));
+    }
+    for (name, value) in &spec.labels {
+        label(name, value, "spec.labels")?;
+    }
+    let mut facts = standing.cloned().unwrap_or_default();
+    facts.key.clone_from(&spec.url);
+    if standing.is_none() {
+        facts.engine.clone_from(&spec.url);
+        facts.dp_size = 1;
+    }
+    facts.role = role;
+    facts.wire_modes = wire_modes;
+    if !spec.runtime.is_empty() {
+        facts.engine_kind.clone_from(&spec.runtime);
+    }
+    if !spec.models.is_empty() {
+        facts.models.clone_from(&spec.models);
+    }
+    // The labels of record are the registration's, whole.
+    facts.labels = spec
+        .labels
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    if !spec.zone.is_empty() {
+        facts.zone = Some(spec.zone.clone());
+    }
+    if spec.kv_block_size != 0 {
+        facts.kv_block_size = Some(spec.kv_block_size);
+    }
+    if let Some(block) = &spec.overload {
+        facts.overload = overload(block, "spec.overload.kv_usage_permille")?;
+    }
+    // The health policy of record is the registration's, whole: one that
+    // states none is checked under the defaults.
+    let default = HealthPolicy::default();
+    facts.health = spec
+        .health_policy
+        .as_ref()
+        .map_or(default, |policy| HealthPolicy {
+            failure_threshold: or_default(policy.failure_threshold, default.failure_threshold),
+            success_threshold: or_default(policy.success_threshold, default.success_threshold),
+            check_interval_ms: or_default(policy.check_interval_ms, default.check_interval_ms),
+            timeout_ms: or_default(policy.timeout_ms, default.timeout_ms),
+            probes: !policy.disabled,
+        });
+    if let Some(signals) = &spec.signals {
+        if signals.scrape && signals.scrape_interval_ms == 0 {
+            return Err(refused(
+                "spec.signals.scrape_interval_ms",
+                "a scrape names its interval",
+            ));
+        }
+        if !signals.scrape && signals.scrape_interval_ms != 0 {
+            return Err(refused(
+                "spec.signals.scrape",
+                "an interval comes with the scrape flag",
+            ));
+        }
+        if !signals.scrape_family.is_empty() && signals.scrape_family != facts.engine_kind {
+            return Err(refused(
+                "spec.signals.scrape_family",
+                "a scrape reads the registration's runtime as its family",
+            ));
+        }
+        facts.signals = Signals {
+            events: signals.events,
+            loads: signals.loads,
+            scrape_interval_ms: signals.scrape_interval_ms,
+        };
+    }
+    // The row whole, last: each field is within its own bound here.
+    fits(&facts, &facts.labels, "spec")?;
+    Ok(facts)
+}
+
+/// The store's patch of the contract's over the row it names: the labels
+/// merged (set, then removed), the overload block replaced when present.
+/// `None` when the patch changes nothing of `standing`. The labels it would
+/// leave are held to a registration's bounds, the row whole last.
+pub(crate) fn patch(
+    request: &proto::PatchWorkerRequest,
+    standing: &WorkerFacts,
+) -> Result<Option<WorkerPatch>, Refused> {
+    if request
+        .remove_labels
+        .iter()
+        .any(|name| request.labels.contains_key(name))
+    {
+        return Err(refused(
+            "remove_labels",
+            "a label is set or removed, not both",
+        ));
+    }
+    if request.remove_labels.len() > LABELS {
+        return Err(refused(
+            "remove_labels",
+            "a patch removes at most 128 labels",
+        ));
+    }
+    if request
+        .remove_labels
+        .iter()
+        .any(|name| name.len() > KEY_BYTES)
+    {
+        return Err(refused(
+            "remove_labels",
+            "a label's key is at most 128 bytes",
+        ));
+    }
+    // A label is set or removed, not both: the labels a patch sets all stand
+    // in the row it would make.
+    if request.labels.len() > LABELS {
+        return Err(refused("labels", "a row holds at most 128 labels"));
+    }
+    for (name, value) in &request.labels {
+        label(name, value, "labels")?;
+    }
+    let mut labels: BTreeMap<String, String> = standing.labels.clone();
+    for (name, value) in &request.labels {
+        labels.insert(name.clone(), value.clone());
+    }
+    for name in &request.remove_labels {
+        labels.remove(name);
+    }
+    let labels = if labels == standing.labels {
+        None
+    } else {
+        // The bounds are of the row the patch would make.
+        if labels.len() > LABELS {
+            return Err(refused("labels", "a row holds at most 128 labels"));
+        }
+        fits(standing, &labels, "labels")?;
+        Some(labels)
+    };
+    let overload = match &request.overload {
+        Some(block) => {
+            Some(overload(block, "overload.kv_usage_permille")?).filter(|o| *o != standing.overload)
+        }
+        None => None,
+    };
+    Ok(
+        (labels.is_some() || overload.is_some()).then_some(WorkerPatch {
+            labels,
+            priority: None,
+            overload,
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, time::Instant};
+
+    use prost::Message as _;
+
+    use super::{
+        event, facts, patch, refused, replaced, row, status, status_changed, Refused, KEY_BYTES,
+        LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
+    };
+    use crate::{
+        proto::{self, worker_event::Event},
+        store::{
+            identity, GatewayId, HealthPolicy, Overload, Reachability, Signals, WorkerFacts,
+            WorkerRow, WorkerStatus,
+        },
+        view::{Role, WireModes, WorkerId},
+    };
+
+    const URL: &str = "grpc://10.0.0.5:8000";
+
+    fn spec() -> proto::WorkerSpec {
+        proto::WorkerSpec {
+            url: URL.to_owned(),
+            wire: proto::WireMode::Grpc as i32,
+            role: proto::Role::Single as i32,
+            ..Default::default()
+        }
+    }
+
+    /// What the row of these facts weighs under its own labels.
+    fn weight(facts: &WorkerFacts) -> usize {
+        super::weight(facts, &facts.labels)
+    }
+
+    /// A name of `bytes` bytes.
+    fn text(bytes: usize) -> String {
+        "a".repeat(bytes)
+    }
+
+    /// A registration whose row weighs `bytes`: three labels at a value's
+    /// bound and a fourth that fills the rest.
+    fn weighing(bytes: usize) -> proto::WorkerSpec {
+        let mut stated = proto::WorkerSpec {
+            labels: ["a", "b", "c"]
+                .map(|key| (key.to_owned(), text(VALUE_BYTES)))
+                .into(),
+            ..spec()
+        };
+        stated.labels.insert("fill".to_owned(), text(200));
+        let base = weight(&facts(&stated, None).expect("a row under every bound"));
+        stated
+            .labels
+            .insert("fill".to_owned(), text(200 + bytes - base));
+        stated
+    }
+
+    /// A store row with every fact the wire's row tells set to a value of
+    /// its own.
+    fn full() -> WorkerRow {
+        let facts = WorkerFacts {
+            key: URL.to_owned(),
+            engine: "grpc://10.0.0.5".to_owned(),
+            incarnation: 3,
+            role: Role::Decode,
+            wire_modes: WireModes::GRPC,
+            engine_kind: "runtime-a".to_owned(),
+            models: vec!["model-a".to_owned(), "model-b".to_owned()],
+            dp_rank: 2,
+            dp_size: 4,
+            labels: BTreeMap::from([
+                ("policy".to_owned(), "least_load".to_owned()),
+                ("tier".to_owned(), "gold".to_owned()),
+            ]),
+            zone: Some("zone-1".to_owned()),
+            max_running: Some(96),
+            kv_block_size: Some(16),
+            reachable_from: Reachability::Gateway(GatewayId(0xabc)),
+            signals: Signals {
+                events: true,
+                loads: true,
+                scrape_interval_ms: 2_500,
+            },
+            health: HealthPolicy {
+                failure_threshold: 5,
+                success_threshold: 4,
+                check_interval_ms: 7_000,
+                timeout_ms: 900,
+                probes: false,
+            },
+            overload: Overload {
+                kv_usage_permille: Some(875),
+                waiting_requests: None,
+            },
+            ..WorkerFacts::default()
+        };
+        WorkerRow {
+            id: identity(URL, 3),
+            facts,
+            status: WorkerStatus::Draining,
+            revision: 11,
+            admitted_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn the_wires_row_tells_every_fact_of_the_stores_row() {
+        let stored = full();
+        let told = row(&stored);
+        let expected = proto::WorkerRow {
+            id: stored.id.0,
+            registration_key: URL.to_owned(),
+            incarnation: 3,
+            url: URL.to_owned(),
+            wire: proto::WireMode::Grpc as i32,
+            role: proto::Role::Decode as i32,
+            runtime: "runtime-a".to_owned(),
+            models: vec!["model-a".to_owned(), "model-b".to_owned()],
+            dp_size: 4,
+            labels: [("policy", "least_load"), ("tier", "gold")]
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect(),
+            zone: "zone-1".to_owned(),
+            status: proto::WorkerStatus::Draining as i32,
+            revision: 11,
+            health: proto::HealthFlag::Draining as u32,
+            reachable: Some(proto::Reachability {
+                scope: Some(proto::reachability::Scope::GatewayId(
+                    "0000000000000abc".to_owned(),
+                )),
+            }),
+            pairing: None,
+            overload: Some(proto::OverloadThresholds {
+                queue_limit: None,
+                kv_usage_permille: Some(875),
+            }),
+            signals: Some(proto::Signals {
+                events: true,
+                loads: true,
+                scrape: true,
+                scrape_interval_ms: 2_500,
+                scrape_family: "runtime-a".to_owned(),
+            }),
+            kv_block_size: 16,
+            policy: "least_load".to_owned(),
+            topology: Vec::new(),
+            max_running: 96,
+            dp_rank: 2,
+            engine: "grpc://10.0.0.5".to_owned(),
+            health_policy: Some(proto::HealthPolicy {
+                failure_threshold: 5,
+                success_threshold: 4,
+                check_interval_ms: 7_000,
+                timeout_ms: 900,
+                disabled: true,
+            }),
+        };
+        assert_eq!(told, expected);
+    }
+
+    #[test]
+    fn a_row_of_defaults_reads_any_gateway_and_no_scrape() {
+        let stored = WorkerRow {
+            id: identity(URL, 1),
+            facts: WorkerFacts {
+                key: URL.to_owned(),
+                wire_modes: WireModes::HTTP.union(WireModes::GRPC),
+                ..WorkerFacts::default()
+            },
+            status: WorkerStatus::Ready,
+            revision: 1,
+            admitted_at: Instant::now(),
+        };
+        let told = row(&stored);
+        // Two wires read as the sum of their numbers.
+        assert_eq!(told.wire, 3);
+        assert_eq!(told.health, proto::HealthFlag::Healthy as u32);
+        assert_eq!(
+            told.reachable,
+            Some(proto::Reachability {
+                scope: Some(proto::reachability::Scope::Any(true)),
+            })
+        );
+        let signals = told.signals.expect("the row's signals");
+        assert!(!signals.scrape && signals.scrape_family.is_empty());
+        let default = Overload::default();
+        assert_eq!(
+            told.overload,
+            Some(proto::OverloadThresholds {
+                queue_limit: default.waiting_requests,
+                kv_usage_permille: default.kv_usage_permille.map(u32::from),
+            })
+        );
+        assert_eq!(
+            told.health_policy.map(|policy| policy.disabled),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn every_status_has_its_own_word_on_the_wire() {
+        let told = [
+            WorkerStatus::Pending,
+            WorkerStatus::Ready,
+            WorkerStatus::NotReady,
+            WorkerStatus::Failed,
+            WorkerStatus::Draining,
+        ]
+        .map(status);
+        assert_eq!(
+            told,
+            [
+                proto::WorkerStatus::Pending,
+                proto::WorkerStatus::Ready,
+                proto::WorkerStatus::NotReady,
+                proto::WorkerStatus::Failed,
+                proto::WorkerStatus::Draining,
+            ]
+        );
+        let change = status_changed(identity(URL, 1), WorkerStatus::Pending, WorkerStatus::Ready);
+        assert_eq!(
+            event(change, 0, 9, 4),
+            proto::WorkerEvent {
+                seq: 0,
+                membership_epoch: 9,
+                event: Some(Event::Status(proto::StatusChanged {
+                    worker_id: identity(URL, 1).0,
+                    old: proto::WorkerStatus::Pending as i32,
+                    new: proto::WorkerStatus::Ready as i32,
+                    health: proto::HealthFlag::Healthy as u32,
+                })),
+                term: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn a_bare_registration_is_one_checked_rank_under_the_stores_defaults() {
+        let made = facts(&spec(), None).expect("a bare registration");
+        assert_eq!(
+            made,
+            WorkerFacts {
+                key: URL.to_owned(),
+                engine: URL.to_owned(),
+                role: Role::Single,
+                wire_modes: WireModes::GRPC,
+                dp_size: 1,
+                ..WorkerFacts::default()
+            }
+        );
+        assert!(made.health.probes);
+        assert_eq!(made.reachable_from, Reachability::Any);
+    }
+
+    #[test]
+    fn a_registration_states_its_row_field_by_field() {
+        let stated = proto::WorkerSpec {
+            runtime: "runtime-a".to_owned(),
+            models: vec!["model-a".to_owned()],
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            zone: "zone-1".to_owned(),
+            overload: Some(proto::OverloadThresholds {
+                queue_limit: Some(40),
+                kv_usage_permille: None,
+            }),
+            kv_block_size: 16,
+            dp_size: 1,
+            signals: Some(proto::Signals {
+                events: true,
+                loads: false,
+                scrape: true,
+                scrape_interval_ms: 3_000,
+                scrape_family: "runtime-a".to_owned(),
+            }),
+            health_policy: Some(proto::HealthPolicy {
+                failure_threshold: 0,
+                success_threshold: 6,
+                check_interval_ms: 0,
+                timeout_ms: 250,
+                disabled: true,
+            }),
+            ..spec()
+        };
+        let made = facts(&stated, None).expect("a full registration");
+        let default = HealthPolicy::default();
+        assert_eq!(
+            made,
+            WorkerFacts {
+                key: URL.to_owned(),
+                engine: URL.to_owned(),
+                role: Role::Single,
+                wire_modes: WireModes::GRPC,
+                engine_kind: "runtime-a".to_owned(),
+                models: vec!["model-a".to_owned()],
+                dp_size: 1,
+                labels: BTreeMap::from([("tier".to_owned(), "gold".to_owned())]),
+                zone: Some("zone-1".to_owned()),
+                kv_block_size: Some(16),
+                signals: Signals {
+                    events: true,
+                    loads: false,
+                    scrape_interval_ms: 3_000,
+                },
+                health: HealthPolicy {
+                    // A zero takes the default's value.
+                    failure_threshold: default.failure_threshold,
+                    success_threshold: 6,
+                    check_interval_ms: default.check_interval_ms,
+                    timeout_ms: 250,
+                    probes: false,
+                },
+                overload: Overload {
+                    // An unset threshold takes the store's default field.
+                    kv_usage_permille: Overload::default().kv_usage_permille,
+                    waiting_requests: Some(40),
+                },
+                ..WorkerFacts::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_threshold_the_block_leaves_unset_takes_the_stores_default() {
+        // Each line reads the store's default field, set or not: the case
+        // stands whatever that default is.
+        let default = Overload::default();
+        let made = |queue_limit, kv_usage_permille| {
+            let stated = proto::WorkerSpec {
+                overload: Some(proto::OverloadThresholds {
+                    queue_limit,
+                    kv_usage_permille,
+                }),
+                ..spec()
+            };
+            facts(&stated, None).expect("a registration").overload
+        };
+        assert_eq!(made(None, None), default);
+        assert_eq!(
+            made(None, Some(900)),
+            Overload {
+                kv_usage_permille: Some(900),
+                ..default
+            }
+        );
+        assert_eq!(
+            made(Some(40), None),
+            Overload {
+                waiting_requests: Some(40),
+                ..default
+            }
+        );
+    }
+
+    #[test]
+    fn a_registration_over_a_standing_row_keeps_what_it_leaves_unsaid_save_its_labels_and_its_policy(
+    ) {
+        let standing = full().facts;
+        assert!(!standing.health.probes, "the standing row is unchecked");
+        let made = facts(&spec(), Some(&standing)).expect("a bare registration");
+        assert_eq!(
+            made,
+            WorkerFacts {
+                // What every registration states.
+                role: Role::Single,
+                wire_modes: WireModes::GRPC,
+                // The two facts that are the registration's, whole: it
+                // states no label, and no policy, so it is checked under
+                // the defaults.
+                labels: BTreeMap::new(),
+                health: HealthPolicy::default(),
+                ..standing
+            }
+        );
+        assert!(made.health.probes);
+    }
+
+    #[test]
+    fn a_field_the_store_cannot_hold_is_refused_by_its_path() {
+        let signals = |scrape, scrape_interval_ms, family: &str| {
+            Some(proto::Signals {
+                scrape,
+                scrape_interval_ms,
+                scrape_family: family.to_owned(),
+                ..Default::default()
+            })
+        };
+        let cases: [(proto::WorkerSpec, &str); 18] = [
+            (
+                proto::WorkerSpec {
+                    url: String::new(),
+                    ..spec()
+                },
+                "spec.url",
+            ),
+            (
+                proto::WorkerSpec {
+                    url: "grpc://10.0.0.5:8000 ".to_owned(),
+                    ..spec()
+                },
+                "spec.url",
+            ),
+            (
+                proto::WorkerSpec {
+                    url: "grpc://10.0.0.5:8000\u{7}".to_owned(),
+                    ..spec()
+                },
+                "spec.url",
+            ),
+            (
+                proto::WorkerSpec {
+                    runtime: "runtime a".to_owned(),
+                    ..spec()
+                },
+                "spec.runtime",
+            ),
+            (
+                proto::WorkerSpec {
+                    runtime: "runtime-a\n".to_owned(),
+                    ..spec()
+                },
+                "spec.runtime",
+            ),
+            (
+                proto::WorkerSpec {
+                    models: vec!["model-a".to_owned(), " model-b".to_owned()],
+                    ..spec()
+                },
+                "spec.models",
+            ),
+            (
+                proto::WorkerSpec {
+                    models: vec![String::new()],
+                    ..spec()
+                },
+                "spec.models",
+            ),
+            (proto::WorkerSpec { wire: 0, ..spec() }, "spec.wire"),
+            (proto::WorkerSpec { wire: 3, ..spec() }, "spec.wire"),
+            // A host-local wire: no registration names the gateway that
+            // holds its socket.
+            (
+                proto::WorkerSpec {
+                    wire: proto::WireMode::Zmq as i32,
+                    ..spec()
+                },
+                "spec.wire",
+            ),
+            (proto::WorkerSpec { role: 0, ..spec() }, "spec.role"),
+            (
+                proto::WorkerSpec {
+                    dp_size: 2,
+                    ..spec()
+                },
+                "spec.dp_size",
+            ),
+            (
+                proto::WorkerSpec {
+                    topology: vec!["rack-1".to_owned()],
+                    ..spec()
+                },
+                "spec.topology",
+            ),
+            (
+                proto::WorkerSpec {
+                    pairing: Some(proto::PairingDescriptor::default()),
+                    ..spec()
+                },
+                "spec.pairing",
+            ),
+            (
+                proto::WorkerSpec {
+                    overload: Some(proto::OverloadThresholds {
+                        queue_limit: None,
+                        kv_usage_permille: Some(1_001),
+                    }),
+                    ..spec()
+                },
+                "spec.overload.kv_usage_permille",
+            ),
+            (
+                proto::WorkerSpec {
+                    signals: signals(true, 0, ""),
+                    ..spec()
+                },
+                "spec.signals.scrape_interval_ms",
+            ),
+            (
+                proto::WorkerSpec {
+                    signals: signals(false, 500, ""),
+                    ..spec()
+                },
+                "spec.signals.scrape",
+            ),
+            (
+                proto::WorkerSpec {
+                    runtime: "runtime-a".to_owned(),
+                    signals: signals(true, 500, "runtime-b"),
+                    ..spec()
+                },
+                "spec.signals.scrape_family",
+            ),
+        ];
+        for (stated, path) in cases {
+            let Refused { path: found, why } =
+                facts(&stated, None).expect_err("the registration is refused");
+            assert_eq!(found, path, "{stated:?}");
+            assert!(!why.is_empty());
+        }
+        // The two zeroes of a width both read one rank.
+        for dp_size in [0, 1] {
+            let made = facts(&proto::WorkerSpec { dp_size, ..spec() }, None);
+            assert_eq!(made.map(|facts| facts.dp_size), Ok(1));
+        }
+        assert_eq!(
+            refused("a", "b"),
+            Refused {
+                path: "a",
+                why: "b"
+            }
+        );
+    }
+
+    #[test]
+    fn a_patch_merges_the_labels_and_replaces_the_overload_block() {
+        // A label the patch leaves unsaid stays: the patch is merged.
+        let mut standing = full().facts;
+        standing.labels.insert("zone".to_owned(), "west".to_owned());
+        let request = proto::PatchWorkerRequest {
+            labels: [
+                ("tier".to_owned(), "silver".to_owned()),
+                ("lane".to_owned(), "b".to_owned()),
+            ]
+            .into(),
+            remove_labels: vec!["policy".to_owned(), "absent".to_owned()],
+            overload: Some(proto::OverloadThresholds {
+                queue_limit: Some(12),
+                kv_usage_permille: None,
+            }),
+            ..Default::default()
+        };
+        let made = patch(&request, &standing)
+            .expect("a patch in order")
+            .expect("a patch that changes the row");
+        assert_eq!(
+            made.labels,
+            Some(BTreeMap::from([
+                ("lane".to_owned(), "b".to_owned()),
+                ("tier".to_owned(), "silver".to_owned()),
+                ("zone".to_owned(), "west".to_owned()),
+            ]))
+        );
+        assert_eq!(made.priority, None);
+        assert_eq!(
+            made.overload,
+            Some(Overload {
+                kv_usage_permille: Overload::default().kv_usage_permille,
+                waiting_requests: Some(12),
+            })
+        );
+    }
+
+    #[test]
+    fn a_patch_that_changes_nothing_is_none_and_a_label_both_set_and_removed_is_refused() {
+        // The row states both thresholds and so does each block below: a
+        // block is compared with the row field by field, whatever the
+        // store's defaults are.
+        let mut standing = full().facts;
+        standing.overload.waiting_requests = Some(12);
+        let stating = |queue_limit| proto::PatchWorkerRequest {
+            labels: [("tier".to_owned(), "gold".to_owned())].into(),
+            remove_labels: vec!["absent".to_owned()],
+            overload: Some(proto::OverloadThresholds {
+                queue_limit: Some(queue_limit),
+                kv_usage_permille: Some(875),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(patch(&stating(12), &standing), Ok(None));
+        let empty = proto::PatchWorkerRequest::default();
+        assert_eq!(patch(&empty, &standing), Ok(None));
+        // A block that differs in one threshold is the patch's one change.
+        let made = patch(&stating(13), &standing).expect("a patch in order");
+        assert_eq!(
+            made.map(|patch| (patch.labels, patch.overload)),
+            Some((
+                None,
+                Some(Overload {
+                    kv_usage_permille: Some(875),
+                    waiting_requests: Some(13),
+                })
+            ))
+        );
+
+        let both = proto::PatchWorkerRequest {
+            labels: [("tier".to_owned(), "silver".to_owned())].into(),
+            remove_labels: vec!["tier".to_owned()],
+            ..Default::default()
+        };
+        assert_eq!(
+            patch(&both, &standing).map_err(|refused| refused.path),
+            Err("remove_labels")
+        );
+        let over = proto::PatchWorkerRequest {
+            overload: Some(proto::OverloadThresholds {
+                queue_limit: None,
+                kv_usage_permille: Some(4_000),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            patch(&over, &standing).map_err(|refused| refused.path),
+            Err("overload.kv_usage_permille")
+        );
+    }
+
+    #[test]
+    fn a_field_at_its_bound_is_taken_and_one_over_is_refused_by_its_path() {
+        type Stating = fn(usize) -> proto::WorkerSpec;
+        let cases: [(&str, usize, &str, Stating); 7] = [
+            (
+                "spec.url",
+                URL_BYTES,
+                "a URL is at most 2048 bytes",
+                |bytes| proto::WorkerSpec {
+                    url: text(bytes),
+                    ..spec()
+                },
+            ),
+            (
+                "spec.runtime",
+                NAME_BYTES,
+                "a runtime is at most 256 bytes",
+                |bytes| proto::WorkerSpec {
+                    runtime: text(bytes),
+                    ..spec()
+                },
+            ),
+            (
+                "spec.zone",
+                NAME_BYTES,
+                "a zone is at most 256 bytes",
+                |bytes| proto::WorkerSpec {
+                    zone: text(bytes),
+                    ..spec()
+                },
+            ),
+            (
+                "spec.models",
+                NAME_BYTES,
+                "a model id is at most 256 bytes",
+                |bytes| proto::WorkerSpec {
+                    models: vec!["m".to_owned(), text(bytes)],
+                    ..spec()
+                },
+            ),
+            (
+                "spec.labels",
+                KEY_BYTES,
+                "a label's key is at most 128 bytes",
+                |bytes| proto::WorkerSpec {
+                    labels: [(text(bytes), String::new())].into(),
+                    ..spec()
+                },
+            ),
+            (
+                "spec.labels",
+                VALUE_BYTES,
+                "a label's value is at most 4096 bytes",
+                |bytes| proto::WorkerSpec {
+                    labels: [("k".to_owned(), text(bytes))].into(),
+                    ..spec()
+                },
+            ),
+            (
+                "spec.labels",
+                LABELS,
+                "a row holds at most 128 labels",
+                |count| {
+                    let labels = (0..count).map(|n| (n.to_string(), String::new()));
+                    proto::WorkerSpec {
+                        labels: labels.collect(),
+                        ..spec()
+                    }
+                },
+            ),
+        ];
+        for (path, bound, why, stating) in cases {
+            assert!(facts(&stating(bound), None).is_ok(), "{path} at {bound}");
+            assert_eq!(
+                facts(&stating(bound + 1), None).map(|_| ()),
+                Err(refused(path, why)),
+                "{path} past {bound}"
+            );
+            assert!(why.contains(&bound.to_string()), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_row_at_its_bound_is_taken_and_one_byte_over_is_refused_whole() {
+        assert_eq!(ROW_BYTES, 16_384);
+        let made = facts(&weighing(ROW_BYTES), None).expect("a row at its bound");
+        assert_eq!(weight(&made), ROW_BYTES);
+        assert_eq!(
+            facts(&weighing(ROW_BYTES + 1), None).map(|_| ()),
+            Err(refused("spec", "a row is at most 16384 bytes on the wire"))
+        );
+    }
+
+    #[test]
+    fn a_patch_is_held_to_the_bounds_of_the_row_it_would_make() {
+        type Asking = fn(usize) -> proto::PatchWorkerRequest;
+        let keyed = |labels: Vec<(String, String)>| proto::PatchWorkerRequest {
+            labels: labels.into_iter().collect(),
+            ..Default::default()
+        };
+        let cases: [(&str, usize, &str, Asking); 5] = [
+            (
+                "labels",
+                KEY_BYTES,
+                "a label's key is at most 128 bytes",
+                |bytes| proto::PatchWorkerRequest {
+                    labels: [(text(bytes), String::new())].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "labels",
+                VALUE_BYTES,
+                "a label's value is at most 4096 bytes",
+                |bytes| proto::PatchWorkerRequest {
+                    labels: [("k".to_owned(), text(bytes))].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "labels",
+                LABELS,
+                "a row holds at most 128 labels",
+                |count| {
+                    let labels = (0..count).map(|n| (n.to_string(), String::new()));
+                    proto::PatchWorkerRequest {
+                        labels: labels.collect(),
+                        ..Default::default()
+                    }
+                },
+            ),
+            (
+                "remove_labels",
+                LABELS,
+                "a patch removes at most 128 labels",
+                |count| {
+                    let remove_labels = (0..count).map(|n| n.to_string()).collect();
+                    proto::PatchWorkerRequest {
+                        remove_labels,
+                        ..Default::default()
+                    }
+                },
+            ),
+            (
+                "remove_labels",
+                KEY_BYTES,
+                "a label's key is at most 128 bytes",
+                |bytes| proto::PatchWorkerRequest {
+                    remove_labels: vec![text(bytes)],
+                    ..Default::default()
+                },
+            ),
+        ];
+        let bare = facts(&spec(), None).expect("a bare row");
+        for (path, bound, why, asking) in cases {
+            assert!(patch(&asking(bound), &bare).is_ok(), "{path} at {bound}");
+            assert_eq!(
+                patch(&asking(bound + 1), &bare).map(|_| ()),
+                Err(refused(path, why)),
+                "{path} past {bound}"
+            );
+            assert!(why.contains(&bound.to_string()), "{why}");
+        }
+        // The count is of the row the patch would make: a label it removes
+        // makes room for the one it sets.
+        let mut crowded = bare.clone();
+        crowded.labels = (0..LABELS)
+            .map(|n| (n.to_string(), String::new()))
+            .collect();
+        let more = keyed(vec![("more".to_owned(), String::new())]);
+        assert_eq!(
+            patch(&more, &crowded).map(|_| ()),
+            Err(refused("labels", "a row holds at most 128 labels"))
+        );
+        let swap = proto::PatchWorkerRequest {
+            remove_labels: vec!["0".to_owned()],
+            ..more
+        };
+        assert!(patch(&swap, &crowded).is_ok_and(|made| made.is_some()));
+        // The row whole: a label of 500 bytes under a one-byte key adds 509.
+        let near = facts(&weighing(ROW_BYTES - 509), None).expect("a row under its bound");
+        let filling = |bytes| keyed(vec![("p".to_owned(), text(bytes))]);
+        let made = patch(&filling(500), &near).expect("a row at its bound");
+        let mut after = near.clone();
+        after.labels = made
+            .and_then(|patch| patch.labels)
+            .expect("the labels moved");
+        assert_eq!(weight(&after), ROW_BYTES);
+        assert_eq!(
+            patch(&filling(501), &near).map(|_| ()),
+            Err(refused(
+                "labels",
+                "a row is at most 16384 bytes on the wire"
+            ))
+        );
+        // A row at its bound takes a patch of the overload block alone and
+        // stays within it at its widest: the block was weighed so.
+        let brim = facts(&weighing(ROW_BYTES), None).expect("a row at its bound");
+        let block = proto::PatchWorkerRequest {
+            overload: Some(proto::OverloadThresholds {
+                queue_limit: Some(u32::MAX),
+                kv_usage_permille: Some(1_000),
+            }),
+            ..Default::default()
+        };
+        let made = patch(&block, &brim).expect("a patch in order");
+        let stated = WorkerFacts {
+            overload: made.and_then(|patch| patch.overload).expect("the block"),
+            ..brim
+        };
+        let mut widest = row(&WorkerRow {
+            id: WorkerId(u64::MAX),
+            facts: stated.clone(),
+            status: WorkerStatus::Ready,
+            revision: u64::MAX,
+            ..full()
+        });
+        widest.incarnation = u64::MAX;
+        assert_eq!(widest.encoded_len(), ROW_BYTES);
+        // And the row registers again as it stands, its block stated.
+        let again = proto::WorkerSpec {
+            overload: block.overload,
+            ..weighing(ROW_BYTES)
+        };
+        assert!(facts(&again, Some(&stated)).is_ok_and(|made| made == stated));
+        // And a label of the same bytes in other letters still fits it.
+        let other = keyed(vec![("a".to_owned(), "b".repeat(VALUE_BYTES))]);
+        assert!(patch(&other, &stated).is_ok_and(|made| made.is_some()));
+    }
+
+    #[test]
+    fn a_rows_weight_is_its_bytes_on_the_wire_with_its_numbers_at_their_widest() {
+        // A row whose every text holds `bytes`, a model id and a label's key
+        // left empty, under `labels` more labels of no value.
+        let edge = |bytes: usize, labels: usize| WorkerRow {
+            facts: WorkerFacts {
+                key: text(bytes),
+                engine: text(bytes),
+                engine_kind: text(bytes),
+                models: vec![String::new(), text(bytes)],
+                zone: Some(text(bytes)),
+                labels: (0..labels)
+                    .map(|n| (n.to_string(), String::new()))
+                    .chain([
+                        ("policy".to_owned(), text(bytes)),
+                        (String::new(), text(bytes)),
+                    ])
+                    .collect(),
+                ..full().facts
+            },
+            ..full()
+        };
+        let bare = WorkerRow {
+            facts: facts(&spec(), None).expect("a bare row"),
+            ..full()
+        };
+        // The widest a row of these facts is told: the controller's numbers
+        // at their most, under a status that sets a health bit, its overload
+        // block stated in full. The sum is the wire's own length at each
+        // side of a length's second byte, and with a field left empty.
+        for stored in [full(), bare, edge(127, 127), edge(128, 128), edge(300, 0)] {
+            let widest = WorkerRow {
+                id: WorkerId(u64::MAX),
+                status: WorkerStatus::Ready,
+                revision: u64::MAX,
+                ..stored
+            };
+            let mut told = row(&widest);
+            told.incarnation = u64::MAX;
+            told.overload = Some(proto::OverloadThresholds {
+                queue_limit: Some(u32::MAX),
+                kv_usage_permille: Some(1_000),
+            });
+            let key = widest.facts.key.len();
+            assert_eq!(weight(&widest.facts), told.encoded_len(), "a key of {key}");
+        }
+        // No status a row moves to tells more, and no revision.
+        for status in [
+            WorkerStatus::Pending,
+            WorkerStatus::Ready,
+            WorkerStatus::NotReady,
+            WorkerStatus::Failed,
+            WorkerStatus::Draining,
+        ] {
+            let at = WorkerRow { status, ..full() };
+            assert!(row(&at).encoded_len() <= weight(&at.facts), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_page_of_rows_at_their_bound_is_half_a_frame_and_an_answer_far_less() {
+        // The contract's page (`WorkerSnapshot`) and a client's default frame.
+        const PAGE: usize = 128;
+        const FRAME: usize = 4 * 1024 * 1024;
+        let fat = WorkerRow {
+            facts: facts(&weighing(ROW_BYTES), None).expect("a row at its bound"),
+            ..full()
+        };
+        let page = proto::WorkerSnapshot {
+            workers: vec![row(&fat); PAGE],
+            last: true,
+        };
+        // A page frames each row in four bytes.
+        assert!(page.encoded_len() <= FRAME / 2 + 4 * PAGE + 2);
+        // A replacement's answer carries two rows.
+        let answer = event(replaced(&fat, &fat, true), u64::MAX, u64::MAX, u64::MAX);
+        assert!(answer.encoded_len() <= 2 * ROW_BYTES + 64);
+    }
+}

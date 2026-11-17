@@ -240,6 +240,10 @@ name = "ingest"
 required-features = ["controller"]
 
 [[test]]
+name = "membership_door"
+required-features = ["controller"]
+
+[[test]]
 name = "replicas"
 required-features = ["controller"]
 

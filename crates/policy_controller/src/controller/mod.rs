@@ -1,11 +1,11 @@
 //! The standalone controller's run loop (design 2, 6, 8 and 10): the store,
 //! the load driver over it, the election, the gRPC listeners with their
 //! scopes, the service and the health service on each, the admin listener,
-//! readiness and the drain. The service answers `Leader` and a gateway's
-//! `Session`, and the run loop sweeps the gateways that are gone; the
-//! scopes' other call bodies arrive with the gateway, ingestion and control
-//! scope PRs, the other ingestion drivers with their move out of the
-//! gateway. In the
+//! readiness and the drain. The service answers `Leader`, a gateway's
+//! `Session` and, on the leader, the control scope's registration calls,
+//! and the run loop sweeps the gateways that are gone; the scopes' other
+//! call bodies arrive with the gateway, ingestion and control scope PRs,
+//! the other ingestion drivers with their move out of the gateway. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document and answers
 //! `GetPolicySpec` ([`Controller::spec_file`]).
@@ -39,6 +39,7 @@ pub mod election;
 mod gateways;
 mod generations;
 mod lifecycle;
+mod membership;
 pub mod metrics;
 mod principal;
 pub mod readiness;
@@ -55,6 +56,7 @@ pub mod tls;
     )
 )]
 mod wire;
+mod worker_wire;
 
 use std::{future::Future, io, net::SocketAddr, path::PathBuf, pin::pin, sync::Arc};
 
@@ -542,8 +544,16 @@ impl Controller {
     /// streams with them.
     ///
     /// Every listener's health service reports the overall status (service
-    /// `""`) as the readiness and [`SERVICE_NAME`] as `NOT_SERVING`. A
-    /// listener or an election thread that ends before the shutdown ends
+    /// `""`) as the readiness and [`SERVICE_NAME`] as `NOT_SERVING`, but a
+    /// control listener that takes a principal: `SERVING` while this replica
+    /// leads, so a client that checks the service's health by that name
+    /// finds the leader's control listener. That word is told at every move
+    /// of the run loop and after every step of the election, so a fence that
+    /// closes between two steps reads `SERVING` until the next; a
+    /// registration call reads the fence itself and is refused in that
+    /// window.
+    ///
+    /// A listener or an election thread that ends before the shutdown ends
     /// the serve with its error, the other listeners closed.
     pub async fn serve(self, shutdown: impl Future<Output = ()>) -> Result<(), Error> {
         self.serve_until(shutdown, std::future::pending()).await
@@ -574,6 +584,9 @@ impl Controller {
         let (stop, _held) = watch::channel(false);
         let mut tasks: JoinSet<Result<(), Error>> = JoinSet::new();
         let mut reporters = Vec::with_capacity(listeners.len());
+        // The reporters of the listeners whose door a caller can pass: the
+        // control scope's, where a layer places a principal.
+        let mut doors = Vec::new();
         for bound in listeners {
             let (reporter, health) = tonic_health::server::health_reporter();
             reporter
@@ -582,6 +595,9 @@ impl Controller {
             reporter
                 .set_service_status(SERVICE_NAME, ServingStatus::NotServing)
                 .await;
+            if bound.scopes.contains(&Scope::Control) && bound.layer != Layer::Off {
+                doors.push(reporter.clone());
+            }
             let routes = Service::new(bound.scopes, Arc::clone(&shared)).routes(bound.layer);
             let mut stop = stop.subscribe();
             let name = bound.name;
@@ -598,6 +614,37 @@ impl Controller {
                     .map_err(|source| Error::Serve { name, source })
             });
             reporters.push(reporter);
+        }
+        if !doors.is_empty() {
+            // A door's word for the service's name follows the role. This
+            // task is its one writer.
+            let mut role = readiness.clone();
+            let mut stop = stop.subscribe();
+            tasks.spawn(async move {
+                let mut told = None;
+                loop {
+                    let leads = role.state() == State::Leader;
+                    if told != Some(leads) {
+                        let word = if leads {
+                            ServingStatus::Serving
+                        } else {
+                            ServingStatus::NotServing
+                        };
+                        for door in &doors {
+                            door.set_service_status(SERVICE_NAME, word).await;
+                        }
+                        told = Some(leads);
+                    }
+                    tokio::select! {
+                        _ = stop.wait_for(|stop| *stop) => return Ok(()),
+                        moved = role.moved() => {
+                            if moved.is_none() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            });
         }
         let driver = Arc::new(LoadDriver::new(
             Arc::clone(&store),

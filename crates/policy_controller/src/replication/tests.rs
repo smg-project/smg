@@ -204,7 +204,7 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
     );
     assert_eq!(
         (row.status, row.revision, epoch),
-        (WorkerStatus::Ready, 2, 2)
+        (WorkerStatus::Ready, 1, 2)
     );
 
     let (id, rank, sample) = load(&entries[3]);

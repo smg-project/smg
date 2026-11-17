@@ -543,8 +543,10 @@ impl Workers {
         if from == status {
             return None;
         }
+        // The revision counts the row's stated facts: a status change
+        // leaves it, so the holder of a row's revision stays current while
+        // the worker's health moves.
         row.row.status = status;
-        row.row.revision += 1;
         Some(self.record(MembershipChange::StatusChanged {
             id,
             from,
@@ -581,13 +583,16 @@ impl WorkersStore for MemoryStore {
             // A new incarnation under the key: the old id leaves with its
             // counters; its status carries over when the registration
             // matches (role, models and wires), as the registry inherits a
-            // replaced worker's runtime state today.
+            // replaced worker's runtime state today. A drain is of the
+            // registration it named and ends with it: a draining
+            // incarnation hands no status on.
             let old = workers.rows.remove(&old_id);
             let new_id = identity(&facts.key, facts.incarnation);
             let status = old
                 .as_ref()
                 .filter(|old| {
-                    old.row.facts.role == facts.role
+                    old.row.status != WorkerStatus::Draining
+                        && old.row.facts.role == facts.role
                         && old.row.facts.models == facts.models
                         && old.row.facts.wire_modes == facts.wire_modes
                 })
