@@ -919,6 +919,7 @@ mod tests {
     use std::{
         convert::Infallible,
         future::{ready, Ready},
+        iter::repeat,
         net::{Ipv4Addr, SocketAddr},
         pin::Pin,
         sync::mpsc,
@@ -935,7 +936,7 @@ mod tests {
         net::TcpListener,
         sync::mpsc::{unbounded_channel, UnboundedReceiver},
         task::{yield_now, JoinSet},
-        time::timeout,
+        time::{sleep, timeout},
     };
     use tonic::{
         codegen::tokio_stream::{iter, once, pending, Stream, StreamExt},
@@ -1681,8 +1682,11 @@ mod tests {
     type Script = fn() -> (Vec<DecideAnswer>, End);
 
     /// The decide call of a peer that answers its script's frames in turn,
-    /// whatever the call sends, and goes on as the script's end says.
-    struct Decides(Script);
+    /// whatever the call sends, and goes on as the script's end says. With
+    /// a drip it goes on instead with a credit of one ask each drip, for as
+    /// long as the call stands.
+    #[derive(Clone, Copy)]
+    struct Decides(Script, Option<Duration>);
 
     impl StreamingService<DecideRequest> for Decides {
         type Response = DecideAnswer;
@@ -1692,26 +1696,39 @@ mod tests {
         fn call(&mut self, _request: Request<Streaming<DecideRequest>>) -> Self::Future {
             let (frames, end) = (self.0)();
             let frames = iter(frames.into_iter().map(Ok));
-            let answers: Self::ResponseStream = match end {
-                None => Box::pin(frames.chain(pending())),
-                Some(end) => Box::pin(frames.chain(iter(end.err().map(Err)))),
+            let answers: Self::ResponseStream = match (self.1, end) {
+                (Some(drip), _) => {
+                    let credits = iter(repeat(())).then(move |()| async move {
+                        sleep(drip).await;
+                        Ok::<_, Status>(told(0, b"", credit(1)))
+                    });
+                    Box::pin(frames.chain(credits))
+                }
+                (None, None) => Box::pin(frames.chain(pending())),
+                (None, Some(end)) => Box::pin(frames.chain(iter(end.err().map(Err)))),
             };
             ready(Ok(tonic::Response::new(answers)))
         }
     }
 
-    /// A peer that answers each call as [`Decides`] does, for as long as
-    /// the case holds its task.
+    /// A peer that answers each call as `script` says, for as long as the
+    /// case holds its task.
     async fn deciding(
         script: Script,
     ) -> (SocketAddr, JoinSet<Result<(), tonic::transport::Error>>) {
+        peer(Decides(script, None)).await
+    }
+
+    /// A peer that answers each call as [`Decides`] does, for as long as
+    /// the case holds its task.
+    async fn peer(decides: Decides) -> (SocketAddr, JoinSet<Result<(), tonic::transport::Error>>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("a listener");
         let address = listener.local_addr().expect("its address");
         let answer = Router::new().fallback(move |request: axum::extract::Request| async move {
             Grpc::new(tonic_prost::ProstCodec::<DecideAnswer, DecideRequest>::default())
-                .streaming(Decides(script), request)
+                .streaming(decides, request)
                 .await
                 .map(Body::new)
         });
@@ -1779,19 +1796,25 @@ mod tests {
             )
         })
         .await;
-        let (mut stream, _stub) = stream(address, 1).await;
+        let (mut stream, _stub) = stream(address, 3).await;
         let mut floor = 0;
         stream
             .send(&mut floor, ask(b"a"), ROOM)
             .await
             .expect("the ask is queued");
-        assert_eq!(stream.credit, 0, "the ask spent the stream's one credit");
+        assert_eq!(
+            stream.credit, 2,
+            "the ask spent one of the stream's credits"
+        );
         let answer = stream.answer(&mut floor, b"a", ROOM).await;
         assert!(
             matches!(&answer, Ok(Answer::Decision(told)) if *told == Decision::default()),
             "{answer:?}"
         );
-        assert_eq!(stream.credit, 5, "the credit frame added its window");
+        assert_eq!(
+            stream.credit, 7,
+            "the credit frame added its window to the credit the stream held"
+        );
         assert_eq!(floor, 1, "a frame's term raises the floor");
     }
 
@@ -2219,5 +2242,72 @@ mod tests {
                 "an end found at the door drops the stream"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_new_stream_opens_at_the_welcomes_window_and_its_answer_raises_the_clients_floor() {
+        let (address, _serving) = deciding(|| (vec![told(4, b"a", decision())], None)).await;
+        let (stream, stub) = stream(address, 0).await;
+        let (mut client, _welcoming) = holding(stream, ROOM).await;
+        // The next ask opens the client's own stream over the deciding
+        // peer, at the window its welcome states.
+        client.stub = stub;
+        client.decide = None;
+        client.session.welcome.decide_window = 3;
+
+        let answer = client.decide(ask(b"a")).await;
+        assert!(matches!(answer, Ok(Answer::Decision(_))), "{answer:?}");
+        let credit = client.decide.as_ref().map(|stream| stream.credit);
+        assert_eq!(
+            credit,
+            Some(2),
+            "a new stream opens at the welcome's window"
+        );
+        assert_eq!(
+            client.floor, 4,
+            "an answer's term raises the client's own floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trickle_of_credit_frames_does_not_outlast_the_answers_bound() {
+        // A credit frame each sixth of the bound and no answer: each frame
+        // comes well inside the bound, and the wait for the answer still
+        // ends at it.
+        let (address, _serving) = peer(Decides(|| (Vec::new(), None), Some(SHORT / 6))).await;
+        let (mut stream, _stub) = stream(address, 1).await;
+        let mut floor = 0;
+        stream
+            .send(&mut floor, ask(b"a"), ROOM)
+            .await
+            .expect("the ask is queued");
+        let waited = timeout(ROOM, stream.answer(&mut floor, b"a", SHORT))
+            .await
+            .expect("a trickle of credit frames does not outlast the answer's bound");
+        assert!(ran_out(&waited, "the decision", SHORT), "{waited:?}");
+    }
+
+    #[tokio::test]
+    async fn a_frame_below_the_floor_on_the_way_to_a_streams_end_is_refused() {
+        let (address, _serving) = deciding(|| {
+            let closed = Status::unavailable("the listeners closed");
+            (vec![told(1, b"", credit(1))], Some(Err(closed)))
+        })
+        .await;
+        let (mut stream, _stub) = stream(address, 1).await;
+        timeout(ROOM, async {
+            while !stream.requests.is_closed() {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("the connection drops an ended call's queue");
+        // The queue is closed and the stream still holds a frame under the
+        // term 1: the read for the end takes the floor's check too.
+        let refused = stream.send(&mut 2, ask(b"a"), ROOM).await;
+        assert!(
+            matches!(refused, Err(Error::BelowFloor { term: 1, floor: 2 })),
+            "a frame below the floor is refused on the way to a stream's end: {refused:?}"
+        );
     }
 }
