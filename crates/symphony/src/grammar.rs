@@ -991,7 +991,7 @@ impl Format {
         let (before, after) = self.around(|layout| layout.answer.as_ref());
         if content == 0 {
             let mut parts = vec![answer];
-            if !before.is_empty() {
+            if !answer_open && !before.is_empty() {
                 parts.insert(0, Grammar::ConstString(before.to_string()));
             }
             let end = format!("{after}{}", self.turn_end());
@@ -4236,6 +4236,66 @@ mod tests {
         assert_prefilled_answer_skips_thinks_first(
             &thinking_first(),
             value!({"type": "json_schema", "json_schema": answer_schema()}),
+        );
+    }
+
+    #[test]
+    fn prefilled_unframed_answer_omits_consumed_layout_prefix() {
+        let format = qwen3_rows().with_layout(Layout {
+            answer: Some(Message {
+                before: "```json\n".into(),
+                after: "\n```".into(),
+                ..Message::default()
+            }),
+            ..Layout::default()
+        });
+        assert_eq!(format.validate(), Ok(()));
+        let body = value!({"type": "json_schema", "json_schema": answer_schema()});
+        let suffix = value!({"type": "const_string", "value": "\n```"});
+        let start = format
+            .answer_grammar_at(
+                &shared_schema(),
+                false,
+                GrammarStart::Unknown,
+                OutputPosition::Start,
+            )
+            .expect("the whole answer");
+        start.check().expect("a valid whole-answer grammar");
+        assert_eq!(
+            start.to_json(),
+            value!({"type": "sequence", "elements": [
+                {"type": "const_string", "value": "```json\n"},
+                body,
+                suffix,
+            ]}),
+        );
+        assert_eq!(
+            Some(start),
+            format.answer_grammar_for(&shared_schema(), false, GrammarStart::Unknown),
+        );
+        assert_prefilled_answer_skips_thinks_first(
+            &format,
+            value!({"type": "sequence", "elements": [body, suffix]}),
+        );
+    }
+
+    #[test]
+    fn prefilled_framed_answer_omits_consumed_layout_prefix() {
+        let format = formats::kimi_k3().with_layout(Layout {
+            answer: Some(Message {
+                before: "```json\n".into(),
+                ..Message::default()
+            }),
+            ..Layout::default()
+        });
+        assert_eq!(format.validate(), Ok(()));
+        assert_prefilled_answer_skips_thinks_first(
+            &format,
+            value!({
+                "type": "tag", "begin": "",
+                "content": {"type": "json_schema", "json_schema": answer_schema()},
+                "end": "<|close|>response<|sep|><|close|>message<|sep|>",
+            }),
         );
     }
 
