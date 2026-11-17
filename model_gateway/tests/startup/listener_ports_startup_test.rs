@@ -5,7 +5,9 @@
 //! server having joined the cluster. All used to be partial starts: a
 //! listener came up, answered, and the process died. The gateway runs as a
 //! process on purpose: the checks belong before the runtime and the
-//! listeners exist.
+//! listeners exist. The last case holds the launcher to its own part: a port
+//! it picked for a launch goes to no other socket before the gateway binds
+//! it.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -16,6 +18,7 @@
 use std::{fs, net::TcpListener};
 
 use gateway_launch::{base_args, free_ports, launch_with, serial, Launch, Until, EXIT_TIMEOUT, IP};
+use tokio::net::TcpSocket;
 
 use crate::gateway_launch;
 
@@ -242,6 +245,46 @@ fn a_held_mesh_port_refuses_to_start() {
         "mesh-port-held",
         &launch,
         &["--mesh-port", "Address already in use"],
+    );
+    drop(held);
+}
+
+/// A port picked for a launch stays its gateway's: a socket that asks for
+/// the number before the gateway binds it gets nothing. On a busy host
+/// another process was now and then handed such a number, and the gateway
+/// was refused on a port its test did not hold. The mesh port is held here
+/// and the picked metrics port is the one asked for: taken, it is the
+/// gateway's first failed bind, and the refusal names it and not the mesh
+/// port. Linux alone: the launcher keeps a picked port nowhere else.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_picked_port_is_kept_from_another_socket() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let held = TcpListener::bind((IP, 0)).expect("a port to hold");
+    let held_port = held.local_addr().expect("the held address").port();
+    let [port, metrics_port, _] = free_ports();
+    // What a connection of another process is to a bind of its source port:
+    // a socket on the number that shares it with nobody.
+    let other = TcpSocket::new_v4().expect("a TCP socket");
+    let taken = other.bind((IP, metrics_port).into());
+    let mut args = base_args(port, metrics_port);
+    args.extend(mesh_args(held_port));
+    let launch = launch_with(
+        &args,
+        &[port],
+        Until::Bound,
+        &dir.path().join("picked-port.log"),
+    );
+    assert_refused(
+        "picked-port",
+        &launch,
+        &["--mesh-port", "Address already in use"],
+    );
+    assert!(
+        taken.is_err(),
+        "another socket took the picked port {metrics_port}\n{}",
+        launch.log
     );
     drop(held);
 }
