@@ -206,9 +206,15 @@ impl Phi3VisionProcessor {
 
         let transposed = width < height;
         let img = if transposed {
-            // Transpose (PIL's Image.TRANSPOSE): equivalent to fliph + rotate270 (ccw 90°)
-            // This swaps x and y coordinates: pixel at (x, y) goes to (y, x)
-            Cow::Owned(image.fliph().rotate270())
+            // Transpose (PIL's Image.TRANSPOSE): the pixel at (x, y) goes to
+            // (y, x). An RGB8 image in one pass, any other through the flip and
+            // the quarter turn that make the same image.
+            Cow::Owned(match image {
+                DynamicImage::ImageRgb8(rgb) => {
+                    DynamicImage::ImageRgb8(transforms::transpose_rgb(rgb))
+                }
+                other => other.fliph().rotate270(),
+            })
         } else {
             Cow::Borrowed(image)
         };
@@ -223,14 +229,14 @@ impl Phi3VisionProcessor {
         let resized = transforms::resize_bilinear_pil(&img, new_w, new_h);
 
         // Pad height to multiple of 336
-        let padded = DynamicImage::ImageRgb8(self.padding_336(resized.into_rgb8()));
+        let padded = self.padding_336(resized.into_rgb8());
 
         // Transpose back if needed (transpose is self-inverse)
-        if transposed {
-            padded.fliph().rotate270()
+        DynamicImage::ImageRgb8(if transposed {
+            transforms::transpose_rgb(&padded)
         } else {
             padded
-        }
+        })
     }
 
     /// Pad image height to multiple of 336 (centered, white padding).
@@ -314,7 +320,8 @@ impl Phi3VisionProcessor {
         // 4. The global image (336x336) comes first
         let tile = TILE_SIZE as usize;
         let end = values.len() + (self.num_crops + 1) * 3 * tile * tile;
-        values.extend(self.create_global_image(&tensor).iter());
+        let (global, _) = self.create_global_image(&tensor).into_raw_vec_and_offset();
+        values.extend_from_slice(&global);
 
         // 5. The HD image's tiles, row-major, as far as the crops go
         let (h, w) = (hd_h as usize, hd_w as usize);
@@ -357,9 +364,7 @@ impl VisionPreProcessor for Phi3VisionProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
         for image in images {
             let (width, height) = image.dimensions();

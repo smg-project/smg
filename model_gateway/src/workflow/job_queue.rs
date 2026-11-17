@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap, DashSet};
 use openai_protocol::worker::{
     ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
@@ -24,7 +25,7 @@ use wfaas::{StateStore, WorkflowData, WorkflowEngine, WorkflowError, WorkflowId,
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
-    worker::{identity::endpoint::Endpoint, registry::WorkerId},
+    worker::{health::manager::WorkerJobs, identity::endpoint::Endpoint, registry::WorkerId},
     workflow::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
@@ -32,7 +33,7 @@ use crate::{
         create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
         registered_entries, registered_in, McpServerConfigRequest, TokenizerConfigRequest,
         TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
-        WorkerRegistrationMode,
+        WorkerRegistrationMode, WorkflowEngines,
     },
 };
 
@@ -929,6 +930,15 @@ impl JobQueue {
         })
     }
 
+    /// The workflow engines, or the refusal a job answers while they are not
+    /// built yet.
+    fn workflow_engines(context: &AppContext) -> Result<&WorkflowEngines, String> {
+        context
+            .workflow_engines
+            .get()
+            .ok_or_else(|| "Workflow engines not initialized".to_string())
+    }
+
     /// Cancels the `POST /workers` registration workflows the store holds for
     /// `worker_url`: the active ones are cancelled, a cancelled one counts, one
     /// that ended between the listing and the cancel is skipped. Says how many
@@ -938,11 +948,7 @@ impl JobQueue {
         context: &AppContext,
         worker_url: &str,
     ) -> Result<(usize, bool), String> {
-        let engine = &context
-            .workflow_engines
-            .get()
-            .ok_or_else(|| "Workflow engines not initialized".to_string())?
-            .worker_registration;
+        let engine = &Self::workflow_engines(context)?.worker_registration;
         let states = engine
             .state_store()
             .list_all()
@@ -1191,10 +1197,7 @@ impl JobQueue {
                 if Self::take_mark(cancelled_before_start, own_id) {
                     return Err("Registration cancelled before it started".to_string());
                 }
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let timeout_duration =
                     Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
@@ -1279,10 +1282,7 @@ impl JobQueue {
                 }
             }
             Job::UpdateWorker { url, update } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data = create_worker_update_workflow_data(
                     url.to_string(),
@@ -1301,10 +1301,7 @@ impl JobQueue {
                 .await
             }
             Job::RefreshWorkerLabels { url } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let mut workflow_data = create_worker_update_workflow_data(
                     url.to_string(),
@@ -1333,10 +1330,7 @@ impl JobQueue {
                 url,
                 expected_revisions,
             } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data = create_worker_removal_workflow_data(
                     url.to_string(),
@@ -1384,10 +1378,7 @@ impl JobQueue {
                 result
             }
             Job::AddWasmModule { config } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data =
                     create_wasm_registration_workflow_data(*config.clone(), Arc::clone(context));
@@ -1403,10 +1394,7 @@ impl JobQueue {
                 .await
             }
             Job::RemoveWasmModule { request } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data =
                     create_wasm_removal_workflow_data(*request.clone(), Arc::clone(context));
@@ -1555,10 +1543,7 @@ impl JobQueue {
                 Ok(format!("Submitted {server_count} RegisterMcpServer jobs"))
             }
             Job::RegisterMcpServer { config } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data =
                     create_mcp_workflow_data((**config).clone(), Arc::clone(context));
@@ -1578,10 +1563,7 @@ impl JobQueue {
                 // noted for the model (a failure of the model's last load
                 // answers its requests 503 tokenizer_load_failed).
                 let result = async {
-                    let engines = context
-                        .workflow_engines
-                        .get()
-                        .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                    let engines = Self::workflow_engines(context)?;
 
                     let workflow_data =
                         create_tokenizer_workflow_data(*config.clone(), Arc::clone(context));
@@ -1763,6 +1745,30 @@ impl JobQueue {
                 status_map.len()
             );
         }
+    }
+}
+
+#[async_trait]
+impl WorkerJobs for JobQueue {
+    async fn remove_worker(
+        &self,
+        url: String,
+        worker_id: &WorkerId,
+        revision: u64,
+    ) -> Result<(), String> {
+        // Guard the failed worker by its own id. The url is a DP base, so the
+        // removal step matches the whole rank group; a bare revision would take
+        // out every sibling that happens to sit at the same revision.
+        let expected_revisions = HashMap::from([(worker_id.as_str().to_string(), Some(revision))]);
+        self.submit(Job::RemoveWorker {
+            url,
+            expected_revisions: Some(expected_revisions),
+        })
+        .await
+    }
+
+    async fn refresh_worker_labels(&self, url: String) -> Result<bool, String> {
+        self.submit_or_defer(Job::RefreshWorkerLabels { url }).await
     }
 }
 
@@ -3865,5 +3871,48 @@ mod tests {
             kept_removal_pins(&kept, url),
             Some(pins(&[("a", Some(1)), ("b", Some(2))]))
         );
+    }
+
+    /// The health manager's removal reaches the removal workflow under the
+    /// revisions it names: a worker named at another revision stays
+    /// registered, and it goes once it is named at its own.
+    #[tokio::test]
+    async fn a_health_removal_runs_under_the_revisions_it_names() {
+        use crate::{
+            service_discovery::testing::live_app_context,
+            worker::{BasicWorkerBuilder, Worker},
+        };
+
+        async fn ended(queue: &JobQueue, url: &str) {
+            while queue
+                .get_status(url)
+                .is_some_and(|status| matches!(status.status.as_str(), "pending" | "processing"))
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        let context = live_app_context();
+        let registry = &context.worker_registry;
+        let queue = context.worker_job_queue.get().expect("the live queue");
+        let url = "http://w:8000";
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+        let id = registry
+            .register(Arc::clone(&worker))
+            .expect("the worker registers");
+        for (revision, stays) in [(worker.revision() + 1, true), (worker.revision(), false)] {
+            queue
+                .remove_worker(url.to_string(), &id, revision)
+                .await
+                .expect("the removal is queued");
+            tokio::time::timeout(Duration::from_secs(30), ended(queue, url))
+                .await
+                .expect("the removal ends");
+            assert_eq!(
+                registry.get_by_url(url).is_some(),
+                stays,
+                "named at revision {revision}"
+            );
+        }
     }
 }

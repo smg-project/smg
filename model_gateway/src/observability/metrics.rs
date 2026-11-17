@@ -77,10 +77,10 @@ pub(crate) fn is_interned(s: &str) -> bool {
 /// Per-worker caches of the handles the gateway's records go through. The
 /// per-request ones: the HTTP layer's, the stream-timing set's, the
 /// per-worker request counters' and gauges', the breaker's outcomes', the
-/// selection's, the cache-aware decision's, the admission gauges' and the
-/// body path's. The ones a worker's own streams move, with no request in
-/// hand: the engine load set, which a load record sets, and the KV-event
-/// set, which a batch of the event stream records.
+/// selection's, the cache-aware decision's, the index lookup's, the admission
+/// gauges' and the body path's. The ones a worker's own streams move, with no
+/// request in hand: the engine load set, which a load record sets, and the
+/// KV-event set, which a batch of the event stream records.
 /// The helpers, the installed flag and the router's request and duration
 /// caches are the external router crate's
 /// (`smg_external_router::metrics::handles`), so every router records the
@@ -480,6 +480,8 @@ mod handles {
         pub(super) static PREFIX_HASH_BRANCHES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_cache_aware_match_ratio`: one series.
         pub(super) static CACHE_AWARE_MATCH_RATIO: RefCell<Option<Histogram>> = const { RefCell::new(None) };
+        /// `smg_kv_index_lookup_seconds` by index.
+        pub(super) static KV_INDEX_LOOKUPS: RefCell<FxHashMap<&'static str, Histogram>> = RefCell::new(FxHashMap::default());
         /// `smg_routing_key_source_total` by source.
         pub(super) static ROUTING_KEY_SOURCES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_admission_queue_depth`: one series.
@@ -515,6 +517,7 @@ mod handles {
         CONSISTENT_HASHING_BRANCHES.with_borrow_mut(HashMap::clear);
         PREFIX_HASH_BRANCHES.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_MATCH_RATIO.set(None);
+        KV_INDEX_LOOKUPS.with_borrow_mut(HashMap::clear);
         ROUTING_KEY_SOURCES.with_borrow_mut(HashMap::clear);
         ADMISSION_QUEUE_DEPTH.set(None);
         ADMISSION_INFLIGHT.set(None);
@@ -2556,81 +2559,34 @@ impl Metrics {
         // The handles, built the first time a stream has something for
         // each of them; the model label is interned once per build.
         let model = || intern_model_label(model_id);
-        let ttft_histogram = || {
+        let duration_histogram = |name: &'static str| {
             histogram!(
-                "smg_router_ttft_seconds",
+                name,
                 "router_type" => router_type,
                 "backend_type" => backend_type,
                 "model" => model(),
                 "endpoint" => endpoint
             )
         };
-        let tpot_histogram = || {
-            histogram!(
-                "smg_router_tpot_seconds",
-                "router_type" => router_type,
-                "backend_type" => backend_type,
-                "model" => model(),
-                "endpoint" => endpoint
-            )
-        };
-        let first_token_histogram = || {
-            histogram!(
-                TIME_TO_FIRST_TOKEN_SECONDS,
-                "router_type" => router_type,
-                "backend_type" => backend_type,
-                "model" => model(),
-                "endpoint" => endpoint
-            )
-        };
-        let per_output_token_histogram = || {
-            histogram!(
-                REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS,
-                "router_type" => router_type,
-                "backend_type" => backend_type,
-                "model" => model(),
-                "endpoint" => endpoint
-            )
-        };
-        let generation_histogram = || {
-            histogram!(
-                "smg_router_generation_duration_seconds",
-                "router_type" => router_type,
-                "backend_type" => backend_type,
-                "model" => model(),
-                "endpoint" => endpoint
-            )
-        };
-        let input_counter = || {
+        let ttft_histogram = || duration_histogram("smg_router_ttft_seconds");
+        let tpot_histogram = || duration_histogram("smg_router_tpot_seconds");
+        let first_token_histogram = || duration_histogram(TIME_TO_FIRST_TOKEN_SECONDS);
+        let per_output_token_histogram =
+            || duration_histogram(REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS);
+        let generation_histogram = || duration_histogram("smg_router_generation_duration_seconds");
+        let tokens_counter = |token_type: &'static str| {
             counter!(
                 "smg_router_tokens_total",
                 "router_type" => router_type,
                 "backend_type" => backend_type,
                 "model" => model(),
                 "endpoint" => endpoint,
-                "token_type" => metrics_labels::TOKEN_INPUT
+                "token_type" => token_type
             )
         };
-        let output_counter = || {
-            counter!(
-                "smg_router_tokens_total",
-                "router_type" => router_type,
-                "backend_type" => backend_type,
-                "model" => model(),
-                "endpoint" => endpoint,
-                "token_type" => metrics_labels::TOKEN_OUTPUT
-            )
-        };
-        let cached_counter = || {
-            counter!(
-                "smg_router_tokens_total",
-                "router_type" => router_type,
-                "backend_type" => backend_type,
-                "model" => model(),
-                "endpoint" => endpoint,
-                "token_type" => metrics_labels::TOKEN_CACHED
-            )
-        };
+        let input_counter = || tokens_counter(metrics_labels::TOKEN_INPUT);
+        let output_counter = || tokens_counter(metrics_labels::TOKEN_OUTPUT);
+        let cached_counter = || tokens_counter(metrics_labels::TOKEN_CACHED);
 
         if !handles::keep_handles() {
             if let Some(ttft) = ttft {
@@ -3511,7 +3467,12 @@ impl Metrics {
     /// Time of one index lookup on the routing path, recorded after the
     /// lookup returned and outside any lock.
     pub fn record_kv_index_lookup(index: &'static str, seconds: f64) {
-        histogram!("smg_kv_index_lookup_seconds", "index" => index).record(seconds);
+        handles::with_static(
+            &handles::KV_INDEX_LOOKUPS,
+            index,
+            || histogram!("smg_kv_index_lookup_seconds", "index" => index),
+            |lookups| lookups.record(seconds),
+        );
     }
 
     /// Ranks of this worker whose index may be stale.

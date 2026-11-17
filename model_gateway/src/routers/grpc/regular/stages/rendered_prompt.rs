@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use llm_multimodal::Modality;
 use llm_tokenizer::traits::{PromptEncoding, Tokenizer};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     routers::{
@@ -175,12 +175,27 @@ pub(crate) async fn prepare_rendered_prompt(
                     multimodal_intermediate = Some(output.intermediate);
                 }
                 Err(e) => {
+                    let response = multimodal::processing_failed_response(&e);
+                    // The request's own media, by an explicit verdict, is the
+                    // client's to fix: one WARN with the cause, the answer
+                    // marked reported. Every other failure keeps ERROR and
+                    // stays unmarked: the media host's, this process's, and
+                    // one with no verdict, whose 400 also covers a model
+                    // configuration this host could not load.
+                    if multimodal::is_request_media_fault(&e) {
+                        warn!(
+                            function = stage,
+                            error = %format!("{e:#}"),
+                            "Multimodal processing failed"
+                        );
+                        return Err(utils::reported(response));
+                    }
                     error!(
                         function = stage,
                         error = %format!("{e:#}"),
                         "Multimodal processing failed"
                     );
-                    return Err(multimodal::processing_failed_response(&e));
+                    return Err(response);
                 }
             }
         }
@@ -205,9 +220,12 @@ mod tests {
         TokenizerRegistry,
     };
     use openai_protocol::{chat::ChatCompletionRequest, worker::MmProcessingMode};
+    use tracing::Level;
 
     use super::prepare_rendered_prompt;
     use crate::{
+        middleware::ReportedRefusal,
+        observability::logging::test_support::{test_subscriber, LinesAtWarnOrAbove},
         routers::{
             common::placement::PipelinePin,
             grpc::{
@@ -217,6 +235,7 @@ mod tests {
                     MultimodalConfigRegistry, MultimodalSettings, PlaceholderTokens,
                 },
                 regular::stages::testing::components_over,
+                testing::unreadable_model_dir,
                 utils::MediaContext,
             },
         },
@@ -315,6 +334,45 @@ mod tests {
                 .get("x-smg-error-code")
                 .and_then(|v| v.to_str().ok()),
             Some("multimodal_prompt_contract_mismatch")
+        );
+    }
+
+    /// A processing failure with no verdict that the request's media is at
+    /// fault (here, a model whose `config.json` does not parse) keeps the
+    /// stage's ERROR line and stays unmarked, though its answer is a 400.
+    #[tokio::test]
+    async fn a_processing_failure_with_no_client_verdict_keeps_the_error_line() {
+        // The media context names where the model's configuration is looked
+        // for: a local directory, alive to the end of the test, so the load
+        // fails on this host, with no fetch.
+        let model_dir = unreadable_model_dir();
+        let (mut ctx, tokenizer) = context().await;
+        let mut placeholders = PlaceholderTokens::default();
+        placeholders.insert(Modality::Image, "token".to_string());
+        let mut media = media(MmProcessingMode::Router, placeholders);
+        media.tokenizer_source = model_dir.path().to_str().unwrap().to_string();
+        let lines = LinesAtWarnOrAbove::default();
+        let _subscriber = test_subscriber(lines.clone());
+
+        let Err(response) = prepare_rendered_prompt(
+            &mut ctx,
+            &tokenizer,
+            "Hello token",
+            PromptEncoding::FromText,
+            Some(media),
+            &[],
+            "test",
+        )
+        .await
+        else {
+            panic!("media of a model without a media config is refused");
+        };
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.extensions().get::<ReportedRefusal>().is_none());
+        assert_eq!(
+            lines.lines(),
+            [(Level::ERROR, "Multimodal processing failed".to_string())]
         );
     }
 

@@ -45,6 +45,9 @@
 # 512-worker rows did not count steadily in that reading. They keep the time's verdict.
 repeats = 3
 count = true
+# The count ends 2,280 s into the run: the gate step's bound is 40 minutes, and the report is written
+# in the two minutes behind the count. No count starts in the budget's last 30 s.
+run_budget = 2280
 filter = "^policy_engine/power_of_two/"
 
 # The files that feed this binary beyond the measured crate: the base side is built with them as the pull

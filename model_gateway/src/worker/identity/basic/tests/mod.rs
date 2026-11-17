@@ -1,4 +1,5 @@
 mod dispatch_on_the_door;
+mod engine_connection;
 mod running_window_label;
 
 use std::{thread, time::Duration};
@@ -8,11 +9,14 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::worker::{HealthCheckConfig, WorkerSpec};
 
 use super::*;
-use crate::worker::{
-    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-    identity::metadata::DecodingLabels,
-    test_support::{no_health_check, RefusedAddress},
-    BasicWorkerBuilder, OverloadThresholds,
+use crate::{
+    routers::grpc::backend_client::{backend_client_if_initialized, BackendClient},
+    worker::{
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        identity::metadata::DecodingLabels,
+        test_support::{no_health_check, RefusedAddress},
+        BasicWorkerBuilder, OverloadThresholds,
+    },
 };
 
 /// The `smg_worker_cb_state` sample for the test worker's URL in a
@@ -1178,16 +1182,16 @@ fn replacement_adopts_the_backend_client_only_on_a_matching_transport() {
     let new = build(ConnectionMode::Zmq);
     assert!(new.inherit_shared_state_from(&old));
     assert!(Arc::ptr_eq(
-        &new.backend_client.load_full(),
-        &old.backend_client.load_full()
+        &new.engine_connection.load_full(),
+        &old.engine_connection.load_full()
     ));
 
     // A transport change means a different wire protocol — no adoption.
     let retyped = build(ConnectionMode::Http);
     assert!(retyped.inherit_shared_state_from(&old));
     assert!(!Arc::ptr_eq(
-        &retyped.backend_client.load_full(),
-        &old.backend_client.load_full()
+        &retyped.engine_connection.load_full(),
+        &old.engine_connection.load_full()
     ));
 }
 
@@ -1213,7 +1217,7 @@ async fn the_declared_bootstrap_is_read_through_the_backend_peek() {
         .worker_type(WorkerType::Prefill)
         .health_config(no_health_check())
         .build();
-    assert!(worker.backend_client_if_initialized().is_none());
+    assert!(worker.engine_connection_if_initialized().is_none());
 
     let (client, engine) = tokio::join!(
         ZmqEngineClient::connect(
@@ -1239,14 +1243,14 @@ async fn the_declared_bootstrap_is_read_through_the_backend_peek() {
     let client = client.expect("adapter connect");
     let _engine = engine.expect("mock engine");
     worker
-        .backend_client
+        .engine_connection
         .load_full()
         .set(Arc::new(BackendClient::Zmq(client)))
         .ok()
         .expect("cell empty");
 
-    let backend = worker
-        .backend_client_if_initialized()
+    let backend = backend_client_if_initialized(&worker)
+        .expect("the gateway's client")
         .expect("the connect landed");
     assert_eq!(backend.declared_bootstrap(), Some(("10.0.0.7", 8998)));
 }
@@ -1294,7 +1298,7 @@ async fn zmq_health_check_evicts_a_dead_client_and_resets_the_guard() {
         .build();
 
     // Inject a completed connect and mark the one-shot guard as set.
-    let cell = worker.backend_client.load_full();
+    let cell = worker.engine_connection.load_full();
     cell.set(Arc::new(BackendClient::Zmq(client)))
         .ok()
         .expect("cell empty");
@@ -1302,7 +1306,7 @@ async fn zmq_health_check_evicts_a_dead_client_and_resets_the_guard() {
 
     // A live client stays cached and reports healthy.
     assert!(worker.zmq_health_check());
-    assert!(worker.backend_client.load().get().is_some());
+    assert!(worker.engine_connection.load().get().is_some());
 
     // Kill the engine and wait for the dispatcher to latch the client closed.
     engine
@@ -1312,7 +1316,7 @@ async fn zmq_health_check_evicts_a_dead_client_and_resets_the_guard() {
     let observed_dead = time::timeout(Duration::from_secs(5), async {
         loop {
             let alive = worker
-                .backend_client
+                .engine_connection
                 .load()
                 .get()
                 .map(|c| c.is_alive())
@@ -1333,7 +1337,7 @@ async fn zmq_health_check_evicts_a_dead_client_and_resets_the_guard() {
     // probe re-runs the handshake for a replacement engine.
     assert!(!worker.zmq_health_check());
     assert!(
-        worker.backend_client.load().get().is_none(),
+        worker.engine_connection.load().get().is_none(),
         "dead client must be evicted from the cell"
     );
     assert!(
@@ -1364,10 +1368,10 @@ async fn a_zmq_workers_health_check_is_its_probes_answer() {
     );
 
     let client = connected
-        .backend_client_if_initialized()
+        .engine_connection_if_initialized()
         .expect("the connect landed");
     worker
-        .backend_client
+        .engine_connection
         .load_full()
         .set(client)
         .ok()
@@ -1413,7 +1417,7 @@ async fn zmq_worker_on_a_mock_rank(
         .health_config(no_health_check())
         .build();
     worker
-        .backend_client
+        .engine_connection
         .load_full()
         .set(Arc::new(BackendClient::Zmq(client)))
         .ok()
@@ -1641,7 +1645,7 @@ async fn zmq_get_backend_client_hands_the_handshake_to_the_background_driver() {
     let base = tempfile::tempdir().unwrap();
     let (worker, input_socket) = unattended_zmq_worker(base.path());
 
-    let acquired = time::timeout(Duration::from_secs(5), worker.get_backend_client())
+    let acquired = time::timeout(Duration::from_secs(5), worker.engine_connection())
         .await
         .expect("acquisition must not await the handshake");
     assert!(
@@ -1649,7 +1653,7 @@ async fn zmq_get_backend_client_hands_the_handshake_to_the_background_driver() {
         "acquisition must report the backend as not connected yet"
     );
     assert!(
-        worker.backend_client.load().get().is_none(),
+        worker.engine_connection.load().get().is_none(),
         "no client can be cached before the handshake lands"
     );
 
@@ -1668,7 +1672,7 @@ async fn zmq_get_backend_client_hands_the_handshake_to_the_background_driver() {
 
     // A second acquisition rides the in-flight driver instead of spawning
     // another one (which would rebind the same sockets).
-    assert!(worker.get_backend_client().await.is_err());
+    assert!(worker.engine_connection().await.is_err());
     assert!(Arc::ptr_eq(
         &handle,
         &worker

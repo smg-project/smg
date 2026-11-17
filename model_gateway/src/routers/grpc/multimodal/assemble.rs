@@ -78,7 +78,7 @@ async fn assemble_multimodal_data_impl(
     // Defense in depth: worker selection already rejected unsupported (backend,
     // modality) combinations. Re-assert here against the same capability matrix
     // so assembly can never silently mishandle a modality the backend lacks.
-    ensure_client_supports_intermediate(client, &intermediate)?;
+    ensure_backend_supports_modalities(client.runtime_type(), &intermediate)?;
     match client {
         BackendClient::Grpc(GrpcClient::Sglang(_)) => assemble_sglang_data(intermediate, workers),
         BackendClient::Grpc(GrpcClient::Vllm(_)) => Ok(MultimodalData::Vllm(
@@ -296,7 +296,7 @@ pub(super) fn assemble_vllm_batches_with(
 
 /// TRT-LLM takes a single preprocessed batch (one modality). The
 /// per-modality capability is enforced by
-/// [`ensure_client_supports_intermediate`]; this only enforces the structural
+/// [`ensure_backend_supports_modalities`]; this only enforces the structural
 /// single-batch constraint.
 pub(super) fn into_single_batch(
     intermediate: MultimodalIntermediate,
@@ -311,16 +311,6 @@ pub(super) fn into_single_batch(
         .into_batches()
         .pop()
         .context("multimodal intermediate is missing its sole batch")
-}
-
-/// Defense-in-depth capability assertion mirroring the early worker-selection
-/// check, keyed on the concrete backend client. See
-/// [`crate::routers::grpc::multimodal::capability::ensure_backend_supports_modalities`].
-fn ensure_client_supports_intermediate(
-    client: &BackendClient,
-    intermediate: &MultimodalIntermediate,
-) -> Result<()> {
-    ensure_backend_supports_modalities(client.runtime_type(), intermediate)
 }
 
 /// Serialize worker pixels in the configured vision dtype, preserving integer metadata.
@@ -566,7 +556,7 @@ fn assemble_tokenspeed_with_options(
     let item_count = intermediate.media.len();
     // Build items imperatively so that if any step fails partway we can unlink
     // the /dev/shm segments already created for prior items' encoder inputs
-    // (and this item's, once created). `?`/`collect` would drop those
+    // (and this item's, once created). A plain `?` or `collect` would drop those
     // `TokenSpeedTensor::Shm` handles without ever reaching the send-path
     // cleanup, leaking files until the next sweep.
     let mut ordered_bindings = intermediate.bindings.iter().collect::<Vec<_>>();
@@ -579,20 +569,10 @@ fn assemble_tokenspeed_with_options(
     let mut items: Vec<TokenSpeedMultimodalItem> = Vec::with_capacity(item_count);
     for binding in ordered_bindings {
         let item_index = binding.item_index;
-        let mm_placeholders = match placeholders_for_binding(binding, true) {
-            Ok(value) => value,
-            Err(error) => {
-                cleanup_tokenspeed_items_encoder_shm(&items, None);
-                return Err(error);
-            }
-        };
-        let content_hash = match content_hash_for_item(intermediate, item_index) {
-            Ok(value) => value,
-            Err(error) => {
-                cleanup_tokenspeed_items_encoder_shm(&items, None);
-                return Err(error);
-            }
-        };
+        let mm_placeholders = placeholders_for_binding(binding, true)
+            .inspect_err(|_| cleanup_tokenspeed_items_encoder_shm(&items, None))?;
+        let content_hash = content_hash_for_item(intermediate, item_index)
+            .inspect_err(|_| cleanup_tokenspeed_items_encoder_shm(&items, None))?;
         let encoder_input_started = Instant::now();
         // EPD prefill: the embedding arrives over Mooncake and this item's
         // encoder_input is stripped downstream (clear_mm_pixel_values), so skip
@@ -600,58 +580,38 @@ fn assemble_tokenspeed_with_options(
         let encoder_input = if skip_pixel_values {
             TokenSpeedTensor::inline(Vec::new(), Vec::new(), encoder_input_dtype.to_string())
         } else if let Some(input) = owned_input.take() {
-            match serialize_tokenspeed_encoder_input_owned(
+            serialize_tokenspeed_encoder_input_owned(
                 input,
                 &encoder_input_dtype,
                 shm_enabled,
                 shm_min_bytes,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    cleanup_tokenspeed_items_encoder_shm(&items, None);
-                    return Err(error);
-                }
-            }
+            )
+            .inspect_err(|_| cleanup_tokenspeed_items_encoder_shm(&items, None))?
         } else {
-            let item_encoder_input = match encoder_input_for_item(
+            let item_encoder_input = encoder_input_for_item(
                 &intermediate.preprocessed,
                 &intermediate.field_layouts.encoder_input,
                 item_index,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    cleanup_tokenspeed_items_encoder_shm(&items, None);
-                    return Err(error);
-                }
-            };
-            match serialize_tokenspeed_encoder_input(
+            )
+            .inspect_err(|_| cleanup_tokenspeed_items_encoder_shm(&items, None))?;
+            serialize_tokenspeed_encoder_input(
                 &item_encoder_input,
                 &encoder_input_dtype,
                 shm_enabled,
                 shm_min_bytes,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    cleanup_tokenspeed_items_encoder_shm(&items, None);
-                    return Err(error);
-                }
-            }
+            )
+            .inspect_err(|_| cleanup_tokenspeed_items_encoder_shm(&items, None))?
         };
         let encoder_input_serialize_ms = encoder_input_started.elapsed().as_secs_f64() * 1000.0;
         let model_specific_started = Instant::now();
-        let model_specific_tensors = match serialize_model_specific_for_item(
+        // On an error here `encoder_input` (possibly SHM) was created for this item
+        // but the item isn't built; clean it plus all prior items.
+        let model_specific_tensors = serialize_model_specific_for_item(
             &intermediate.preprocessed.model_specific,
             &intermediate.field_layouts.model_specific,
             item_index,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                // `encoder_input` (possibly SHM) was created for this item but the
-                // item isn't built; clean it plus all prior items.
-                cleanup_tokenspeed_items_encoder_shm(&items, Some(&encoder_input));
-                return Err(error);
-            }
-        };
+        )
+        .inspect_err(|_| cleanup_tokenspeed_items_encoder_shm(&items, Some(&encoder_input)))?;
         let model_specific_serialize_ms = model_specific_started.elapsed().as_secs_f64() * 1000.0;
         if log_timing {
             info!(

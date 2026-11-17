@@ -38,6 +38,7 @@ mod net;
 mod replicas;
 
 use std::{
+    collections::BTreeMap,
     io::Write,
     path::Path,
     time::{Duration, Instant},
@@ -282,9 +283,20 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
         let refused = client
             .get_snapshot(SnapshotRequest::default())
             .await
-            .expect_err("no step serves the call");
+            .expect_err("no step or no follower serves the call");
         assert_eq!(refused.code(), snapshot, "GetSnapshot on {listener}");
     }
+
+    // The first leader took a lease no record stood for: its fence opened
+    // between two steps, and its line of leading comes at the step after.
+    // The kill waits for that line, so the logs hold one take a term.
+    assert!(
+        replicas[first]
+            .logs(|leader| leader.takes().last() == Some(&term))
+            .await,
+        "the first leader logged no take of term {term}:\n{}",
+        replicas[first].log()
+    );
 
     // THE KILL. The lease is not released: a follower takes it once the
     // record stood still for its duration by that follower's own clock.
@@ -679,7 +691,7 @@ impl Stretch {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "a measurement for the Numbers table, run by name"]
 async fn a_lease_file_removed_under_a_live_leader_with_a_standby_looking() {
-    lost_under_a_live_leader("REMOVED").await;
+    lost_under_a_live_leader(Loss::Removed).await;
 }
 
 /// The same rounds with the record's holder cleared in place, the term, the
@@ -688,12 +700,45 @@ async fn a_lease_file_removed_under_a_live_leader_with_a_standby_looking() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "a measurement for the Numbers table, run by name"]
 async fn a_holder_cleared_in_place_under_a_live_leader_with_a_standby_looking() {
-    lost_under_a_live_leader("CLEARED").await;
+    lost_under_a_live_leader(Loss::Cleared).await;
 }
 
-/// The rounds of the two cells above; `label` names the loss and the
-/// printed lines.
-async fn lost_under_a_live_leader(label: &str) {
+/// The same rounds with no standby looking: the lease file is removed under
+/// a lone live leader and a second replica starts right then. It never saw
+/// the lease held, so it takes at once under its own run's first term, and
+/// the round reads its own first answer as the leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement for the Numbers table, run by name"]
+async fn a_replica_started_while_a_live_leaders_lease_file_is_gone() {
+    lost_under_a_live_leader(Loss::Started).await;
+}
+
+/// How a round of the three cells above loses the lease's record.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Loss {
+    Removed,
+    Cleared,
+    Started,
+}
+
+impl Loss {
+    /// The name on the printed lines.
+    fn label(self) -> &'static str {
+        match self {
+            Loss::Removed => "REMOVED",
+            Loss::Cleared => "CLEARED",
+            Loss::Started => "STARTED",
+        }
+    }
+}
+
+/// The compare-and-swaps a clearing may lose to renewals before the cell
+/// ends by name.
+const CLEARINGS: u32 = 100;
+
+/// The rounds of the three cells above.
+async fn lost_under_a_live_leader(loss: Loss) {
+    let label = loss.label();
     let mut out = std::io::stdout();
     let settings = replicas::timings(ElectionSettings::default(), &mut out);
     let rounds = rounds("SMG_REPLICAS_ROUNDS", 5);
@@ -711,35 +756,49 @@ async fn lost_under_a_live_leader(label: &str) {
         agreed(&mut record, &mut replicas).await;
         let first_ms = millis(started.elapsed());
         tokio::time::sleep(spread(round, 333, period)).await;
-        replicas.push(start(&format!("replica-{round}-b"), &lease, settings));
-        // The term the loss is read against: the one both replicas agree on
-        // right before it.
-        let (_, term) = agreed(&mut record, &mut replicas).await;
-        tokio::time::sleep(spread(round, 0, period)).await;
-        if label == "CLEARED" {
-            // A compare and swap through the store: a renewal that lands
-            // first moves the record, and the clearing is tried again.
-            let mut store = FileLease::new(&lease);
-            loop {
-                let held = store.read().expect("the lease file reads");
-                let held = held.expect("the lease file holds a record");
-                let cleared = LeaseRecord {
-                    holder: String::new(),
-                    ..held.clone()
-                };
-                if store.write(Some(&held), &cleared).expect("the clearing") == Written::Done {
-                    break;
-                }
-            }
-        } else {
-            // The removal under the store's own lock, as a writer of the
-            // store moves the file: no renewal in flight puts the record
-            // back.
-            let lock = std::fs::File::create(dir.path().join("lease.lock")).expect("the lock");
-            lock.lock().expect("the store's lock");
-            std::fs::remove_file(&lease).expect("the removal");
+        let second = format!("replica-{round}-b");
+        if loss != Loss::Started {
+            replicas.push(start(&second, &lease, settings));
+            agreed(&mut record, &mut replicas).await;
+            tokio::time::sleep(spread(round, 0, period)).await;
         }
+        // The loss is read against the term of the record it moved: a
+        // change of leader after the last agreement would leave an agreed
+        // term one behind.
+        let term = match loss {
+            Loss::Cleared => {
+                // A compare and swap through the store: a renewal that
+                // lands first moves the record, and the clearing is tried
+                // again, a bounded number of times.
+                let mut store = FileLease::new(&lease);
+                (0..CLEARINGS)
+                    .find_map(|_| {
+                        let held = store.read().expect("the lease file reads");
+                        let held = held.expect("the lease file holds a record");
+                        let cleared = LeaseRecord {
+                            holder: String::new(),
+                            ..held.clone()
+                        };
+                        let written = store.write(Some(&held), &cleared).expect("the clearing");
+                        (written == Written::Done).then_some(held.term)
+                    })
+                    .expect("a clearing lands within its tries")
+            }
+            Loss::Removed | Loss::Started => {
+                // The removal under the store's own lock, as a writer of
+                // the store moves the file: no renewal in flight puts the
+                // record back.
+                let lock = std::fs::File::create(dir.path().join("lease.lock")).expect("the lock");
+                lock.lock().expect("the store's lock");
+                let term = stored(&lease).term;
+                std::fs::remove_file(&lease).expect("the removal");
+                term
+            }
+        };
         let removed = Instant::now();
+        if loss == Loss::Started {
+            replicas.push(start(&second, &lease, settings));
+        }
         let (mut samples, mut both) = (0u64, 0u64);
         let (mut two, mut nobody) = (Stretch::default(), Stretch::default());
         let mut taken: Option<(Instant, u64)> = None;
@@ -752,9 +811,18 @@ async fn lost_under_a_live_leader(label: &str) {
             two.read(leaders == 2, at);
             nobody.read(leaders == 0, at);
             if taken.is_none() {
+                // A standby takes above the lost term. A replica started
+                // after the loss counts from its own run's first term, so
+                // its take is read by its name.
                 taken = answers
                     .iter()
-                    .find(|a| a.info.is_leader && a.info.term > term)
+                    .find(|a| {
+                        a.info.is_leader
+                            && match loss {
+                                Loss::Started => a.replica == second,
+                                Loss::Removed | Loss::Cleared => a.info.term > term,
+                            }
+                    })
                     .map(|a| (a.returned, a.info.term));
             }
             match taken {
@@ -909,4 +977,78 @@ async fn a_second_process_started_under_a_live_leaders_identity() {
     }
     summaries(&mut out, [("TWIN_TWO_LEADERS_MS", &mut two_ms)]);
     writeln!(out, "TWIN_ROUNDS n={rounds} second_led={second_led}").expect("stdout");
+}
+
+/// Says `Hello` to each of `replicas` in turn until one answers `Welcome`:
+/// the time since `started`. What answered each `Hello` before it is
+/// counted by name.
+async fn first_welcome(
+    replicas: &[Replica],
+    started: Instant,
+    answers: &mut BTreeMap<String, u64>,
+) -> Duration {
+    loop {
+        for replica in replicas {
+            match replica.hello("gateway-a").await {
+                Ok(_) => return started.elapsed(),
+                Err(answer) => *answers.entry(answer).or_default() += 1,
+            }
+        }
+        assert!(
+            started.elapsed() < ROOM,
+            "no Welcome in {ROOM:?}: {answers:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// What a start costs a gateway, at the design's default settings or at
+/// the timings the environment names. Over `SMG_REPLICAS_ROUNDS` rounds
+/// (default 5) a controller starts alone over the lease in its own
+/// process, as one replica runs by default, and then three start over one
+/// new lease file. A gateway says `Hello` to each replica in turn every few
+/// milliseconds, and its first `Welcome` is timed from the first start;
+/// what answered every `Hello` before it is counted by name. A measurement,
+/// run by name with `--ignored`; it asserts nothing of the election.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement for the Numbers table, run by name"]
+async fn a_gateways_first_welcome_after_a_start() {
+    let mut out = std::io::stdout();
+    let settings = replicas::timings(ElectionSettings::default(), &mut out);
+    let rounds = rounds("SMG_REPLICAS_ROUNDS", 5);
+    let (mut alone_ms, mut shared_ms) = (Vec::new(), Vec::new());
+    let mut answers = BTreeMap::new();
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lease = dir.path().join("lease");
+        for (ids, place, samples) in [
+            (&["a"][..], Lease::Own, &mut alone_ms),
+            (&["b", "c", "d"][..], Lease::File(&lease), &mut shared_ms),
+        ] {
+            let started = Instant::now();
+            let replicas: Vec<Replica> = ids
+                .iter()
+                .map(|id| {
+                    Replica::start(
+                        &format!("replica-{round}-{id}"),
+                        place,
+                        settings,
+                        SETTLE_SECS,
+                    )
+                    .expect("the replica starts")
+                })
+                .collect();
+            samples.push(millis(
+                first_welcome(&replicas, started, &mut answers).await,
+            ));
+        }
+    }
+    summaries(
+        &mut out,
+        [
+            ("ALONE_START_TO_WELCOME_MS", &mut alone_ms),
+            ("SHARED_START_TO_WELCOME_MS", &mut shared_ms),
+        ],
+    );
+    writeln!(out, "WELCOME_ROUNDS n={rounds} answers_before={answers:?}").expect("stdout");
 }

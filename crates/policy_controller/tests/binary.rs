@@ -69,3 +69,84 @@ fn a_forced_color_reaches_a_pipe() {
         );
     }
 }
+
+/// The binary runs on the allocator the gateway's binary registers, with a
+/// copy of its settings. A burst of registrations builds the store's world
+/// again at every write, and the system allocator keeps resident what those
+/// builds free. The allocator is asked for its statistics at the process's
+/// end, an ask the system allocator does not hear, and the statistics name
+/// the settings it runs on.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[test]
+fn the_binary_runs_on_the_gateways_allocator() {
+    let ask = [("_RJEM_MALLOC_CONF", "stats_print:true")];
+    let output = refused_start(&ask).expect("the binary runs");
+    let written = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        written.contains("jemalloc statistics"),
+        "no statistics of the allocator at the end: {written:?}"
+    );
+    for setting in [
+        // The allocator compiles no background thread for an Apple target.
+        #[cfg(not(target_vendor = "apple"))]
+        "opt.background_thread: true",
+        "opt.dirty_decay_ms: 10000 (",
+        "opt.muzzy_decay_ms: 0 (",
+        "opt.narenas: 16\n",
+        "opt.oversize_threshold: 33554432\n",
+        // The workspace's cargo configuration builds the allocator of an
+        // aarch64 binary for 64 KiB pages, the largest its kernels run with.
+        #[cfg(all(target_arch = "aarch64", target_env = "gnu"))]
+        "Page size: 65536\n",
+    ] {
+        assert!(
+            written.contains(setting),
+            "the allocator does not run on {setting:?}: {written:?}"
+        );
+    }
+}
+
+/// The binary's settings are a copy of the gateway's constant, which this
+/// crate cannot import. The gateway's source is read by path: the copy
+/// moves with the constant, or this case fails.
+#[test]
+fn the_binarys_settings_are_the_gateways_constant() {
+    let gateway = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../model_gateway/src/observability/metrics.rs"
+    ));
+    let binary = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bin/smg-policy-controller.rs"
+    ));
+    let theirs =
+        settings_after(gateway, "pub const SERVER_MALLOC_CONF").expect("the gateway's constant");
+    let ours = settings_after(binary, "const SETTINGS").expect("the binary's copy");
+    assert_eq!(ours, theirs, "the binary's settings are not the gateway's");
+}
+
+/// The example controller's settings are a copy of this binary's, in a file
+/// a user copies out of the tree: no case of the copy can read this one.
+/// The example's source is read by path: its copy moves with the binary's,
+/// or this case fails.
+#[test]
+fn the_examples_settings_are_the_binarys() {
+    let binary = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bin/smg-policy-controller.rs"
+    ));
+    let example = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/policy-controller/src/main.rs"
+    ));
+    let ours = settings_after(binary, "const SETTINGS").expect("the binary's settings");
+    let theirs = settings_after(example, "pub static MALLOC_CONF").expect("the example's copy");
+    assert_eq!(theirs, ours, "the example's settings are not the binary's");
+}
+
+/// The byte string a source assigns after `name`, without its quotes.
+fn settings_after<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let (_, rest) = source.split_once(name)?;
+    let (_, rest) = rest.split_once("b\"")?;
+    rest.split_once('"').map(|(settings, _)| settings)
+}

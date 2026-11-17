@@ -326,6 +326,7 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
         // Long enough that the counter below reads the first poll alone,
         // however slow the host; the first tick polls at once.
         load_poll_interval: Duration::from_secs(10),
+        decide_shards: 2,
         election: Election::default(),
     })
     .await

@@ -4,8 +4,9 @@
 //! own codec (no socket under it), writing to the bounded SSE channel a
 //! client reads from, with the bytes written as the result. The gRPC router
 //! module re-exports `EngineScript`, `StreamBench` and `ForcedChat`, the face
-//! `benches/stream_state_machines.rs` and `benches/forced_call_stream.rs`
-//! see; the module is compiled for the crate's test targets only.
+//! `benches/stream_state_machines.rs`, `benches/forced_call_stream.rs` and
+//! `benches/symphony_messages_stream.rs` see; the module is compiled for the
+//! crate's test targets only.
 
 #![expect(
     clippy::expect_used,
@@ -265,9 +266,9 @@ impl ForcedChat {
 
 /// The stream drivers, ready to run a script: one streaming processor over
 /// the legacy parser factories (the tool parser `json`, the reasoning parser
-/// `qwen3`), the character tokenizer, the chat request's spec under the
-/// legacy parsers and under Symphony's Qwen3 table, the completion's and the
-/// Messages' specs, and the loopback peer the engine streams are owned
+/// `qwen3`), the character tokenizer, the chat request's and the Messages'
+/// specs under the legacy parsers and under Symphony's Qwen3 table, the
+/// completion's spec, and the loopback peer the engine streams are owned
 /// against (never dispatched to: the abort on drop is disarmed).
 pub struct StreamBench {
     processor: StreamingProcessor,
@@ -280,6 +281,7 @@ pub struct StreamBench {
     chat_symphony_logprobs: ChatResponseSpec,
     completion: CompletionResponseSpec,
     messages: MessagesResponseSpec,
+    messages_symphony: MessagesResponseSpec,
 }
 
 impl StreamBench {
@@ -347,6 +349,24 @@ impl StreamBench {
             &reasoning_parsers,
         );
         let processor = StreamingProcessor::new(tool_parsers, reasoning_parsers, resolver, "vllm");
+        let messages = MessagesResponseSpec {
+            thinking_requested: true,
+            thinking_text_returned: true,
+            reasoning_in_prefill: false,
+            prompt_tokens: 8,
+            max_tokens: 4096,
+            context_window: None,
+            tool_choice: None,
+            has_tools: false,
+            history_tool_calls_count: 0,
+            chat_tools: Vec::new().into(),
+            stop_sequences: None,
+            symphony: None,
+            first_tool_call_only: false,
+            parser_names: None,
+        };
+        let mut messages_symphony = messages.clone();
+        messages_symphony.symphony = Some(qwen3_assignment());
         Self {
             processor,
             tokenizer: Arc::new(CharacterTokenizer::default()),
@@ -357,22 +377,8 @@ impl StreamBench {
             chat_logprobs,
             chat_symphony_logprobs,
             completion: CompletionResponseSpec::new(&completion_request, Vec::new()),
-            messages: MessagesResponseSpec {
-                thinking_requested: true,
-                thinking_text_returned: true,
-                reasoning_in_prefill: false,
-                prompt_tokens: 8,
-                max_tokens: 4096,
-                context_window: None,
-                tool_choice: None,
-                has_tools: false,
-                history_tool_calls_count: 0,
-                chat_tools: Vec::new().into(),
-                stop_sequences: None,
-                symphony: None,
-                first_tool_call_only: false,
-                parser_names: None,
-            },
+            messages,
+            messages_symphony,
         }
     }
 
@@ -490,8 +496,19 @@ impl StreamBench {
         bytes
     }
 
-    /// A Messages stream with thinking requested: the bytes written.
+    /// A Messages stream with thinking requested, under the legacy parsers:
+    /// the bytes written.
     pub async fn messages(&self, script: &EngineScript) -> usize {
+        self.messages_under(&self.messages, script).await
+    }
+
+    /// A Messages stream with thinking requested, under Symphony's Qwen3
+    /// table: the bytes written.
+    pub async fn messages_symphony(&self, script: &EngineScript) -> usize {
+        self.messages_under(&self.messages_symphony, script).await
+    }
+
+    async fn messages_under(&self, spec: &MessagesResponseSpec, script: &EngineScript) -> usize {
         let stream = self.engine_stream(script);
         let (tx, rx) = sse_channel();
         let driven = async {
@@ -502,7 +519,7 @@ impl StreamBench {
                     dispatch("msg-bench"),
                     Arc::clone(&self.tokenizer),
                     (None, None, false, false, false),
-                    self.messages.clone(),
+                    spec.clone(),
                     &tx,
                     None,
                 )

@@ -130,7 +130,9 @@ pub(crate) struct PlacementInputs<'a> {
     /// Extra per-request candidate predicate; a worker it rejects is never
     /// selected (e.g. only workers that process media references themselves,
     /// or none that already answered this request definitively). It is asked
-    /// once a candidate, and while it refuses nobody the selection runs over
+    /// once a candidate in a pass of the selection, which runs once more when
+    /// it found nobody available and a candidate has come free since (see
+    /// `select_among`), and while it refuses nobody the selection runs over
     /// the pool as drawn.
     pub candidate_filter: Option<CandidateFilter<'a>>,
     /// Engines (by base URL) a failed attempt of this request already
@@ -391,12 +393,28 @@ pub(crate) fn select_from(
     select_among(registry, policies, model_id, candidates, None, inputs)
 }
 
-/// The selection behind both single-worker entries. `whole` is the
-/// snapshot's own list when `candidates` is that list as the registry holds
-/// it: the policy is told the list's name when the candidates reach it as
-/// that list, and reads which workers it was handed once something narrowed
-/// them (a candidate filter that refuses a worker, a policy that needs its
-/// candidates filtered for it, the engines a retry already tried).
+/// Why a pass of the single-worker selection placed nobody.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Miss {
+    /// Nobody was available at the pass's read: the placement's own filter
+    /// left no candidate, or a policy that filters availability itself
+    /// found none.
+    NobodyAvailable,
+    /// The policy declined among the available candidates it was handed.
+    Declined,
+}
+
+/// The selection behind both single-worker entries: one pass, and one more
+/// when the pass found nobody available while a candidate the request may
+/// use is available now. The pass and the veto fallback each read every
+/// worker's vetoes on their own, so a veto that lifts between the two reads
+/// leaves the pass with nobody and the fallback with a pool that is not all
+/// vetoed: a refusal on a pool that can take the request. A pool with
+/// nobody available keeps its miss, and a policy that declined among
+/// available candidates is not asked again (a strict target on a worker
+/// that is not available, beside workers that are). The second pass repeats
+/// what a pass records on its way (the routing key's source, the manual
+/// policy's branch, round robin's step), on this path alone.
 fn select_among(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -405,6 +423,43 @@ fn select_among(
     whole: Option<&Arc<[Arc<dyn Worker>]>>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
+    // At most two rounds. The pass has this one caller, so it compiles into
+    // the selection and a placement pays for no call between the two.
+    let mut asked_again = false;
+    loop {
+        match select_pass(registry, policies, model_id, candidates, whole, inputs) {
+            Ok(selected) => return Some(selected),
+            Err(Miss::NobodyAvailable) if !asked_again => {}
+            Err(Miss::NobodyAvailable | Miss::Declined) => return None,
+        }
+        let came_free = candidates.iter().any(|worker| {
+            worker.is_available()
+                && inputs
+                    .candidate_filter
+                    .is_none_or(|accepts| accepts(worker.as_ref()))
+        });
+        if !came_free {
+            return None;
+        }
+        asked_again = true;
+    }
+}
+
+/// One pass of the single-worker selection. `whole` is the
+/// snapshot's own list when `candidates` is that list as the registry holds
+/// it: the policy is told the list's name when the candidates reach it as
+/// that list, and reads which workers it was handed once something narrowed
+/// them (a candidate filter that refuses a worker, a policy that needs its
+/// candidates filtered for it, the engines a retry already tried). A miss
+/// says why ([`Miss`]).
+fn select_pass(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    candidates: &[Arc<dyn Worker>],
+    whole: Option<&Arc<[Arc<dyn Worker>]>>,
+    inputs: PlacementInputs<'_>,
+) -> Result<Arc<dyn Worker>, Miss> {
     let policy = policies.get_policy_or_default(model_id);
 
     // The per-request predicate applies to every entry point, so a caller
@@ -503,7 +558,8 @@ fn select_among(
         }
     };
     if available.is_empty() {
-        return overload_fallback(registry, policy.name(), model_id, candidates);
+        return overload_fallback(registry, policy.name(), model_id, candidates)
+            .ok_or(Miss::NobodyAvailable);
     }
     // The name goes with the list itself, read here and nowhere above:
     // whatever narrowed the candidates handed on a list of its own, at
@@ -519,8 +575,14 @@ fn select_among(
     // otherwise delegates to the configured policy.
     let Some(idx) = policies.select_worker_for_model(&policy, model_id, available, &info) else {
         // A policy that filters availability itself misses on an
-        // all-overloaded pool the same way the pre-filter empties.
-        return overload_fallback(registry, policy.name(), model_id, candidates);
+        // all-overloaded pool the same way the pre-filter empties. Any other
+        // policy was handed available candidates and declined.
+        let miss = if policy_filters_unavailable_workers(policy.as_ref()) {
+            Miss::NobodyAvailable
+        } else {
+            Miss::Declined
+        };
+        return overload_fallback(registry, policy.name(), model_id, candidates).ok_or(miss);
     };
     let selected = available[idx].clone();
     if info.overload_lifted && !candidates.iter().any(|w| w.is_available()) {
@@ -540,7 +602,7 @@ fn select_among(
         policy.name(),
     );
 
-    Some(selected)
+    Ok(selected)
 }
 
 /// The steering default for a pool whose every worker is vetoed, by the
@@ -1461,8 +1523,11 @@ mod tests {
             LeastLoadPolicy, PowerOfTwoPolicy, RoundRobinPolicy,
         },
         worker::{
+            connection::engine::EngineConnection,
+            health::circuit_breaker::CircuitState,
+            identity::basic::WorkerMetadata,
             load::state::{one_rank_load, TestFeed},
-            runtime::StallReason,
+            runtime::{RoutingState, StallReason},
             BasicWorkerBuilder, ModelCard, PdWire, WorkerType,
         },
     };
@@ -1936,7 +2001,7 @@ mod tests {
             let registry = gated_pd_registry(8);
             let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
             policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
-            let feed = TestFeed::attached_to(decode_policy.as_ref());
+            let feed = TestFeed::attached_to(|rx| decode_policy.as_ref().set_load_receiver(rx));
             policies.set_decode_policy(decode_policy);
             // d:1 runs its whole window of eight at 160 tokens/s and holds
             // every room; d:2 runs one request at 20 tokens/s.
@@ -2921,6 +2986,182 @@ mod tests {
         assert_eq!(selected.url(), "http://h:1");
     }
 
+    /// A worker whose overload veto lifts right after selection has read its
+    /// routing state once, as a load record that lands between the pass's
+    /// read and the veto fallback's read does. Everything else is the real
+    /// worker's.
+    #[derive(Debug)]
+    struct VetoLiftsAfterARead {
+        worker: crate::worker::BasicWorker,
+        lifted: std::sync::OnceLock<()>,
+    }
+
+    impl VetoLiftsAfterARead {
+        /// A ready worker under the overload veto.
+        fn vetoed(url: &str) -> Arc<dyn Worker> {
+            let worker = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(WorkerType::Regular)
+                .build();
+            worker.set_status(WorkerStatus::Ready);
+            worker.set_overloaded(true);
+            Arc::new(Self {
+                worker,
+                lifted: std::sync::OnceLock::new(),
+            })
+        }
+
+        /// What `read` sees of the worker; the veto lifts behind the first read.
+        fn read<T>(&self, read: impl FnOnce(&crate::worker::BasicWorker) -> T) -> T {
+            let seen = read(&self.worker);
+            if self.lifted.set(()).is_ok() {
+                self.worker.set_overloaded(false);
+            }
+            seen
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Worker for VetoLiftsAfterARead {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn url(&self) -> &str {
+            self.worker.url()
+        }
+        fn api_key(&self) -> Option<&String> {
+            self.worker.api_key()
+        }
+        fn worker_type(&self) -> &WorkerType {
+            self.worker.worker_type()
+        }
+        fn connection_mode(&self) -> &ConnectionMode {
+            self.worker.connection_mode()
+        }
+        fn status(&self) -> WorkerStatus {
+            self.worker.status()
+        }
+        fn set_status(&self, status: WorkerStatus) {
+            self.worker.set_status(status);
+        }
+        fn load(&self) -> usize {
+            self.worker.load()
+        }
+        fn increment_load(&self) {
+            self.worker.increment_load();
+        }
+        fn decrement_load(&self) {
+            self.worker.decrement_load();
+        }
+        fn routing_key_load(&self) -> usize {
+            self.worker.routing_key_load()
+        }
+        fn routing_key_inflight(&self, routing_key: &str) -> usize {
+            self.worker.routing_key_inflight(routing_key)
+        }
+        fn increment_routing_key_load(&self, routing_key: &str) {
+            self.worker.increment_routing_key_load(routing_key);
+        }
+        fn decrement_routing_key_load(&self, routing_key: &str) {
+            self.worker.decrement_routing_key_load(routing_key);
+        }
+        fn processed_requests(&self) -> usize {
+            self.worker.processed_requests()
+        }
+        fn increment_processed(&self) {
+            self.worker.increment_processed();
+        }
+        fn metadata(&self) -> &WorkerMetadata {
+            self.worker.metadata()
+        }
+        fn circuit_breaker_state(&self) -> CircuitState {
+            self.worker.circuit_breaker_state()
+        }
+        fn circuit_breaker_can_execute(&self) -> bool {
+            self.worker.circuit_breaker_can_execute()
+        }
+        fn record_circuit_breaker_outcome(&self, success: bool) {
+            self.worker.record_circuit_breaker_outcome(success);
+        }
+        fn resilience(&self) -> &crate::worker::ResolvedResilience {
+            self.worker.resilience()
+        }
+        fn http_client(&self) -> &reqwest::Client {
+            self.worker.http_client()
+        }
+        fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+            self.worker.http_client_handle_if_initialized()
+        }
+        async fn check_health_async(&self) -> crate::worker::WorkerResult<()> {
+            self.worker.check_health_async().await
+        }
+        async fn engine_connection(
+            &self,
+        ) -> crate::worker::WorkerResult<Option<Arc<dyn EngineConnection>>> {
+            self.worker.engine_connection().await
+        }
+        fn is_available(&self) -> bool {
+            self.read(|worker| worker.is_available())
+        }
+        fn routing_state(&self) -> RoutingState {
+            self.read(|worker| worker.routing_state())
+        }
+        fn is_overloaded(&self) -> bool {
+            self.worker.is_overloaded()
+        }
+        fn stall_reason(&self) -> Option<StallReason> {
+            self.worker.stall_reason()
+        }
+    }
+
+    /// An overload veto that lifts between the pass's read and the veto
+    /// fallback's read is no refusal. The pass saw its only worker vetoed,
+    /// the fallback then finds a pool that is not all vetoed, and one more
+    /// pass takes the worker that came free. Two rows: a policy that filters
+    /// availability itself, as the default policy does, and a policy the
+    /// placement filters the candidates for.
+    #[test]
+    fn a_veto_that_lifts_between_the_two_reads_is_no_refusal() {
+        let registry = WorkerRegistry::new();
+        let mut refused = Vec::new();
+        for config in [PolicyConfig::RoundRobin, PolicyConfig::ConsistentHashing] {
+            let policies = PolicyRegistry::new(config);
+            // One pass alone must find nobody available: were the veto to
+            // lift before the pass's own read, the test would pass without
+            // the gap between that read and the fallback's.
+            let alone = [VetoLiftsAfterARead::vetoed("http://w:1")];
+            assert_eq!(
+                select_pass(
+                    &registry,
+                    &policies,
+                    MODEL,
+                    &alone,
+                    None,
+                    PlacementInputs::default()
+                )
+                .err(),
+                Some(Miss::NobodyAvailable),
+                "one pass alone, under {}",
+                policies.get_policy_or_default(MODEL).name()
+            );
+            let candidates = [VetoLiftsAfterARead::vetoed("http://w:1")];
+            let selected = select_from(
+                &registry,
+                &policies,
+                MODEL,
+                &candidates,
+                PlacementInputs::default(),
+            );
+            if selected.is_none() {
+                refused.push(policies.get_policy_or_default(MODEL).name());
+            }
+        }
+        assert!(
+            refused.is_empty(),
+            "refused while its only worker was available, under: {refused:?}"
+        );
+    }
+
     #[test]
     fn selection_and_failure_read_the_same_pool() {
         let registry = registry_with(&[("http://h:1", ConnectionMode::Http, RuntimeType::Sglang)]);
@@ -3259,9 +3500,12 @@ mod tests {
     /// An explicit target counts the workers available when the request
     /// arrives. With the worker at index 1 out (not ready, overloaded, or
     /// its breaker open), index 1 names the worker that was at index 2 and
-    /// index 2 names nobody. Back in, the indexes read as before.
+    /// index 2 names nobody: the policy declines, and the selection leaves
+    /// it at that one pass. Back in, the indexes read as before.
     #[test]
     fn an_explicit_target_indexes_the_available_workers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
         let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
         let target = |index: usize| {
@@ -3296,6 +3540,36 @@ mod tests {
             assert!(
                 target(2).is_none(),
                 "{veto}: index 2 is past the available workers"
+            );
+            // That miss is the policy's decline among available workers, and
+            // a decline takes one pass: the whole selection asks the filter
+            // as often as one pass does.
+            let asked = AtomicUsize::new(0);
+            let counted = |_: &dyn Worker| {
+                asked.fetch_add(1, Ordering::Relaxed);
+                true
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", "2".parse().unwrap());
+            let inputs = PlacementInputs {
+                headers: Some(&headers),
+                candidate_filter: Some(&counted),
+                ..Default::default()
+            };
+            let pool = candidates(&registry, MODEL, RoutingPool::HttpRegular, None);
+            let (drawn, whole) = (pool.as_slice(), pool.shared());
+            assert_eq!(
+                select_pass(&registry, &policies, MODEL, drawn, whole, inputs).err(),
+                Some(Miss::Declined),
+                "{veto}: one pass declines a target past the available workers"
+            );
+            let one_pass = asked.swap(0, Ordering::Relaxed);
+            let selected = select_among(&registry, &policies, MODEL, drawn, whole, inputs);
+            assert!(selected.is_none(), "{veto}: index 2 names nobody");
+            assert_eq!(
+                asked.load(Ordering::Relaxed),
+                one_pass,
+                "{veto}: a decline is not asked again"
             );
             assert_eq!(target(0).unwrap().url(), by_index[0].url(), "{veto}");
         };

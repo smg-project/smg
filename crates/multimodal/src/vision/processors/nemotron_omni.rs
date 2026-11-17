@@ -258,20 +258,25 @@ impl NemotronOmniProcessor {
             return rgb_bytes(image);
         }
         let rgba = image.to_rgba8();
-        let mut out = Vec::with_capacity(rgba.as_raw().len() / 4 * 3);
-        for px in rgba.as_raw().as_chunks::<4>().0 {
-            let alpha = u32::from(px[3]);
-            for &c in &px[..3] {
+        let (width, height) = (rgba.width() as usize, rgba.height() as usize);
+        // An RGBA8 input comes back in a clone of its own container, which
+        // may be longer than its pixels.
+        let (pixels, _) = rgba.as_raw()[..4 * width * height].as_chunks::<4>();
+        // Whole pixels are collected and the vector is flattened: one exact
+        // allocation, and no capacity check per byte in the loop.
+        let out = pixels
+            .iter()
+            .map(|px| {
+                let alpha = u32::from(px[3]);
                 // PIL's BLEND: (255 * (255 - a) + c * a) / 255, rounded with its DIV255.
-                let v = 255 * (255 - alpha) + u32::from(c) * alpha + 128;
-                out.push(((v + (v >> 8)) >> 8) as u8);
-            }
-        }
-        (
-            rgba.width() as usize,
-            rgba.height() as usize,
-            Cow::Owned(out),
-        )
+                [px[0], px[1], px[2]].map(|c| {
+                    let v = 255 * (255 - alpha) + u32::from(c) * alpha + 128;
+                    ((v + (v >> 8)) >> 8) as u8
+                })
+            })
+            .collect::<Vec<[u8; 3]>>()
+            .into_flattened();
+        (width, height, Cow::Owned(out))
     }
 
     /// Resize, normalize and patchify one RGB image: appends its
@@ -391,9 +396,7 @@ impl VisionPreProcessor for NemotronOmniProcessor {
         images: &[&DynamicImage],
         context: &VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let sizes: Vec<_> = images
             .iter()
             .map(|image| (image.width(), image.height()))
@@ -607,6 +610,21 @@ mod tests {
         assert_eq!(
             rgb.as_ref(),
             [255, 255, 255, 227, 132, 177, 254, 255, 254, 9, 8, 7]
+        );
+    }
+
+    /// An RGBA8 image in a container longer than its pixels composites as
+    /// the exact image does.
+    #[test]
+    fn a_longer_container_composites_as_its_image() {
+        let pixels = vec![0, 0, 0, 0, 200, 10, 99, 128, 37, 250, 1, 1, 9, 8, 7, 255];
+        let mut container = pixels.clone();
+        container.extend_from_slice(&[0xAB; 7]);
+        let exact = DynamicImage::from(image::RgbaImage::from_raw(4, 1, pixels).unwrap());
+        let longer = DynamicImage::from(image::RgbaImage::from_raw(4, 1, container).unwrap());
+        assert_eq!(
+            NemotronOmniProcessor::rgb_on_white(&longer),
+            NemotronOmniProcessor::rgb_on_white(&exact)
         );
     }
 

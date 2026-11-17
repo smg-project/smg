@@ -140,8 +140,8 @@ pub(crate) fn choice(
 pub(crate) use self::{constraint::constraint, reader::assign};
 pub(crate) use self::{
     constraint::{
-        constraint_for, grammar_start_of, turn_constraint, vocabulary_of, worker_constraint, Asks,
-        AutoRequest, AutoTag, Prepared, PreparedConstraint,
+        constraint_for, grammar_start_of, keeps_references, turn_constraint, vocabulary_of,
+        worker_constraint, Asks, AutoRequest, AutoTag, Prepared, PreparedConstraint,
     },
     names::{
         check_names, keeps_special_tokens_for, labels_select_nothing, named_table, reading,

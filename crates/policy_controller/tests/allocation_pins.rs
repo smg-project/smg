@@ -15,11 +15,12 @@ use std::time::{Duration, Instant};
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
-        WorkersStore, PUBLISH_WINDOW,
+        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers, PairingDescriptor,
+        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow, PairPools, PolicySpec,
-    PoolFacts, RequestFacts, Role, Scratch, Side, SignalSource, Target, WorkerId, PRESETS,
+    PoolFacts, RequestFacts, Role, Scratch, Side, SignalSource, Target, WireModes, WorkerId,
+    PRESETS,
 };
 
 #[global_allocator]
@@ -166,6 +167,43 @@ fn a_round_robin_decision_over_a_changing_survivor_set_allocates_nothing() {
             allocations, 0,
             "round_robin churn at {n}: a decision allocated"
         );
+    }
+}
+
+#[test]
+fn the_pass_behind_a_draw_that_keeps_nobody_allocates_nothing() {
+    // The first decision draws over a pool with every row ready and writes
+    // a few rows. A later one meets the pool with one row ready: the draw
+    // keeps nobody and the whole pass runs, for the first time on this
+    // scratch. The first decision took the pass's room.
+    for preset in ["passthrough", "random", "round_robin", "power_of_two"] {
+        let engine = engine_of(preset);
+        let mut ready = fleet(512);
+        for row in &mut ready {
+            row.health.healthy = true;
+        }
+        let mut lone = ready.clone();
+        for row in &mut lone {
+            row.health.healthy = row.position == 300;
+        }
+        let cx = Constraints::default();
+        let mut scratch = Scratch::new();
+        let first = engine.decide(&facts(1), &pool(512), &ready, &cx, &mut scratch);
+        assert!(
+            first.trace().drew_first(),
+            "{preset}: the first decision drew"
+        );
+        let mut widened = 0;
+        for seed in 2..66u64 {
+            let (decision, allocations) = allocations_during(|| {
+                engine.decide(&facts(seed), &pool(512), &lone, &cx, &mut scratch)
+            });
+            assert_eq!(allocations, 0, "{preset}: a decision allocated");
+            let pick = decision.pick().expect("the lone row routes");
+            assert_eq!(pick.targets.first().map(|t| t.position), Some(300));
+            widened += u32::from(!pick.trace.drew_first());
+        }
+        assert!(widened > 0, "{preset}: no decision reached the whole pass");
     }
 }
 
@@ -344,6 +382,141 @@ fn a_build_from_the_store_after_the_first_allocates_nothing() {
 }
 
 #[test]
+fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
+    // Two prefills of two transports; of 64 decodes every fourth names no
+    // transport and pairs with both: three decode classes in two lists.
+    let store = MemoryStore::new();
+    let register = |key: String, role: Role, transport: Option<&str>| {
+        store.upsert(WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            role,
+            wire_modes: WireModes::GRPC,
+            models: vec!["m".to_string()],
+            dp_size: 1,
+            pairing: transport.map(|transport| PairingDescriptor {
+                transport: Some(transport.to_string()),
+                ..PairingDescriptor::default()
+            }),
+            ..WorkerFacts::default()
+        });
+    };
+    for (index, transport) in ["tx-a", "tx-b"].into_iter().enumerate() {
+        register(
+            format!("grpc://p{index}:9000"),
+            Role::Prefill,
+            Some(transport),
+        );
+    }
+    for index in 0..64 {
+        let transport = [Some("tx-a"), Some("tx-b"), Some("tx-a"), None][index % 4];
+        register(format!("grpc://d{index}:9000"), Role::Decode, transport);
+    }
+    let ask = Ask {
+        gateway: GatewayId(1),
+        now: Instant::now(),
+        pinned: None,
+        affinity: true,
+    };
+    let mut out = PairBuffers::default();
+    // The first build sizes the host's buffers: the rows, the columns and
+    // the table.
+    store.build_pair("m", &ask, &mut out).expect("both pools");
+    let (built, allocations) = allocations_during(|| store.build_pair("m", &ask, &mut out));
+    let sizes = built.map(|(prefill, decode)| (prefill.pool_size, decode.pool_size));
+    assert_eq!(sizes, Some((2, 64)));
+    let pools = out.pools();
+    assert_eq!(
+        (pools.prefill_affinity.len(), pools.decode_affinity.len()),
+        (2, 64)
+    );
+    // Each prefill class lists its transport's decodes and the silent ones.
+    let world = store.world();
+    let classes = world.pairs("m").expect("the model's classes");
+    assert_eq!((classes.classes(), classes.entries()), (2, 4));
+    assert_eq!(pools.table.validate(), Ok(()));
+    assert_eq!(allocations, 0, "a pair build through the door allocated");
+}
+
+#[test]
+fn a_write_that_moves_an_offer_allocates_what_a_write_that_moves_none_does() {
+    // Pairs that name no runtime. One prefill names its runtime and unnames
+    // it in turn, which moves its offer at every write and no class: the
+    // writer derives for that worker alone from what it keeps, and hands
+    // back the classes it had.
+    for n in [8_usize, 64] {
+        let store = MemoryStore::new();
+        let facts_of = |index: usize, runtime: &str| {
+            let (role, key) = if index < n {
+                (Role::Prefill, format!("grpc://p{index}:9000"))
+            } else {
+                (Role::Decode, format!("grpc://d{index}:9000"))
+            };
+            WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                role,
+                wire_modes: WireModes::GRPC,
+                engine_kind: runtime.to_string(),
+                models: vec!["m".to_string()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            }
+        };
+        for index in 0..2 * n {
+            store.upsert(facts_of(index, ""));
+        }
+        // The fewest allocation calls of one write among a few: the store's
+        // change log grows by doubling, and one write in many pays for it.
+        let fewest = |runtimes: [&str; 2]| {
+            let one = |turn: usize| {
+                let facts = facts_of(n / 2, runtimes[turn % 2]);
+                allocations_during(|| store.upsert(facts)).1
+            };
+            (0..8).map(one).min()
+        };
+        // The first writes size what the writer keeps of the derivation.
+        fewest(["rt-b", ""]);
+        let (kept, moved) = (fewest(["", ""]), fewest(["rt-b", ""]));
+        assert_eq!(
+            moved, kept,
+            "{n} a side: the written worker's derive allocated"
+        );
+    }
+}
+
+#[test]
+fn a_registration_into_a_standing_pool_allocates_its_list_once() {
+    // A membership write walks every member into its pool's list. A
+    // standing pool's list starts at the pool's last length and one more,
+    // so what a registration allocates does not follow the fleet: one into
+    // 512 workers makes the allocator calls of one into 8.
+    let fewest = |n: usize| {
+        let (store, _, _) = store_of(n);
+        // The fewest allocation calls of one registration among a few: the
+        // store's tables and the writer's kept lists grow by doubling, and
+        // one write in many pays for it.
+        let one = |turn: usize| {
+            let key = format!("http://new{turn}:8000");
+            let facts = WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                models: vec!["m".to_string()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            };
+            allocations_during(|| store.upsert(facts)).1
+        };
+        (0..8).map(one).min()
+    };
+    let (few, many) = (fewest(8), fewest(512));
+    assert_eq!(many, few, "a registration's allocations follow the fleet");
+}
+
+#[test]
 fn a_record_inside_the_window_allocates_nothing_and_a_publication_derives_nothing() {
     let (store, ids, opened) = store_of(64);
     // Inside the window the store's making opened: on file and folded,
@@ -363,4 +536,25 @@ fn a_record_inside_the_window_allocates_nothing_and_a_publication_derives_nothin
     let ((), allocations) = allocations_during(|| store.publish(due));
     assert_eq!(allocations, 3, "a publication of one pool's rows");
     assert_eq!(store.publish_due(), None);
+}
+
+/// A validation builds an index key's error path at the key's refusal
+/// alone: keys that pass add no allocation, so a spec of a thousand keys
+/// more allocates nothing more.
+#[test]
+fn index_keys_that_pass_add_no_allocation_to_a_validation() {
+    // A process's first validation builds the stock catalog, once: unmeasured.
+    let first = PolicySpec::preset("round_robin").expect("a preset");
+    assert!(first.validate().is_ok(), "the preset validates");
+    let allocations = |keys: u32| {
+        let mut spec = PolicySpec::preset("round_robin").expect("a preset");
+        for key in 0..keys {
+            spec.index
+                .insert(format!("model-{key:04}*"), Default::default());
+        }
+        let (engine, allocations) = allocations_during(|| spec.validate());
+        assert!(engine.is_ok(), "{keys} keys validate");
+        allocations
+    };
+    assert_eq!(allocations(2_000), allocations(1_000));
 }

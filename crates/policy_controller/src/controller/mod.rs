@@ -1,12 +1,17 @@
 //! The standalone controller's run loop (design 2, 6, 8 and 10): the store,
 //! the load driver over it, the election, the gRPC listeners with their
 //! scopes, the service and the health service on each, the admin listener,
-//! readiness and the drain. The service answers `Leader` and a gateway's
-//! `Session`, and the run loop sweeps the gateways that are gone; the
-//! scopes' other call bodies arrive with the gateway, ingestion and control
-//! scope PRs, the other ingestion drivers with their move out of the
-//! gateway. In the
-//! `elected` mode the gateway runs this same loop inside its process.
+//! readiness and the drain. The service answers `Leader`, a gateway's
+//! `Session` and its `Decide` streams, whose decisions run on the
+//! controller's deciding threads, and, on the leader, the control scope's
+//! registration calls and the gateway scope's watch of the worker rows, and
+//! the run loop sweeps the gateways that are gone; the scopes' other call
+//! bodies arrive with the gateway, ingestion and control scope PRs, the
+//! other ingestion drivers with their move out of the gateway. In the
+//! `elected` mode the gateway runs this same loop inside its process. A
+//! controller given a spec file runs its document, watches the file and
+//! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
+//! ([`Controller::spec_file`]).
 //!
 //! A controller is bound first and served second ([`Controller::bind`], then
 //! [`Controller::serve`]): the bind takes every address (port `0` for an
@@ -25,16 +30,27 @@
 
 pub mod admin;
 pub mod config;
+mod decide;
+mod deciders;
 pub mod election;
 mod gateways;
+mod generations;
+mod lifecycle;
+mod membership;
 pub mod metrics;
 mod principal;
 pub mod readiness;
+mod replication;
+mod run;
 mod service;
 mod session;
+mod spec_file;
 pub mod tls;
+mod watch_workers;
+mod wire;
+mod worker_wire;
 
-use std::{future::Future, io, net::SocketAddr, pin::pin, sync::Arc};
+use std::{future::Future, io, net::SocketAddr, path::PathBuf, pin::pin, sync::Arc};
 
 use axum::serve::{ListenerExt as _, TapIo};
 use tokio::{
@@ -44,15 +60,21 @@ use tokio::{
     time::timeout,
 };
 use tonic::transport::{server::TcpIncoming, Server};
-use tonic_health::ServingStatus;
+use tonic_health::{server::HealthReporter, ServingStatus};
 use tracing::{error, info, warn};
 
+// The Decide call's two bounds, for the reference client: it holds them at
+// its own door and reads no second copy.
+#[cfg(feature = "client")]
+pub(crate) use self::wire::{MAX_FRAME, MAX_REQUEST_ID};
 pub use self::{
     admin::{Version, VERSION},
     config::{Config, ConfigError, Listener, Scope, Tls},
     election::{Election, LeaseError, LeasePlace},
+    generations::SpecRejected,
     principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},
+    run::run,
     tls::TlsError,
 };
 use self::{
@@ -60,8 +82,10 @@ use self::{
     principal::Layer,
     readiness::Phase,
     service::{Service, Shared},
+    spec_file::SpecFile,
 };
 use crate::{
+    catalog::Catalog,
     elector::{Elector, Fence},
     ingest::{
         loads::{LoadDriver, LoadDriverConfig},
@@ -79,18 +103,21 @@ pub const PROTOCOL_PACKAGE: &str = "smg.policy.v1";
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The gRPC service every scope is a part of (design 8: one service, four
-/// credentialed scopes), as the health service names it. A listener reports
-/// it `SERVING` while its replica leads, its door is open and its scope's
-/// work can be done there: on the control scope a registration is taken, on
-/// the gateway scope a decision is answered, on the ingestion scope a push is
-/// taken, on the replication scope a standby can follow. Any other listener
-/// reports it `NOT_SERVING`; `Leader` is every scope's and moves no
-/// listener's word.
+/// credentialed scopes), as the health service names it. Every listener
+/// reports it `NOT_SERVING` from its bind on, and no line reports it
+/// `SERVING` yet: `Session` being served moves no listener's word. The
+/// design's rule waits for the steps that serve a scope's work: `SERVING`
+/// while the listener's replica leads and its scope's work can be done
+/// there (on the gateway scope, a decision answered). `Leader` is every
+/// scope's and moves no listener's word.
 pub const SERVICE_NAME: &str = "smg.policy.v1.PolicyController";
 
 /// A controller with its listeners bound and nothing served yet.
 pub struct Controller {
     config: Config,
+    /// The stages a policy document may name, fixed at the bind: the stock
+    /// build's, or the host's own.
+    catalog: Arc<Catalog>,
     phase: watch::Sender<Phase>,
     readiness: Readiness,
     metrics: Arc<metrics::Metrics>,
@@ -103,6 +130,9 @@ pub struct Controller {
     /// What every listener's instance of the service reads; the store is
     /// its field, the run loop's drivers read the same one.
     shared: Arc<Shared>,
+    /// The spec's file source, once [`Controller::spec_file`] has read it:
+    /// the serve watches it.
+    spec_file: Option<SpecFile>,
     listeners: Vec<Bound>,
     admin: AdminSockets,
     admin_addr: SocketAddr,
@@ -231,6 +261,15 @@ pub enum Error {
     /// The engines' HTTP client could not be built.
     #[error("the engines' probe: {0}")]
     Probe(#[source] reqwest::Error),
+    /// The spec file could not be read, or its document does not run.
+    #[error("the spec file {}: {source}", .path.display())]
+    SpecFile {
+        /// The file.
+        path: PathBuf,
+        /// Why its document was not applied.
+        #[source]
+        source: SpecRejected,
+    },
     /// The lease's place could not be opened, or the elector refused its
     /// identity.
     #[error("the election's lease: {0}")]
@@ -238,10 +277,17 @@ pub enum Error {
     /// The election thread could not be started.
     #[error("the election thread: {0}")]
     ElectionThread(#[source] io::Error),
+    /// A deciding thread could not be started.
+    #[error("the deciding threads: {0}")]
+    Deciders(#[source] io::Error),
     /// The election thread ended before the shutdown: nothing renews the
     /// lease, so the controller stops.
     #[error("the election thread ended before the shutdown")]
     ElectionEnded,
+    /// A deciding thread ended before the shutdown: the models it decided
+    /// have no decider, so the controller stops and gives the lead up.
+    #[error("a deciding thread ended before the shutdown")]
+    DeciderEnded,
     /// A listener returned before the shutdown signal.
     #[error("a listener stopped before the shutdown")]
     Stopped,
@@ -251,14 +297,34 @@ pub enum Error {
 }
 
 impl Controller {
+    /// [`Controller::bind_with`] over the stock build's stages.
+    pub async fn bind(config: Config) -> Result<Self, Error> {
+        Self::bind_with(config, Catalog::builtin()).await
+    }
+
     /// Validates the configuration, installs the process crypto provider,
     /// reads and parses every listener's TLS material, binds every address,
     /// opens the lease's place and builds the store. Nothing is served yet
     /// and no lease is taken, so a refusal arrives before a client can
-    /// connect.
-    pub async fn bind(config: Config) -> Result<Self, Error> {
+    /// connect. A policy document names the stages `catalog` holds: the
+    /// stock build's and the ones the host added. One that needs the
+    /// lifecycle's calls ([`crate::Lifecycle::needs_lifecycle`]) is refused
+    /// as not in this build: the controller makes none of them yet.
+    pub async fn bind_with(config: Config, catalog: Catalog) -> Result<Self, Error> {
         config.validate()?;
         tls::install_crypto_provider();
+        // The stages a policy document may name in this build, the host's
+        // own among them.
+        info!(
+            controller_id = %config.controller_id,
+            filters = ?catalog.filters().collect::<Vec<_>>(),
+            scorers = ?catalog.scorers().collect::<Vec<_>>(),
+            pickers = ?catalog.pickers().collect::<Vec<_>>(),
+            "stages held"
+        );
+        // No served line makes a lifecycle call yet: a stage that needs
+        // them is refused by name, never run on state nothing keeps.
+        let catalog = Arc::new(catalog.without_lifecycle());
         let mut listeners = Vec::with_capacity(config.listeners.len());
         for listener in &config.listeners {
             let name = listener.name.clone();
@@ -337,16 +403,22 @@ impl Controller {
         );
         let (standing, stood) = watch::channel(Standing::default());
         let (phase, readiness) = readiness::channel(elector.fence(), stood.clone());
-        let shared = Arc::new(Shared::new(
+        let journal = replication::journaled(&config.election.lease);
+        let shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
             &elector,
             stood,
-            Arc::new(MemoryStore::new()),
-        ));
+            journal,
+            Arc::clone(&catalog),
+            config.decide_shards,
+        )
+        .map_err(Error::Deciders)?;
+        let shared = Arc::new(shared);
         let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
         Ok(Self {
             config,
+            catalog,
             phase,
             readiness,
             metrics: Arc::new(metrics::Metrics::new()),
@@ -354,6 +426,7 @@ impl Controller {
             elector,
             standing,
             shared,
+            spec_file: None,
             listeners,
             admin,
             admin_addr,
@@ -416,6 +489,48 @@ impl Controller {
         Ok(())
     }
 
+    /// The stages a policy document may name in this controller, fixed at
+    /// the bind: a spec file's document is validated against them
+    /// ([`Controller::spec_file`]).
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    /// Takes the controller's policy spec from the file at `path` (design
+    /// 4.6): the document is read and applied now, as generation 1 or under
+    /// the number its `generation` line writes, and the control scope
+    /// answers `GetPolicySpec` with it. [`Self::serve`] then watches the
+    /// file: a changed one is applied as the next generation, or under the
+    /// number it writes, and one that does not run is rejected whole, with
+    /// the running generation kept.
+    ///
+    /// A file that cannot be read, or a document the validator refuses, is
+    /// refused here, before anything serves. The document names the stages
+    /// the bind was handed ([`Controller::catalog`]), a host's own among
+    /// them. A controller that takes no spec file serves no spec call,
+    /// watches nothing and renders no spec series.
+    pub async fn spec_file(&mut self, path: impl Into<PathBuf>) -> Result<(), Error> {
+        let path = path.into();
+        let generations = Arc::clone(&self.shared.generations);
+        let read = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || SpecFile::start(path, generations))
+        };
+        match read.await {
+            Ok(Ok(file)) => self.spec_file = Some(file),
+            Ok(Err(source)) => return Err(Error::SpecFile { path, source }),
+            Err(join) => return Err(Error::Task(join.to_string())),
+        }
+        info!(
+            controller_id = %self.config.controller_id,
+            path = %path.display(),
+            generation = self.shared.generations.generation(),
+            "spec file"
+        );
+        self.metrics.spec(Arc::clone(&self.shared.generations));
+        Ok(())
+    }
+
     /// The store the ingestion drivers and the scopes' calls feed and read.
     pub fn store(&self) -> Arc<MemoryStore> {
         Arc::clone(&self.shared.store)
@@ -445,12 +560,26 @@ impl Controller {
     /// lease before the settle window, so a follower takes it within one
     /// renew period; the listeners keep accepting for the settle window,
     /// stop accepting, and close within the rest of the grace period, their
-    /// streams with them.
+    /// streams with them. An open `Decide` stream ends `UNAVAILABLE` when
+    /// they stop accepting: it does not hold the close to the grace period.
     ///
     /// Every listener's health service reports the overall status (service
-    /// `""`) as the readiness and [`SERVICE_NAME`] as `NOT_SERVING`. A
-    /// listener or an election thread that ends before the shutdown ends
-    /// the serve with its error, the other listeners closed.
+    /// `""`) as the readiness and [`SERVICE_NAME`] as `NOT_SERVING`, but a
+    /// control listener that takes a principal: `SERVING` while this replica
+    /// leads, so a client that checks the service's health by that name
+    /// finds the leader's control listener. That word is told at every move
+    /// of the run loop and after every step of the election, so a fence that
+    /// closes between two steps reads `SERVING` until the next; a
+    /// registration call reads the fence itself and is refused in that
+    /// window. An open watch of the rows follows the same telling: it ends
+    /// `ABORTED` when this replica stops leading, an idle one at the next
+    /// step of the election. A lead can open between two steps, and a watch
+    /// admitted before the next one is ended by any telling that finds no
+    /// leader here, the drain's first.
+    ///
+    /// A listener, an election thread or a deciding thread that ends before
+    /// the shutdown ends the serve with its error, the other listeners
+    /// closed.
     pub async fn serve(self, shutdown: impl Future<Output = ()>) -> Result<(), Error> {
         self.serve_until(shutdown, std::future::pending()).await
     }
@@ -472,14 +601,20 @@ impl Controller {
             elector,
             standing,
             shared,
+            spec_file,
             listeners,
             admin,
             ..
         } = self;
         let store = Arc::clone(&shared.store);
-        let (stop, _held) = watch::channel(false);
+        // The listeners' close is one word, and an open decide stream hears
+        // it too: the word is `Shared`'s.
+        let stop = shared.stop.clone();
         let mut tasks: JoinSet<Result<(), Error>> = JoinSet::new();
         let mut reporters = Vec::with_capacity(listeners.len());
+        // The reporters of the listeners whose door a caller can pass: the
+        // control scope's, where a layer places a principal.
+        let mut doors = Vec::new();
         for bound in listeners {
             let (reporter, health) = tonic_health::server::health_reporter();
             reporter
@@ -488,6 +623,9 @@ impl Controller {
             reporter
                 .set_service_status(SERVICE_NAME, ServingStatus::NotServing)
                 .await;
+            if bound.scopes.contains(&Scope::Control) && bound.layer != Layer::Off {
+                doors.push(reporter.clone());
+            }
             let routes = Service::new(bound.scopes, Arc::clone(&shared)).routes(bound.layer);
             let mut stop = stop.subscribe();
             let name = bound.name;
@@ -505,6 +643,16 @@ impl Controller {
             });
             reporters.push(reporter);
         }
+        let teller = tell_role(
+            readiness.clone(),
+            stop.subscribe(),
+            doors,
+            shared.role.clone(),
+        );
+        tasks.spawn(async move {
+            teller.await;
+            Ok(())
+        });
         let driver = Arc::new(LoadDriver::new(
             Arc::clone(&store),
             probe,
@@ -527,10 +675,34 @@ impl Controller {
             gateways.run(sweep_stop).await;
             Ok(())
         });
+        if let Some(file) = spec_file {
+            let file_stop = stop.subscribe();
+            tasks.spawn(async move {
+                file.run(file_stop)
+                    .await
+                    .map_err(|join| Error::Task(join.to_string()))
+            });
+        }
+        // A deciding thread that unwound decides nothing from then on and
+        // nothing starts it again: the serve ends by its error, as it ends
+        // by the election thread's.
+        let mut unwound = shared.deciders.ended();
+        let mut deciders_stop = stop.subscribe();
+        tasks.spawn(async move {
+            let told = async { unwound.wait_for(|unwound| *unwound).await.is_ok() };
+            let stopped = async {
+                let _ = deciders_stop.wait_for(|stop| *stop).await;
+            };
+            tokio::select! {
+                true = told => Err(Error::DeciderEnded),
+                () = stopped => Ok(()),
+            }
+        });
         let app = admin::router(admin::Admin {
             readiness: readiness.clone(),
             metrics: Arc::clone(&metrics),
             loads,
+            decides: Arc::clone(shared.deciders.counts()),
         });
         let mut admin_stop = stop.subscribe();
         tasks.spawn(async move {
@@ -665,25 +837,92 @@ impl Controller {
     }
 }
 
+/// Tells the role at each change of it and, at the stop, that this replica
+/// left: every door's word for the service's name follows it, and so does
+/// every open watch of the rows. The serve's one writer of both.
+///
+/// A watch is told that this replica does not lead at every move while it
+/// does not, where a door is told at the change alone. A take with no
+/// holder to wait for leads one renew deadline after its write, between
+/// two steps of the election: the fence admits a watch from that instant,
+/// and until the next step such a watch stands under the word that nobody
+/// leads here. The word told again ends it, the drain's included; told at
+/// the change alone, the drain would leave that watch open to the end of
+/// the grace period.
+async fn tell_role(
+    mut role: Readiness,
+    mut stop: watch::Receiver<bool>,
+    doors: Vec<HealthReporter>,
+    told: watch::Sender<bool>,
+) {
+    let (mut last, mut left) = (None, false);
+    loop {
+        let leads = !left && role.state() == State::Leader;
+        // The watches first: nothing is awaited between the read of the
+        // fence and their word.
+        if leads {
+            told.send_if_modified(|was| !std::mem::replace(was, true));
+        } else {
+            told.send_replace(false);
+        }
+        if last != Some(leads) {
+            let word = if leads {
+                ServingStatus::Serving
+            } else {
+                ServingStatus::NotServing
+            };
+            for door in &doors {
+                door.set_service_status(SERVICE_NAME, word).await;
+            }
+            last = Some(leads);
+        }
+        if left {
+            return;
+        }
+        // At the stop the listeners close next: the loop says once more
+        // that this replica left, then ends. A serve that is gone reads the
+        // same.
+        tokio::select! {
+            _ = stop.wait_for(|stop| *stop) => left = true,
+            moved = role.moved() => left = moved.is_none(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! What no case outside the module reaches: a serve whose election
-    //! thread is gone on its own, and a serve that leaves by a listener's
-    //! error.
+    //! thread is gone on its own, one whose deciding thread unwound, and a
+    //! serve that leaves by a listener's error.
 
-    use std::{future::pending, thread, time::Duration};
+    use std::{
+        future::pending,
+        sync::Arc,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use axum::serve::Listener as _;
     use tokio::{
         net::{TcpListener, TcpStream},
-        sync::oneshot,
+        sync::{oneshot, watch},
+        task::JoinSet,
         time::timeout,
     };
     use tonic::codegen::tokio_stream::StreamExt as _;
 
-    use super::{config::tests::valid, Controller, Error};
-    use crate::elector::{
-        ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Written,
+    use super::{
+        config::tests::valid,
+        election::Standing,
+        readiness::{self, Phase},
+        tell_role, Controller, Error,
+    };
+    use crate::{
+        elector::{
+            ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Tick,
+            Written,
+        },
+        store::Kinds,
     };
 
     /// A lease that stores `writes` writes: the thread that steps it panics
@@ -753,6 +992,34 @@ mod tests {
         drop(dialed);
     }
 
+    /// The deciding threads are the configuration's count: a model's
+    /// requests go to one of that many.
+    #[tokio::test]
+    async fn the_controller_starts_the_deciding_threads_its_configuration_counts() {
+        let mut config = valid();
+        config.decide_shards = 3;
+        let controller = Controller::bind(config).await.expect("the listeners bind");
+        let deciders = &controller.shared.deciders;
+        let highest = (0..64)
+            .map(|index| deciders.of(&format!("model-{index}")))
+            .max();
+        assert_eq!(highest, Some(2));
+    }
+
+    /// The bind draws its log's first place: two binds of one configuration
+    /// start apart and under no term, so a place of the run before is no
+    /// place of this run.
+    #[tokio::test]
+    async fn the_bind_draws_its_logs_first_place() {
+        let mut starts = Vec::new();
+        for _ in 0..2 {
+            let controller = Controller::bind(valid()).await.expect("the listeners bind");
+            starts.push(controller.shared.feed.log.head(Kinds::Watched));
+        }
+        assert_ne!(starts[0].seq, starts[1].seq, "two runs start apart");
+        assert!(starts.iter().all(|start| start.seq != 0 && start.term == 0));
+    }
+
     /// The thread gone at its take, before the serve read ready, and at its
     /// first renewal, after: the serve ends with the error either way, so
     /// the process exits and its supervisor starts it again.
@@ -780,6 +1047,47 @@ mod tests {
             assert!(
                 matches!(served, Err(Error::ElectionEnded)),
                 "a lease that gave way after {writes} writes: {served:?}"
+            );
+        }
+    }
+
+    /// A deciding thread that unwound leaves its models with no decider:
+    /// the serve ends with the error, told before the serve began, before
+    /// it read ready or after, so the process exits and its supervisor
+    /// starts it again. A word told before the serve began is one its
+    /// receiver was made after: the serve reads it by its value.
+    #[tokio::test]
+    async fn a_serve_whose_deciding_thread_unwound_ends_with_an_error() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Told {
+            BeforeTheServe,
+            BeforeReady,
+            AfterReady,
+        }
+        for told in [Told::BeforeTheServe, Told::BeforeReady, Told::AfterReady] {
+            let controller = Controller::bind(valid()).await.expect("the listeners bind");
+            let shared = Arc::clone(&controller.shared);
+            let mut phase = controller.phase.subscribe();
+            if told == Told::BeforeTheServe {
+                shared.deciders.tell_unwound();
+            }
+            let unwinds = async move {
+                if told == Told::AfterReady {
+                    let serving = |phase: &Phase| *phase == Phase::Serving;
+                    assert!(phase.wait_for(serving).await.is_ok(), "the serve is ready");
+                }
+                if told != Told::BeforeTheServe {
+                    shared.deciders.tell_unwound();
+                }
+            };
+            let (served, ()) = timeout(Duration::from_secs(20), async {
+                tokio::join!(controller.serve(pending()), unwinds)
+            })
+            .await
+            .expect("the serve ends within twenty seconds");
+            assert!(
+                matches!(served, Err(Error::DeciderEnded)),
+                "told {told:?}: {served:?}"
             );
         }
     }
@@ -927,5 +1235,150 @@ mod tests {
                 "the lease is released when the serve has returned (by an error: {by_error}): {record:?}"
             );
         }
+    }
+
+    /// The role's one teller over a candidate's own fence: it says that the
+    /// replica leads once it does, that it does not at the step after a
+    /// loss, and at the stop that it left. The candidate is alone over its
+    /// lease, so each take leads at once.
+    #[tokio::test]
+    async fn the_role_is_told_at_each_change_and_as_left_at_the_stop() {
+        let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+            .expect("the default settings are in order");
+        let (steps, stepped) = watch::channel(Standing::default());
+        let (phase, readiness) = readiness::channel(elector.fence(), stepped);
+        let (stop, stopped) = watch::channel(false);
+        let (told, mut role) = watch::channel(false);
+        let mut teller = JoinSet::new();
+        teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
+        let mut told_as = async |leads: bool| {
+            let reached =
+                timeout(Duration::from_secs(5), role.wait_for(|told| *told == leads)).await;
+            assert!(
+                matches!(reached, Ok(Ok(_))),
+                "the role was not told as {leads}"
+            );
+        };
+
+        // Serving, and the lease taken: the step after it tells the role.
+        phase.send_replace(Phase::Serving);
+        assert!(matches!(
+            elector.tick(Instant::now()),
+            Ok(Tick::Acquired { .. })
+        ));
+        steps.send_replace(Standing::default());
+        told_as(true).await;
+        // The lease let go with no stop: told at the next step.
+        assert!(elector.release().expect("a release"));
+        steps.send_replace(Standing::default());
+        told_as(false).await;
+        // Taken again, then the stop: the replica left, and the teller ends.
+        assert!(matches!(
+            elector.tick(Instant::now()),
+            Ok(Tick::Acquired { .. })
+        ));
+        steps.send_replace(Standing::default());
+        told_as(true).await;
+        stop.send_replace(true);
+        told_as(false).await;
+        assert!(
+            teller.join_next().await.is_some(),
+            "the teller ends at the stop"
+        );
+    }
+
+    /// A serve whose lead opened with no step of the election since: the
+    /// take of a lease with no holder to wait for leads one renew deadline
+    /// after its write, between two steps. The fence admits a watch from
+    /// that instant, and the word such a watch finds still says that nobody
+    /// leads here.
+    struct Unstepped {
+        elector: Elector,
+        steps: watch::Sender<Standing>,
+        phase: watch::Sender<Phase>,
+        /// The role's word, as a watch admitted now holds it.
+        watch: watch::Receiver<bool>,
+        /// The serve's stop, never said, and the teller's task.
+        _serve: (watch::Sender<bool>, JoinSet<()>),
+    }
+
+    impl Unstepped {
+        async fn new() -> Self {
+            let settings = ElectionSettings {
+                duration: Duration::from_millis(1500),
+                renew_period: Duration::from_millis(100),
+                renew_deadline: Duration::from_millis(500),
+            };
+            let mut elector = Elector::new(
+                Box::new(MemoryLease::new()),
+                "controller-0@127.0.0.1:1",
+                settings,
+            )
+            .expect("the settings are in order");
+            let (steps, stepped) = watch::channel(Standing::default());
+            let (phase, readiness) = readiness::channel(elector.fence(), stepped);
+            let (stop, stopped) = watch::channel(false);
+            let (told, role) = watch::channel(false);
+            let mut teller = JoinSet::new();
+            teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
+
+            // The take, and a renewal just short of its lead's opening that
+            // keeps the fence open most of a renew deadline past it: the
+            // step's telling finds a follower.
+            phase.send_replace(Phase::Serving);
+            let taken = Instant::now();
+            assert_eq!(
+                elector.tick(taken).expect("the take"),
+                Tick::Acquired { term: 1 }
+            );
+            let renewed = taken + settings.renew_deadline - Duration::from_millis(10);
+            assert_eq!(
+                elector.tick(renewed).expect("the renewal"),
+                Tick::Renewed { term: 1 }
+            );
+            steps.send_replace(Standing::default());
+            // The lead opens by itself and the fence admits a watch. No step
+            // came since: the word the watch finds says that nobody leads.
+            tokio::time::sleep(settings.renew_deadline).await;
+            assert_eq!(elector.fence().leader_term(Instant::now()), Some(1));
+            let mut watch = role.clone();
+            assert!(!*watch.borrow_and_update());
+            Self {
+                elector,
+                steps,
+                phase,
+                watch,
+                _serve: (stop, teller),
+            }
+        }
+
+        /// The watch is told again that nobody leads here.
+        async fn hears(&mut self, what: &str) {
+            let heard = timeout(Duration::from_secs(5), self.watch.changed()).await;
+            assert!(
+                matches!(heard, Ok(Ok(()))),
+                "{what} was not told to a watch that stood under the word: {heard:?}"
+            );
+            assert!(!*self.watch.borrow());
+        }
+    }
+
+    /// A watch admitted before any step told the role as leading stands
+    /// under the word that this replica does not lead. The drain tells that
+    /// word again, and the watch hears it.
+    #[tokio::test]
+    async fn a_watch_admitted_before_the_role_was_told_as_leading_hears_the_drain() {
+        let mut serve = Unstepped::new().await;
+        serve.phase.send_replace(Phase::Draining);
+        serve.hears("the drain").await;
+    }
+
+    /// So does the step that finds the lead gone, with no stop.
+    #[tokio::test]
+    async fn a_watch_admitted_before_the_role_was_told_as_leading_hears_the_loss_of_its_lead() {
+        let mut serve = Unstepped::new().await;
+        assert!(serve.elector.release().expect("a release"));
+        serve.steps.send_replace(Standing::default());
+        serve.hears("the lead's loss").await;
     }
 }

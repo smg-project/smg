@@ -32,6 +32,7 @@ use crate::{
         },
         gateway::Gateway,
         grpc::{
+            backend_client::BackendConnector,
             multimodal::MultimodalConfigRegistry,
             regular::symphony::{check_names, named_table},
             utils::{Names, ALIASES},
@@ -450,7 +451,7 @@ impl AppContextBuilder {
         // constructor that builds the policy registry itself configures them
         // before that build (`from_config` and the test harness do).
         // This call covers a context assembled without such a constructor.
-        liveness::configure_from(&router_config);
+        liveness::configure_from(router_config.worker_liveness_budgets());
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
 
@@ -547,7 +548,9 @@ impl AppContextBuilder {
             router_config.clone(),
         ));
 
-        let worker_client_cache = Arc::new(WorkerHttpClientCache::new(&router_config));
+        let worker_client_cache = Arc::new(WorkerHttpClientCache::new(
+            router_config.worker_http_client_settings(),
+        ));
         let gateway_auth = AuthConfig::with_tenant_keys(
             router_config.api_key.clone(),
             &router_config.tenant_api_keys,
@@ -626,7 +629,7 @@ impl AppContextBuilder {
         // The configuration's liveness budgets take effect before the policy
         // registry is built below (the first call wins; `build` keeps its
         // call for a context assembled without this constructor).
-        liveness::configure_from(&router_config);
+        liveness::configure_from(router_config.worker_liveness_budgets());
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
@@ -806,7 +809,9 @@ impl AppContextBuilder {
 
     /// Create worker registry
     fn with_worker_registry(mut self) -> Self {
-        self.worker_registry = Some(Arc::new(WorkerRegistry::new()));
+        self.worker_registry = Some(Arc::new(
+            WorkerRegistry::new().with_engine_connector(BackendConnector::shared()),
+        ));
         self
     }
 
@@ -1010,7 +1015,7 @@ fn mcp_bootstrap_config(file: Option<&smg_mcp::McpConfig>) -> smg_mcp::McpConfig
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::{HealthCheckConfig, WorkerSpec, WorkerStatus};
     use tracing_test::traced_test;
 
     use super::*;
@@ -1018,7 +1023,8 @@ mod tests {
         config::types::PolicyConfig,
         routers::common::prefill_admission::PrefillAdmissionAttempt,
         worker::{
-            test_support::{select_worker, worker_of},
+            connection::engine::NO_ENGINE_CONNECTOR,
+            test_support::{select_worker, worker_of, RefusedAddress},
             BasicWorkerBuilder, ConnectionMode, SubscriptionKind, Worker, WorkerType,
         },
     };
@@ -1404,6 +1410,40 @@ policy:
         );
     }
 
+    /// The registry the gateway builds connects its mesh imports through
+    /// the gateway's connector: an imported gRPC worker's connect reaches
+    /// for its engine, it is not refused for want of a connector.
+    #[tokio::test]
+    async fn the_gateways_registry_connects_its_mesh_imports() {
+        let refused = RefusedAddress::reserve();
+        let registry = AppContextBuilder::new()
+            .with_worker_registry()
+            .worker_registry
+            .expect("the registry");
+        let mut spec = WorkerSpec::new(format!("grpc://{}", refused.addr()));
+        spec.connection_mode = ConnectionMode::Grpc;
+        registry.on_remote_worker_state(&smg_mesh::WorkerState {
+            worker_id: "peer-w1".to_string(),
+            model_id: "m".to_string(),
+            url: spec.url.clone(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: serde_json::to_vec(&spec).expect("a spec encodes"),
+            owner: "peer".to_string(),
+        });
+        let import = registry.get_all().pop().expect("the import");
+        assert_eq!(*import.connection_mode(), ConnectionMode::Grpc);
+
+        match import.engine_connection().await {
+            Ok(connection) => assert!(connection.is_some()),
+            Err(refusal) => assert!(
+                !refusal.to_string().contains(NO_ENGINE_CONNECTOR),
+                "{refusal}"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn worker_status_change_wakes_prefill_admission() {
         let registry = Arc::new(WorkerRegistry::new());
@@ -1614,7 +1654,9 @@ pub(crate) mod testing {
             tokenizer_load_failures: Arc::default(),
             worker_loaded_tokenizers: Arc::default(),
             wasm_manager: None,
-            worker_client_cache: Arc::new(WorkerHttpClientCache::new(&router_config)),
+            worker_client_cache: Arc::new(WorkerHttpClientCache::new(
+                router_config.worker_http_client_settings(),
+            )),
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,
                 job_queue,

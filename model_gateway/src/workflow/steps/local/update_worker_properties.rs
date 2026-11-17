@@ -16,10 +16,10 @@ use super::create_worker::{
 use crate::{
     service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
-        health::overload::OverloadThresholds, identity::basic::merge_labels,
-        registry::service::MAX_WORKER_LABELS, BasicWorker, BasicWorkerBuilder, RuntimeType, Worker,
+        identity::basic::merge_labels, registry::service::MAX_WORKER_LABELS, BasicWorker,
+        BasicWorkerBuilder, RuntimeType, Worker,
     },
-    workflow::data::WorkerUpdateWorkflowData,
+    workflow::data::{require_app_context, WorkerUpdateWorkflowData},
 };
 
 /// Step to update worker properties.
@@ -59,12 +59,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             context.data.updated_workers = Some(Vec::new());
             return Ok(StepResult::Skip);
         }
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.app_context.as_ref())?.clone();
         let workers_to_update = context
             .data
             .workers_to_update
@@ -289,9 +284,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .cost(updated_cost)
                 // The effective overload thresholds re-resolve against the
                 // same gateway defaults registration used.
-                .overload_defaults(OverloadThresholds::from_gateway_config(
-                    &app_context.router_config,
-                ))
+                .overload_defaults(app_context.router_config.worker_overload_thresholds())
                 .status(next_status);
             if refresh {
                 // A connector or role the operator configured none of follows

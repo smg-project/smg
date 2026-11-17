@@ -500,6 +500,62 @@ async fn test_reconcile_without_job_queue_is_safe() {
     .await;
 }
 
+/// A pass that waits for a queue slot with an addition in hand holds that
+/// URL's claim while it waits: a `POST` of the URL during the wait is told
+/// a registration is in flight. The pass used to read the URL's status
+/// first and submit without a claim, so such a `POST` was admitted and the
+/// pass then queued a second registration of the URL beside it.
+#[tokio::test]
+async fn an_addition_waiting_for_a_queue_slot_holds_its_urls_claim() {
+    use crate::workflow::{JobQueue, JobQueueConfig};
+
+    let app_context = create_test_app_context();
+    // One slot and no runner: the dispatcher takes one job out and waits for
+    // a permit that never comes, and the next job fills the slot.
+    let queue = JobQueue::new(
+        JobQueueConfig {
+            queue_capacity: 1,
+            max_concurrent_jobs: 0,
+        },
+        Arc::downgrade(&app_context),
+    );
+    app_context.worker_job_queue.set(Arc::clone(&queue)).ok();
+    let registration = |url: &str, registration_mode| Job::AddWorker {
+        config: Box::new(WorkerSpec::new(url)),
+        registration_mode,
+    };
+    for other in 1.. {
+        tokio::task::yield_now().await;
+        if queue.get_load_info().0 == 1 {
+            break;
+        }
+        let url = format!("http://10.0.0.{other}:8080");
+        queue
+            .submit(registration(&url, WorkerRegistrationMode::Upsert))
+            .await
+            .expect("a slot");
+    }
+
+    let worker = published("http://10.0.9.1:8080", "u1");
+    let url = worker.endpoint.render();
+    let desired = desired_state_of(&[worker]);
+    let mut pass = std::pin::pin!(reconcile(
+        &desired,
+        DiscoveryKind::Kubernetes,
+        &app_context,
+        time::Instant::now(),
+    ));
+    assert!(
+        matches!(futures::poll!(pass.as_mut()), std::task::Poll::Pending),
+        "the pass waits for a queue slot"
+    );
+
+    assert!(
+        !queue.claim_if_idle(&registration(&url, WorkerRegistrationMode::CreateOnly)),
+        "the waiting addition holds its URL: a POST of it is told to poll"
+    );
+}
+
 /// A prefill worker discovered without a bootstrap annotation carries no
 /// bootstrap port into its spec and is handed the default port on the
 /// request path (here a vLLM worker on the Mooncake connector, as the

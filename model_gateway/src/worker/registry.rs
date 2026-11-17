@@ -9,7 +9,7 @@
 //! # Consistent Hash Ring
 //! The registry maintains a pre-computed [`HashRing`] per model for O(log n)
 //! consistent hashing. The ring is rebuilt only when workers are added or
-//! removed, not per request. See [`crate::policies::hash_ring`] for the ring
+//! removed, not per request. See [`hash_ring`] for the ring
 //! itself — this file only wires registry events to ring rebuilds.
 
 #[cfg(test)]
@@ -25,16 +25,20 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dashmap::{mapref::entry::Entry, DashMap};
-use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{TagVocabulary, WorkerStatus},
+};
 use rustc_hash::FxBuildHasher;
+use smg_worker::settings::RetryConfig;
+use symphony::grammar::GrammarStart;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::{
-    config::types::RetryConfig,
     observability::metrics::{metrics_labels, Metrics},
-    policies::hash_ring::HashRing,
     worker::{
+        connection::engine::EngineConnector,
         health::circuit_breaker::CircuitState,
         identity::{
             basic::{RuntimeType, WorkerType},
@@ -44,14 +48,19 @@ use crate::{
             pair_index::{PdPairIndex, PdWire},
             pairing::PdPairingMode,
         },
-        registry::event::{WorkerConnected, WorkerEvent},
+        registry::{
+            event::{WorkerConnected, WorkerEvent},
+            hash_ring::HashRing,
+        },
         ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
 };
 
 pub mod event;
+pub mod hash_ring;
 // The admin API's service over this registry lives with the control plane
-// (`crate::admin::worker_service`); the path it had here is kept.
+// (`crate::admin::worker_service`); the path it had here is kept until the
+// runtime moves into the worker crate.
 pub use crate::admin::worker_service as service;
 
 /// Unique identifier for a worker
@@ -206,6 +215,27 @@ pub(crate) struct WindowFloor {
     pub(crate) prefill: Option<u32>,
 }
 
+/// What a model's workers say together to a request, before one of them is
+/// selected: the parser names their cards set for the model, where their
+/// engines start a grammar, and the structural-tag vocabulary their grammar
+/// compilers take. The stage that prepares a request's reading holds the
+/// rule that reads each from the workers; a snapshot keeps the answers
+/// ([`ModelWorkerSnapshot::labels`]).
+///
+/// The answers depend on the membership and on the model id as spelled,
+/// never on a request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelLabels {
+    /// The tool-call parser the cards name, when one does.
+    pub(crate) tool_parser: Option<String>,
+    /// The reasoning parser the cards name, when one does.
+    pub(crate) reasoning_parser: Option<String>,
+    /// Where the workers' engines start a grammar, taken together.
+    pub(crate) grammar_start: GrammarStart,
+    /// The structural-tag vocabulary every worker's compiler takes.
+    pub(crate) vocabulary: TagVocabulary,
+}
+
 /// Immutable membership snapshot. Route-specific projections are populated
 /// lazily once and then shared by every request until membership changes
 /// publish a replacement snapshot.
@@ -226,6 +256,9 @@ pub(crate) struct ModelWorkerSnapshot {
     /// The pools' window floors, each kept with the model id it was read
     /// for (see [`Self::window_floor`]).
     window_floors: [OnceLock<(Box<str>, WindowFloor)>; RoutingPool::COUNT],
+    /// What the workers of this generation say together, kept with the
+    /// model id it was read for (see [`Self::labels`]).
+    labels: OnceLock<(Box<str>, ModelLabels)>,
 }
 
 impl ModelWorkerSnapshot {
@@ -236,6 +269,7 @@ impl ModelWorkerSnapshot {
             pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
             harmony: OnceLock::new(),
             window_floors: std::array::from_fn(|_| OnceLock::new()),
+            labels: OnceLock::new(),
         }
     }
 
@@ -280,6 +314,34 @@ impl ModelWorkerSnapshot {
         let (spelling, floor) =
             self.window_floors[pool.index()].get_or_init(|| (model_id.into(), read(workers)));
         (**spelling == *model_id).then_some(*floor)
+    }
+
+    /// What the snapshot's workers say together for `model_id`: `read` reads
+    /// them on the first request after the membership change, every request
+    /// after it reads the kept answers, so preparing a request walks no
+    /// worker, whatever the size of the fleet. Whatever changes a card
+    /// publishes a new snapshot (see [`Self::harmony`]), and a worker's
+    /// labels are read once, at its construction. The rules stay with the
+    /// stage that prepares a request's reading, as `harmony`'s stays with
+    /// the router's detector.
+    ///
+    /// The answers are kept with the model id they were read for, as
+    /// spelled, like a window floor ([`Self::window_floor`]). `None` for
+    /// another spelling than the kept one, and for a snapshot without a
+    /// worker (the one every unknown model shares keeps no client's model
+    /// id): the caller then reads the workers itself.
+    pub(crate) fn labels(
+        &self,
+        model_id: &str,
+        read: impl FnOnce(&[Arc<dyn Worker>]) -> ModelLabels,
+    ) -> Option<&ModelLabels> {
+        if self.all.is_empty() {
+            return None;
+        }
+        let (spelling, labels) = self
+            .labels
+            .get_or_init(|| (model_id.into(), read(&self.all)));
+        (**spelling == *model_id).then_some(labels)
     }
 
     /// The compatible prefill/decode pairs of `wire` under `mode`: descriptor
@@ -499,6 +561,10 @@ pub struct WorkerRegistry {
     /// [`Self::take_connect_signal_receiver`]; `None` thereafter (and when
     /// no manager runs, e.g. health checks globally disabled).
     connect_signal_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<WorkerConnected>>>,
+
+    /// What makes the engine connection of a worker this registry builds
+    /// from a peer's published state (see [`Self::with_engine_connector`]).
+    engine_connector: Option<Arc<dyn EngineConnector>>,
 }
 
 impl WorkerRegistry {
@@ -549,7 +615,18 @@ impl WorkerRegistry {
             event_tx: broadcast::Sender::new(1024),
             connect_signal_tx,
             connect_signal_rx: parking_lot::Mutex::new(Some(connect_signal_rx)),
+            engine_connector: None,
         }
+    }
+
+    /// The registry with the connector its mesh imports connect through.
+    /// The host names it where it builds the registry: a worker imported
+    /// from a peer's published state is built here, and a gRPC or ZMQ
+    /// worker built without a connector refuses its connect.
+    #[must_use]
+    pub fn with_engine_connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
+        self.engine_connector = Some(connector);
+        self
     }
 
     /// Registration origin for a worker, if it is currently registered.
@@ -2949,7 +3026,7 @@ impl WorkerRegistry {
                     PublishedSpec::HostLocal => return,
                     PublishedSpec::Spec(spec) => {
                         let replacement: Arc<dyn Worker> =
-                            Arc::new(Self::import_from(state, Some(*spec)));
+                            Arc::new(self.import_from(state, Some(*spec)));
                         let record = ImportRecord {
                             version: state.version,
                             from_spec: true,
@@ -3058,7 +3135,7 @@ impl WorkerRegistry {
         // New worker — build from the full WorkerSpec if it decoded,
         // otherwise fall back to the minimal builder.
         let spec_applied = spec.is_some();
-        let worker: Arc<dyn Worker> = Arc::new(Self::import_from(state, spec));
+        let worker: Arc<dyn Worker> = Arc::new(self.import_from(state, spec));
 
         // A `Mesh` origin keeps the outbound sync from re-publishing the
         // imported state (which would version-bump the CRDT in a loop),
@@ -3105,7 +3182,7 @@ impl WorkerRegistry {
     /// spec: the minimal worker, through the replacement path
     /// (`import_rebuild_wanted` keeps an import built from a spec instead).
     fn rebuild_minimal_import(&self, import_id: &WorkerId, state: &smg_mesh::WorkerState) {
-        let replacement: Arc<dyn Worker> = Arc::new(Self::import_from(state, None));
+        let replacement: Arc<dyn Worker> = Arc::new(self.import_from(state, None));
         let record = ImportRecord {
             version: state.version,
             from_spec: false,
@@ -3228,19 +3305,26 @@ impl WorkerRegistry {
     /// state's health says. An explicitly-unhealthy import must not be
     /// routable: the builder defaults `disable_health_check` workers to
     /// `Ready`, so the `false` case needs a forced demotion, not just no
-    /// promotion.
+    /// promotion. It connects through the registry's connector.
     fn import_from(
+        &self,
         state: &smg_mesh::WorkerState,
         spec: Option<openai_protocol::worker::WorkerSpec>,
     ) -> super::identity::basic::BasicWorker {
         use openai_protocol::model_card::ModelCard;
 
-        let worker = match spec {
-            Some(spec) => super::identity::builder::BasicWorkerBuilder::from_spec(spec).build(),
+        // The builder without a default: an import connects through the
+        // registry's own connector.
+        let builder: super::identity::builder::BasicWorkerBuilder = match spec {
+            Some(spec) => super::identity::builder::BasicWorkerBuilder::from_spec(spec),
             None => super::identity::builder::BasicWorkerBuilder::new(&state.url)
-                .model(ModelCard::new(&state.model_id))
-                .build(),
+                .model(ModelCard::new(&state.model_id)),
         };
+        let worker = match &self.engine_connector {
+            Some(connector) => builder.engine_connector(Arc::clone(connector)),
+            None => builder,
+        }
+        .build();
         worker.set_status(if state.health {
             WorkerStatus::Ready
         } else {

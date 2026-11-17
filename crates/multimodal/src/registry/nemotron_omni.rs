@@ -55,10 +55,7 @@ pub(super) struct NemotronOmniSpec;
 
 impl NemotronOmniSpec {
     fn unsupported(modality: Modality) -> ModelRegistryError {
-        ModelRegistryError::UnsupportedModality {
-            spec: "nemotron_omni",
-            modality,
-        }
+        ModelRegistryError::unsupported("nemotron_omni", modality)
     }
 
     /// The anchor token, the feature token id and the wrapping begin/end ids.
@@ -310,10 +307,7 @@ impl ModelProcessorSpec for NemotronOmniSpec {
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
         match modality {
             Modality::Image | Modality::Video => Ok(Box::new(NemotronOmniProcessor::new())),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

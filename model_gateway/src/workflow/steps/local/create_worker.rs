@@ -26,15 +26,13 @@ use crate::{
         zmq_client::zmq_handshake_address,
     },
     worker::{
-        health::{
-            circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
-            resilience::resolve_resilience,
-        },
+        health::{circuit_breaker::CircuitBreakerConfig, resilience::resolve_resilience},
         identity::{
             basic::{merge_labels, RuntimeType, CONTEXT_WINDOW_LABELS, WINDOW_LABELS},
             endpoint::Endpoint,
             metadata::join_base,
         },
+        registry::service::{control_character_refusal, logged_strings},
         BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
@@ -257,7 +255,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let http_client = context.data.http_client("create_worker")?;
         let http2 = context.data.http2.unwrap_or(false);
 
-        let overload_defaults = OverloadThresholds::from_gateway_config(&app_context.router_config);
+        let overload_defaults = app_context.router_config.worker_overload_thresholds();
 
         let health_base = app_context.router_config.health_check.to_protocol_config();
         let health_config =
@@ -440,8 +438,13 @@ pub(super) fn validate_constrained_decoding_label(
 ) -> WorkflowResult<()> {
     match labels.get(ConstrainedDecoding::LABEL) {
         Some(value) => {
-            ConstrainedDecoding::parse(value)
-                .map(drop)
+            // The value may be the worker's own report, and the refusal of an
+            // unknown policy repeats it: a control character is refused first,
+            // in a sentence that names the label and not the value.
+            let field = (ConstrainedDecoding::LABEL, Some(value.as_str()));
+            control_character_refusal([field])
+                .map_or(Ok(()), Err)
+                .and_then(|()| ConstrainedDecoding::parse(value).map(drop))
                 .map_err(|why| WorkflowError::StepFailed {
                     step_id: StepId::new(step),
                     message: format!("Worker {}: {why}", Endpoint::redacted_str(url)),
@@ -541,9 +544,12 @@ pub(super) fn warn_on_conflicting_parser_overrides(
     }
 }
 
-/// Reject parser-override names the registries don't know: the legacy parsers', and, under
-/// `--parser symphony`, Symphony's tables (`regular::symphony::check_names`). A name whose
-/// factory is absent is not checked (parsers unused in that configuration).
+/// Reject a card the registry cannot take as it came. First a control character in its id or
+/// parser names, with the door's sentence (`control_character_refusal`): the door checked the
+/// strings a request carried, and these may be the worker's own report. Then parser-override
+/// names the registries don't know: the legacy parsers', and, under `--parser symphony`,
+/// Symphony's tables (`regular::symphony::check_names`). A name whose factory is absent is not
+/// checked against a registry (parsers unused in that configuration).
 pub(super) fn validate_parser_overrides(
     card: &ModelCard,
     worker_url: &str,
@@ -551,6 +557,9 @@ pub(super) fn validate_parser_overrides(
     tool_parser_factory: Option<&tool_parser::ParserFactory>,
     reasoning_parser_factory: Option<&reasoning_parser::ParserFactory>,
 ) -> Result<(), String> {
+    if let Some(refusal) = control_character_refusal(logged_strings(card)) {
+        return Err(refusal);
+    }
     check_names(
         parser,
         &card_names(card),
@@ -1949,6 +1958,91 @@ mod tests {
         assert!(
             !text.contains("secret") && !text.contains("user:"),
             "{text}"
+        );
+    }
+
+    /// The text the registration of a worker that reports `labels` fails
+    /// with.
+    async fn failure_of_a_worker_reporting(labels: &[(&str, &str)]) -> String {
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::{create_worker_workflow_data, local::test_support::labels_of};
+
+        let spec = WorkerSpec::new("http://worker:8000");
+        let mut data =
+            create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Http);
+        data.http_client_handle = Some(Arc::new(http_client()));
+        data.discovered_labels = labels_of(labels);
+        let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        CreateLocalWorkerStep
+            .execute(&mut ctx)
+            .await
+            .expect_err("the registration fails")
+            .to_string()
+    }
+
+    /// A model id the worker itself reports is refused like one a request
+    /// carries: the registration fails with the door's sentence, which does
+    /// not repeat the id.
+    #[tokio::test]
+    async fn a_reported_model_id_with_a_control_character_fails_the_registration() {
+        assert_eq!(
+            failure_of_a_worker_reporting(&[("served_model_name", "m\nINJECTED")]).await,
+            "Step failed: create_worker - models[].id must not contain control characters"
+        );
+    }
+
+    /// A tool parser name the worker reports is refused the same way.
+    #[tokio::test]
+    async fn a_reported_tool_parser_with_a_control_character_fails_the_registration() {
+        assert_eq!(
+            failure_of_a_worker_reporting(&[
+                ("served_model_name", "m"),
+                ("tool_parser", "p\nINJECTED"),
+            ])
+            .await,
+            "Step failed: create_worker - models[].tool_parser must not contain control characters"
+        );
+    }
+
+    /// A reasoning parser name the worker reports is refused the same way.
+    #[tokio::test]
+    async fn a_reported_reasoning_parser_with_a_control_character_fails_the_registration() {
+        assert_eq!(
+            failure_of_a_worker_reporting(&[
+                ("served_model_name", "m"),
+                ("reasoning_parser", "p\nINJECTED"),
+            ])
+            .await,
+            "Step failed: create_worker - models[].reasoning_parser must not contain control characters"
+        );
+    }
+
+    /// A `constrained_decoding` value the worker reports with a control
+    /// character in it is refused in a sentence that names the label and
+    /// does not repeat the value. A value on one line that names no policy
+    /// is refused by name, as before.
+    #[tokio::test]
+    async fn a_reported_decoding_policy_with_a_control_character_fails_the_registration() {
+        assert_eq!(
+            failure_of_a_worker_reporting(&[
+                ("served_model_name", "m"),
+                ("constrained_decoding", "sometimes\nINJECTED"),
+            ])
+            .await,
+            "Step failed: create_worker - Worker http://worker:8000: \
+             constrained_decoding must not contain control characters"
+        );
+        assert_eq!(
+            failure_of_a_worker_reporting(&[
+                ("served_model_name", "m"),
+                ("constrained_decoding", "sometimes"),
+            ])
+            .await,
+            "Step failed: create_worker - Worker http://worker:8000: constrained_decoding must be \
+             'requested' or 'always', not 'sometimes'"
         );
     }
 

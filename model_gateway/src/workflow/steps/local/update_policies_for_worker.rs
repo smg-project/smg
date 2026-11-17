@@ -8,7 +8,10 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     policies::as_cache_aware,
-    workflow::{data::WorkerUpdateWorkflowData, steps::shared::start_kv_stream},
+    workflow::{
+        data::{require_app_context, WorkerUpdateWorkflowData},
+        steps::shared::start_kv_stream,
+    },
 };
 
 /// Step to update policies for updated workers.
@@ -23,11 +26,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
         &self,
         context: &mut WorkflowContext<WorkerUpdateWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         let updated_workers =
             context.data.updated_workers.as_ref().ok_or_else(|| {
                 WorkflowError::ContextValueNotFound("updated_workers".to_string())

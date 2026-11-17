@@ -340,10 +340,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        routers::{grpc::backend_client::BackendClient, http::set_request_model},
+        routers::http::set_request_model,
         worker::{
-            health::circuit_breaker::CircuitState, identity::basic::WorkerMetadata, BasicWorker,
-            BasicWorkerBuilder, ResolvedResilience, WorkerResult, WorkerType,
+            connection::engine::EngineConnection, health::circuit_breaker::CircuitState,
+            identity::basic::WorkerMetadata, BasicWorker, BasicWorkerBuilder, ResolvedResilience,
+            WorkerResult, WorkerType,
         },
     };
 
@@ -859,8 +860,8 @@ mod tests {
         async fn check_health_async(&self) -> WorkerResult<()> {
             self.0.check_health_async().await
         }
-        async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
-            self.0.get_backend_client().await
+        async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {
+            self.0.engine_connection().await
         }
         fn prepare_request(&self, mut req: Value) -> WorkerResult<Value> {
             if let Some(obj) = req.as_object_mut() {

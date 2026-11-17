@@ -18,7 +18,7 @@ use tracing::warn;
 
 use crate::{
     config::RouterConfig,
-    routers::grpc::backend_client::BackendClient,
+    routers::grpc::backend_client::{connected_backend_client, get_backend_client, BackendClient},
     worker::{registry::WorkerId, Worker, WorkerHttpClientCache, WorkerRegistry},
 };
 
@@ -120,7 +120,7 @@ impl RegistryRlView {
         // at its word until it lands.
         let control_calls = (*worker.connection_mode() == ConnectionMode::Zmq
             && spec.runtime_type == RuntimeType::TokenSpeed
-            && worker.backend_client_if_initialized().is_none_or(|client| {
+            && connected_backend_client(worker.as_ref()).is_none_or(|client| {
                 matches!(client.as_ref(), BackendClient::Zmq(client) if client.carries_control_calls())
             }))
             .then(|| {
@@ -171,9 +171,7 @@ impl RlControlCalls for EngineConnectionControl {
         body: Option<serde_json::Value>,
         timeout: Duration,
     ) -> Result<Vec<RankReply>, CallFailure> {
-        let client = self
-            .worker
-            .get_backend_client()
+        let client = get_backend_client(self.worker.as_ref())
             .await
             .map_err(|e| CallFailure::Failed(format!("the engine is not connected: {e}")))?
             .ok_or_else(|| {
@@ -247,7 +245,9 @@ mod tests {
         for w in workers {
             registry.register(w);
         }
-        let cache = Arc::new(WorkerHttpClientCache::new(config));
+        let cache = Arc::new(WorkerHttpClientCache::new(
+            config.worker_http_client_settings(),
+        ));
         RegistryRlView::new(registry, cache)
     }
 

@@ -24,7 +24,10 @@ use serial_test::serial;
 use smg::{
     config::{GroupedDpSticky, ParserChoice},
     middleware::{RouteRequestMeta, TenantKey},
-    routers::{grpc::backend_client::BackendClient, RouterTrait},
+    routers::{
+        grpc::backend_client::{get_backend_client, BackendClient},
+        RouterTrait,
+    },
     worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
 };
 
@@ -169,7 +172,7 @@ async fn build_router_with(
     // handshake; wait for it to land so requests hit a connected worker. The
     // budget covers a loaded CI runner, not the local ~100ms case.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+    while !matches!(worker.engine_connection().await, Ok(Some(_))) {
         assert!(
             tokio::time::Instant::now() < deadline,
             "ZMQ handshake never completed against the mock engine(s)"
@@ -195,8 +198,7 @@ async fn build_router_with(
 async fn expect_worker_idle(worker: &Arc<BasicWorker>, what: &str) {
     let settled = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let link = worker
-            .get_backend_client()
+        let link = get_backend_client(worker.as_ref())
             .await
             .ok()
             .flatten()
@@ -649,7 +651,7 @@ async fn grammar_over_zmq(parser: &str, led: bool) {
             )
             .await;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-            while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+            while !matches!(worker.engine_connection().await, Ok(Some(_))) {
                 assert!(
                     tokio::time::Instant::now() < deadline,
                     "ZMQ handshake never completed against the mock engine"
@@ -723,7 +725,7 @@ async fn grammar_over_zmq(parser: &str, led: bool) {
         (false, Grammar::None),
         (true, Grammar::None),
     ] {
-        let mut request = router.route_chat(None, &meta, chat(stream, grammar), MODEL);
+        let mut request = router.route_chat(None, &meta, Arc::new(chat(stream, grammar)), MODEL);
         // A streamed answer's response goes out once the request is at the
         // engine, before the engine answers; a non-streamed one only after.
         let (inbound, early) = if stream {
@@ -832,7 +834,7 @@ async fn a_budget_beyond_the_window_is_refused_before_the_engine_over_zmq() {
     let router =
         build_grpc_router(config, MODEL, vec![Arc::clone(&worker) as Arc<dyn Worker>]).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+    while !matches!(worker.engine_connection().await, Ok(Some(_))) {
         assert!(
             tokio::time::Instant::now() < deadline,
             "ZMQ handshake never completed against the mock engine"
@@ -849,7 +851,7 @@ async fn a_budget_beyond_the_window_is_refused_before_the_engine_over_zmq() {
     };
 
     let response = router
-        .route_chat(None, &test_meta(), chat(WINDOW + 1), MODEL)
+        .route_chat(None, &test_meta(), Arc::new(chat(WINDOW + 1)), MODEL)
         .await;
     assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(response.into_body(), 1 << 16)
@@ -866,7 +868,7 @@ async fn a_budget_beyond_the_window_is_refused_before_the_engine_over_zmq() {
     );
 
     let response = router
-        .route_chat(None, &test_meta(), chat(WINDOW), MODEL)
+        .route_chat(None, &test_meta(), Arc::new(chat(WINDOW)), MODEL)
         .await;
     assert_eq!(response.status(), http::StatusCode::OK);
 }
@@ -935,7 +937,7 @@ async fn usage_prompt_count_over_zmq_is_the_gateways_until_the_engine_reports_on
             )
             .await;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-            while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+            while !matches!(worker.engine_connection().await, Ok(Some(_))) {
                 assert!(
                     tokio::time::Instant::now() < deadline,
                     "ZMQ handshake never completed against the mock engine"
@@ -991,7 +993,7 @@ async fn usage_prompt_count_over_zmq_is_the_gateways_until_the_engine_reports_on
                     }
                     let body: ChatCompletionRequest =
                         serde_json::from_value(body).expect("a chat request");
-                    router.route_chat(None, &meta, body, MODEL)
+                    router.route_chat(None, &meta, Arc::new(body), MODEL)
                 }
                 "completions" => {
                     let body: CompletionRequest = serde_json::from_value(serde_json::json!({
@@ -1009,7 +1011,7 @@ async fn usage_prompt_count_over_zmq_is_the_gateways_until_the_engine_reports_on
                         "messages": [{"role": "user", "content": user}],
                     }))
                     .expect("a messages request");
-                    router.route_messages(None, &meta, body, MODEL)
+                    router.route_messages(None, &meta, Arc::new(body), MODEL)
                 }
                 "responses" => {
                     let body: ResponsesRequest = serde_json::from_value(serde_json::json!({

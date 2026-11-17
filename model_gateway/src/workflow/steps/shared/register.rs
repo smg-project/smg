@@ -16,7 +16,7 @@ use super::{pool_group, refresh_worker_pool_sizes, PoolGroups};
 use crate::{
     routers::{common::pd_admission, grpc::regular::symphony::telemetry},
     worker::{health::bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
-    workflow::data::{WorkerRegistrationData, WorkerRegistrationMode},
+    workflow::data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode},
 };
 
 /// Unified step to register workers in the registry.
@@ -217,11 +217,7 @@ pub(crate) mod registration_hold {
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .get_app_context()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.get_app_context())?.clone();
 
         let workers = context
             .data

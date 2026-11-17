@@ -333,7 +333,7 @@ fn update_expected_wait_loads(
             )
         })
         .collect();
-    TestFeed::attached_to(policy).publish(&loads);
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&loads);
 }
 
 /// Like [`update_expected_wait_loads`], with each report counting the
@@ -357,7 +357,7 @@ fn update_expected_wait_loads_counting_held(
             (worker.url().to_string(), load)
         })
         .collect();
-    TestFeed::attached_to(policy).publish(&loads);
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&loads);
 }
 
 /// One selection for `text` through the string path.
@@ -596,7 +596,7 @@ fn a_miss_avoids_the_worker_whose_report_hides_the_requests_the_router_holds() {
     one_queued.loads[0].num_waiting_reqs = 1;
     let mut idle = expected_wait_load(0, 0.1, 100.0);
     idle.loads[0].num_running_reqs = 0;
-    TestFeed::attached_to(&policy).publish(&HashMap::from([
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&HashMap::from([
         (workers[0].url().to_string(), one_queued),
         (workers[1].url().to_string(), idle),
     ]));
@@ -628,7 +628,7 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
     running.loads[0].num_running_reqs = 3;
     let mut queued = expected_wait_load(3_100, 0.1, 100.0);
     queued.loads[0].num_running_reqs = 0;
-    TestFeed::attached_to(&policy).publish(&HashMap::from([
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&HashMap::from([
         (workers[0].url().to_string(), running),
         (workers[1].url().to_string(), queued),
     ]));
@@ -640,7 +640,7 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
     // the fixture's one running request (10.24 s each), so it cancels:
     // 40.96 s against `w2`'s 41.24 s.
     let (policy, workers) = initialised_pair();
-    TestFeed::attached_to(&policy).publish(&HashMap::from([
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&HashMap::from([
         (
             workers[0].url().to_string(),
             expected_wait_load(0, 0.1, 100.0),
@@ -668,7 +668,7 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
 #[test]
 fn a_report_the_snapshot_dropped_is_no_longer_scored() {
     let (policy, workers) = initialised_pair();
-    let feed = TestFeed::attached_to(&policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     feed.publish(&HashMap::from([
         (
             workers[0].url().to_string(),
@@ -703,7 +703,7 @@ fn a_report_the_snapshot_dropped_is_no_longer_scored() {
 #[test]
 fn the_shared_snapshot_is_the_score_source() {
     let (policy, workers) = initialised_pair();
-    let feed = TestFeed::attached_to(&policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     feed.publish(&HashMap::from([
         (
             workers[0].url().to_string(),
@@ -782,7 +782,7 @@ fn cache_aware_worker_removal_prunes_expected_wait_state() {
             (worker.url().to_string(), load)
         })
         .collect();
-    let feed = TestFeed::attached_to(&policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     feed.publish(&loads);
 
     let first = SelectWorkerInfo {
@@ -883,7 +883,7 @@ fn prefill_miss_ignores_generation_rate() {
             .map(|url| worker_of(url, WorkerType::Prefill))
             .collect();
         policy.init_workers(&workers);
-        let feed = TestFeed::attached_to(&policy.load_scorer);
+        let feed = TestFeed::attached_to(|rx| policy.load_scorer.set_load_receiver(rx));
         feed.publish(&HashMap::from([
             (
                 workers[0].url().to_string(),
@@ -3840,7 +3840,7 @@ fn event_decay_keeps_strict_affinity_ahead_of_expected_wait() {
             expected_wait_load(8, 0.0, 1_000.0),
         ),
     ]);
-    TestFeed::attached_to(&policy).publish(&overlap_loads);
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&overlap_loads);
 
     let monitor = Arc::new(KvEventMonitor::new());
     monitor.indexers.insert("unknown".to_string(), indexer);
@@ -4130,7 +4130,7 @@ fn gated_pair(config: CacheAwareConfig) -> (CacheAwarePolicy, Vec<Arc<dyn Worker
     let policy = CacheAwarePolicy::with_config(gate_at_mean(config));
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     policy.init_workers(&workers);
-    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&skewed_rate_loads(&workers));
     (policy, workers)
 }
 
@@ -4217,7 +4217,7 @@ fn idle_rate_residual_does_not_herd_misses() {
         }],
         ..Default::default()
     };
-    TestFeed::attached_to(&policy).publish(&HashMap::from([
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&HashMap::from([
         (workers[0].url().to_string(), idle(0.36)),
         (workers[1].url().to_string(), idle(0.0)),
     ]));
@@ -5405,6 +5405,127 @@ fn a_large_pool_miss_spreads_over_the_pool() {
     );
 }
 
+/// `count` workers of one model behind a policy whose model has no event
+/// index: the token tree places, and it holds `tokens` for the worker at
+/// `holder`.
+fn large_pool_on_the_tree(
+    count: usize,
+    holder: usize,
+    tokens: &[u32],
+) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+    let urls: Vec<String> = (0..count).map(|i| format!("http://w{i}:8000")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let workers = make_workers(&refs);
+    let policy = CacheAwarePolicy::with_config(test_config());
+    seed_token_tenants(&policy, &workers, tokens, &[refs[holder]]);
+    policy.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new())));
+    (policy, workers)
+}
+
+/// A pool of one model above the sample's reach decides what the scan
+/// decides, at 33 workers and at 200. With an event index the sampled
+/// decision places the holder the index names; without one the scan decides
+/// (the tree's holder), and the sampled decision hands the request over
+/// before it draws a worker.
+#[test]
+fn a_large_pool_of_one_model_decides_as_the_scan_with_and_without_an_event_index() {
+    let prompt: Vec<u32> = (1..=8).collect();
+    for count in [2 * FLEET_SAMPLE + 1, 200] {
+        let holder = count - 3;
+        let (policy, workers) = large_pool(
+            count,
+            holder,
+            &[&[1, 2, 3, 4], &[5, 6, 7, 8]],
+            test_config(),
+        );
+        for _ in 0..8 {
+            let info = tokens_info(&prompt);
+            assert!(
+                matches!(
+                    policy.select_worker_sampled(&workers, &info),
+                    Sampled::Decided(Some(idx)) if idx == holder
+                ),
+                "{count} workers with an index: the sample decides"
+            );
+            assert_eq!(policy.select_worker(&workers, &info), Some(holder));
+            assert_eq!(policy.select_worker_scanned(&workers, &info), Some(holder));
+        }
+
+        let (policy, workers) = large_pool_on_the_tree(count, holder, &prompt);
+        for _ in 0..8 {
+            let info = tokens_info(&prompt);
+            assert!(
+                matches!(policy.select_worker_sampled(&workers, &info), Sampled::Scan),
+                "{count} workers without an index: the scan decides"
+            );
+            assert_eq!(policy.select_worker(&workers, &info), Some(holder));
+            assert_eq!(policy.select_worker_scanned(&workers, &info), Some(holder));
+        }
+    }
+}
+
+/// A pool whose workers name different models is the scan's when its first
+/// worker's model has no event index, whatever index the other workers'
+/// model has and whichever workers a sample would draw: no sample is drawn
+/// for it.
+#[test]
+fn a_mixed_pool_whose_first_worker_has_no_event_index_is_the_scans() {
+    use openai_protocol::model_card::ModelCard;
+
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
+
+    let (policy, mut workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], test_config());
+    workers[0] = Arc::new(
+        BasicWorkerBuilder::new("http://plain:8000")
+            .model(ModelCard::new("plain"))
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build(),
+    );
+    policy.init_workers(&workers);
+    let prompt: Vec<u32> = (1..=8).collect();
+    for _ in 0..8 {
+        assert!(matches!(
+            policy.select_worker_sampled(&workers, &tokens_info(&prompt)),
+            Sampled::Scan
+        ));
+    }
+}
+
+/// The lookup after the draw still decides one pool: its first worker names
+/// a model with an event index and is never drawn, and every worker a sample
+/// can draw names a model without one. The sample's first worker names the
+/// index the decision reads, there is none, and the scan decides.
+#[test]
+fn a_mixed_pool_whose_sampled_workers_have_no_event_index_is_the_scans() {
+    use openai_protocol::model_card::ModelCard;
+
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
+
+    let (policy, mut workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], test_config());
+    workers[0].set_status(WorkerStatus::NotReady);
+    for (i, worker) in workers.iter_mut().enumerate().skip(1) {
+        *worker = Arc::new(
+            BasicWorkerBuilder::new(format!("http://plain{i}:8000").as_str())
+                .model(ModelCard::new("plain"))
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        );
+    }
+    policy.init_workers(&workers);
+    let prompt: Vec<u32> = (1..=8).collect();
+    let info = tokens_info(&prompt);
+    assert!(!info.admits(workers[0].routing_state()));
+    assert!(info.admits(workers[1].routing_state()));
+    for _ in 0..8 {
+        assert!(matches!(
+            policy.select_worker_sampled(&workers, &info),
+            Sampled::Scan
+        ));
+    }
+}
+
 #[test]
 fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
     let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
@@ -6167,7 +6288,7 @@ fn prefill_miss_uses_input_capacity_without_generation_rate_bias() {
             let mut more_work = expected_wait_load(4_000, 0.0, 2_000.0);
             less_work.loads[0].prefill_throughput = less_rate;
             more_work.loads[0].prefill_throughput = more_rate;
-            let feed = TestFeed::attached_to(&policy.load_scorer);
+            let feed = TestFeed::attached_to(|rx| policy.load_scorer.set_load_receiver(rx));
             feed.publish(&HashMap::from([
                 (workers[0].url().to_string(), less_work),
                 (workers[1].url().to_string(), more_work),

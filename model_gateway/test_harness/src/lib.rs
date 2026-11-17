@@ -476,7 +476,7 @@ async fn build_test_app_context(
     // The configuration's liveness budgets before the policy registry is
     // built, as `AppContextBuilder::from_config` orders them: the first call
     // in a process wins.
-    smg::worker::configure_liveness(&config);
+    smg::worker::configure_liveness(config.worker_liveness_budgets());
 
     // Initialize registries. The policy registry takes the configuration's
     // pairing mode, as `AppContextBuilder::from_config` gives it: without it

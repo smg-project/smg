@@ -338,9 +338,7 @@ impl VisionPreProcessor for LlavaProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
         // Store original sizes
         let item_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
@@ -576,9 +574,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
         let mut patches_per_image: Vec<Vec<Array3<f32>>> = Vec::with_capacity(images.len());
         let mut feature_token_counts = Vec::with_capacity(images.len());
