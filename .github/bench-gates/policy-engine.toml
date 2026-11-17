@@ -1,7 +1,7 @@
 # Regression gate for `cargo bench -p smg-policy-controller --bench decision`, run by
 # .github/workflows/benchmark-policy-engine.yml on pull requests through scripts/bench_gate.py. It is the
-# first row of that workflow's matrix; policy-engine-power-of-two.toml and policy-engine-affinity.toml gate
-# the second and the third row's binaries.
+# first row of that workflow's matrix; policy-engine-power-of-two.toml, policy-engine-affinity.toml and
+# policy-engine-prefix-hash.toml gate the second, the third and the fourth row's binaries.
 #
 # The gate runs the whole file: the view build at 8, 64 and 512 workers (`policy_engine/view_build/<n>`),
 # the decision per preset at the same sizes (`policy_engine/decide/<preset>/<n>`), the least-load decision
