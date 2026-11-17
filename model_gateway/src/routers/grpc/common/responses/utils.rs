@@ -26,7 +26,7 @@ use crate::{
     observability::metrics::Metrics,
     routers::{
         common::{
-            mcp_utils::{ensure_request_mcp_client, DEFAULT_MAX_ITERATIONS},
+            mcp_utils::{ensure_request_mcp_routing, DEFAULT_MAX_ITERATIONS},
             openai_bridge,
             persistence_utils::{
                 persist_conversation_items, persist_conversation_items_if_open, PersistError,
@@ -234,31 +234,16 @@ pub(crate) async fn ensure_mcp_connection(
     if let Some(tools) = tools {
         // TODO: Thread real request headers through the gRPC responses path if/when
         // gRPC MCP flows need the same forwarded-header preservation contract.
-        match ensure_request_mcp_client(mcp_orchestrator, format_registry, tools).await {
-            Some(mcp_servers) => {
-                return Ok((true, mcp_servers));
-            }
-            None => {
-                // No MCP servers available
-                if has_explicit_mcp_tools {
-                    // Explicit MCP tools MUST have working connections
-                    error!(
-                        function = "ensure_mcp_connection",
-                        "Failed to connect to MCP servers"
-                    );
-                    return Err(error::failed_dependency(
-                        "connect_mcp_server_failed",
-                        "Failed to connect to MCP servers. Check server_url and authorization.",
-                    ));
-                }
-                // Builtin tools without MCP routing - pass through to model
-                debug!(
-                    function = "ensure_mcp_connection",
-                    "No MCP routing configured for builtin tools, passing through to model"
-                );
-                return Ok((false, Vec::new()));
-            }
+        if let Some(mcp_servers) =
+            ensure_request_mcp_routing(mcp_orchestrator, format_registry, tools).await?
+        {
+            return Ok((true, mcp_servers));
         }
+        // Builtin tools without MCP routing - pass through to model
+        debug!(
+            function = "ensure_mcp_connection",
+            "No MCP routing configured for builtin tools, passing through to model"
+        );
     }
 
     Ok((false, Vec::new()))

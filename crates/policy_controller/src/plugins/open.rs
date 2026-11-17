@@ -10,6 +10,8 @@ use std::{
 
 use thread_local::ThreadLocal;
 
+use crate::framework::{self, DecisionScope};
+
 /// The decisions open on a deciding host's threads, one a thread, each with
 /// its number and what is left of its budget. Whoever hosts the engine makes
 /// one of these and builds every plugin kind's runtime over it. A plugin is
@@ -85,6 +87,75 @@ impl OpenDecision {
     }
 }
 
+/// Whether a plugin alone consumed its decision's budget: its own time in
+/// the decision before a call, `spent_micros`, and the call's grant in
+/// full, `granted_micros`, reach the budget as seeded. Exact: a microsecond
+/// short, some other draw took part of the budget, and a call that runs out
+/// there is the decision's budget spent.
+fn reaches_the_budget(spent_micros: u64, granted_micros: u64, seed_micros: u64) -> bool {
+    spent_micros.saturating_add(granted_micros) >= seed_micros
+}
+
+/// Whether the bound a call ran out under was its plugin's own: the call
+/// had its whole frame, or the plugin alone consumed the decision's budget
+/// (its own time in the decision before the call and the call's grant in
+/// full reach the budget as seeded). Short of both, the shared remainder
+/// clamped the call (other plugins drew it, or the host held a call of this
+/// one): its run-out is the decision's budget spent and no failure. Every
+/// kind asks here whose bound a run-out was, and nowhere else.
+pub(crate) fn own_bound(
+    whole_frame: bool,
+    spent_micros: u64,
+    granted_micros: u64,
+    seed_micros: u64,
+) -> bool {
+    whole_frame || reaches_the_budget(spent_micros, granted_micros, seed_micros)
+}
+
+/// An open of a plugin's bound decision that has not returned yet. The
+/// engine closes a scope only after its open returned, and a plugin's open
+/// marks its phase open and counts the decision before its own steps. So an
+/// open that stops half-way takes both back itself, by the walk the close
+/// does. Every kind's open runs under one of these.
+pub(crate) struct HalfOpen<'a, S: DecisionScope> {
+    scope: &'a S,
+    returned: bool,
+}
+
+impl<'a, S: DecisionScope> HalfOpen<'a, S> {
+    /// The guard of `scope`'s open, made before the open's first step.
+    pub(crate) fn new(scope: &'a S) -> Self {
+        Self {
+            scope,
+            returned: false,
+        }
+    }
+
+    /// The open returned: the scope's close is the engine's from here.
+    pub(crate) fn returned(&mut self) {
+        self.returned = true;
+    }
+
+    /// The open is unwinding, and a second panic let out here would end the
+    /// process. So the walk runs contained: if it panics too (the host's
+    /// clock again, a destructor's host call), it stops there and the open's
+    /// panic is the one the host sees. Out of line: an open that returned
+    /// pays the guard's one test.
+    #[cold]
+    #[inline(never)]
+    fn undo(&self) {
+        framework::contained(|| self.scope.close());
+    }
+}
+
+impl<S: DecisionScope> Drop for HalfOpen<'_, S> {
+    fn drop(&mut self) {
+        if !self.returned {
+            self.undo();
+        }
+    }
+}
+
 /// One plugin's part in the decision open on a thread: the decision's
 /// number, the plugin's opens of it still to close (each side of a pair,
 /// each binding), and whether the plugin already failed it. The decision is
@@ -155,7 +226,7 @@ impl Part {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpenDecisions, Part};
+    use super::{own_bound, reaches_the_budget, OpenDecisions, Part};
 
     #[test]
     fn the_first_open_numbers_and_seeds_and_later_opens_draw_the_same_remainder() {
@@ -259,5 +330,56 @@ mod tests {
             part.open(1),
             "the same number reads as the decision already failed"
         );
+    }
+
+    /// The run-out's rule is exact: a plugin's own time and the grant in
+    /// full reach the budget or they do not, to the microsecond.
+    #[test]
+    fn a_spend_and_a_grant_reach_the_budget_to_the_microsecond() {
+        // A plugin's time before the call, the grant, the budget as seeded,
+        // and whether the plugin alone consumed it.
+        let table = [
+            (400, 599, 1_000, false),
+            (400, 600, 1_000, true),
+            (400, 601, 1_000, true),
+            (0, 999, 1_000, false),
+            (0, 1_000, 1_000, true),
+            (999, 0, 1_000, false),
+            (1_000, 0, 1_000, true),
+            // The sum saturates, and reaches.
+            (u64::MAX, 1, u64::MAX, true),
+            (u64::MAX - 1, 0, u64::MAX, false),
+        ];
+        for (spent, granted, seed, reached) in table {
+            assert_eq!(
+                reaches_the_budget(spent, granted, seed),
+                reached,
+                "{spent} and {granted} under {seed}"
+            );
+        }
+    }
+
+    /// A bound is the plugin's own by either arm: the call had its whole
+    /// frame, however small beside the budget, or the plugin's own spend
+    /// and the grant reach the budget. Short of both it is the remainder's.
+    #[test]
+    fn a_bound_is_the_plugins_own_by_its_whole_frame_or_by_its_own_spend() {
+        // The whole frame, the spend before, the grant, the budget as
+        // seeded, and whether the bound was the plugin's own.
+        let table = [
+            (true, 0, 1, 1_000, true),
+            (true, 0, 0, 1_000, true),
+            (false, 0, 999, 1_000, false),
+            (false, 400, 599, 1_000, false),
+            (false, 400, 600, 1_000, true),
+            (false, 0, 1_000, 1_000, true),
+        ];
+        for (whole, spent, granted, seed, own) in table {
+            assert_eq!(
+                own_bound(whole, spent, granted, seed),
+                own,
+                "whole {whole}, {spent} and {granted} under {seed}"
+            );
+        }
     }
 }

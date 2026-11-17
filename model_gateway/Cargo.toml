@@ -308,6 +308,11 @@ name = "forced_call_stream"
 harness = false
 path = "benches/forced_call_stream.rs"
 
+[[bench]]
+name = "symphony_messages_stream"
+harness = false
+path = "benches/symphony_messages_stream.rs"
+
 [lints]
 workspace = true
 

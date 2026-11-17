@@ -64,7 +64,7 @@ pub(super) struct Class {
 /// point. The matcher asks it once per character it tests (every class test
 /// and every first-set test on ASCII text), and a table read is one load
 /// where a bit of a 128-bit word costs a two-word select and a variable shift.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct AsciiSet([bool; 128]);
 
 impl Default for AsciiSet {
@@ -571,7 +571,7 @@ pub(super) enum GroupsEnd {
 /// code points, one bit for every character beyond ASCII (set when a class
 /// may hold any of them), and whether the node can match without consuming a
 /// character, in which case any character may follow it.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct First {
     ascii: AsciiSet,
     non_ascii: bool,
@@ -641,6 +641,10 @@ pub(crate) struct Pattern {
     /// at its first position, the join of a letter run aside
     /// ([`Self::reads_space_after`]).
     before_space: Vec<usize>,
+    /// The class every match of the program begins with, when its first op
+    /// takes one character of a class or a run of at least one: the search
+    /// passes over every character outside it (see `Matches::next`).
+    opens_with: Option<usize>,
 }
 
 /// The matcher of a pattern: a hand-written scanner for the two template
@@ -861,6 +865,11 @@ impl Pattern {
         let mut firsts = Vec::new();
         compile(&root, &mut program, &mut firsts);
         program.push(Op::Match);
+        let opens_with = match program.first() {
+            Some(&Op::Char(class)) => Some(class),
+            Some(&Op::Run { class, min, .. }) if min > 0 => Some(class),
+            _ => None,
+        };
         Some(Self {
             classes: parser.classes,
             program,
@@ -872,12 +881,19 @@ impl Pattern {
             anchored,
             bare_interval_repeat: parser.bare_interval_repeat,
             before_space,
+            opens_with,
         })
     }
 
     /// The pattern's classes, which its [`Part`](chain::Part) indexes.
     pub(super) fn classes(&self) -> &[Class] {
         &self.classes
+    }
+
+    /// The class every match begins with, when the pattern names one
+    /// (`opens_with`): a text that holds no character of it holds no match.
+    pub(super) fn opening_class(&self) -> Option<&Class> {
+        self.opens_with.map(|class| &self.classes[class])
     }
 
     /// What the pattern is as a stage of a three-stage chain, if anything.
@@ -1021,6 +1037,13 @@ impl Pattern {
         }
     }
 
+    /// Whether an all-ASCII text has a walk of its own here
+    /// ([`Self::for_each_match`] with `ASCII`): the template scanner's lean
+    /// scan.
+    pub(crate) fn has_lean_scan(&self) -> bool {
+        matches!(self.matcher, Matcher::Template(_))
+    }
+
     /// Calls `f` with each match of `text`, leftmost first, each continuing
     /// after the last (what [`Self::find_iter`] yields), the matcher
     /// dispatched once per text: a scanner runs its own loop with `f`
@@ -1029,15 +1052,31 @@ impl Pattern {
     /// instructions of a warm long encode); the program keeps the iterator.
     /// `words` says the scanners' run loops take their word scans: the loop
     /// is compiled both ways, and the encoder chooses once per call on the
-    /// input's length (its `WORD_SCAN_MIN_BYTES`).
+    /// input's length (its `WORD_SCAN_MIN_BYTES`). `ASCII` says `text` is all
+    /// ASCII: the template scanner's runs then take the lean scan
+    /// (`Roles::run_end_ascii`) whatever `words` says. It is a constant and
+    /// no argument, so that the lean loop is compiled only into the caller's
+    /// copy for such a text and the other copy keeps the loops it had.
     #[inline(always)]
-    pub(crate) fn for_each_match<F: FnMut(usize, usize)>(&self, text: &str, words: bool, mut f: F) {
+    pub(crate) fn for_each_match<const ASCII: bool, F: FnMut(usize, usize)>(
+        &self,
+        text: &str,
+        words: bool,
+        mut f: F,
+    ) {
+        debug_assert!(
+            !ASCII || text.is_ascii(),
+            "the lean scan reads no byte beyond ASCII"
+        );
         match &self.matcher {
+            Matcher::Template(scanner) if ASCII => {
+                scanner.for_each_match::<true, true, F>(&self.classes, text, &mut f);
+            }
             Matcher::Template(scanner) if words => {
-                scanner.for_each_match::<true, F>(&self.classes, text, &mut f);
+                scanner.for_each_match::<true, false, F>(&self.classes, text, &mut f);
             }
             Matcher::Template(scanner) => {
-                scanner.for_each_match::<false, F>(&self.classes, text, &mut f);
+                scanner.for_each_match::<false, false, F>(&self.classes, text, &mut f);
             }
             Matcher::Cased(scanner) if words => {
                 scanner.for_each_match::<true, F>(&self.classes, text, &mut f);
@@ -1624,13 +1663,13 @@ impl Scanner {
     /// Compiled into its callers' loops: out of line it was a call per
     /// piece, and every value the loop keeps across a call is a spill.
     #[inline(always)]
-    fn match_at<const WORDS: bool>(
+    fn match_at<const WORDS: bool, const ASCII: bool>(
         &self,
         classes: &[Class],
         text: &str,
         pos: usize,
     ) -> Option<usize> {
-        let (c, len) = self.roles.at(text, pos)?;
+        let (c, len) = self.roles.at_by::<ASCII>(text, pos)?;
         let after = pos + len;
         // 1. A clitic: the first alternative whose characters follow in order.
         let first = text.as_bytes()[pos];
@@ -1646,29 +1685,35 @@ impl Scanner {
         }
         // 2. A letter run, with the lead-in when a letter follows it.
         if c & Role::WordPrefix.bit() != 0 {
-            if let Some((d, n)) = self.roles.at(text, after) {
+            if let Some((d, n)) = self.roles.at_by::<ASCII>(text, after) {
                 if d & Role::Word.bit() != 0 {
-                    return Some(self.roles.run_end_as::<{ WordScan::LETTERS }, WORDS>(
-                        text,
-                        after + n,
-                        Role::Word.bit(),
-                    ));
+                    return Some(
+                        self.roles
+                            .run_end_by::<{ WordScan::LETTERS }, WORDS, ASCII>(
+                                text,
+                                after + n,
+                                Role::Word.bit(),
+                            ),
+                    );
                 }
             }
         }
         if c & Role::Word.bit() != 0 {
-            return Some(self.roles.run_end_as::<{ WordScan::LETTERS }, WORDS>(
-                text,
-                after,
-                Role::Word.bit(),
-            ));
+            return Some(
+                self.roles
+                    .run_end_by::<{ WordScan::LETTERS }, WORDS, ASCII>(
+                        text,
+                        after,
+                        Role::Word.bit(),
+                    ),
+            );
         }
         // 3. Up to the bound of digits.
         if c & Role::Digit.bit() != 0 {
             let mut end = after;
             let mut count = 1;
             while count < self.digit_cap {
-                match self.roles.at(text, end) {
+                match self.roles.at_by::<ASCII>(text, end) {
                     Some((d, n)) if d & Role::Digit.bit() != 0 => {
                         end += n;
                         count += 1;
@@ -1681,16 +1726,26 @@ impl Scanner {
         // 4. A punctuation run, with the space when punctuation follows it,
         //    and the line breaks after the run.
         if c & Role::PunctPrefix.bit() != 0 {
-            if let Some((d, n)) = self.roles.at(text, after) {
+            if let Some((d, n)) = self.roles.at_by::<ASCII>(text, after) {
                 if d & Role::Punct.bit() != 0 {
-                    let end = self.roles.run_end(text, after + n, Role::Punct.bit());
-                    return Some(self.roles.run_end(text, end, Role::PunctBreak.bit()));
+                    let end = self
+                        .roles
+                        .run_end_of::<ASCII>(text, after + n, Role::Punct.bit());
+                    return Some(
+                        self.roles
+                            .run_end_of::<ASCII>(text, end, Role::PunctBreak.bit()),
+                    );
                 }
             }
         }
         if c & Role::Punct.bit() != 0 {
-            let end = self.roles.run_end(text, after, Role::Punct.bit());
-            return Some(self.roles.run_end(text, end, Role::PunctBreak.bit()));
+            let end = self
+                .roles
+                .run_end_of::<ASCII>(text, after, Role::Punct.bit());
+            return Some(
+                self.roles
+                    .run_end_of::<ASCII>(text, end, Role::PunctBreak.bit()),
+            );
         }
         // 5. Whitespace ending in line breaks: the greedy whitespace run
         //    gives back to the last position where a line break stands,
@@ -1698,7 +1753,7 @@ impl Scanner {
         let mut end = pos;
         let mut last_break = None;
         loop {
-            match self.roles.at(text, end) {
+            match self.roles.at_by::<ASCII>(text, end) {
                 Some((d, n)) if d & Role::BreakSpace.bit() != 0 => {
                     if d & Role::Break.bit() != 0 {
                         last_break = Some(end);
@@ -1713,18 +1768,21 @@ impl Scanner {
             }
         }
         if let Some(start) = last_break {
-            return Some(self.roles.run_end(text, start, Role::Break.bit()));
+            return Some(
+                self.roles
+                    .run_end_of::<ASCII>(text, start, Role::Break.bit()),
+            );
         }
         // 6. Whitespace before a non-space: the greedy run gives back its last
         //    character while a non-space follows it, down to one.
         if c & Role::TrailSpace.bit() != 0 {
-            let mut end = self.roles.run_end_as::<{ WordScan::SPACES }, WORDS>(
+            let mut end = self.roles.run_end_by::<{ WordScan::SPACES }, WORDS, ASCII>(
                 text,
                 after,
                 Role::TrailSpace.bit(),
             );
             loop {
-                match self.roles.at(text, end) {
+                match self.roles.at_by::<ASCII>(text, end) {
                     Some((d, _)) if d & Role::NotTrail.bit() != 0 => {}
                     _ => return Some(end),
                 }
@@ -1737,7 +1795,7 @@ impl Scanner {
         }
         // 7. The whitespace run.
         if c & Role::Space.bit() != 0 {
-            return Some(self.roles.run_end_as::<{ WordScan::SPACES }, WORDS>(
+            return Some(self.roles.run_end_by::<{ WordScan::SPACES }, WORDS, ASCII>(
                 text,
                 after,
                 Role::Space.bit(),
@@ -1748,9 +1806,11 @@ impl Scanner {
 
     /// Calls `f` with each piece of `text` in order (see
     /// [`Pattern::for_each_match`]): a position no alternative matches at
-    /// is passed over by one character, as the iterator does.
+    /// is passed over by one character, as the iterator does. With `ASCII`
+    /// (a text that is all ASCII) the runs take the lean scan, whatever
+    /// `WORDS` says.
     #[inline(always)]
-    fn for_each_match<const WORDS: bool, F: FnMut(usize, usize)>(
+    fn for_each_match<const WORDS: bool, const ASCII: bool, F: FnMut(usize, usize)>(
         &self,
         classes: &[Class],
         text: &str,
@@ -1762,7 +1822,7 @@ impl Scanner {
         each_match(
             text,
             #[inline(always)]
-            |pos| self.match_at::<WORDS>(classes, text, pos),
+            |pos| self.match_at::<WORDS, ASCII>(classes, text, pos),
             f,
         );
     }
@@ -1887,34 +1947,7 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
             // alternation without them would compile to no ops and match
             // empty. Once per pattern, so the check stays in release builds.
             assert_eq!(sets.len(), alternatives.len());
-            let mut previous_split = None;
-            let mut jumps = Vec::new();
-            for (index, (alternative, first)) in alternatives.iter().zip(sets).enumerate() {
-                let split = program.len();
-                if let Some(previous) = previous_split {
-                    if let Op::Split { first: set, .. } = program[previous] {
-                        program[previous] = Op::Split {
-                            next: split,
-                            first: set,
-                        };
-                    }
-                }
-                program.push(Op::Split {
-                    next: NO_NEXT,
-                    first: firsts.len(),
-                });
-                firsts.push(*first);
-                previous_split = Some(split);
-                compile(alternative, program, firsts);
-                if index + 1 < alternatives.len() {
-                    jumps.push(program.len());
-                    program.push(Op::Jump(NO_NEXT));
-                }
-            }
-            let end = program.len();
-            for jump in jumps {
-                program[jump] = Op::Jump(end);
-            }
+            compile_alternatives(alternatives, sets, program, firsts);
         }
         Node::NotAhead(class) => program.push(Op::NotAhead(*class)),
         Node::End => program.push(Op::End),
@@ -1961,6 +1994,98 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
     }
 }
 
+/// Lays out an alternation: each alternative behind a `Split` that names
+/// the next one, and a jump past the alternation at its end. The leading
+/// alternatives that begin with the same characters ([`leading_run`]) are
+/// laid out as one alternative, an alternation of their own: every attempt
+/// arrives at the first `Split`, and a character outside their set passes
+/// them all in one step instead of one step each (the GPT-2 pattern begins
+/// with seven clitics, each behind the apostrophe). They are tried in the
+/// same order and before the alternatives after them, so the matches are
+/// the same.
+fn compile_alternatives(
+    alternatives: &[Node],
+    sets: &[First],
+    program: &mut Vec<Op>,
+    firsts: &mut Vec<First>,
+) {
+    let mut jumps = Vec::new();
+    lay_out_alternatives(alternatives, sets, program, firsts, &mut jumps);
+    let end = program.len();
+    for jump in jumps {
+        program[jump] = Op::Jump(end);
+    }
+}
+
+/// The layout of [`compile_alternatives`] up to its jumps: `jumps` takes
+/// the place of the jump behind every alternative but the last, for the
+/// caller to point past the alternation. The leading run adds its own to
+/// the same list, so a match of one of its alternatives leaves by one
+/// jump, as it would in a flat layout.
+fn lay_out_alternatives(
+    alternatives: &[Node],
+    sets: &[First],
+    program: &mut Vec<Op>,
+    firsts: &mut Vec<First>,
+    jumps: &mut Vec<usize>,
+) {
+    let run = leading_run(sets);
+    let mut previous_split = None;
+    let mut index = 0;
+    while index < alternatives.len() {
+        let split = program.len();
+        if let Some(previous) = previous_split {
+            if let Op::Split { first: set, .. } = program[previous] {
+                program[previous] = Op::Split {
+                    next: split,
+                    first: set,
+                };
+            }
+        }
+        program.push(Op::Split {
+            next: NO_NEXT,
+            first: firsts.len(),
+        });
+        firsts.push(sets[index]);
+        previous_split = Some(split);
+        // The run's alternatives all begin with the set of its first one.
+        let taken = if index == 0 { run } else { 1 };
+        if taken > 1 {
+            lay_out_alternatives(
+                &alternatives[..taken],
+                &sets[..taken],
+                program,
+                firsts,
+                jumps,
+            );
+        } else {
+            compile(&alternatives[index], program, firsts);
+        }
+        index += taken;
+        if index < alternatives.len() {
+            jumps.push(program.len());
+            program.push(Op::Jump(NO_NEXT));
+        }
+    }
+}
+
+/// How many of an alternation's alternatives, counted from its first, stand
+/// behind one `Split` of their own: the leading ones that begin with the
+/// same characters, when there are at least two of them and others after
+/// them; one otherwise. A set that admits the empty match excludes no
+/// character, so its alternatives stay apart.
+fn leading_run(sets: &[First]) -> usize {
+    let run = match sets.first() {
+        Some(lead) if !lead.nullable => sets.iter().take_while(|set| *set == lead).count(),
+        _ => 1,
+    };
+    if run < sets.len() {
+        run
+    } else {
+        1
+    }
+}
+
 /// The most choices a match of `node` can hold at once: every run and every
 /// alternation on a path leaves one until the path is done or backs off.
 fn choices(node: &Node) -> usize {
@@ -1986,7 +2111,18 @@ fn choices(node: &Node) -> usize {
             }
         }
         Node::Concat(nodes) => nodes.iter().map(choices).sum(),
-        Node::Alt { alternatives, .. } => 1 + alternatives.iter().map(choices).max().unwrap_or(0),
+        Node::Alt {
+            alternatives,
+            firsts,
+        } => {
+            let deepest = |nodes: &[Node]| nodes.iter().map(choices).max().unwrap_or(0);
+            // The leading run stands behind a `Split` of its own
+            // ([`leading_run`]): one more choice on the paths through it.
+            match leading_run(firsts) {
+                1 => 1 + deepest(alternatives),
+                run => (2 + deepest(&alternatives[..run])).max(1 + deepest(&alternatives[run..])),
+            }
+        }
     }
 }
 
@@ -2010,21 +2146,40 @@ impl Iterator for Matches<'_, '_> {
 
     fn next(&mut self) -> Option<(usize, usize)> {
         while self.pos < self.text.len() {
-            let start = self.pos;
+            let mut start = self.pos;
             let end = match &self.pattern.matcher {
                 Matcher::Template(scanner) => {
-                    scanner.match_at::<false>(&self.pattern.classes, self.text, start)
+                    scanner.match_at::<false, false>(&self.pattern.classes, self.text, start)
                 }
                 Matcher::Cased(scanner) => {
                     scanner.match_at::<false>(&self.pattern.classes, self.text, start)
                 }
-                Matcher::Program => self.pattern.match_at(
-                    self.text,
-                    start,
-                    self.from,
-                    &mut self.choices,
-                    &mut self.memo,
-                ),
+                Matcher::Program => {
+                    if let Some(class) = self.pattern.opens_with {
+                        // Every match begins with a character of this class,
+                        // so the characters outside it are passed over here,
+                        // one class test each: a start at one would run the
+                        // program only to fail at its first op.
+                        let class = &self.pattern.classes[class];
+                        loop {
+                            let Some((c, len)) = next_char(self.text, start) else {
+                                self.pos = start;
+                                return None;
+                            };
+                            if class.contains(c) {
+                                break;
+                            }
+                            start += len;
+                        }
+                    }
+                    self.pattern.match_at(
+                        self.text,
+                        start,
+                        self.from,
+                        &mut self.choices,
+                        &mut self.memo,
+                    )
+                }
             };
             match end {
                 Some(end) if end > start => {
@@ -3654,6 +3809,86 @@ mod tests {
         assert!(matches!(parsed.program.last(), Some(Op::Match)));
     }
 
+    /// The leading alternatives that begin with the same characters stand
+    /// behind one choice: the seven clitics of the GPT-2 pattern, each
+    /// behind the apostrophe, are one alternative of the root's six, and a
+    /// character that is no apostrophe passes them in one step. They are
+    /// tried in the pattern's order all the same, and the matches are the
+    /// engine's. An alternation that is one such run from end to end, one
+    /// whose first two alternatives begin differently, and a run after the
+    /// first alternative are laid out as they are written.
+    #[test]
+    fn leading_alternatives_with_one_first_set_stand_behind_one_choice() {
+        let chain =
+            |pattern: &str, pc: usize| split_chain(&Pattern::parse(pattern).expect("parses"), pc);
+        // The root: the clitics as one, the letter and digit runs and the
+        // punctuation with their optional space, the two whitespace runs.
+        let root = chain(GPT2, 0);
+        assert_eq!(root.len(), 6);
+        assert!(root[0].may_start('\'') && !root[0].may_start('s') && !root[0].may_start(' '));
+        // The clitics in the pattern's order, right after the root's split.
+        let clitics = chain(GPT2, 1);
+        assert_eq!(clitics.len(), 7);
+        assert!(clitics.iter().all(|first| *first == root[0]));
+        // A run of two before a third alternative is one of the root's two.
+        assert_eq!(chain("ab|ac|[0-9]+", 0).len(), 2);
+        assert_eq!(chain("ab|ac|[0-9]+", 1).len(), 2);
+        // As written: one run from end to end, first alternatives that begin
+        // differently, and a run after the first alternative.
+        assert_eq!(chain(END_LETTERS, 0).len(), 2);
+        assert_eq!(chain("ab|[0-9]+|ac|\u{E9}+", 0).len(), 4);
+        assert_eq!(chain("[0-9]+|ab|ac|x", 0).len(), 4);
+        // A match of one of the run's alternatives leaves by one jump, past
+        // the whole alternation: no jump of the program lands on a jump.
+        let parsed = Pattern::parse("ab|ac|[0-9]+").expect("parses");
+        for op in &parsed.program {
+            if let Op::Jump(target) = op {
+                assert!(!matches!(parsed.program[*target], Op::Jump(_)));
+            }
+        }
+        // The run's own choice counts toward the bound: with the run's paths
+        // at the limit the pattern parses and matches, and with one more
+        // optional character it is declined.
+        let at_limit = |optionals: usize| {
+            let run = "a?".repeat(optionals);
+            format!("a{run}b|a{run}c|d")
+        };
+        let parsed = Pattern::parse(&at_limit(MAX_CHOICES - 2)).expect("parses");
+        let text = "a".repeat(MAX_CHOICES - 1) + "b";
+        assert_eq!(
+            parsed.find_iter(&text).collect::<Vec<_>>(),
+            vec![(0, text.len())]
+        );
+        assert!(Pattern::parse(&at_limit(MAX_CHOICES - 1)).is_none());
+
+        // The engine's matches where the run's alternatives nest prefixes,
+        // fail late, and give way to the alternatives after them.
+        const ALPHABET: [char; 12] = [
+            'a', 'b', 'c', 'd', 's', 't', '\'', ' ', '7', '!', '\n', '\u{E9}',
+        ];
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for pattern in [
+            GPT2,
+            "ab|ac|[0-9]+",
+            "a+b|a+c|[a-d]+|'",
+            "'s|'t|'[a-d]+|[a-z ]+|'",
+            "ab|ab?c|a|[b-d]+",
+            "ab|[0-9]+|ac|\u{E9}+",
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses").program_only();
+            for round in 0..400 {
+                let text: String = (0..1 + round % 24)
+                    .map(|_| ALPHABET[(pseudo_random(&mut state) % ALPHABET.len() as u64) as usize])
+                    .collect();
+                assert_eq!(
+                    parsed.find_iter(&text).collect::<Vec<_>>(),
+                    oracle_matches(pattern, &text),
+                    "pattern {pattern:?} text {text:?}"
+                );
+            }
+        }
+    }
+
     /// The `\z` that ends a digit-grouping lookahead counts as an anchor, as
     /// the bare `\A`, `\z` and `\G` do; a lookahead ending in the word
     /// boundary does not.
@@ -5128,6 +5363,88 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The search passes over the characters no match begins with. A program
+    /// whose first op takes a character of one class, or a run of at least
+    /// one, names that class at load, and its matches are the engine's where
+    /// the class is rare or absent, at both ends of the text and beside
+    /// characters of two to four bytes. A first op that may take nothing
+    /// names no class, since a match can begin with what follows it.
+    #[test]
+    fn the_search_passes_over_characters_outside_the_opening_class() {
+        const ALPHABET: [char; 16] = [
+            '1',
+            '2',
+            '7',
+            '\u{663}',
+            'a',
+            'b',
+            'c',
+            'x',
+            ' ',
+            '\u{e9}',
+            '\u{6f22}',
+            '\u{304b}',
+            '\u{1F600}',
+            '!',
+            '.',
+            '\n',
+        ];
+        let mut texts: Vec<String> = [
+            "",
+            "x",
+            "7",
+            "12",
+            "123",
+            "123 begins",
+            "ends on 123",
+            "abc123def4567",
+            "no digit at all, only words",
+            "\u{e9}123\u{1F600}456\u{6f22}",
+            "\u{663}\u{664}\u{665} 12 345",
+            "aabx abab cx",
+            "\u{6f22}\u{5b57}\u{304b}\u{306a} kana \u{30ab}",
+            "!!.. a.b",
+        ]
+        .iter()
+        .map(|text| (*text).to_string())
+        .collect();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..400 {
+            let len = (pseudo_random(&mut state) % 24) as usize;
+            texts.push(
+                (0..len)
+                    .map(|_| ALPHABET[(pseudo_random(&mut state) % ALPHABET.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        let agrees = |pattern: &str, opens: bool| {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert!(matches!(parsed.matcher, Matcher::Program), "{pattern}");
+            assert_eq!(parsed.opens_with.is_some(), opens, "{pattern}");
+            for text in &texts {
+                assert_eq!(
+                    parsed.find_iter(text).collect::<Vec<_>>(),
+                    oracle_matches(pattern, text),
+                    "{pattern} on {text:?}"
+                );
+            }
+        };
+        for pattern in [
+            "[0-9][0-9][0-9]",
+            r"\p{N}+",
+            DIGITS,
+            CJK,
+            "[!-/]+",
+            "[a-c]+x",
+            r"\p{Nd}{2}x?",
+        ] {
+            agrees(pattern, true);
+        }
+        for pattern in [" ?[a-z]+", r"\p{N}?x", "ab|[0-9]+"] {
+            agrees(pattern, false);
         }
     }
 }

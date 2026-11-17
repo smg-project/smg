@@ -3592,7 +3592,7 @@ def test_the_grpc_release_selects_a_package_until_pypi_holds_both_its_files(tmp_
 # reached anyway.
 REGISTRY_WORKFLOWS = {
     "release-pypi.yml": ("build", "build-sdist"),
-    "release-crates.yml": ("tier1",),
+    "release-crates.yml": ("tier0",),
     "release-grpc.yml": ("detect",),
 }
 CANDIDATE_IF = "${{ !contains(github.ref_name, '-rc.') }}"

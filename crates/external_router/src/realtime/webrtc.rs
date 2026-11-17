@@ -131,18 +131,15 @@ pub async fn parse_webrtc_request(
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    // The media type without its parameters (a multipart boundary, say).
+    let media_type = content_type
+        .split_once(';')
+        .map_or(content_type, |(media_type, _parameters)| media_type)
+        .trim();
 
-    if content_type
-        .split(';')
-        .next()
-        .is_some_and(|mt| mt.trim().eq_ignore_ascii_case("multipart/form-data"))
-    {
+    if media_type.eq_ignore_ascii_case("multipart/form-data") {
         parse_multipart(content_type, body).await
-    } else if content_type
-        .split(';')
-        .next()
-        .is_some_and(|mt| mt.trim().eq_ignore_ascii_case("application/sdp"))
-    {
+    } else if media_type.eq_ignore_ascii_case("application/sdp") {
         parse_sdp(body, query_model)
     } else {
         error!(
@@ -375,38 +372,31 @@ fn resolve_auth(
     worker_api_key: Option<&String>,
 ) -> Result<String, Response> {
     let effective_auth = auth_header.or_else(|| extract_auth_header(None, worker_api_key));
+    // Either refusal is the request's: no credential, or one that is not text.
+    let refused = |response: Response| {
+        Metrics::record_router_error(
+            labels.router,
+            labels.backend,
+            metrics_labels::CONNECTION_WEBRTC,
+            model,
+            metrics_labels::ENDPOINT_REALTIME,
+            metrics_labels::ERROR_VALIDATION,
+            metrics_labels::REASON_INVALID_REQUEST,
+        );
+        response
+    };
     match effective_auth {
         Some(v) => match v.to_str() {
             Ok(s) => Ok(s.to_string()),
-            Err(_) => {
-                Metrics::record_router_error(
-                    labels.router,
-                    labels.backend,
-                    metrics_labels::CONNECTION_WEBRTC,
-                    model,
-                    metrics_labels::ENDPOINT_REALTIME,
-                    metrics_labels::ERROR_VALIDATION,
-                    metrics_labels::REASON_INVALID_REQUEST,
-                );
-                Err((
+            Err(_) => Err(refused(
+                (
                     StatusCode::BAD_REQUEST,
                     "Authorization header contains invalid UTF-8 characters",
                 )
-                    .into_response())
-            }
+                    .into_response(),
+            )),
         },
-        None => {
-            Metrics::record_router_error(
-                labels.router,
-                labels.backend,
-                metrics_labels::CONNECTION_WEBRTC,
-                model,
-                metrics_labels::ENDPOINT_REALTIME,
-                metrics_labels::ERROR_VALIDATION,
-                metrics_labels::REASON_INVALID_REQUEST,
-            );
-            Err(StatusCode::UNAUTHORIZED.into_response())
-        }
+        None => Err(refused(StatusCode::UNAUTHORIZED.into_response())),
     }
 }
 

@@ -274,6 +274,11 @@ impl ModelFingerprint {
     pub fn of(model: &str) -> Self {
         Self(fingerprint(model.as_bytes()))
     }
+
+    /// The fingerprint's value, for a key the crate derives from a model.
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 /// A session: a key within its model and phase, as the one value a lease
@@ -575,8 +580,11 @@ pub struct Candidate {
     /// The pairing class: `0` for a worker outside any pairing. Which decode
     /// classes a prefill class pairs with is the pair table's to say
     /// ([`PairTable`](crate::PairTable)); with no table a decode pairs with a
-    /// prefill of the same class. Until a store derives classes, a host keys
-    /// it by the open prefill a decode partners with.
+    /// prefill of the same class. The store derives the classes and their
+    /// table where a membership write moves a member or an offer, and again
+    /// under a generation of another pairing mode
+    /// ([`store::pairing`](crate::store::pairing)); a host that builds its
+    /// own rows keys it by the open prefill a decode partners with.
     pub pair_class: u32,
     /// Host-supplied admission bit: the prefill capacity window has a slot.
     pub has_capacity: bool,
@@ -725,6 +733,32 @@ const fn session_phase(phase: Phase) -> u64 {
     }
 }
 
+/// The fingerprint of the key whose session within a model and a phase is
+/// `session`: the formula of [`RequestFacts::session`] run backwards, each
+/// step of which is one-to-one. A host that is sent a session key as the
+/// session's value reads the key's fingerprint by it, so its record is the
+/// one the plain key gives: the session is `session` again, and a stage
+/// that reads the key itself reads the same key. `model` is the
+/// fingerprint of the model's name.
+///
+/// `0` for no session, and for the one value a model and a phase give the
+/// fingerprint no key has: neither is a key's session. The value `1` reads
+/// as the key the formula sends there by itself, not the one it lifts
+/// there.
+pub const fn key_of_session(session: u64, model: u64, phase: Phase) -> u64 {
+    if session == 0 {
+        return 0;
+    }
+    let mut h = session;
+    h ^= (h >> 31) ^ (h >> 62);
+    h = h.wrapping_mul(0x3196_42b2_d24d_8ec3);
+    h ^= (h >> 27) ^ (h >> 54);
+    h = h.wrapping_mul(0x96de_1b17_3f11_9089);
+    h ^= (h >> 30) ^ (h >> 60);
+    let scope = model ^ session_phase(phase).wrapping_mul(SESSION_MIX);
+    h ^ scope.wrapping_mul(SESSION_MIX)
+}
+
 impl<'a> RequestFacts<'a> {
     /// The rows the host named, where they answer: beside an empty column.
     /// The column is asked first, so a host that fills one pays nothing for
@@ -839,6 +873,14 @@ pub struct PoolFacts<'a> {
     pub generation: u64,
     /// Healthy capacity per zone; empty for an unzoned fleet.
     pub zones: &'a [ZoneCapacity],
+    /// Which of the pool's lists the candidates are, where the host hands
+    /// more than one of a pool under one membership epoch: two that differ
+    /// by a row, or by a bit the host writes on a row for one asker alone,
+    /// carry different values, and a host that hands one leaves `0`. A
+    /// stage that keeps state by the pool and reads no row for it, as a
+    /// rotation does, keys it by this too. In-process only: a plugin reads
+    /// the rows it is handed.
+    pub reach: u64,
 }
 
 #[cfg(test)]
@@ -1103,6 +1145,55 @@ mod tests {
         .session();
         assert_eq!(lifted.get(), 1);
         assert!(!lifted.is_none());
+    }
+
+    /// The formula runs backwards: a session's value gives its key's
+    /// fingerprint within the same model and phase, on the contract's own
+    /// numbers and across keys, models and phases.
+    #[test]
+    fn a_sessions_value_gives_its_keys_fingerprint_back_within_its_model_and_phase() {
+        let phases = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
+        let contract: [u64; 4] = [
+            0x6e88_ff71_cc98_2a42,
+            0x619f_dbb0_c262_9a55,
+            0x3e92_fbbd_183d_f4b6,
+            0x3780_ba54_336a_57d0,
+        ];
+        let model = fingerprint(b"model-a");
+        for (phase, session) in phases.into_iter().zip(contract) {
+            let key = key_of_session(session, model, phase);
+            assert_eq!(key, 0xd449_9ecc_c740_2a12, "{phase:?}");
+        }
+        for (index, phase) in (0..4_000_u32).zip(phases.into_iter().cycle()) {
+            let name = format!("model-{}", index % 7);
+            let key = fingerprint(format!("key-{index}").as_bytes());
+            let session = RequestFacts {
+                model: &name,
+                session_key: Identity::hashed(key),
+                phase,
+                ..RequestFacts::default()
+            }
+            .session()
+            .get();
+            let read = key_of_session(session, fingerprint(name.as_bytes()), phase);
+            assert_eq!(read, key, "key-{index} under {name}, {phase:?}");
+        }
+        // No session has no key, and neither has the one value a model and
+        // a phase give the fingerprint no key has.
+        assert_eq!(key_of_session(0, model, Phase::Single), 0);
+        assert_eq!(
+            key_of_session(0xc771_96d2_b9cf_9497, model, Phase::Single),
+            0
+        );
+        // The value the formula lifts a zero result to reads as the key it
+        // sends there by itself, whose session it is too.
+        let sent = key_of_session(1, model, Phase::Single);
+        let lifted = RequestFacts {
+            model: "model-a",
+            session_key: Identity::hashed(sent),
+            ..RequestFacts::default()
+        };
+        assert_eq!((sent, lifted.session().get()), (0xbddd_7c85_982a_9f6f, 1));
     }
 
     #[test]

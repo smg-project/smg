@@ -987,8 +987,19 @@ mod tests {
         );
         let engine = engine.expect("HELLO/INIT with the first handshake");
         // The dropped listeners' socket files go on their own tasks; a real
-        // frontend binds again a health probe later.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // frontend binds again a health probe later, the test once they are
+        // gone.
+        tokio::time::timeout(TIMEOUT, async {
+            while [&handshake, &input, &output].into_iter().any(|endpoint| {
+                endpoint
+                    .strip_prefix("ipc://")
+                    .is_some_and(|path| std::path::Path::new(path).exists())
+            }) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dropped listeners' socket files go");
 
         // The frontend binds again; the engine's handshake socket reconnects,
         // and its READY, then its registration, arrive at the new handshake.

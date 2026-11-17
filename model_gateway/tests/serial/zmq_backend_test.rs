@@ -723,7 +723,7 @@ async fn grammar_over_zmq(parser: &str, led: bool) {
         (false, Grammar::None),
         (true, Grammar::None),
     ] {
-        let mut request = router.route_chat(None, &meta, chat(stream, grammar), MODEL);
+        let mut request = router.route_chat(None, &meta, Arc::new(chat(stream, grammar)), MODEL);
         // A streamed answer's response goes out once the request is at the
         // engine, before the engine answers; a non-streamed one only after.
         let (inbound, early) = if stream {
@@ -849,7 +849,7 @@ async fn a_budget_beyond_the_window_is_refused_before_the_engine_over_zmq() {
     };
 
     let response = router
-        .route_chat(None, &test_meta(), chat(WINDOW + 1), MODEL)
+        .route_chat(None, &test_meta(), Arc::new(chat(WINDOW + 1)), MODEL)
         .await;
     assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(response.into_body(), 1 << 16)
@@ -866,7 +866,7 @@ async fn a_budget_beyond_the_window_is_refused_before_the_engine_over_zmq() {
     );
 
     let response = router
-        .route_chat(None, &test_meta(), chat(WINDOW), MODEL)
+        .route_chat(None, &test_meta(), Arc::new(chat(WINDOW)), MODEL)
         .await;
     assert_eq!(response.status(), http::StatusCode::OK);
 }
@@ -991,7 +991,7 @@ async fn usage_prompt_count_over_zmq_is_the_gateways_until_the_engine_reports_on
                     }
                     let body: ChatCompletionRequest =
                         serde_json::from_value(body).expect("a chat request");
-                    router.route_chat(None, &meta, body, MODEL)
+                    router.route_chat(None, &meta, Arc::new(body), MODEL)
                 }
                 "completions" => {
                     let body: CompletionRequest = serde_json::from_value(serde_json::json!({
