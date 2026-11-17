@@ -271,12 +271,13 @@ pub trait Lifecycle: Send + Sync {
     /// these calls: `true` for one whose state the calls keep, as the
     /// workers it lists or the bookings it learns from. The standalone
     /// controller makes the membership call and tells a stage of a lease's
-    /// issue and of its end at the dispatch deadline, and of no dispatch,
-    /// completion or release yet: it refuses a document that names such a
-    /// stage as not in this build ([`crate::SpecError::NotInBuild`]). A
+    /// issue, of its dispatch, completion and release at its gateway's word
+    /// and of its end at the dispatch deadline, and not yet of the end of a
+    /// lease whose gateway was let go: it refuses a document that names such
+    /// a stage as not in this build ([`crate::SpecError::NotInBuild`]). A
     /// host that embeds the engine makes every call. `false` by default: a
-    /// stage that takes a call to
-    /// shed state early decides the same without it.
+    /// stage that takes a call to shed state early decides the same without
+    /// it.
     fn needs_lifecycle(&self) -> bool {
         false
     }

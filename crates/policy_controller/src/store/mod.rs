@@ -92,7 +92,7 @@ pub use kv_events::{
     Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
     SnapshotChunk,
 };
-pub use leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore};
+pub use leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked};
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
 pub use memory::{Cut, MemoryStore};
 pub use pairing::{PairClasses, PairingDescriptor};

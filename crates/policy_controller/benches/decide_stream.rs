@@ -98,7 +98,7 @@ use smg_policy_controller::{
     },
     store::{
         Ask, GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
-        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        Picked, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
     AppliedSpec, Constraints, Lease, LeaseId, LoadRow, Phase, PolicySpec, PoolFacts, ReleaseReason,
     RequestFacts, Role, Scratch,
@@ -901,6 +901,7 @@ fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
                 gateway,
                 request: seed,
                 target,
+                picked: Picked::default(),
                 decode: None,
                 term,
                 issued_at: ask.now,

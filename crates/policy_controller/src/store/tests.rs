@@ -8,11 +8,13 @@ use super::{
     leases::{Counts, Slot},
     Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink, KvEvent,
     KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
-    MembershipChange, MembershipTail, MemoryStore, Pin, PollMode, Reachability, ReservationKind,
-    ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals, SnapshotChunk,
-    StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+    MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Reachability,
+    ReservationKind, ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals,
+    SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
+    WorkersStore,
 };
 use crate::{
+    decision::{Target, Targets},
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
     view::{fingerprint, LoadRow, Role, SignalSource, WorkerId},
 };
@@ -62,6 +64,7 @@ fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
         gateway,
         request: id,
         target: WorkerId(7),
+        picked: Picked::default(),
         decode: None,
         term,
         issued_at: now,
@@ -1691,6 +1694,55 @@ fn a_sweeps_one_write_gives_back_the_counts_of_every_gateway_that_goes() {
     assert_eq!(leases.drop_gateways(&[GatewayId(3), GatewayId(1)]), [1, 2]);
     assert_eq!(in_flight(&store), of(2, 0));
     assert_eq!(leases.live(GatewayId(2)), 2);
+}
+
+#[test]
+fn a_dispatch_on_another_target_of_the_pick_moves_the_leases_count() {
+    let store = MemoryStore::new();
+    let (a, b) = (ready(&store, "http://a:1"), ready(&store, "http://b:1"));
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    store.set_term(1);
+    let of = |a_holds, b_holds| {
+        let mut rows = [(a, a_holds), (b, b_holds)];
+        rows.sort_unstable();
+        rows
+    };
+    // A pick of a, then b: the lease books a.
+    let mut targets = Targets::new();
+    for id in [a, b] {
+        targets.push(Target {
+            id,
+            ..Target::default()
+        });
+    }
+    let picked = |id: u64| LeaseRecord {
+        picked: Picked::of(&targets),
+        ..booking(gateway, id, a, now)
+    };
+    let leases: &dyn LeasesStore = &store;
+    leases.issue(picked(1)).expect("filed");
+    assert_eq!(in_flight(&store), of(1, 0));
+    // The gateway dispatched to the pick's second target: the count is b's.
+    let on = |target_index| Dispatch {
+        target_index,
+        ..Dispatch::default()
+    };
+    assert!(leases.dispatched(gateway, LeaseId(1), on(1), now));
+    assert_eq!(in_flight(&store), of(0, 1));
+    let filed = leases.get(gateway, LeaseId(1)).expect("on file");
+    assert_eq!((filed.target, filed.lease.target_index), (b, 1));
+    // A second dispatch of one lease, on the first target, moves nothing.
+    assert!(leases.dispatched(gateway, LeaseId(1), on(0), now));
+    assert_eq!(in_flight(&store), of(0, 1));
+    // The lease ends on the count it books now.
+    assert!(leases.released(gateway, LeaseId(1), None, ReleaseReason::ClientGone));
+    assert_eq!(in_flight(&store), of(0, 0));
+    // An index the pick holds no target at moves the state and no count.
+    leases.issue(picked(2)).expect("filed");
+    assert!(leases.dispatched(gateway, LeaseId(2), on(2), now));
+    assert_eq!(in_flight(&store), of(1, 0));
+    let state = leases.get(gateway, LeaseId(2)).map(|record| record.state);
+    assert_eq!(state, Some(LeaseState::Dispatched { at: now }));
 }
 
 #[test]

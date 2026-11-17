@@ -325,9 +325,10 @@ impl Controller {
     /// connect. A policy document names the stages `catalog` holds: the
     /// stock build's and the ones the host added. One that needs the
     /// lifecycle's calls ([`crate::Lifecycle::needs_lifecycle`]) is refused
-    /// as not in this build: the controller makes the membership call and
-    /// tells a stage of a lease's issue and of its end at the dispatch
-    /// deadline, and of no dispatch, completion or release yet.
+    /// as not in this build: the controller makes the membership call, and a
+    /// stage hears a lease's issue, its dispatch, completion and release at
+    /// its gateway's word and its end at the dispatch deadline here, and not
+    /// yet the end of a lease whose gateway was let go.
     pub async fn bind_with(config: Config, catalog: Catalog) -> Result<Self, Error> {
         config.validate()?;
         tls::install_crypto_provider();
@@ -340,11 +341,12 @@ impl Controller {
             pickers = ?catalog.pickers().collect::<Vec<_>>(),
             "stages held"
         );
-        // The store makes the membership call, and a served decision tells
-        // a stage of its lease and of the lease's end at the dispatch
-        // deadline. No line tells one of a dispatch, a completion or a
-        // release yet: a stage that needs the calls is refused by name,
-        // never run on state half kept.
+        // The store makes the membership call. A served decision tells a
+        // stage of its lease, a gateway's frame of the lease's dispatch,
+        // completion or release and the dispatch deadline of its end; no
+        // line tells one of a lease that left with its gateway yet: a stage
+        // that needs the calls is refused by name, never run on state half
+        // kept.
         let catalog = Arc::new(catalog.without_lifecycle());
         let mut listeners = Vec::with_capacity(config.listeners.len());
         for listener in &config.listeners {

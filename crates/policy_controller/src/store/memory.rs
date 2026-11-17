@@ -1875,15 +1875,36 @@ impl LeasesStore for MemoryStore {
         &self,
         gateway: GatewayId,
         lease: LeaseId,
-        _dispatch: Dispatch,
+        dispatch: Dispatch,
         at: Instant,
     ) -> bool {
+        // The standing world, for the count of a target the dispatch moves
+        // the lease to: read before the leases' lock, which nests with no
+        // other.
+        let world = self.world.load();
         let mut leases = self.leases.lock();
+        // The records and the counts are two fields of one hold.
+        let leases = &mut *leases;
         let Some(held) = leases.records.get_mut(&(gateway, lease)) else {
             return false;
         };
-        if held.record.state == LeaseState::Issued {
-            held.record.state = LeaseState::Dispatched { at };
+        if held.record.state != LeaseState::Issued {
+            return true;
+        }
+        held.record.state = LeaseState::Dispatched { at };
+        // A dispatch on another target of the pick: the lease books that
+        // worker from here on, and the count of the first one is free.
+        let named = held.record.target_at(dispatch.target_index);
+        if let Some((target, _)) = named.filter(|(target, _)| *target != held.record.target) {
+            if let Some(booked) = held.booked {
+                leases.counts.free(booked);
+            }
+            held.booked = world.booked_of(target);
+            if let Some(booked) = held.booked {
+                leases.counts.book(booked);
+            }
+            held.record.target = target;
+            held.record.lease.target_index = dispatch.target_index;
         }
         true
     }

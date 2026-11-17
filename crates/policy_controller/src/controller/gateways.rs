@@ -724,7 +724,8 @@ pub(crate) mod tests {
         elector::{ElectionSettings, Elector, Tick},
         lease::{Lease, LeaseId},
         store::{
-            GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, WorkersStore,
+            GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
+            WorkersStore,
         },
         view::WorkerId,
     };
@@ -796,6 +797,7 @@ pub(crate) mod tests {
             gateway,
             request: id,
             target: WorkerId(7),
+            picked: Picked::default(),
             decode: None,
             term: 0,
             issued_at: now,
