@@ -29,7 +29,6 @@ UTILITIES = [
     "rm",
     "sed",
     "tr",
-    "uname",
 ]
 
 # The mirror in use is the word in MIRROR: "bad" answers its probe and serves
@@ -80,6 +79,10 @@ SUDO = '#!/bin/bash\necho "$*" >> "$SUDO_CALLS"\nexec "$@"\n'
 # The retry helper's pauses, recorded instead of slept.
 SLEEP = '#!/bin/bash\necho "$1" >> "$SLEEPS"\n'
 
+# The OpenCV script picks its package manager by the kernel's name: the bed is
+# a Linux host, whatever the checkout's host is.
+UNAME = "#!/bin/bash\necho Linux\n"
+
 
 class Bed:
     """The helper beside the real retry helper and stand-ins of its two siblings, on a PATH of its own."""
@@ -98,7 +101,8 @@ class Bed:
             real = shutil.which(name)
             if real:
                 os.symlink(real, self.bin / name)
-        for name, text in {"apt-get": APT_GET, "sudo": SUDO, "sleep": SLEEP}.items():
+        stand_ins = {"apt-get": APT_GET, "sudo": SUDO, "sleep": SLEEP, "uname": UNAME}
+        for name, text in stand_ins.items():
             path = self.bin / name
             path.write_text(text)
             path.chmod(0o755)
