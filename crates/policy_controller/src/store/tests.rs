@@ -4,10 +4,11 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    identity, identity_of, BatchFacts, BatchOutcome, GatewayId, HealthSink, KvEventSink,
-    LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource, MembershipChange,
-    MembershipTail, MemoryStore, Pin, PollMode, ReservationKind, ReservationStore, ResyncReason,
-    SessionsStore, SnapshotChunk, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+    identity, identity_of, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink,
+    KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
+    MembershipChange, MembershipTail, MemoryStore, Pin, PollMode, ReservationKind,
+    ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals, SnapshotChunk,
+    StoredBlock, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
 };
 use crate::{
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
@@ -220,7 +221,10 @@ fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
         Some((WorkerStatus::Pending, WorkerStatus::Ready)),
         "two passes promote a pending worker"
     );
-    let stale = revision() - 1;
+    // A patch moves the revision: an outcome read under the one it left is
+    // stale.
+    let stale = revision();
+    WorkersStore::patch(&store, id, WorkerPatch::default(), stale).expect("the patch");
     assert_eq!(
         health.probe_outcome(id, false, stale),
         None,
@@ -257,7 +261,92 @@ fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
     assert_eq!(
         health.connected(fresh, fresh_revision),
         None,
-        "the promotion moved the revision"
+        "a ready row takes no second promotion"
+    );
+}
+
+#[test]
+fn a_threshold_past_the_counters_range_is_never_met_early() {
+    // The first threshold whose tenfold passes 32 bits, and the last one.
+    for threshold in [429_496_730, u32::MAX] {
+        let store = MemoryStore::new();
+        let health: &dyn HealthSink = &store;
+        let mut stated = facts("http://w:8000", 1);
+        stated.health.failure_threshold = threshold;
+        let id = store.upsert(stated).id();
+        let revision = || WorkersStore::get(&store, id).expect("the row").revision;
+        // A pending worker's cap is ten thresholds: five failed probes are
+        // far under it.
+        for _ in 0..5 {
+            assert_eq!(
+                health.probe_outcome(id, false, revision()),
+                None,
+                "pending under {threshold}"
+            );
+        }
+        assert_eq!(health.probe_outcome(id, true, revision()), None);
+        assert_eq!(
+            health.probe_outcome(id, true, revision()),
+            Some((WorkerStatus::Pending, WorkerStatus::Ready))
+        );
+        // And a ready one stays ready through failures under the threshold.
+        for _ in 0..5 {
+            assert_eq!(
+                health.probe_outcome(id, false, revision()),
+                None,
+                "ready under {threshold}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_counter_at_its_ranges_end_stays_there() {
+    let store = MemoryStore::new();
+    let health: &dyn HealthSink = &store;
+    let mut stated = facts("http://w:8000", 1);
+    stated.health.failure_threshold = u32::MAX;
+    let id = store.upsert(stated).id();
+    let revision = || WorkersStore::get(&store, id).expect("the row").revision;
+    // A pending worker's cap is held at the counter's end: met there, and
+    // one probe short of it not yet.
+    store.probed(id, 0, 0, u32::MAX - 2);
+    assert_eq!(health.probe_outcome(id, false, revision()), None);
+    assert_eq!(
+        health.probe_outcome(id, false, revision()),
+        Some((WorkerStatus::Pending, WorkerStatus::Failed))
+    );
+    // Each counter at its end takes one probe more and stays there.
+    store.probed(id, u32::MAX, u32::MAX, u32::MAX);
+    assert_eq!(health.probe_outcome(id, false, revision()), None);
+    store.probed(id, 0, u32::MAX, u32::MAX);
+    assert_eq!(
+        health.probe_outcome(id, true, revision()),
+        Some((WorkerStatus::Failed, WorkerStatus::Ready))
+    );
+}
+
+#[test]
+fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
+    let store = MemoryStore::new();
+    let health: &dyn HealthSink = &store;
+    let id = store.upsert(facts("http://p:8000", 1)).id();
+    let read = WorkersStore::get(&store, id).expect("the row").revision;
+    WorkersStore::patch(&store, id, WorkerPatch::default(), read).expect("the patch");
+    assert_eq!(
+        health.connected(id, read),
+        None,
+        "a stale signal is dropped"
+    );
+    assert_eq!(
+        WorkersStore::get(&store, id).expect("the row").status,
+        WorkerStatus::Pending,
+        "and the row stays as it stood"
+    );
+    assert_eq!(
+        health.connected(id, read + 1),
+        Some((WorkerStatus::Pending, WorkerStatus::Ready)),
+        "the signal read under the row's revision promotes"
     );
 }
 
@@ -290,6 +379,30 @@ fn a_gateway_veto_masks_the_worker_for_that_gateway_until_its_end_or_its_clear()
     assert!(
         !health.completed_ok_since(g1, id, now),
         "one gateway's dispatch keeps the worker routable for that gateway alone"
+    );
+}
+
+/// The health table keeps the latest instant of a gateway's completions on
+/// a worker: an earlier one that arrives after it moves nothing back.
+#[test]
+fn a_gateways_completion_on_a_worker_is_kept_at_its_latest_instant() {
+    let store = MemoryStore::new();
+    let id = ready(&store, "http://e:8000");
+    let health: &dyn HealthSink = &store;
+    let gateway = GatewayId(1);
+    let first = Instant::now();
+    let second = first + Duration::from_millis(5);
+    health.completed(gateway, id, TransportClass::Ok, first);
+    assert!(!health.completed_ok_since(gateway, id, second));
+    health.completed(gateway, id, TransportClass::Ok, second);
+    assert!(
+        health.completed_ok_since(gateway, id, second),
+        "the later completion is the one kept"
+    );
+    health.completed(gateway, id, TransportClass::Ok, first);
+    assert!(
+        health.completed_ok_since(gateway, id, second),
+        "an earlier one that arrives late moves nothing back"
     );
 }
 
@@ -360,7 +473,7 @@ fn a_removed_worker_leaves_no_load_row_and_a_late_record_or_report_writes_none()
     let loads: &dyn LoadSink = &store;
     let t0 = Instant::now();
     loads.record(id, 0, row(0), t0, LoadSource::Stream);
-    loads.report(id, &[(1, row(0))], t0, LoadSource::Poll);
+    loads.report(&[(id, 1, Some(row(0)))], t0, LoadSource::Poll);
     assert_eq!(loads.ranks(id), 2);
     assert_eq!(store.load_entries(), 1);
 
@@ -372,7 +485,11 @@ fn a_removed_worker_leaves_no_load_row_and_a_late_record_or_report_writes_none()
     let later = t0 + Duration::from_secs(1);
     loads.record(id, 0, row(0), later, LoadSource::Stream);
     loads.record(id, 0, row(0), later, LoadSource::Relay(GatewayId(4)));
-    loads.report(id, &[(0, row(0)), (1, row(0))], later, LoadSource::Poll);
+    loads.report(
+        &[(id, 0, Some(row(0))), (id, 1, Some(row(0)))],
+        later,
+        LoadSource::Poll,
+    );
     assert_eq!(loads.ranks(id), 0, "a late write re-creates nothing");
     assert!(loads.load(id, 0).is_none());
     assert_eq!(store.load_entries(), 0);
@@ -420,7 +537,7 @@ fn a_load_write_for_an_id_that_never_registered_is_dropped() {
     let stranger = WorkerId(77);
     let t0 = Instant::now();
     loads.record(stranger, 0, row(0), t0, LoadSource::Scrape);
-    loads.report(stranger, &[(0, row(0))], t0, LoadSource::Poll);
+    loads.report(&[(stranger, 0, Some(row(0)))], t0, LoadSource::Poll);
     assert_eq!(loads.ranks(stranger), 0);
     assert_eq!(store.load_entries(), 0);
 }
@@ -438,7 +555,7 @@ fn a_writer_racing_the_removal_finds_no_row_after_it_returns() {
             scope.spawn(|| {
                 for _ in 0..50 {
                     store.record(id, 0, row(0), t0, LoadSource::Stream);
-                    store.report(id, &[(1, row(0))], t0, LoadSource::Poll);
+                    store.report(&[(id, 1, Some(row(0)))], t0, LoadSource::Poll);
                 }
             });
             scope.spawn(|| {
@@ -464,7 +581,7 @@ fn an_evicted_member_has_nothing_on_file_and_takes_its_next_report() {
         PollMode::Poll,
         "its receipts went too"
     );
-    loads.report(id, &[(0, row(0))], t0, LoadSource::Poll);
+    loads.report(&[(id, 0, Some(row(0)))], t0, LoadSource::Poll);
     assert_eq!(loads.ranks(id), 1, "a member's next report is written");
 }
 
@@ -492,7 +609,11 @@ fn fallback_polling_stays_while_a_silent_rank_stays_silent() {
         PollMode::Fallback,
         "rank 1 fell silent"
     );
-    sink.report(id, &[(0, row), (1, row)], later, LoadSource::Poll);
+    sink.report(
+        &[(id, 0, Some(row)), (id, 1, Some(row))],
+        later,
+        LoadSource::Poll,
+    );
     assert_eq!(
         sink.poll_mode(id, later, interval),
         PollMode::Fallback,
@@ -561,8 +682,11 @@ fn a_record_replaces_its_rank_alone_and_a_poll_fills_only_the_ranks_that_stayed_
     let mut polled = row(0);
     polled.running = 2;
     loads.report(
-        id,
-        &[(0, polled), (1, polled), (2, polled)],
+        &[
+            (id, 0, Some(polled)),
+            (id, 1, Some(polled)),
+            (id, 2, Some(polled)),
+        ],
         polled_at,
         LoadSource::Poll,
     );
@@ -601,7 +725,7 @@ fn the_poll_mode_reads_the_receipts_of_the_pushing_ranks_alone() {
     let interval = Duration::from_secs(10);
     let t0 = Instant::now();
     assert_eq!(loads.poll_mode(id, t0, interval), PollMode::Poll);
-    loads.report(id, &[(0, row(0))], t0, LoadSource::Poll);
+    loads.report(&[(id, 0, Some(row(0)))], t0, LoadSource::Poll);
     assert_eq!(
         loads.poll_mode(id, t0, interval),
         PollMode::Poll,
@@ -654,22 +778,88 @@ fn a_scrape_writes_no_receipt_so_the_poll_stays() {
     );
 }
 
+/// A row whose signals ask for events, at `rank`: the store indexes its
+/// blocks.
+fn publisher(store: &MemoryStore, key: &str, rank: u16) -> WorkerId {
+    let facts = WorkerFacts {
+        dp_rank: rank,
+        signals: Signals {
+            events: true,
+            ..Signals::default()
+        },
+        ..facts(key, 1)
+    };
+    store.upsert(facts).id()
+}
+
+/// What the batch of `sequence` carries in these cases: one block of its
+/// own at a chain's start, so the blocks a rank holds count the batches
+/// applied since its last clear.
+fn one_block(sequence: u64) -> [KvEvent; 1] {
+    [KvEvent::Stored {
+        parent: None,
+        blocks: vec![StoredBlock {
+            seq_hash: SequenceHash(1_000 + sequence),
+            content_hash: ContentHash(2_000 + sequence),
+        }],
+    }]
+}
+
+#[test]
+fn a_reorder_that_moves_the_first_model_moves_the_rows_lane_with_it() {
+    let store = MemoryStore::new();
+    let sink: &dyn KvEventSink<Batch = [KvEvent]> = &store;
+    let mut stated = WorkerFacts {
+        models: vec!["m".to_owned(), "n".to_owned()],
+        signals: Signals {
+            events: true,
+            ..Signals::default()
+        },
+        ..facts("w", 1)
+    };
+    let id = store.upsert(stated.clone()).id();
+    for seq in 1..=3 {
+        sink.admit(id, 0, batch(seq), &one_block(seq));
+    }
+    let held = || (store.kv().held_blocks("m"), store.kv().held_blocks("n"));
+    assert_eq!(held(), (3, 0));
+    // The same two the other way round, written in place. A row's events
+    // are keyed by its first model, and the lane moves with it in the same
+    // write: no block stays under the old key, and the lane made anew is
+    // unheard, which tells a collector to feed it from a snapshot.
+    stated.models.reverse();
+    assert_eq!(store.upsert(stated).id(), id);
+    assert_eq!(held(), (0, 0));
+    assert_eq!(sink.cursor(id, 0), None);
+    assert_eq!(
+        sink.admit(id, 0, batch(1), &one_block(1)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(held(), (0, 1));
+}
+
 #[test]
 fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
     let store = MemoryStore::new();
-    let sink: &dyn KvEventSink<Batch = ()> = &store;
-    let id = WorkerId(9);
+    let sink: &dyn KvEventSink<Batch = [KvEvent]> = &store;
+    let id = publisher(&store, "w", 0);
     assert_eq!(sink.cursor(id, 0), None, "a rank never heard from");
-    assert_eq!(sink.admit(id, 0, batch(17), &()), BatchOutcome::Applied);
-    assert_eq!(sink.admit(id, 0, batch(18), &()), BatchOutcome::Applied);
     assert_eq!(
-        sink.admit(id, 0, batch(18), &()),
+        sink.admit(id, 0, batch(17), &one_block(17)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(
+        sink.admit(id, 0, batch(18), &one_block(18)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(
+        sink.admit(id, 0, batch(18), &one_block(18)),
         BatchOutcome::Skipped,
         "a duplicate"
     );
     assert_eq!(sink.cursor(id, 0).expect("heard").applied, 18);
     assert_eq!(
-        sink.admit(id, 0, batch(25), &()),
+        sink.admit(id, 0, batch(25), &one_block(25)),
         BatchOutcome::Gap {
             expected: 19,
             received: 25
@@ -678,36 +868,50 @@ fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
     assert!(sink.cursor(id, 0).expect("heard").replay_pending);
     for seq in 19..=25 {
         assert_eq!(
-            sink.admit(id, 0, batch(seq), &()),
+            sink.admit(id, 0, batch(seq), &one_block(seq)),
             BatchOutcome::Applied,
             "the replay fills the gap"
         );
     }
-    assert_eq!(store.applied_batches(id, 0), 9);
+    assert_eq!(store.indexed_blocks(id, 0), 9);
     assert_eq!(
-        sink.admit(id, 0, batch(40), &()),
+        sink.admit(id, 0, batch(40), &one_block(40)),
         BatchOutcome::Gap {
             expected: 26,
             received: 40
         }
     );
     assert_eq!(
-        sink.admit(id, 0, batch(50), &()),
+        sink.admit(id, 0, batch(50), &one_block(50)),
         BatchOutcome::Applied,
         "a second gap is lost history, applied"
     );
     let cursor = sink.cursor(id, 0).expect("heard");
     assert!(cursor.degraded && !cursor.replay_pending);
     assert_eq!(
-        store.applied_batches(id, 0),
+        store.indexed_blocks(id, 0),
         10,
         "a small gap keeps the state"
     );
-    assert_eq!(sink.admit(id, 1, batch(3), &()), BatchOutcome::Applied);
+    let second = publisher(&store, "w/1", 1);
     assert_eq!(
-        sink.cursor(id, 1).expect("heard").applied,
+        sink.admit(second, 1, batch(3), &one_block(3)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(
+        sink.cursor(second, 1).expect("heard").applied,
         3,
         "each rank its own counter"
+    );
+    assert_eq!(
+        sink.admit(id, 1, batch(3), &one_block(3)),
+        BatchOutcome::Skipped,
+        "a batch of a rank the row is not"
+    );
+    assert_eq!(
+        sink.admit(WorkerId(9), 0, batch(1), &one_block(1)),
+        BatchOutcome::Skipped,
+        "a batch of a worker the store holds no row for"
     );
 }
 
@@ -717,13 +921,16 @@ fn kv_batches_apply_in_sequence_skip_duplicates_and_ask_one_replay_per_gap() {
 #[test]
 fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_not() {
     let store = MemoryStore::new();
-    let sink: &dyn KvEventSink<Batch = ()> = &store;
-    let id = WorkerId(11);
+    let sink: &dyn KvEventSink<Batch = [KvEvent]> = &store;
+    let id = publisher(&store, "w", 0);
     for seq in 1..=5 {
-        assert_eq!(sink.admit(id, 0, batch(seq), &()), BatchOutcome::Applied);
+        assert_eq!(
+            sink.admit(id, 0, batch(seq), &one_block(seq)),
+            BatchOutcome::Applied
+        );
     }
     assert_eq!(
-        sink.admit(id, 0, batch(3), &()),
+        sink.admit(id, 0, batch(3), &one_block(3)),
         BatchOutcome::Skipped,
         "a late duplicate on the same connection"
     );
@@ -731,20 +938,16 @@ fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_no
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 0);
     sink.reconnected(id);
     assert_eq!(
-        sink.admit(id, 0, batch(3), &()),
+        sink.admit(id, 0, batch(3), &one_block(3)),
         BatchOutcome::Applied,
         "the same sequence on a fresh connection is a restarted publisher"
     );
     let cursor = sink.cursor(id, 0).expect("heard");
     assert_eq!((cursor.applied, cursor.degraded), (3, false));
-    assert_eq!(
-        store.applied_batches(id, 0),
-        1,
-        "the rank was cleared first"
-    );
+    assert_eq!(store.indexed_blocks(id, 0), 1, "the rank was cleared first");
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
     assert_eq!(
-        sink.admit(id, 0, batch(4), &()),
+        sink.admit(id, 0, batch(4), &one_block(4)),
         BatchOutcome::Applied,
         "the new life continues from there"
     );
@@ -754,10 +957,13 @@ fn a_fresh_connection_below_the_cursor_is_a_restart_where_a_late_duplicate_is_no
 #[test]
 fn a_publisher_restart_and_a_resync_clear_the_rank_and_a_removal_forgets_it() {
     let store = MemoryStore::new();
-    let sink: &dyn KvEventSink<Batch = ()> = &store;
-    let id = WorkerId(9);
+    let sink: &dyn KvEventSink<Batch = [KvEvent]> = &store;
+    let id = publisher(&store, "w", 0);
     for seq in 1..=5 {
-        assert_eq!(sink.admit(id, 0, batch(seq), &()), BatchOutcome::Applied);
+        assert_eq!(
+            sink.admit(id, 0, batch(seq), &one_block(seq)),
+            BatchOutcome::Applied
+        );
     }
     let clearing = BatchFacts {
         sequence: 2,
@@ -765,51 +971,51 @@ fn a_publisher_restart_and_a_resync_clear_the_rank_and_a_removal_forgets_it() {
         snapshot: None,
     };
     assert_eq!(
-        sink.admit(id, 0, clearing, &()),
+        sink.admit(id, 0, clearing, &one_block(2)),
         BatchOutcome::Applied,
         "a clear below the cursor is a restarted publisher"
     );
-    assert_eq!(
-        store.applied_batches(id, 0),
-        1,
-        "the rank was cleared first"
-    );
+    assert_eq!(store.indexed_blocks(id, 0), 1, "the rank was cleared first");
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 1);
     sink.reconnected(id);
     assert_eq!(
-        sink.admit(id, 0, batch(1), &()),
+        sink.admit(id, 0, batch(1), &one_block(1)),
         BatchOutcome::Applied,
         "below the cursor on a fresh connection: a restart too"
     );
     assert_eq!(store.resyncs(ResyncReason::PublisherRestart), 2);
     for seq in 2..=4 {
-        sink.admit(id, 0, batch(seq), &());
+        sink.admit(id, 0, batch(seq), &one_block(seq));
     }
+    assert_eq!(store.indexed_blocks(id, 0), 4);
     sink.resync(id, Some(0), ResyncReason::OutOfRange);
-    assert_eq!(store.applied_batches(id, 0), 0);
+    assert_eq!(store.indexed_blocks(id, 0), 0);
     assert_eq!(sink.cursor(id, 0).expect("heard").applied, 0);
     assert_eq!(store.resyncs(ResyncReason::OutOfRange), 1);
     let chunk = BatchFacts {
         sequence: 90,
         clears: false,
         snapshot: Some(SnapshotChunk {
-            index: 0,
-            count: 2,
             unknown_before: true,
         }),
     };
-    assert_eq!(sink.admit(id, 0, chunk, &()), BatchOutcome::Applied);
+    sink.resync(id, Some(0), ResyncReason::Snapshot);
+    assert_eq!(
+        sink.admit(id, 0, chunk, &one_block(90)),
+        BatchOutcome::Applied
+    );
     let cursor = sink.cursor(id, 0).expect("heard");
     assert_eq!((cursor.applied, cursor.degraded), (90, true));
     assert_eq!(store.resyncs(ResyncReason::Snapshot), 1);
     assert_eq!(
-        sink.admit(id, 0, batch(91), &()),
+        sink.admit(id, 0, batch(91), &one_block(91)),
         BatchOutcome::Applied,
         "live batches continue after the snapshot's stamp"
     );
+    assert_eq!(store.indexed_blocks(id, 0), 2);
     sink.removed(id);
     assert_eq!(sink.cursor(id, 0), None);
-    assert_eq!(store.applied_batches(id, 0), 0);
+    assert_eq!(store.indexed_blocks(id, 0), 0);
     sink.set_block_size("m", 16);
     sink.set_block_size("m", 8);
     assert_eq!(sink.block_size("m"), Some(16), "only ever raised");
@@ -970,8 +1176,8 @@ fn a_lease_above_the_stores_term_is_refused_and_one_below_is_kept() {
     );
     assert_eq!(leases.issue(lease(gateway, 2, 3, now)), Ok(()));
     assert_eq!(leases.live(gateway), 2);
-    assert!(leases.dispatched(gateway, LeaseId(1), Side::Single, now));
-    assert!(!leases.dispatched(GatewayId(2), LeaseId(1), Side::Single, now));
+    assert!(leases.dispatched(gateway, LeaseId(1), Dispatch::default(), now));
+    assert!(!leases.dispatched(GatewayId(2), LeaseId(1), Dispatch::default(), now));
     let expired = leases.expire(now + Duration::from_secs(2));
     assert_eq!(
         expired.len(),
@@ -995,7 +1201,7 @@ fn a_lease_above_the_stores_term_is_refused_and_one_below_is_kept() {
         duration_micros: 0,
     };
     assert!(leases.completed(gateway, LeaseId(1), &outcome));
-    assert!(!leases.released(gateway, LeaseId(1), ReleaseReason::ClientGone));
+    assert!(!leases.released(gateway, LeaseId(1), None, ReleaseReason::ClientGone));
     assert_eq!(leases.live(gateway), 0);
 }
 

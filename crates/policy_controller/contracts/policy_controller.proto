@@ -5,7 +5,11 @@
 //
 // Versioning: design appendix A (additive within v1). The package is
 // pre-release until the first shipped release that carries it; the rule
-// binds from then on.
+// binds from then on. Hello carries the range of protocol versions the
+// gateway speaks and Welcome the one the controller picked; a range that
+// holds no version the controller speaks is refused with
+// FAILED_PRECONDITION, the status message naming the range and the
+// controller's version.
 //
 // Scopes and principals: design 5.2. Four credentialed scopes, each
 // mountable on its own listener; the verified principal is transport
@@ -21,10 +25,12 @@
 // and answers Session and Decide with NotLeader / Busy { NOT_LEADER }.
 // A listener its operator names takes a caller's identity as told: the
 // caller states its name in the `x-smg-principal` metadata entry of every
-// call, once (one token of printable ASCII, 1 to 253 bytes), nothing is
-// verified, and the principal reads METHOD_AS_TOLD. Such a listener has no
-// other credential rule. Leader needs no principal: it tells a caller where
-// to go before the caller holds a session.
+// call, once (one token of visible ASCII, 0x21 to 0x7E, with no comma, 1
+// to 253 bytes: entries a hop joined with a comma are two names), nothing
+// is verified, and the principal reads METHOD_AS_TOLD. Such a listener has
+// no other credential rule, and the stated name stands there wherever
+// this contract says the verified subject. Leader needs no principal: it
+// tells a caller where to go before the caller holds a session.
 // Fencing: design 5.3. Every ControllerFrame and DecideAnswer carries the
 // leader's term, every GatewayFrame the gateway's term floor. A gateway
 // raises its floor from Leader and rejects frames below it; the controller
@@ -34,20 +40,44 @@
 // Flow: design 5.2. Budgets are relative to receipt, never absolute; credits
 // ride the Decide stream as deltas (Credit) and are never taken back; with
 // no credit the gateway decides locally; a Decide whose budget is gone on
-// arrival is answered Busy { BUDGET_GONE_ON_ARRIVAL } without a lease; a
-// Decision that arrives after a fallback is answered with Released.
+// arrival, or ends while it is decided, is answered
+// Busy { BUDGET_GONE_ON_ARRIVAL } without a lease, and the controller counts
+// the second apart; a Decision that arrives after a fallback is answered
+// with Released.
 // Errors (gRPC status): UNAUTHENTICATED no principal, or Hello's id is not
 // the subject (the stream closes); PERMISSION_DENIED the scope or
 // role does not cover the RPC; FAILED_PRECONDITION not the leader (a
-// NotLeader in the status details), a floor above the term, a revision or
+// NotLeader in the status details, which are a google.rpc.Status that
+// holds it as an Any, its address the leader's gateway listener as Leader
+// tells it; on Session, the NotLeader frame ahead
+// of the status), a first frame that is not Hello or a second Hello, no
+// protocol version in common, a floor above the term, a revision or
 // digest guard, or a rejoin position not held under its term (a
 // resync_required batch precedes it; the rejoin opens a new Replicate
-// stream); INVALID_ARGUMENT a spec or registration rejected (the field
-// path in ApplyResult.issues and the status detail); RESOURCE_EXHAUSTED a
+// stream); INVALID_ARGUMENT a spec, registration or patch rejected (the
+// field path in ApplyResult.issues, and at the head of a refused
+// registration's or patch's status message), a Dispatched, Completed or
+// Released whose side, class, reason or number reads wrong, or a Released
+// that names neither a lease nor a ticket (the field's name in the
+// message); RESOURCE_EXHAUSTED a
 // relay over its per-subscriber budget or a standby over its backlog (a
-// resync_required batch precedes it); UNAVAILABLE a standby not yet synced;
-// ABORTED fenced mid-stream, reconnect through Leader; OUT_OF_RANGE and
-// DATA_LOSS never raised, forwarded as RelayResync. In-band within a stream:
+// resync_required batch precedes it), a Hello past the controller's
+// ceiling of present gateways, or a Session frame over the transport's
+// limit of 4 MiB a message; ALREADY_EXISTS a Hello whose id collides
+// with another present gateway's, refused while that one stands, or an
+// add of a registered URL; NOT_FOUND a replace of an absent URL, or no
+// worker under the id; DEADLINE_EXCEEDED a Session stream that said no
+// Hello within 5 s of its open; UNAVAILABLE a standby not yet synced;
+// ABORTED fenced mid-stream, reconnect through Leader, a Hello read
+// under a term the election left before its seat was taken, or a session
+// a newer one of its gateway replaced, or a worker row that moved under a
+// membership call (a second writer: read the row again); OUT_OF_RANGE and
+// DATA_LOSS raised by no handler, forwarded as RelayResync. The
+// transport answers OUT_OF_RANGE itself to a request over its limit of
+// 4 MiB on a call of one request message; on a Session stream the reader
+// answers that finding RESOURCE_EXHAUSTED. Any other read of a
+// Session frame that the transport fails ends the stream under the
+// transport's own status. In-band within a stream:
 // Busy, NotLeader, SpecAck { accepted: false }, Decline.
 
 syntax = "proto3";
@@ -109,7 +139,7 @@ message GatewayFrame {
 // What the gateway holds; the leases, pins and vetoes follow in HelloPage
 // frames, the counts here size the restore.
 message Hello {
-  // Must equal the verified subject.
+  // Must equal the principal's subject.
   string gateway_id = 1;
   uint32 protocol_min = 2;
   uint32 protocol_max = 3;
@@ -206,7 +236,7 @@ message ControllerFrame {
   }
 }
 
-// The answer to Hello; `principal` echoes what the transport verified.
+// The answer to Hello; `principal` echoes the session's principal.
 message Welcome {
   uint32 protocol = 1;
   uint64 generation = 2;
@@ -218,7 +248,9 @@ message Welcome {
   // Initial credit per Decide stream; a new Decide stream starts here again.
   uint32 decide_window = 7;
   uint32 max_decide_streams = 8;
-  // The stream rule's grace period and the default dispatch TTL.
+  // The stream rule's grace period and the default dispatch TTL. A gateway
+  // is let go one grace period after its last session ended, and one period
+  // more at most while a session that a newer one replaced still runs.
   uint32 grace_period_ms = 9;
   uint32 dispatch_ttl_ms = 10;
   // How often the gateway polls Leader for its term floor.
@@ -376,7 +408,9 @@ message WorkerEvent {
 }
 
 // Paged at 128 rows, every page at the snapshot's seq; a watcher switches to
-// the tail at `last` and, cut before it, reconnects with resume_seq 0.
+// the tail at `last` and, cut before it, reconnects with resume_seq 0. A row
+// is at most 16,384 bytes at its registration (WorkerSpec), so a page of 128
+// rows is about half of a 4 MiB frame.
 message WorkerSnapshot {
   repeated WorkerRow workers = 1;
   bool last = 2;
@@ -390,7 +424,8 @@ message SnapshotRequired {
 message Replaced {
   WorkerRow old = 1;
   WorkerRow new = 2;
-  // Runtime and breaker state carried over.
+  // Runtime and breaker state carried over. A draining row hands none on:
+  // a drain ends with the registration it named.
   bool state_carried = 3;
 }
 
@@ -407,6 +442,8 @@ enum WorkerStatus {
   WORKER_STATUS_READY = 2;
   WORKER_STATUS_NOT_READY = 3;
   WORKER_STATUS_DRAINING = 4;
+  // A sustained liveness failure: kept and probed, it may return.
+  WORKER_STATUS_FAILED = 5;
 }
 
 message StatusChanged {
@@ -420,9 +457,16 @@ message StatusChanged {
 message WorkerRow {
   fixed64 id = 1;
   string registration_key = 2;
+  // The number of this life of the key. Its high 24 bits are the term of
+  // the leader that registered it. Its low 40 count the store's membership
+  // writes from a base a controller run draws once, so another run under
+  // the same term counts from elsewhere. Within one run and one term a later
+  // life has the higher number. A caller reads the number from the answer
+  // and never computes it.
   uint64 incarnation = 3;
   string url = 4;
-  // The one wire this registration serves (one URL on one wire).
+  // The one wire a registration serves (one URL on one wire). The numbers
+  // are bits: a row that serves several wires tells their sum.
   WireMode wire = 5;
   Role role = 6;
   string runtime = 7;
@@ -431,6 +475,8 @@ message WorkerRow {
   map<string, string> labels = 10;
   string zone = 11;
   WorkerStatus status = 12;
+  // Counts the row's stated facts: it moves with the events that carry a
+  // row (registered, replaced, relabelled) and with no status change.
   uint64 revision = 13;
   // HealthFlag bits.
   uint32 health = 14;
@@ -443,6 +489,12 @@ message WorkerRow {
   string policy = 20;
   repeated string topology = 21;
   uint32 max_running = 22;
+  // The rank of its data-parallel engine this row is; 0 for a single rank.
+  uint32 dp_rank = 23;
+  // The engine the row belongs to: one for the ranks of a data-parallel
+  // engine, the registration key for a single rank.
+  string engine = 24;
+  HealthPolicy health_policy = 25;
 }
 
 // A host-local wire is reachable from one gateway only.
@@ -470,10 +522,28 @@ message PairingDescriptor {
 
 // Per-worker overrides over the spec's defaults; unset means the spec's value.
 message OverloadThresholds {
+  // Two thresholds no judge read; a reader brings one back under a new number.
+  reserved 3, 4;
+  reserved "in_flight_limit", "waiting_tokens_limit";
   optional uint32 queue_limit = 1;
   optional uint32 kv_usage_permille = 2;
-  optional uint32 in_flight_limit = 3;
-  optional uint32 waiting_tokens_limit = 4;
+}
+
+// The prober's settings for one worker. A zero count or period means the
+// controller's default.
+message HealthPolicy {
+  // Consecutive failed probes before a ready worker leaves rotation; three
+  // times as many fail it. A threshold whose multiple passes the probe
+  // counter's range (32 bits) is never met before the counter's end.
+  uint32 failure_threshold = 1;
+  // Consecutive passed probes before a worker returns.
+  uint32 success_threshold = 2;
+  uint32 check_interval_ms = 3;
+  uint32 timeout_ms = 4;
+  // The checks are off: the worker is ready from its registration and the
+  // prober never judges it. The registrant says "do not check", never
+  // "healthy".
+  bool disabled = 5;
 }
 
 // How the controller learns the worker's loads and events.
@@ -548,20 +618,55 @@ message RelayEnded {
 message RegisterWorkerRequest {
   WorkerSpec spec = 1;
   enum Mode {
+    // Reads as MODE_ADD.
     MODE_UNSPECIFIED = 0;
+    // The URL must be absent: ALREADY_EXISTS otherwise.
     MODE_ADD = 1;
+    // The URL must stand: its next incarnation, NOT_FOUND otherwise.
     MODE_REPLACE = 2;
+    // Registers an absent URL. Over a standing row: equal facts write nothing
+    // and answer the row unmoved, a change of role, wire or models is a new
+    // incarnation, any other change is made in place. The models change
+    // when their set does: the same ids in another order are written in
+    // place, and the row tells the stated order.
     MODE_UPSERT = 3;
   }
   Mode mode = 2;
   // Wait for the handshake; otherwise the row is answered PENDING and the
-  // handshake's result is a StatusChanged on WatchWorkers.
+  // handshake's result is a StatusChanged on WatchWorkers. A worker whose
+  // checks are off is ready from its registration: its wait ends in the call
+  // and the answer is the row after it. INVALID_ARGUMENT, by this field's
+  // name, where the controller runs no handshake that ends the wait.
   bool wait_ready = 3;
 }
 
-// A registration before the handshake fills the row.
+// A registration before the handshake fills the row. A name is taken as
+// written: a URL, a runtime or a model id that holds a blank or a control
+// character is INVALID_ARGUMENT. Over a standing row (MODE_REPLACE,
+// MODE_UPSERT) the labels and the health policy are the registration's,
+// whole; any other field left unset or empty keeps the row's value, and an
+// overload or a signals block that is present replaces the row's. A URL's
+// first registration names its wire and its role: INVALID_ARGUMENT by the
+// field it leaves unset, and by the field that states a number this
+// contract does not name.
+//
+// Bounds, each INVALID_ARGUMENT by its field: a URL at most 2,048 bytes; a
+// runtime, a zone and a model id at most 256 bytes each; at most 128 labels,
+// a key at most 128 bytes and a value at most 4,096. Last, by `spec`: the
+// row the registration would make is at most 16,384 bytes as WorkerRow
+// encodes it, measured with the numbers the controller gives a row (its id,
+// incarnation, revision and status) and the overload block at their widest:
+// no later status, revision or patched block adds a byte.
+//
+// A limit of this build, not a number of the contract: a row names at most
+// 128 model ids (INVALID_ARGUMENT by `spec.models`). A gateway's own
+// registration takes a worker of more ids, and this door refuses it; the
+// count is said again once the store's cost of a row's ids is measured.
 message WorkerSpec {
   string url = 1;
+  // WIRE_MODE_ZMQ is INVALID_ARGUMENT here: a host-local wire is reachable
+  // from the one gateway that holds its socket (Reachability), and no field
+  // of a registration names a gateway.
   WireMode wire = 2;
   Role role = 3;
   string runtime = 4;
@@ -570,16 +675,33 @@ message WorkerSpec {
   string zone = 7;
   OverloadThresholds overload = 8;
   uint32 kv_block_size = 9;
+  // Of the descriptor a registration states the bootstrap port alone, and
+  // the row tells it back: the store holds no other field of it yet, and one
+  // a caller states is INVALID_ARGUMENT by its path. Zero states no port:
+  // the standing port stays, under a REPLACE too, and it is cleared by
+  // removing the worker and registering it again.
   PairingDescriptor pairing = 10;
-  // 0: discover the data-parallel width (always on).
+  // 0: the data-parallel width is discovered where a handshake runs (always
+  // on) and is one rank where none does. Above 1: INVALID_ARGUMENT where no
+  // call answers a row a rank.
   uint32 dp_size = 11;
   Signals signals = 12;
   repeated string topology = 13;
+  // Unset: checked, under the controller's defaults, whatever stood under
+  // the URL: every registration that wants its checks off says so.
+  HealthPolicy health_policy = 14;
 }
 
 message PatchWorkerRequest {
+  // An id names one registration: NOT_FOUND once it left, whatever stands
+  // under its URL since.
   fixed64 worker_id = 1;
+  // The row the patch would make holds a registration's bounds (WorkerSpec):
+  // INVALID_ARGUMENT by this field for a key, a value, the count and the row
+  // whole.
   map<string, string> labels = 2;
+  // At most 128 keys, each within a key's bound: INVALID_ARGUMENT by this
+  // field.
   repeated string remove_labels = 3;
   OverloadThresholds overload = 4;
   // The row's revision the caller read; FAILED_PRECONDITION when it moved.
@@ -587,10 +709,14 @@ message PatchWorkerRequest {
 }
 
 message DeregisterWorkerRequest {
+  // The id and the revision the caller read, as in PatchWorkerRequest.
   fixed64 worker_id = 1;
   uint64 revision = 2;
   // Drain (no new leases, Removed after the last Completed) instead of an
-  // immediate removal that releases its leases.
+  // immediate removal that releases its leases. Where the controller counts
+  // no lease the row stays DRAINING until a call without the flag removes
+  // it or the URL's next incarnation replaces it. A drain of a draining row
+  // writes nothing and answers the row unmoved.
   bool drain = 3;
 }
 

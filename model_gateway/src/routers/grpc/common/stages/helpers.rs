@@ -916,9 +916,10 @@ pub(crate) fn maybe_inject_pd_metadata(
         ..
     } = workers
     {
-        let rendezvous = PdProtocol::for_runtime(*runtime_type).map(|p| p.rendezvous);
-        if rendezvous == Some(PdRendezvous::SglangBootstrap) {
-            inject_sglang_bootstrap_metadata(request, prefill);
+        let protocol = PdProtocol::for_runtime(*runtime_type)
+            .filter(|protocol| protocol.rendezvous == PdRendezvous::SglangBootstrap);
+        if let Some(protocol) = protocol {
+            inject_sglang_bootstrap_metadata(request, prefill, protocol.dp_placement);
         }
     }
 }
@@ -927,11 +928,13 @@ pub(crate) fn maybe_inject_pd_metadata(
 fn inject_sglang_bootstrap_metadata(
     request: &mut ProtoGenerateRequest,
     prefill_worker: &Arc<dyn Worker>,
+    dp_placement: DpPlacement,
 ) {
     let metadata = prefill_worker.metadata();
     let hostname = metadata.bootstrap_host();
     let bootstrap_port = metadata.bootstrap_port().unwrap_or(DEFAULT_BOOTSTRAP_PORT);
-    let room_id = rand::rng().random_range(0..i32::MAX);
+    // This wire's room is an `int32`: minted under that bound, the cast is exact.
+    let room_id = mint_room(dp_placement, prefill_worker, i64::from(i32::MAX)) as i32;
 
     let disagg_params = DisaggregatedParams {
         bootstrap_host: hostname.to_string(),
@@ -1133,18 +1136,7 @@ fn inject_kv_bootstrap_room(
     // round_robin the decode side follows the same residue and deliberately
     // inherits the prefill placement (decode prefix reuse shrinks the KV
     // transfer).
-    let room_id = match (
-        dp_placement,
-        prefill_worker.dp_rank(),
-        prefill_worker.dp_size(),
-    ) {
-        (DpPlacement::RoomResidue, Some(rank), Some(dp)) if dp > 1 && rank < dp => {
-            let dp = dp as i64;
-            let base = rand::rng().random_range(0..i64::MAX - dp);
-            base - (base % dp) + rank as i64
-        }
-        _ => rand::rng().random_range(0..i64::MAX),
-    };
+    let room_id = mint_room(dp_placement, prefill_worker, i64::MAX);
 
     request.set_kv_bootstrap_info(hostname.to_string(), bootstrap_port as i32, room_id);
 
@@ -1152,6 +1144,31 @@ fn inject_kv_bootstrap_room(
         "Injected PD rendezvous: host={}, port={}, room={}",
         hostname, bootstrap_port, room_id
     );
+}
+
+/// A fresh rendezvous room in `0..bound`. Under `DpPlacement::RoomResidue`
+/// a dp-aware prefill worker's room is congruent to its rank, the residue
+/// the engine places by (`room % dp_size`): the room's low bits carry that
+/// structure, so do not shard on them elsewhere. A `dp_size` the room
+/// cannot carry (at or above `bound`) gets a free room, like a worker of
+/// one rank.
+fn mint_room(dp_placement: DpPlacement, prefill_worker: &Arc<dyn Worker>, bound: i64) -> i64 {
+    match (
+        dp_placement,
+        prefill_worker.dp_rank(),
+        prefill_worker.dp_size(),
+    ) {
+        (DpPlacement::RoomResidue, Some(rank), Some(dp))
+            if dp > 1 && rank < dp && i64::try_from(dp).is_ok_and(|dp| dp < bound) =>
+        {
+            // The guard holds `dp` below `bound`: both casts are exact, and
+            // the draw's range, `0..bound - dp`, is not empty.
+            let dp = dp as i64;
+            let base = rand::rng().random_range(0..bound - dp);
+            base - (base % dp) + rank as i64
+        }
+        _ => rand::rng().random_range(0..bound),
+    }
 }
 
 #[cfg(test)]

@@ -1269,6 +1269,12 @@ subscription from zero while it is complete, and a state snapshot
 replay is conservatively reset because it cannot distinguish an idle publisher
 from a restarted one.
 
+The load record on the stream differs the same way while the publisher is
+quiet: the Python servicers repeat one record, that of the rank whose batch
+went out last, and the Rust servicer's relay repeats every rank's record on
+the rank's own clock. An engine with several data-parallel ranks behind one
+address wants the Rust servicer.
+
 #### Rust request path (`--servicer-impl rust`)
 
 `sglang serve --grpc-mode` (`python -m sglang.launch_server --grpc-mode`)
@@ -1344,10 +1350,16 @@ elsewhere, and the decode side looks for the KV on that rank), the Router's pin
 yielding to it (a warning on the connection's first such request, a debug line
 on each later one); the decode side keeps the pin. A prefill side of
 several plain data-parallel replicas (`--dp-size N` without attention DP) is
-refused at launch with the engine's reason: every replica reports attention-DP
-rank 0 to the engine's KV sender, which fails each request whose room's residue
-is not 0; attention DP (`--tp-size N --attn-dp-size N`) is the multi-rank
-prefill shape. The planned
+served when it follows the room (the engine's default on a prefill side, or
+`--load-balance-method follow_bootstrap_room`): every replica reports
+attention-DP rank 0 to the engine's KV sender, so each request names the
+replica it runs on, and the decode side, which must run without
+`SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK`, finds that replica by the
+room. Under any other load-balance method, or with that variable on in the
+prefill side's environment (it stands in for the decode side's, which the
+launcher cannot see), the launch is refused: the decode side would wait for a
+rank the sender never registers for a request that names its rank; attention
+DP (`--tp-size N --attn-dp-size N`) serves those launches. The planned
 warm-up pins each of its requests to a rank (on a prefill or decode side with a
 stand-in room of that rank's residue), so every rank is warm before the Router
 sends anything. What the wire does not carry is reported, not emulated: an `--encoder-only` launch is refused (SGLang's entrypoint runs

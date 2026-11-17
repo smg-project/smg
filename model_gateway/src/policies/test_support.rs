@@ -39,7 +39,7 @@ pub(crate) fn with_headers(headers: &http::HeaderMap) -> SelectWorkerInfo<'_> {
 /// The `a`/`b` worker pair under `policy` with a test feed attached; the
 /// test publishes the pair's reports through the feed.
 pub(crate) fn fed_pair<P: LoadBalancingPolicy>(policy: P) -> (P, TestFeed, Vec<Arc<dyn Worker>>) {
-    let feed = TestFeed::attached_to(&policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     let workers = make_workers(&["http://a:8000", "http://b:8000"]);
     (policy, feed, workers)
 }

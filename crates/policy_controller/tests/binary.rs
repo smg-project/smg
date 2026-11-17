@@ -69,3 +69,33 @@ fn a_forced_color_reaches_a_pipe() {
         );
     }
 }
+
+/// The binary runs on the allocator the gateway's binary registers, with a
+/// copy of its settings. A burst of registrations builds the store's world
+/// again at every write, and the system allocator keeps resident what those
+/// builds free. The allocator is asked for its statistics at the process's
+/// end, an ask the system allocator does not hear, and the statistics name
+/// the settings it runs on.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[test]
+fn the_binary_runs_on_the_gateways_allocator() {
+    let ask = [("_RJEM_MALLOC_CONF", "stats_print:true")];
+    let output = refused_start(&ask).expect("the binary runs");
+    let written = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        written.contains("jemalloc statistics"),
+        "no statistics of the allocator at the end: {written:?}"
+    );
+    for setting in [
+        "opt.background_thread: true",
+        "opt.dirty_decay_ms: 10000 (",
+        "opt.muzzy_decay_ms: 0 (",
+        "opt.narenas: 16\n",
+        "opt.oversize_threshold: 33554432\n",
+    ] {
+        assert!(
+            written.contains(setting),
+            "the allocator does not run on {setting:?}: {written:?}"
+        );
+    }
+}

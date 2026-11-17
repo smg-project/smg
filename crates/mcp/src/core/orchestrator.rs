@@ -864,13 +864,14 @@ impl McpOrchestrator {
                             // The write-back is this connection's: a recovery
                             // during the listings replaced the entry (or a
                             // removal dropped it), and its own load's tools
-                            // and outcome stand, not a stale listing's.
-                            match static_servers.get_mut(key) {
-                                Some(mut entry) if Arc::ptr_eq(&entry.client, &client) => {
-                                    entry.list_error = None;
-                                }
+                            // and outcome stand, not a stale listing's. The
+                            // entry stays held while the listing goes in and
+                            // its error is cleared last: a reader that finds
+                            // no listing error finds the tools.
+                            let mut server = match static_servers.get_mut(key) {
+                                Some(entry) if Arc::ptr_eq(&entry.client, &client) => entry,
                                 _ => continue,
-                            }
+                            };
                             tool_inventory.clear_server_tool_entries(key);
                             for entry in tools {
                                 tool_inventory.insert_entry(entry);
@@ -884,6 +885,8 @@ impl McpOrchestrator {
                                 install_resources(&tool_inventory, key, resources);
                             }
                             apply_tool_configs(&tool_inventory, &config);
+                            server.list_error = None;
+                            drop(server);
                             info!(
                                 "Refreshed '{}'; the inventory now holds {} tools",
                                 key,
@@ -977,6 +980,32 @@ impl McpOrchestrator {
         }
 
         names
+    }
+
+    /// Whether a server of this name is configured as internal: the answer
+    /// [`Self::internal_server_names`] holds for the name, read by key.
+    pub(crate) fn is_internal_server(&self, name: &str) -> bool {
+        self.static_servers
+            .get(name)
+            .is_some_and(|entry| entry.config.internal)
+            || self
+                .config
+                .servers
+                .iter()
+                .any(|server| server.internal && server.name == name)
+    }
+
+    /// Whether a server of this name has `builtin_type` configured: the
+    /// answer [`Self::builtin_server_names`] holds for the name, read by key.
+    pub(crate) fn is_builtin_server(&self, name: &str) -> bool {
+        self.static_servers
+            .get(name)
+            .is_some_and(|entry| entry.config.builtin_type.is_some())
+            || self
+                .config
+                .servers
+                .iter()
+                .any(|server| server.builtin_type.is_some() && server.name == name)
     }
 
     /// Execute a single tool using an already-resolved qualified binding.
@@ -1813,14 +1842,9 @@ impl McpOrchestrator {
     /// List tools for specific servers: the servers in the order given, each
     /// server's tools in its listing order (the inventory's maps keep neither),
     /// an entry without a position after the listed ones, the name settling
-    /// ties. One walk of the inventory, cloning only these servers' entries.
+    /// ties. Read by server key, cloning only these servers' entries.
     pub fn list_tools_for_servers(&self, server_keys: &[String]) -> Vec<ToolEntry> {
-        // For small server lists (typical case: 1-5), linear scan is faster than HashSet
-        let server_rank = |server_key: &str| server_keys.iter().position(|s| s == server_key);
-
-        let mut ranked = self
-            .tool_inventory
-            .entries_keyed(|entry| server_rank(entry.server_key()));
+        let mut ranked = self.tool_inventory.entries_of_servers(server_keys);
         ranked.sort_by(|(rank_a, a), (rank_b, b)| {
             (rank_a, a.position.is_none(), a.position, a.tool_name()).cmp(&(
                 rank_b,
@@ -1871,8 +1895,10 @@ impl McpOrchestrator {
             .and_then(|entry| entry.list_error.clone())
     }
 
-    /// Whether a configured server is held under `server_key`: connected at
-    /// startup (an optional server whose connect failed is not held).
+    /// Whether a configured server is held under `server_key`: one that
+    /// connected, at construction or by a later registration, and is held
+    /// until shutdown, a dropped transport included (a server whose first
+    /// connect failed, or whose registration is still retrying, is not held).
     pub fn has_static_server(&self, server_key: &str) -> bool {
         self.static_servers.contains_key(server_key)
     }

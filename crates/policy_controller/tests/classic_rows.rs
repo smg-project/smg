@@ -8,14 +8,14 @@
 //! commit draws other counts within the same spread. One module a classic
 //! policy holds its rows' shape and their replay.
 //!
-//! The sheets live outside this repository, with the recorder:
-//! `SMG_POLICY_CLASSIC_ROWS` names their directory for the ignored test. A
-//! few rows of each form are copied into the policy's module from its
-//! sheet, so every run of the suite with the `ingest` feature replays a
-//! subset. A row's reports reach the view through that feature's row
-//! builder, so a bare test run of the crate builds no part of this target
-//! and replays no recorded row. The ignored test holds every copied row to
-//! the sheet's row of its name.
+//! The sheets live beside this target, in `tests/classic/sheets`, with the
+//! notes on their rows, and each recorder is a test module of the gateway
+//! crate beside the code it runs. Every run of the suite with the `ingest`
+//! feature replays every row of every sheet. A few rows of each form are
+//! copied into the policy's module from its sheet as well, and the replay
+//! holds every copied row to the sheet's row of its name. A row's reports
+//! reach the view through that feature's row builder, so a bare test run
+//! of the crate builds no part of this target and replays no recorded row.
 //!
 //! A sequence row must replay pick for pick. A drawn row must give each
 //! worker the recorded share within the spread of two samples of that size,
@@ -23,7 +23,9 @@
 //! No row is decided differently. A row whose form this crate does not
 //! build yet is owed: [`OWED`] names it with the validator's words and the
 //! change that builds it, and the replay fails once the row is no longer
-//! refused in those words.
+//! refused in those words. A sheet whose module has not landed here is owed
+//! too: [`OWED_SHEETS`] names its policy and the change that brings the
+//! module, and the suite fails once a module replays that policy.
 #![expect(clippy::expect_used, reason = "a replay that stops on a broken setup")]
 
 use std::{
@@ -73,6 +75,46 @@ const OWED: &[Owed] = &[Owed {
     refused: "sessions run under the single plan",
     by: "sessions on the sides of a pair, which read the pair's partner lists",
 }];
+
+/// A sheet of the directory whose module has not landed here: `policy`
+/// is its head's, and `by` names the change that brings the module. The
+/// sheet replays no row and answers for no defect while no
+/// module replays its policy, and the suite fails the day one does, so an
+/// entry cannot outlive its debt.
+struct OwedSheet {
+    policy: &'static str,
+    by: &'static str,
+}
+
+/// The owed sheets: each was recorded before the change that replays it
+/// landed here.
+const OWED_SHEETS: &[OwedSheet] = &[
+    OwedSheet {
+        policy: "all_vetoed",
+        by: "the rule that answers a pool the overload veto empties",
+    },
+    OwedSheet {
+        policy: "encode_pair",
+        by: "the placement of a request's encode items beside its pair",
+    },
+    OwedSheet {
+        policy: "overload",
+        by: "the replay of the overload verdict and the rule that ends a sample by its age",
+    },
+    OwedSheet {
+        policy: "pair-index",
+        by: "the prefill and decode pair index",
+    },
+    OwedSheet {
+        policy: "pair-select",
+        by: "the placement of a prefill and decode pair",
+    },
+];
+
+/// The owed sheet of a policy, when one is owed.
+fn owed_sheet(policy: &str) -> Option<&'static OwedSheet> {
+    OWED_SHEETS.iter().find(|owed| owed.policy == policy)
+}
 
 fn shares(counts: &[u32], draws: u32) -> Vec<f64> {
     counts
@@ -220,7 +262,8 @@ const MODULES: [Module; 2] = [
 ];
 
 /// The number of rows replayed and what did not replay; a text that is no
-/// sheet is one defect, and so is a sheet of a policy no module replays.
+/// sheet is one defect, and so is a sheet of a policy no module replays
+/// unless [`OWED_SHEETS`] names it.
 fn replay_sheet(text: &str, source: &str) -> (usize, Vec<String>) {
     let head: Head = match serde_json::from_str(text) {
         Ok(head) => head,
@@ -229,6 +272,7 @@ fn replay_sheet(text: &str, source: &str) -> (usize, Vec<String>) {
     let module = MODULES.iter().find(|module| module.policy == head.policy);
     let (rows, mut defects) = match module {
         Some(module) => (module.replay)(text, source),
+        None if owed_sheet(&head.policy).is_some() => (0, Vec::new()),
         None => (
             0,
             vec![format!(
@@ -372,9 +416,9 @@ fn replay_sheets(sheets: &[(String, String)]) -> (Vec<(usize, Vec<String>)>, Vec
 /// how many defects it answers for), then one a module of [`MODULES`]: the
 /// policy with its one sheet's rows and defects, or that it has no sheet,
 /// or how many. Its defects: what no one sheet answers for, then each
-/// sheet's own. The ignored test prints the lines and fails on a defect.
-/// The replay job reads the lines too and fails unless every policy line
-/// counts rows and no defect, so a run that checks nothing cannot pass.
+/// sheet's own. The whole replay prints the lines and fails on a defect
+/// and on a policy line that counts no row, so a run that replays nothing
+/// cannot pass.
 fn replay_report(sheets: &[(String, String)]) -> (Vec<String>, Vec<String>) {
     let (of_sheet, mut defects) = replay_sheets(sheets);
     let mut lines = Vec::with_capacity(sheets.len() + MODULES.len());
@@ -392,14 +436,25 @@ fn replay_report(sheets: &[(String, String)]) -> (Vec<String>, Vec<String>) {
             more => format!("policy {policy}: {} sheets", more.len()),
         });
     }
+    for (name, text) in sheets {
+        let owed = serde_json::from_str::<Head>(text)
+            .ok()
+            .and_then(|head| owed_sheet(&head.policy));
+        if let Some(owed) = owed {
+            lines.push(format!(
+                "owed {}: {name} waits for {}",
+                owed.policy, owed.by
+            ));
+        }
+    }
     defects.extend(of_sheet.into_iter().flat_map(|(_, found)| found));
     (lines, defects)
 }
 
 /// The sheets of a directory, each as its path and its text, by path: every
 /// file with the `json` extension, whatever its name, so a sheet nobody
-/// expects is read and answered for. No other file is read: the recorder
-/// and its notes live beside the sheets.
+/// expects is read and answered for. No other file is read: the notes on
+/// the rows live beside the sheets.
 fn sheets_under(dir: &Path) -> Vec<(String, String)> {
     let mut paths: Vec<PathBuf> = fs::read_dir(dir)
         .expect("the sheets' directory is readable")
@@ -431,8 +486,52 @@ fn the_classic_manual_rows_replay_pick_for_pick_and_share_for_share() {
     assert!(defects.is_empty(), "{defects:#?}");
 }
 
+/// A sheet whose module has not landed is owed, not a defect: it replays no
+/// row, the report says what it waits for, and it still names the commit
+/// its rows were recorded from. No entry names a policy a module replays.
+#[test]
+fn a_sheet_owed_its_module_replays_no_row_and_is_no_defect() {
+    for owed in OWED_SHEETS {
+        assert!(
+            MODULES.iter().all(|module| module.policy != owed.policy),
+            "{} has a module now: take it out of OWED_SHEETS",
+            owed.policy
+        );
+        let text = format!(
+            r#"{{"recorded_from": "a commit", "policy": "{}", "rows": []}}"#,
+            owed.policy
+        );
+        assert_eq!(replay_sheet(&text, "owed.json"), (0, Vec::new()));
+    }
+    let mut sheets = copied_sheets();
+    sheets.push((
+        "owed.json".to_string(),
+        r#"{"recorded_from": "a commit", "policy": "all_vetoed", "rows": []}"#.to_string(),
+    ));
+    let (lines, defects) = replay_report(&sheets);
+    assert_eq!(defects, Vec::<String>::new());
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "owed.json: 0 rows, 0 defects"),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("owed all_vetoed: owed.json waits for ")),
+        "{lines:#?}"
+    );
+    let unnamed = r#"{"recorded_from": "", "policy": "all_vetoed", "rows": []}"#;
+    let (_, defects) = replay_sheet(unnamed, "owed.json");
+    assert!(
+        matches!(defects.as_slice(), [one] if one.contains("no commit")),
+        "{defects:#?}"
+    );
+}
+
 /// Every owed row is in an inline subset, so every run of the suite checks
-/// that it is still refused, not the ignored test alone.
+/// that it is still refused, the copied rows' replay beside the whole one.
 #[test]
 fn every_owed_row_is_an_inline_row() {
     let inline = row_names::<classic::manual::Row>(classic::manual::INLINE);
@@ -599,7 +698,7 @@ fn a_sheet_that_names_no_commit_is_a_defect() {
     );
 }
 
-/// The walk of the sheets' directory, as the ignored test reads it: every
+/// The walk of the sheets' directory, as the whole replay reads it: every
 /// `json` file is a sheet to answer for, whatever its name, and no other
 /// file is read. Beside the copied sheets, each under its policy's name, a
 /// sheet of a policy no module replays, a second sheet of one policy under
@@ -613,9 +712,10 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
     for (name, text) in copied_sheets() {
         write(&name, &text);
     }
-    // The recorder's own files stand beside the sheets and are not read.
+    // The notes on the rows and a file of another kind stand beside the
+    // sheets and are not read.
     write("README.md", "how the rows are recorded");
-    write("classic_rows.rs", "// the recorder");
+    write("rows.txt", "no sheet: not a json file");
     let (lines, defects) = replay_report(&sheets_under(dir.path()));
     assert_eq!(lines.len(), 2 * MODULES.len(), "{lines:#?}");
     assert_eq!(defects, Vec::<String>::new());
@@ -655,7 +755,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
     }
 }
 
-/// The report the ignored test prints and judges by, over sheets built
+/// The report the whole replay prints and judges by, over sheets built
 /// here: a line a sheet, then a line a module of the table. The copied
 /// sheets give clean lines and no defect. Each planted defect is refused by
 /// name and shows in a line: a policy left with no sheet and a second sheet
@@ -755,30 +855,32 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
     );
 }
 
-/// Ignored by default because the sheets live in the test-data repository,
-/// not here: `cargo test --features ingest --test classic_rows -- --ignored`
-/// with `SMG_POLICY_CLASSIC_ROWS` naming their directory runs it. It fails
-/// rather than passes when the variable is unset, when a policy with a
-/// module here has no sheet in the directory, and when a row copied into a
-/// module is not its sheet's row.
+/// The whole replay, over the sheets beside this target: every row of every
+/// sheet under `tests/classic/sheets`. It fails when a policy with a module
+/// here has no sheet in the directory, when a row copied into a module is
+/// not its sheet's row, and when a policy's line counts no row, so a run
+/// that replays nothing cannot pass.
 #[test]
-#[ignore = "needs SMG_POLICY_CLASSIC_ROWS, the recorded sheets' directory of the test-data repository"]
 #[expect(
     clippy::print_stdout,
     reason = "the per-sheet counts are the replay's report"
 )]
 fn every_recorded_classic_row_replays() {
-    let dir = std::env::var_os("SMG_POLICY_CLASSIC_ROWS")
-        .expect("SMG_POLICY_CLASSIC_ROWS names the recorded sheets' directory");
-    let sheets = sheets_under(Path::new(&dir));
-    assert!(
-        !sheets.is_empty(),
-        "no sheets under {}",
-        dir.to_string_lossy()
-    );
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/classic/sheets");
+    let sheets = sheets_under(&dir);
+    assert!(!sheets.is_empty(), "no sheets under {}", dir.display());
     let (lines, defects) = replay_report(&sheets);
     for line in &lines {
         println!("{line}");
     }
     assert!(defects.is_empty(), "{defects:#?}");
+    let policies: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("policy "))
+        .collect();
+    assert_eq!(policies.len(), MODULES.len(), "{lines:#?}");
+    assert!(
+        policies.iter().all(|line| !line.contains(": 0 rows, ")),
+        "a policy replayed no row: {lines:#?}"
+    );
 }

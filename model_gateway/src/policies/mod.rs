@@ -16,12 +16,20 @@ use crate::{
 mod bucket;
 mod cache_aware;
 mod cache_namespace;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_all_vetoed_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_manual_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_rows;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;
 pub mod expected_wait;
 mod factory;
-pub mod hash_ring;
 mod least_load;
 mod manual;
 mod passthrough;
@@ -32,7 +40,6 @@ mod registry;
 mod round_robin;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
@@ -50,6 +57,12 @@ pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+
+// The ring lives with the registry that owns and rebuilds it, and the
+// periodic task beside the worker runtime. The paths they had here are kept:
+// the policies name both, and callers outside the crate name the ring.
+pub(crate) use crate::worker::periodic_task as utils;
+pub use crate::worker::registry::hash_ring;
 
 /// Core trait for load balancing policies
 ///
@@ -205,6 +218,17 @@ pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolic
         || policy.is::<CacheAwarePolicy>()
         || policy.is::<ManualPolicy>()
         || policy.is::<PassthroughPolicy>()
+}
+
+/// Whether a built-in policy reads the model's hash ring
+/// ([`SelectWorkerInfo::hash_ring`]). Single-worker placement fetches the
+/// ring for these alone: the fetch is a keyed read of the registry and a
+/// shared count, up and down, on every request. A policy that starts to read
+/// the ring joins this list; left out, it is handed none and places by its
+/// ring-less fallback.
+pub(crate) fn policy_reads_hash_ring(policy: &dyn LoadBalancingPolicy) -> bool {
+    let policy = policy.as_any();
+    policy.is::<ConsistentHashingPolicy>() || policy.is::<PrefixHashPolicy>()
 }
 
 pub trait DPRankLoadPolicy: Send + Sync + Debug {
@@ -463,7 +487,9 @@ pub struct SelectWorkerInfo<'a> {
     /// present under the routing-key override.
     pub rid_key: Option<&'a str>,
     /// Pre-computed hash ring for O(log n) consistent hashing
-    /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
+    /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds.
+    /// Single-worker placement hands it to a policy that reads it
+    /// (`policy_reads_hash_ring`) and `None` to any other.
     pub hash_ring: Option<Arc<HashRing>>,
     /// Which PD role this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.
@@ -637,7 +663,7 @@ mod tests {
         );
 
         // A busy worker is still eligible: load alone is not the veto.
-        let _guard = WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
+        let _guard = WorkerLoadGuard::with_key(Arc::clone(&workers[1]), None);
         assert_eq!(
             get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
             vec![0, 1, 2]

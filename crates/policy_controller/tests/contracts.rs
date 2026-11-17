@@ -165,6 +165,7 @@ fn request_record() -> &'static [&'static str] {
             block_size,
             now_micros,
             affinity,
+            named,
             model_fingerprint,
         }
     )
@@ -211,6 +212,7 @@ fn pool_record() -> &'static [&'static str] {
             regime,
             generation,
             zones,
+            reach,
         }
     )
 }
@@ -627,7 +629,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
             record: request_record(),
             // The affinity column rides the request in the crate; the wire
             // carries each entry in its candidate.
-            host_only: &["now_micros", "affinity", "model_fingerprint"],
+            host_only: &["now_micros", "affinity", "named", "model_fingerprint"],
             wire_only: &["prompt_text"],
             wire: &[
                 ("model", Type::String),
@@ -670,7 +672,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &[],
+            host_only: &["reach"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -755,6 +757,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "shadow_pick",
                 "fallback",
                 "affinity_source",
+                // The record reads it from its count ([`Trace::drew_first`]).
+                "drew_first",
             ],
             wire: &[
                 ("profile", Type::Uint32),
@@ -768,9 +772,10 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("shadow_pick", Type::Fixed64),
                 ("fallback", Type::Bool),
                 ("affinity_source", Type::Enum),
+                ("drew_first", Type::Bool),
             ],
             repeated: &["top", "drops"],
-            optional: &[],
+            optional: &["survivors"],
         },
         ProtoMirror {
             message: "Lease",
@@ -853,7 +858,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "request",
             crate_record: request_record(),
-            host_only: &["now_micros", "affinity", "model_fingerprint"],
+            host_only: &["now_micros", "affinity", "named", "model_fingerprint"],
             before: &[],
             beside: &[],
         },
@@ -867,7 +872,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &[],
+            host_only: &["reach"],
             before: &[],
             beside: &[],
         },
@@ -1710,6 +1715,91 @@ fn the_watch_workers_resume_fields_are_pinned() {
             .collect();
         assert_eq!(found, expected, "{message_name}: a resume field moved");
     }
+}
+
+/// What a registration states and its answer tells, by name and number: the
+/// prober's settings (one message for the registration and the row), the
+/// row's rank and engine, and the two thresholds a row is judged by.
+const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
+    (
+        "HealthPolicy",
+        &[
+            ("failure_threshold", 1, Type::Uint32),
+            ("success_threshold", 2, Type::Uint32),
+            ("check_interval_ms", 3, Type::Uint32),
+            ("timeout_ms", 4, Type::Uint32),
+            ("disabled", 5, Type::Bool),
+        ],
+    ),
+    (
+        "OverloadThresholds",
+        &[
+            ("queue_limit", 1, Type::Uint32),
+            ("kv_usage_permille", 2, Type::Uint32),
+        ],
+    ),
+    (
+        "WorkerRow",
+        &[
+            ("dp_rank", 23, Type::Uint32),
+            ("engine", 24, Type::String),
+            ("health_policy", 25, Type::Message),
+        ],
+    ),
+    ("WorkerSpec", &[("health_policy", 14, Type::Message)]),
+];
+
+#[test]
+fn the_membership_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, expected) in MEMBERSHIP_FIELDS {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        // The two small messages are pinned whole, the two rows by the
+        // fields named here.
+        let whole = matches!(*message_name, "HealthPolicy" | "OverloadThresholds");
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                whole
+                    || expected
+                        .iter()
+                        .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a membership field moved");
+    }
+
+    // The two thresholds no judge read left the message: their numbers and
+    // names stay reserved, so a reader brings one back under a new number.
+    let overload = message(controller, "OverloadThresholds")
+        .expect("OverloadThresholds is in the controller file");
+    let reserved: Vec<i32> = overload
+        .reserved_range
+        .iter()
+        .flat_map(|range| range.start()..range.end())
+        .collect();
+    assert_eq!(reserved, [3, 4], "the reserved numbers");
+    assert_eq!(
+        overload.reserved_name,
+        strings(&["in_flight_limit", "waiting_tokens_limit"])
+    );
+
+    // A status keeps its number; the failed one is the last.
+    assert_eq!(
+        enum_values(controller, "WorkerStatus"),
+        Some(proto_enum(
+            "WORKER_STATUS",
+            &["Pending", "Ready", "NotReady", "Draining", "Failed"]
+        ))
+    );
 }
 
 /// The packed request block's layout as the world's comment states it: an

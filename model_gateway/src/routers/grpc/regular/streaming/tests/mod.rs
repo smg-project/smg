@@ -141,6 +141,24 @@ fn chunk_frames_write_the_bytes_of_the_whole_structs() {
                 usage.is_some()
             );
         }
+
+        let usage = Usage::from_counts(3, 2);
+        let mut buffer = BytesMut::new();
+        frame.write_usage_chunk(&mut buffer, &usage);
+        let whole = ChatCompletionStreamResponse {
+            id: "chatcmpl-1".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1_700_000_000,
+            model: "model-x".to_string(),
+            system_fingerprint: fingerprint.map(str::to_string),
+            choices: Vec::new(),
+            usage: Some(usage),
+        };
+        assert_eq!(
+            event(&buffer),
+            serde_json::to_vec(&whole).unwrap(),
+            "chat usage chunk, fingerprint {fingerprint:?}"
+        );
     }
 }
 

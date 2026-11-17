@@ -2963,6 +2963,45 @@ mod tests {
         );
     }
 
+    /// A session reads the orchestrator's maps by key. A walk of one of them
+    /// allocates once per shard, four times at the least and more with every
+    /// core of the host. No read here has room for one: the tool listing of a
+    /// server without tools allocates nothing, and a session makes only its
+    /// own calls, 4 when the request binds no server and 12 when it binds
+    /// one.
+    #[tokio::test]
+    async fn a_session_walks_no_sharded_map() {
+        let orchestrator = McpOrchestrator::new(McpConfig::default())
+            .await
+            .expect("an orchestrator with no servers");
+
+        let before = counting_alloc::calls();
+        let session = McpToolSession::new(&orchestrator, Vec::new(), "test-request");
+        let unbound = counting_alloc::calls() - before;
+
+        let bindings = vec![McpServerBinding {
+            label: "a-label".to_string(),
+            server_key: "a-server".to_string(),
+            allowed_tools: None,
+            list_error: None,
+        }];
+        let before = counting_alloc::calls();
+        let bound_session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        let bound = counting_alloc::calls() - before;
+
+        let keys = ["a-server".to_string()];
+        let before = counting_alloc::calls();
+        let listed = orchestrator.list_tools_for_servers(&keys);
+        let listing = counting_alloc::calls() - before;
+
+        assert!(session.mcp_tools().is_empty() && listed.is_empty());
+        assert!(bound_session.mcp_tools().is_empty() && bound_session.mcp_servers().len() == 1);
+        assert!(
+            unbound < 8 && bound < 16 && listing < 4,
+            "allocation calls: {unbound} for a session without a server, {bound} for a session that binds one, {listing} for a server's tool listing"
+        );
+    }
+
     /// Allocation calls of the tool descriptors above, today.
     const PINNED_DESCRIPTOR_CALLS: usize = 4643;
 

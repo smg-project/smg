@@ -61,6 +61,7 @@ use openai_protocol::worker::{
 };
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
+use rustc_hash::FxHashMap;
 use smg_grpc_client::common_proto::EngineLoad;
 use tokio::{
     sync::{broadcast, Notify},
@@ -70,9 +71,9 @@ use tracing::{debug, info, warn};
 
 use crate::{
     observability::metrics::Metrics,
-    policies::PolicyRegistry,
     worker::{
         health::liveness,
+        identity::endpoint::Endpoint,
         load::state::{LoadReceiver, LoadSnapshot, LoadState},
         registry::event::WorkerEvent,
         ConnectionMode, Worker, WorkerRegistry,
@@ -82,6 +83,24 @@ use crate::{
 mod scrape;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The rank loads by worker as the update line writes them: each address
+/// masked. A worker's address may hold a credential in its userinfo or a
+/// token in its query. The address is read when the line is written, so
+/// nothing is parsed while debug logging is off.
+struct MaskedLoads<'a>(&'a HashMap<String, HashMap<isize, isize>>);
+
+impl Debug for MaskedLoads<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(url, ranks)| (Endpoint::redacted_str(url), ranks)),
+            )
+            .finish()
+    }
+}
 
 /// DP rank load cache used by load-aware routing policies.
 ///
@@ -108,7 +127,10 @@ impl WorkerLoadManager {
 
     /// Replace cached rank loads for the supplied workers, preserving other workers.
     pub fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
-        debug!("WorkerLoadManager update_dp_loads map:{:?}", loads);
+        debug!(
+            "WorkerLoadManager update_dp_loads map:{:?}",
+            MaskedLoads(loads)
+        );
         let mut cached = self.dp_cached_loads.write();
         cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
@@ -290,10 +312,22 @@ impl NativeLoadsMemo {
     }
 }
 
+/// The routing side as the load monitor sees it: whoever reads the loads the
+/// monitor publishes and books requests on workers. The gateway's policy
+/// registry implements it; the monitor names no policy.
+pub trait LoadConsumer: Send + Sync {
+    /// Whether a reader wants worker loads, so the monitor has to fetch them.
+    fn needs_loads(&self) -> bool;
+
+    /// Trim what the readers booked on `worker` to the requests the router
+    /// still holds there.
+    fn reconcile_in_flight(&self, worker: &dyn Worker);
+}
+
 /// Load monitoring service that subscribes to `WorkerRegistry` events.
 pub struct WorkerMonitor {
     worker_registry: Arc<WorkerRegistry>,
-    policy_registry: Arc<PolicyRegistry>,
+    load_consumer: Arc<dyn LoadConsumer>,
     pub worker_load_manager: Arc<WorkerLoadManager>,
     default_interval: Duration,
     /// When set, force load polling even if no load-aware routing policy is
@@ -324,14 +358,17 @@ pub struct WorkerMonitor {
     /// ([`Self::apply_pushed_load`]), a poll's entry replaces a rank's that
     /// pushed nothing since the poll began ([`Self::apply_polled_load`]).
     /// A record's readers borrow it, and the coalesced publish copies it
-    /// once per window, so a record builds no report of its own.
-    pushed_reports: Mutex<HashMap<String, WorkerLoadResponse>>,
+    /// once per window, so a record builds no report of its own. This map
+    /// and the two below are keyed by the worker's URL, a string of the
+    /// gateway's own, and every record looks its worker up in each: they
+    /// hash with FxHash.
+    pushed_reports: Mutex<FxHashMap<String, WorkerLoadResponse>>,
     /// When each rank of a worker last pushed a load record, by receipt:
     /// the tick's poll decision reads it (see [`PollMode`]).
-    pushed_at: Mutex<HashMap<String, BTreeMap<i32, Instant>>>,
+    pushed_at: Mutex<FxHashMap<String, BTreeMap<i32, Instant>>>,
     /// The workers whose report changed since the last coalesced publish,
     /// each with the incarnation that pushed, for the publish fence.
-    pending_pushed: Mutex<HashMap<String, Arc<dyn Worker>>>,
+    pending_pushed: Mutex<FxHashMap<String, Arc<dyn Worker>>>,
     pushed_notify: Arc<Notify>,
     pushed_flush_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -437,7 +474,7 @@ impl WorkerMonitor {
     /// is still safe to read; it just stays empty.
     pub fn new(
         worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
+        load_consumer: Arc<impl LoadConsumer + 'static>,
         default_interval_secs: u64,
         engine_metrics: bool,
         conditional_polling: bool,
@@ -445,7 +482,7 @@ impl WorkerMonitor {
         let load_state = Arc::new(LoadState::new(Arc::clone(&worker_registry)));
         Self {
             worker_registry,
-            policy_registry,
+            load_consumer,
             worker_load_manager: Arc::new(WorkerLoadManager::new()),
             default_interval: Duration::from_secs(default_interval_secs.max(1)),
             engine_metrics,
@@ -456,9 +493,9 @@ impl WorkerMonitor {
             event_task: Mutex::new(None),
             eviction_flush_task: Mutex::new(None),
             liveness_sweep_task: Mutex::new(None),
-            pushed_reports: Mutex::new(HashMap::new()),
-            pushed_at: Mutex::new(HashMap::new()),
-            pending_pushed: Mutex::new(HashMap::new()),
+            pushed_reports: Mutex::new(FxHashMap::default()),
+            pushed_at: Mutex::new(FxHashMap::default()),
+            pending_pushed: Mutex::new(FxHashMap::default()),
             pushed_notify: Arc::new(Notify::new()),
             pushed_flush_task: Mutex::new(None),
         }
@@ -624,8 +661,7 @@ impl WorkerMonitor {
         if !self.conditional_polling {
             return true;
         }
-        let routing_needs_load = self.policy_registry.needs_backend_loads()
-            || self.policy_registry.get_dp_rank_policy().is_some();
+        let routing_needs_load = self.load_consumer.needs_loads();
         let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
         routing_needs_load || self.engine_metrics || overload_needs_load
     }
@@ -1854,7 +1890,7 @@ async fn poll_group_once(
     // for every worker, polled or served by its stream, whether or not a
     // fetch succeeded; the live count is the router's.
     for worker in &workers {
-        monitor.policy_registry.reconcile_in_flight(worker.as_ref());
+        monitor.load_consumer.reconcile_in_flight(worker.as_ref());
     }
 
     if polled.is_empty() {
@@ -1933,7 +1969,7 @@ mod native_loads_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        policies::{LoadBalancingPolicy, SelectWorkerInfo},
+        policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
         worker::{BasicWorkerBuilder, ConnectionMode, WorkerLoadGuard, WorkerType},
     };
 
@@ -2163,11 +2199,17 @@ mod native_loads_tests {
     #[tokio::test]
     async fn load_poll_reconciles_in_flight_with_the_workers_policy() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
-        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+        let registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let monitor = Arc::new(WorkerMonitor::new(
+            registry.clone(),
+            Arc::clone(&policy_registry),
+            1,
+            false,
+            false,
+        ));
         let recorder = Arc::new(ReconcileRecorder::default());
-        monitor
-            .policy_registry
-            .set_decode_policy(Arc::clone(&recorder) as Arc<dyn LoadBalancingPolicy>);
+        policy_registry.set_decode_policy(Arc::clone(&recorder) as Arc<dyn LoadBalancingPolicy>);
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(stub.url.as_str())
                 .worker_type(WorkerType::Decode)
@@ -2181,7 +2223,7 @@ mod native_loads_tests {
                 .build(),
         );
         worker.set_status(WorkerStatus::Ready);
-        let held = WorkerLoadGuard::new(Arc::clone(&worker), None);
+        let held = WorkerLoadGuard::with_key(Arc::clone(&worker), None);
         registry.register(Arc::clone(&worker)).unwrap();
         monitor.start_event_loop();
 
@@ -3759,3 +3801,7 @@ mod native_loads_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_overload_rows;

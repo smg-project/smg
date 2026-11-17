@@ -15,7 +15,13 @@
 //! to the store at a take and publishes what it saw. At the shutdown signal
 //! it closes the fence and rewrites the record released, in that order, so
 //! no instant has two open fences and the next candidate to look takes the
-//! lease at once; it then stops and never takes again.
+//! lease at once, or one renew deadline later when this thread's own take
+//! still waited to lead; it then stops and never takes again.
+//!
+//! A word to leave (`Running::step_down`: a planned hand-over, or a term a
+//! caller says it saw) is taken by the same thread between two steps: the
+//! fence closed, the lease released, no take for one lease duration. The
+//! thread goes on stepping.
 
 use std::{
     fmt, io,
@@ -33,7 +39,7 @@ use super::config::ConfigError;
 #[cfg(feature = "kubernetes")]
 use crate::elector::KubernetesLease;
 use crate::{
-    elector::{ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, MemoryLease, Tick},
+    elector::{ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, Tick, TERM_CEILING},
     store::{LeasesStore, MemoryStore},
 };
 
@@ -291,7 +297,9 @@ pub enum LeaseError {
 /// is not there refuses the start before a listener serves.
 pub(crate) async fn elector(election: &Election, identity: String) -> Result<Elector, LeaseError> {
     let backend: Box<dyn LeaseBackend> = match &election.lease {
-        LeasePlace::Process => Box::new(MemoryLease::new()),
+        // The elector makes this place's store itself and hands it to
+        // nobody: no other holder can be, and its take leads at once.
+        LeasePlace::Process => return Ok(Elector::alone(identity, election.settings)?),
         LeasePlace::File(path) => {
             let directory = match path.parent() {
                 Some(directory) if !directory.as_os_str().is_empty() => directory,
@@ -345,16 +353,26 @@ pub(crate) struct Standing {
     /// the highest this replica saw: no write stored that holder under
     /// the term beside it.
     pub(crate) holder: String,
-    /// The highest term this replica saw.
+    /// The highest term this replica saw, in the lease or said by a caller.
     pub(crate) term: u64,
     /// Whether a look at the lease has succeeded: readiness waits for the
     /// first, so a replica that cannot reach its lease never reads ready.
     pub(crate) looked: bool,
 }
 
-/// The running election: its stop signal and its end.
+/// A word to the election thread.
+enum Word {
+    /// The planned stop: the fence closed, the lease released, the thread
+    /// ended.
+    Stop,
+    /// Leave and stay in the election: a planned hand-over, or a term a
+    /// caller says it saw.
+    StepDown(Option<u64>),
+}
+
+/// The running election: its words and its end.
 pub(crate) struct Running {
-    stop: mpsc::Sender<()>,
+    words: mpsc::Sender<Word>,
     /// Taken once the thread's end was seen.
     end: Option<oneshot::Receiver<()>>,
 }
@@ -364,7 +382,29 @@ impl Running {
     /// and ends.
     pub(crate) fn stop(&self) {
         // A thread that is gone has nothing to release.
-        let _ = self.stop.send(());
+        let _ = self.words.send(Word::Stop);
+    }
+
+    /// A word to leave: a planned hand-over (`None`), or a term `above`
+    /// that a caller says it saw, a gateway's floor or a standby's. The
+    /// thread counts the term among the terms this replica saw. Where it
+    /// leads under a lower term, or no term is said, it closes the fence,
+    /// releases the lease under the highest term it saw and takes nothing
+    /// for one lease duration; a replica that holds no lease, or leads at
+    /// or above the term said, keeps on as it is. A word may not spend the
+    /// last term: the caller refuses, at its wire, a term whose next is not
+    /// below [`TERM_CEILING`].
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "its callers land with the session's term floor")
+    )]
+    pub(crate) fn step_down(&self, above: Option<u64>) {
+        assert!(
+            above.is_none_or(|term| term < TERM_CEILING - 1),
+            "a term that leaves none to take reached the election"
+        );
+        // A thread that is gone holds no lease.
+        let _ = self.words.send(Word::StepDown(above));
     }
 
     /// Resolves when the thread is gone, after a stop or on its own; at
@@ -386,18 +426,18 @@ pub(crate) fn start(
     store: Arc<MemoryStore>,
     standing: watch::Sender<Standing>,
 ) -> io::Result<Running> {
-    let (stop, stopped) = mpsc::channel();
+    let (words, heard) = mpsc::channel();
     let (end, ended) = oneshot::channel();
     thread::Builder::new()
         .name("election".to_owned())
         .spawn(move || {
-            run(elector, &store, &standing, &stopped);
+            run(elector, &store, &standing, &heard);
             // The run loop is gone with its receiver when the controller
             // returned first.
             let _ = end.send(());
         })?;
     Ok(Running {
-        stop,
+        words,
         end: Some(ended),
     })
 }
@@ -406,13 +446,14 @@ fn run(
     mut elector: Elector,
     store: &MemoryStore,
     standing: &watch::Sender<Standing>,
-    stopped: &mpsc::Receiver<()>,
+    words: &mpsc::Receiver<Word>,
 ) {
     let period = elector.settings().renew_period;
     let deadline = elector.settings().renew_deadline;
     let mut seen = Standing::default();
     let mut following = String::new();
-    let mut gone = false;
+    let mut streak = Streak::default();
+    let mut leading = false;
     let mut failing = false;
     let mut fallen = false;
     // The start of the step that stamped the fence last, while this replica
@@ -458,10 +499,20 @@ fn run(
                         late = false;
                     }
                 }
-                match elector.observed() {
-                    // A record that is gone names nobody and has a line of
-                    // its own.
-                    _ if matches!(tick, Tick::Gone { .. }) => seen.holder.clear(),
+                // A record that is gone names nobody and has a line of its
+                // own. So does a lease lost to nobody, released or emptied
+                // under this holder: the next step says which. The standing
+                // reads either as no record.
+                let nobody = match &tick {
+                    Tick::Gone { .. } => true,
+                    Tick::Lost { holder, .. } => holder.is_empty(),
+                    // A replica that waits its turn follows nobody,
+                    // whatever record stands.
+                    Tick::Waiting { .. } => true,
+                    _ => false,
+                };
+                let named = if nobody { None } else { elector.observed() };
+                match named {
                     // The lease lost its history (a Lease deleted or
                     // replaced, a lease file restored): no write stored
                     // this holder under the highest term this replica
@@ -476,7 +527,7 @@ fn run(
                                 identity = elector.identity(),
                                 term = record.term,
                                 highest = seen.term,
-                                "the lease's term fell under the highest this replica saw; nobody is named until it is back"
+                                "the lease's term is under the highest this replica saw or was told; nobody is named until it is back"
                             );
                         }
                         fallen = true;
@@ -489,7 +540,14 @@ fn run(
                     }
                     None => seen.holder.clear(),
                 }
-                report(&elector, &tick, store, &mut following, &mut gone);
+                report(
+                    &elector,
+                    &tick,
+                    store,
+                    &mut following,
+                    &mut streak,
+                    &mut leading,
+                );
             }
             Err(error) => {
                 // One line a streak: the step repeats every renew period.
@@ -507,10 +565,28 @@ fn run(
         seen.term = seen.term.max(elector.fence().term());
         standing.send_replace(seen.clone());
         // A step that took the period or more is followed at once, never
-        // sooner.
-        match stopped.recv_timeout(period.saturating_sub(began.elapsed())) {
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        // sooner. A word to leave is taken when it comes, and the wait for
+        // the next step goes on.
+        let next = began + period;
+        let stop = loop {
+            match words.recv_timeout(next.saturating_duration_since(Instant::now())) {
+                Err(mpsc::RecvTimeoutError::Timeout) => break false,
+                Ok(Word::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break true,
+                Ok(Word::StepDown(above)) => {
+                    let left = step_down(&mut elector, above);
+                    let told = above.unwrap_or(0);
+                    // A lease this replica left names nobody, and so does a
+                    // term above the one the holder is named under.
+                    if left || told > seen.term {
+                        seen.holder.clear();
+                        seen.term = seen.term.max(told);
+                        standing.send_replace(seen.clone());
+                    }
+                }
+            }
+        };
+        if stop {
+            break;
         }
     }
     give_up(&mut elector);
@@ -519,20 +595,38 @@ fn run(
     standing.send_replace(seen);
 }
 
-/// One line a change of role or a gone streak; a take's term to the store.
+/// The steps in a row that follow nobody for one reason: its line is written
+/// once a streak.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum Streak {
+    #[default]
+    None,
+    /// The record is gone or names no holder.
+    Gone,
+    /// The lease stands free and this replica waits its turn.
+    Waiting,
+}
+
+/// One line a change of role, a gone streak or a waiting one; a take's term
+/// to the store.
 fn report(
     elector: &Elector,
     tick: &Tick,
     store: &MemoryStore,
     following: &mut String,
-    gone: &mut bool,
+    streak: &mut Streak,
+    leading: &mut bool,
 ) {
-    let was_gone = std::mem::replace(gone, matches!(tick, Tick::Gone { .. }));
+    let now = match tick {
+        Tick::Gone { .. } => Streak::Gone,
+        Tick::Waiting { .. } => Streak::Waiting,
+        _ => Streak::None,
+    };
+    let was = std::mem::replace(streak, now);
     match tick {
         Tick::Acquired { term } => {
             following.clear();
             store.set_term(*term);
-            info!(identity = elector.identity(), term, "leading");
         }
         Tick::Lost { term, holder } => {
             warn!(
@@ -556,11 +650,22 @@ fn report(
         Tick::Gone { term } => {
             // One line a streak; a holder followed after it is named anew.
             following.clear();
-            if !was_gone {
+            if was != Streak::Gone {
                 warn!(
                     identity = elector.identity(),
                     term,
-                    "the lease's record is gone; nobody is named and it is taken after that record's duration"
+                    "the lease's record is gone or names no holder; nobody is named and it is taken after that record's duration"
+                );
+            }
+        }
+        Tick::Waiting { term } => {
+            // One line a streak, at info: a turn waited out is no anomaly.
+            following.clear();
+            if was != Streak::Waiting {
+                info!(
+                    identity = elector.identity(),
+                    term,
+                    "the lease stands free and this replica waits its turn; it takes the lease when its hold ends unless another replica takes it first"
                 );
             }
         }
@@ -568,18 +673,81 @@ fn report(
             debug!(identity = elector.identity(), ?tick, "election step");
         }
     }
+    // One line when the fence opens: at the take, or one renew deadline
+    // after a take of a record with no holder to wait for. The elector
+    // says which take it made: after a slow step the fence reads closed
+    // here as well, with no wait to name, and the next renewal leads.
+    match tick {
+        Tick::Acquired { term } | Tick::Renewed { term } => {
+            if !*leading {
+                *leading = elector.fence().leader_term(Instant::now()).is_some();
+                if *leading {
+                    info!(identity = elector.identity(), term, "leading");
+                } else if matches!(tick, Tick::Acquired { .. }) && elector.waits_to_lead() {
+                    info!(
+                        identity = elector.identity(),
+                        term,
+                        "took a lease with no holder to wait for; leading one renew deadline after the take"
+                    );
+                }
+            }
+        }
+        _ => *leading = false,
+    }
+}
+
+/// A word to leave, taken by the election thread. The elector counts the
+/// term; a holder under a lower term, or one told no term, closes its fence,
+/// releases the lease and holds its takes back. `true` when this replica
+/// held the lease and left it: a release that failed is tried again at every
+/// step, in place of a renewal.
+fn step_down(elector: &mut Elector, above: Option<u64>) -> bool {
+    match elector.step_down(above, Instant::now()) {
+        Ok(true) => {
+            if elector.is_alone() {
+                info!(
+                    identity = elector.identity(),
+                    above,
+                    "stepped down; the lease is released and this replica, alone over its lease, takes it again at its next step"
+                );
+            } else {
+                info!(
+                    identity = elector.identity(),
+                    above,
+                    "stepped down; the lease is released and this replica takes nothing for one lease duration"
+                );
+            }
+            true
+        }
+        Ok(false) => false,
+        Err(error) => {
+            warn!(
+                identity = elector.identity(),
+                above,
+                %error,
+                "stepped down; the release failed and is tried again at the next step"
+            );
+            true
+        }
+    }
 }
 
 /// The planned stop: the elector closes the fence, then rewrites the record
-/// released, so the next candidate to look takes the lease at once. The
-/// first release follows the loop's last step at once: a stop does not wait
-/// for the period. A release that fails is tried again, a bounded number of
+/// released, so the next candidate to look takes the lease at once, or one
+/// renew deadline later when the take still waited to lead. The first
+/// release follows the loop's last step at once: a stop does not wait for
+/// the period. A release that fails is tried again, a bounded number of
 /// times, and no sooner than one renew period after the attempt before it
 /// began, as the loop spaces its steps; an attempt that took the period is
 /// followed at once. The fence is closed either way and the lease then
 /// expires by its duration.
 fn give_up(elector: &mut Elector) {
     let period = elector.settings().renew_period;
+    // A holder whose release finds the record moved has none to release,
+    // and says what a step that read the loss says. It lost the lease after
+    // its last step, or an earlier attempt of this stop stored the release
+    // with its answer lost and the next candidate took the lease since.
+    let held = elector.is_holder().then(|| elector.fence().term());
     for attempt in 1..=RELEASE_ATTEMPTS {
         let began = Instant::now();
         match elector.release() {
@@ -587,7 +755,15 @@ fn give_up(elector: &mut Elector) {
                 info!(identity = elector.identity(), "the lease is released");
                 return;
             }
-            Ok(false) => return,
+            Ok(false) => {
+                if let Some(term) = held {
+                    warn!(
+                        identity = elector.identity(),
+                        term, "the lease moved; the fence is closed"
+                    );
+                }
+                return;
+            }
             Err(error) => {
                 warn!(identity = elector.identity(), attempt, %error, "the release failed");
             }
@@ -617,12 +793,13 @@ mod tests {
 
     use super::{
         dialable, elector, identity, run, split_identity, start, Election, LeaseError, LeasePlace,
-        Running, Standing,
+        Running, Standing, Word,
     };
     use crate::{
         controller::config::ConfigError,
         elector::{
             ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Written,
+            TERM_CEILING,
         },
         store::{LeasesStore, MemoryStore},
     };
@@ -827,6 +1004,16 @@ mod tests {
             assert_eq!(object(None).to_string(), "Lease smg-policy");
             assert!(object(None).is_shared());
         }
+    }
+
+    #[tokio::test]
+    async fn the_process_place_makes_an_elector_alone_that_leads_at_its_take() {
+        let mut alone = elector(&Election::default(), "controller-0@127.0.0.1:1".to_owned())
+            .await
+            .expect("the process place needs nothing");
+        let now = Instant::now();
+        alone.tick(now).expect("the take");
+        assert_eq!(alone.fence().leader_term(now), Some(1));
     }
 
     #[tokio::test]
@@ -1241,7 +1428,7 @@ mod tests {
             stood.borrow().holder.is_empty()
         });
         looks(&mut stood, 5);
-        stop.send(()).expect("the loop runs");
+        stop.send(Word::Stop).expect("the loop runs");
         // Bounded like every wait here: a loop that ignored its stop fails
         // this case by name.
         until("the loop's end after its stop", || looping.is_finished());
@@ -1250,9 +1437,7 @@ mod tests {
         let text = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
         let fell = text
             .lines()
-            .filter(|line| {
-                line.contains("the lease's term fell under the highest this replica saw")
-            })
+            .filter(|line| line.contains("the lease's term is under the highest this replica saw"))
             .count();
         assert_eq!(fell, 2, "{text}");
     }
@@ -1439,7 +1624,7 @@ mod tests {
     /// beside it, for the reason the fallen term's case gives.
     struct Looping {
         lines: Logged,
-        stop: mpsc::Sender<()>,
+        stop: mpsc::Sender<Word>,
         thread: thread::JoinHandle<()>,
         _beside: tracing::Dispatch,
     }
@@ -1471,7 +1656,7 @@ mod tests {
         /// that hold `words`; the whole text comes back for a failure's
         /// message.
         fn stopped_with(self, words: &str) -> (usize, String) {
-            self.stop.send(()).expect("the loop runs");
+            self.stop.send(Word::Stop).expect("the loop runs");
             until("the loop's end after its stop", || {
                 self.thread.is_finished()
             });
@@ -1480,6 +1665,70 @@ mod tests {
             let count = text.lines().filter(|line| line.contains(words)).count();
             (count, text)
         }
+    }
+
+    /// A leader whose lease moved after its last step finds it at its
+    /// stop's release: it releases nothing and says the lease moved under
+    /// the term it held, as a step that read the loss would. A replica that
+    /// held nothing at its stop says nothing of a move, and neither does a
+    /// holder whose release lands.
+    #[test]
+    fn a_stop_that_finds_the_lease_moved_says_so_and_releases_nothing() {
+        const MOVED: &str = "the lease moved; the fence is closed";
+        // A renew period of twenty seconds: the stop's release is the
+        // first to read the lease after the take.
+        let settings = ElectionSettings {
+            duration: Duration::from_secs(60),
+            renew_period: Duration::from_secs(20),
+            renew_deadline: Duration::from_secs(40),
+        };
+        let store = Losable::default();
+        let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", settings)
+            .expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let leading = looping(holder, standing);
+        until("the take", || stood.borrow().holder == "a@127.0.0.1:1");
+        // Another candidate's record is stored over the holder's.
+        let theirs = LeaseRecord {
+            holder: "b@127.0.0.1:2".to_owned(),
+            term: 2,
+            duration_ms: 60_000,
+            ..LeaseRecord::default()
+        };
+        store.put(&theirs);
+        let (moved, text) = leading.stopped_with(MOVED);
+        assert_eq!(moved, 1, "{text}");
+        // The line carries the term this replica held, not the record's.
+        let line = text
+            .lines()
+            .find(|line| line.contains(MOVED))
+            .expect("the line");
+        assert!(
+            line.split_whitespace().any(|field| field == "term=1"),
+            "{line}"
+        );
+        assert!(!text.contains("the lease is released"), "{text}");
+        let mut lease = store.clone();
+        assert_eq!(lease.read().expect("a read"), Some(theirs));
+
+        let follower = Elector::new(Box::new(store.clone()), "c@127.0.0.1:3", settings)
+            .expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let following = looping(follower, standing);
+        until("the first look", || stood.borrow().looked);
+        let (moved, text) = following.stopped_with(MOVED);
+        assert_eq!(moved, 0, "{text}");
+
+        // A holder that stops over a quiet store releases, and says nothing
+        // of a move.
+        let quiet = Elector::new(Box::new(MemoryLease::new()), "d@127.0.0.1:4", settings)
+            .expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let released = looping(quiet, standing);
+        until("the take", || stood.borrow().holder == "d@127.0.0.1:4");
+        let (moved, text) = released.stopped_with(MOVED);
+        assert_eq!(moved, 0, "{text}");
+        assert!(text.contains("the lease is released"), "{text}");
     }
 
     #[test]
@@ -1616,11 +1865,188 @@ mod tests {
             stood.borrow().holder.is_empty()
         });
         looks(&mut stood, 5);
-        let (gone, text) = looping.stopped_with("the lease's record is gone");
+        let (gone, text) = looping.stopped_with("the lease's record is gone or names no holder");
         assert_eq!(gone, 2, "{text}");
         assert!(!text.contains("the lease's term fell"), "{text}");
         // The holder followed again after the first streak is named anew.
         assert_eq!(text.matches(": following").count(), 2, "{text}");
+    }
+
+    #[test]
+    fn a_take_whose_slow_step_closed_its_fence_logs_no_wait() {
+        const TOOK: &str = "took a lease with no holder to wait for";
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(20),
+            renew_deadline: Duration::from_millis(400),
+        };
+        // A holder's release is taken at once and waits for nobody. This
+        // take's step began a second before its report, as over a store that
+        // answers slowly: the fence reads closed at the report, past its
+        // renew deadline, and no line names a wait that was not made.
+        let mut lease = MemoryLease::new();
+        let released = LeaseRecord {
+            term: 1,
+            ..LeaseRecord::default()
+        };
+        assert_eq!(
+            lease.write(None, &released).expect("a write"),
+            Written::Done
+        );
+        let mut taker = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", settings)
+            .expect("the settings are in order");
+        let began = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the clock is past its first second");
+        let tick = taker.tick(began).expect("the take");
+        assert_eq!(tick, crate::elector::Tick::Acquired { term: 2 });
+        assert_eq!(taker.fence().leader_term(Instant::now()), None);
+        let lines = Logged(Arc::new(Mutex::new(Vec::new())));
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let mut leading = false;
+        tracing::subscriber::with_default(subscriber, || {
+            super::report(
+                &taker,
+                &tick,
+                &MemoryStore::new(),
+                &mut String::new(),
+                &mut super::Streak::default(),
+                &mut leading,
+            );
+        });
+        let text = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+        assert_eq!(text.matches(TOOK).count(), 0, "{text}");
+        assert!(!leading, "{text}");
+    }
+
+    #[test]
+    fn a_take_with_no_holder_to_wait_for_logs_its_take_and_leading_once_the_fence_opens() {
+        const TOOK: &str = "took a lease with no holder to wait for";
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(20),
+            renew_deadline: Duration::from_millis(400),
+        };
+        // Stopped inside the renew deadline of a take over no record: the
+        // take's line alone. The deadline is half a minute: the case ends
+        // inside it.
+        let patient = ElectionSettings {
+            duration: Duration::from_secs(60),
+            renew_deadline: Duration::from_secs(30),
+            ..settings
+        };
+        let lease = MemoryLease::new();
+        let taker = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", patient)
+            .expect("the settings are in order");
+        let fence = taker.fence();
+        let (standing, mut stood) = watch::channel(Standing::default());
+        let inside = looping(taker, standing);
+        until("the take", || stood.borrow().holder == "a@127.0.0.1:1");
+        looks(&mut stood, 5);
+        assert_eq!(fence.leader_term(Instant::now()), None);
+        let (leading, text) = inside.stopped_with(": leading");
+        assert_eq!((leading, text.matches(TOOK).count()), (0, 1), "{text}");
+
+        // The same take under a deadline the case outlives: one line of
+        // leading, after the take's, at the renewal that opens the fence.
+        let mut lease = MemoryLease::new();
+        let taker = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", settings)
+            .expect("the settings are in order");
+        let fence = taker.fence();
+        let (standing, _stood) = watch::channel(Standing::default());
+        let outlived = looping(taker, standing);
+        until("the fence's opening", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        // Another holder takes the lease away and stalls. Its record is
+        // waited out and taken above: a holder was waited for, so that take
+        // leads at once, under the line of leading and no line of the take.
+        let other = LeaseRecord {
+            holder: "x@127.0.0.1:8".to_owned(),
+            term: 2,
+            duration_ms: 600,
+            ..LeaseRecord::default()
+        };
+        until("the other holder's take", || {
+            let current = lease.read().expect("a read");
+            lease.write(current.as_ref(), &other).expect("a write") == Written::Done
+        });
+        until("the take above", || {
+            fence.leader_term(Instant::now()) == Some(3)
+        });
+        let (leading, text) = outlived.stopped_with(": leading");
+        assert_eq!((leading, text.matches(TOOK).count()), (2, 1), "{text}");
+        assert!(text.find(TOOK) < text.find(": leading"), "{text}");
+    }
+
+    #[test]
+    fn a_holder_whose_record_is_emptied_logs_that_it_is_gone_and_no_fallen_term() {
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(20),
+            renew_deadline: Duration::from_millis(400),
+        };
+        let store = Losable::default();
+        let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", settings)
+            .expect("the settings are in order");
+        let fence = holder.fence();
+        let (standing, mut stood) = watch::channel(Standing::default());
+        let looping = looping(holder, standing);
+        until("the fence's opening", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        // The record is replaced by an empty one under its holder. The
+        // holder's step reads a loss to nobody, the next one a record that
+        // is gone: one line, and none of a fallen term, which never comes
+        // back. The case ends inside the wait.
+        store.put(&LeaseRecord::default());
+        until("the look at the loss", || stood.borrow().holder.is_empty());
+        looks(&mut stood, 5);
+        assert_eq!(stood.borrow().term, 1);
+        let (gone, text) = looping.stopped_with("the lease's record is gone or names no holder");
+        assert_eq!(gone, 1, "{text}");
+        assert!(!text.contains("the lease's term fell"), "{text}");
+    }
+
+    /// A lease lost to another holder names that holder on the standing at
+    /// the look that reads the loss: only a loss to nobody reads as no
+    /// record.
+    #[test]
+    fn a_lease_lost_to_another_holder_names_that_holder_at_the_look_at_the_loss() {
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(20),
+            renew_deadline: Duration::from_millis(400),
+        };
+        let store = Losable::default();
+        let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", settings)
+            .expect("the settings are in order");
+        let fence = holder.fence();
+        let (standing, stood) = watch::channel(Standing::default());
+        let looping = looping(holder, standing);
+        until("the fence's opening", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        // Another candidate's record is stored over the holder's, under the
+        // next term. The first look that no longer names the holder read
+        // the loss, and names the lease's holder.
+        store.put(&LeaseRecord {
+            holder: "b@127.0.0.1:2".to_owned(),
+            term: 2,
+            duration_ms: 60_000,
+            ..LeaseRecord::default()
+        });
+        until("the look at the loss", || {
+            stood.borrow().holder != "a@127.0.0.1:1"
+        });
+        let at_the_loss = stood.borrow().clone();
+        let (_, text) = looping.stopped_with("the lease");
+        assert_eq!(at_the_loss.holder, "b@127.0.0.1:2", "{text}");
+        assert_eq!(at_the_loss.term, 2, "{text}");
     }
 
     /// A record lost under a live holder, by no release. The holder's fence
@@ -1892,5 +2318,348 @@ mod tests {
             Some(3),
             "the free lease is taken at once under the next term"
         );
+    }
+
+    /// The order of the design's settings at a fifth of their size, with a
+    /// short period.
+    fn brisk() -> ElectionSettings {
+        ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(20),
+            renew_deadline: Duration::from_millis(400),
+        }
+    }
+
+    #[test]
+    fn a_leader_told_a_term_above_its_own_leaves_and_the_standby_leads_above_that_term() {
+        let lease = MemoryLease::new();
+        let candidate = |identity: &str| {
+            Elector::new(Box::new(lease.clone()), identity, brisk())
+                .expect("the settings are in order")
+        };
+        let (first, second) = (candidate("a@127.0.0.1:1"), candidate("b@127.0.0.1:2"));
+        let (first_fence, second_fence) = (first.fence(), second.fence());
+        let fences = [&*first_fence, &*second_fence];
+        let second_store = Arc::new(MemoryStore::new());
+        let (first_standing, first_stood) = watch::channel(Standing::default());
+        let (second_standing, second_stood) = watch::channel(Standing::default());
+        let first_running =
+            start(first, Arc::new(MemoryStore::new()), first_standing).expect("a thread");
+        wait_for("the first lead", fences, || {
+            first_fence.leader_term(Instant::now()) == Some(1)
+        });
+        let second_running =
+            start(second, Arc::clone(&second_store), second_standing).expect("a thread");
+        wait_for("the second's first look", fences, || {
+            second_stood.borrow().holder == "a@127.0.0.1:1"
+        });
+
+        // A term of seven is said to the leader, as a gateway's floor is:
+        // it leaves, and the standby takes the released lease at its next
+        // look, above the term the leader was told. No instant has two open
+        // fences: every wait here asks both.
+        first_running.step_down(Some(7));
+        wait_for("the standby's take above the term said", fences, || {
+            second_fence.leader_term(Instant::now()) == Some(8) && second_store.term() == 8
+        });
+        wait_for("the replica that left follows the taker", fences, || {
+            *first_stood.borrow()
+                == Standing {
+                    holder: "b@127.0.0.1:2".to_owned(),
+                    term: 8,
+                    looked: true,
+                }
+        });
+        assert_eq!(first_fence.leader_term(Instant::now()), None);
+        first_running.stop();
+        ended(first_running);
+        second_running.stop();
+        ended(second_running);
+    }
+
+    #[test]
+    fn a_replica_alone_over_its_own_lease_that_is_told_to_leave_leads_again_at_its_next_step() {
+        // No other candidate can take a lease the elector made itself: a
+        // word holds nothing back, and the line at the word says so.
+        let elector = Elector::alone("a@127.0.0.1:1", brisk()).expect("the settings are in order");
+        let fence = elector.fence();
+        let (standing, stood) = watch::channel(Standing::default());
+        let looping = looping(elector, standing);
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        looping
+            .stop
+            .send(Word::StepDown(Some(7)))
+            .expect("the loop runs");
+        until("the retake above the term said", || {
+            fence.leader_term(Instant::now()) == Some(8)
+        });
+        until("the standing after the retake", || {
+            stood.borrow().holder == "a@127.0.0.1:1"
+        });
+        assert_eq!(stood.borrow().term, 8);
+        let (said, text) =
+            looping.stopped_with("alone over its lease, takes it again at its next step");
+        assert_eq!(said, 1, "{text}");
+        assert!(!text.contains("waits its turn"), "{text}");
+        assert!(
+            !text.contains("takes nothing for one lease duration"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_replica_with_no_standby_that_is_told_to_leave_waits_one_lease_duration_and_leads_again_above(
+    ) {
+        let lease = MemoryLease::new();
+        let settings = brisk();
+        let elector = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", settings)
+            .expect("the settings are in order");
+        let fence = elector.fence();
+        let (standing, stood) = watch::channel(Standing::default());
+        let looping = looping(elector, standing);
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+
+        // A term of seven is said: the replica leaves, and it names nobody
+        // under that term while it waits its turn.
+        let word = Instant::now();
+        looping
+            .stop
+            .send(Word::StepDown(Some(7)))
+            .expect("the loop runs");
+        until("the leave", || {
+            *stood.borrow()
+                == Standing {
+                    holder: String::new(),
+                    term: 7,
+                    looked: true,
+                }
+        });
+        assert_eq!(fence.leader_term(Instant::now()), None);
+        // With no standby over a lease it shares, it takes the lease back
+        // when its hold ends, one lease duration after the word and above
+        // the term it was told: the price of the door where no standby
+        // looks.
+        until("the retake", || {
+            fence.leader_term(Instant::now()) == Some(8)
+        });
+        let out = word.elapsed();
+        assert!(
+            out >= settings.duration,
+            "led again {out:?} after the word, inside its hold"
+        );
+        until("the standing after the retake", || {
+            stood.borrow().holder == "a@127.0.0.1:1"
+        });
+        assert_eq!(stood.borrow().term, 8);
+        let (waits, text) =
+            looping.stopped_with("the lease stands free and this replica waits its turn");
+        assert_eq!(waits, 1, "{text}");
+        let line = text
+            .lines()
+            .find(|line| line.contains("waits its turn"))
+            .expect("the waiting line");
+        assert!(
+            line.contains(" INFO "),
+            "a turn waited out is no warning: {line}"
+        );
+        assert_eq!(
+            text.matches("stepped down; the lease is released").count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(text.matches(": leading").count(), 2, "{text}");
+        assert!(!text.contains("the lease's record is gone"), "{text}");
+        assert!(!text.contains("the lease's term is under"), "{text}");
+    }
+
+    #[test]
+    fn a_replica_that_waits_its_turn_names_nobody_over_a_record_that_ran_out() {
+        // A record that names a holder and ran out by this replica's clock
+        // is free to take. A replica inside its hold takes nothing and
+        // follows nobody: its standing names no holder, whatever the record
+        // says.
+        let mut lease = MemoryLease::new();
+        let elector = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", brisk())
+            .expect("the settings are in order");
+        let fence = elector.fence();
+        let (standing, stood) = watch::channel(Standing::default());
+        let looping = looping(elector, standing);
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        looping
+            .stop
+            .send(Word::StepDown(Some(7)))
+            .expect("the loop runs");
+        until("the leave", || stood.borrow().term == 7);
+        // Another holder's record lands over the release, says five renew
+        // periods and is never renewed: the replica follows it while it
+        // lasts, and its own hold outlasts it.
+        let released = lease.read().expect("a read").expect("the release");
+        assert!(released.is_released());
+        let ran_out = LeaseRecord {
+            holder: "x@127.0.0.1:9".to_owned(),
+            term: 8,
+            acquired_at_micros: released.renewed_at_micros + 1,
+            renewed_at_micros: released.renewed_at_micros + 1,
+            duration_ms: 100,
+        };
+        assert_eq!(
+            lease.write(Some(&released), &ran_out).expect("a write"),
+            Written::Done
+        );
+        until("the record that ran out names nobody", || {
+            *stood.borrow()
+                == Standing {
+                    holder: String::new(),
+                    term: 8,
+                    looked: true,
+                }
+        });
+        assert_eq!(fence.leader_term(Instant::now()), None);
+        until("the retake above the record that ran out", || {
+            fence.leader_term(Instant::now()) == Some(9)
+        });
+        let (waits, text) =
+            looping.stopped_with("the lease stands free and this replica waits its turn");
+        assert!(waits >= 1, "{text}");
+    }
+
+    #[test]
+    fn a_term_said_to_a_follower_is_counted_and_its_take_is_above_it() {
+        // The holder's duration is a minute: the follower takes only at its
+        // release.
+        let held = LeaseRecord {
+            holder: "x@127.0.0.1:8".to_owned(),
+            term: 5,
+            duration_ms: 60_000,
+            ..LeaseRecord::default()
+        };
+        let mut lease = MemoryLease::new();
+        assert_eq!(lease.write(None, &held).expect("a write"), Written::Done);
+        let follower = Elector::new(Box::new(lease.clone()), "b@127.0.0.1:2", brisk())
+            .expect("the settings are in order");
+        let fence = follower.fence();
+        let (standing, mut stood) = watch::channel(Standing::default());
+        let looping = looping(follower, standing);
+        until("the first look", || stood.borrow().holder == held.holder);
+
+        // A caller says it saw term nine. No lease moves; the holder under
+        // term five is named no longer, since no write stored it under nine.
+        looping
+            .stop
+            .send(Word::StepDown(Some(9)))
+            .expect("the loop runs");
+        until("the term counted", || {
+            *stood.borrow()
+                == Standing {
+                    holder: String::new(),
+                    term: 9,
+                    looked: true,
+                }
+        });
+        // Looks at the holder's record under the lower term: one line a
+        // streak, nobody named, no write.
+        looks(&mut stood, 5);
+        assert!(stood.borrow().holder.is_empty());
+        assert_eq!(stood.borrow().term, 9);
+        assert_eq!(lease.read().expect("a read"), Some(held.clone()));
+        // The holder releases: the follower takes at once, above the term it
+        // was told, and it was never held back.
+        let released = LeaseRecord {
+            holder: String::new(),
+            duration_ms: 0,
+            ..held.clone()
+        };
+        assert_eq!(
+            lease.write(Some(&held), &released).expect("a write"),
+            Written::Done
+        );
+        until("the take", || fence.leader_term(Instant::now()) == Some(10));
+        let (under, text) = looping
+            .stopped_with("the lease's term is under the highest this replica saw or was told");
+        assert_eq!(under, 1, "{text}");
+        assert!(!text.contains("stepped down"), "{text}");
+        assert!(!text.contains("waits its turn"), "{text}");
+    }
+
+    #[test]
+    fn a_release_that_fails_at_the_word_is_tried_again_at_the_next_step_with_nobody_named() {
+        let lease = MemoryLease::new();
+        let releases = Arc::new(Mutex::new(Vec::new()));
+        let store = FailsReleases {
+            lease: lease.clone(),
+            failing: 2,
+            stalled: Duration::ZERO,
+            releases: Arc::clone(&releases),
+        };
+        let elector = Elector::new(Box::new(store), "a@127.0.0.1:1", brisk())
+            .expect("the settings are in order");
+        let fence = elector.fence();
+        let (standing, stood) = watch::channel(Standing::default());
+        let looping = looping(elector, standing);
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+
+        // The release fails at the word and at the step after it, and lands
+        // at the third try. The fence is closed from the word, nobody is
+        // named, and no step in between renews the lease.
+        looping
+            .stop
+            .send(Word::StepDown(None))
+            .expect("the loop runs");
+        until("the release", || {
+            lease
+                .clone()
+                .read()
+                .expect("a read")
+                .is_some_and(|record| record.is_released())
+        });
+        assert_eq!(fence.leader_term(Instant::now()), None);
+        assert_eq!(releases.lock().len(), 3);
+        assert!(stood.borrow().holder.is_empty());
+        let (failed, text) = looping
+            .stopped_with("stepped down; the release failed and is tried again at the next step");
+        assert_eq!(failed, 1, "{text}");
+        assert_eq!(text.matches(": leading").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn the_highest_term_a_word_may_say_leaves_the_last_term_to_take() {
+        let elector = Elector::new(Box::new(MemoryLease::new()), "a@127.0.0.1:1", brisk())
+            .expect("the settings are in order");
+        let fence = elector.fence();
+        let (standing, _stood) = watch::channel(Standing::default());
+        let running = start(elector, Arc::new(MemoryStore::new()), standing).expect("a thread");
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        // The replica leaves under the term said, and the last term under
+        // the ceiling is its next take.
+        running.step_down(Some(TERM_CEILING - 2));
+        until("the retake", || {
+            fence.leader_term(Instant::now()) == Some(TERM_CEILING - 1)
+        });
+        running.stop();
+        ended(running);
+    }
+
+    #[test]
+    #[should_panic(expected = "a term that leaves none to take reached the election")]
+    fn a_term_that_leaves_none_to_take_is_refused_at_the_door() {
+        let elector = Elector::new(
+            Box::new(MemoryLease::new()),
+            "a@127.0.0.1:1",
+            ElectionSettings::default(),
+        )
+        .expect("the settings are in order");
+        let (standing, _stood) = watch::channel(Standing::default());
+        let running = start(elector, Arc::new(MemoryStore::new()), standing).expect("a thread");
+        running.step_down(Some(TERM_CEILING - 1));
     }
 }

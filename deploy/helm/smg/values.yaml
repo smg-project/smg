@@ -464,6 +464,17 @@ policyController:
     replication: 30102
     admin: 30103
 
+  # -- Nothing is verified on a listener named here: whoever reaches its
+  #    port acts as any principal of its scopes. The listeners that take a
+  #    caller's stated name as its identity, passed as --identity-as-told:
+  #    any of gateway, control and replication, each once, in any order.
+  #    None by default: the controller then refuses every call but Leader as
+  #    unauthenticated. Name one only behind a mesh that verifies its
+  #    callers, or a network policy that admits them alone: the Service
+  #    carries the gateways' and the operators' ports, and a pod's address
+  #    reaches all three listeners.
+  identityAsTold: []
+
   # -- The Service <fullname>-policy-controller, three ports on the listeners'
   #    own numbers: `grpc` for the gateways' listener, `control` for the
   #    operators' and `metrics` for the admin listener, the scrape target, as

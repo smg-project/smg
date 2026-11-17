@@ -8,9 +8,10 @@
 //! `leaseDurationSeconds`, so the object reads to `kubectl` and to any other
 //! leader election as a lease. The term has no spec field: it lives in the
 //! [`TERM_ANNOTATION`], and `leaseTransitions` carries the count of holder
-//! changes the term is one ahead of. The spec stores whole seconds, so an
-//! election duration with a fraction of a second is refused at the first
-//! write.
+//! changes the term is one ahead of, a restart under the same identity
+//! counted as one. The spec stores whole seconds, so an election duration
+//! with a fraction of a second is refused at the first write, and the wait
+//! a release hands on is rounded up to them.
 //!
 //! A write replaces the object under the resource version of the object
 //! read last; the server refuses a replace over a version that moved. An
@@ -256,12 +257,19 @@ impl LeaseBackend for KubernetesLease {
 /// The spec for `record`, over `base` for the fields the record has no say
 /// in (a preferred holder, a strategy).
 fn spec_of(record: &LeaseRecord, base: LeaseSpec) -> Result<LeaseSpec, ElectError> {
-    if !record.duration_ms.is_multiple_of(1_000) {
+    // A holder's duration is a setting, refused with a fraction of a second.
+    // A released record's is a wait handed on: it rounds up to the spec's
+    // whole seconds, the safe side of a wait.
+    let whole = if record.is_released() {
+        record.duration_ms.div_ceil(1_000)
+    } else if record.duration_ms.is_multiple_of(1_000) {
+        record.duration_ms / 1_000
+    } else {
         return Err(ElectError::Settings(
             "the duration must be whole seconds for a Kubernetes Lease",
         ));
-    }
-    let seconds = i32::try_from(record.duration_ms / 1_000)
+    };
+    let seconds = i32::try_from(whole)
         .map_err(|_| ElectError::Settings("the duration must fit the Lease's seconds"))?;
     Ok(LeaseSpec {
         holder_identity: (!record.holder.is_empty()).then(|| record.holder.clone()),
@@ -583,6 +591,10 @@ pub(in crate::elector) mod tests {
         let mut a = cell.candidate("a@host:1");
         let t0 = Instant::now() + S;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        // Term zero is no holder's word, and an apply that replaces the
+        // object leaves this shape under a live leader: the fence stays
+        // closed for one renew deadline, as over no record.
+        assert_eq!(a.fence().leader_term(t0), None);
         let calls = cell.server.calls();
         assert!(calls.iter().any(|call| call.starts_with("PUT ")));
         assert!(!calls.iter().any(|call| call.starts_with("POST ")));
@@ -705,7 +717,14 @@ pub(in crate::elector) mod tests {
             "the take landed"
         );
         assert_eq!(a.tick(t0 + S).expect("own"), Tick::Acquired { term: 1 });
-        assert_eq!(a.fence().leader_term(t0 + S), Some(1));
+        // No Lease record stood at the attempt: the fence opens one renew
+        // deadline after it, at the renewal that lands then.
+        assert_eq!(a.fence().leader_term(t0 + S), None);
+        assert_eq!(
+            a.tick(t0 + 2 * S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        assert_eq!(a.fence().leader_term(t0 + 2 * S), Some(1));
     }
 
     #[test]
@@ -727,6 +746,29 @@ pub(in crate::elector) mod tests {
             .calls()
             .iter()
             .any(|call| call.starts_with("POST ")));
+    }
+
+    #[test]
+    fn a_release_inside_the_takes_wait_is_written_in_whole_seconds() {
+        // The wait such a release hands on is the renew deadline, and the
+        // spec stores whole seconds: a deadline with a fraction rounds up,
+        // the safe side of a wait, where a holder's duration is refused.
+        let cell = Cell::new();
+        let settings = ElectionSettings {
+            duration: Duration::from_secs(3),
+            renew_period: Duration::from_millis(500),
+            renew_deadline: Duration::from_millis(1_500),
+        };
+        let mut a = Elector::new(Box::new(cell.backend()), "a@host:1", settings).expect("settings");
+        assert_eq!(
+            a.tick(Instant::now() + S).expect("take"),
+            Tick::Acquired { term: 1 }
+        );
+        assert!(a.waits_to_lead());
+        assert!(a.release().expect("release"));
+        let spec = cell.server.object().spec.expect("a spec");
+        assert_eq!(spec.holder_identity, None);
+        assert_eq!(spec.lease_duration_seconds, Some(2));
     }
 
     #[test]

@@ -34,23 +34,24 @@
 //! reservation: `encode` would only walk the message's length for a
 //! capacity check that cannot fail against a buffer that grows on demand.
 //! An embedding request carries the same prompt message; the writer has no
-//! arm for it, so its ids keep prost's three walks. Decoding is prost's own
-//! decoder, unchanged. tonic builds the encode buffer itself; the tests
-//! below drive the codec through tonic's own request body, as a client call
-//! does.
+//! arm for it, so its ids keep prost's three walks. tonic builds the encode
+//! buffer itself; the tests below drive the codec through tonic's own request
+//! body, as a client call does.
+//!
+//! A response is decoded by prost from the frame's own bytes
+//! ([`FrameDecoder`]), not through tonic's view of its receive buffer.
 
 use std::{any::Any, cell::RefCell, marker::PhantomData};
 
 use prost::{
-    bytes::{BufMut, BytesMut},
+    bytes::{Buf, BufMut, BytesMut},
     encoding::{encode_key, encode_varint, encoded_len_varint, key_len, WireType},
     Message,
 };
 use tonic::{
-    codec::{BufferSettings, Codec, EncodeBuf, Encoder},
+    codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
     Status,
 };
-use tonic_prost::{ProstCodec, ProstDecoder};
 
 use crate::{mlx_proto, sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
 
@@ -82,14 +83,43 @@ where
     type Encode = T;
     type Decode = U;
     type Encoder = SizedProstEncoder<T>;
-    type Decoder = ProstDecoder<U>;
+    type Decoder = FrameDecoder<U>;
 
     fn encoder(&mut self) -> Self::Encoder {
         SizedProstEncoder { _pd: PhantomData }
     }
 
     fn decoder(&mut self) -> Self::Decoder {
-        ProstCodec::<T, U>::raw_decoder(BufferSettings::default())
+        FrameDecoder::default()
+    }
+}
+
+/// prost's decoding, read from the frame's own bytes. tonic hands a decoder
+/// a view of its receive buffer bounded to the frame, and prost reads a
+/// message through it a field at a time: every varint, string and packed id
+/// pays the view's bound check and the buffer's cursor move. The frame is
+/// one contiguous run of that buffer, so it is split off first (no copy:
+/// the split a `bytes` field of the message takes anyway) and prost reads
+/// the split, where a read moves one pointer. The message, and the status
+/// of a frame prost refuses, are the stock decoder's.
+#[derive(Debug, Clone, Default)]
+pub struct FrameDecoder<U> {
+    _pd: PhantomData<U>,
+}
+
+impl<U: Message + Default> Decoder for FrameDecoder<U> {
+    type Item = U;
+    type Error = Status;
+
+    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+        let frame = buf.copy_to_bytes(buf.remaining());
+        U::decode(frame)
+            .map(Some)
+            .map_err(|error| Status::internal(error.to_string()))
+    }
+
+    fn buffer_settings(&self) -> BufferSettings {
+        BufferSettings::default()
     }
 }
 
@@ -464,17 +494,29 @@ pub(crate) fn reserves_for<T: 'static>(item: &T) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
+        fmt::Debug,
         pin::pin,
         task::{Context, Poll},
     };
 
-    use futures::{future::ready, stream};
+    use futures::{future::ready, stream, Stream};
     use prost::bytes::Bytes;
-    use tonic::{codec::EncodeBody, codegen::Body};
+    use tonic::{
+        codec::{CompressionEncoding, EncodeBody},
+        codegen::{
+            http::{HeaderMap, HeaderValue, StatusCode},
+            Body,
+        },
+        Code,
+    };
+    use tonic_prost::ProstCodec;
 
     use super::*;
     use crate::{
-        common_proto::Modality,
+        common_proto::{
+            kv_cache_event::Data, EngineLoad, KvBlock, KvBlocksStored, KvCacheEvent, KvEventBatch,
+            Modality,
+        },
         mlx_proto, sglang_proto, tokenspeed_encoder_proto, tokenspeed_proto,
         tokenspeed_scheduler::tokenspeed_proto::{tensor_data::Payload, TensorData},
         trtllm_proto, vllm_proto,
@@ -500,15 +542,308 @@ mod tests {
         assert_eq!(tensor().encode_to_vec(), expected);
     }
 
+    /// An event batch as an engine publishes it: one store of `blocks` blocks
+    /// of 16 ids under a parent, with the load record that rides it.
+    fn event_batch(blocks: u32) -> KvEventBatch {
+        KvEventBatch {
+            sequence_number: 1234,
+            timestamp: 1_763_280_000.125,
+            events: vec![KvCacheEvent {
+                event_id: 5678,
+                data: Some(Data::Stored(KvBlocksStored {
+                    blocks: (0..blocks)
+                        .map(|block| KvBlock {
+                            block_hash: -6_548_723_112_998_741_231 + i64::from(block),
+                            token_ids: (0..16).map(|id| 1000 + 7919 * id + block).collect(),
+                            block_size: 16,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    parent_block_hash: Some(3_874_665_120_098_432_117),
+                    ..Default::default()
+                })),
+            }],
+            dp_rank: Some(0),
+            load: Some(EngineLoad {
+                running_requests: 3,
+                waiting_requests: 1,
+                token_usage: 0.25,
+                gen_throughput: 100.0,
+                max_running_requests: 4096,
+                age_ms: 2,
+                sample: 99,
+                cache_hit_rate: Some(0.5),
+                num_used_tokens: Some(1024),
+                max_total_num_tokens: Some(2_097_152),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// One token's chunk of a generate stream.
+    fn generate_chunk() -> Box<tokenspeed_proto::GenerateResponse> {
+        Box::new(tokenspeed_proto::GenerateResponse {
+            request_id: "chatcmpl-0123456789abcdef0123456789abcdef".to_string(),
+            response: Some(tokenspeed_proto::generate_response::Response::Chunk(
+                tokenspeed_proto::GenerateStreamChunk {
+                    token_ids: vec![12345],
+                    prompt_tokens: 80,
+                    completion_tokens: 17,
+                    cached_tokens: 64,
+                    ..Default::default()
+                },
+            )),
+        })
+    }
+
+    /// A gRPC frame with the header's compressed flag and length as given.
+    fn frame(flag: u8, len: usize, payload: &[u8]) -> Bytes {
+        let mut frame = vec![flag];
+        frame.extend_from_slice(&(len as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        Bytes::from(frame)
+    }
+
+    /// The status that ended a response stream, if one did.
+    type Ended = Option<(Code, String)>;
+
+    /// What a response body of `chunks` yields through `decoder`, read as a
+    /// client call reads it: the messages in order, and how the stream ended.
+    fn received<D>(
+        decoder: D,
+        chunks: &[Bytes],
+        encoding: Option<CompressionEncoding>,
+    ) -> (Vec<D::Item>, Ended)
+    where
+        D: Decoder<Error = Status> + Send + 'static,
+    {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let frames: Vec<_> = chunks
+            .iter()
+            .cloned()
+            .map(http_body::Frame::data)
+            .chain(std::iter::once(http_body::Frame::trailers(trailers)))
+            .map(Ok::<_, Status>)
+            .collect();
+        let body = http_body_util::StreamBody::new(stream::iter(frames));
+        let mut responses = pin!(tonic::Streaming::new_response(
+            decoder,
+            body,
+            StatusCode::OK,
+            encoding,
+            None,
+        ));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut messages = Vec::new();
+        loop {
+            match responses.as_mut().poll_next(&mut cx) {
+                Poll::Ready(Some(Ok(message))) => messages.push(message),
+                Poll::Ready(Some(Err(status))) => {
+                    return (messages, Some((status.code(), status.message().to_owned())))
+                }
+                Poll::Ready(None) => return (messages, None),
+                Poll::Pending => panic!("a ready body never pends"),
+            }
+        }
+    }
+
+    /// The same bytes through prost's own decoder and through the frame
+    /// decoder: the messages and the stream's end are equal, and returned.
+    fn through_both<U>(chunks: &[Bytes], encoding: Option<CompressionEncoding>) -> (Vec<U>, Ended)
+    where
+        U: Message + Default + PartialEq + Debug + Send + 'static,
+    {
+        let stock = received(
+            ProstCodec::<(), U>::raw_decoder(BufferSettings::default()),
+            chunks,
+            encoding,
+        );
+        let ours = received(FrameDecoder::<U>::default(), chunks, encoding);
+        assert_eq!(ours, stock);
+        ours
+    }
+
+    /// `messages` as one response stream, however the transport cuts its
+    /// bytes: in two at every offset, and a byte at a time.
+    fn decodes_alike_however_cut<U>(messages: Vec<U>)
+    where
+        U: Message + Default + PartialEq + Clone + Debug + Send + 'static,
+    {
+        let bytes: Vec<u8> = messages.iter().flat_map(prost_frame).collect();
+        for cut in 0..=bytes.len() {
+            let (head, tail) = bytes.split_at(cut);
+            let chunks = [Bytes::copy_from_slice(head), Bytes::copy_from_slice(tail)];
+            assert_eq!(
+                through_both::<U>(&chunks, None),
+                (messages.clone(), None),
+                "cut at {cut}"
+            );
+        }
+        let single: Vec<Bytes> = bytes.iter().map(|&byte| Bytes::from(vec![byte])).collect();
+        assert_eq!(through_both::<U>(&single, None), (messages, None));
+    }
+
+    /// Whole messages, an empty one among them, however the transport cuts
+    /// their bytes (a frame header, a varint and a packed id each cut in
+    /// two): a generate stream's, and an event stream's.
+    #[test]
+    fn frames_cut_at_every_offset_decode_as_prosts_decoder_reads_them() {
+        decodes_alike_however_cut(vec![generate_chunk(), Box::default(), generate_chunk()]);
+        decodes_alike_however_cut(vec![
+            event_batch(1),
+            KvEventBatch::default(),
+            event_batch(3),
+        ]);
+    }
+
+    /// `message` cut short at every length, each cut sent as one frame: how
+    /// many of the cuts prost refused, and of how many.
+    fn refused_cuts<U>(message: &U) -> (usize, usize)
+    where
+        U: Message + Default + PartialEq + Debug + Send + 'static,
+    {
+        let payload = message.encode_to_vec();
+        let refused = (0..payload.len())
+            .filter(|&cut| {
+                let (head, _) = payload.split_at(cut);
+                through_both::<U>(&[frame(0, cut, head)], None).1.is_some()
+            })
+            .count();
+        (refused, payload.len())
+    }
+
+    /// A frame prost refuses ends the stream with prost's own status: a
+    /// message cut short (a varint, a fixed-width field and a
+    /// length-delimited field each cut in two), a wire type that does not
+    /// exist, a length that runs past the frame, and text that is not UTF-8.
+    #[test]
+    fn a_frame_prost_refuses_ends_the_stream_with_prosts_status() {
+        for (refused, cuts) in [
+            refused_cuts(&generate_chunk()),
+            refused_cuts(&event_batch(2)),
+        ] {
+            assert!(refused > cuts / 2, "{refused} of {cuts} cuts refused");
+        }
+        for malformed in [
+            &[0x0f][..],
+            &[0x1a, 0x7f, 0x01][..],
+            &[0x0a, 0x02, 0xff, 0xfe][..],
+        ] {
+            let chunks = [frame(0, malformed.len(), malformed)];
+            let (messages, ended) =
+                through_both::<Box<tokenspeed_proto::GenerateResponse>>(&chunks, None);
+            assert!(messages.is_empty(), "{malformed:?}");
+            assert_eq!(
+                ended.map(|(code, _)| code),
+                Some(Code::Internal),
+                "{malformed:?}"
+            );
+        }
+    }
+
+    /// The largest message tonic's receive limit admits decodes as prost's
+    /// decoder reads it; a byte more is refused before either decoder sees
+    /// it, with one status.
+    #[test]
+    fn a_message_at_the_receive_limit_decodes_and_a_byte_more_is_refused() {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let message = |id_len: usize| tokenspeed_proto::GenerateResponse {
+            request_id: "r".repeat(id_len),
+            response: None,
+        };
+        let largest = message(LIMIT - 5);
+        assert_eq!(largest.encoded_len(), LIMIT);
+        let chunks = [Bytes::from(prost_frame(&largest))];
+        let (messages, ended) = through_both::<tokenspeed_proto::GenerateResponse>(&chunks, None);
+        assert_eq!(ended, None);
+        assert!(messages == [largest]);
+
+        let chunks = [Bytes::from(prost_frame(&message(LIMIT - 4)))];
+        let (messages, ended) = through_both::<tokenspeed_proto::GenerateResponse>(&chunks, None);
+        assert!(messages.is_empty());
+        assert_eq!(ended.map(|(code, _)| code), Some(Code::OutOfRange));
+    }
+
+    /// The header's compressed flag is tonic's to read, the same in front of
+    /// either decoder: set with no encoding agreed, or set to a value that
+    /// does not exist, it ends the stream with one status; with gzip agreed
+    /// the inflated frame decodes as prost's decoder reads it.
+    #[test]
+    fn the_compressed_flag_is_read_as_the_stock_codec_reads_it() {
+        let batch = event_batch(2);
+        let payload = batch.encode_to_vec();
+        for flag in [1, 2] {
+            let chunks = [frame(flag, payload.len(), &payload)];
+            let (messages, ended) = through_both::<KvEventBatch>(&chunks, None);
+            assert!(messages.is_empty(), "flag {flag}");
+            assert_eq!(
+                ended.map(|(code, _)| code),
+                Some(Code::Internal),
+                "flag {flag}"
+            );
+        }
+        let gzip = Some(CompressionEncoding::Gzip);
+        let codec = ProstCodec::<KvEventBatch, KvEventBatch>::default();
+        let deflated = encoded_wire_bytes(codec, batch.clone(), gzip);
+        assert_eq!(
+            deflated.first(),
+            Some(&1),
+            "the encoder set the compressed flag"
+        );
+        assert_eq!(
+            through_both::<KvEventBatch>(&[Bytes::from(deflated)], gzip),
+            (vec![batch], None)
+        );
+    }
+
+    /// The cost of one decoded frame, for the Numbers table: `DECODED_FRAMES`
+    /// frames (20,000 by default) of an event batch and of a generate chunk
+    /// through prost's own decoder and through the frame decoder; run with
+    /// `--ignored` under a counter that names the two.
+    #[test]
+    #[ignore = "a cost, not a check"]
+    fn cost_per_decoded_frame() {
+        let frames: usize = std::env::var("DECODED_FRAMES")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(20_000);
+        let batches = vec![Bytes::from(prost_frame(&event_batch(1))); frames];
+        let (decoded, _) = through_both::<KvEventBatch>(&batches, None);
+        assert_eq!(decoded.len(), frames);
+        let chunks = vec![Bytes::from(prost_frame(&generate_chunk())); frames];
+        let (decoded, _) = through_both::<Box<tokenspeed_proto::GenerateResponse>>(&chunks, None);
+        assert_eq!(decoded.len(), frames);
+    }
+
     /// What tonic puts on the wire for one message through `codec`: the data
     /// frames of the client request body it builds, in order.
-    fn wire_bytes<C, T>(mut codec: C, message: T) -> Vec<u8>
+    fn wire_bytes<C, T>(codec: C, message: T) -> Vec<u8>
+    where
+        C: Codec<Encode = T>,
+        T: Send + 'static,
+    {
+        encoded_wire_bytes(codec, message, None)
+    }
+
+    /// [`wire_bytes`] under the compression `encoding` names.
+    fn encoded_wire_bytes<C, T>(
+        mut codec: C,
+        message: T,
+        encoding: Option<CompressionEncoding>,
+    ) -> Vec<u8>
     where
         C: Codec<Encode = T>,
         T: Send + 'static,
     {
         let source = stream::once(ready(Ok::<T, Status>(message)));
-        let mut body = pin!(EncodeBody::new_client(codec.encoder(), source, None, None));
+        let mut body = pin!(EncodeBody::new_client(
+            codec.encoder(),
+            source,
+            encoding,
+            None
+        ));
         let mut cx = Context::from_waker(std::task::Waker::noop());
         let mut bytes = Vec::new();
         loop {

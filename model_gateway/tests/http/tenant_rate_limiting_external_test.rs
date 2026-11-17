@@ -68,7 +68,9 @@ async fn chat_as(router: &dyn RouterTrait, model: &str) -> axum::response::Respo
         "model": model,
         "messages": [{"role": "user", "content": PROMPT_TEXT}],
     }));
-    router.route_chat(None, &tenant(), body, model).await
+    router
+        .route_chat(None, &tenant(), Arc::new(body), model)
+        .await
 }
 
 // ---------------------------------------------------------------------------

@@ -1227,7 +1227,11 @@ impl Format {
         if closes.peek().is_none() || closes.clone().any(|close| before.ends_with(close)) {
             return Some(last);
         }
+        // Rows that name one close one after another (Inkling's three into `ended`): its search
+        // is not repeated for the next of them.
+        let mut searched = "";
         let closed = closes
+            .filter(|&close| std::mem::replace(&mut searched, close) != close)
             .filter_map(|close| before.rfind(close).map(|at| at + close.len()))
             .max()
             .unwrap_or(0);
@@ -1253,13 +1257,17 @@ impl Format {
     /// the turn opener that opens the model's turn (the last one, or the open message's own
     /// where the opener is a terminal the model writes at every message), or the whole prompt
     /// when the table names none or the prompt does not hold it; for a table with turn anchors,
-    /// from the start of the last anchor found, or nothing when the prompt holds none. A caller
-    /// that keeps the prompt for a later `Input::Prompt` need keep only this: replayed again, it
-    /// gives itself.
+    /// from the start of the last anchor found, or nothing when the prompt holds none. A prompt
+    /// that ends with the turn's end and opens no turn ([`Self::unopened_turn_starts_in`]) is
+    /// not replayed: that end alone stands for it. A caller that keeps the prompt for a later
+    /// `Input::Prompt` need keep only this: replayed again, it gives itself.
     pub fn replay<'p>(&self, prompt: &'p str) -> &'p str {
         if !self.anchors.is_empty() {
             let from = self.last_anchor(prompt).map_or(prompt.len(), |(at, _)| at);
             return &prompt[from..];
+        }
+        if let Some(unopened) = self.ends_unopened(prompt) {
+            return &prompt[prompt.len() - unopened.end.len()..];
         }
         match self.turn_opens_at(prompt) {
             Some(at) => &prompt[at..],
@@ -1290,10 +1298,89 @@ impl Format {
 
     /// The last turn anchor in `prompt` and where it starts, found as `finditer` finds the
     /// alternation of the anchors: the earliest match, the first anchor in the table's order
-    /// where several match there, then on from that match's end. Each anchor's next occurrence is
-    /// searched for again only once the matches have passed it, so a prompt costs one pass per
-    /// anchor. An anchor with no text never matches.
+    /// where several match there, then on from that match's end. Where the anchors start with
+    /// one byte, the last place an anchor starts at is found by that byte from the prompt's end;
+    /// where they start with different bytes, by each anchor's first byte in the prompt's tail
+    /// alone, where a generation prompt holds its anchor. No match crosses a place that no
+    /// anchor the scan would take crosses, so the scan starts at such a place at or before the
+    /// one found and its matches are the whole scan's. A prompt dense in the anchors' one byte
+    /// near its end is scanned from its start, as is one whose tail holds none of the anchors
+    /// that start with different bytes: each anchor's next occurrence is searched for again only
+    /// once the matches have passed it, so the prompt costs one pass per anchor. An anchor with
+    /// no text never matches.
     fn last_anchor(&self, prompt: &str) -> Option<(usize, &Anchor)> {
+        let bytes = prompt.as_bytes();
+        let anchors = || self.anchors.iter().filter(|anchor| !anchor.text.is_empty());
+        let longest = anchors().map(|anchor| anchor.text.len()).max()?;
+        let first = anchors().next()?.text.as_bytes()[0];
+        let mixed = anchors().any(|anchor| anchor.text.as_bytes()[0] != first);
+        // The anchor the scan takes where it stands at `at`.
+        let taken =
+            |at: usize| anchors().find(|anchor| bytes[at..].starts_with(anchor.text.as_bytes()));
+        // The last place in `low..high` that `anchor` starts at, read back by its first byte.
+        let last_in = |anchor: &Anchor, low: usize, high: usize| {
+            let text = anchor.text.as_bytes();
+            memchr::memrchr_iter(text[0], &bytes[low..high])
+                .map(|at| low + at)
+                .find(|&at| bytes[at..].starts_with(text))
+        };
+        let last = 'last: {
+            if mixed {
+                let tail = bytes.len().saturating_sub(4 * longest);
+                let in_tail = anchors()
+                    .filter_map(|anchor| last_in(anchor, tail, bytes.len()))
+                    .max();
+                if in_tail.is_none() && tail == 0 {
+                    return None;
+                }
+                break 'last in_tail;
+            }
+            // A place that starts no anchor costs about as much as 384 bytes of one anchor's
+            // pass from the start: once the places read so far stand denser than one in 384
+            // bytes an anchor, past an anchor's length from the end, the passes cost less.
+            for (passed, at) in memchr::memrchr_iter(first, bytes).enumerate() {
+                if taken(at).is_some() {
+                    break 'last Some(at);
+                }
+                let back = bytes.len() - at;
+                if back > longest && passed > back * self.anchors.len() / 384 {
+                    break 'last None;
+                }
+            }
+            return None;
+        };
+        if let Some(last) = last {
+            // An anchor that crosses `from` starts within its own length before it.
+            let mut from = last;
+            if mixed {
+                while let Some(crossing) = anchors()
+                    .filter_map(|anchor| {
+                        last_in(anchor, from.saturating_sub(anchor.text.len() - 1), from)
+                    })
+                    .min()
+                {
+                    from = crossing;
+                }
+            } else {
+                while let Some(crossing) = (from.saturating_sub(longest - 1)..from).find(|&at| {
+                    bytes[at] == first
+                        && taken(at).is_some_and(|anchor| at + anchor.text.len() > from)
+                }) {
+                    from = crossing;
+                }
+            }
+            let mut found = None;
+            while from <= last {
+                match taken(from) {
+                    Some(anchor) => {
+                        found = Some((from, anchor));
+                        from += anchor.text.len();
+                    }
+                    None => from += 1,
+                }
+            }
+            return found;
+        }
         let find = |anchor: &Anchor, from: usize| {
             if anchor.text.is_empty() {
                 return None;
@@ -1426,11 +1513,32 @@ impl Format {
         if prompt.is_empty() {
             return None;
         }
+        if self.ends_unopened(prompt).is_some() {
+            return Some(unopened.state);
+        }
         let opener = self.turn_opener.as_ref()?;
         let opened = opener
             .rfind(prompt)
             .is_some_and(|at| !prompt[at + opener.text.len()..].contains(unopened.end.as_str()));
         (!opened).then_some(unopened.state)
+    }
+
+    /// The unopened row, where `prompt` ends with the turn's end and no turn opener starts so
+    /// late that it runs into that end: such a prompt opens no turn wherever its last opener
+    /// stands, so the answer takes a suffix compare and a search of the last few bytes, not of
+    /// the prompt. A template that writes no opener ends every generation prompt so.
+    fn ends_unopened(&self, prompt: &str) -> Option<&Unopened> {
+        let unopened = self.unopened.as_ref().filter(|row| !row.end.is_empty())?;
+        let opener = self.turn_opener.as_ref()?;
+        let before = prompt.strip_suffix(unopened.end.as_str())?;
+        let late = before
+            .len()
+            .saturating_sub(opener.text.len().saturating_sub(1));
+        opener
+            .finder
+            .rfind(&prompt.as_bytes()[late..])
+            .is_none()
+            .then_some(unopened)
     }
 
     /// The state `prompt` leaves the table in ([`Self::replayed`]): where the engine starts the
@@ -2437,6 +2545,74 @@ mod tests {
     }
 
     #[test]
+    fn the_last_anchor_is_the_last_match_of_a_scan_from_the_prompts_start() {
+        // `finditer` over the alternation, a place at a time.
+        fn scanned<'f>(format: &'f Format, prompt: &str) -> Option<(usize, &'f str)> {
+            let mut last = None;
+            let mut at = 0;
+            while at < prompt.len() {
+                let here = format
+                    .anchors
+                    .iter()
+                    .find(|anchor| prompt.as_bytes()[at..].starts_with(anchor.text.as_bytes()));
+                match here {
+                    Some(anchor) => {
+                        last = Some((at, anchor.text.as_str()));
+                        at += anchor.text.len();
+                    }
+                    None => at += 1,
+                }
+            }
+            last
+        }
+        // Anchors that overlap themselves and each other, in both orders.
+        let tables: [&[&str]; 12] = [
+            &["aa"],
+            &["ab", "a"],
+            &["a", "ab"],
+            &["aaa", "aa"],
+            &["aa", "aaa"],
+            &["aba", "bab"],
+            &["ab", "ba", "b"],
+            &["abc", "bca", "cab"],
+            &["abab", "bc", "c"],
+            &["aba", "ab"],
+            &["abab", "a"],
+            &["aab", "aba", "a"],
+        ];
+        // Frames that hold no anchor, some of characters of several bytes, and one dense in the
+        // letter most anchors start with.
+        let frames = [
+            ("", ""),
+            ("", "-----"),
+            ("--", "-------------"),
+            ("｜", "｜｜｜｜"),
+            ("", "｜｜｜｜｜｜｜｜｜｜｜"),
+            ("a-", "-a-a-a-a-a-a-a-a-"),
+        ];
+        for anchors in tables {
+            let format = anchors.iter().fold(
+                Format::new("t").state("content", Emits::Content),
+                |format, anchor| format.turn_anchor(anchor),
+            );
+            for length in 0..=6_u32 {
+                for code in 0..3_usize.pow(length) {
+                    let text: String = (0..length)
+                        .map(|place| ['a', 'b', 'c'][code / 3_usize.pow(place) % 3])
+                        .collect();
+                    for (head, tail) in frames {
+                        let prompt = format!("{head}{text}{tail}");
+                        let found = format
+                            .last_anchor(&prompt)
+                            .map(|(at, anchor)| (at, anchor.text.as_str()));
+                        assert_eq!(found, scanned(&format, &prompt), "{anchors:?} {prompt:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_prompt_without_an_anchor_replays_nothing_and_a_replay_gives_itself() {
         let format = gemma_anchors();
         assert_eq!(format.replay("hello "), "");
@@ -2616,6 +2792,50 @@ mod tests {
             said(&shown),
             ("a thought</a>an answer".to_string(), String::new(), 0)
         );
+    }
+
+    #[test]
+    fn a_prompt_that_ends_with_the_turns_end_keeps_the_end_alone() {
+        let format = Format::new("ends")
+            .terminal("open", "<a>")
+            .terminal("close", "</a>")
+            .state("content", Emits::Content)
+            .state("inside", Emits::Reasoning)
+            .transition("content", "open", "inside")
+            .transition("inside", "close", "content")
+            .opens_turn("<|assistant|>")
+            .unopened_turn_starts_in("inside", "<|end|>");
+        // No opener at all, and an opener the end follows: the end alone is kept, and the output
+        // starts from it where it starts from the whole prompt.
+        for prompt in [
+            "User: hi<|end|>",
+            "<|assistant|><a>t</a>answer<|end|>User: more<|end|>",
+            "<|end|>",
+        ] {
+            let kept = format.replay(prompt);
+            assert_eq!(kept, "<|end|>", "{prompt:?}");
+            assert_eq!(format.replay(kept), kept, "{prompt:?}");
+            assert_eq!(format.replayed(kept), format.replayed(prompt), "{prompt:?}");
+            assert_eq!(format.prompt_state(prompt), 1, "{prompt:?}");
+        }
+        // A prompt that ends elsewhere is searched as before: an opened turn replays from its
+        // opener, and one that opens none is kept whole.
+        assert_eq!(
+            format.replay("User: hi<|end|><|assistant|><a>"),
+            "<|assistant|><a>"
+        );
+        assert_eq!(format.replay("User: hi<|end|>\n"), "User: hi<|end|>\n");
+        assert_eq!(format.prompt_state("User: hi<|end|>\n"), 1);
+        // An opener that runs into the end is followed by no whole end: the turn is opened.
+        let crossing = Format::new("crossing")
+            .state("content", Emits::Content)
+            .state("inside", Emits::Reasoning)
+            .opens_turn("ab")
+            .unopened_turn_starts_in("inside", "bc");
+        assert_eq!(crossing.replay("xabc"), "abc");
+        assert_eq!(crossing.prompt_state("xabc"), 0);
+        assert_eq!(crossing.replay("xab_bc"), "bc");
+        assert_eq!(crossing.prompt_state("xab_bc"), 1);
     }
 
     #[test]
