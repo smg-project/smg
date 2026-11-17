@@ -1522,8 +1522,8 @@ mod tests {
             hash_ring::HashRing, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
             LeastLoadPolicy, PowerOfTwoPolicy, RoundRobinPolicy,
         },
-        routers::grpc::backend_client::BackendClient,
         worker::{
+            connection::engine::EngineConnection,
             health::circuit_breaker::CircuitState,
             identity::basic::WorkerMetadata,
             load::state::{one_rank_load, TestFeed},
@@ -3095,10 +3095,10 @@ mod tests {
         async fn check_health_async(&self) -> crate::worker::WorkerResult<()> {
             self.worker.check_health_async().await
         }
-        async fn get_backend_client(
+        async fn engine_connection(
             &self,
-        ) -> crate::worker::WorkerResult<Option<Arc<BackendClient>>> {
-            self.worker.get_backend_client().await
+        ) -> crate::worker::WorkerResult<Option<Arc<dyn EngineConnection>>> {
+            self.worker.engine_connection().await
         }
         fn is_available(&self) -> bool {
             self.read(|worker| worker.is_available())

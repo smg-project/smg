@@ -38,6 +38,7 @@ use uuid::Uuid;
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     worker::{
+        connection::engine::EngineConnector,
         health::circuit_breaker::CircuitState,
         identity::{
             basic::{RuntimeType, WorkerType},
@@ -560,6 +561,10 @@ pub struct WorkerRegistry {
     /// [`Self::take_connect_signal_receiver`]; `None` thereafter (and when
     /// no manager runs, e.g. health checks globally disabled).
     connect_signal_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<WorkerConnected>>>,
+
+    /// What makes the engine connection of a worker this registry builds
+    /// from a peer's published state (see [`Self::with_engine_connector`]).
+    engine_connector: Option<Arc<dyn EngineConnector>>,
 }
 
 impl WorkerRegistry {
@@ -610,7 +615,18 @@ impl WorkerRegistry {
             event_tx: broadcast::Sender::new(1024),
             connect_signal_tx,
             connect_signal_rx: parking_lot::Mutex::new(Some(connect_signal_rx)),
+            engine_connector: None,
         }
+    }
+
+    /// The registry with the connector its mesh imports connect through.
+    /// The host names it where it builds the registry: a worker imported
+    /// from a peer's published state is built here, and a gRPC or ZMQ
+    /// worker built without a connector refuses its connect.
+    #[must_use]
+    pub fn with_engine_connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
+        self.engine_connector = Some(connector);
+        self
     }
 
     /// Registration origin for a worker, if it is currently registered.
@@ -3010,7 +3026,7 @@ impl WorkerRegistry {
                     PublishedSpec::HostLocal => return,
                     PublishedSpec::Spec(spec) => {
                         let replacement: Arc<dyn Worker> =
-                            Arc::new(Self::import_from(state, Some(*spec)));
+                            Arc::new(self.import_from(state, Some(*spec)));
                         let record = ImportRecord {
                             version: state.version,
                             from_spec: true,
@@ -3119,7 +3135,7 @@ impl WorkerRegistry {
         // New worker — build from the full WorkerSpec if it decoded,
         // otherwise fall back to the minimal builder.
         let spec_applied = spec.is_some();
-        let worker: Arc<dyn Worker> = Arc::new(Self::import_from(state, spec));
+        let worker: Arc<dyn Worker> = Arc::new(self.import_from(state, spec));
 
         // A `Mesh` origin keeps the outbound sync from re-publishing the
         // imported state (which would version-bump the CRDT in a loop),
@@ -3166,7 +3182,7 @@ impl WorkerRegistry {
     /// spec: the minimal worker, through the replacement path
     /// (`import_rebuild_wanted` keeps an import built from a spec instead).
     fn rebuild_minimal_import(&self, import_id: &WorkerId, state: &smg_mesh::WorkerState) {
-        let replacement: Arc<dyn Worker> = Arc::new(Self::import_from(state, None));
+        let replacement: Arc<dyn Worker> = Arc::new(self.import_from(state, None));
         let record = ImportRecord {
             version: state.version,
             from_spec: false,
@@ -3289,19 +3305,26 @@ impl WorkerRegistry {
     /// state's health says. An explicitly-unhealthy import must not be
     /// routable: the builder defaults `disable_health_check` workers to
     /// `Ready`, so the `false` case needs a forced demotion, not just no
-    /// promotion.
+    /// promotion. It connects through the registry's connector.
     fn import_from(
+        &self,
         state: &smg_mesh::WorkerState,
         spec: Option<openai_protocol::worker::WorkerSpec>,
     ) -> super::identity::basic::BasicWorker {
         use openai_protocol::model_card::ModelCard;
 
-        let worker = match spec {
-            Some(spec) => super::identity::builder::BasicWorkerBuilder::from_spec(spec).build(),
+        // The builder without a default: an import connects through the
+        // registry's own connector.
+        let builder: super::identity::builder::BasicWorkerBuilder = match spec {
+            Some(spec) => super::identity::builder::BasicWorkerBuilder::from_spec(spec),
             None => super::identity::builder::BasicWorkerBuilder::new(&state.url)
-                .model(ModelCard::new(&state.model_id))
-                .build(),
+                .model(ModelCard::new(&state.model_id)),
         };
+        let worker = match &self.engine_connector {
+            Some(connector) => builder.engine_connector(Arc::clone(connector)),
+            None => builder,
+        }
+        .build();
         worker.set_status(if state.health {
             WorkerStatus::Ready
         } else {

@@ -1390,7 +1390,7 @@ impl WorkerManager {
         for worker in all_workers {
             if matches!(worker.connection_mode(), ConnectionMode::Zmq)
                 && !matches!(
-                    worker.get_backend_client().await,
+                    worker.engine_connection().await,
                     Ok(Some(client)) if client.carries_admin_calls()
                 )
             {

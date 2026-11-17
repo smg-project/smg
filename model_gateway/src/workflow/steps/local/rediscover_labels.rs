@@ -16,7 +16,10 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_metadata::discover_engine_labels;
 use crate::{
-    routers::grpc::{backend_client::BackendClient, zmq_client},
+    routers::grpc::{
+        backend_client::{backend_client_if_initialized, BackendClient},
+        zmq_client,
+    },
     worker::ConnectionMode,
     workflow::data::WorkerUpdateWorkflowData,
 };
@@ -49,7 +52,13 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
             // what registration read from the model's files; a link not up
             // yet leaves the labels as they are, and the next transition
             // into service refreshes again.
-            let Some(link) = worker.backend_client_if_initialized() else {
+            let link = backend_client_if_initialized(worker.as_ref()).map_err(|e| {
+                WorkflowError::StepFailed {
+                    step_id: StepId::new("rediscover_labels"),
+                    message: format!("could not read the link of {}: {e}", worker.redacted_url()),
+                }
+            })?;
+            let Some(link) = link else {
                 debug!(worker_url = %worker.redacted_url(), "The ZMQ link is not up; nothing to refresh");
                 return Ok(StepResult::Skip);
             };
@@ -206,7 +215,7 @@ mod tests {
             BasicWorkerBuilder::new(ep("worker.ipc"))
                 .connection_mode(ConnectionMode::Zmq)
                 .runtime_type(RuntimeType::Vllm)
-                .backend_client(BackendClient::Zmq(client.expect("adapter connect")))
+                .engine_connection(BackendClient::Zmq(client.expect("adapter connect")))
                 .discovered_labels(HashMap::from([(
                     "constrained_decoding_start".to_string(),
                     "first_token".to_string(),

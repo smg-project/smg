@@ -24,6 +24,7 @@ use crate::{
     routers::{
         error,
         grpc::{
+            backend_client::get_backend_client,
             context::EncodeWorkerAssignment,
             proto_wrapper::{ProtoGenerateRequest, ProtoGenerateResponse},
             utils::tonic_ext::TonicStatusExt,
@@ -108,8 +109,7 @@ impl PushEncodePlan {
         };
         let (encoder, mut params) = encoder_request(original, worker, self.destination.as_deref());
         let cleanup = PushCleanup::new(&params);
-        let backend = worker
-            .get_backend_client()
+        let backend = get_backend_client(worker)
             .await
             .map_err(|e| error::service_unavailable("ec_encoder_connection", e.to_string()))?
             .ok_or_else(|| {
