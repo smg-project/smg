@@ -1,5 +1,6 @@
 use std::{
     fs,
+    path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
         Arc,
@@ -31,7 +32,7 @@ use crate::{
         test_engine::serve_on_loopback,
         testing::{
             grpc_config, grpc_ctx, grpc_ctx_from, grpc_ctx_over_stores, grpc_ctx_with_parsers,
-            mcp_orchestrator,
+            mcp_orchestrator, unreadable_model_dir,
         },
     },
     tenant::TenantKey,
@@ -201,7 +202,7 @@ fn count_request(model: &str) -> CountMessageTokensRequest {
 /// model_not_found for a model nobody serves. No worker takes part.
 #[tokio::test]
 async fn count_tokens_is_answered_from_the_tokenizer() {
-    let (_ctx, router) = regular_router_over_m(None).await;
+    let (_ctx, router) = regular_router_over_m(None, None).await;
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
     let response = router
@@ -231,9 +232,10 @@ async fn count_tokens_is_answered_from_the_tokenizer() {
 /// capability matrix is refused with the sentence `/v1/messages` gives,
 /// instead of counted, before any media is fetched; to an engine that
 /// takes images the count goes on into media resolution (here, to the
-/// config lookup the mock tokenizer cannot satisfy).
+/// config lookup the test's model directory cannot satisfy).
 #[tokio::test]
 async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
+    let model_dir = unreadable_model_dir();
     for (runtime, code, message) in [
         (
             RuntimeType::Mlx,
@@ -242,7 +244,7 @@ async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
         ),
         (RuntimeType::Sglang, "invalid_multimodal_request", None),
     ] {
-        let (_ctx, router) = regular_router_over_m(Some(runtime)).await;
+        let (_ctx, router) = regular_router_over_m(Some(runtime), Some(model_dir.path())).await;
         let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         let request: CountMessageTokensRequest = serde_json::from_value(json!({
             "model": "m",
@@ -271,6 +273,75 @@ async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
         assert_eq!(body["error"]["code"], code, "{runtime}: {body}");
         if let Some(message) = message {
             assert_eq!(body["error"]["message"], message, "{runtime}: {body}");
+        }
+    }
+}
+
+/// count_tokens judges media of a model without a media spec by the template
+/// the count renders through, as `/v1/messages` does: the one for requests
+/// with tools when the request declares tools, the default one otherwise.
+#[tokio::test]
+async fn count_tokens_media_without_a_spec_is_judged_by_the_template_the_count_renders_through() {
+    use llm_tokenizer::{chat_template::ChatTemplateContentFormat, mock::MockTokenizer};
+
+    use crate::routers::grpc::regular::stages::testing::components_forwarding_media_of;
+
+    let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+    for (default, with_tools) in [
+        (
+            ChatTemplateContentFormat::String,
+            ChatTemplateContentFormat::OpenAI,
+        ),
+        (
+            ChatTemplateContentFormat::OpenAI,
+            ChatTemplateContentFormat::String,
+        ),
+    ] {
+        let tokenizer = MockTokenizer::new()
+            .with_deferred_chat_ids(vec![11, 12, 13])
+            .with_content_format(default)
+            .with_tool_content_format(with_tools);
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        ctx.worker_registry
+            .register(grpc_worker_for_m_on(None))
+            .expect("register worker");
+        let mut router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let (_dir, components) = components_forwarding_media_of("m", Arc::new(tokenizer)).await;
+        router.shared_components = components;
+        for (declares_tools, format) in [(true, with_tools), (false, default)] {
+            let mut body = json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "What colour is this pixel?"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                    }}
+                ]}]
+            });
+            if declares_tools {
+                body["tools"] = json!([{
+                    "name": "lookup", "description": "Look a thing up",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]);
+            }
+            let request: CountMessageTokensRequest =
+                serde_json::from_value(body).expect("count request");
+            let response = router
+                .route_messages_count_tokens(None, &tenant_meta, request, "m")
+                .await;
+            if format == ChatTemplateContentFormat::String {
+                assert_eq!(
+                    error::extract_error_code_from_response(&response),
+                    "multimodal_not_supported",
+                    "declares tools: {declares_tools}"
+                );
+            } else {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "declares tools: {declares_tools}"
+                );
+            }
         }
     }
 }
@@ -354,14 +425,20 @@ fn grpc_worker_for_m_on(runtime: Option<RuntimeType>) -> Arc<BasicWorker> {
 /// A regular gRPC router over one local worker of model `m`, whose
 /// tokenizer is the mock that answers three ids: the context the count and
 /// Messages tests share. `runtime` names the worker's engine when a test's
-/// claim depends on it.
-async fn regular_router_over_m(runtime: Option<RuntimeType>) -> (Arc<AppContext>, GrpcRouter) {
+/// claim depends on it; `model_dir` is the tokenizer's source for a test
+/// whose request carries media, so the model's config lookup stays on this
+/// disk.
+async fn regular_router_over_m(
+    runtime: Option<RuntimeType>,
+    model_dir: Option<&Path>,
+) -> (Arc<AppContext>, GrpcRouter) {
     let ctx = grpc_ctx(regular_routing_mode()).await;
+    let source = model_dir.map_or("mock", |dir| dir.to_str().expect("utf-8 path"));
     let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
         llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
     );
     ctx.tokenizer_registry
-        .load("m", "m", "mock", || async move { Ok(tokenizer) })
+        .load("m", "m", source, || async move { Ok(tokenizer) })
         .await
         .expect("register the tokenizer");
     ctx.worker_registry
@@ -632,7 +709,7 @@ fn sse_event(frame: &str, name: &str) -> serde_json::Value {
 /// context window the model's workers advertise is the pipeline's 400.
 #[tokio::test]
 async fn max_tokens_zero_is_answered_with_an_empty_message() {
-    let (ctx, router) = regular_router_over_m(None).await;
+    let (ctx, router) = regular_router_over_m(None, None).await;
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
     let body = json!({
         "model": "m", "max_tokens": 0,
@@ -1514,7 +1591,7 @@ async fn chat(
     }))
     .expect("chat request");
     let response = router
-        .route_chat(Some(headers), &tenant_meta, body, model)
+        .route_chat(Some(headers), &tenant_meta, Arc::new(body), model)
         .await;
     let status = response.status();
     let parser = response
@@ -1813,7 +1890,8 @@ fn max_tokens_zero_records_the_requests_media_and_count_tokens_does_not() {
     ]}]);
     ::metrics::with_local_recorder(&recorder, || {
         runtime.block_on(async {
-            let (_ctx, router) = regular_router_over_m(None).await;
+            let model_dir = unreadable_model_dir();
+            let (_ctx, router) = regular_router_over_m(None, Some(model_dir.path())).await;
             let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
             let count: CountMessageTokensRequest =

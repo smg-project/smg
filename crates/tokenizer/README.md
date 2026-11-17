@@ -98,10 +98,12 @@ anchor spelling in caller text is not an image. Image bytes, geometry, feature
 generation and cache identity belong to that layer. Audio, video, document
 rendering and non-function tools are not supported here.
 
-Native image processing requires the checkpoint's `image_preprocessing.json`.
-It retains original dimensions and rejects request-level `max_long_side_pixel`
-overrides before fetching media. Grid cells contain duplicated temporal RGB
-patches with fixed normalization. The tokenizer bundle includes that policy file.
+Native image processing requires the checkpoint's fixed image policy: its
+`image_preprocessing.json`, or the `Inkling2ImageProcessor` section of the
+released `processor_config.json`. Both forms give the same features. It retains
+original dimensions and rejects request-level `max_long_side_pixel` overrides
+before fetching media. Grid cells contain duplicated temporal RGB patches with
+fixed normalization. The tokenizer bundle includes both policy files.
 
 `cargo test -p llm-tokenizer --test inkling2_renderer` runs self-contained tests.
 The ignored oracle test additionally requires `INKLING2_MODEL_DIR` and

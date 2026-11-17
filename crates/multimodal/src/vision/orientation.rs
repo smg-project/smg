@@ -5,6 +5,12 @@
 //! permutations of the pixels, so every path writes the same bytes; images of
 //! other types take the `image` crate's own transform.
 //!
+//! The turned pixels go into a buffer of the pool the decoders take theirs
+//! from (`buffer_pool`): a permutation writes every byte of its output, so the
+//! buffer need not arrive zeroed, and a zeroed allocation of a photo's size
+//! is fresh pages on every request. The source's buffer returns to the pool
+//! here, because the frame only ever holds the turned image.
+//!
 //! The AArch64 path is the module's only use of `core::arch` vector loads and
 //! stores, hence the local override of the workspace-wide
 //! `unsafe_code = "deny"`; every pointer it forms comes from an exact-size
@@ -17,6 +23,8 @@
 
 use image::{metadata::Orientation, DynamicImage, RgbImage};
 
+use crate::buffer_pool;
+
 /// `image` with `orientation` applied: the pixels `DynamicImage::apply_orientation`
 /// produces, by the fast paths for RGB8 and the `image` crate for the rest.
 pub(crate) fn oriented(image: DynamicImage, orientation: Orientation) -> DynamicImage {
@@ -24,7 +32,11 @@ pub(crate) fn oriented(image: DynamicImage, orientation: Orientation) -> Dynamic
         return image;
     }
     match image {
-        DynamicImage::ImageRgb8(rgb) => DynamicImage::ImageRgb8(oriented_rgb8(&rgb, orientation)),
+        DynamicImage::ImageRgb8(rgb) => {
+            let turned = oriented_rgb8(&rgb, orientation);
+            buffer_pool::recycle(rgb.into_raw());
+            DynamicImage::ImageRgb8(turned)
+        }
         mut other => {
             other.apply_orientation(orientation);
             other
@@ -139,7 +151,7 @@ fn oriented_rgb8(image: &RgbImage, orientation: Orientation) -> RgbImage {
 /// order (`pixels`).
 fn flipped(src: &[u8], w: usize, h: usize, rows: bool, pixels: bool) -> Vec<u8> {
     let row_len = w * 3;
-    let mut out = vec![0u8; src.len()];
+    let mut out = buffer_pool::take(src.len());
     for (y, row) in src.chunks_exact(row_len).enumerate() {
         let target = if rows { h - 1 - y } else { y };
         let out_row = &mut out[target * row_len..(target + 1) * row_len];
@@ -183,7 +195,7 @@ fn reverse_pixels_scalar(row: &[u8], out_row: &mut [u8]) {
 /// columns of the result reversed as `layout` says: 16 x 16 pixel tiles on
 /// the vector unit, the border tiles pixel by pixel.
 fn transposed(src: &[u8], w: usize, h: usize, layout: Transpose) -> Vec<u8> {
-    let mut out = vec![0u8; src.len()];
+    let mut out = buffer_pool::take(src.len());
     let (out_w, out_h) = (h, w);
     // Destination row of source column x, destination column of source row y.
     let row_of = |x: usize| layout.row_of(out_h, x);
@@ -768,5 +780,39 @@ mod tests {
         expected.apply_orientation(Orientation::Rotate90);
         let actual = oriented(DynamicImage::ImageRgba8(rgba), Orientation::Rotate90);
         assert!(actual.as_bytes() == expected.as_bytes());
+    }
+
+    /// A frame the size of a decoded photo, above the pool's floor, where a
+    /// taken buffer arrives holding the debug sentinel, and one pixel past a
+    /// whole tile on each axis, so the tiles, the border blocks and the row
+    /// tails all write into it: every turn still writes the pixels
+    /// `apply_orientation` produces, its output is a pool buffer and the
+    /// source's buffer is idle in the pool again.
+    #[test]
+    fn a_photo_sized_frame_turns_inside_the_pool() {
+        static POOL: buffer_pool::BufferPool = buffer_pool::BufferPool::new();
+        buffer_pool::with_pool(&POOL, || {
+            let (w, h) = (641, 481);
+            let image = gradient(w, h, 5);
+            let len = image.as_raw().len();
+            for orientation in ORIENTATIONS.into_iter().skip(1) {
+                let mut expected = DynamicImage::ImageRgb8(image.clone());
+                expected.apply_orientation(orientation);
+                let mut pixels = buffer_pool::take(len);
+                pixels.copy_from_slice(image.as_raw());
+                let source = RgbImage::from_raw(w, h, pixels).expect("a 641x481 frame");
+                let actual = oriented(DynamicImage::ImageRgb8(source), orientation);
+                assert!(
+                    actual.as_bytes() == expected.as_bytes(),
+                    "{orientation:?}: pixels differ"
+                );
+                buffer_pool::recycle_image(actual);
+                assert_eq!(
+                    POOL.held(),
+                    2 * buffer_pool::allocation_capacity(len),
+                    "{orientation:?}: the source's buffer and the turned one are both idle in the pool"
+                );
+            }
+        });
     }
 }

@@ -440,6 +440,14 @@ impl<W: fmt::Write + ?Sized> fmt::Write for Sanitizing<'_, W> {
     }
 }
 
+/// Whether `text` holds a control character. The line format spells out the
+/// ones a terminal reads as the start of an escape sequence and writes the
+/// rest as they came, a line break among them; a door that takes a caller's
+/// text which a line writes unquoted asks here, and refuses it.
+pub(crate) fn has_control_character(text: &str) -> bool {
+    text.chars().any(char::is_control)
+}
+
 /// A value's `Display` text, sanitized when the format sanitizes; as a
 /// `Debug` the same text (the stock lists an error's sources this way).
 struct Sanitized<T> {

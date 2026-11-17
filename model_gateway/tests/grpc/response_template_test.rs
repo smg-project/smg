@@ -358,7 +358,12 @@ fn chat_request(extra: Value) -> openai_protocol::chat::ChatCompletionRequest {
 async fn chat(gateway: &Gateway, extra: Value) -> Chat {
     let stream = extra["stream"] == true;
     let request = chat_request(extra);
-    let body = read(gateway.router.route_chat(None, &tenant(), request, MODEL)).await;
+    let body = read(
+        gateway
+            .router
+            .route_chat(None, &tenant(), Arc::new(request), MODEL),
+    )
+    .await;
     let arguments = |args: &str| match args {
         "" => Value::Null,
         args => serde_json::from_str(args).unwrap(),
@@ -1063,7 +1068,9 @@ async fn hf_refuses_what_the_templates_table_cannot_constrain() {
     let (status, error) = refusal(gateway.router.route_chat(
         None,
         &tenant(),
-        chat_request(json!({"tools": tools(), "tool_choice": "required"})),
+        Arc::new(chat_request(
+            json!({"tools": tools(), "tool_choice": "required"}),
+        )),
         MODEL,
     ))
     .await;
@@ -1088,7 +1095,7 @@ async fn hf_refuses_what_the_templates_table_cannot_constrain() {
     let (status, error) = refusal(gateway.router.route_chat(
         None,
         &tenant(),
-        chat_request(json!({})),
+        Arc::new(chat_request(json!({}))),
         MODEL,
     ))
     .await;
@@ -1211,7 +1218,7 @@ async fn turn_sent(
         Duration::from_secs(30),
         gateway
             .router
-            .route_chat(None, &tenant, chat_request(extra), MODEL),
+            .route_chat(None, &tenant, Arc::new(chat_request(extra)), MODEL),
     )
     .await
     .expect("request should finish");

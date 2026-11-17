@@ -21,6 +21,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use futures::stream::{self, FuturesUnordered, StreamExt};
@@ -54,12 +55,18 @@ use crate::{
         ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
         WorkerType,
     },
-    workflow::{steps::local::discover_grpc_kv_engine_id, Job, JobQueue},
+    workflow::steps::local::discover_grpc_kv_engine_id,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT: usize = 32;
 const MAX_CONCURRENT_HEALTH_PROBES: usize = 128;
+
+/// The longest delay the schedule holds, and the longest probe interval or
+/// probe timeout the worker API takes: thirty years, which no process
+/// outlives. The schedule adds a delay to its clock, and the clock cannot
+/// hold every sum a caller's number makes.
+pub(crate) const MAX_PROBE_DELAY: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
 
 /// Result of a fan-out request to a single worker
 struct WorkerResponse {
@@ -156,8 +163,29 @@ impl std::fmt::Debug for WorkerManager {
 pub struct WorkerManagerConfig {
     /// Default check interval used when a worker has no override.
     pub default_check_interval_secs: u64,
-    /// Which workers that reach Failed get a `Job::RemoveWorker`.
+    /// Which workers that reach Failed are removed ([`WorkerJobs::remove_worker`]).
     pub remove_unhealthy: UnhealthyRemovalScope,
+}
+
+/// What the health manager asks of the gateway for a worker: the removal of
+/// one that failed, and a re-read of the labels of one that came into
+/// service. The gateway's job queue implements it; the manager names no job.
+#[async_trait]
+pub trait WorkerJobs: Send + Sync {
+    /// Queue the removal of the failed worker `worker_id` at `url`, as it
+    /// stood at `revision`. `url` may be a base address other workers share:
+    /// the removal takes the named worker alone, and only at that revision.
+    async fn remove_worker(
+        &self,
+        url: String,
+        worker_id: &WorkerId,
+        revision: u64,
+    ) -> Result<(), String>;
+
+    /// Queue a re-read of the labels of the worker at `url`. `Ok(false)` when
+    /// another job for the worker is in flight: the refresh is kept and runs
+    /// when that job ends.
+    async fn refresh_worker_labels(&self, url: String) -> Result<bool, String>;
 }
 
 /// How a profiling call is spelled in its log line and its summary.
@@ -203,7 +231,7 @@ impl WorkerManager {
     pub fn maybe_start(
         registry: Arc<WorkerRegistry>,
         config: WorkerManagerConfig,
-        job_queue: Option<Arc<JobQueue>>,
+        job_queue: Option<Arc<dyn WorkerJobs>>,
         health_checks_enabled: bool,
         zmq_transport_enabled: bool,
     ) -> Option<Self> {
@@ -231,12 +259,11 @@ impl WorkerManager {
     ///   - Probes due workers via `Worker::check_health_async()`.
     ///   - Applies the state machine to probe outcomes and calls
     ///     `WorkerRegistry::transition_status()` to publish StatusChanged.
-    ///   - Submits `Job::RemoveWorker` for Failed workers when removal is
-    ///     enabled.
+    ///   - Asks for the removal of Failed workers when removal is enabled.
     pub fn start(
         registry: Arc<WorkerRegistry>,
         config: WorkerManagerConfig,
-        job_queue: Option<Arc<JobQueue>>,
+        job_queue: Option<Arc<dyn WorkerJobs>>,
     ) -> Self {
         let shutdown_notify = Arc::new(Notify::new());
         let shutdown_clone = shutdown_notify.clone();
@@ -419,12 +446,19 @@ fn schedule_at(
     match slot {
         ProbeSlot::Probe(interval) => {
             let delay = if immediate { Duration::ZERO } else { interval };
-            next_check.insert(worker_id, now + delay);
+            next_check.insert(worker_id, deadline_after(now, delay));
         }
         ProbeSlot::Unprobed | ProbeSlot::Removal => {
             next_check.remove(&worker_id);
         }
     }
+}
+
+/// `now + delay`, the delay capped at [`MAX_PROBE_DELAY`]: a deadline that
+/// far out never comes, and the sum of the clock and a longer delay may not
+/// exist.
+fn deadline_after(now: tokio::time::Instant, delay: Duration) -> tokio::time::Instant {
+    now + delay.min(MAX_PROBE_DELAY)
 }
 
 /// Background task body: deadline-driven probe loop + event subscription.
@@ -445,7 +479,7 @@ async fn run_health_loop(
     mut connect_rx: Option<mpsc::UnboundedReceiver<WorkerConnected>>,
     mut next_check: HashMap<WorkerId, tokio::time::Instant>,
     config: WorkerManagerConfig,
-    job_queue: Option<Arc<JobQueue>>,
+    job_queue: Option<Arc<dyn WorkerJobs>>,
     shutdown: Arc<Notify>,
 ) {
     // Removals go to the queue only under a removal scope; label refreshes
@@ -469,7 +503,7 @@ async fn run_health_loop(
             now,
         );
         for removal in removals {
-            if let Some(jq) = removal_queue.as_ref() {
+            if let Some(jq) = removal_queue.as_deref() {
                 submit_removal_job(
                     &registry,
                     &removal.worker_id,
@@ -482,11 +516,9 @@ async fn run_health_loop(
             }
         }
 
-        let sleep_until = next_check
-            .values()
-            .min()
-            .copied()
-            .unwrap_or_else(|| now + Duration::from_secs(config.default_check_interval_secs));
+        let sleep_until = next_check.values().min().copied().unwrap_or_else(|| {
+            deadline_after(now, Duration::from_secs(config.default_check_interval_secs))
+        });
 
         tokio::select! {
             Some(completion) = probes.next(), if !probes.is_empty() => {
@@ -497,8 +529,8 @@ async fn run_health_loop(
                 match apply_probe_completion(
                     &registry,
                     completion,
-                    removal_queue.as_ref().map(|queue| (queue, config.remove_unhealthy)),
-                    job_queue.as_ref(),
+                    removal_queue.as_deref().map(|queue| (queue, config.remove_unhealthy)),
+                    job_queue.as_deref(),
                 )
                 .await
                 {
@@ -560,7 +592,7 @@ async fn run_health_loop(
                             let gap = Duration::from_secs(
                                 worker.metadata().health_config.timeout_secs.max(1),
                             );
-                            let due = tokio::time::Instant::now() + gap;
+                            let due = deadline_after(tokio::time::Instant::now(), gap);
                             next_check
                                 .entry(worker_id)
                                 .and_modify(|deadline| *deadline = (*deadline).min(due))
@@ -579,7 +611,7 @@ async fn run_health_loop(
                             connected,
                             &mut next_check,
                             &config,
-                            job_queue.as_ref(),
+                            job_queue.as_deref(),
                         )
                         .await;
                     }
@@ -737,7 +769,7 @@ fn queue_due_probes(
         };
 
         let expected_revision = worker.revision();
-        next_check.insert(worker_id.clone(), now + interval);
+        next_check.insert(worker_id.clone(), deadline_after(now, interval));
         in_flight.insert(worker_id.clone());
         probes.push(Box::pin(async move {
             let probe_result = worker.check_health_async().await;
@@ -764,8 +796,8 @@ fn queue_due_probes(
 async fn apply_probe_completion(
     registry: &Arc<WorkerRegistry>,
     completion: ProbeCompletion,
-    removal: Option<(&Arc<JobQueue>, UnhealthyRemovalScope)>,
-    refresh_queue: Option<&Arc<JobQueue>>,
+    removal: Option<(&dyn WorkerJobs, UnhealthyRemovalScope)>,
+    refresh_queue: Option<&dyn WorkerJobs>,
 ) -> ProbeApplyResult {
     let ProbeCompletion {
         worker_id,
@@ -875,7 +907,7 @@ async fn apply_connect_signal_and_refresh(
     connected: WorkerConnected,
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     config: &WorkerManagerConfig,
-    job_queue: Option<&Arc<JobQueue>>,
+    job_queue: Option<&dyn WorkerJobs>,
 ) {
     let Some((worker_id, worker)) = apply_connect_signal(registry, connected, next_check, config)
     else {
@@ -1091,17 +1123,14 @@ fn labels_follow_the_engine(
 /// they changed. While another job for the worker is in flight (its
 /// registration, whose last steps run after the worker is in the registry
 /// and a handshake can complete; an update) the refresh is kept and runs
-/// when that job ends (`JobQueue::submit_or_defer`), never submitted beside
+/// when that job ends ([`WorkerJobs::refresh_worker_labels`]), never submitted beside
 /// it (it would take that job's status under the URL) and never dropped: a
 /// worker that stays in service has no next transition to retry on, and on
 /// the ZMQ wire this refresh is what gives it its window. A failed
 /// submission is logged; the next transition retries.
-async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &Arc<JobQueue>) {
+async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &dyn WorkerJobs) {
     let url = worker.url().to_string();
-    match job_queue
-        .submit_or_defer(Job::RefreshWorkerLabels { url: url.clone() })
-        .await
-    {
+    match job_queue.refresh_worker_labels(url.clone()).await {
         Ok(true) => debug!(
             worker_url = %Endpoint::redacted_str(&url),
             "Submitted a label refresh for a worker that came into service"
@@ -1257,7 +1286,7 @@ async fn submit_removal_job(
     worker_id: &WorkerId,
     worker_url: &str,
     expected_revision: u64,
-    job_queue: &Arc<JobQueue>,
+    job_queue: &dyn WorkerJobs,
     scope: UnhealthyRemovalScope,
 ) {
     if !should_remove_failed(registry, worker_id, scope) {
@@ -1276,16 +1305,8 @@ async fn submit_removal_job(
         expected_revision,
         "Removing failed worker from registry"
     );
-    // Guard the failed worker by its own id. The url is a DP base, so the
-    // removal step matches the whole rank group; a bare revision would take
-    // out every sibling that happens to sit at the same revision.
-    let expected_revisions =
-        HashMap::from([(worker_id.as_str().to_string(), Some(expected_revision))]);
     if let Err(e) = job_queue
-        .submit(Job::RemoveWorker {
-            url: url.clone(),
-            expected_revisions: Some(expected_revisions),
-        })
+        .remove_worker(url.clone(), worker_id, expected_revision)
         .await
     {
         error!(

@@ -68,9 +68,10 @@ use crate::{
 pub struct ProbeResponse;
 
 /// Response-extension marker for a refusal whose refusing router wrote the
-/// log line for it already (one WARN per refusal, rate-limited under a
-/// sustained condition, with the request id, the model and the pool's
-/// state). [`ResponseLogger`] logs a marked response at DEBUG instead of a
+/// log line for it already (one WARN per refusal: a selection's rate-limited
+/// under a sustained condition, with the request id, the model and the
+/// pool's state; a preparation's with the cause of a client's mistake).
+/// [`ResponseLogger`] logs a marked response at DEBUG instead of a
 /// second line at ERROR: a client retrying at once against a model whose
 /// workers are all down turned every refusal into three ERROR lines, and
 /// the log into a storm.

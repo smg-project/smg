@@ -25,7 +25,7 @@ use openai_protocol::{
     },
 };
 use serde_json::json;
-use tracing::{debug, trace, warn};
+use tracing::{debug, enabled, trace, warn, Level};
 
 use super::types::HarmonyBuildOutput;
 use crate::routers::grpc::{
@@ -472,8 +472,7 @@ impl HarmonyBuilder {
         let (instructions, messages) = split_instructions(&request.messages);
         let tools = chat_tools(request).filter(|tools| !tools.is_empty());
         if instructions.is_some() || tools.is_some() {
-            let dev_msg =
-                self.build_developer_message_from_chat(instructions.as_deref(), tools.as_ref());
+            let dev_msg = self.build_developer_message(tools.as_ref(), instructions.as_deref());
             all_messages.push(dev_msg);
         }
 
@@ -529,18 +528,21 @@ impl HarmonyBuilder {
             .flat_map(|set| set.into_iter())
             .collect();
 
-        // Decode tokens to see what the model actually receives
-        let decoded_text = encoding
-            .tokenizer()
-            .decode_utf8(&token_ids)
-            .unwrap_or_else(|_| "<decode error>".to_string());
-        trace!(
-            token_count = token_ids.len(),
-            token_preview = ?&token_ids[..token_ids.len().min(20)],
-            decoded_length = decoded_text.len(),
-            "Encoded conversation to tokens - decoded text follows:"
-        );
-        trace!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
+        // What the model receives, decoded back for the trace lines alone:
+        // a pass over every prompt token, so it runs only when they print.
+        if enabled!(Level::TRACE) {
+            let decoded_text = encoding
+                .tokenizer()
+                .decode_utf8(&token_ids)
+                .unwrap_or_else(|_| "<decode error>".to_string());
+            trace!(
+                token_count = token_ids.len(),
+                token_preview = ?&token_ids[..token_ids.len().min(20)],
+                decoded_length = decoded_text.len(),
+                "Encoded conversation to tokens - decoded text follows:"
+            );
+            trace!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
+        }
 
         Ok(HarmonyBuildOutput {
             input_ids: token_ids,
@@ -681,27 +683,6 @@ impl HarmonyBuilder {
         HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
     }
 
-    fn build_developer_message_from_chat(
-        &self,
-        instructions: Option<&str>,
-        tools: Option<&Vec<Tool>>,
-    ) -> HarmonyMessage {
-        self.build_developer_message(tools, instructions)
-    }
-
-    /// Build developer message from Responses request
-    ///
-    /// # Arguments
-    /// * `instructions` - Optional instructions (Responses API specific)
-    /// * `tools` - Optional list of tools
-    fn build_developer_message_from_responses(
-        &self,
-        instructions: Option<&str>,
-        tools: Option<&Vec<ResponseTool>>,
-    ) -> HarmonyMessage {
-        self.build_developer_message(tools, instructions)
-    }
-
     /// Construct input messages for Responses API with Harmony
     ///
     /// Handles both new conversations and continuations of previous responses.
@@ -739,9 +720,9 @@ impl HarmonyBuilder {
 
             // Add developer message if we have custom tools or instructions
             if with_custom_tools || request.instructions.is_some() {
-                let dev_msg = self.build_developer_message_from_responses(
-                    request.instructions.as_deref(),
+                let dev_msg = self.build_developer_message(
                     request.tools.as_ref(),
+                    request.instructions.as_deref(),
                 );
                 all_messages.push(dev_msg);
             }
@@ -1363,6 +1344,7 @@ mod tests {
         responses::{ImageGenerationTool, ResponseInput, ResponseTool, ResponsesRequest},
     };
     use smg_grpc_client::vllm_proto as vllm;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::routers::grpc::common::responses::utils::namespace_test_request;
@@ -1940,7 +1922,7 @@ mod tests {
             });
             assert_eq!(commentary, !expected.is_empty(), "{case}");
             // The developer message describes the same tools.
-            let developer = builder.build_developer_message_from_chat(None, tools.as_ref());
+            let developer = builder.build_developer_message(tools.as_ref(), None);
             assert_eq!(developer.content.len(), 1, "{case}");
             let described: Vec<String> = developer
                 .content
@@ -2254,5 +2236,29 @@ mod tests {
             "messages": [{"role": "user", "content": "Check Hangzhou weather."}]
         }));
         assert_eq!(prompt, REQUEST_TOOLS);
+    }
+
+    /// With trace logging on, a Responses build still writes its two trace
+    /// lines from the prompt decoded back: the decoded length on the first,
+    /// the text under the marker of the second.
+    #[test]
+    #[traced_test]
+    fn build_from_responses_traces_the_decoded_prompt() {
+        let request = ResponsesRequest {
+            model: "gpt-oss-120b".to_string(),
+            input: ResponseInput::Text("draw a cat".to_string()),
+            ..Default::default()
+        };
+        let output = HarmonyBuilder::new()
+            .build_from_responses(&request)
+            .expect("harmony build must succeed");
+        let decoded = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .expect("decode harmony tokens back to UTF-8");
+
+        assert!(logs_contain(&format!("decoded_length={}", decoded.len())));
+        assert!(logs_contain("DECODED_TEXT_START"));
     }
 }

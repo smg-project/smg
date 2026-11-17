@@ -191,6 +191,8 @@ pub(crate) struct ZmqConnectionMeta {
     /// disagrees yielding to it
     /// (see [`ZmqEngineClient::note_engine_places_by_rendezvous_room`]).
     engine_places_by_rendezvous_room: OnceLock<()>,
+    /// See [`ZmqEngineClient::note_engine_ranks_are_replicas`].
+    engine_ranks_are_replicas: OnceLock<()>,
     /// A pin's yield to the room on this connection: the first is logged at
     /// WARN, the rest at DEBUG (`PinYieldNote`).
     pin_yield: PinYieldNote,
@@ -435,6 +437,7 @@ impl ZmqEngineClient {
                 supported_tasks: tokio::sync::OnceCell::new(),
                 engine_truncates_long_prompts: OnceLock::new(),
                 engine_places_by_rendezvous_room: OnceLock::new(),
+                engine_ranks_are_replicas: OnceLock::new(),
                 pin_yield: PinYieldNote::default(),
                 request_timeout: OnceLock::new(),
             }),
@@ -538,6 +541,15 @@ impl ZmqEngineClient {
     /// nothing.
     pub fn note_engine_places_by_rendezvous_room(&self) {
         let _ = self.meta.engine_places_by_rendezvous_room.set(());
+    }
+
+    /// The ranks of an engine that places by the room
+    /// ([`Self::note_engine_places_by_rendezvous_room`]) are plain
+    /// data-parallel replicas, as the launcher that started it knows: from
+    /// now a room-placed request names its rank to the engine, whose KV
+    /// sender fails an unnamed one on every replica but the first.
+    pub fn note_engine_ranks_are_replicas(&self) {
+        let _ = self.meta.engine_ranks_are_replicas.set(());
     }
 
     /// The window the prompt admission applies on this connection: the
@@ -1194,10 +1206,12 @@ impl ZmqEngineClient {
         // pin, or on a prefill side that follows the room by its room's
         // residue ([`Self::note_engine_places_by_rendezvous_room`]).
         let ranks = client.engines().len();
-        let placement = if self.meta.engine_places_by_rendezvous_room.get().is_some() {
-            RankPlacement::RoomResidue
-        } else {
+        let placement = if self.meta.engine_places_by_rendezvous_room.get().is_none() {
             RankPlacement::Pin
+        } else if self.meta.engine_ranks_are_replicas.get().is_some() {
+            RankPlacement::ReplicaRoomResidue
+        } else {
+            RankPlacement::RoomResidue
         };
         let mut streams = Vec::new();
         // Fan-out clones share identical media; cache only within this request.
@@ -1877,8 +1891,10 @@ impl ZmqEngineClient {
                     world_size: ready
                         .map_or(1, |r| i32::try_from(r.world_size).unwrap_or(i32::MAX)),
                     // The handshake does not say which structural-tag
-                    // vocabulary the engine's grammar compiler takes.
+                    // vocabulary the engine's grammar compiler takes, nor
+                    // where the engine starts a grammar.
                     structural_tag_vocabulary: String::new(),
+                    constrained_decoding_start: String::new(),
                 }))
             }
         }

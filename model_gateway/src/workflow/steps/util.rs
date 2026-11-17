@@ -106,7 +106,7 @@ pub(crate) async fn try_http_reachable(
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| format!("Health check failed: {e}"))?;
+        .map_err(|e| format!("Health check failed: {}", e.without_url()))?;
 
     Ok(())
 }
@@ -319,6 +319,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::{server::http_client, worker::test_support::RefusedAddress};
 
     struct DropFlag(Arc<AtomicBool>);
 
@@ -348,6 +349,21 @@ mod tests {
     fn http_health_url_rejects_grpc_schemes() {
         assert!(http_health_url("grpc://localhost:30001").is_err());
         assert!(http_health_url("grpcs://localhost:30001").is_err());
+    }
+
+    /// An address registered with a query, at a port nobody listens on: the
+    /// failure does not repeat the query. The HTTP client's own error text
+    /// ends with the request URL, the query kept.
+    #[tokio::test]
+    async fn a_failed_http_probe_goes_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}?token=s3cret", refused.http_url());
+
+        let err = try_http_reachable(&url, 1, &http_client())
+            .await
+            .expect_err("nothing listens at the address");
+
+        assert!(!err.contains("s3cret"), "{err}");
     }
 
     #[test]

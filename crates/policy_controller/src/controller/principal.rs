@@ -15,11 +15,11 @@
 
 use tonic::{Request, Status};
 
-use crate::proto::principal::Method;
+use crate::{proto::principal::Method, store::GatewayId, view};
 
 /// The metadata entry a caller states its name in, on a listener that takes
 /// identities as told.
-pub(crate) const ENTRY: &str = "x-smg-principal";
+pub const ENTRY: &str = "x-smg-principal";
 
 /// The longest name a caller states: a DNS name's bound.
 const NAME_MAX: usize = 253;
@@ -43,11 +43,21 @@ pub(crate) struct Principal {
     pub(crate) method: Method,
 }
 
+impl Principal {
+    /// The subject as the store keys a gateway's leases, vetoes and reports:
+    /// its fingerprint, never `0`, which is the embedded mode's own gateway.
+    pub(crate) fn gateway(&self) -> GatewayId {
+        GatewayId(view::fingerprint(self.subject.as_bytes()))
+    }
+}
+
 /// The layer of a listener that takes identities as told: the name the call
 /// states in [`ENTRY`] becomes its principal, nothing verified. A name is
-/// one token of printable ASCII, at most [`NAME_MAX`] bytes, stated once: a
-/// call that states none, two, or one that is no such token passes with no
-/// principal.
+/// one token of visible ASCII (0x21 to 0x7E) with no comma, at most
+/// [`NAME_MAX`] bytes, stated once: a call that states none, two, or one
+/// that is no such token passes with no principal. The wire lets a hop
+/// join a key's entries into one value with a comma between them, so a
+/// comma is two names.
 pub(crate) fn as_told(mut request: Request<()>) -> Request<()> {
     let mut stated = request.metadata().get_all(ENTRY).iter();
     let subject = match (stated.next(), stated.next()) {
@@ -57,7 +67,9 @@ pub(crate) fn as_told(mut request: Request<()>) -> Request<()> {
             .filter(|name| {
                 !name.is_empty()
                     && name.len() <= NAME_MAX
-                    && name.bytes().all(|byte| byte.is_ascii_graphic())
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_graphic() && byte != b',')
             })
             .map(str::to_owned),
         _ => None,
@@ -76,7 +88,7 @@ pub(crate) fn as_told(mut request: Request<()>) -> Request<()> {
 pub(crate) fn principal<T>(request: &Request<T>) -> Result<&Principal, Status> {
     request.extensions().get::<Principal>().ok_or_else(|| {
         Status::unauthenticated(format!(
-            "the call has no principal: this listener takes none as told, or the call states none in {ENTRY}"
+            "the call has no principal: this listener takes none as told, or the call states no single valid name in {ENTRY}"
         ))
     })
 }
@@ -86,10 +98,10 @@ pub(crate) mod tests {
     use tonic::{Code, Request};
 
     use super::{as_told, principal, Principal, ENTRY, NAME_MAX};
-    use crate::proto::principal::Method;
+    use crate::{proto::principal::Method, store::GatewayId};
 
     /// The refusal of a call with no principal, word for word.
-    pub(crate) const NO_PRINCIPAL: &str = "the call has no principal: this listener takes none as told, or the call states none in x-smg-principal";
+    pub(crate) const NO_PRINCIPAL: &str = "the call has no principal: this listener takes none as told, or the call states no single valid name in x-smg-principal";
 
     /// A principal as the layer places it.
     pub(crate) fn told(subject: &str) -> Principal {
@@ -123,6 +135,8 @@ pub(crate) mod tests {
             principal(&placed).expect("the layer placed one"),
             &told("gateway-a")
         );
+        // The method's number on the wire is the contract's.
+        assert_eq!(i32::from(Method::AsTold), 4);
         // A name at the bound is taken.
         let longest = "a".repeat(NAME_MAX);
         assert_eq!(
@@ -157,8 +171,19 @@ pub(crate) mod tests {
         assert!(principal(&as_told(request)).is_err());
     }
 
+    #[test]
+    fn a_gateways_id_is_its_subjects_fingerprint_and_never_the_embedded_one() {
+        let a = told("gateway-a").gateway();
+        let b = told("gateway-b").gateway();
+        assert_ne!(a, b);
+        assert_ne!(a, GatewayId::LOCAL);
+        assert_eq!(a, told("gateway-a").gateway());
+    }
+
     /// Two names are no name: neither the first nor the last is taken, so a
     /// hop that adds its own entry to a caller's never decides by position.
+    /// Joined into one value, as the wire lets a hop join them, they are two
+    /// names still.
     #[test]
     fn a_call_that_states_two_names_passes_with_no_principal() {
         let mut request = stating("gateway-a");
@@ -172,5 +197,9 @@ pub(crate) mod tests {
             .metadata_mut()
             .append(ENTRY, "gateway-a".parse().expect("an ASCII value"));
         assert!(principal(&as_told(request)).is_err());
+        // One value with a comma, wherever the comma stands.
+        for joined in ["gateway-a,gateway-b", "gateway-a,", ",gateway-a", ","] {
+            assert!(principal(&as_told(stating(joined))).is_err(), "{joined}");
+        }
     }
 }

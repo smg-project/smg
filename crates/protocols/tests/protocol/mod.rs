@@ -6,6 +6,7 @@ mod completion;
 mod decisions;
 mod deepseek_profile;
 mod embedding;
+mod models;
 mod provider_ext;
 mod realtime;
 mod responses;
