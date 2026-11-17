@@ -180,25 +180,6 @@ impl BackendClient {
         router_stops
     }
 
-    /// Whether the backend answers the admin RPCs (cache flush, profiling):
-    /// a gRPC servicer does, a ZMQ engine when its wire carries control calls
-    /// (an SGLang scheduler, or a TokenSpeed one that declares them).
-    pub fn carries_admin_calls(&self) -> bool {
-        match self {
-            Self::Grpc(_) => true,
-            Self::Zmq(client) => client.carries_control_calls(),
-        }
-    }
-
-    /// Local liveness. gRPC has no cheap local flag (it uses a health RPC), so
-    /// this reports `true` for gRPC; ZMQ reflects its connection liveness.
-    pub fn is_alive(&self) -> bool {
-        match self {
-            Self::Grpc(_) => true,
-            Self::Zmq(client) => client.is_alive(),
-        }
-    }
-
     pub async fn health_check(&self) -> Result<HealthCheckResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.health_check().await,
@@ -223,79 +204,6 @@ impl BackendClient {
         match self {
             Self::Grpc(client) => client.get_server_info().await,
             Self::Zmq(client) => Ok(zmq_client::server_info(client)),
-        }
-    }
-
-    pub async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.get_loads().await,
-            Self::Zmq(client) => Ok(client.get_loads()),
-        }
-    }
-
-    pub async fn flush_cache(
-        &self,
-        timeout_s: f32,
-    ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.flush_cache(timeout_s).await,
-            // The reply wait is the servicers' rule, read from the adapter.
-            Self::Zmq(client) => {
-                let (success, message) = client
-                    .flush_cache_control(timeout_s, flush_reply_wait(timeout_s))
-                    .await?;
-                Ok(common_proto::FlushCacheResponse { success, message })
-            }
-        }
-    }
-
-    pub async fn start_profile(
-        &self,
-        req: common_proto::StartProfileRequest,
-    ) -> Result<common_proto::ProfileResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.start_profile(req).await,
-            Self::Zmq(client) => {
-                let (success, message) = client
-                    .profile_control(Some(SglangProfileStart::from_request(req)), PROFILE_WAIT)
-                    .await?;
-                Ok(common_proto::ProfileResponse { success, message })
-            }
-        }
-    }
-
-    pub async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.stop_profile().await,
-            Self::Zmq(client) => {
-                let (success, message) = client.profile_control(None, PROFILE_WAIT).await?;
-                Ok(common_proto::ProfileResponse { success, message })
-            }
-        }
-    }
-
-    pub async fn subscribe_kv_events(
-        &self,
-        start_seq: u64,
-    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.subscribe_kv_events(start_seq).await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "SubscribeKvEvents not supported over ZMQ",
-            )),
-        }
-    }
-
-    /// The worker's load records alone, no events; `Unimplemented` over ZMQ
-    /// (the engine pushes its scheduler stats on that wire already).
-    pub async fn subscribe_load_records(
-        &self,
-    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.subscribe_load_records().await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "SubscribeKvEvents not supported over ZMQ",
-            )),
         }
     }
 
@@ -451,17 +359,33 @@ impl BackendClient {
     }
 }
 
-/// The worker runtime's view of the client: each call is the client's own.
+/// The worker runtime's view of the client. A call the runtime alone makes
+/// has its one body here: the client has no inherent method of its name, so
+/// the call cannot resolve to itself.
 #[async_trait]
 impl EngineConnection for BackendClient {
+    /// Whether the backend answers the admin RPCs (cache flush, profiling):
+    /// a gRPC servicer does, a ZMQ engine when its wire carries control calls
+    /// (an SGLang scheduler, or a TokenSpeed one that declares them).
     fn carries_admin_calls(&self) -> bool {
-        BackendClient::carries_admin_calls(self)
+        match self {
+            Self::Grpc(_) => true,
+            Self::Zmq(client) => client.carries_control_calls(),
+        }
     }
 
+    /// Local liveness. gRPC has no cheap local flag (it uses a health RPC), so
+    /// this reports `true` for gRPC; ZMQ reflects its connection liveness.
     fn is_alive(&self) -> bool {
-        BackendClient::is_alive(self)
+        match self {
+            Self::Grpc(_) => true,
+            Self::Zmq(client) => client.is_alive(),
+        }
     }
 
+    /// The client's own health read, narrowed to its verdict. The inherent
+    /// method answers the whole reply, so this path cannot come back here:
+    /// without that method `healthy` names no field.
     async fn health_check(&self) -> Result<bool, tonic::Status> {
         BackendClient::health_check(self)
             .await
@@ -469,38 +393,81 @@ impl EngineConnection for BackendClient {
     }
 
     async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
-        BackendClient::get_loads(self).await
+        match self {
+            Self::Grpc(client) => client.get_loads().await,
+            Self::Zmq(client) => Ok(client.get_loads()),
+        }
     }
 
     async fn flush_cache(
         &self,
         timeout_s: f32,
     ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
-        BackendClient::flush_cache(self, timeout_s).await
+        match self {
+            Self::Grpc(client) => client.flush_cache(timeout_s).await,
+            // The reply wait is the servicers' rule, read from the adapter.
+            Self::Zmq(client) => {
+                let (success, message) = client
+                    .flush_cache_control(timeout_s, flush_reply_wait(timeout_s))
+                    .await?;
+                Ok(common_proto::FlushCacheResponse { success, message })
+            }
+        }
     }
 
     async fn start_profile(
         &self,
         req: common_proto::StartProfileRequest,
     ) -> Result<common_proto::ProfileResponse, tonic::Status> {
-        BackendClient::start_profile(self, req).await
+        match self {
+            Self::Grpc(client) => client.start_profile(req).await,
+            Self::Zmq(client) => {
+                let (success, message) = client
+                    .profile_control(Some(SglangProfileStart::from_request(req)), PROFILE_WAIT)
+                    .await?;
+                Ok(common_proto::ProfileResponse { success, message })
+            }
+        }
     }
 
     async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status> {
-        BackendClient::stop_profile(self).await
+        match self {
+            Self::Grpc(client) => client.stop_profile().await,
+            Self::Zmq(client) => {
+                let (success, message) = client.profile_control(None, PROFILE_WAIT).await?;
+                Ok(common_proto::ProfileResponse { success, message })
+            }
+        }
     }
 
     async fn subscribe_kv_events(
         &self,
         start_seq: u64,
     ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
-        BackendClient::subscribe_kv_events(self, start_seq).await
+        match self {
+            Self::Grpc(client) => client.subscribe_kv_events(start_seq).await,
+            Self::Zmq(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents not supported over ZMQ",
+            )),
+        }
     }
 
+    /// The worker's load records alone, no events; `Unimplemented` over ZMQ
+    /// (the engine pushes its scheduler stats on that wire already).
     async fn subscribe_load_records(
         &self,
     ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
-        BackendClient::subscribe_load_records(self).await
+        match self {
+            Self::Grpc(client) => client.subscribe_load_records().await,
+            Self::Zmq(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents not supported over ZMQ",
+            )),
+        }
+    }
+
+    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
+        let mut labels = BackendClient::get_server_info(self).await?.to_labels();
+        Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
     }
 }
 
@@ -901,6 +868,30 @@ mod tests {
         let peeked = backend_client_if_initialized(&worker).unwrap().unwrap();
         assert!(Arc::ptr_eq(&connected, &again));
         assert!(Arc::ptr_eq(&connected, &peeked));
+        engine.abort();
+    }
+
+    /// The handle's health read is the engine's verdict, not the arrival of
+    /// a reply: an engine that answers unhealthy reads `false`.
+    #[tokio::test]
+    async fn an_engine_that_answers_unhealthy_reads_unhealthy_through_the_handle() {
+        let (url, engine) = mock_engine("m").await;
+        let port: u16 = url
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .expect("the mock engine's port");
+        let connection = BackendConnector
+            .connect_grpc(
+                &url.replacen("http://", "grpc://", 1),
+                RuntimeType::TokenSpeed,
+            )
+            .await
+            .expect("the mock engine connects");
+        assert!(connection.health_check().await.expect("the engine answers"));
+
+        mock_worker::overrides::for_port(port).set_serving(false);
+        assert!(!connection.health_check().await.expect("the engine answers"));
         engine.abort();
     }
 

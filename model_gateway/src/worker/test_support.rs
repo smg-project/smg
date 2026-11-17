@@ -403,6 +403,10 @@ impl EngineConnection for NoEngine {
     ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
         no_engine()
     }
+
+    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
+        no_engine()
+    }
 }
 
 /// A connector that hands out [`NoEngine`] connections and counts the
