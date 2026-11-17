@@ -71,9 +71,15 @@ fn resolving_a_media_items_dtype_allocates_nothing_on_the_default_path() {
     let overrides = DtypeOverrides::from_env();
     let tokenspeed_override = overrides.image.or(overrides.default);
     // The allocator's counter adds a copy's size class, not its length: read
-    // what one copy of the label costs. Under an override the name is the
-    // process's own and the label is not copied.
+    // what one copy of the label costs. Under a TokenSpeed override the name
+    // is the process's own and the label is not copied. The copy is at least
+    // the label's length: a counter that stopped moving fails here, and not
+    // as `0 == 0` on every row below.
     let one_copy = bytes_allocated_during(|| drop(std::hint::black_box(LABEL.to_owned())));
+    assert!(
+        one_copy >= LABEL.len() as u64,
+        "the counter reads this thread's allocations: one copy of {LABEL:?} read {one_copy} bytes"
+    );
     let label_copy = if tokenspeed_override.is_some() {
         0
     } else {
