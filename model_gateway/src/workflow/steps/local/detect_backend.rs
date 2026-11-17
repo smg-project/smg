@@ -134,17 +134,19 @@ async fn probe_models_endpoint(
     }
 }
 
-/// Probe vLLM's `/version` endpoint.
-async fn try_vllm_version(
+/// Probe one path of the backend: `Ok` when it is reached and answers with
+/// a success status.
+async fn probe_path(
     url: &str,
+    path: &str,
     timeout_secs: u64,
     client: &Client,
     api_key: Option<&str>,
 ) -> Result<(), String> {
-    let version_url = format!("{}/version", http_base_url(url));
+    let probe_url = format!("{}{path}", http_base_url(url));
 
     let mut req = client
-        .get(&version_url)
+        .get(&probe_url)
         .timeout(Duration::from_secs(timeout_secs));
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
@@ -153,44 +155,13 @@ async fn try_vllm_version(
     let response = req.send().await.map_err(|e| {
         format!(
             "Failed to reach {}: {}",
-            Endpoint::redacted_str(&version_url),
+            Endpoint::redacted_str(&probe_url),
             e.without_url()
         )
     })?;
 
     if !response.status().is_success() {
-        return Err(format!("/version returned {}", response.status()));
-    }
-
-    Ok(())
-}
-
-/// Probe SGLang's `/server_info` endpoint.
-async fn try_sglang_server_info(
-    url: &str,
-    timeout_secs: u64,
-    client: &Client,
-    api_key: Option<&str>,
-) -> Result<(), String> {
-    let info_url = format!("{}/server_info", http_base_url(url));
-
-    let mut req = client
-        .get(&info_url)
-        .timeout(Duration::from_secs(timeout_secs));
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
-    }
-
-    let response = req.send().await.map_err(|e| {
-        format!(
-            "Failed to reach {}: {}",
-            Endpoint::redacted_str(&info_url),
-            e.without_url()
-        )
-    })?;
-
-    if !response.status().is_success() {
-        return Err(format!("/server_info returned {}", response.status()));
+        return Err(format!("{path} returned {}", response.status()));
     }
 
     Ok(())
@@ -236,8 +207,8 @@ async fn detect_http_backend(
     // regardless of whether /server_info also succeeds. We only conclude SGLang if
     // /server_info succeeds and /version does not.
     let (vllm_result, sglang_result) = tokio::join!(
-        try_vllm_version(url, timeout_secs, client, api_key),
-        try_sglang_server_info(url, timeout_secs, client, api_key),
+        probe_path(url, "/version", timeout_secs, client, api_key),
+        probe_path(url, "/server_info", timeout_secs, client, api_key),
     );
 
     let vllm_failure = match vllm_result {
