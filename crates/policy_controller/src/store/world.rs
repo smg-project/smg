@@ -89,7 +89,7 @@ use crate::{
     spec::{AppliedSpec, Pairing},
     store::{
         loads::LoadSample,
-        pairing::{known, Member, PairClasses},
+        pairing::{known, Derivation, Member, PairClasses, Pool},
         workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
         GatewayId,
     },
@@ -891,39 +891,55 @@ struct Entry<'a> {
     own: Overload,
 }
 
-/// What the pairing rule reads of some entries: each worker's id, wires,
-/// runtime and descriptor.
-fn members<'a>(entries: &[Entry<'a>]) -> Vec<Member<'a>> {
-    entries
-        .iter()
-        .map(|entry| {
-            let facts = entry.facts;
-            Member::new(
-                entry.row.id,
-                facts.wire_modes,
-                &facts.engine_kind,
-                facts.pairing.as_ref(),
-            )
-        })
-        .collect()
+/// What the pairing rule reads of one side's entries, in place: each
+/// worker's id, wires, runtime and descriptor.
+impl<'a> Pool<'a> for [Entry<'a>] {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn id(&self, at: usize) -> WorkerId {
+        self[at].row.id
+    }
+
+    fn member(&self, at: usize) -> Member<'a> {
+        let entry = &self[at];
+        let facts = entry.facts;
+        Member::new(
+            entry.row.id,
+            facts.wire_modes,
+            &facts.engine_kind,
+            facts.pairing.as_ref(),
+        )
+    }
 }
 
 /// What a membership write asks of the pair classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Classes {
-    /// A member joined or left, or a member's offer may have moved: every
-    /// model's classes are derived.
+    /// Every model's classes are derived whole: a generation of another
+    /// pairing mode, which moves every verdict.
     Derive,
+    /// One worker's write moved a member or a member's offer: `left` is
+    /// the worker the last write held and `joined` the worker as it stands
+    /// now, each where there is one, and one id where a registration moved
+    /// its own offer. The classes are derived for that worker alone in the
+    /// models it left and joined ([`Derivation::written`]) and carried in
+    /// every other.
+    Written {
+        left: Option<WorkerId>,
+        joined: Option<WorkerId>,
+    },
     /// No member joined or left and no member's offer moved
     /// ([`same_offer`]): the classes are the last write's, carried. A
-    /// derivation reads every member's facts, so a write that moves none
-    /// of them pays for none.
+    /// derivation reads the written member's facts, so a write that moves
+    /// none of them pays for none.
     Carry,
 }
 
 /// Whether two versions of one worker's facts stand in the same pools with
 /// the same offer: the role and the models place a worker in its pools, and
-/// the wires, the runtime and the descriptor are what [`members`] reads of
+/// the wires, the runtime and the descriptor are what the pairing rule reads of
 /// it, the runtime as an offer holds it ([`known`]). A write from one such
 /// version to the other moves no pair class.
 pub(super) fn same_offer(old: &WorkerFacts, new: &WorkerFacts) -> bool {
@@ -935,25 +951,45 @@ pub(super) fn same_offer(old: &WorkerFacts, new: &WorkerFacts) -> bool {
 }
 
 /// One model's pair classes under `mode`, each prefill's and each decode's
-/// class written on its row: `carried`, the last write's, where this write
-/// moved no member and no offer, else derived. `None` when a side has no
-/// member: one side alone is no pair, and its rows keep class 0.
+/// class written on its row. `carried` is the last write's and `kept` holds
+/// the model's derivation as that write left it: the classes are carried
+/// where this write moved no member and no offer, derived for the written
+/// worker alone where it moved one, and derived whole for a model's first
+/// pair and for a generation of another mode (`classes`). `None` when a
+/// side has no member: one side alone is no pair, and its rows keep class
+/// 0.
 fn pair_up(
     sides: &mut [Vec<Entry<'_>>; ROLES],
     mode: Pairing,
+    classes: Classes,
     carried: Option<&Arc<PairClasses>>,
+    kept: &mut FxHashMap<Box<str>, Derivation>,
+    model: &str,
 ) -> Option<Arc<PairClasses>> {
     let (prefill, decode) = (role_slot(Role::Prefill), role_slot(Role::Decode));
     if sides[prefill].is_empty() || sides[decode].is_empty() {
         return None;
     }
-    let classes = match carried {
-        Some(carried) => Arc::clone(carried),
-        None => Arc::new(PairClasses::derive(
-            &members(&sides[prefill]),
-            &members(&sides[decode]),
-            mode,
-        )),
+    let (prefills, decodes) = (sides[prefill].as_slice(), sides[decode].as_slice());
+    let classes = match (classes, carried) {
+        // No member and no offer moved: the last write's classes stand, and
+        // what is kept of their derivation is not looked up.
+        (Classes::Carry, Some(carried)) => Arc::clone(carried),
+        (classes, carried) => match kept.get_mut(model) {
+            Some(derivation) => match (classes, carried) {
+                (Classes::Written { left, joined }, Some(carried)) => derivation
+                    .written(carried, prefills, decodes, mode, (left, joined))
+                    .map_or_else(|| Arc::clone(carried), Arc::new),
+                _ => Arc::new(derivation.whole(prefills, decodes, mode)),
+            },
+            // The model's first pair.
+            None => {
+                let mut derivation = Derivation::default();
+                let classes = Arc::new(derivation.whole(prefills, decodes, mode));
+                kept.insert(model.into(), derivation);
+                classes
+            }
+        },
     };
     for (side, classed) in [(prefill, classes.prefills()), (decode, classes.decodes())] {
         let ids = sides[side].iter().map(|entry| entry.row.id);
@@ -1062,6 +1098,10 @@ pub(super) struct Writer {
     /// The store's epoch at the last membership write.
     epoch: u64,
     derived: Arc<Derived>,
+    /// Each model's derivation of its pair classes as the last membership
+    /// write left it, for the models that hold a prefill and a decode: the
+    /// next write of one worker derives for that worker alone.
+    derivations: FxHashMap<Box<str>, Derivation>,
     /// Each pool's rows as the last publication left them.
     published: Vec<Arc<[Candidate]>>,
     /// Each pool's spare: the rows it published before its last, kept for
@@ -1142,6 +1182,7 @@ impl Writer {
             origin,
             epoch: 0,
             derived: Arc::default(),
+            derivations: FxHashMap::default(),
             published: Vec::new(),
             spares: Vec::new(),
             working: Vec::new(),
@@ -1554,9 +1595,9 @@ impl Writer {
     /// each row with its load record on file, make them the working copy
     /// and publish them through the one door: every pool is new, so the
     /// door copies none, every earlier fold is in the world this returns
-    /// and nothing waits. The pair classes are derived too, or carried
-    /// from the last write where the caller says this one moved no member
-    /// and no offer (`classes`).
+    /// and nothing waits. The pair classes are derived for the written
+    /// worker alone, derived whole or carried from the last write, as the
+    /// caller says (`classes`).
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
@@ -1565,8 +1606,9 @@ impl Writer {
         classes: Classes,
     ) -> Arc<World> {
         let origin = self.origin;
-        // The last write's classes, for a write that moved no offer.
-        let last = (classes == Classes::Carry).then(|| Arc::clone(&self.derived));
+        // The last write's classes: carried, or what the written worker's
+        // derive starts from.
+        let last = (classes != Classes::Derive).then(|| Arc::clone(&self.derived));
         // An engine whose last poll brought no report stays silent across
         // the write: its verdict is not raised again from what is still on
         // file. The word is carried by its members' ids, which the outgoing
@@ -1657,7 +1699,8 @@ impl Writer {
             // The model's classes go on its prefill pool's shape: a model
             // that has classes has that pool.
             let carried = last.as_deref().and_then(|last| last.pairs(&model));
-            let mut pairs = pair_up(&mut sides, self.spec.pairing(), carried);
+            let (mode, kept) = (self.spec.pairing(), &mut self.derivations);
+            let mut pairs = pair_up(&mut sides, mode, classes, carried, kept, &model);
             let mut indexes = [None; ROLES];
             for (side, entries) in sides.into_iter().enumerate() {
                 if entries.is_empty() {
@@ -1700,6 +1743,14 @@ impl Writer {
                 indexes[side] = Some(index);
             }
             by_model.insert(model, indexes);
+        }
+        if classes != Classes::Carry {
+            // A model that lost a side keeps no derivation.
+            let (prefill, decode) = (role_slot(Role::Prefill), role_slot(Role::Decode));
+            let paired =
+                |pools: &[Option<u32>; ROLES]| pools[prefill].is_some() && pools[decode].is_some();
+            self.derivations
+                .retain(|model, _| by_model.get(model).is_some_and(paired));
         }
         self.places
             .sort_unstable_by_key(|place| (place.id, place.pool));
@@ -2126,6 +2177,13 @@ impl Writer {
     #[cfg(test)]
     pub(super) fn held_rows(&self) -> usize {
         self.held.len() + self.unlisted.len()
+    }
+
+    /// How many whole derivations made what the writer keeps of `model`'s
+    /// pair classes; `None` where it keeps nothing of them.
+    #[cfg(test)]
+    pub(super) fn whole_derivations(&self, model: &str) -> Option<usize> {
+        self.derivations.get(model).map(Derivation::wholes)
     }
 
     fn publish_window(&mut self, at: Instant) -> Arc<World> {

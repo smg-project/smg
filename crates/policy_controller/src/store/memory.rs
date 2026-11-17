@@ -327,8 +327,9 @@ impl MemoryStore {
     /// them in one world. Called under the workers lock by every membership
     /// write; it takes the load lock, as those writes do, so each row
     /// carries the load record on file and no record is lost across the
-    /// swap. `classes` says whether the write moved a member or a member's
-    /// offer: the pair classes are derived, or carried where it moved none.
+    /// swap. `classes` names the worker whose write moved a member or a
+    /// member's offer: the pair classes are derived for it alone, or carried
+    /// where the write moved none.
     fn rebuild_world(&self, workers: &Workers, classes: Classes) {
         let mut loads = self.loads.lock();
         let Loads { ranks, writer } = &mut *loads;
@@ -396,6 +397,13 @@ impl MemoryStore {
     #[cfg(test)]
     pub(super) fn held_rows(&self) -> usize {
         self.loads.lock().writer.held_rows()
+    }
+
+    /// How many whole derivations made what the writer keeps of `model`'s
+    /// pair classes; `None` where it keeps nothing of them.
+    #[cfg(test)]
+    pub(super) fn whole_derivations(&self, model: &str) -> Option<usize> {
+        self.loads.lock().writer.whole_derivations(model)
     }
 
     /// The KV tables, for the index's cases.
@@ -594,7 +602,10 @@ impl WorkersStore for MemoryStore {
                 let classes = if same_offer(&row.row.facts, &facts) {
                     Classes::Carry
                 } else {
-                    Classes::Derive
+                    Classes::Written {
+                        left: Some(old_id),
+                        joined: Some(old_id),
+                    }
                 };
                 row.row.facts = facts;
                 row.row.revision += 1;
@@ -656,7 +667,11 @@ impl WorkersStore for MemoryStore {
             // one's, and no load of it stands before the replacement.
             self.loads.lock().ranks.insert(new_id, Ranks::default());
             self.index_member(&workers, new_id);
-            self.rebuild_world(&workers, Classes::Derive);
+            let classes = Classes::Written {
+                left: Some(old_id),
+                joined: Some(new_id),
+            };
+            self.rebuild_world(&workers, classes);
             return change;
         }
         let id = identity(&facts.key, facts.incarnation);
@@ -681,7 +696,11 @@ impl WorkersStore for MemoryStore {
         // writes go into.
         self.loads.lock().ranks.insert(id, Ranks::default());
         self.index_member(&workers, id);
-        self.rebuild_world(&workers, Classes::Derive);
+        let classes = Classes::Written {
+            left: None,
+            joined: Some(id),
+        };
+        self.rebuild_world(&workers, classes);
         change
     }
 
@@ -724,7 +743,11 @@ impl WorkersStore for MemoryStore {
         // later finds no load entry and writes nothing.
         self.forget_worker(id);
         let change = workers.record_over(MembershipChange::Removed { id }, Some(&row.row));
-        self.rebuild_world(&workers, Classes::Derive);
+        let classes = Classes::Written {
+            left: Some(id),
+            joined: None,
+        };
+        self.rebuild_world(&workers, classes);
         Some(change)
     }
 
