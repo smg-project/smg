@@ -711,7 +711,8 @@ struct Assembled {
     retained: usize,
 }
 
-/// More content blocks than this in one answer are not followed.
+/// An answer may hold this many content blocks. One with a block past them
+/// is not stored: the record is the answer the client read, or nothing.
 const MAX_BLOCKS: usize = 1024;
 
 /// More bytes than this without an event's end, before the first event or
@@ -873,7 +874,11 @@ impl StreamedTurn {
             MessageStreamEvent::ContentBlockStart {
                 index,
                 content_block,
-            } => answer.start_block(index, content_block, size),
+            } => {
+                if answer.start_block(index, content_block, size).is_err() {
+                    self.decline("a content block past the bound on blocks");
+                }
+            }
             MessageStreamEvent::ContentBlockDelta { index, delta } => answer.delta(index, delta),
             MessageStreamEvent::ContentBlockStop { index } => {
                 if answer.stop_block(index).is_err() {
@@ -1018,10 +1023,17 @@ impl Assembled {
     /// The block at `index`, as its start event of `size` bytes gave it. A
     /// block may arrive whole in that event (a server tool's result, a block
     /// this gateway does not read), so the event counts toward the bytes
-    /// retained, as a delta does; one that replaces a block counts too.
-    fn start_block(&mut self, index: u32, block: ContentBlock, size: usize) {
+    /// retained, as a delta does; one that replaces a block counts too. A
+    /// block past `MAX_BLOCKS` has no place in the record, which would then
+    /// not be the answer the client read.
+    fn start_block(
+        &mut self,
+        index: u32,
+        block: ContentBlock,
+        size: usize,
+    ) -> Result<(), Unreadable> {
         let Some(index) = slot(index) else {
-            return;
+            return Err(Unreadable);
         };
         self.retained += size;
         while self.blocks.len() < index {
@@ -1038,6 +1050,7 @@ impl Assembled {
             self.blocks[index] = block;
             self.partial_json[index].clear();
         }
+        Ok(())
     }
 
     fn delta(&mut self, index: u32, delta: ContentBlockDelta) {
@@ -2290,6 +2303,39 @@ mod tests {
             let stored = threads.turns("msg_whole", None).await.is_ok();
             assert_eq!(stored, kept, "a limit of {limit} bytes");
         }
+    }
+
+    /// An answer with a block past the bound on blocks is not stored, as
+    /// the record would lack that block: the client reads the stream as it
+    /// came, and the continue from its id is the 404.
+    #[tokio::test]
+    async fn a_block_past_the_block_bound_leaves_no_turn() {
+        let threads = MessageThreads::new();
+        let mut events = text_events("msg_many", "known");
+        events.splice(
+            4..4,
+            [
+                (
+                    "content_block_start",
+                    json!({"type": "content_block_start", "index": MAX_BLOCKS, "content_block": {"type": "text", "text": "past the bound"}}),
+                ),
+                (
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": MAX_BLOCKS}),
+                ),
+            ],
+        );
+        let bytes = sse(&events);
+        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+        let answered = threads
+            .stored(turn.expect("a turn"), streamed(&bytes, &[]))
+            .await;
+        let read = to_bytes(answered.into_body(), usize::MAX)
+            .await
+            .expect("the stream");
+        assert_eq!(read.as_ref(), bytes.as_slice());
+        let stored = threads.turns("msg_many", None).await.is_ok();
+        assert!(!stored, "a turn that lacks a block the client read");
     }
 
     /// A stream with data this gateway cannot read (a tool call whose input
