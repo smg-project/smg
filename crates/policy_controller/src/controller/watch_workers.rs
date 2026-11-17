@@ -1821,6 +1821,29 @@ mod tests {
         assert_eq!(taken, HELD);
     }
 
+    /// The last word waits for room: a watcher whose channel is full and
+    /// that takes an event inside [`STALL`] is told that its replica left,
+    /// after what its channel held.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_word_waits_for_room_on_a_watcher_that_takes_an_event_inside_its_bound() {
+        let leader = leader();
+        let mut stream = leader.watch(Start::Snapshot, &[]);
+        next(&mut stream).await;
+        let written = HELD + 8;
+        for n in 0..written {
+            leader.register(n, 1, "model-a");
+        }
+        holding(&stream, HELD).await;
+        // The word finds the channel full, the fence open still.
+        leader.role.send_replace(false);
+        tokio::time::sleep(STALL / 2).await;
+        assert!(!stream.events.is_closed(), "the word waits for room");
+        let (taken, word) = to_the_last_word(&mut stream, written).await;
+        assert_eq!(word.code(), Code::Aborted);
+        assert_eq!(taken, HELD, "what the stream held");
+        assert!(stream.next().await.is_none(), "the end");
+    }
+
     /// A tail that lets the kept cut go waits behind no watch that holds
     /// the lock for its cut: the lock is tried.
     #[test]
