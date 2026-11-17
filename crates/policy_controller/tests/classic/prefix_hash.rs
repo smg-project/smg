@@ -46,12 +46,16 @@ const BLOCK: usize = 16;
 const RUNS: u32 = 32;
 
 /// The policy's configuration, in the gateway's own spelling.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Config {
     prefix_token_count: u32,
     load_factor: f64,
     balance_abs_threshold: u32,
+    /// The boundaries a prompt is keyed at, ascending; none for a key at
+    /// the one depth.
+    #[serde(default)]
+    cache_boundaries: Vec<u32>,
 }
 
 /// The gateway's default configuration, which the preset carries.
@@ -59,10 +63,11 @@ const DEFAULT: Config = Config {
     prefix_token_count: 256,
     load_factor: 1.25,
     balance_abs_threshold: 10,
+    cache_boundaries: Vec::new(),
 };
 
 /// What a request carries to be placed by.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Request {
     #[serde(default)]
@@ -100,6 +105,15 @@ struct Prompts {
     text: bool,
 }
 
+/// A boundary a level row's request reaches under its deepest one, with the
+/// row's workers in the ring order of the request's head at that boundary.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Level {
+    boundary: u32,
+    order: Vec<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Row {
@@ -108,6 +122,9 @@ pub struct Row {
     /// A ring row's request: the row's workers are listed in its ring order.
     #[serde(default)]
     ring: Option<Request>,
+    /// A level row: the shallower boundaries its request reaches.
+    #[serde(default)]
+    levels: Vec<Level>,
     /// The requests the host holds on each worker at the start.
     workers: Vec<u32>,
     #[serde(default)]
@@ -121,13 +138,14 @@ impl Config {
     /// The preset as named for a row recorded under the gateway's default
     /// configuration, so the preset's own numbers are held to those rows;
     /// for any other row, the preset with the row's numbers in its ring
-    /// stage.
-    fn spec(self) -> PolicySpec {
+    /// stage and the row's boundaries in its view.
+    fn spec(&self) -> PolicySpec {
         let preset = PolicySpec::preset(POLICY).expect("the preset's form");
-        if self == DEFAULT {
+        if *self == DEFAULT {
             return preset;
         }
         let mut document = serde_json::to_value(preset).expect("the preset serializes");
+        document["view"]["boundaries"] = self.cache_boundaries.clone().into();
         let stage = &mut document["profiles"][POLICY]["score"][0]["consistent-hash"];
         stage["prefix_tokens"] = self.prefix_token_count.into();
         stage["bounded_load"] = serde_json::json!({
@@ -161,6 +179,7 @@ fn chain(bytes: &[u8], block: usize) -> Vec<u64> {
 
 /// A request as a host hands it to a decision: its block hashes, what they
 /// were made over, and its size in tokens.
+#[derive(Clone)]
 struct Hashed {
     key: Option<String>,
     hashes: Vec<u64>,
@@ -230,7 +249,7 @@ struct Bed {
 impl Bed {
     /// The bed, or the validator's words when this crate does not build the
     /// row's form. `run` separates the seeds of a row's runs.
-    fn new(config: Config, loads: &[u32], places: &[usize], run: u32) -> Result<Self, String> {
+    fn new(config: &Config, loads: &[u32], places: &[usize], run: u32) -> Result<Self, String> {
         assert_eq!(places.len(), loads.len(), "a place of every worker");
         let engine = config.spec().validate().map_err(|err| err.to_string())?;
         let pool = (0..loads.len())
@@ -325,7 +344,7 @@ fn in_order(workers: usize) -> Vec<usize> {
 /// The ring order of `request` over a pool of `workers` on this crate's
 /// ring: the worker it lands on with every worker ready and idle, then with
 /// the members found so far down, until every worker is placed.
-fn ring_order(config: Config, workers: usize, request: &Hashed) -> Result<Vec<usize>, String> {
+fn ring_order(config: &Config, workers: usize, request: &Hashed) -> Result<Vec<usize>, String> {
     let mut order: Vec<usize> = Vec::with_capacity(workers);
     while order.len() < workers {
         let mut bed = Bed::new(config, &vec![0; workers], &in_order(workers), 0)?;
@@ -357,24 +376,77 @@ impl Prompts {
 }
 
 impl Row {
-    /// Where each of the row's workers stands in the pool.
-    fn places(&self) -> Result<Vec<usize>, String> {
+    /// Where each of the row's workers stands in the pool, and for a level
+    /// row the prompt that stands in for its request on this crate's ring.
+    fn places(&self) -> Result<(Vec<usize>, Option<Hashed>), String> {
+        let workers = self.workers.len();
         match self.ring.as_ref().map(Hashed::of) {
-            Some(request) if request.keyed() => {
-                ring_order(self.config, self.workers.len(), &request)
+            Some(_) if !self.levels.is_empty() => {
+                let (own, places) = self.level_request()?;
+                Ok((places, Some(own)))
             }
-            _ => Ok(in_order(self.workers.len())),
+            Some(request) if request.keyed() => {
+                Ok((ring_order(&self.config, workers, &request)?, None))
+            }
+            _ => Ok((in_order(workers), None)),
         }
     }
 
+    /// A level row's request on this crate's ring. Two rings agree on no
+    /// pair of keys, so the recorded prompt's two keys stand otherwise
+    /// here: the row is replayed with the first prompt of the level rows'
+    /// kind, as long as the recorded one, whose head at each shallower
+    /// boundary puts the row's workers in the recorded order.
+    fn level_request(&self) -> Result<(Hashed, Vec<usize>), String> {
+        let workers = self.workers.len();
+        let tokens = self
+            .ring
+            .as_ref()
+            .and_then(|ring| ring.tokens.as_deref())
+            .map_or(0, |runs| ids(runs).len() as u32);
+        for i in 0..1_000u32 {
+            let first = 3_000_000 + 1_000 * i;
+            let prompt: Vec<u32> = (first..first + tokens).collect();
+            let request = Hashed::of_tokens(&prompt);
+            let places = ring_order(&self.config, workers, &request)?;
+            let mut stands = true;
+            for level in &self.levels {
+                let head = prompt
+                    .get(..level.boundary as usize)
+                    .ok_or("a level past the row's request")?;
+                let order: Vec<usize> =
+                    ring_order(&self.config, workers, &Hashed::of_tokens(head))?
+                        .iter()
+                        .map(|worker| {
+                            places
+                                .iter()
+                                .position(|place| place == worker)
+                                .expect("a worker of the pool")
+                        })
+                        .collect();
+                stands &= order == level.order;
+            }
+            if stands {
+                return Ok((request, places));
+            }
+        }
+        Err("no prompt among a thousand stands as the row's levels do".to_string())
+    }
+
     /// The row's steps decided once from a fresh engine: the worker each
-    /// request went to.
-    fn run(&self, places: &[usize], run: u32) -> Result<Vec<usize>, String> {
-        let mut bed = Bed::new(self.config, &self.workers, places, run)?;
+    /// request went to. `own` stands in for a level row's request.
+    fn run(&self, places: &[usize], own: Option<&Hashed>, run: u32) -> Result<Vec<usize>, String> {
+        let mut bed = Bed::new(&self.config, &self.workers, places, run)?;
         let mut answers = Vec::new();
         for step in &self.steps {
             match step {
-                Step::Pick(request) => answers.push(bed.place(&Hashed::of(request))),
+                Step::Pick(request) => {
+                    let request = match own {
+                        Some(own) if Some(request) == self.ring.as_ref() => own.clone(),
+                        _ => Hashed::of(request),
+                    };
+                    answers.push(bed.place(&request));
+                }
                 Step::Loads(loads) => bed.loads(loads),
                 Step::Ready(ready) => bed.ready(ready),
             }
@@ -386,12 +458,12 @@ impl Row {
     /// decides, the runs differ, and the outcome is how often each worker
     /// took the row's last request, a shape no recorded sequence has.
     fn sequence(&self) -> Result<Outcome, String> {
-        let places = self.places()?;
-        let first = self.run(&places, 0)?;
+        let (places, own) = self.places()?;
+        let first = self.run(&places, own.as_ref(), 0)?;
         let mut counts = vec![0u32; self.workers.len()];
         let mut one = true;
         for run in 0..RUNS {
-            let answers = self.run(&places, run)?;
+            let answers = self.run(&places, own.as_ref(), run)?;
             one &= answers == first;
             if let Some(&last) = answers.last() {
                 counts[last] += 1;
@@ -410,7 +482,7 @@ impl Row {
     /// A pairs row or a spread row over the row's idle pool.
     fn counted(&self, prompts: Prompts) -> Result<Outcome, String> {
         let workers = self.workers.len();
-        let mut bed = Bed::new(self.config, &self.workers, &in_order(workers), 0)?;
+        let mut bed = Bed::new(&self.config, &self.workers, &in_order(workers), 0)?;
         let mut place = |ids: &[u32]| {
             bed.place(&if prompts.text {
                 Hashed::of_text(ids)
@@ -759,6 +831,72 @@ pub const INLINE: &str = r#"{
       "workers": [0, 0, 0, 0, 0, 0, 0, 0],
       "prompts": {"count": 2000, "tokens": 300},
       "outcome": {"counts": {"draws": 2000, "counts": [311, 276, 272, 243, 239, 229, 224, 206]}}
+    },
+    {
+      "name": "under-boundaries-a-worker-under-the-bound-keeps-the-deepest-boundary-s-key",
+      "config": {"prefix_token_count": 256, "load_factor": 1.25, "balance_abs_threshold": 10, "cache_boundaries": [64, 256]},
+      "ring": {"tokens": [[3059000, 300]]},
+      "levels": [{"boundary": 64, "order": [2, 0, 1, 3]}],
+      "workers": [12, 0, 5, 1],
+      "steps": [
+        {"pick": {"tokens": [[3059000, 300]]}}
+      ],
+      "outcome": {"sequence": [0]}
+    },
+    {
+      "name": "a-worker-past-the-bound-passes-the-key-to-the-next-boundary-s-worker",
+      "config": {"prefix_token_count": 256, "load_factor": 1.25, "balance_abs_threshold": 10, "cache_boundaries": [64, 256]},
+      "ring": {"tokens": [[3059000, 300]]},
+      "levels": [{"boundary": 64, "order": [2, 0, 1, 3]}],
+      "workers": [30, 0, 5, 1],
+      "steps": [
+        {"pick": {"tokens": [[3059000, 300]]}}
+      ],
+      "outcome": {"sequence": [2]}
+    },
+    {
+      "name": "workers-past-the-bound-at-every-boundary-pass-the-key-to-the-fewest-requests",
+      "config": {"prefix_token_count": 256, "load_factor": 1.25, "balance_abs_threshold": 10, "cache_boundaries": [64, 256]},
+      "ring": {"tokens": [[3059000, 300]]},
+      "levels": [{"boundary": 64, "order": [2, 0, 1, 3]}],
+      "workers": [30, 3, 28, 0],
+      "steps": [
+        {"pick": {"tokens": [[3059000, 300]]}}
+      ],
+      "outcome": {"sequence": [3]}
+    },
+    {
+      "name": "a-down-worker-at-the-next-boundary-hands-the-key-to-that-ring-s-next-member",
+      "config": {"prefix_token_count": 256, "load_factor": 1.25, "balance_abs_threshold": 10, "cache_boundaries": [64, 256]},
+      "ring": {"tokens": [[3017000, 300]]},
+      "levels": [{"boundary": 64, "order": [2, 3, 0, 1]}],
+      "workers": [30, 0, 5, 1],
+      "steps": [
+        {"ready": [true, true, false, true]},
+        {"pick": {"tokens": [[3017000, 300]]}}
+      ],
+      "outcome": {"sequence": [3]}
+    },
+    {
+      "name": "under-boundaries-the-64th-token-of-a-prompt-that-reaches-64-alone-is-in-the-key",
+      "config": {"prefix_token_count": 256, "load_factor": 1.25, "balance_abs_threshold": 10, "cache_boundaries": [64, 256]},
+      "workers": [0, 0, 0, 0, 0, 0, 0, 0],
+      "prompts": {"count": 64, "tokens": 100, "differ_at": 63},
+      "outcome": {"counts": {"draws": 64, "counts": [7, 57]}}
+    },
+    {
+      "name": "under-boundaries-the-65th-token-of-a-prompt-that-reaches-64-alone-is-outside-the-key",
+      "config": {"prefix_token_count": 256, "load_factor": 1.25, "balance_abs_threshold": 10, "cache_boundaries": [64, 256]},
+      "workers": [0, 0, 0, 0, 0, 0, 0, 0],
+      "prompts": {"count": 64, "tokens": 100, "differ_at": 64},
+      "outcome": {"counts": {"draws": 64, "counts": [64, 0]}}
+    },
+    {
+      "name": "a-prompt-that-reaches-a-boundary-is-not-keyed-at-the-one-depth",
+      "config": {"prefix_token_count": 128, "load_factor": 1.25, "balance_abs_threshold": 10, "cache_boundaries": [64, 256]},
+      "workers": [0, 0, 0, 0, 0, 0, 0, 0],
+      "prompts": {"count": 64, "tokens": 300, "differ_at": 200},
+      "outcome": {"counts": {"draws": 64, "counts": [9, 55]}}
     }
   ]
 }"#;

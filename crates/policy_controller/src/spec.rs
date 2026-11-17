@@ -123,7 +123,15 @@ pub struct Needs {
     /// The request text in the view (a text-window hash form, for a host
     /// without a tokenizer).
     pub text: bool,
+    /// The request's prefix block hashes over its token ids. A decision is
+    /// handed the hashes as deep as the stages that declare them read
+    /// ([`AppliedSpec::block_hashes_read`]), so a stage that reads the list
+    /// declares one of the two kinds: under a generation where no stage
+    /// does, it is handed none.
     pub token_hashes: bool,
+    /// The request's prefix block hashes over windows of its text, which a
+    /// host without a tokenizer feeds in their place. A stage that reads a
+    /// prefix by either kind sets this beside `text`.
     pub text_hashes: bool,
     /// Load reports per worker.
     pub loads: bool,
@@ -564,8 +572,11 @@ impl Default for BucketParams {
 
 /// The bounded-load rule of the consistent-hash scorer: a ring owner whose
 /// requests in flight are past both parts of the rule over the candidates'
-/// mean, the request being placed counted in the mean, is passed over, and
-/// the profile's next stage places the request.
+/// mean, the request being placed counted in the mean, is passed over. A
+/// prefix keyed at a boundary is then tried at the next boundary down. A
+/// request no owner keeps is scored as one with no key: the profile's next
+/// stage places it, and in a profile with no stage after the ring the picker
+/// draws among every candidate, the passed owner among them.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoundedLoadParams {
@@ -591,7 +602,14 @@ pub struct ConsistentHashParams {
     /// The depth in tokens at which a request with no routing key is keyed
     /// by its prefix: the last whole block at or under the depth, so at
     /// least one block of the view's block size and at most the blocks a
-    /// request carries. Absent, such a request has no key.
+    /// request carries. Under the view's `boundaries` a request that reaches
+    /// one is keyed there instead, at the deepest it reaches. The depth is
+    /// checked in the view's token blocks and read in the blocks a request
+    /// was hashed by. A text request's windows are `block_size` characters,
+    /// a quarter of a token block, so it carries a quarter of the checked
+    /// depth and a deeper depth keys at its last window. Under a block size
+    /// an engine published above the depth a request has no key. Absent, a
+    /// request with no routing key has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub prefix_tokens: Option<u32>,
@@ -1996,10 +2014,27 @@ impl Deferred {
     }
 }
 
-/// A consistent-hash stage's prefix depth against the view that carries a
-/// request's block hashes. The key is the last whole block at or under
-/// `prefix_tokens`: the depth holds at least one block of the view's block
-/// size, and no more blocks than a request carries into the view.
+/// What a prefix depth breaks against the view that carries a request's
+/// block hashes: `under` when it holds no whole block of the view's block
+/// size, `over` when a request carries no block that deep.
+fn depth_edge(
+    depth: u32,
+    gates: Gates,
+    view: &ViewSpec,
+    under: &'static str,
+    over: &'static str,
+) -> Option<&'static str> {
+    match depth / gates.block_size {
+        0 => Some(under),
+        blocks if blocks > view.max_block_hashes => Some(over),
+        _ => None,
+    }
+}
+
+/// A consistent-hash stage's prefix depths against the view. A key is the
+/// last whole block at or under its depth, so `prefix_tokens` and each of
+/// the view's boundaries hold at least one block and no more blocks than a
+/// request carries.
 fn check_prefix_depth(
     stage: &ScoreStage,
     gates: Gates,
@@ -2013,19 +2048,31 @@ fn check_prefix_depth(
     else {
         return Ok(());
     };
-    match tokens / gates.block_size {
-        0 => Err(at.bad(
-            "prefix_tokens",
-            tokens,
-            "at least one block of view.block_size",
-        )),
-        blocks if blocks > view.max_block_hashes => Err(at.bad(
-            "prefix_tokens",
-            tokens,
-            "at most view.max_block_hashes blocks of view.block_size",
-        )),
-        _ => Ok(()),
+    if let Some(reason) = depth_edge(
+        *tokens,
+        gates,
+        view,
+        "at least one block of view.block_size",
+        "at most view.max_block_hashes blocks of view.block_size",
+    ) {
+        return Err(at.bad("prefix_tokens", tokens, reason));
     }
+    for (i, &boundary) in view.boundaries.iter().enumerate() {
+        if let Some(reason) = depth_edge(
+            boundary,
+            gates,
+            view,
+            "at least one block of view.block_size under a consistent-hash prefix key",
+            "at most view.max_block_hashes blocks of view.block_size under a consistent-hash prefix key",
+        ) {
+            return Err(SpecError::BadField {
+                path: format!("view.boundaries[{i}]"),
+                value: boundary.to_string(),
+                reason,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn built_scorer(scorer: impl Scorer + 'static) -> Resolved<Box<dyn Scorer>> {
@@ -2048,7 +2095,8 @@ fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
     Gates::of(affinity, kv, view.block_size)
 }
 
-fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
+/// The stage's scorer. `boundaries` are the view's, where a prefix ring keys.
+fn scorer_of(stage: &ScoreStage, gates: Gates, boundaries: &[u32]) -> Resolved<Box<dyn Scorer>> {
     match stage {
         ScoreStage::LeastLoad(p) => built_scorer(LeastLoad::new(
             p.kv_pressure_weight.unwrap_or(0.15),
@@ -2078,7 +2126,7 @@ fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
         ScoreStage::ConsistentHash(p) => {
             let ring = ConsistentHash::new(p.bounded_load.as_ref());
             built_scorer(match p.prefix_tokens {
-                Some(tokens) => ring.keyed_by_prefix(tokens, gates),
+                Some(tokens) => ring.keyed_by_prefix(tokens, gates, boundaries),
                 None => ring,
             })
         }
@@ -2240,14 +2288,18 @@ impl HashDepth {
     }
 
     /// What a built scorer reads: a consistent-hash stage keyed by a prefix
-    /// reads as deep as its `prefix_tokens`, any other stage as its `needs`
-    /// declare.
-    fn of_scorer(stage: &ScoreStage, needs: Needs) -> Self {
+    /// reads as deep as its `prefix_tokens` or the deepest of the view's
+    /// `boundaries`, where a request that reaches one is keyed, and any
+    /// other stage as its `needs` declare.
+    fn of_scorer(stage: &ScoreStage, boundaries: &[u32], needs: Needs) -> Self {
         match stage {
             ScoreStage::ConsistentHash(ConsistentHashParams {
                 prefix_tokens: Some(tokens),
                 ..
-            }) => Self::Tokens(*tokens),
+            }) => {
+                let deepest = boundaries.iter().copied().max().unwrap_or(0);
+                Self::Tokens(deepest.max(*tokens))
+            }
             _ => Self::of(needs),
         }
     }
@@ -2297,19 +2349,10 @@ fn check_profile(
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
         check_prefix_depth(&stage, gates, view, &stage_at)?;
-        let resolved = match &stage {
-            // A view's boundaries are where the prefix ring keys, the
-            // deepest one a request reaches first.
-            ScoreStage::ConsistentHash(p)
-                if p.prefix_tokens.is_some() && !view.boundaries.is_empty() =>
-            {
-                Resolved::NotInBuild("the consistent-hash boundary levels")
-            }
-            _ => scorer_of(&stage, gates),
-        };
-        match resolved {
+        match scorer_of(&stage, gates, &view.boundaries) {
             Resolved::Built(scorer) => {
-                depth.deepen(HashDepth::of_scorer(&stage, scorer.needs()));
+                let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
+                depth.deepen(read);
                 scorers.push(Weighted {
                     scorer,
                     weight: stage.weight(),
@@ -3519,6 +3562,14 @@ mod tests {
             r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":[{"consistent-hash":{"prefix_tokens":256}}],"pick":"best"},"q":{"score":[{"consistent-hash":{"prefix_tokens":512}}],"pick":"best"}},"bindings":[{"match":{"model":"a*"},"profiles":{"single":"p"}},{"match":{"model":"*"},"profiles":{"single":"q"}}]}"#,
         );
         assert_eq!(applied(&two).block_hashes_read(Token, 0), 32);
+        // Under a view's boundaries a prefix key is read at the deepest one
+        // a request reaches, so the generation reads as deep as that one,
+        // and no shallower than the key's own depth.
+        let mut levelled = preset("prefix_hash");
+        levelled.view.boundaries = vec![64, 1024];
+        assert_eq!(applied(&levelled).block_hashes_read(Token, 0), 64);
+        levelled.view.boundaries = vec![64];
+        assert_eq!(applied(&levelled).block_hashes_read(Token, 0), 16);
     }
 
     /// A guest stage of each kind, under the name it is registered by, that
@@ -4632,22 +4683,19 @@ mod tests {
         let needs = prefix.validate().expect("validates").needs();
         assert!(needs.ring && needs.token_hashes && needs.text_hashes);
         // Under a view that names boundaries the prefix ring keys at the
-        // deepest one a request reaches, which this build does not carry.
+        // deepest one a request reaches, and asks for the same.
         let levelled = doc(
             r#"{"apiVersion":"smg.policy/v1","view":{"boundaries":[256,1024]},"profiles":{"p":{"score":[{"consistent-hash":{"prefix_tokens":512}}],"pick":"best"}}}"#,
         );
-        assert_eq!(
-            not_in_build(&levelled),
-            (
-                "profiles.p.score[0].consistent-hash".to_string(),
-                "the consistent-hash boundary levels"
-            )
-        );
-        // A ring with no prefix form reads no boundary and builds there.
+        let needs = levelled.validate().expect("validates").needs();
+        assert!(needs.ring && needs.token_hashes && needs.text_hashes);
+        // A ring with no prefix form reads no boundary and asks for no
+        // hashes there.
         let plain = doc(
             r#"{"apiVersion":"smg.policy/v1","view":{"boundaries":[256,1024]},"profiles":{"p":{"score":[{"consistent-hash":{"bounded_load":{"factor":1.5}}}],"pick":"best"}}}"#,
         );
-        assert!(plain.validate().expect("validates").needs().ring);
+        let needs = plain.validate().expect("validates").needs();
+        assert!(needs.ring && !needs.token_hashes && !needs.text_hashes);
     }
 
     /// The prefix depth is held to the view that carries the hashes: at
@@ -4685,6 +4733,36 @@ mod tests {
         }
         assert_eq!(refused(view, 63), under);
         assert_eq!(refused(view, 320), over);
+        // Under a prefix key each of the view's boundaries is held to the
+        // same two edges.
+        let boundary = |boundaries: &str| {
+            let view = format!(r#"{{"boundaries":{boundaries}}}"#);
+            match spec(&view, 256).validate() {
+                Err(SpecError::BadField { path, reason, .. }) => (path, reason),
+                other => panic!("{boundaries}: validated as {other:?}"),
+            }
+        };
+        assert!(spec(r#"{"boundaries":[16,4096,4111]}"#, 256)
+            .validate()
+            .is_ok());
+        assert_eq!(
+            boundary("[8,64]"),
+            (
+                "view.boundaries[0]".to_string(),
+                "at least one block of view.block_size under a consistent-hash prefix key"
+            )
+        );
+        assert_eq!(
+            boundary("[64,4112]"),
+            (
+                "view.boundaries[1]".to_string(),
+                "at most view.max_block_hashes blocks of view.block_size under a consistent-hash prefix key"
+            )
+        );
+        // A view that no prefix key reads keeps such boundaries.
+        assert!(spec_with_view(r#"{"boundaries":[8,4112]}"#)
+            .validate()
+            .is_ok());
     }
 
     #[test]

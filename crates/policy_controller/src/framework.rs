@@ -48,7 +48,10 @@ pub trait Filter: Send + Sync + Debug {
     /// What the host must feed for this filter to mean anything. A filter
     /// that reads the affinity column ([`RequestFacts::affinity`]) declares
     /// [`Needs::affinity`]; one that does not may be handed an empty
-    /// column, which reads as nothing held.
+    /// column, which reads as nothing held. So with the request's block
+    /// hashes: a stage that reads them declares [`Needs::token_hashes`] or
+    /// [`Needs::text_hashes`], and one that declares neither may be handed
+    /// none.
     fn needs(&self) -> Needs {
         Needs::default()
     }
@@ -128,7 +131,10 @@ pub trait Scorer: Lifecycle + Debug {
     /// What the host must feed for this scorer to mean anything. A scorer
     /// that reads the affinity column ([`RequestFacts::affinity`]) declares
     /// [`Needs::affinity`]; one that does not may be handed an empty
-    /// column, which reads as nothing held.
+    /// column, which reads as nothing held. So with the request's block
+    /// hashes: a stage that reads them declares [`Needs::token_hashes`] or
+    /// [`Needs::text_hashes`], and one that declares neither may be handed
+    /// none.
     fn needs(&self) -> Needs {
         Needs::default()
     }
@@ -288,7 +294,10 @@ pub trait Picker: Lifecycle + Debug {
     /// What the host must feed for this picker to mean anything. A picker
     /// that reads the affinity column ([`RequestFacts::affinity`]) declares
     /// [`Needs::affinity`]; one that does not may be handed an empty
-    /// column, which reads as nothing held.
+    /// column, which reads as nothing held. So with the request's block
+    /// hashes: a stage that reads them declares [`Needs::token_hashes`] or
+    /// [`Needs::text_hashes`], and one that declares neither may be handed
+    /// none.
     fn needs(&self) -> Needs {
         Needs::default()
     }

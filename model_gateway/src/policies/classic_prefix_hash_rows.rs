@@ -18,13 +18,23 @@
 //! is the key's own worker on whatever ring replays the row.
 //!
 //! A pairs row places pairs of prompts on an idle pool and counts the pairs
-//! whose two prompts took one worker, then the pairs that took two. Prompt `i` of such a row is `tokens`
-//! ids from `1_000_000 + 1_000 * i` on, and its twin differs at the one
-//! place `differ_at`, where it holds `2_000_000_000 + i`. Where the row's
-//! prompts are `text`, each is spelled as text: prompt `i` is ids from
-//! `1_000 * i` on and its twin holds `65_000 + i`. A spread row
-//! places `count` such prompts once each and counts what each worker took,
-//! the largest count first: two rings give one worker different shares.
+//! whose two prompts took one worker, then the pairs that took two. Prompt
+//! `i` of such a row is `tokens` ids from `1_000_000 + 1_000 * i` on, and its
+//! twin differs at the one place `differ_at`, where it holds
+//! `2_000_000_000 + i`. Where the row's prompts are `text`, each is spelled
+//! as text: prompt `i` is ids from `1_000 * i` on and its twin holds
+//! `65_000 + i`. A spread row places `count` such prompts once each and
+//! counts what each worker took, the largest count first: two rings give one
+//! worker different shares.
+//!
+//! Under boundaries a prompt is keyed at the deepest one it reaches, and a
+//! worker past the bound passes the key to the worker of the next boundary
+//! down. Two rings agree on no pair of keys, so a level row says how its two
+//! keys stand to each other: its workers are listed in the ring order of its
+//! request, and `levels` lists them again in the ring order of the request's
+//! head at the shallower boundary. The recorder takes the first prompt that
+//! stands so, 300 ids from `3_000_000 + 1_000 * i` on, and a replay looks
+//! for its own.
 //!
 //! Run it from the repository's root:
 //!
@@ -62,12 +72,23 @@ struct Config {
     prefix_token_count: usize,
     load_factor: f64,
     balance_abs_threshold: usize,
+    /// The boundaries a prompt is keyed at, ascending; none for a key at the
+    /// one depth `prefix_token_count`.
+    #[serde(skip_serializing_if = "<[usize]>::is_empty")]
+    cache_boundaries: &'static [usize],
 }
 
 const DEFAULT: Config = Config {
     prefix_token_count: 256,
     load_factor: 1.25,
     balance_abs_threshold: 10,
+    cache_boundaries: &[],
+};
+
+/// The default configuration under two boundaries.
+const LEVELLED: Config = Config {
+    cache_boundaries: &[64, 256],
+    ..DEFAULT
 };
 
 impl Config {
@@ -76,7 +97,7 @@ impl Config {
             prefix_token_count: self.prefix_token_count,
             load_factor: self.load_factor,
             balance_abs_threshold: self.balance_abs_threshold,
-            cache_boundaries: Vec::new(),
+            cache_boundaries: self.cache_boundaries.to_vec(),
         }
     }
 }
@@ -186,6 +207,14 @@ enum Outcome {
     Counts { draws: u32, counts: Vec<u32> },
 }
 
+/// A boundary a level row's request reaches under its deepest one: the row's
+/// workers in the ring order of the request's head at that boundary.
+#[derive(Serialize)]
+struct Level {
+    boundary: usize,
+    order: Vec<usize>,
+}
+
 #[derive(Serialize)]
 struct Row {
     name: &'static str,
@@ -193,6 +222,9 @@ struct Row {
     /// A ring row's request: the row's workers are listed in its ring order.
     #[serde(skip_serializing_if = "Option::is_none")]
     ring: Option<Request>,
+    /// A level row: the shallower boundaries its request reaches.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    levels: Vec<Level>,
     /// The requests the router holds on each worker at the start.
     workers: Vec<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -397,6 +429,7 @@ fn sequence_row(
         name,
         config,
         ring,
+        levels: Vec::new(),
         workers: workers.to_vec(),
         steps,
         prompts: None,
@@ -445,6 +478,7 @@ fn prompts_row(name: &'static str, config: Config, prompts: Prompts) -> Row {
         name,
         config,
         ring: None,
+        levels: Vec::new(),
         workers: vec![0; POOL],
         steps: Vec::new(),
         prompts: Some(prompts),
@@ -750,10 +784,182 @@ fn depth_rows() -> Vec<Row> {
     ]
 }
 
+/// One run of token ids as a prompt. A recording's rows live as long as it
+/// runs, so the run is leaked into them.
+fn run(first: u32, count: usize) -> Runs {
+    let count = u32::try_from(count).expect("a count of tokens");
+    Box::leak(Box::new([[first, count]]))
+}
+
+/// How many tokens a level row's prompt holds: past the deeper boundary.
+const LEVEL_TOKENS: usize = 300;
+
+/// The first prompt of the level rows whose head at the shallower boundary
+/// puts the row's workers in the order `want`, with the pool's order of the
+/// row's workers. A ring spreads its keys, so a prompt among the first few
+/// hundred stands so.
+fn level_request(workers: usize, want: &[usize]) -> (Request, Vec<usize>) {
+    let boundary = LEVELLED.cache_boundaries[0];
+    (0..1_000u32)
+        .find_map(|i| {
+            let first = 3_000_000 + 1_000 * i;
+            let request = tokens(run(first, LEVEL_TOKENS));
+            let places = ring_order(LEVELLED, workers, request);
+            let head = ring_order(LEVELLED, workers, tokens(run(first, boundary)));
+            let order: Vec<usize> = head
+                .iter()
+                .map(|worker| {
+                    places
+                        .iter()
+                        .position(|place| place == worker)
+                        .expect("a worker of the pool")
+                })
+                .collect();
+            (order == want).then_some((request, places))
+        })
+        .expect("a prompt whose two keys stand in the wanted order")
+}
+
+/// A row under the two boundaries: `before`, then one pick of a prompt whose
+/// head at the shallower boundary stands in the order `want`.
+fn level_row(name: &'static str, want: &[usize], workers: &[u32], before: Vec<Step>) -> Row {
+    let (request, places) = level_request(workers.len(), want);
+    let mut steps = before;
+    steps.push(pick(request));
+    let outcome = recorded(name, 20, || {
+        Outcome::Sequence(Bed::run(LEVELLED, workers, &steps, &places))
+    });
+    Row {
+        name,
+        config: LEVELLED,
+        ring: Some(request),
+        levels: vec![Level {
+            boundary: LEVELLED.cache_boundaries[0],
+            order: want.to_vec(),
+        }],
+        workers: workers.to_vec(),
+        steps,
+        prompts: None,
+        outcome,
+    }
+}
+
+/// Under boundaries: the deepest one a prompt reaches is tried first, then
+/// the next one down, and the fewest requests take a key that no boundary's
+/// worker keeps.
+fn level_rows() -> Vec<Row> {
+    // The head's worker is the third of the prompt's own ring order: neither
+    // the prompt's own worker nor that ring's next member.
+    let apart = [2, 0, 1, 3];
+    vec![
+        level_row(
+            "under-boundaries-a-worker-under-the-bound-keeps-the-deepest-boundary-s-key",
+            &apart,
+            &[12, 0, 5, 1],
+            Vec::new(),
+        ),
+        level_row(
+            "a-worker-past-the-bound-passes-the-key-to-the-next-boundary-s-worker",
+            &apart,
+            &[30, 0, 5, 1],
+            Vec::new(),
+        ),
+        level_row(
+            "workers-past-the-bound-at-every-boundary-pass-the-key-to-the-fewest-requests",
+            &apart,
+            &[30, 3, 28, 0],
+            Vec::new(),
+        ),
+        level_row(
+            "one-worker-at-both-boundaries-passes-the-key-to-the-fewest-requests",
+            &[0, 2, 1, 3],
+            &[30, 5, 0, 1],
+            Vec::new(),
+        ),
+        level_row(
+            "a-down-worker-at-the-next-boundary-hands-the-key-to-that-ring-s-next-member",
+            &[2, 3, 0, 1],
+            &[30, 0, 5, 1],
+            vec![Step::Ready(vec![true, true, false, true])],
+        ),
+        level_row(
+            "a-down-worker-at-the-deepest-boundary-hands-the-key-to-that-ring-s-next-member",
+            &apart,
+            &[0, 5, 0, 1],
+            vec![Step::Ready(vec![false, true, true, true])],
+        ),
+    ]
+}
+
+/// How deep the key reads under boundaries, by pairs of prompts that differ
+/// at one place.
+fn level_depth_rows() -> Vec<Row> {
+    let pairs = |tokens: u32, differ_at: u32| Prompts {
+        count: 64,
+        tokens,
+        differ_at: Some(differ_at),
+        text: false,
+    };
+    let other_depth = Config {
+        prefix_token_count: 128,
+        ..LEVELLED
+    };
+    vec![
+        prompts_row(
+            "under-boundaries-the-256th-token-of-a-prompt-that-reaches-256-is-in-the-key",
+            LEVELLED,
+            pairs(300, 255),
+        ),
+        prompts_row(
+            "under-boundaries-the-257th-token-of-a-prompt-that-reaches-256-is-outside-the-key",
+            LEVELLED,
+            pairs(300, 256),
+        ),
+        prompts_row(
+            "under-boundaries-the-64th-token-of-a-prompt-that-reaches-64-alone-is-in-the-key",
+            LEVELLED,
+            pairs(100, 63),
+        ),
+        prompts_row(
+            "under-boundaries-the-65th-token-of-a-prompt-that-reaches-64-alone-is-outside-the-key",
+            LEVELLED,
+            pairs(100, 64),
+        ),
+        prompts_row(
+            "under-boundaries-a-prompt-that-reaches-none-is-keyed-at-the-one-depth",
+            LEVELLED,
+            pairs(48, 47),
+        ),
+        prompts_row(
+            "a-prompt-that-reaches-a-boundary-is-not-keyed-at-the-one-depth",
+            other_depth,
+            pairs(300, 200),
+        ),
+        prompts_row(
+            "under-boundaries-the-256th-token-of-a-text-that-reaches-256-is-in-the-key",
+            LEVELLED,
+            Prompts {
+                text: true,
+                ..pairs(300, 255)
+            },
+        ),
+        prompts_row(
+            "under-boundaries-the-257th-token-of-a-text-that-reaches-256-is-outside-the-key",
+            LEVELLED,
+            Prompts {
+                text: true,
+                ..pairs(300, 256)
+            },
+        ),
+    ]
+}
+
 fn rows() -> Vec<Row> {
     let mut rows = key_rows();
     rows.extend(bound_rows());
     rows.extend(depth_rows());
+    rows.extend(level_rows());
+    rows.extend(level_depth_rows());
     rows
 }
 

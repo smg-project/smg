@@ -34,20 +34,14 @@ fn expected_document(item: &str) -> Option<&str> {
 /// with the change that builds the last form its document lacks, and when
 /// an item is refused as not in this build in words this list does not give
 /// it.
-const NOT_IN_BUILD: &[(&str, &str)] = &[
-    (
-        "27-cli-prefix-hash-boundaries.md",
-        "the consistent-hash boundary levels",
-    ),
-    (
-        // The document also names the prefix-affinity accounting, its
-        // uncached credit and the best-with-temperature picker: the change
-        // that builds the decay rewrites these words, and the entry leaves
-        // with the last of the four.
-        "28-cli-cache-aware-hash-index-full.md",
-        "the prefix-affinity decay",
-    ),
-];
+const NOT_IN_BUILD: &[(&str, &str)] = &[(
+    // The document also names the prefix-affinity accounting, its
+    // uncached credit and the best-with-temperature picker: the change
+    // that builds the decay rewrites these words, and the entry leaves
+    // with the last of the four.
+    "28-cli-cache-aware-hash-index-full.md",
+    "the prefix-affinity decay",
+)];
 
 /// The corpus's size: an item that leaves the directory or arrives in it,
 /// or takes an extension the walk does not read, is a defect, told after
