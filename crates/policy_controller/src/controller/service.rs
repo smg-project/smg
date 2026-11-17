@@ -26,12 +26,18 @@
 use std::{
     io,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use prost::Message as _;
 use tokio::sync::watch;
-use tonic::{service::Routes, Code, Request, Response, Status, Streaming};
+use tonic::{
+    codegen::http,
+    server::NamedService,
+    service::{interceptor::InterceptedService, Routes},
+    Code, Request, Response, Status, Streaming,
+};
 
 use super::{
     config::Scope,
@@ -45,7 +51,7 @@ use super::{
     replication::{Batches, Replication},
     session,
     watch_workers::{self, Feed, Source, Watchers, Watching},
-    PROTOCOL_VERSION,
+    wire, PROTOCOL_VERSION,
 };
 use crate::{
     catalog::Catalog,
@@ -63,6 +69,47 @@ const NOT_IN_TERM: &str = "this replica leads a term its store has not entered y
 
 /// A watch's refusal by a replica that does not lead.
 const FOLLOWS_NO_LOG: &str = "this replica does not lead and follows no leader's log";
+
+/// The path the transport routes the `Decide` call by.
+const DECIDE_PATH: &str = "/smg.policy.v1.PolicyController/Decide";
+
+/// The contract's service behind two bounds on a message as received: a
+/// `Decide` frame's own on that call ([`wire::MAX_FRAME`]), the
+/// transport's on every other.
+#[derive(Clone)]
+struct ByCall<S> {
+    decide: S,
+    rest: S,
+}
+
+impl<S, B> tonic::codegen::Service<http::Request<B>> for ByCall<S>
+where
+    S: tonic::codegen::Service<http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Either side may take the next request: both are asked.
+        match self.decide.poll_ready(cx) {
+            Poll::Ready(Ok(())) => self.rest.poll_ready(cx),
+            other => other,
+        }
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() == DECIDE_PATH {
+            self.decide.call(request)
+        } else {
+            self.rest.call(request)
+        }
+    }
+}
+
+impl<S: NamedService> NamedService for ByCall<S> {
+    const NAME: &'static str = S::NAME;
+}
 
 /// What every listener's instance of the service reads. A step that serves
 /// a call adds its state here.
@@ -353,12 +400,24 @@ impl Service {
     /// This instance as its listener mounts it: behind the listener's one
     /// layer, or behind none.
     pub(crate) fn routes(self, layer: Layer) -> Routes {
+        let service = Arc::new(self);
+        // A `Decide` frame is held to its bound as received: the transport
+        // refuses a longer one at its length. Every other message is under
+        // the transport's own limit.
+        let decide = PolicyControllerServer::from_arc(Arc::clone(&service))
+            .max_decoding_message_size(wire::MAX_FRAME);
+        let rest = PolicyControllerServer::from_arc(service);
         match layer {
-            Layer::Off => Routes::new(PolicyControllerServer::new(self)),
-            Layer::AsTold => Routes::new(PolicyControllerServer::with_interceptor(
-                self,
-                |request: Request<()>| Ok(principal::as_told(request)),
-            )),
+            Layer::Off => Routes::new(ByCall { decide, rest }),
+            Layer::AsTold => {
+                let told = |request: Request<()>| -> Result<Request<()>, Status> {
+                    Ok(principal::as_told(request))
+                };
+                Routes::new(ByCall {
+                    decide: InterceptedService::new(decide, told),
+                    rest: InterceptedService::new(rest, told),
+                })
+            }
         }
     }
 
@@ -1252,6 +1311,17 @@ mod tests {
             refused.message().starts_with("with_needs: "),
             "{}",
             refused.message()
+        );
+    }
+
+    /// The path the transport routes `Decide` by is the contract's: its
+    /// service's name, then its method's.
+    #[test]
+    fn the_decide_calls_path_is_the_contracts_services_and_its_methods() {
+        assert!(methods().contains(&"Decide"));
+        assert_eq!(
+            super::DECIDE_PATH,
+            format!("/{}/Decide", crate::controller::SERVICE_NAME)
         );
     }
 

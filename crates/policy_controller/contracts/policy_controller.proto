@@ -365,7 +365,9 @@ message SpecPush {
 
 // Idempotent on (verified gateway id, request_id) for the lease's lifetime: a
 // repeated Decide after a stream reset returns the standing decision. A
-// frame is at most 64 KiB as encoded.
+// frame is at most 64 KiB as encoded, and one over it is refused whole: a
+// sender cuts its block hashes at the tail until its frame fits, and
+// counts the cut on its own side.
 message DecideRequest {
   // 1 to 256 bytes: the gateway's own key of one request among those it has
   // standing, carried back on every answer. A longer id is sent as a digest

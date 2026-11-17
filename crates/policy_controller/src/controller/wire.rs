@@ -30,8 +30,9 @@
 //! in either form, and a stage that reads the key itself reads one key.
 //! The one value that would give the fingerprint no key has is refused.
 //!
-//! A range the contract fixes refuses a frame, its size and its id's
-//! length among them; a bound a generation's document sets never does,
+//! A range the contract fixes refuses a frame, its id's length among
+//! them, and the transport refuses one over its size as received; a
+//! bound a generation's document sets never does,
 //! since the gateway may be a generation behind. The block hashes past what
 //! the deciding generation reads of the request are cut at the read, the
 //! first ones kept: a prefix cut short is still a prefix.
@@ -47,8 +48,6 @@
 
 use std::{mem, time::Duration};
 
-use prost::Message as _;
-
 use crate::{
     decision::{Decision, ShedReason, Target, Trace},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
@@ -59,16 +58,14 @@ use crate::{
     },
 };
 
-/// Why a frame is refused before any decision: its size, or the field by
-/// its path in the contract.
+/// Why a frame is refused before any decision: the field, by its path in
+/// the contract. A frame's size is the transport's to refuse
+/// ([`MAX_FRAME`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum Refusal {
     /// The field holds a number its record has no place for.
     #[error("{0} is out of its range in this protocol version")]
     OutOfRange(&'static str),
-    /// The frame is larger, as encoded, than a `DecideRequest` may be.
-    #[error("a DecideRequest of {0} bytes is over the call's limit of {limit} bytes", limit = MAX_FRAME)]
-    TooLarge(usize),
 }
 
 /// The longest `request_id` a frame carries, in bytes; the shortest is one.
@@ -76,10 +73,16 @@ pub(crate) enum Refusal {
 /// length is a range of the contract.
 pub(crate) const MAX_REQUEST_ID: usize = 256;
 
-/// The largest `DecideRequest`, in bytes as encoded. A stream's window and
-/// a decider's queue hold frames by the place, so the frame's size is what
-/// bounds their bytes: as read, a frame holds its encoded bytes and one
-/// record for each of its headers, [`MAX_HEADERS`] of them at most.
+/// The largest `DecideRequest`, in bytes as received: the transport refuses
+/// a longer one on the `Decide` call at its length, before it reads it, so
+/// a field this build does not know counts too. A stream's window and a
+/// decider's queue hold frames by the place, so the frame's size is what
+/// bounds their bytes: as read, a frame holds no more than it was received
+/// as and one record for each of its headers, [`MAX_HEADERS`] of them at
+/// most. A frame over the bound is refused whole, whatever its lists hold:
+/// a sender cuts its hashes at the tail until its frame fits, and the
+/// spec's range for their cap ends at what one frame carries
+/// ([`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES)).
 pub(crate) const MAX_FRAME: usize = 64 * 1024;
 
 /// A `DecideRequest` the engine's record holds whole.
@@ -99,14 +102,12 @@ pub(crate) struct Checked {
 }
 
 impl Checked {
-    /// Checks `request`, or refuses it: by its size as encoded, then by the
-    /// first field the record cannot hold. A frame with no facts, or with
-    /// no constraints, reads as one that leaves every field of them unset.
+    /// Checks `request`, or refuses it by the first field the record cannot
+    /// hold. Its size is not asked here: the transport held the frame to
+    /// [`MAX_FRAME`] as received, and a frame reads to no more than that.
+    /// A frame with no facts, or with no constraints, reads as one that
+    /// leaves every field of them unset.
     pub(crate) fn new(request: proto::DecideRequest) -> Result<Self, Refusal> {
-        let size = request.encoded_len();
-        if size > MAX_FRAME {
-            return Err(Refusal::TooLarge(size));
-        }
         if !(1..=MAX_REQUEST_ID).contains(&request.request_id.len()) {
             return Err(Refusal::OutOfRange("request_id"));
         }
@@ -460,12 +461,13 @@ fn trace(trace: &Trace) -> proto::Trace {
 
 #[cfg(test)]
 mod tests {
-    use super::{busy, credit, decided, emptied, Checked, Lists, Refusal, Viewed};
+    use super::{busy, credit, decided, emptied, Checked, Lists, Refusal, Viewed, MAX_FRAME};
     use crate::{
         decision::{
             Decision, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
         },
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
+        spec::MAX_BLOCK_HASHES,
         view::{
             fingerprint, AffinityFacts, Constraints, HashKind, Header, Identity, MediaCounts,
             ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
@@ -874,6 +876,27 @@ mod tests {
         assert_eq!(read(4), [1, 2, 3, 4]);
         assert_eq!(read(6), [1, 2, 3, 4, 5, 6]);
         assert_eq!(read(7), [1, 2, 3, 4, 5, 6]);
+    }
+
+    /// The spec's range for `view.max_block_hashes` ends where the frame's
+    /// bound does. A frame of that many hashes and an id of one byte is
+    /// read, five bytes under the bound, and one hash more carries it over.
+    #[test]
+    fn the_specs_highest_cap_of_hashes_is_what_one_frame_carries() {
+        let frame = |hashes: u32| proto::DecideRequest {
+            request_id: vec![1],
+            facts: Some(proto::RequestFacts {
+                block_hashes: (0..u64::from(hashes)).collect(),
+                ..proto::RequestFacts::default()
+            }),
+            constraints: None,
+        };
+        let at = frame(MAX_BLOCK_HASHES);
+        assert_eq!(prost::Message::encoded_len(&at), MAX_FRAME - 5);
+        let read = Checked::new(at).expect("a frame under the bound");
+        assert_eq!(u32::try_from(read.hashes()), Ok(MAX_BLOCK_HASHES));
+        let over = frame(MAX_BLOCK_HASHES + 1);
+        assert_eq!(prost::Message::encoded_len(&over), MAX_FRAME + 3);
     }
 
     #[test]

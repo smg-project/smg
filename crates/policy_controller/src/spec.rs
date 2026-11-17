@@ -60,6 +60,12 @@ pub const DENIED_HEADERS: [&str; 7] = [
 /// header by its position in one byte.
 pub const MAX_HEADERS: usize = 256;
 
+/// The highest `view.max_block_hashes`: the hashes a `DecideRequest` at
+/// the contract's bound of 64 KiB carries beside an id of one byte, at
+/// eight bytes a hash and ten of tags and lengths. A higher cap would
+/// bind on no frame the call accepts.
+pub const MAX_BLOCK_HASHES: u32 = 8_190;
+
 /// The filters this build carries.
 pub const FILTERS: [&str; 5] = [
     "healthy",
@@ -219,8 +225,9 @@ pub struct ViewSpec {
     /// Ascending token positions the hash index and the prefix-hash ring
     /// key on; empty for none. A hash index needs at least one.
     pub boundaries: Vec<u32>,
-    /// How many prefix block hashes a request carries into the view.
-    #[schemars(range(min = 1))]
+    /// How many prefix block hashes a request carries into the view, 8,190
+    /// at most: one frame of the Decide call carries no more.
+    #[schemars(range(min = 1, max = 8190))]
     pub max_block_hashes: u32,
 }
 
@@ -1789,7 +1796,15 @@ fn check_view(view: &ViewSpec, denied: &[&str]) -> Result<(), SpecError> {
             }
         }
     }
-    at.nonzero("max_block_hashes", Some(view.max_block_hashes))
+    at.nonzero("max_block_hashes", Some(view.max_block_hashes))?;
+    if view.max_block_hashes > MAX_BLOCK_HASHES {
+        return Err(at.bad(
+            "max_block_hashes",
+            view.max_block_hashes,
+            "at most 8190, the hashes one Decide frame carries",
+        ));
+    }
+    Ok(())
 }
 
 fn check_index(index: &BTreeMap<String, IndexSpec>, view: &ViewSpec) -> Result<(), SpecError> {
@@ -4464,6 +4479,17 @@ mod tests {
         assert_eq!(
             bad_field(&spec_with_view(r#"{"max_block_hashes":0}"#)),
             "view.max_block_hashes"
+        );
+        // One frame of the Decide call carries 8,190 hashes: that cap is
+        // taken, and one above it is refused by the field's name.
+        let cap = |hashes: u32| spec_with_view(&format!(r#"{{"max_block_hashes":{hashes}}}"#));
+        assert!(cap(MAX_BLOCK_HASHES).validate().is_ok());
+        let refused = cap(MAX_BLOCK_HASHES + 1)
+            .validate()
+            .expect_err("a cap one frame cannot carry");
+        assert_eq!(
+            refused.to_string(),
+            "view.max_block_hashes = 8191 is not at most 8190, the hashes one Decide frame carries"
         );
         let spec = spec_with_view(r#"{"block_size":128,"boundaries":[256,1024,4096]}"#);
         assert!(spec.validate().is_ok());
