@@ -1074,7 +1074,7 @@ def test_the_chart_refuses_what_the_controller_refuses_at_start():
         unknown = render_error(*ON, f"policyController.identityAsTold={names}", skip_schema=True)
         assert "policyController.identityAsTold names" in unknown
         assert "none of the chart's listeners (gateway, control, replication)" in unknown
-    assert "policyController.identityAsTold is gateway" in render_error(
+    assert 'policyController.identityAsTold is "gateway"' in render_error(
         *ON, "policyController.identityAsTold=gateway", skip_schema=True
     )
     # The names the schema takes render the same with its check skipped.
@@ -1082,6 +1082,25 @@ def test_the_chart_refuses_what_the_controller_refuses_at_start():
         render(*ON, "policyController.identityAsTold={replication,gateway}", skip_schema=True)
     )["args"]
     assert told[told.index("--identity-as-told") + 1] == "gateway,replication"
+    # A null is the value left out, with the check skipped too.
+    unset = render(*ON, "policyController.identityAsTold=null", skip_schema=True)
+    assert "--identity-as-told" not in container(unset)["args"]
+
+
+@needs_helm
+@pytest.mark.parametrize("written", ["false", "0", '""', "{}"])
+def test_a_told_value_that_is_no_list_is_refused_though_it_reads_as_empty(
+    written: str, tmp_path: Path
+):
+    """With the schema's check skipped, a value that is no list is refused as
+    it was written. One that reads as empty never renders as no listener
+    told: null alone is the value left out."""
+    values = tmp_path / "values.yaml"
+    values.write_text(f"policyController:\n  identityAsTold: {written}\n")
+    refused = render_error(*ON, files=(values,), skip_schema=True)
+    assert f"policyController.identityAsTold is {written}: a list of listeners' names" in refused
+    # The schema refuses each first.
+    assert "policyController.identityAsTold" in render_error(*ON, files=(values,))
 
 
 def schema_block() -> dict:
