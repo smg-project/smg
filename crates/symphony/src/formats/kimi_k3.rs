@@ -196,7 +196,10 @@ mod tests {
                 Event::Content(text)
                 | Event::Reasoning(text)
                 | Event::Dropped { text, .. }
-                | Event::Malformed { text, .. } => text.tokens.unwrap(),
+                | Event::Malformed { text, .. }
+                | Event::ToolCallStart { source: text, .. }
+                | Event::ToolCallArguments { source: text, .. }
+                | Event::ToolCallEnd { source: text, .. } => text.tokens.unwrap(),
                 _ => 0,
             })
             .sum();
@@ -226,6 +229,82 @@ mod tests {
             assert!(events
                 .iter()
                 .all(|event| !matches!(event, Event::Malformed { .. })));
+        }
+    }
+
+    #[test]
+    fn bound_arguments_keep_ordinary_tag_spellings_at_every_cut() {
+        for value in [
+            "hello",
+            "Kimi ends a value with <|close|>argument<|sep|> and starts one with <|open|>argument key=\"k\" type=\"string\"<|sep|> in its template.",
+            "é🌍 <|close|>call<|sep|><|open|>tools<|sep|> stays text",
+        ] {
+            let pieces = [
+                ("<|close|>think<|sep|>", true),
+                ("<|open|>tools<|sep|>", true),
+                ("<|open|>call tool=\"delete_file\" index=\"1\"<|sep|>", true),
+                ("<|open|>argument key=\"content\" type=\"string\"<|sep|>", true),
+                (value, false),
+                ("<|close|>argument<|sep|>", true),
+                ("<|close|>call<|sep|>", true),
+                ("<|close|>tools<|sep|>", true),
+                ("<|close|>message<|sep|>", true),
+            ];
+            let output: String = pieces.iter().map(|(text, _)| *text).collect();
+            for finish in [EngineFinish::Stop, EngineFinish::Length] {
+                for cut in output.char_indices().map(|(at, _)| at).chain([output.len()]) {
+                    let events = token_bound(PROMPT, &pieces, cut, finish.clone());
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&arguments_of(&events, 0)).unwrap(),
+                        serde_json::json!({"content": value}),
+                        "cut {cut}, finish {finish:?}"
+                    );
+                    assert!(malformed(&events).is_empty());
+                    assert_eq!(bytes(&events), output);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bound_argument_cut_tails_require_origins_at_every_cut() {
+        for tail in ["<|close|>argu", "<|open|>argu"] {
+            for structural in [false, true] {
+                let pieces = [
+                    ("<|close|>think<|sep|>", true),
+                    ("<|open|>tools<|sep|>", true),
+                    ("<|open|>call tool=\"delete_file\" index=\"1\"<|sep|>", true),
+                    (
+                        "<|open|>argument key=\"content\" type=\"string\"<|sep|>",
+                        true,
+                    ),
+                    ("keep ", false),
+                    (tail, structural),
+                ];
+                let output: String = pieces.iter().map(|(text, _)| *text).collect();
+                let expected = format!("keep {}", if structural { "" } else { tail });
+                for finish in [EngineFinish::Stop, EngineFinish::Length] {
+                    for cut in 0..=output.len() {
+                        let events = token_bound(PROMPT, &pieces, cut, finish.clone());
+                        let actual = arguments_of(&events, 0);
+                        if finish == EngineFinish::Stop {
+                            assert_eq!(
+                                serde_json::from_str::<serde_json::Value>(&actual).unwrap(),
+                                serde_json::json!({"content": expected}),
+                                "cut {cut}"
+                            );
+                        } else {
+                            let quoted = serde_json::to_string(&expected).unwrap();
+                            assert_eq!(
+                                actual,
+                                format!("{{\"content\": {}", &quoted[..quoted.len() - 1]),
+                                "cut {cut}"
+                            );
+                        }
+                        assert_eq!(bytes(&events), output);
+                    }
+                }
+            }
         }
     }
 
