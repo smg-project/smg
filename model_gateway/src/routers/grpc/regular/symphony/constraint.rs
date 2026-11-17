@@ -194,6 +194,67 @@ fn opens_with_free_text(grammar: &Grammar) -> bool {
     }
 }
 
+/// Whether `schema`, the older registry's JSON schema for a forced call to `tools`, keeps what
+/// every reference in the tools' parameters points at: each is a local one (`#` and a JSON
+/// pointer) whose target in `schema` is its target in the tool's own parameters. The registry
+/// writes a named function's parameters as they are, and for a list of tools one schema that
+/// nests each tool's parameters and lifts their `$defs` to its root, where a reference to
+/// anything else (an entry of `definitions`, the tool's own root) points nowhere or at another
+/// value. A schema that loses a target is not sent in a tag's place ([`Prepared::held_by`]).
+/// A constraint of another kind, which the registry does not give with no parser named, is
+/// taken as it is.
+pub(crate) fn keeps_references(schema: &ToolConstraint, tools: &[Tool]) -> bool {
+    let ToolConstraint::JsonSchema(schema) = schema else {
+        return true;
+    };
+    let mut references = tools
+        .iter()
+        .map(|tool| tool.function.parameters_schema())
+        .flat_map(|parameters| {
+            references_in(parameters)
+                .into_iter()
+                .map(move |reference| (parameters, reference))
+        })
+        .peekable();
+    if references.peek().is_none() {
+        return true;
+    }
+    let Ok(schema) = serde_json::from_str::<Value>(schema) else {
+        return false;
+    };
+    references.all(|(parameters, reference)| {
+        reference.strip_prefix('#').is_some_and(|pointer| {
+            parameters
+                .pointer(pointer)
+                .is_some_and(|target| schema.pointer(pointer) == Some(target))
+        })
+    })
+}
+
+/// The text of every reference written in `schema`: each `$ref`, `$dynamicRef` and
+/// `$recursiveRef`.
+fn references_in(schema: &Value) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut pending = vec![schema];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(members) => {
+                for (key, member) in members {
+                    match (key.as_str(), member) {
+                        ("$ref" | "$dynamicRef" | "$recursiveRef", Value::String(reference)) => {
+                            found.push(reference.as_str());
+                        }
+                        _ => pending.push(member),
+                    }
+                }
+            }
+            Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
+    }
+    found
+}
+
 /// The tag of a JSON answer following `schema`, with `reasoning_open` when the prompt leaves the
 /// model inside its thought ([`Format::answer_grammar`]): the answer written where the table
 /// reads one, which the engine's own schema constraint is not for a table whose answer is a
@@ -1612,6 +1673,79 @@ mod tests {
         assert!(
             marked > 0,
             "the sweep meets tables whose tag opens with free text"
+        );
+    }
+
+    /// The older registry's schema keeps a reference when its target there is its target in the
+    /// tool's own parameters: any local reference of a named function, whose parameters are the
+    /// schema; a `$defs` entry under the one schema for a list of tools, which lifts those and
+    /// nothing else. A reference to an entry of `definitions` or to the tool's own root under
+    /// that list, one that resolves nowhere, one that is no local pointer, and one whose target
+    /// the schema carries with another value are not kept.
+    #[test]
+    fn a_schema_keeps_a_reference_whose_target_it_carries() {
+        let tool = |parameters: &Value| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": {"name": "lookup", "parameters": parameters},
+            }))
+            .expect("a tool")
+        };
+        let referring = |reference: &str| {
+            json!({
+                "type": "object",
+                "properties": {"place": {"$ref": reference}},
+                "$defs": {"place": {"type": "string"}},
+                "definitions": {"place": {"type": "string"}},
+            })
+        };
+        // A named function's parameters are the schema as they are.
+        let own = |parameters: &Value| ToolConstraint::JsonSchema(parameters.to_string());
+        // A list's one schema nests the parameters and carries `defs` at its root.
+        let listed = |parameters: &Value, defs: Value| {
+            ToolConstraint::JsonSchema(
+                json!({
+                    "type": "array",
+                    "items": {"anyOf": [{"properties": {"parameters": parameters}}]},
+                    "$defs": defs,
+                })
+                .to_string(),
+            )
+        };
+        let place = || json!({"place": {"type": "string"}});
+        for (reference, named, list) in [
+            ("#/$defs/place", true, true),
+            ("#/definitions/place", true, false),
+            ("#", true, false),
+            ("#/$defs/missing", false, false),
+            ("https://example.com/place.json", false, false),
+        ] {
+            let parameters = referring(reference);
+            let tools = [tool(&parameters)];
+            assert_eq!(
+                keeps_references(&own(&parameters), &tools),
+                named,
+                "{reference}: a named function"
+            );
+            assert_eq!(
+                keeps_references(&listed(&parameters, place()), &tools),
+                list,
+                "{reference}: a list of tools"
+            );
+        }
+        let parameters = referring("#/$defs/place");
+        let other = json!({"place": {"type": "integer"}});
+        assert!(
+            !keeps_references(&listed(&parameters, other), &[tool(&parameters)]),
+            "another value under the name"
+        );
+        let plain = json!({"type": "object"});
+        assert!(
+            keeps_references(
+                &ToolConstraint::JsonSchema("not JSON".to_string()),
+                &[tool(&plain)]
+            ),
+            "no reference: nothing to keep"
         );
     }
 

@@ -15,7 +15,7 @@ use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{common::Tool, profile::ProviderProfile};
 use tool_parser::ToolConstraint;
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::{
     config::ParserChoice,
@@ -80,7 +80,8 @@ pub(crate) struct Prepared {
 /// lets the model call, and the legacy tool parser's name). A table's tag
 /// for a forced call that opens with free text gives way to that registry's
 /// JSON schema, asked with no parser named, and stands where the schema
-/// cannot be built (`regular::symphony::Prepared::held_by`). On a thinking
+/// cannot be built or loses what a reference in the tools' parameters
+/// points at (`regular::symphony::keeps_references`). On a thinking
 /// prompt a parser with a reasoning prefix gets its tag wrapped so a forced
 /// call follows the reasoning instead of preempting it: `switch` is the API's
 /// tokenizer-driven answer, and where a table reads the response its replay
@@ -154,15 +155,34 @@ pub(crate) fn prepare(
     // call, so the older registry's JSON schema goes out in its place. No
     // parser is named for it: a parser's own tag opens the same way and is
     // not spelled for the workers' vocabulary. A request that schema cannot
-    // spell keeps the table's tag.
+    // spell keeps the table's tag: one the registry cannot build, or one
+    // that loses what a reference in the tools' parameters points at.
     let from_the_table = from_the_table.map(|found| {
         found.held_by(|| {
-            ctx.components
+            let schema = ctx
+                .components
                 .tool_parser_factory
                 .registry()
                 .generate_tool_constraint(None, tools, choice.as_deref()?, reasoning)
+                .inspect_err(|e| {
+                    debug!(
+                        function = stage,
+                        error = %e,
+                        "No JSON schema for the forced call; the table's tag stands"
+                    );
+                })
                 .ok()
-                .flatten()
+                .flatten()?;
+            if symphony::keeps_references(&schema, tools) {
+                Some(schema)
+            } else {
+                debug!(
+                    function = stage,
+                    "The JSON schema for the forced call loses a reference's target; the \
+                     table's tag stands"
+                );
+                None
+            }
         })
     });
     let constraint = match (from_the_table, choice.as_deref()) {
@@ -1053,27 +1073,62 @@ mod tests {
         }
     }
 
-    /// Two tools whose schemas define one name differently, under `required` from an open
-    /// thought on workers that name no start: the older registry's one schema for the whole
-    /// list cannot hold both definitions, so the request keeps the table's tag, which reads
-    /// each tool's definitions apart, and is served. With one definition under the name the
-    /// schema goes out.
+    /// A `required` call the older registry's one schema cannot spell keeps the table's tag,
+    /// from an open thought on workers that name no start, and is served: two tools that
+    /// define one name differently, which that schema refuses to build; a reference to an entry
+    /// of `definitions`, which it builds and leaves pointing nowhere, since it lifts the tools'
+    /// `$defs` and nothing else. The table's tag reads each tool's parameters apart. Where every
+    /// reference keeps its target the schema goes out: one definition under the name, and a
+    /// named function, whose parameters are the schema as they are.
     #[test]
     fn a_required_call_the_schema_cannot_spell_keeps_the_tables_tag() {
         let tokenizer = hiding(&["<think>", "</think>"]);
-        let tool = |name: &str, place: &str| {
+        let tool = |name: &str, definitions: &str, place: &str| {
             json!({"type": "function", "function": {"name": name, "parameters": {
                 "type": "object",
-                "properties": {"place": {"$ref": "#/$defs/place"}},
-                "$defs": {"place": {"type": place}},
+                "properties": {"place": {"$ref": format!("#/{definitions}/place")}},
+                definitions: {"place": {"type": place}},
             }}})
         };
-        for (place, schema) in [("string", true), ("integer", false)] {
+        let required = json!("required");
+        let named = json!({"type": "function", "function": {"name": "lookup"}});
+        for (case, choice, tools, schema) in [
+            (
+                "one definition under the name",
+                &required,
+                vec![
+                    tool("lookup", "$defs", "string"),
+                    tool("route", "$defs", "string"),
+                ],
+                true,
+            ),
+            (
+                "two definitions under one name",
+                &required,
+                vec![
+                    tool("lookup", "$defs", "string"),
+                    tool("route", "$defs", "integer"),
+                ],
+                false,
+            ),
+            (
+                "a reference to an entry of `definitions`",
+                &required,
+                vec![tool("lookup", "definitions", "string")],
+                false,
+            ),
+            (
+                "a named function, the same reference",
+                &named,
+                vec![tool("lookup", "definitions", "string")],
+                true,
+            ),
+        ] {
             let chat: Arc<ChatCompletionRequest> = Arc::new(
                 serde_json::from_value(json!({
                     "model": SERVED, "messages": [{"role": "user", "content": "hi"}],
-                    "tool_choice": "required",
-                    "tools": [tool("lookup", "string"), tool("route", place)],
+                    "tool_choice": choice,
+                    "tools": tools,
                 }))
                 .expect("chat request"),
             );
@@ -1098,7 +1153,7 @@ mod tests {
             .expect("nothing refused");
             assert_eq!(
                 prepared.json_schema, schema,
-                "the second tool's place is {place}: {:?}",
+                "{case}: {:?}",
                 prepared.constraint
             );
             assert_eq!(
@@ -1107,8 +1162,7 @@ mod tests {
                     Ok(symphony::Prepared::Constraint { table: true, .. })
                 ),
                 !schema,
-                "the second tool's place is {place}: the table's own tag where the schema \
-                 cannot be spelled"
+                "{case}: the table's own tag where the schema cannot spell the request"
             );
         }
     }
