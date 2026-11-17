@@ -34,7 +34,10 @@
 //!   wakes the same threads whatever its fleet, the client's own calls
 //!   included). A run's instructions are read from outside it
 //!   (`perf stat -e instructions:u`): two runs of different length give a
-//!   decision's by their difference. A counted run keeps no round trip and
+//!   decision's by their difference. A counted run's window holds whole
+//!   exchanges: it opens before the first measured request is handed over
+//!   and closes at the last measured answer, which no request follows. A
+//!   counted run keeps no round trip and
 //!   sorts none: a sort grows faster than its length, and the difference
 //!   of two runs would keep part of it.
 //!
@@ -42,11 +45,16 @@
 //! rows stay inside a stream's window and a decider's queue) and the
 //! process's resident size. A closed-loop row also prints its CPU seconds
 //! per million decisions, client and controller together; an open-loop
-//! client spins between instants, so its row prints none. Every decision
-//! of a row is a pick over its fleet, or the bench stops: a setup that
-//! drifted to another outcome would print another path's numbers.
-//! `DECIDE_STREAM_ROWS=round_trip`, `offered` or `rate` runs one kind
-//! alone, and `--test` runs every row for a moment.
+//! client spins between instants, so its row prints none. A reading the
+//! kernel's file did not give prints `n/a`. A closed-loop row prints the
+//! answers it could not time too (`overtaken`, none expected): an answer
+//! whose slot of the ring a later request took while it waited. Every
+//! decision of a row or a count cell is a pick over its fleet, or the
+//! bench stops: a setup that drifted to another outcome would print
+//! another path's numbers. `DECIDE_STREAM_ROWS=round_trip`, `offered` or
+//! `rate` runs one kind alone, and `--test` runs every row for a moment.
+//! A run with no `--bench` is a test too, as criterion reads one: `cargo
+//! bench` passes `--bench`, and a test of every target passes neither.
 //!
 //! The process installs a tracing subscriber that takes nothing, as the
 //! binary installs one of its own: with none, each span of the transport
@@ -143,8 +151,9 @@ const GATEWAY: &str = "bench-gateway";
 const PRESET: &str = "least_load";
 /// The controller's runtime threads.
 const SERVER_THREADS: usize = 2;
-/// The slots a stream keeps its requests' send instants in: above every
-/// row's count in flight.
+/// The slots a stream keeps its requests' send instants in, each beside
+/// its request's id: above every row's count in flight. An answer whose
+/// slot a later request took is counted, not timed.
 const RING: u64 = 1_024;
 /// The budget every request brings.
 const BUDGET_MICROS: u32 = 5_000_000;
@@ -390,6 +399,9 @@ struct Tally {
     /// The measured requests an open loop decided itself: due with no
     /// credit.
     local: u64,
+    /// The measured answers a closed loop could not time: a later request
+    /// took their slot of the ring.
+    overtaken: u64,
 }
 
 /// Every decision of a row is a pick over its fleet. Another outcome means
@@ -399,6 +411,12 @@ fn picked(decision: &Decision) {
         matches!(decision.outcome, Some(Outcome::Pick(_))),
         "a pick over the fleet: {decision:?}"
     );
+}
+
+/// Opens the allocator's count.
+fn counting() {
+    CALLS.store(0, Ordering::Relaxed);
+    COUNTING.store(true, Ordering::Relaxed);
 }
 
 fn slot(id: u64) -> usize {
@@ -425,7 +443,7 @@ fn request(id: u64, models: &[String]) -> DecideRequest {
 /// Hands the stream its next request and keeps the instant.
 async fn hand(
     requests: &mpsc::Sender<DecideRequest>,
-    sent_at: &mut [Instant],
+    sent_at: &mut [(u64, Instant)],
     next: &mut u64,
     models: &[String],
 ) {
@@ -433,7 +451,7 @@ async fn hand(
     *next += 1;
     let frame = request(id, models);
     if let Some(at) = sent_at.get_mut(slot(id)) {
-        *at = Instant::now();
+        *at = (id, Instant::now());
     }
     requests
         .send(frame)
@@ -452,7 +470,7 @@ async fn ask(addr: SocketAddr, shape: Shape) -> Tally {
         .await
         .expect("a present gateway's stream opens")
         .into_inner();
-    let mut sent_at = vec![Instant::now(); slot(RING - 1) + 1];
+    let mut sent_at = vec![(u64::MAX, Instant::now()); slot(RING - 1) + 1];
     let mut next = 0;
     let mut tally = Tally {
         nanos: Vec::with_capacity(usize::try_from(shape.measured).expect("a count that fits")),
@@ -463,12 +481,16 @@ async fn ask(addr: SocketAddr, shape: Shape) -> Tally {
         calls: 0,
         late: 0,
         local: 0,
+        overtaken: 0,
     };
+    if shape.counted && shape.warm == 0 {
+        counting();
+    }
     for _ in 0..shape.in_flight {
         hand(&requests, &mut sent_at, &mut next, &models).await;
     }
     let mut done = 0;
-    while done < shape.warm + shape.measured {
+    loop {
         let answer = answers
             .message()
             .await
@@ -482,10 +504,6 @@ async fn ask(addr: SocketAddr, shape: Shape) -> Tally {
         }
         if done == shape.warm {
             tally.opened = received;
-            if shape.counted {
-                CALLS.store(0, Ordering::Relaxed);
-                COUNTING.store(true, Ordering::Relaxed);
-            }
         }
         if done >= shape.warm {
             tally.answered += 1;
@@ -498,15 +516,29 @@ async fn ask(addr: SocketAddr, shape: Shape) -> Tally {
                 .as_slice()
                 .try_into()
                 .expect("the request's eight bytes");
-            let at = sent_at
-                .get(slot(u64::from_be_bytes(id)))
-                .expect("a slot of the ring");
-            let took = received.saturating_duration_since(*at);
-            tally
-                .nanos
-                .push(u64::try_from(took.as_nanos()).expect("a round trip under centuries"));
+            let id = u64::from_be_bytes(id);
+            match sent_at.get(slot(id)) {
+                Some((held, at)) if *held == id => {
+                    let took = received.saturating_duration_since(*at);
+                    tally.nanos.push(
+                        u64::try_from(took.as_nanos()).expect("a round trip under centuries"),
+                    );
+                }
+                // A later request took the slot while this one waited:
+                // its instant is not this request's.
+                _ => tally.overtaken += 1,
+            }
         }
         done += 1;
+        // No request follows the last measured answer, and a counted run
+        // opens its window before the first measured request is handed
+        // over: the window holds whole exchanges.
+        if done == shape.warm + shape.measured {
+            break;
+        }
+        if shape.counted && done == shape.warm {
+            counting();
+        }
         hand(&requests, &mut sent_at, &mut next, &models).await;
     }
     if shape.counted {
@@ -545,6 +577,7 @@ async fn offer(addr: SocketAddr, shape: Shape) -> Tally {
         calls: 0,
         late: 0,
         local: 0,
+        overtaken: 0,
     };
     let start = Instant::now();
     let due = |id: u64| start + gap.saturating_mul(u32::try_from(id).unwrap_or(u32::MAX));
@@ -619,30 +652,29 @@ fn current_thread() -> runtime::Runtime {
 }
 
 /// The process's CPU time so far, in the kernel's ticks of ten
-/// milliseconds; zero where the kernel's file does not read.
-fn cpu_ticks() -> u64 {
-    let stat = fs::read_to_string("/proc/self/stat").unwrap_or_default();
+/// milliseconds; none where the kernel's file does not read.
+fn cpu_ticks() -> Option<u64> {
+    let stat = fs::read_to_string("/proc/self/stat").ok()?;
     // Past the command's closing parenthesis the state is the first field,
     // the user time the twelfth and the system time the thirteenth.
-    let fields = stat.rsplit_once(')').map_or("", |(_, fields)| fields);
-    fields
-        .split_whitespace()
-        .skip(11)
-        .take(2)
-        .filter_map(|field| field.parse::<u64>().ok())
-        .sum()
+    let (_, fields) = stat.rsplit_once(')')?;
+    let mut times = fields.split_whitespace().skip(11).map(str::parse::<u64>);
+    let (Some(Ok(user)), Some(Ok(system))) = (times.next(), times.next()) else {
+        return None;
+    };
+    Some(user + system)
 }
 
-/// The process's resident size in MiB; zero where the kernel's file does
+/// The process's resident size in MiB; none where the kernel's file does
 /// not read.
-fn rss_mib() -> u64 {
-    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+fn rss_mib() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
     status
         .lines()
         .find_map(|line| line.strip_prefix("VmRSS:"))
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|kib| kib.parse::<u64>().ok())
-        .map_or(0, |kib| kib / 1_024)
+        .map(|kib| kib / 1_024)
 }
 
 /// What a wire row measured, over all its streams.
@@ -651,12 +683,14 @@ struct Row {
     nanos: Vec<u64>,
     busy: u64,
     per_second: u64,
-    /// CPU milliseconds of the whole process per million decisions.
-    cpu_millis_per_million: u64,
-    rss_mib: u64,
+    /// CPU milliseconds of the whole process per million decisions, and
+    /// its resident size: none where the kernel's file did not read.
+    cpu_millis_per_million: Option<u64>,
+    rss_mib: Option<u64>,
     calls: u64,
     late: u64,
     local: u64,
+    overtaken: u64,
 }
 
 /// Runs one wire row: a served controller, the gateway's session, and the
@@ -687,7 +721,9 @@ fn wire(shape: Shape) -> Row {
         .into_iter()
         .map(|stream| stream.join().expect("a client's thread ends cleanly"))
         .collect();
-    let ticks = cpu_ticks().saturating_sub(before);
+    let ticks = cpu_ticks()
+        .zip(before)
+        .map(|(after, before)| after.saturating_sub(before));
     let rss_mib = rss_mib();
     drop(session);
     drop(session_runtime);
@@ -698,11 +734,13 @@ fn wire(shape: Shape) -> Row {
         nanos: Vec::new(),
         busy: 0,
         per_second: 0,
-        cpu_millis_per_million: (ticks * 10 * 1_000_000).checked_div(decisions).unwrap_or(0),
+        cpu_millis_per_million: ticks
+            .and_then(|ticks| (ticks * 10 * 1_000_000).checked_div(decisions)),
         rss_mib,
         calls: 0,
         late: 0,
         local: 0,
+        overtaken: 0,
     };
     // The streams' answers together over the one interval they share, from
     // the first measured answer of any to the last of all: a sum of each
@@ -722,6 +760,7 @@ fn wire(shape: Shape) -> Row {
         row.calls += tally.calls;
         row.late += tally.late;
         row.local += tally.local;
+        row.overtaken += tally.overtaken;
         row.nanos.extend(tally.nanos);
     }
     row.nanos.sort_unstable();
@@ -741,6 +780,12 @@ fn micros(nanos: u64) -> String {
 
 fn seconds(millis: u64) -> String {
     format!("{}.{:02}", millis / 1_000, millis % 1_000 / 10)
+}
+
+/// A reading of the process as a row prints it: `n/a` where the kernel's
+/// file gave none.
+fn read<T>(reading: Option<T>, print: impl FnOnce(T) -> String) -> String {
+    reading.map_or_else(|| "n/a".to_owned(), print)
 }
 
 /// The engine's own decision, in process: the store's deciding door, a view
@@ -781,13 +826,16 @@ fn in_process(store: &MemoryStore, decisions: u64) -> u64 {
                 &mut scratch,
             )
         });
+        assert!(
+            decision.pick().is_some(),
+            "a pick over the fleet, in process"
+        );
         black_box(&decision);
     };
     for seed in 0..2_000 {
         decide(seed);
     }
-    CALLS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
+    counting();
     for seed in 0..decisions {
         decide(2_000 + seed);
     }
@@ -840,7 +888,9 @@ fn main() -> io::Result<()> {
     // spans off the tracing crate's log path.
     tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::default())
         .expect("no subscriber stands before the bench's");
-    let quick = env::args().any(|arg| arg == "--test");
+    // As criterion reads a run: `cargo bench` passes `--bench`, and a test
+    // of every target passes neither flag.
+    let quick = env::args().any(|arg| arg == "--test") || !env::args().any(|arg| arg == "--bench");
     let mut out = io::stdout().lock();
     if let Ok(cell) = env::var("DECIDE_STREAM_COUNT") {
         return count(&cell, &mut out);
@@ -867,7 +917,7 @@ fn main() -> io::Result<()> {
             });
             writeln!(
                 out,
-                "policy_decide_stream/round_trip/{in_flight} members=64 deciders=2 decisions={} p50_us={} p99_us={} p999_us={} max_us={} per_s={} busy={} cpu_s_per_million={} rss_mib={}",
+                "policy_decide_stream/round_trip/{in_flight} members=64 deciders=2 decisions={} p50_us={} p99_us={} p999_us={} max_us={} per_s={} busy={} cpu_s_per_million={} rss_mib={} overtaken={}",
                 row.nanos.len(),
                 percentile(&row.nanos, 1, 2),
                 percentile(&row.nanos, 99, 100),
@@ -875,8 +925,9 @@ fn main() -> io::Result<()> {
                 percentile(&row.nanos, 1, 1),
                 row.per_second,
                 row.busy,
-                seconds(row.cpu_millis_per_million),
-                row.rss_mib,
+                read(row.cpu_millis_per_million, seconds),
+                read(row.rss_mib, |mib| mib.to_string()),
+                row.overtaken,
             )?;
             out.flush()?;
         }
@@ -909,7 +960,7 @@ fn main() -> io::Result<()> {
                 row.busy,
                 row.local,
                 row.late,
-                row.rss_mib,
+                read(row.rss_mib, |mib| mib.to_string()),
             )?;
             out.flush()?;
         }
@@ -930,14 +981,15 @@ fn main() -> io::Result<()> {
                 });
                 writeln!(
                     out,
-                    "policy_decide_stream/rate/{members}/{deciders} models={models} streams=4 in_flight=32 decisions={} per_s={} p50_us={} p99_us={} busy={} cpu_s_per_million={} rss_mib={}",
+                    "policy_decide_stream/rate/{members}/{deciders} models={models} streams=4 in_flight=32 decisions={} per_s={} p50_us={} p99_us={} busy={} cpu_s_per_million={} rss_mib={} overtaken={}",
                     row.nanos.len(),
                     row.per_second,
                     percentile(&row.nanos, 1, 2),
                     percentile(&row.nanos, 99, 100),
                     row.busy,
-                    seconds(row.cpu_millis_per_million),
-                    row.rss_mib,
+                    read(row.cpu_millis_per_million, seconds),
+                    read(row.rss_mib, |mib| mib.to_string()),
+                    row.overtaken,
                 )?;
                 out.flush()?;
             }
