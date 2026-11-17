@@ -381,6 +381,22 @@ impl EncoderCore {
             .contains_key(text)
     }
 
+    /// The added tokens of the vocabulary, special or not: each spelling,
+    /// and whether its entry carries a flag under which the flat encode
+    /// reads more than the spelling or none of it (the token takes the
+    /// whitespace beside it, or matches only as a whole word), or reads it
+    /// in a later pass (the token is matched after normalization).
+    fn added_entries(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .values()
+            .map(|token| {
+                let flagged = token.lstrip || token.rstrip || token.single_word || token.normalized;
+                (token.content.as_str(), flagged)
+            })
+    }
+
     /// The matcher over the added vocabulary, built on first use.
     fn added(&self) -> Option<&AddedTokens> {
         self.added
@@ -960,6 +976,7 @@ impl HuggingFaceTokenizer {
             chat_template
                 .mark_built_controls(
                     &|text: &str| core.is_added(text),
+                    || core.added_entries(),
                     || core.added(),
                     &special_tokens,
                 )
@@ -2658,6 +2675,7 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         if !self.structural_controls
             && self.chat_template.mark_built_controls(
                 &|text: &str| core.is_added(text),
+                || core.added_entries(),
                 || core.added(),
                 &self.special_tokens,
             )

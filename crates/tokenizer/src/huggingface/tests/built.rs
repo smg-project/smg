@@ -82,7 +82,42 @@ const SEARCHES: &str = "{% for message in messages %}{% if message['role'] == 'u
     {% endif %}{% endfor %}";
 
 fn checkpoint(dir: &Path, template: &str) -> HuggingFaceTokenizer {
-    fs::write(dir.join("tokenizer.json"), TOKENIZER_JSON).unwrap();
+    checkpoint_of(dir, TOKENIZER_JSON, template)
+}
+
+/// [`TOKENIZER_JSON`] with one more added token, `content`, that is not
+/// special.
+fn with_added_token(content: &str) -> String {
+    let flags = r#""single_word": false, "lstrip": false, "rstrip": false, "normalized": false"#;
+    let conversion = TOKENIZER_JSON
+        .replace(
+            r#""special": true}],"#,
+            &format!(
+                r#""special": true}},
+        {{"id": 19, "content": "{content}", {flags}, "special": false}}],"#
+            ),
+        )
+        .replace(r#"">": 18}"#, &format!(r#"">": 18, "{content}": 19}}"#));
+    assert!(conversion.contains(r#""id": 19"#) && conversion.contains(r#"": 19}"#));
+    conversion
+}
+
+/// `conversion` with `flag` set on the entry of its added token `content`.
+fn with_flag(conversion: &str, content: &str, flag: &str) -> String {
+    let entry = format!(
+        r#""content": "{content}", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false"#
+    );
+    let flagged = entry.replace(
+        &format!(r#""{flag}": false"#),
+        &format!(r#""{flag}": true"#),
+    );
+    assert!(conversion.contains(&entry) && flagged != entry);
+    conversion.replace(&entry, &flagged)
+}
+
+/// [`checkpoint`] over `conversion`, a tokenizer file.
+fn checkpoint_of(dir: &Path, conversion: &str, template: &str) -> HuggingFaceTokenizer {
+    fs::write(dir.join("tokenizer.json"), conversion).unwrap();
     fs::write(dir.join("chat_template.jinja"), template).unwrap();
     fs::write(
         dir.join("tokenizer_config.json"),
@@ -216,6 +251,130 @@ fn a_template_that_spells_a_control_whole_is_left_as_it_was() {
         let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
         assert!(from_text);
         assert_eq!(ids, TYPED_AS_THE_CONTROL);
+    }
+}
+
+#[test]
+fn a_control_that_a_longer_added_token_holds_leaves_the_template_as_it_was() {
+    // The flat encode takes the added tokens leftmost and longest. Where the
+    // text beside a control the template writes completes a longer added
+    // token, that token is read; between marks the control would be. So a
+    // token that begins with one of the template's controls and goes on,
+    // that ends with one, that holds one, or that ends inside one leaves the
+    // template as it was, and no matcher is built to tell: the prompt reads
+    // as the flat encode reads it, the longer token (19) where the text
+    // completes it.
+    for (content, flat) in [
+        ("[/INST:x]a", vec![2, 13, 3, 14, 19, 14, 1]),
+        ("b[/INST:x]", vec![2, 13, 3, 19, 13, 14, 1]),
+        ("b[/INST:x]a", vec![2, 13, 3, 19, 14, 1]),
+        ("b[/INST", vec![2, 13, 3, 19, 10, 11, 12, 13, 14, 1]),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint_of(temp.path(), &with_added_token(content), &builds());
+        assert!(!tok.chat_template.marked(), "{content}");
+        assert!(tok.core.added.get().is_none(), "{content}");
+        let (text, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+        assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>");
+        assert!(from_text, "{content}");
+        assert_eq!(ids, flat, "{content}");
+    }
+    // A token that stands inside a control, that is its beginning, or that
+    // begins inside it never takes its place: the control starts first, or
+    // is the longer. Those templates are marked.
+    for content in ["T:x", "[/INST:", ":x]a"] {
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint_of(temp.path(), &with_added_token(content), &builds());
+        assert!(tok.chat_template.marked(), "{content}");
+        let (_, ids, from_text) = render(&tok, json!("a[INST:x]b"));
+        assert!(!from_text, "{content}");
+        assert_eq!(
+            ids,
+            [2, 13, 4, 6, 7, 8, 9, 10, 11, 12, 14, 3, 13, 14, 1],
+            "{content}"
+        );
+    }
+    // The same for a special token the template writes by the name a render
+    // gives it: no statement binds the end token here.
+    let constants = "{% set suffix = ':x' %}{% set open = '[INST{}]'.format(suffix) %}\
+        {% set close = '[/INST{}]'.format(suffix) %}";
+    let by_name = template(constants, "{{ open }}", "{{ close }}", "{{ eos_token }}");
+    for (content, marked) in [("</s:x>a", false), ("s:x", true)] {
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint_of(temp.path(), &with_added_token(content), &by_name);
+        assert_eq!(tok.chat_template.marked(), marked, "{content}");
+    }
+}
+
+#[test]
+fn a_control_whose_entry_carries_a_flag_leaves_the_template_as_it_was() {
+    // The closing token takes the whitespace behind it or before it, matches
+    // only as a whole word, or is matched after normalization: the flat
+    // encode reads more than its characters there, or none of them, or
+    // reads it in a later pass, and between marks it would be read as
+    // itself. The template is left as it was.
+    for flag in ["rstrip", "lstrip", "single_word", "normalized"] {
+        let temp = TempDir::new().unwrap();
+        let conversion = with_flag(TOKENIZER_JSON, "[/INST:x]", flag);
+        let tok = checkpoint_of(temp.path(), &conversion, &builds());
+        assert!(!tok.chat_template.marked(), "{flag}");
+        assert!(tok.core.added.get().is_none(), "{flag}");
+        let (text, ids, from_text) = render(&tok, json!("a[INST:x]b"));
+        assert!(from_text, "{flag}");
+        let flat = tok.encode(&text, false).unwrap().into_token_ids();
+        assert_eq!(ids, flat, "{flag}");
+    }
+}
+
+#[test]
+fn a_control_matched_after_a_lowering_normalizer_leaves_the_template_as_it_was() {
+    // The file lowers the text, and the opening token is matched after
+    // normalization: the flat encode reads it wherever the lowered text
+    // holds its lowered spelling, and between marks only the spelling as it
+    // stands would be read. The template is left as it was, and the prompt
+    // reads as the flat encode reads it.
+    let lowers = TOKENIZER_JSON.replace(
+        r#""normalizer": null"#,
+        r#""normalizer": {"type": "Lowercase"}"#,
+    );
+    assert_ne!(lowers, TOKENIZER_JSON);
+    let temp = TempDir::new().unwrap();
+    let conversion = with_flag(&lowers, "[INST:x]", "normalized");
+    let tok = checkpoint_of(temp.path(), &conversion, &builds());
+    assert!(!tok.chat_template.marked());
+    assert!(tok.core.added.get().is_none());
+    let (text, ids, from_text) = render(&tok, json!("a[inst:x]b"));
+    assert_eq!(text, "[INST:x]a[inst:x]b[/INST:x]ab</s:x>");
+    assert!(from_text);
+    assert_eq!(ids, [2, 13, 2, 14, 3, 13, 14, 1]);
+}
+
+#[test]
+fn a_token_that_begins_inside_a_normalized_control_leaves_the_template_as_it_was() {
+    // The closing token is matched after normalization, and an added token
+    // that is matched as it stands begins inside it. The flat encode takes
+    // the tokens matched as they stand first, so where the text behind the
+    // closing token completes that one (19), it is read; between marks the
+    // closing token would be. The template is left as it was, and what it
+    // writes reads the same whatever the request holds.
+    let conversion = with_flag(&with_added_token("x]b"), "[/INST:x]", "normalized");
+    let source = format!(
+        "{}{{% if flat %}}{{{{ close ~ 'b' }}}}{{% endif %}}",
+        builds()
+    );
+    let temp = TempDir::new().unwrap();
+    let tok = checkpoint_of(temp.path(), &conversion, &source);
+    assert!(!tok.chat_template.marked());
+    let flat = HashMap::from([("flat".to_owned(), json!(true))]);
+    for content in ["a[INST:x]b", "ab"] {
+        let params = ChatTemplateParams {
+            template_kwargs: Some(&flat),
+            ..ChatTemplateParams::default()
+        };
+        let (text, ids, from_text) = render_under(&tok, json!(content), params);
+        assert!(from_text, "{content}");
+        assert!(text.ends_with("</s:x>[/INST:x]b"), "{content}");
+        assert!(ids.ends_with(&[1, 4, 5, 6, 7, 8, 9, 10, 19]), "{content}");
     }
 }
 

@@ -656,6 +656,9 @@ impl TiktokenTokenizer {
                     .get(text)
                     .is_some_and(|id| added_texts.get(id).is_some_and(|added| added == text))
             },
+            // This file's reader takes an added token as it stands: no flag
+            // of an entry counts.
+            || added_texts.values().map(|text| (text.as_str(), false)),
             || {
                 matcher
                     .get_or_init(|| {
@@ -2620,9 +2623,19 @@ mod tests {
     /// merge, so the direct encoder takes the file, and three added tokens
     /// that end in one suffix.
     fn suffixed_controls_dir(template: &str, model_config: Option<&str>) -> tempfile::TempDir {
+        suffixed_controls_dir_with(template, model_config, None)
+    }
+
+    /// [`suffixed_controls_dir`] with one more added token, `longer`, when
+    /// one is given.
+    fn suffixed_controls_dir_with(
+        template: &str,
+        model_config: Option<&str>,
+        longer: Option<&str>,
+    ) -> tempfile::TempDir {
         let mut model = full_byte_tiktoken_model();
         model.push_str(&format!("{} 256\n", STANDARD.encode([0xE4, 0xB8])));
-        let config = serde_json::json!({
+        let mut config = serde_json::json!({
             "added_tokens_decoder": {
                 "300": {"content": "</s:x>", "special": true},
                 "301": {"content": "[INST:x]", "special": true},
@@ -2631,6 +2644,10 @@ mod tests {
             "eos_token": "</s:x>",
             "chat_template": template,
         });
+        if let Some(content) = longer {
+            config["added_tokens_decoder"]["303"] =
+                serde_json::json!({"content": content, "special": false});
+        }
         write_tiktoken_dir(&model, &config.to_string(), model_config)
     }
 
@@ -2728,6 +2745,20 @@ mod tests {
         assert!(matches!(tokenizer.renderer, Renderer::KimiK25Tools));
         assert!(tokenizer.controls.is_none());
         assert!(typed_turn_ids(&tokenizer).1);
+    }
+
+    /// Where a longer added token begins with a control the template builds,
+    /// or ends inside one, the template is left as it was (see
+    /// `ChatTemplateState::mark_built_controls`); a token that stands inside
+    /// a control changes nothing.
+    #[test]
+    fn a_tiktoken_file_s_control_that_a_longer_added_token_holds_leaves_the_template_as_it_was() {
+        for (longer, marked) in [("[/INST:x]a", false), ("b[/INST", false), ("T:x", true)] {
+            let dir = suffixed_controls_dir_with(&builds_its_controls(), None, Some(longer));
+            let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+            assert_eq!(tokenizer.controls.is_some(), marked, "{longer}");
+            assert_eq!(typed_turn_ids(&tokenizer).1, !marked, "{longer}");
+        }
     }
 
     /// A template set later is judged as the checkpoint's own was at load.

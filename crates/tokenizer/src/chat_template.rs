@@ -2422,6 +2422,52 @@ fn with_marked_literals(source: &str, bindings: &[ControlBinding]) -> Option<Str
     Some(marked)
 }
 
+/// Whether the flat encode may read one of `spellings`, where a text holds
+/// it, otherwise than alone and as it stands. `added` is every added token
+/// of the vocabulary, each with whether its entry carries a flag: it takes
+/// the whitespace beside it, it matches only as a whole word, or it is
+/// matched after normalization.
+///
+/// Between marks a spelling is read as its own token. The flat encode takes
+/// the added tokens leftmost and longest, each under its flags: first the
+/// ones matched as they stand, then, in what is left between them, the
+/// ones matched after normalization. So a flagged spelling is more than
+/// its characters there, or none of them, or it is read only in the second
+/// pass, behind every token of the first and wherever the text normalizes
+/// to it; and a token that holds a spelling, or that ends inside one, takes
+/// the spelling's place where the text beside it completes that token. A
+/// token that stands inside a spelling without a flag, or that begins
+/// inside one, never does: the spelling starts first, or is the longer.
+fn contested<'a>(spellings: &[&str], mut added: impl Iterator<Item = (&'a str, bool)>) -> bool {
+    // The bytes a spelling begins with: a token meets a spelling only there.
+    let mut begins = [false; 256];
+    for spelling in spellings {
+        if let Some(&first) = spelling.as_bytes().first() {
+            begins[usize::from(first)] = true;
+        }
+    }
+    added.any(|(token, flagged)| {
+        if flagged && spellings.contains(&token) {
+            return true;
+        }
+        let token = token.as_bytes();
+        token.iter().enumerate().any(|(at, &byte)| {
+            begins[usize::from(byte)]
+                && spellings.iter().any(|spelling| {
+                    let (spelling, rest) = (spelling.as_bytes(), &token[at..]);
+                    if at == 0 {
+                        // The token begins with the spelling and goes on.
+                        rest.len() > spelling.len() && rest.starts_with(spelling)
+                    } else {
+                        // The token holds the spelling further in, or ends
+                        // inside it.
+                        rest.starts_with(spelling) || spelling.starts_with(rest)
+                    }
+                })
+        })
+    })
+}
+
 /// The names a render gives the four special tokens a template reads
 /// ([`RENDER_CONTEXT_NAMES`]). No template reads any other special token of
 /// the vocabulary.
@@ -4235,37 +4281,78 @@ impl ChatTemplateState {
     /// added tokens, is asked for only once a template binds a control
     /// spelling its source does not hold, so a checkpoint without one never
     /// builds it.
+    ///
+    /// Before that the vocabulary is read once: `added` is every added
+    /// token, with whether its entry carries a flag. Where the flat encode
+    /// may read a spelling that would stand between marks otherwise than
+    /// alone and as it stands ([`contested`]), the templates stay as they
+    /// are: a prompt with the marks would read that spelling as its own
+    /// token everywhere.
     /// Returns whether the templates are now marked.
-    pub(crate) fn mark_built_controls<'a>(
+    pub(crate) fn mark_built_controls<'a, 'b, I>(
         &mut self,
         is_control: &dyn Fn(&str) -> bool,
+        added: impl FnOnce() -> I,
         controls: impl FnOnce() -> Option<&'a AddedTokens>,
         special_tokens: &SpecialTokens,
-    ) -> bool {
-        let bindings = self.control_bindings(is_control, special_tokens);
-        if bindings.is_empty() {
+    ) -> bool
+    where
+        I: Iterator<Item = (&'b str, bool)>,
+    {
+        let own = self.control_bindings(is_control, special_tokens);
+        if own.is_empty() {
+            return false;
+        }
+        let nested: Vec<_> = [&self.tool_use, &self.processor]
+            .into_iter()
+            .flatten()
+            .map(|state| state.control_bindings(is_control, special_tokens))
+            .collect();
+        // Every spelling that would stand between marks: what the templates
+        // bind, and the special tokens a render gives by name.
+        let named = [
+            &special_tokens.bos_token,
+            &special_tokens.eos_token,
+            &special_tokens.unk_token,
+            &special_tokens.pad_token,
+        ];
+        let spellings: Vec<&str> = own
+            .iter()
+            .chain(nested.iter().flatten())
+            .map(|binding| binding.spelling.as_str())
+            .chain(named.into_iter().flatten().map(String::as_str))
+            .filter(|spelling| !spelling.is_empty())
+            .collect();
+        if contested(&spellings, added()) {
+            tracing::debug!(
+                "the chat template binds control spellings and stays unmarked: the flat encode \
+                 may read one of them otherwise than alone"
+            );
             return false;
         }
         let Some(controls) = controls() else {
             return false;
         };
-        let Some(own) = self.built_controls_marked(&bindings, controls, special_tokens) else {
+        let Some(own) = self.built_controls_marked(&own, controls, special_tokens) else {
             return false;
         };
-        let mut nested = Vec::new();
-        for state in [&self.tool_use, &self.processor].into_iter().flatten() {
-            let bindings = state.control_bindings(is_control, special_tokens);
-            let Some(env) = state.built_controls_marked(&bindings, controls, special_tokens) else {
+        let mut envs = Vec::new();
+        for (state, bindings) in [&self.tool_use, &self.processor]
+            .into_iter()
+            .flatten()
+            .zip(&nested)
+        {
+            let Some(env) = state.built_controls_marked(bindings, controls, special_tokens) else {
                 return false;
             };
-            nested.push(env);
+            envs.push(env);
         }
         self.env = Some(own);
         self.marked = true;
         for (state, env) in [&mut self.tool_use, &mut self.processor]
             .into_iter()
             .flatten()
-            .zip(nested)
+            .zip(envs)
         {
             state.env = Some(env);
             state.marked = true;
