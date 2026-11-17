@@ -75,3 +75,15 @@ pub(crate) fn warn_detokenize_recoveries(
         );
     }
 }
+
+/// `refusal` marked [`ReportedRefusal`](crate::middleware::ReportedRefusal),
+/// for the stage that wrote the refusal's line itself: one WARN with the
+/// cause, for an answer in the client's class, so the pipeline's stage line
+/// and the access log's response line for it stay at DEBUG. A failure in the
+/// server's class is not marked and keeps its ERROR lines.
+pub(crate) fn reported(mut refusal: axum::response::Response) -> axum::response::Response {
+    refusal
+        .extensions_mut()
+        .insert(crate::middleware::ReportedRefusal);
+    refusal
+}

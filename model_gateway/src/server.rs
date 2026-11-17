@@ -59,10 +59,11 @@ mod rate_limit_document;
 pub(crate) mod tls;
 
 // The HTTP client constructors and the process crypto provider they install
-// first live beside the private-key-file check in `tls`; callers read them as
-// `server::http_client()` and its siblings.
-pub use tls::{blocking_http_client, http_client, http_client_builder, install_crypto_provider};
-
+// first live in the worker tree, which builds the worker-directed clients
+// with them; callers read them as `server::http_client()` and its siblings.
+pub use crate::worker::connection::client_factory::{
+    blocking_http_client, http_client, http_client_builder, install_crypto_provider,
+};
 use crate::{
     admin::{
         json::AdminJson,
@@ -108,7 +109,7 @@ use crate::{
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
-        health::manager::{WorkerManager, WorkerManagerConfig},
+        health::manager::{WorkerJobs, WorkerManager, WorkerManagerConfig},
         identity::endpoint::Endpoint,
         ConnectionMode,
     },
@@ -255,6 +256,9 @@ async fn v1_chat_completions(
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     let model = body.model.clone();
+    // One allocation holds the parsed request from here on: the router
+    // layers below move its pointer, not the 1 KiB request.
+    let body = Arc::new(body);
     cancel
         .guard(
             state
@@ -2442,7 +2446,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             default_check_interval_secs: config.router_config.health_check.check_interval_secs,
             remove_unhealthy: config.router_config.unhealthy_removal_scope(),
         },
-        app_context.worker_job_queue.get().cloned(),
+        app_context
+            .worker_job_queue
+            .get()
+            .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>),
         !config.router_config.health_check.disable_health_check,
         config.router_config.connection_mode == ConnectionMode::Zmq,
     );

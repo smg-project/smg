@@ -450,7 +450,7 @@ impl AppContextBuilder {
         // constructor that builds the policy registry itself configures them
         // before that build (`from_config` and the test harness do).
         // This call covers a context assembled without such a constructor.
-        liveness::configure_from(&router_config);
+        liveness::configure_from(router_config.worker_liveness_budgets());
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
 
@@ -547,7 +547,9 @@ impl AppContextBuilder {
             router_config.clone(),
         ));
 
-        let worker_client_cache = Arc::new(WorkerHttpClientCache::new(&router_config));
+        let worker_client_cache = Arc::new(WorkerHttpClientCache::new(
+            router_config.worker_http_client_settings(),
+        ));
         let gateway_auth = AuthConfig::with_tenant_keys(
             router_config.api_key.clone(),
             &router_config.tenant_api_keys,
@@ -626,7 +628,7 @@ impl AppContextBuilder {
         // The configuration's liveness budgets take effect before the policy
         // registry is built below (the first call wins; `build` keeps its
         // call for a context assembled without this constructor).
-        liveness::configure_from(&router_config);
+        liveness::configure_from(router_config.worker_liveness_budgets());
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
@@ -1614,7 +1616,9 @@ pub(crate) mod testing {
             tokenizer_load_failures: Arc::default(),
             worker_loaded_tokenizers: Arc::default(),
             wasm_manager: None,
-            worker_client_cache: Arc::new(WorkerHttpClientCache::new(&router_config)),
+            worker_client_cache: Arc::new(WorkerHttpClientCache::new(
+                router_config.worker_http_client_settings(),
+            )),
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,
                 job_queue,

@@ -447,7 +447,11 @@ fn test_transform_messages_string_format_rejects_missing_modality_placeholder() 
     let error = process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
         .unwrap_err();
 
-    assert!(error.contains("missing audio placeholder"));
+    // The request's own: media for a template with no placeholder for it.
+    assert!(
+        matches!(&error, PromptError::Refused(cause) if cause.contains("missing audio placeholder")),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -2779,6 +2783,7 @@ fn process_with_derived_profile(
         media_order,
         ProviderProfile::for_model(&request.model),
     )
+    .map_err(String::from)
 }
 
 /// A tool declared without a parameter schema reaches the template with

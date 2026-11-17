@@ -47,7 +47,7 @@ impl ProcessStage for TranscriptionResponseProcessingStage {
 
         let execution_result = stage_output(ctx.response.execution_result.take(), FUNCTION)?;
 
-        let dispatch = stage_output(ctx.dispatch.as_ref(), FUNCTION)?.clone();
+        let dispatch = stage_output(ctx.dispatch.take(), FUNCTION)?;
 
         let stop_decoder = stage_output(ctx.response.stop_decoder.as_mut(), FUNCTION)?;
 

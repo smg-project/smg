@@ -600,7 +600,7 @@ fn resolve_mm_tensor_payload(
     rdma: Option<MmRdmaExport<'_>>,
 ) -> MmTensorPayload {
     use crate::observability::metrics::Metrics;
-    let log_timing = log_tokenspeed_mm_timing_enabled();
+    let log_timing = log_mm_timing_enabled();
 
     let nbytes = data.len();
     if let Some(handle) =
@@ -678,8 +678,4 @@ fn vllm_tensor_payload(
         MmTensorPayload::Shm(handle) => vllm::tensor_data::Payload::Shm(handle),
         MmTensorPayload::Remote(handle) => vllm::tensor_data::Payload::Remote(handle),
     }
-}
-
-fn log_tokenspeed_mm_timing_enabled() -> bool {
-    log_mm_timing_enabled()
 }
