@@ -19,13 +19,11 @@ use openai_protocol::worker::{RuntimeType, WorkerType};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        identity::{basic::WorkerTypeExt, endpoint::Endpoint},
-        pd::pairing::KvTransferProfile,
-        Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
-    },
+use crate::worker::{
+    identity::{basic::WorkerTypeExt, endpoint::Endpoint},
+    metrics::Metrics,
+    pd::pairing::KvTransferProfile,
+    Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
 };
 
 /// How long the probe waits for the connection: long enough for a far host,

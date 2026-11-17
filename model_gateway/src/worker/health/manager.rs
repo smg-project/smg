@@ -39,27 +39,24 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        connection::engine::NO_ENGINE_CONNECTOR,
-        health::liveness,
-        identity::{
-            basic::WorkerTypeExt,
-            endpoint::{grpc_base_url, Endpoint},
-        },
-        load::{
-            metrics_aggregator::{self, MetricPack},
-            state::LoadSnapshot,
-        },
-        registry::{
-            event::{WorkerConnected, WorkerEvent},
-            WorkerId,
-        },
-        runtime::WorkerRuntime,
-        ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
-        WorkerType,
+use crate::worker::{
+    connection::engine::NO_ENGINE_CONNECTOR,
+    health::liveness,
+    identity::{
+        basic::WorkerTypeExt,
+        endpoint::{grpc_base_url, Endpoint},
     },
+    load::{
+        metrics_aggregator::{self, MetricPack},
+        state::LoadSnapshot,
+    },
+    metrics::Metrics,
+    registry::{
+        event::{WorkerConnected, WorkerEvent},
+        WorkerId,
+    },
+    runtime::WorkerRuntime,
+    ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerRegistry, WorkerResult, WorkerType,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);

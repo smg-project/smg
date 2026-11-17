@@ -142,13 +142,11 @@ use std::{
 use openai_protocol::worker::WorkerStatus;
 use tracing::{info, warn};
 
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        identity::basic::{StallReason, COLD_PREFILL_TOKENS_PER_SEC},
-        runtime::WorkerRuntime,
-        Worker,
-    },
+use crate::worker::{
+    identity::basic::{StallReason, COLD_PREFILL_TOKENS_PER_SEC},
+    metrics::Metrics,
+    runtime::WorkerRuntime,
+    Worker,
 };
 
 const DEFAULT_STALL: Duration = Duration::from_secs(2);

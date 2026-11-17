@@ -12,7 +12,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Weak,
     },
 };
 
@@ -244,6 +244,19 @@ impl RefusedAddress {
             .expect("a socket that shares its port");
         socket
     }
+}
+
+/// A removed worker nothing holds any more: a dead witness for `retire`.
+pub fn gone(url: &str) -> Weak<dyn Worker> {
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+    Arc::downgrade(&worker)
+}
+
+/// A removed worker a handle still holds: the worker and its witness.
+pub fn held(url: &str) -> (Arc<dyn Worker>, Weak<dyn Worker>) {
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+    let witness = Arc::downgrade(&worker);
+    (worker, witness)
 }
 
 #[cfg(test)]

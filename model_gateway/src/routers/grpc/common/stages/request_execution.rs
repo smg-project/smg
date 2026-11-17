@@ -63,6 +63,7 @@ use crate::{
     worker::{
         health::liveness::{self, SideReprieve},
         identity::basic::WorkerTypeExt,
+        metrics::Metrics as WorkerMetrics,
         ConnectionModeExt, Worker,
     },
 };
@@ -1165,7 +1166,7 @@ async fn execute_single(
     let streaming = proto_request.stream();
     let worker = workers.single();
     if let Some(worker) = worker {
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
     }
     // The call's future is boxed, as the disaggregated sides' are: it is the
     // large part of the dispatch, and inlined in the pipeline's future it
@@ -1350,7 +1351,7 @@ async fn execute_embed(
     let worker = workers.single();
     let calls = requests.into_iter().map(|request| {
         if let Some(worker) = worker {
-            Metrics::record_worker_request(worker.url(), worker.model_id());
+            WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
         }
         client.embed(request)
     });
@@ -1515,7 +1516,7 @@ async fn execute_parallel_pd(
         .into_iter()
         .flatten()
     {
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
     }
     // The side is booked on its worker here, before its call is polled: a
     // servicer that sends its headers with the first message answers the

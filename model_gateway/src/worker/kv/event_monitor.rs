@@ -37,12 +37,10 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use super::index_backend::KvIndex;
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        identity::endpoint::Endpoint, load::monitor::WorkerMonitor, periodic_task::PeriodicTask,
-        registry::WorkerRegistry, ConnectionMode, Worker, UNKNOWN_MODEL_ID,
-    },
+use crate::worker::{
+    identity::endpoint::Endpoint, load::monitor::WorkerMonitor, metrics::Metrics,
+    periodic_task::PeriodicTask, registry::WorkerRegistry, ConnectionMode, Worker,
+    UNKNOWN_MODEL_ID,
 };
 
 mod admission;

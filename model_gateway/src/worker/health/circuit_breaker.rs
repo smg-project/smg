@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use smg_worker::metrics_labels;
 use tracing::info;
 
-use crate::{observability::metrics::Metrics, worker::identity::endpoint::Endpoint};
+use crate::worker::{identity::endpoint::Endpoint, metrics::Metrics};
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone, PartialEq, Eq)]

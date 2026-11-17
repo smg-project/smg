@@ -35,25 +35,23 @@ use symphony::grammar::GrammarStart;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        connection::engine::EngineConnector,
-        health::circuit_breaker::CircuitState,
-        identity::{
-            basic::{RuntimeType, WorkerType},
-            endpoint::Endpoint,
-        },
-        pd::{
-            pair_index::{PdPairIndex, PdWire},
-            pairing::PdPairingMode,
-        },
-        registry::{
-            event::{WorkerConnected, WorkerEvent},
-            hash_ring::HashRing,
-        },
-        ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
+use crate::worker::{
+    connection::engine::EngineConnector,
+    health::circuit_breaker::CircuitState,
+    identity::{
+        basic::{RuntimeType, WorkerType},
+        endpoint::Endpoint,
     },
+    metrics::Metrics,
+    pd::{
+        pair_index::{PdPairIndex, PdWire},
+        pairing::PdPairingMode,
+    },
+    registry::{
+        event::{WorkerConnected, WorkerEvent},
+        hash_ring::HashRing,
+    },
+    ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
 };
 
 pub mod event;

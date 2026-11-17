@@ -1,0 +1,630 @@
+use metrics_exporter_prometheus::{DistributionBuilder, PrometheusBuilder};
+use metrics_util::parse_quantiles;
+use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+use super::*;
+use crate::{
+    observability::{
+        metrics::{
+            test_support::{assert_metric, render_with_recorder, sorted_series},
+            DEFAULT_SUMMARY_QUANTILES,
+        },
+        worker_metrics::{WorkerSeries, WorkerSeriesRecorder},
+    },
+    worker::test_support::{gone, held},
+};
+
+/// Core engine gauges share these labels for the snapshot fixtures.
+const CORE_LABELS: [&str; 3] = ["dp_rank=\"2\"", "model=\"m\"", "worker=\"http://w:1\""];
+
+#[test]
+fn record_engine_load_sets_core_gauges_per_dp_rank() {
+    let response = WorkerLoadResponse {
+        timestamp: "t".to_string(),
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            dp_rank: 2,
+            num_running_reqs: 7,
+            num_waiting_reqs: 3,
+            token_usage: 0.5,
+            gen_throughput: 42.0,
+            cache_hit_rate: 0.25,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let rendered = render_with_recorder(|| {
+        Metrics::record_engine_load("http://w:1", "m", &response);
+    });
+
+    // The exporter renders labels in insertion order, so assert on the
+    // metric line's components rather than a fixed label ordering.
+    assert_metric(&rendered, "smg_engine_running_requests", &CORE_LABELS, "7");
+    assert_metric(&rendered, "smg_engine_waiting_requests", &CORE_LABELS, "3");
+    assert_metric(&rendered, "smg_engine_gen_throughput", &CORE_LABELS, "42");
+    // PD gauges absent when no disagg section was reported.
+    assert!(
+        !rendered.contains("smg_engine_pd_"),
+        "PD gauges must not appear without a disagg section; rendered:\n{rendered}"
+    );
+}
+
+/// The capacity behind the usage ratio is a series of its own when the
+/// engine reports it, and absent when the record carries the ratio alone.
+#[test]
+fn record_engine_load_sets_the_kv_capacity_when_the_engine_reports_it() {
+    let mut response = WorkerLoadResponse {
+        timestamp: "t".to_string(),
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            dp_rank: 2,
+            token_usage: 0.5,
+            max_total_num_tokens: 262_144,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let rendered = render_with_recorder(|| {
+        Metrics::record_engine_load("http://w:1", "m", &response);
+    });
+    assert_metric(
+        &rendered,
+        "smg_engine_kv_capacity_tokens",
+        &CORE_LABELS,
+        "262144",
+    );
+    assert_metric(&rendered, "smg_engine_token_usage", &CORE_LABELS, "0.5");
+
+    response.loads[0].max_total_num_tokens = 0;
+    let rendered = render_with_recorder(|| {
+        Metrics::record_engine_load("http://w:1", "m", &response);
+    });
+    assert!(
+        !rendered.contains("smg_engine_kv_capacity_tokens"),
+        "a record without the capacity sets no series; rendered:\n{rendered}"
+    );
+    assert_metric(&rendered, "smg_engine_token_usage", &CORE_LABELS, "0.5");
+}
+
+/// A model's block size is one gauge, set from what the gateway knows, and
+/// 0 once it knows none.
+#[test]
+fn the_kv_block_size_of_a_model_is_a_gauge() {
+    let rendered = render_with_recorder(|| {
+        Metrics::set_kv_block_size("m", 16);
+        Metrics::set_kv_block_size("m", 64);
+    });
+    assert_metric(
+        &rendered,
+        "smg_kv_block_size_tokens",
+        &["model=\"m\""],
+        "64",
+    );
+    let rendered = render_with_recorder(|| {
+        Metrics::set_kv_block_size("m", 64);
+        Metrics::set_kv_block_size("m", 0);
+    });
+    assert_metric(&rendered, "smg_kv_block_size_tokens", &["model=\"m\""], "0");
+}
+
+#[test]
+fn record_engine_load_sets_pd_gauges_when_disagg_present() {
+    let response = WorkerLoadResponse {
+        timestamp: "t".to_string(),
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            dp_rank: 0,
+            disagg_mode: Some("prefill".to_string()),
+            kv_transfer_latency_ms: Some(3.5),
+            kv_transfer_speed_gb_s: Some(12.0),
+            prefill_queue_reqs: Some(9),
+            decode_queue_reqs: Some(4),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let rendered = render_with_recorder(|| {
+        Metrics::record_engine_load("http://w:1", "m", &response);
+    });
+
+    let pd_labels = ["role=\"prefill\"", "worker=\"http://w:1\"", "dp_rank=\"0\""];
+    assert_metric(
+        &rendered,
+        "smg_engine_pd_kv_transfer_latency_ms",
+        &pd_labels,
+        "3.5",
+    );
+    assert_metric(
+        &rendered,
+        "smg_engine_pd_prefill_queue_reqs",
+        &pd_labels,
+        "9",
+    );
+    assert_metric(
+        &rendered,
+        "smg_engine_pd_decode_queue_reqs",
+        &pd_labels,
+        "4",
+    );
+}
+
+/// The `smg_engine_*` set recorded through kept handles renders exactly as
+/// it does with a key built per record: the same series with the same
+/// values, a capacity or PD series only where a load carried the figure,
+/// and a rank's own record (the pushed shape) moving that rank's values
+/// alone.
+#[test]
+fn the_engine_load_set_renders_the_same_through_kept_handles() {
+    let report = |running: i32, hit_rate: f64| WorkerLoadResponse {
+        timestamp: "t".to_string(),
+        dp_rank_count: 2,
+        loads: vec![
+            SchedulerLoadSnapshot {
+                dp_rank: 0,
+                num_running_reqs: running,
+                num_waiting_reqs: 1,
+                token_usage: 0.5,
+                gen_throughput: 42.0,
+                cache_hit_rate: hit_rate,
+                max_total_num_tokens: 262_144,
+                disagg_mode: Some("prefill".to_string()),
+                kv_transfer_latency_ms: Some(3.5),
+                prefill_queue_reqs: Some(9),
+                ..Default::default()
+            },
+            SchedulerLoadSnapshot {
+                dp_rank: 1,
+                num_running_reqs: running + 1,
+                cache_hit_rate: hit_rate,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let records = || {
+        Metrics::record_engine_load("http://w:1", "m", &report(7, 0.25));
+        Metrics::record_engine_rank_load("http://w:1", "m", &report(8, 0.75).loads[0]);
+        Metrics::record_engine_load("http://w:2", "m2", &report(1, 0.5));
+    };
+    let built = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(false));
+        records();
+        handles::reset();
+    });
+    let kept = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        records();
+        handles::reset();
+    });
+    assert_eq!(sorted_series(&kept), sorted_series(&built));
+    for expected in [
+        "smg_engine_running_requests{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 8",
+        "smg_engine_running_requests{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\"} 8",
+        "smg_engine_cache_hit_rate{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 0.75",
+        "smg_engine_cache_hit_rate{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\"} 0.25",
+        "smg_engine_kv_capacity_tokens{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 262144",
+        "smg_engine_pd_kv_transfer_latency_ms{worker=\"http://w:1\",role=\"prefill\",dp_rank=\"0\"} 3.5",
+        "smg_engine_pd_prefill_queue_reqs{worker=\"http://w:1\",role=\"prefill\",dp_rank=\"0\"} 9",
+        "smg_engine_running_requests{worker=\"http://w:2\",model=\"m2\",dp_rank=\"1\"} 2",
+    ] {
+        assert!(
+            kept.lines().any(|line| line == expected),
+            "missing {expected} in:\n{kept}"
+        );
+    }
+    assert!(
+        !kept.contains(
+            "smg_engine_kv_capacity_tokens{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\""
+        ),
+        "a rank whose loads carry no capacity has no capacity series:\n{kept}"
+    );
+    assert!(
+        !kept.contains("smg_engine_pd_kv_transfer_speed_gb_s"),
+        "a figure no load carried has no series:\n{kept}"
+    );
+}
+
+#[test]
+fn test_intern_string_returns_same_arc() {
+    let s1 = intern_string("test_model");
+    let s2 = intern_string("test_model");
+
+    // Should return the same Arc (pointer equality)
+    assert!(Arc::ptr_eq(&s1, &s2));
+    assert_eq!(&*s1, "test_model");
+}
+
+#[test]
+fn test_intern_string_different_strings() {
+    let s1 = intern_string("model_a");
+    let s2 = intern_string("model_b");
+
+    // Different strings should have different Arcs
+    assert!(!Arc::ptr_eq(&s1, &s2));
+    assert_eq!(&*s1, "model_a");
+    assert_eq!(&*s2, "model_b");
+}
+
+#[test]
+fn test_intern_string_empty() {
+    let s1 = intern_string("");
+    let s2 = intern_string("");
+
+    assert!(Arc::ptr_eq(&s1, &s2));
+    assert_eq!(&*s1, "");
+}
+
+#[test]
+fn test_interner_size_grows() {
+    let initial_size = interner_size();
+
+    // Intern some unique strings
+    let unique = format!("unique_test_string_{initial_size}");
+    intern_string(&unique);
+
+    assert!(interner_size() > initial_size);
+}
+
+/// The kept worker counters follow the worker set: a removal drops the
+/// address's series and the handles kept to them, so a write after the
+/// removal lands nowhere, and a re-registration starts the counter over
+/// instead of feeding the handle built while the address was retired.
+#[test]
+fn kept_worker_counters_follow_the_workers_registrations() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(&workers),
+    );
+    // The rendered `smg_worker_requests_total` of each worker, in order.
+    let counts = || {
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        ["http://w1", "http://w2"].map(|worker| {
+            rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with("smg_worker_requests_total{")
+                        && line.contains(&format!("worker=\"{worker}\""))
+                })
+                .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
+        })
+    };
+    handles::force_on_this_thread(Some(true));
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::record_worker_request("http://w1", "m");
+        Metrics::record_worker_request("http://w1", "m");
+        Metrics::record_worker_request("http://w2", "m");
+        assert_eq!(counts(), [Some("2".to_owned()), Some("1".to_owned())]);
+
+        workers.retire("http://w1", gone("http://w1"));
+        handles::worker_set_changed();
+        // A send racing the removal: its write is dropped, not kept.
+        Metrics::record_worker_request("http://w1", "m");
+        assert_eq!(counts(), [None, Some("1".to_owned())]);
+
+        workers.activate("http://w1");
+        handles::worker_set_changed();
+        Metrics::record_worker_request("http://w1", "m");
+        Metrics::record_worker_request("http://w1", "m");
+        Metrics::record_worker_request("http://w2", "m");
+        assert_eq!(counts(), [Some("2".to_owned()), Some("2".to_owned())]);
+    });
+    handles::reset();
+}
+
+/// With handles kept, the per-request worker gauges set the recorder's
+/// own series (the last value written shows), and a retirement drops the
+/// kept handle: a set racing the removal feeds nothing, a re-registration
+/// gets a fresh handle.
+#[test]
+fn kept_worker_gauges_set_the_recorders_series() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(&workers),
+    );
+    workers.activate("http://w1");
+    // The rendered value of one per-worker series.
+    let value = |series: &str, worker: &str| -> Option<String> {
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("{series}{{"))
+                    && line.contains(&format!("worker=\"{worker}\""))
+            })
+            .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
+    };
+    handles::force_on_this_thread(Some(true));
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::set_worker_requests_active("http://w1", 3);
+        Metrics::set_worker_requests_active("http://w1", 2);
+        Metrics::set_worker_cb_consecutive_failures("http://w1", 1);
+        Metrics::set_worker_cb_consecutive_successes("http://w1", 4);
+        Metrics::set_worker_routing_keys_active("http://w1", 5);
+        assert_eq!(
+            value("smg_worker_requests_active", "http://w1").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            value("smg_worker_cb_consecutive_failures", "http://w1").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            value("smg_worker_cb_consecutive_successes", "http://w1").as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            value("smg_worker_routing_keys_active", "http://w1").as_deref(),
+            Some("5")
+        );
+
+        workers.retire("http://w1", gone("http://w1"));
+        handles::worker_set_changed();
+        Metrics::set_worker_requests_active("http://w1", 9);
+        assert_eq!(value("smg_worker_requests_active", "http://w1"), None);
+
+        workers.activate("http://w1");
+        handles::worker_set_changed();
+        Metrics::set_worker_requests_active("http://w1", 1);
+        assert_eq!(
+            value("smg_worker_requests_active", "http://w1").as_deref(),
+            Some("1")
+        );
+    });
+    handles::reset();
+}
+
+/// A removed worker a handle still holds keeps its address retired through
+/// the upkeep, so its late write lands nowhere; the address is forgotten
+/// once the handle is gone.
+#[test]
+fn a_held_removed_worker_keeps_its_address_retired_through_upkeep() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(&workers),
+    );
+    let listed = || {
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        rendered.lines().any(|line| {
+            line.starts_with("smg_worker_requests_total{") && line.contains("worker=\"http://w1\"")
+        })
+    };
+    handles::force_on_this_thread(Some(true));
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::record_worker_request("http://w1", "m");
+        assert!(listed());
+        let (worker, witness) = held("http://w1");
+        workers.retire("http://w1", witness);
+        handles::worker_set_changed();
+        workers.run_upkeep();
+        // A write from a handle that still holds the removed worker lands nowhere.
+        Metrics::record_worker_request("http://w1", "m");
+        assert!(!listed());
+        assert_eq!(workers.retired_len(), 1);
+        drop(worker);
+        workers.run_upkeep();
+        assert_eq!(workers.retired_len(), 0);
+    });
+    handles::reset();
+}
+
+/// The registry's registration and removal hooks are what move the
+/// worker-set generation the kept counters are checked against.
+#[test]
+fn a_registration_or_a_removal_drops_the_kept_worker_counters() {
+    let mut kept = handles::WorkerRequests::default();
+    kept.for_worker("http://w")
+        .insert(Arc::from("m"), metrics::Counter::noop());
+    Metrics::remove_worker_metrics("http://gone", gone("http://gone"));
+    assert!(kept.for_worker("http://w").is_empty(), "a removal");
+    kept.for_worker("http://w")
+        .insert(Arc::from("m"), metrics::Counter::noop());
+    Metrics::worker_registered("http://new");
+    assert!(kept.for_worker("http://w").is_empty(), "a registration");
+}
+
+/// The breaker's outcome counter is a per-worker series: through kept
+/// handles it counts on the recorder's own series, a retirement drops the
+/// kept handle (an outcome racing the removal feeds nothing), and a
+/// re-registration starts the counter over instead of feeding the handle
+/// built while the address was retired.
+#[test]
+fn kept_worker_outcome_counters_follow_the_workers_registrations() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(&workers),
+    );
+    workers.activate("http://w1");
+    // The rendered value of one worker's outcome series.
+    let value = |worker: &str, outcome: &str| -> Option<String> {
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_worker_cb_outcomes_total{")
+                    && line.contains(&format!("worker=\"{worker}\""))
+                    && line.contains(&format!("outcome=\"{outcome}\""))
+            })
+            .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
+    };
+    handles::force_on_this_thread(Some(true));
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::record_worker_cb_outcome("http://w1", "success");
+        Metrics::record_worker_cb_outcome("http://w1", "success");
+        Metrics::record_worker_cb_outcome("http://w1", "failure");
+        assert_eq!(value("http://w1", "success").as_deref(), Some("2"));
+        assert_eq!(value("http://w1", "failure").as_deref(), Some("1"));
+
+        workers.retire("http://w1", gone("http://w1"));
+        handles::worker_set_changed();
+        Metrics::record_worker_cb_outcome("http://w1", "success");
+        assert_eq!(value("http://w1", "success"), None);
+
+        workers.activate("http://w1");
+        handles::worker_set_changed();
+        Metrics::record_worker_cb_outcome("http://w1", "success");
+        assert_eq!(value("http://w1", "success").as_deref(), Some("1"));
+    });
+    handles::reset();
+}
+
+/// The KV-event set a batch moves, recorded through kept handles, renders
+/// exactly as it does with a key built per record: the same series with
+/// the same values, each worker's own.
+#[test]
+fn the_kv_event_set_renders_the_same_through_kept_handles() {
+    let records = || {
+        for worker in ["grpc://w:1", "grpc://w:2"] {
+            Metrics::record_kv_event_blocks(worker, "stored", 3);
+            Metrics::record_kv_event_blocks(worker, "stored", 2);
+            Metrics::record_kv_event_blocks(worker, "removed", 1);
+            Metrics::record_kv_event_batch(worker, "applied");
+            Metrics::record_kv_event_batch(worker, "applied");
+            Metrics::record_kv_event_batch(worker, "load_only");
+            Metrics::record_kv_event_apply(worker, 0.001);
+            Metrics::record_kv_event_lag(worker, 0.25);
+            Metrics::set_kv_index_blocks(worker, 9);
+            Metrics::set_kv_index_blocks(worker, 4);
+        }
+    };
+    let built = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(false));
+        records();
+        handles::reset();
+    });
+    let kept = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        records();
+        handles::reset();
+    });
+    assert_eq!(sorted_series(&kept), sorted_series(&built));
+    for expected in [
+        "smg_kv_event_blocks_total{worker=\"grpc://w:1\",op=\"stored\"} 5",
+        "smg_kv_event_blocks_total{worker=\"grpc://w:2\",op=\"removed\"} 1",
+        "smg_kv_event_batches_total{worker=\"grpc://w:1\",disposition=\"applied\"} 2",
+        "smg_kv_event_batches_total{worker=\"grpc://w:2\",disposition=\"load_only\"} 1",
+        "smg_kv_event_apply_seconds_count{worker=\"grpc://w:2\"} 1",
+        "smg_kv_event_lag_seconds_count{worker=\"grpc://w:1\"} 1",
+        "smg_kv_index_blocks{worker=\"grpc://w:1\"} 4",
+    ] {
+        assert!(
+            kept.lines().any(|line| line == expected),
+            "missing {expected} in:\n{kept}"
+        );
+    }
+}
+
+/// The KV-event set is per-worker series: through kept handles a batch's
+/// records land on the recorder's own series, a retirement drops the kept
+/// handles (a batch racing the removal feeds nothing), and a
+/// re-registration starts the counter over instead of feeding the handles
+/// built while the address was retired.
+#[test]
+fn kept_kv_event_handles_follow_the_workers_registrations() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(&workers),
+    );
+    workers.activate("grpc://w1");
+    // The rendered value of the worker's one series of a name.
+    let value = |name: &str| -> Option<String> {
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        rendered
+            .lines()
+            .find(|line| line.starts_with(&format!("{name}{{")))
+            .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
+    };
+    let batch = |blocks: usize| {
+        Metrics::record_kv_event_batch("grpc://w1", "applied");
+        Metrics::set_kv_index_blocks("grpc://w1", blocks);
+    };
+    handles::force_on_this_thread(Some(true));
+    metrics::with_local_recorder(&recorder, || {
+        batch(3);
+        batch(5);
+        assert_eq!(value("smg_kv_event_batches_total").as_deref(), Some("2"));
+        assert_eq!(value("smg_kv_index_blocks").as_deref(), Some("5"));
+
+        workers.retire("grpc://w1", gone("grpc://w1"));
+        handles::worker_set_changed();
+        batch(7);
+        assert_eq!(value("smg_kv_event_batches_total"), None);
+        assert_eq!(value("smg_kv_index_blocks"), None);
+
+        workers.activate("grpc://w1");
+        handles::worker_set_changed();
+        batch(2);
+        assert_eq!(value("smg_kv_event_batches_total").as_deref(), Some("1"));
+        assert_eq!(value("smg_kv_index_blocks").as_deref(), Some("2"));
+    });
+    handles::reset();
+}
+
+/// The gateway's own module reaches the model labels' set and the keeping
+/// switch through the external router crate's paths, this module through the
+/// worker crate's: one set and one switch stand behind both.
+#[test]
+#[expect(
+    unused_qualifications,
+    reason = "each path is spelled whole: that both name one set is the case"
+)]
+fn both_paths_reach_one_label_set_and_one_switch() {
+    use smg_external_router::metrics as by_router;
+    use smg_worker::metrics as by_worker;
+
+    let through_router = by_router::intern_model_label("both-paths-model");
+    let through_worker = by_worker::intern_model_label("both-paths-model");
+    assert!(Arc::ptr_eq(&through_router, &through_worker));
+
+    by_router::handles::force_on_this_thread(Some(true));
+    assert!(by_worker::handles::keep_handles());
+    by_router::handles::force_on_this_thread(Some(false));
+    assert!(!by_worker::handles::keep_handles());
+    by_router::handles::force_on_this_thread(None);
+}

@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use smg::{
-    observability::{metrics::Metrics, metrics_server::start_metrics_server},
-    worker::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
+    observability::metrics_server::start_metrics_server,
+    worker::{metrics::Metrics, BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
 };
 
 use crate::{common::test_app::scrape, metrics::recorder};

@@ -26,30 +26,27 @@ use tokio::{
 
 pub use super::metadata::WorkerMetadata;
 pub(crate) use crate::worker::runtime::COLD_PREFILL_TOKENS_PER_SEC;
+use crate::worker::{
+    connection::{
+        engine::{EngineConnection, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR},
+        engine_admin::{
+            admin_backend_client, admin_grpc_result, admin_http_post, failed, FLUSH_HTTP_TIMEOUT,
+            PROFILE_HTTP_TIMEOUT,
+        },
+        http_client::LazyHttpClient,
+    },
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    metrics::Metrics,
+    pd::pairing::PdPairing,
+    registry::event::WorkerConnected,
+    runtime::{
+        routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES, STALE_BIT,
+    },
+    CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
+};
 pub use crate::worker::{
     load::inflight::{WorkerLoadGuard, WorkerRoutingKeyLoad},
     runtime::{RoutingState, StallReason, WorkerRuntime},
-};
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        connection::{
-            engine::{EngineConnection, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR},
-            engine_admin::{
-                admin_backend_client, admin_grpc_result, admin_http_post, failed,
-                FLUSH_HTTP_TIMEOUT, PROFILE_HTTP_TIMEOUT,
-            },
-            http_client::LazyHttpClient,
-        },
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        pd::pairing::PdPairing,
-        registry::event::WorkerConnected,
-        runtime::{
-            routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES,
-            STALE_BIT,
-        },
-        CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
-    },
 };
 
 /// Connect the ZMQ backend for this worker. All connect mechanics — address
