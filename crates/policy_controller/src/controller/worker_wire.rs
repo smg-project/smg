@@ -1,15 +1,19 @@
 //! The one conversion between the store's worker rows and the contract's
 //! (design 5.2): a registration call's answer, a watch's page and the
-//! replication stream carry one row. This half takes the store's row to the
+//! replication stream carry one row. One half takes the store's row to the
 //! wire's, and a registration or a patch off the wire into the store's
-//! words; the wire's row back into the store's is the standby's half.
+//! words; the standby's half takes the leader's rows, events and snapshot
+//! back into the store's.
 //!
 //! A request field the store cannot hold is refused by its path
 //! ([`Refused`]), never dropped. So is a field past its bound, and last a
 //! row past [`ROW_BYTES`] whole: an answer's two rows and a snapshot's page
 //! then fit a frame.
 
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use prost::Message as _;
 
@@ -17,10 +21,10 @@ use crate::{
     proto::{self, worker_event::Event},
     replication::{Entry, Event as Written},
     store::{
-        HealthPolicy, LoadSample, MembershipChange, Overload, Position, Reachability, Signals,
-        WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+        Cut, GatewayId, HealthPolicy, LoadSample, LoadSource, MembershipChange, Overload, Position,
+        Reachability, Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
     },
-    view::{Role, SignalSource, WireModes, WorkerId},
+    view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
 };
 
 /// A request field the door refuses: its path in the request, and why.
@@ -461,6 +465,258 @@ pub(crate) fn replication(entry: &Entry, now: Instant) -> proto::ReplicationEven
     proto::ReplicationEvent { event }
 }
 
+const fn unknown(path: &'static str) -> Refused {
+    refused(path, "a value this build does not know")
+}
+
+/// A count the wire carries wide and the store holds narrow.
+fn narrow(value: u32, path: &'static str) -> Result<u16, Refused> {
+    u16::try_from(value).map_err(|_| refused(path, "past the store's width"))
+}
+
+/// The store's status of the wire's; `None` for a word this build does not
+/// know.
+fn told_status(status: i32) -> Option<WorkerStatus> {
+    Some(match proto::WorkerStatus::try_from(status).ok()? {
+        proto::WorkerStatus::Pending => WorkerStatus::Pending,
+        proto::WorkerStatus::Ready => WorkerStatus::Ready,
+        proto::WorkerStatus::NotReady => WorkerStatus::NotReady,
+        proto::WorkerStatus::Failed => WorkerStatus::Failed,
+        proto::WorkerStatus::Draining => WorkerStatus::Draining,
+        proto::WorkerStatus::Unspecified => return None,
+    })
+}
+
+/// The store's row of the wire's, the standby's half of [`row`]: every fact
+/// the wire's row tells, as told, the admission instant `now` less the age
+/// the row crossed with. Of a pairing descriptor the wire's row tells the
+/// bootstrap port alone. The facts it does not tell (the store's typed
+/// descriptor, the priority) stand at the store's defaults: no call states
+/// them in this build.
+///
+/// A value this build cannot hold (a status, a role or a scope it does not
+/// know, a count past the store's width) is refused by its path: a standby
+/// that guessed would hold another row than its leader's.
+pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRow, Refused> {
+    use proto::reachability::Scope;
+    let status = told_status(told.status).ok_or_else(|| unknown("row.status"))?;
+    let role = match proto::Role::try_from(told.role) {
+        Ok(proto::Role::Single) => Role::Single,
+        Ok(proto::Role::Prefill) => Role::Prefill,
+        Ok(proto::Role::Decode) => Role::Decode,
+        Ok(proto::Role::Encode) => Role::Encode,
+        Ok(proto::Role::Unspecified) | Err(_) => return Err(unknown("row.role")),
+    };
+    // A wire this build does not know is a bit `from_bits` drops.
+    let wire_modes = u8::try_from(told.wire)
+        .map(WireModes::from_bits)
+        .ok()
+        .filter(|modes| i32::from(modes.bits()) == told.wire)
+        .ok_or_else(|| unknown("row.wire"))?;
+    let reachable_from = match told.reachable.as_ref().and_then(|from| from.scope.as_ref()) {
+        Some(Scope::Any(true)) => Reachability::Any,
+        Some(Scope::GatewayId(gateway)) => u64::from_str_radix(gateway, 16)
+            .map(|gateway| Reachability::Gateway(GatewayId(gateway)))
+            .map_err(|_| unknown("row.reachable"))?,
+        Some(Scope::Any(false)) | None => return Err(unknown("row.reachable")),
+    };
+    let overload = told
+        .overload
+        .as_ref()
+        .ok_or_else(|| unknown("row.overload"))?;
+    let signals = told
+        .signals
+        .as_ref()
+        .ok_or_else(|| unknown("row.signals"))?;
+    let policy = told
+        .health_policy
+        .as_ref()
+        .ok_or_else(|| unknown("row.health_policy"))?;
+    // Of a descriptor the leader tells the bootstrap port alone ([`row`]):
+    // one that tells more is of a build this one does not follow.
+    let port = told
+        .pairing
+        .as_ref()
+        .map_or(0, |pairing| pairing.bootstrap_port);
+    let port_alone = proto::PairingDescriptor {
+        bootstrap_port: port,
+        ..Default::default()
+    };
+    if told
+        .pairing
+        .as_ref()
+        .is_some_and(|told| *told != port_alone)
+    {
+        return Err(unknown("row.pairing"));
+    }
+    let bootstrap_port = narrow(port, "row.pairing.bootstrap_port")?;
+    let facts = WorkerFacts {
+        key: told.registration_key.clone(),
+        engine: told.engine.clone(),
+        incarnation: told.incarnation,
+        role,
+        wire_modes,
+        engine_kind: told.runtime.clone(),
+        models: told.models.clone(),
+        dp_rank: narrow(told.dp_rank, "row.dp_rank")?,
+        dp_size: narrow(told.dp_size, "row.dp_size")?,
+        labels: told
+            .labels
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        zone: (!told.zone.is_empty()).then(|| told.zone.clone()),
+        max_running: (told.max_running != 0).then_some(told.max_running),
+        kv_block_size: (told.kv_block_size != 0).then_some(told.kv_block_size),
+        bootstrap_port: (bootstrap_port != 0).then_some(bootstrap_port),
+        reachable_from,
+        signals: Signals {
+            events: signals.events,
+            loads: signals.loads,
+            scrape_interval_ms: signals.scrape_interval_ms,
+        },
+        health: HealthPolicy {
+            failure_threshold: policy.failure_threshold,
+            success_threshold: policy.success_threshold,
+            check_interval_ms: policy.check_interval_ms,
+            timeout_ms: policy.timeout_ms,
+            probes: !policy.disabled,
+        },
+        overload: Overload {
+            kv_usage_permille: overload
+                .kv_usage_permille
+                .map(|permille| narrow(permille, "row.overload.kv_usage_permille"))
+                .transpose()?,
+            waiting_requests: overload.queue_limit,
+        },
+        ..WorkerFacts::default()
+    };
+    let age = Duration::from_millis(told.admitted_age_ms);
+    Ok(WorkerRow {
+        id: WorkerId(told.id),
+        facts,
+        status,
+        revision: told.revision,
+        admitted_at: now.checked_sub(age).unwrap_or(now),
+    })
+}
+
+/// A membership event of the leader's stream as a standby's store takes it
+/// ([`crate::store::MemoryStore::follow`]): the epoch, the change, and the
+/// row the write left where the event tells one. A resize crosses as a
+/// relabel; the store reads which it was from the widths.
+pub(crate) fn told_change(
+    told: &proto::WorkerEvent,
+    now: Instant,
+) -> Result<(u64, MembershipChange, Option<WorkerRow>), Refused> {
+    let (change, row) = match told.event.as_ref() {
+        Some(Event::Registered(row)) => {
+            let row = told_row(row, now)?;
+            (MembershipChange::Registered { id: row.id }, Some(row))
+        }
+        Some(Event::Relabelled(row)) => {
+            let row = told_row(row, now)?;
+            (MembershipChange::Relabelled { id: row.id }, Some(row))
+        }
+        Some(Event::Replaced(replaced)) => {
+            let (Some(old), Some(new)) = (&replaced.old, &replaced.new) else {
+                return Err(unknown("membership.replaced"));
+            };
+            let row = told_row(new, now)?;
+            let change = MembershipChange::Replaced {
+                old: WorkerId(old.id),
+                new: row.id,
+            };
+            (change, Some(row))
+        }
+        Some(Event::Removed(removed)) => {
+            let id = WorkerId(removed.worker_id);
+            (MembershipChange::Removed { id }, None)
+        }
+        Some(Event::Status(status)) => {
+            let id = WorkerId(status.worker_id);
+            let from = told_status(status.old).ok_or_else(|| unknown("membership.status.old"))?;
+            let to = told_status(status.new).ok_or_else(|| unknown("membership.status.new"))?;
+            (MembershipChange::StatusChanged { id, from, to }, None)
+        }
+        // A watch's own cases, and one this build does not know.
+        Some(Event::Snapshot(_) | Event::Needs(_) | Event::SnapshotRequired(_)) | None => {
+            return Err(unknown("membership.event"));
+        }
+    };
+    Ok((told.membership_epoch, change, row))
+}
+
+/// A load row of the leader's stream as a standby's store takes it: the
+/// worker, the rank, the row with the age it crossed with, and the source
+/// its record is written under. The row's own source is the ingress's in
+/// its narrow form: a row the stream or a relay pushed is recorded as a
+/// pushed one (the relay's name stays with its gateway), any other as its
+/// poll's or its scrape's, so the poll decision reads the leader's.
+pub(crate) fn told_load(
+    told: &proto::LoadSample,
+) -> Result<(WorkerId, u16, LoadRow, LoadSource), Refused> {
+    let row = told.load.as_ref().ok_or_else(|| unknown("load.load"))?;
+    let (source, ingress) = match proto::SignalSource::try_from(row.source) {
+        Ok(proto::SignalSource::None) => (SignalSource::None, LoadSource::Poll),
+        Ok(proto::SignalSource::Events) => (SignalSource::Events, LoadSource::Stream),
+        Ok(proto::SignalSource::Scrape) => (SignalSource::Scrape, LoadSource::Scrape),
+        Ok(proto::SignalSource::Relay) => (SignalSource::Relay, LoadSource::Stream),
+        Ok(proto::SignalSource::Poll) => (SignalSource::Poll, LoadSource::Poll),
+        Ok(proto::SignalSource::Unspecified) | Err(_) => {
+            return Err(unknown("load.load.source"));
+        }
+    };
+    let stored = LoadRow {
+        running: row.running,
+        queued: row.queued,
+        waiting_uncached_tokens: row.waiting_uncached_tokens,
+        kv_usage_permille: narrow(row.kv_usage_permille, "load.load.kv_usage_permille")?,
+        active_kv_permille: narrow(row.active_kv_permille, "load.load.active_kv_permille")?,
+        live_rate: row.live_rate,
+        resident_tokens: row.resident_tokens,
+        resident_counted: told.resident_counted,
+        report_age_ms: row.report_age_ms,
+        source,
+        max_running: row.max_running,
+    };
+    let rank = narrow(told.dp_rank, "load.dp_rank")?;
+    Ok((WorkerId(told.worker_id), rank, stored, ingress))
+}
+
+/// A complete snapshot as the cut a standby's store is restored from
+/// ([`crate::store::MemoryStore::restore_from`]): the rows and the load
+/// rows at the snapshot's place and epoch. Every instant is `now` less the
+/// age its row crossed with, the one `now` for the whole cut, so no row
+/// ages against another by the restore.
+pub(crate) fn told_cut(told: &proto::Snapshot, now: Instant) -> Result<Cut, Refused> {
+    let mut rows = Vec::with_capacity(told.workers.len());
+    for row in &told.workers {
+        rows.push(told_row(row, now)?);
+    }
+    let mut loads = Vec::with_capacity(told.loads.len());
+    for load in &told.loads {
+        let (id, rank, row, source) = told_load(load)?;
+        let age = Duration::from_millis(u64::from(row.report_age_ms));
+        let sample = LoadSample {
+            row,
+            received_at: now,
+            sampled_at: now.checked_sub(age).unwrap_or(now),
+            source,
+        };
+        loads.push((id, rank, sample));
+    }
+    Ok(Cut {
+        at: Position {
+            seq: told.replication_seq,
+            term: told.replication_term,
+        },
+        epoch: told.membership_epoch,
+        rows,
+        loads,
+    })
+}
+
 /// `value`, or `default` where the wire's zero says unset.
 const fn or_default(value: u32, default: u32) -> u32 {
     if value == 0 {
@@ -837,8 +1093,8 @@ mod tests {
 
     use super::{
         event, load, member, page, patch, refused, registration, removed, replaced, replication,
-        row, start_again, status, status_changed, Refused, KEY_BYTES, LABELS, MODELS, NAME_BYTES,
-        ROW_BYTES, URL_BYTES, VALUE_BYTES,
+        row, start_again, status, status_changed, told_change, told_cut, told_load, told_row,
+        Refused, KEY_BYTES, LABELS, MODELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
     };
     use crate::{
         proto::{self, replication_event::Event as Sent, worker_event::Event},
@@ -2256,5 +2512,279 @@ mod tests {
             left: None,
         };
         assert_eq!(replication(&Entry { at, event: untold }, now).event, None);
+    }
+
+    #[test]
+    fn the_stores_row_comes_back_from_the_wire_fact_by_fact() {
+        let stored = full();
+        let now = stored.admitted_at + Duration::from_millis(1_500);
+        let sent = proto::WorkerRow {
+            admitted_age_ms: 1_500,
+            ..row(&stored)
+        };
+        assert_eq!(told_row(&sent, now), Ok(stored));
+        // A row of the store's defaults comes back as it is.
+        let plain = WorkerRow {
+            id: identity(URL, 1),
+            facts: WorkerFacts {
+                key: URL.to_owned(),
+                ..WorkerFacts::default()
+            },
+            status: WorkerStatus::Pending,
+            revision: 1,
+            admitted_at: now,
+        };
+        assert_eq!(told_row(&row(&plain), now), Ok(plain.clone()));
+        // Each status and each role comes back as itself.
+        for status in [
+            WorkerStatus::Pending,
+            WorkerStatus::Ready,
+            WorkerStatus::NotReady,
+            WorkerStatus::Failed,
+            WorkerStatus::Draining,
+        ] {
+            let each = WorkerRow {
+                status,
+                ..plain.clone()
+            };
+            assert_eq!(told_row(&row(&each), now), Ok(each));
+        }
+        for role in [Role::Single, Role::Prefill, Role::Decode, Role::Encode] {
+            let mut each = plain.clone();
+            each.facts.role = role;
+            assert_eq!(told_row(&row(&each), now), Ok(each));
+        }
+    }
+
+    #[test]
+    fn a_row_this_build_cannot_hold_is_refused_by_its_path() {
+        type Spoil = fn(&mut proto::WorkerRow);
+        let sent = row(&full());
+        let now = Instant::now();
+        let spoiled: [(&str, Spoil); 15] = [
+            ("row.status", |row| row.status = 99),
+            ("row.status", |row| row.status = 0),
+            ("row.role", |row| row.role = 0),
+            ("row.wire", |row| row.wire = 8),
+            ("row.wire", |row| row.wire = -1),
+            ("row.reachable", |row| row.reachable = None),
+            ("row.reachable", |row| {
+                let scope = proto::reachability::Scope::Any(false);
+                row.reachable = Some(proto::Reachability { scope: Some(scope) });
+            }),
+            ("row.reachable", |row| {
+                let scope = proto::reachability::Scope::GatewayId("no number".to_owned());
+                row.reachable = Some(proto::Reachability { scope: Some(scope) });
+            }),
+            ("row.overload", |row| row.overload = None),
+            ("row.signals", |row| row.signals = None),
+            ("row.health_policy", |row| row.health_policy = None),
+            ("row.dp_rank", |row| row.dp_rank = 65_536),
+            ("row.dp_size", |row| row.dp_size = 65_536),
+            // A descriptor that tells more than the bootstrap port.
+            ("row.pairing", |row| {
+                row.pairing = Some(proto::PairingDescriptor {
+                    bootstrap_port: 8_998,
+                    version: "1".to_owned(),
+                    ..Default::default()
+                });
+            }),
+            ("row.pairing.bootstrap_port", |row| {
+                row.pairing = Some(proto::PairingDescriptor {
+                    bootstrap_port: 65_536,
+                    ..Default::default()
+                });
+            }),
+        ];
+        for (path, spoil) in spoiled {
+            let mut row = sent.clone();
+            spoil(&mut row);
+            let refused = told_row(&row, now).expect_err(path);
+            assert_eq!(refused.path, path);
+        }
+        let mut wide = sent;
+        wide.overload = Some(proto::OverloadThresholds {
+            queue_limit: None,
+            kv_usage_permille: Some(65_536),
+        });
+        let refused = told_row(&wide, now).expect_err("a permille past the width");
+        assert_eq!(refused.path, "row.overload.kv_usage_permille");
+    }
+
+    #[test]
+    fn every_membership_event_comes_back_as_the_change_the_store_follows() {
+        let old = full();
+        let new = WorkerRow {
+            id: identity(URL, 4),
+            status: WorkerStatus::Ready,
+            ..full()
+        };
+        let now = new.admitted_at;
+        let sent = |change, row: Option<&WorkerRow>, left: Option<&WorkerRow>| {
+            let entry = Entry {
+                at: Position { seq: 9, term: 4 },
+                event: Written::Member {
+                    epoch: 6,
+                    change,
+                    row: row.cloned().map(Arc::new),
+                    left: left.cloned().map(Arc::new),
+                },
+            };
+            told_change(&member(&entry).expect("a membership event"), now)
+        };
+        let registered = MembershipChange::Registered { id: new.id };
+        let relabelled = MembershipChange::Relabelled { id: new.id };
+        let resized = MembershipChange::Resized { id: new.id };
+        let replacement = MembershipChange::Replaced {
+            old: old.id,
+            new: new.id,
+        };
+        let removal = MembershipChange::Removed { id: old.id };
+        let status = MembershipChange::StatusChanged {
+            id: old.id,
+            from: WorkerStatus::Ready,
+            to: WorkerStatus::Draining,
+        };
+        let row = Some(new.clone());
+        assert_eq!(
+            sent(registered, Some(&new), None),
+            Ok((6, registered, row.clone()))
+        );
+        assert_eq!(
+            sent(relabelled, Some(&new), None),
+            Ok((6, relabelled, row.clone()))
+        );
+        // A resize crosses as a relabel: the store reads the widths.
+        assert_eq!(
+            sent(resized, Some(&new), None),
+            Ok((6, relabelled, row.clone()))
+        );
+        assert_eq!(
+            sent(replacement, Some(&new), Some(&old)),
+            Ok((6, replacement, row))
+        );
+        assert_eq!(sent(removal, None, Some(&old)), Ok((6, removal, None)));
+        assert_eq!(sent(status, Some(&old), None), Ok((6, status, None)));
+        // A watch's own cases and an event of no case are not a change.
+        for event in [
+            None,
+            Some(Event::Snapshot(proto::WorkerSnapshot::default())),
+        ] {
+            let none = proto::WorkerEvent {
+                event,
+                ..proto::WorkerEvent::default()
+            };
+            let refused = told_change(&none, now).expect_err("no change");
+            assert_eq!(refused.path, "membership.event");
+        }
+    }
+
+    #[test]
+    fn a_restored_load_row_is_as_old_as_it_crossed() {
+        let at = Instant::now();
+        let row = LoadRow {
+            running: 3,
+            queued: 2,
+            waiting_uncached_tokens: 4_096,
+            kv_usage_permille: 870,
+            active_kv_permille: 640,
+            live_rate: 12,
+            resident_tokens: 9_000,
+            resident_counted: true,
+            report_age_ms: 0,
+            source: SignalSource::Poll,
+            max_running: 64,
+        };
+        let sample = LoadSample {
+            row,
+            received_at: at,
+            sampled_at: at,
+            source: LoadSource::Poll,
+        };
+        // Sent in a snapshot 700 ms after its receipt, restored later.
+        let sent = load(WorkerId(7), 2, &sample, at + Duration::from_millis(700));
+        let snapshot = proto::Snapshot {
+            loads: vec![sent],
+            replication_seq: 9,
+            replication_term: 2,
+            ..proto::Snapshot::default()
+        };
+        let now = at + Duration::from_secs(5);
+        let cut = told_cut(&snapshot, now).expect("a cut this build holds");
+        let (id, rank, restored) = cut.loads.first().expect("the load row");
+        assert_eq!((*id, *rank), (WorkerId(7), 2));
+        // The restore is its receipt, and its age is the age it crossed
+        // with: a restored row is no fresher than its leader's.
+        assert_eq!(restored.received_at, now);
+        assert_eq!(now - restored.sampled_at, Duration::from_millis(700));
+        assert_eq!(restored.row.report_age_ms, 700);
+    }
+
+    #[test]
+    fn a_load_row_comes_back_with_its_age_and_the_source_it_is_recorded_under() {
+        let at = Instant::now();
+        let stored = |source| LoadRow {
+            running: 3,
+            queued: 2,
+            waiting_uncached_tokens: 4_096,
+            kv_usage_permille: 870,
+            active_kv_permille: 640,
+            live_rate: 12,
+            resident_tokens: 9_000,
+            resident_counted: true,
+            report_age_ms: 40,
+            source,
+            max_running: 64,
+        };
+        for (source, ingress) in [
+            (SignalSource::None, LoadSource::Poll),
+            (SignalSource::Events, LoadSource::Stream),
+            (SignalSource::Relay, LoadSource::Stream),
+            (SignalSource::Scrape, LoadSource::Scrape),
+            (SignalSource::Poll, LoadSource::Poll),
+        ] {
+            let age = Duration::from_millis(40);
+            let sample = LoadSample {
+                row: stored(source),
+                received_at: at,
+                sampled_at: at - age,
+                source: LoadSource::Stream,
+            };
+            // Sent 60 ms after its receipt: the age is the send's.
+            let sent = load(WorkerId(7), 2, &sample, at + Duration::from_millis(60));
+            let aged = LoadRow {
+                report_age_ms: 100,
+                ..stored(source)
+            };
+            assert_eq!(told_load(&sent), Ok((WorkerId(7), 2, aged, ingress)));
+        }
+        let sample = LoadSample {
+            row: stored(SignalSource::Poll),
+            received_at: at,
+            sampled_at: at,
+            source: LoadSource::Poll,
+        };
+        let sent = load(WorkerId(7), 2, &sample, at);
+        let mut unknown = sent;
+        if let Some(row) = &mut unknown.load {
+            row.source = 99;
+        }
+        assert_eq!(
+            told_load(&unknown).map_err(|refused| refused.path),
+            Err("load.load.source")
+        );
+        let rank = proto::LoadSample {
+            dp_rank: 65_536,
+            ..sent
+        };
+        assert_eq!(
+            told_load(&rank).map_err(|refused| refused.path),
+            Err("load.dp_rank")
+        );
+        let none = proto::LoadSample { load: None, ..sent };
+        assert_eq!(
+            told_load(&none).map_err(|refused| refused.path),
+            Err("load.load")
+        );
     }
 }

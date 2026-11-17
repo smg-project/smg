@@ -60,6 +60,7 @@ use super::{
     principal::{self, Layer, Principal},
     replication::{Batches, Replication},
     session,
+    standby::{self, Lag},
     watch_workers::{self, Feed, Source, Watchers, Watching},
     wire, PROTOCOL_VERSION,
 };
@@ -182,6 +183,12 @@ pub(crate) struct Shared {
     /// A gateway's term floor above this replica's term, on its way to the
     /// election.
     pub(crate) floors: Floors,
+    /// How far behind its leader this replica is while it follows one: the
+    /// standby loop writes it.
+    pub(crate) lag: Arc<Lag>,
+    /// The lag a standby reads synced under, the first of the three counts
+    /// of design 5.4: set where the configuration is known.
+    pub(crate) synced_within: Duration,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -248,6 +255,8 @@ impl Shared {
                 Arc::clone(&feed.log),
                 elector.fence(),
             ),
+            lag: Arc::new(Lag::new()),
+            synced_within: standby::synced_within(Duration::ZERO),
             store,
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
@@ -593,15 +602,23 @@ impl Service {
             term,
             is_leader,
         } = shared.leader(shared.fence.leader_term(now));
+        // A replica that follows says how far behind it is, by the age of
+        // its stream's last applied frame; a leader follows nobody.
+        // `synced` reads that lag alone: the live ranks and the generation
+        // narrow the same bit with their steps.
+        let lag = shared.lag.age(now).filter(|_| !is_leader);
         proto::LeaderInfo {
             controller_id,
             address,
             term,
             is_leader,
-            // The sync state is a standby's and arrives with it; one lease
-            // covers every model until a lease per model group exists.
-            synced: false,
-            sync: None,
+            synced: lag.is_some_and(|lag| lag < shared.synced_within),
+            sync: lag.map(|lag| proto::SyncState {
+                replication_lag_ms: u32::try_from(lag.as_millis()).unwrap_or(u32::MAX),
+                ..proto::SyncState::default()
+            }),
+            // One lease covers every model until a lease per model group
+            // exists.
             groups: Vec::new(),
             protocol_min: PROTOCOL_VERSION,
             protocol_max: PROTOCOL_VERSION,
@@ -2125,6 +2142,29 @@ mod tests {
             looked: false,
         });
         assert_eq!(service.leader_info(now), answer("", "", 5, false));
+    }
+
+    #[test]
+    fn a_follower_says_its_lag_and_reads_synced_under_the_bound() {
+        let (_elector, standing, service) = service(&[Scope::Replication]);
+        standing.send_replace(saw("controller-1@10.0.0.8:30100", 4));
+        let at = Instant::now();
+        // No frame applied yet: no sync state.
+        let info = service.leader_info(at);
+        assert!(!info.is_leader && !info.synced && info.sync.is_none());
+        service.shared.lag.applied(at);
+        // The lag holds the frame's instant at a whole microsecond: read
+        // from that instant, the bound is met to the nanosecond.
+        let at = at - service.shared.lag.age(at).expect("a frame applied");
+        let within = service.shared.synced_within;
+        let lag = |info: &proto::LeaderInfo| info.sync.map(|sync| sync.replication_lag_ms);
+        let under = service.leader_info(at + within - Duration::from_millis(1));
+        assert!(under.synced);
+        assert_eq!(lag(&under), u32::try_from(within.as_millis() - 1).ok());
+        // The bound itself is not under it.
+        let at_it = service.leader_info(at + within);
+        assert!(!at_it.synced);
+        assert_eq!(lag(&at_it), u32::try_from(within.as_millis()).ok());
     }
 
     #[tokio::test]

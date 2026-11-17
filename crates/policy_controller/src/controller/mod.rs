@@ -49,6 +49,7 @@ mod service;
 mod session;
 mod spec_file;
 mod spec_store;
+mod standby;
 pub mod tls;
 mod watch_workers;
 mod wire;
@@ -89,6 +90,7 @@ use self::{
     service::{Service, Shared},
     spec_file::SpecFile,
     spec_store::SpecStore,
+    standby::Standby,
 };
 use crate::{
     catalog::Catalog,
@@ -425,7 +427,7 @@ impl Controller {
         let (standing, stood) = watch::channel(Standing::default());
         let (phase, readiness) = readiness::channel(elector.fence(), stood.clone());
         let journal = replication::journaled(&config.election.lease);
-        let shared = Shared::new(
+        let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
             &elector,
@@ -435,6 +437,7 @@ impl Controller {
             config.decide_shards,
         )
         .map_err(Error::Deciders)?;
+        shared.synced_within = standby::synced_within(config.load_poll_interval);
         let shared = Arc::new(shared);
         let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
         Ok(Self {
@@ -469,6 +472,15 @@ impl Controller {
                 .collect(),
             admin: self.admin_addr,
         }
+    }
+
+    /// Where this replica dials the leader it follows, or why it follows
+    /// none: read once the listeners' layers stand, at the serve's start.
+    fn follows(&self) -> Result<u16, NoFollow> {
+        if !self.config.election.lease.is_shared() {
+            return Err(NoFollow::Lease);
+        }
+        following(&self.listeners)
     }
 
     /// Names `listener` one that takes its callers' identities as told
@@ -659,6 +671,7 @@ impl Controller {
         shutdown: impl Future<Output = ()>,
         fault: impl Future<Output = Error>,
     ) -> Result<(), Error> {
+        let follows = self.follows();
         let Self {
             config,
             phase,
@@ -677,6 +690,22 @@ impl Controller {
         // The listeners' close is one word, and an open decide stream hears
         // it too: the word is `Shared`'s.
         let stop = shared.stop.clone();
+        // A replica under a shared lease follows its leader where it can,
+        // and says once why it cannot: it then behaves as before a standby
+        // existed.
+        let follows = match follows {
+            Ok(port) => Some(port),
+            // Nobody else leads under a lease of the replica's own.
+            Err(NoFollow::Lease) => None,
+            Err(why) => {
+                info!(
+                    controller_id = %config.controller_id,
+                    why = why.as_str(),
+                    "this replica follows no leader"
+                );
+                None
+            }
+        };
         let mut tasks: JoinSet<Result<(), Error>> = JoinSet::new();
         let mut reporters = Vec::with_capacity(listeners.len());
         // The reporters of the listeners whose door a caller can pass: the
@@ -730,10 +759,32 @@ impl Controller {
         ));
         let loads = driver.stats();
         let driver_stop = stop.subscribe();
+        // A replica that follows polls no engine: its applier is the load
+        // table's one writer then, and a poll's row between two of the
+        // leader's would take the place of the log the leader's next event
+        // needs. The loop itself runs on every replica: it pays the store's
+        // publications, so a followed row reaches the published world.
+        let polls = follows.map(|_| shared.role.subscribe());
         tasks.spawn(async move {
-            driver.run(driver_stop).await;
+            match polls {
+                Some(polls) => driver.run_while(driver_stop, polls).await,
+                None => driver.run(driver_stop).await,
+            }
             Ok(())
         });
+        if let Some(port) = follows {
+            info!(
+                controller_id = %config.controller_id,
+                port,
+                "this replica follows its leader while it does not lead"
+            );
+            let standby = Standby::new(Arc::clone(&shared), port);
+            let standby_stop = stop.subscribe();
+            tasks.spawn(async move {
+                standby.run(standby_stop).await;
+                Ok(())
+            });
+        }
         // The presence sweep: what a gateway held is let go once its grace
         // period ended with no new `Hello`.
         let gateways = Arc::clone(&shared.gateways);
@@ -958,6 +1009,55 @@ async fn tell_role(
     }
 }
 
+/// Why a replica follows no leader.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoFollow {
+    /// The lease is the replica's own: nobody else leads under it.
+    Lease,
+    /// No listener serves the replication scope.
+    Listener,
+    /// The replication listener places no principal: a leader's would
+    /// refuse every standby.
+    Principal,
+    /// The replication listener serves TLS: a standby's dial has no
+    /// credential yet.
+    Tls,
+}
+
+impl NoFollow {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lease => "the lease is this replica's own",
+            Self::Listener => "no listener serves the replication scope",
+            Self::Principal => "the replication listener places no principal",
+            Self::Tls => {
+                "the replication listener serves TLS, and a standby's dial has no credential yet"
+            }
+        }
+    }
+}
+
+/// The port a standby dials its leader at, on the leader's own host: the
+/// port of this replica's listener that serves the replication scope to a
+/// stated principal in the clear, since replicas are configured alike. Or
+/// why the replica follows no leader, by its last replication listener.
+fn following(listeners: &[Bound]) -> Result<u16, NoFollow> {
+    let mut why = NoFollow::Listener;
+    for bound in listeners {
+        if !bound.scopes.contains(&Scope::Replication) {
+            continue;
+        }
+        if bound.layer == Layer::Off {
+            why = NoFollow::Principal;
+        } else if bound.tls {
+            why = NoFollow::Tls;
+        } else {
+            return Ok(bound.addr.port());
+        }
+    }
+    Err(why)
+}
+
 #[cfg(test)]
 mod tests {
     //! What no case outside the module reaches: a serve whose election
@@ -978,14 +1078,19 @@ mod tests {
         task::JoinSet,
         time::timeout,
     };
-    use tonic::codegen::tokio_stream::StreamExt as _;
+    use tonic::{
+        codegen::tokio_stream::StreamExt as _,
+        transport::{server::TcpIncoming, Server},
+    };
 
     use super::{
         config::tests::valid,
         deciders::{tests as bed, TERM_MARK},
-        election::Standing,
+        election::{self, Standing},
+        following,
+        principal::Layer,
         readiness::{self, Phase},
-        tell_role, Controller, Error,
+        tell_role, Bound, Controller, Error, NoFollow, Scope,
     };
     use crate::{
         elector::{
@@ -1542,5 +1647,77 @@ mod tests {
         assert!(serve.elector.release().expect("a release"));
         serve.steps.send_replace(Standing::default());
         serve.hears("the lead's loss").await;
+    }
+
+    /// A listener as the follow rule reads it: its scopes, its layer and
+    /// whether it serves TLS.
+    type Door<'a> = (&'a [Scope], Layer, bool);
+
+    /// The follow rule over these listeners, each bound on a port of its
+    /// own: the ports, and the rule's answer.
+    async fn followed(doors: &[Door<'_>]) -> (Vec<u16>, Result<u16, NoFollow>) {
+        let mut listeners = Vec::new();
+        for &(scopes, layer, tls) in doors {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+            listeners.push(Bound {
+                name: "listener".to_owned(),
+                scopes: scopes.to_vec(),
+                addr: listener.local_addr().expect("its address"),
+                listener: TcpIncoming::from(listener),
+                server: Server::builder(),
+                tls,
+                mutual: false,
+                layer,
+            });
+        }
+        let ports = listeners.iter().map(|bound| bound.addr.port()).collect();
+        (ports, following(&listeners))
+    }
+
+    #[tokio::test]
+    async fn a_replica_follows_at_its_replication_listener_that_takes_a_name_in_the_clear() {
+        let gateway: Door<'_> = (&[Scope::Gateway, Scope::Control], Layer::AsTold, false);
+        let unnamed: Door<'_> = (&[Scope::Replication], Layer::Off, false);
+        let sealed: Door<'_> = (&[Scope::Replication], Layer::AsTold, true);
+        let open: Door<'_> = (&[Scope::Control, Scope::Replication], Layer::AsTold, false);
+        // Each reason, by the replication listener that gives it.
+        assert_eq!(followed(&[]).await.1, Err(NoFollow::Listener));
+        assert_eq!(followed(&[gateway]).await.1, Err(NoFollow::Listener));
+        assert_eq!(
+            followed(&[gateway, unnamed]).await.1,
+            Err(NoFollow::Principal)
+        );
+        assert_eq!(followed(&[gateway, sealed]).await.1, Err(NoFollow::Tls));
+        // The listener a standby can dial, past those it cannot.
+        let (ports, port) = followed(&[gateway, unnamed, sealed, open]).await;
+        assert_eq!(port.ok(), ports.last().copied());
+    }
+
+    #[tokio::test]
+    async fn a_replica_follows_under_a_shared_lease_alone_and_is_synced_within_its_poll_interval() {
+        // A lease of its own: nobody to follow, whatever its listeners.
+        let mut alone = Controller::bind(valid()).await.expect("the listeners bind");
+        alone
+            .identity_as_told("replication")
+            .expect("a listener of the configuration");
+        assert_eq!(alone.follows(), Err(NoFollow::Lease));
+        // A shared lease: the replication listener's port, once it takes
+        // its callers' names.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut config = valid();
+        config.election.lease = election::LeasePlace::File(dir.path().join("lease"));
+        config.load_poll_interval = Duration::from_secs(30);
+        let mut replica = Controller::bind(config).await.expect("the listeners bind");
+        assert_eq!(replica.follows(), Err(NoFollow::Principal));
+        replica
+            .identity_as_told("replication")
+            .expect("a listener of the configuration");
+        let port = replica
+            .addresses()
+            .of(Scope::Replication)
+            .map(|addr| addr.port());
+        assert_eq!(replica.follows().ok(), port);
+        // Synced reads the configured poll interval, not the stock one.
+        assert_eq!(replica.shared.synced_within, Duration::from_secs(30));
     }
 }

@@ -190,6 +190,22 @@ impl Ring {
         self.unnamed = seq.max(self.unnamed + 1);
         self.unnamed
     }
+
+    /// Starts the places after `first`, under no term: the head of every
+    /// kind, both rings' floors and the first place. The store's own line
+    /// takes the number too and keeps a higher one it stood at: no write
+    /// under no term is numbered at a place the log said was its first.
+    fn start_after(&mut self, first: u64) {
+        let at = Position {
+            seq: first,
+            term: 0,
+        };
+        self.watched.restart(at);
+        self.loads.restart(at);
+        self.head = at;
+        self.first = at;
+        self.unnamed = self.unnamed.max(first);
+    }
 }
 
 /// The log of one store: its last replicated writes in one order of
@@ -309,16 +325,7 @@ impl Log {
     /// a restart below it, a write under no term is numbered past it.
     #[must_use]
     pub fn starting_after(mut self, first: u64) -> Self {
-        let ring = self.ring.get_mut();
-        let at = Position {
-            seq: first,
-            term: 0,
-        };
-        ring.watched.restart(at);
-        ring.loads.restart(at);
-        ring.head = at;
-        ring.first = at;
-        ring.unnamed = first;
+        self.ring.get_mut().start_after(first);
         self
     }
 
@@ -594,7 +601,7 @@ impl Log {
     /// Tells the listener that the watched kinds moved since its last
     /// telling, if they did. Called under no lock of the log or of the
     /// store: once a store has let a write's locks go, and at the end of a
-    /// restart and of a mark.
+    /// restart, of a mark and of a join.
     ///
     /// A telling is owed while the count of moves is past the highest
     /// count told. The count is loaded before the kept one is raised to
@@ -627,7 +634,8 @@ impl Log {
     /// start: a gap, a replay, a falling term and a write of the store's
     /// own under no term are not where a leader's history continues. Nor
     /// is an event under the term this store leads: taken once, that term
-    /// has one writer.
+    /// has one writer. A log that stands at the place its run drew takes
+    /// a leader's first position by [`Log::join`].
     ///
     /// A store that follows has one writer of journaled writes, the one
     /// that applies the leader's batches. Once an event lands, the term the
@@ -648,6 +656,42 @@ impl Log {
             at,
             nth: ring.adoptions,
         })
+    }
+
+    /// Joins the history of the leader this store follows from its start.
+    /// `at` is that history's first position, the start of the leader's
+    /// first term: where a leader continues a standby that applied
+    /// nothing. The log still stands at the place its own run drew, which
+    /// is no start a guard takes ([`Log::adopt`]): it starts after the
+    /// place before `at` instead, as its leader's did
+    /// ([`Log::starting_after`]), and journals the position, which writes
+    /// no row. From here it is its leader's history from the first place
+    /// on, and says that place as its own ([`Log::first`]): the store
+    /// serves a reader that holds nothing from there when it leads. It
+    /// follows the term from this step, so a take of that term again
+    /// starts no lead in it. The first place's number and the one its own
+    /// run drew both stay on the store's own line: a write of its own under
+    /// no term is numbered past the two. The listener is told at its end,
+    /// under no lock of the log.
+    ///
+    /// Refused once the log holds a write or restarted at a snapshot, and
+    /// for a position under no term or with no place before it. The log is
+    /// then as it was.
+    pub fn join(&self, at: Position) -> Result<(), Lost> {
+        let mut ring = self.ring.lock();
+        let Some(first) = at.seq.checked_sub(1) else {
+            return Err(Lost);
+        };
+        if ring.head != ring.first || at.term == 0 {
+            return Err(Lost);
+        }
+        ring.start_after(first);
+        ring.adopting = None;
+        self.follow(&mut ring, at);
+        self.append(&mut ring, at, Event::Term);
+        drop(ring);
+        self.tell();
+        Ok(())
     }
 
     /// Start again at `at`, the position of a snapshot this store was
@@ -1960,6 +2004,156 @@ mod tests {
         let watched = Log::new(8, 0).starting_after(1_000);
         assert_eq!(watched.first(All), None);
         assert_eq!(watched.first(Watched), Some(at(1_000, 0)));
+    }
+
+    #[test]
+    fn a_log_that_holds_nothing_joins_its_leaders_history_at_the_first_position() {
+        // The leader's run drew below this run's number, above it, and the
+        // same one.
+        for (led_after, own) in [(1_000, 2_000), (2_000, 1_000), (1_000, 1_000)] {
+            let leader = Log::new(16, 16).starting_after(led_after);
+            leader.term_rose(4);
+            member(&leader, 1);
+            load(&leader, 2);
+            let first = at(led_after, 0);
+            let led = all_after(&leader, All, first);
+            assert_eq!(marks(&led), [TERM, MEMBER + 1, 2]);
+            let follower = Log::new(16, 16).starting_after(own);
+            // A drawn place is no start a guard takes, whatever comes next.
+            assert_eq!(follower.adopt(led[0].at).err(), Some(Lost), "{own}");
+            assert_eq!(follower.join(led[0].at), Ok(()), "{own}");
+            assert_eq!((follower.term(), follower.followed()), (4, Some(4)));
+            applies(&follower, &led[1..]);
+            assert_eq!(follower.head(All), leader.head(All));
+            assert_eq!(follower.head(Watched), leader.head(Watched));
+            // Its log is its leader's from the first place on: a reader
+            // that holds nothing joins it there.
+            assert_eq!(follower.first(All), Some(first), "{own}");
+            assert_eq!(all_after(&follower, All, first), led);
+            // A write of its own under no term follows the head, past the
+            // number its own run drew: that number stays on its own line.
+            load(&follower, 9);
+            let past = (led_after + 3).max(own) + 1;
+            assert_eq!(follower.head(All), at(past, 0), "{own}");
+        }
+    }
+
+    #[test]
+    fn a_join_is_refused_once_the_log_holds_a_history_and_under_no_term() {
+        let log = Log::new(8, 8).starting_after(1_000);
+        assert_eq!(log.join(at(501, 0)), Err(Lost), "no term");
+        assert_eq!(log.join(at(0, 3)), Err(Lost), "no place before it");
+        assert_eq!(
+            (log.head(All), log.first(All), log.term()),
+            (at(1_000, 0), Some(at(1_000, 0)), 0),
+            "the log as it was"
+        );
+        // A write of its own, a take, a snapshot's place, a join: each is
+        // a history the log holds, and no other starts in it.
+        for held in ["a write", "a take", "a restart", "a join"] {
+            let log = Log::new(8, 8).starting_after(1_000);
+            match held {
+                "a write" => load(&log, 1),
+                "a take" => log.term_rose(2),
+                "a restart" => log.restart(at(40, 3)).expect("a place the log takes"),
+                _ => log.join(at(501, 3)).expect("a log that holds nothing"),
+            }
+            let (head, first) = (log.head(All), log.first(All));
+            assert_eq!(log.join(at(601, 5)), Err(Lost), "{held}");
+            assert_eq!((log.head(All), log.first(All)), (head, first), "{held}");
+        }
+    }
+
+    #[test]
+    fn a_joined_log_follows_its_leaders_term_and_a_take_of_it_again_starts_no_lead() {
+        // The leader's run drew 1,000 and led term 1; this run drew 500.
+        let told = Arc::new(AtomicUsize::new(0));
+        let log = {
+            let told = Arc::clone(&told);
+            Log::new(8, 8).starting_after(500).on_watched(move || {
+                told.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        log.join(at(1_001, 1)).expect("a log that holds nothing");
+        assert_eq!((log.head(All), log.followed()), (at(1_001, 1), Some(1)));
+        // The listener is told at the join's end, as at a mark's.
+        assert_eq!(told.load(Ordering::Relaxed), 1);
+        // A shared lease whose record was lost counts its terms again. The
+        // take of term 1 leads nothing here: the places under that term
+        // stay the leader's writes alone.
+        log.term_rose(1);
+        load(&log, 1);
+        assert_eq!((log.head(All), log.followed()), (at(1_002, 0), Some(1)));
+        assert!(!log.holds(All, at(1_002, 1)));
+        // The next term is led from the head.
+        log.term_rose(2);
+        assert_eq!((log.head(All), log.followed()), (at(1_003, 2), None));
+    }
+
+    #[test]
+    fn no_join_leaves_a_log_empty_at_another_place() {
+        // Every way through the door: the log is as it was, or it holds
+        // the term's start it joined at and has seen that term.
+        for joined in [
+            at(501, 3),
+            at(1_001, 3),
+            at(2_001, 1),
+            at(1, 1),
+            at(501, 0),
+            at(0, 3),
+        ] {
+            let log = Log::new(8, 8).starting_after(1_000);
+            let before = (log.head(All), log.first(All), log.term());
+            match log.join(joined) {
+                Ok(()) => {
+                    let first = at(joined.seq - 1, 0);
+                    assert_eq!((log.head(All), log.first(All)), (joined, Some(first)));
+                    assert_eq!(all_after(&log, All, first).len(), 1, "{joined:?}");
+                    assert_eq!(log.followed(), Some(joined.term), "{joined:?}");
+                }
+                Err(Lost) => {
+                    assert_eq!(joined.seq.min(joined.term), 0, "{joined:?}");
+                    assert_eq!((log.head(All), log.first(All), log.term()), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_join_under_an_open_guard_leaves_no_adopted_place() {
+        // A log that counts from zero gives a guard at its start.
+        let log = Log::new(8, 8);
+        let adopting = log.adopt(at(1, 3)).expect("the next position");
+        log.join(at(7, 3)).expect("a log that holds nothing");
+        // The store's next write follows the joined place: the place of
+        // the event that never landed went with the start it stood after.
+        load(&log, 2);
+        assert_eq!(log.head(All), at(8, 0));
+        assert!(!adopting.landed());
+        adopting.mark();
+        drop(adopting);
+        assert_eq!(log.head(All), at(8, 0));
+    }
+
+    #[test]
+    fn a_joined_logs_own_line_stands_past_its_first_place_and_the_number_it_drew() {
+        // The leader's run drew 1,000; this run drew below it, and above.
+        for (own, past) in [(500, 1_001), (2_000, 2_001)] {
+            let log = Log::new(8, 8).starting_after(own);
+            log.join(at(1_001, 3)).expect("a log that holds nothing");
+            // A snapshot's place below the first place, then one write of
+            // the store's own under no term: it is numbered past the first
+            // place and past the drawn number, so neither names it.
+            log.restart(at(999, 4)).expect("a place the log takes");
+            member(&log, 1);
+            assert_eq!(log.head(All), at(past, 0), "{own}");
+            // A reader that joined at the first place is never served the
+            // store's own line as its leader's: it starts again.
+            let mut out = Vec::new();
+            for held in [at(1_000, 0), at(own, 0)] {
+                assert_eq!(log.read(All, held, 8, &mut out), Err(Lost), "{own}");
+            }
+        }
     }
 
     #[test]

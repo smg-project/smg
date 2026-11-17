@@ -55,7 +55,7 @@ const IDLE: Duration = Duration::from_millis(20);
 /// How long an idle stream stays silent. After it the leader says where its
 /// head stands with an empty batch, so a standby reads its lag from the age
 /// of the stream's last frame.
-const BEAT: Duration = Duration::from_secs(1);
+pub(crate) const BEAT: Duration = Duration::from_secs(1);
 
 /// The most bytes of one message a client reads, by the transport's own
 /// bound: a complete snapshot above it is refused, and a batch stops under
@@ -77,7 +77,8 @@ const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 /// place of the run before would be held, and never told this run's first
 /// writes. After a draw that place is outside this run's log, and its
 /// reader is told to start again. A standby that applied nothing names no
-/// place of any run: it joins at the drawn start ([`Feed::join`]).
+/// place of any run: the standby's feed joins it at the drawn start
+/// ([`Feed::join`]).
 pub(crate) fn journaled(place: &LeasePlace) -> (Arc<MemoryStore>, watch_workers::Feed) {
     journaled_from(place, RandomState::new().hash_one(0u8) % FIRST_PLACES)
 }
@@ -340,8 +341,8 @@ impl Feed {
     /// A standby's feed from the place its hello names, and how its stream
     /// starts: open where the log holds the place under its term, else
     /// with the word to re-sync. A standby that applied nothing names the
-    /// place before every write: it stands at the log's first place, after
-    /// the number the run drew, while the log retains every write since. A
+    /// place before every write: it stands at the log's first place, the
+    /// number the run drew, while the log retains every write since. A
     /// bound of zero is the log's own, and no bound is above it.
     fn join(
         log: Arc<Log>,
