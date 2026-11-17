@@ -9,16 +9,26 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use mock_worker::config::SchedulerWire;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tonic::transport::server::{Router, TcpIncoming};
 
 /// A mock engine serving `model_id` on a loopback port, as its URL and its
 /// server task.
+pub(crate) async fn mock_engine(model_id: &str) -> (String, JoinHandle<()>) {
+    mock_engine_on_wire(model_id, SchedulerWire::default()).await
+}
+
+/// A mock engine as [`mock_engine`] makes it, on the gRPC wire the test
+/// names.
 #[expect(
     clippy::disallowed_methods,
     reason = "bounded test fixture; server task is explicitly aborted"
 )]
-pub(crate) async fn mock_engine(model_id: &str) -> (String, JoinHandle<()>) {
+pub(crate) async fn mock_engine_on_wire(
+    model_id: &str,
+    wire: SchedulerWire,
+) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock worker");
@@ -31,6 +41,7 @@ pub(crate) async fn mock_engine(model_id: &str) -> (String, JoinHandle<()>) {
         http_count: 0,
         grpc_base_port: port,
         grpc_count: 1,
+        grpc_wire: wire,
         zmq_handshake: None,
         zmq_count: 0,
         zmq_start_index: 0,

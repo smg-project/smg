@@ -1082,4 +1082,19 @@ mod tests {
             "<unparsable address>"
         );
     }
+
+    /// The gRPC base keeps a gRPC scheme as the address has it, the secure
+    /// one too, names any other address `grpc://`, and ends without a slash.
+    #[test]
+    fn the_grpc_base_keeps_a_secure_scheme_and_ends_without_a_slash() {
+        for (url, base) in [
+            ("grpc://p:1", "grpc://p:1"),
+            ("grpcs://p:1", "grpcs://p:1"),
+            ("grpcs://p:1/", "grpcs://p:1"),
+            ("http://p:1/", "grpc://p:1"),
+            ("p:1", "grpc://p:1"),
+        ] {
+            assert_eq!(grpc_base_url(url), base, "{url}");
+        }
+    }
 }
