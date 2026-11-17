@@ -584,6 +584,11 @@ mod tests {
             ("nvidia/DeepSeek-V4.1-Flash-1017-NVFP4", Table::DeepSeekV4_1),
             ("microsoft/UserRepGen-4B", Table::Qwen3Tagged),
             ("nvidia/Qwen3.8-Flash-Next-FP4-Local", Table::Qwen3Tagged),
+            (
+                "autotrust/Qwen3.8-Flash-Next-E384-FP4-Local",
+                Table::Qwen3Tagged,
+            ),
+            ("EssentialAI/eai-distill-0.5b", Table::Qwen2_5),
             ("microsoft/AesCode-8B", Table::Qwen3),
             ("microsoft/AesCode-32B", Table::Qwen3),
             ("internlm/Visual-ERM", Table::Qwen3),
