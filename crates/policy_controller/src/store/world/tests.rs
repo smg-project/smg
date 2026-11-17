@@ -30,6 +30,7 @@ use crate::{
 };
 
 mod list_room;
+mod membership_call;
 mod mode_and_overload;
 mod repeated_models;
 mod written;
