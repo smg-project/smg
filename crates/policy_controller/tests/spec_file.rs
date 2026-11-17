@@ -139,22 +139,39 @@ async fn read(replica: &Replica, generation: u64) -> Result<PolicySpecDocument, 
 }
 
 /// What `probe` answers once `met` holds for it, asked every [`PACE`]; the
-/// last answer where the room runs out first.
+/// last answer where the room runs out first. A probe that does not answer
+/// is left at the room's end too: the wait is no longer than its room.
 async fn until<T: Debug, F: Future<Output = T>>(
     mut probe: impl FnMut() -> F,
     met: impl Fn(&T) -> bool,
 ) -> Result<T, String> {
     let started = Instant::now();
+    let mut last = None;
     loop {
-        let answer = probe().await;
+        let left = ROOM.saturating_sub(started.elapsed());
+        let Ok(answer) = tokio::time::timeout(left, probe()).await else {
+            return Err(format!("no answer in {ROOM:?}; the last one: {last:?}"));
+        };
         if met(&answer) {
             return Ok(answer);
         }
         if started.elapsed() > ROOM {
             return Err(format!("not met in {ROOM:?}; the last answer: {answer:?}"));
         }
+        last = Some(answer);
         tokio::time::sleep(PACE).await;
     }
+}
+
+/// A probe that never answers ends its wait at the room's end, by name. The
+/// clock is held, so the room passes at once.
+#[tokio::test(start_paused = true)]
+async fn a_probe_that_never_answers_ends_its_wait_at_the_rooms_end() {
+    let waited = tokio::time::timeout(2 * ROOM, until(std::future::pending::<u8>, |_| true))
+        .await
+        .expect("the wait ends inside twice its room");
+    let told = waited.expect_err("no probe answered");
+    assert!(told.starts_with("no answer in"), "{told}");
 }
 
 /// The standing document once the read call answers it as `generation`.
