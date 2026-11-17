@@ -3391,6 +3391,59 @@ async fn a_failed_upstream_status_ends_the_stream_with_the_typed_error_event() {
     mcp.stop().await;
 }
 
+/// A tool call that fails, streamed (the tool server that always fails behind
+/// an upstream that asks for the tool on every turn, a limit of one): the
+/// call that ran and failed and the call past the limit close alike, each
+/// under `response.mcp_call.failed` and then its `response.output_item.done`
+/// with a `failed` item. No `response.mcp_call.completed` is sent for a call
+/// that failed. The gateway's own tool loop closes a failed call under the
+/// same event (`a_failed_mcp_call_closes_under_the_failed_event` in the
+/// Responses stream contract tests).
+#[tokio::test]
+async fn a_streamed_mcp_call_that_failed_closes_under_the_failed_event() {
+    let mut mcp = MockFailingMCPServer::start("the tool is down")
+        .await
+        .expect("start failing mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let (router, _ctx, _dir) = external_router_with_mcp_yaml(&upstream, &mcp_yaml, 5).await;
+
+    let body = stream_body(
+        router.as_ref(),
+        mcp_request(&mcp.url(), Some(1), true, false),
+    )
+    .await;
+
+    let events = frame_events(&body);
+    // Each call's close: its sub-event, and the status of the item behind it.
+    let closes: Vec<(&str, &str)> = events
+        .windows(2)
+        .filter(|pair| {
+            pair[1]["type"] == "response.output_item.done" && pair[1]["item"]["type"] == "mcp_call"
+        })
+        .map(|pair| {
+            (
+                pair[0]["type"].as_str().unwrap_or_default(),
+                pair[1]["item"]["status"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        closes,
+        [
+            ("response.mcp_call.failed", "failed"),
+            ("response.mcp_call.failed", "failed")
+        ],
+        "the call that ran and failed, then the call past the limit: {body}"
+    );
+    assert!(!body.contains("response.mcp_call.completed"), "{body}");
+    server.abort();
+    mcp.stop().await;
+}
+
 /// The tool-call limit reached mid-stream (an upstream that asks for the
 /// tool on every turn, a limit of one, the response stored): the stream
 /// ends the way the non-streamed loop ends the same stop. The call that fit
