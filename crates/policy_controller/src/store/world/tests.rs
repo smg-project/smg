@@ -1,8 +1,6 @@
 //! The cases of the world and of a decision's build from it, over
 //! [`MemoryStore`]: every instant is handed in, none is slept.
 
-mod pool_binding;
-
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -31,6 +29,7 @@ use crate::{
 
 mod list_room;
 mod mode_and_overload;
+mod pool_binding;
 mod repeated_models;
 mod written;
 
@@ -3233,11 +3232,16 @@ fn overloaded(store: &MemoryStore, now: Instant) -> Vec<WorkerId> {
 
 /// One rank of the two-rank engine `engine`.
 fn rank_of(store: &MemoryStore, engine: &str, rank: u16) -> WorkerId {
+    rank_among(store, engine, rank, 2)
+}
+
+/// One rank of the engine `engine`, which says it has `size` ranks.
+fn rank_among(store: &MemoryStore, engine: &str, rank: u16, size: u16) -> WorkerId {
     store
         .upsert(WorkerFacts {
             engine: engine.to_string(),
             dp_rank: rank,
-            dp_size: 2,
+            dp_size: size,
             ..facts(&format!("{engine}#{rank}"), Role::Single, &[MODEL])
         })
         .id()
@@ -3931,9 +3935,9 @@ fn a_rank_exactly_three_periods_behind_is_counted_and_a_microsecond_past_it_ends
 fn a_rank_at_the_bound_is_counted_beside_one_past_it() {
     let store = MemoryStore::with_publish_window(Duration::ZERO);
     let t0 = Instant::now();
-    let zero = rank_of(&store, "grpc://e:9000", 0);
-    let one = rank_of(&store, "grpc://e:9000", 1);
-    let two = rank_of(&store, "grpc://e:9000", 2);
+    let zero = rank_among(&store, "grpc://e:9000", 0, 3);
+    let one = rank_among(&store, "grpc://e:9000", 1, 3);
+    let two = rank_among(&store, "grpc://e:9000", 2, 3);
     store
         .apply(generation_with(1, block(8, 1.0)))
         .expect("applied");
