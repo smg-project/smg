@@ -1835,7 +1835,7 @@ fn column_fits(column: &[AffinityFacts], pool: &[Candidate]) -> bool {
 }
 
 /// A debug build asserts that the rows a host named in the column's place
-/// ([`NamedAffinity`](crate::NamedAffinity)) stand for `pool`, once where a
+/// ([`NamedAffinity`]) stand for `pool`, once where a
 /// decision takes its inputs: both lists ascending and under the pool's
 /// size, beside an empty column, and no mean in flight, which is the
 /// engine's to set behind a draw. A list out of order hides a holder from
@@ -1994,6 +1994,18 @@ impl Engine {
             Phase::Decode => own.or(self.pair_decode_needs(model)),
             _ => own,
         }
+    }
+
+    /// The sample of the profile that decides a request of `phase` for
+    /// `model`: the cap of each list of rows a host names for that decision
+    /// ([`Needs::sample`]), `0` where that profile never draws and where no
+    /// binding matches. [`Self::needs_for`] answers for a worker's stream,
+    /// where the larger of two needs is the safe one: for a decode decision
+    /// of a model that also pairs it carries the pair's decode side, whose
+    /// sample may be the larger. A cap's safe side is the smaller.
+    pub fn sample_for(&self, model: &str, phase: Phase) -> u32 {
+        self.resolve(model, phase)
+            .map_or(0, |(_, _, profile)| profile.needs().sample)
     }
 
     /// The needs of the decode profile of `model`'s pair binding
@@ -7716,27 +7728,33 @@ mod tests {
     /// Two profiles whose `best` takes a sample of four and of sixteen, for
     /// the models `narrow` and `wide`.
     fn two_samples() -> Engine {
+        let bound = |model: &str, profile| Binding {
+            model: model.into(),
+            profile,
+            ..single_binding()
+        };
+        sampled_under(vec![bound("narrow", 0), bound("wide", 1)])
+    }
+
+    /// Two profiles that draw, under `bindings`: a sample of four (profile
+    /// 0) and a sample of sixteen (profile 1).
+    fn sampled_under(bindings: Vec<Binding>) -> Engine {
         let sampled = |name: &str, sample| Profile {
             name: name.into(),
             filters: vec![Box::new(Healthy)],
             scorers: Vec::new(),
             picker: Box::new(crate::builtins::SampledBest::new(sample)),
         };
-        let bound = |model: &str, profile| Binding {
-            model: model.into(),
-            profile,
-            ..single_binding()
-        };
         Engine::new(
             vec![sampled("narrow", 4), sampled("wide", 16)],
-            vec![bound("narrow", 0), bound("wide", 1)],
+            bindings,
             1,
             Needs::default(),
         )
     }
 
     /// A host caps the rows it names by the sample of the profile that
-    /// decides, which [`Engine::needs_for`] says; the engine's summary
+    /// decides, which [`Engine::sample_for`] says; the engine's summary
     /// holds the largest sample of every profile. The cache-aware preset
     /// says sixteen for a model's single decision.
     #[test]
@@ -7746,7 +7764,7 @@ mod tests {
         let pool = pool_of(64, |_| false);
         let holders: Vec<crate::NamedHolder> = (0..16).map(|row| holding(row, 12)).collect();
         for (model, sample) in [("narrow", 4usize), ("wide", 16)] {
-            let cap = engine.needs_for(model, Phase::Single).sample as usize;
+            let cap = engine.sample_for(model, Phase::Single) as usize;
             assert_eq!(cap, sample, "{model}");
             let facts = RequestFacts {
                 model,
@@ -7756,7 +7774,7 @@ mod tests {
             assert!(got.trace().drew_first(), "{model}: capped so, it draws");
         }
         let cache_aware = preset("cache_aware");
-        assert_eq!(cache_aware.needs_for("m", Phase::Single).sample, 16);
+        assert_eq!(cache_aware.sample_for("m", Phase::Single), 16);
     }
 
     /// Capped by the engine's summary instead, the rows a host names under
@@ -7895,5 +7913,58 @@ mod tests {
             },
             pass
         );
+    }
+
+    /// A decode decision of a model that also pairs is decided by its own
+    /// profile, and the rows a host names for it are capped by that
+    /// profile's sample ([`Engine::sample_for`]). A decode worker's needs
+    /// carry the pair's decode side too ([`Engine::needs_for`]), whose
+    /// sample is the larger here: a list capped by them stands past the
+    /// cap.
+    #[test]
+    fn a_decode_decision_of_a_model_that_also_pairs_is_capped_by_its_own_profile() {
+        let alone = Binding {
+            model: "mixed".into(),
+            phases: vec![Phase::Decode],
+            ..single_binding()
+        };
+        let pair = Binding {
+            model: "mixed".into(),
+            profile: 1,
+            decode_profile: Some(1),
+            ..pair_binding()
+        };
+        let engine = sampled_under(vec![alone, pair]);
+        assert_eq!(engine.needs_for("mixed", Phase::Decode).sample, 16);
+        assert_eq!(engine.sample_for("mixed", Phase::Decode), 4);
+        assert_eq!(engine.sample_for("nobody", Phase::Decode), 0);
+        let holders: Vec<crate::NamedHolder> = (0..4).map(|row| holding(row, 12)).collect();
+        let facts = RequestFacts {
+            model: "mixed",
+            phase: Phase::Decode,
+            ..naming(1, &holders)
+        };
+        let got = drawn(&engine, &facts, &pool_of(64, |_| false));
+        assert!(
+            got.trace().drew_first(),
+            "capped by its own profile, it draws"
+        );
+    }
+
+    /// The engine asks a draw of a pool of [`DRAW_FROM`] rows or more,
+    /// whatever the sample: under a sample of four a pool of nine to
+    /// fifteen rows, more than twice the sample, is still read whole.
+    #[test]
+    fn a_sample_under_eight_draws_from_sixteen_rows_on() {
+        let engine = two_samples();
+        let holders = [holding(0, 12)];
+        let facts = RequestFacts {
+            model: "narrow",
+            ..naming(1, &holders)
+        };
+        for (rows, drew) in [(9, false), (12, false), (15, false), (16, true)] {
+            let got = drawn(&engine, &facts, &pool_of(rows, |_| false));
+            assert_eq!(got.trace().drew_first(), drew, "{rows} rows");
+        }
     }
 }

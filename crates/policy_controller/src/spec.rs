@@ -166,8 +166,9 @@ pub struct Needs {
     /// the warming rows by that draw over their whole list. A host that
     /// cannot fills the column, and the pool is read whole. The cap of a
     /// decision is its own profile's, which
-    /// [`Engine::needs_for`](crate::Engine::needs_for) says: the engine's
-    /// summary holds the largest sample of every profile.
+    /// [`Engine::sample_for`](crate::Engine::sample_for) says: the engine's
+    /// summary holds the largest sample of every profile, and a decode
+    /// worker's needs the larger of its two profiles'.
     pub sample: u32,
 }
 
@@ -630,8 +631,8 @@ pub struct ResidentWorkParams {
 pub struct BestParams {
     /// How many rows the picker draws where the host names the request's
     /// holders and the pool's warming rows: a pool of more than twice this
-    /// many rows is decided by that sample and the named rows, any other by
-    /// the whole pool. From 1 to 64.
+    /// many rows, and of at least 16, is decided by that sample and the
+    /// named rows, any other by the whole pool. From 1 to 64.
     #[schemars(range(min = 1, max = 64))]
     pub sample: u32,
 }

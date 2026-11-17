@@ -1284,8 +1284,9 @@ impl Picker for Best {
 /// The best of a sample: `best` over the rows it draws first. Where the
 /// host named the request's holders and the pool's warming rows
 /// ([`NamedAffinity`](crate::NamedAffinity)) and the pool holds more than
-/// twice the sample, it draws `sample` rows the filters keep, uniformly and
-/// with replacement (a repeat or a refused row costs one of its `2 * sample`
+/// twice the sample, and at least the sixteen rows the engine asks a draw
+/// from, it draws `sample` rows the filters keep, uniformly and with
+/// replacement (a repeat or a refused row costs one of its `2 * sample`
 /// draws), the named rows join them, and the highest combined score among
 /// those wins. Any other pool is read whole, as `best` reads it, and so is
 /// a pool whose sample holds no row.
