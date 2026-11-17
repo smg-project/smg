@@ -58,8 +58,8 @@ pub const DECIDE_BUSY_TOTAL: &str = "smg_policy_controller_decide_busy_total";
 /// `pair_side`, `prompt_text`, `decider_gone`): the `Busy` answers with no
 /// reason, each under what took its decision.
 pub const DECIDE_NO_DECISION_TOTAL: &str = "smg_policy_controller_decide_no_decision_total";
-/// Decide requests that carried more block hashes than their generation's
-/// view reads: decided over the first ones.
+/// Decide requests that carried more block hashes than their generation
+/// reads of them: decided over the first ones, the rest hashed for nothing.
 pub const DECIDE_HASHES_CUT_TOTAL: &str = "smg_policy_controller_decide_hashes_cut_total";
 /// Answers no decide stream took, by `cause`: `stream_gone` for a stream
 /// that had ended, `queue_full` for one whose queue had no place, which a
@@ -185,8 +185,7 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(DECIDE_HASHES_CUT_TOTAL),
             None,
-            "Decide requests that carried more block hashes than their generation's view reads"
-                .into(),
+            "Decide requests that carried more block hashes than their generation reads".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(DECIDE_ANSWERS_DROPPED_TOTAL),

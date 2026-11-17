@@ -138,17 +138,17 @@ const PARTS: usize = 16;
 
 /// One decider's part of the counts that every decision can move, on cache
 /// lines of its own. Where a fleet's gateways speak fewer wires than its
-/// members, each decision counts the candidates it lost; where prompts run
-/// past the view's cap, each counts its request. One count for every
-/// decider would be a line they all write.
+/// members, each decision counts the candidates it lost; where a host
+/// hashes past what its generation reads, each counts its request. One
+/// count for every decider would be a line they all write.
 #[derive(Debug, Default)]
 #[repr(align(128))]
 pub(crate) struct Part {
     /// Candidates the wires of their decision's gateway took from its
     /// view, members that share no wire with it.
     pub(crate) undialed: AtomicU64,
-    /// Requests that carried more block hashes than their generation's
-    /// view reads.
+    /// Requests that carried more block hashes than their generation
+    /// reads of them.
     pub(crate) hashes_cut: AtomicU64,
 }
 
@@ -582,7 +582,7 @@ fn decide_in(
     {
         return None;
     }
-    if taken.request.hashes() > spec.max_block_hashes() {
+    if taken.request.hashes() > taken.request.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
     }
     Some(hand(
@@ -635,8 +635,8 @@ fn shed(reason: ShedReason, emptied_by: &'static str, seed: u64, generation: u64
 /// takes ([`narrow`]), with the affinity column where the request's
 /// profile declares it. The rows its wires take are counted in `undialed`,
 /// the decider's own part, and the list they leave takes a name of its own
-/// ([`cut_reach`]). The request's block hashes are cut at that generation's
-/// cap.
+/// ([`cut_reach`]). The request's block hashes are cut at what that
+/// generation reads of them.
 fn hand<R>(
     world: &World,
     taken: &Taken<'_>,
@@ -705,7 +705,7 @@ fn hand<R>(
         now_micros,
         budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
         affinity: &view.affinity,
-        max_block_hashes: spec.max_block_hashes(),
+        max_block_hashes: request.hashes_read(spec),
     };
     request.read(lists, viewed, |facts, constraints| {
         decide(facts, &pool, &view.candidates, constraints, scratch)
@@ -1824,47 +1824,116 @@ pub(crate) mod tests {
         assert!(late.wait_for(|ended| *ended).await.is_ok());
     }
 
-    /// The engine is handed its generation's cap of a request's block
-    /// hashes, the first ones, and a request that carried more is counted.
+    /// A frame that carries `hashes` block hashes, `1` the first.
+    fn hashed(id: u8, hashes: u64) -> proto::DecideRequest {
+        let mut frame = frame(id, 1);
+        frame
+            .facts
+            .as_mut()
+            .expect("the case's frame has facts")
+            .block_hashes = (1..=hashes).collect();
+        frame
+    }
+
+    /// What the engine is handed of each frame's block hashes with
+    /// `applied` as the standing generation.
+    fn handed_hashes(applied: AppliedSpec, frames: Vec<proto::DecideRequest>) -> Vec<Vec<u64>> {
+        let bed = bed(Some(applied), true, (2, 8), []);
+        let now = bed.script.taken;
+        frames
+            .into_iter()
+            .map(|frame| {
+                let request = checked(frame);
+                let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+                let mut buffers = Buffers::default();
+                bed.store.deciding(|world| {
+                    hand(
+                        world,
+                        &taken,
+                        &mut buffers,
+                        &AtomicU64::new(0),
+                        |facts, _, _, _, _| facts.block_hashes.to_vec(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// The engine is handed as many of a request's block hashes as its
+    /// generation reads of them, the first ones, and a request that carried
+    /// more is counted.
     #[tokio::test]
-    async fn the_block_hashes_past_the_generations_cap_are_cut_and_the_request_is_counted() {
-        let mut document = PolicySpec::preset("random").expect("a preset of this build");
-        document.generation = 1;
-        document.view.max_block_hashes = 4;
-        let mut bed = bed(Some(applied(&document)), true, (2, 8), []);
-        let hashed = |id, hashes: u64| {
-            let mut frame = frame(id, 1);
+    async fn the_block_hashes_past_what_the_generation_reads_are_cut_and_the_request_is_counted() {
+        let first = |count: u64| (1..=count).collect::<Vec<u64>>();
+        // A prefix key 256 tokens deep reads 16 blocks of 16 tokens. The
+        // blocks are the request's own: 32 of a request counted by 8, 4 of
+        // one counted by 64, and of a text 64 blocks of 16 characters.
+        let sized = |id, hashes, block_size| {
+            let mut frame = hashed(id, hashes);
             frame
                 .facts
                 .as_mut()
                 .expect("the case's frame has facts")
-                .block_hashes = (1..=hashes).collect();
+                .block_size = block_size;
             frame
         };
-        let now = bed.script.taken;
-        let read = |frame| {
-            let request = checked(frame);
-            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
-            let mut buffers = Buffers::default();
-            bed.store.deciding(|world| {
-                hand(
-                    world,
-                    &taken,
-                    &mut buffers,
-                    &AtomicU64::new(0),
-                    |facts, _, _, _, _| facts.block_hashes.to_vec(),
-                )
-            })
-        };
-        assert_eq!(read(hashed(1, 6)), [1, 2, 3, 4]);
-        assert_eq!(read(hashed(2, 4)), [1, 2, 3, 4]);
-        assert_eq!(read(hashed(3, 2)), [1, 2]);
-        // Never refused: each is decided, and the one that was cut counted.
-        for (id, hashes) in [(4, 6), (5, 4), (6, 0)] {
-            let answer = bed.ask(hashed(id, hashes)).await;
-            assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
+        let mut text = hashed(6, 80);
+        text.facts
+            .as_mut()
+            .expect("the case's frame has facts")
+            .hash_kind = proto::HashKind::Text.into();
+        assert_eq!(
+            handed_hashes(
+                preset("prefix_hash", 1),
+                vec![
+                    hashed(1, 20),
+                    hashed(2, 16),
+                    hashed(3, 2),
+                    sized(4, 40, 8),
+                    sized(5, 10, 64),
+                    text,
+                ],
+            ),
+            [
+                first(16),
+                first(16),
+                first(2),
+                first(32),
+                first(4),
+                first(64)
+            ]
+        );
+        // A stage with no depth of its own reads to its view's cap.
+        let mut held = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        held.generation = 1;
+        held.view.max_block_hashes = 4;
+        assert_eq!(
+            handed_hashes(
+                applied(&held),
+                vec![hashed(1, 6), hashed(2, 4), hashed(3, 2)]
+            ),
+            [first(4), first(4), first(2)]
+        );
+        // No stage of the random preset reads the hashes, and none are
+        // handed on.
+        assert_eq!(
+            handed_hashes(preset("random", 1), vec![hashed(1, 6)]),
+            [first(0)]
+        );
+        // Never refused: each request is decided, and each that carried
+        // more than its generation reads is counted.
+        let mut unread = leading([]);
+        for (id, hashes) in [(4, 6), (5, 1), (6, 0)] {
+            let answer = unread.ask(hashed(id, hashes)).await;
+            assert!(unread.workers.contains(&picked(&answer)), "{answer:?}");
         }
-        assert_eq!(bed.counts.hashes_cut(), 1);
+        assert_eq!(unread.counts.hashes_cut(), 2);
+        let mut keyed = bed(Some(preset("prefix_hash", 1)), true, (2, 8), []);
+        for (id, hashes) in [(7, 20), (8, 16)] {
+            let answer = keyed.ask(hashed(id, hashes)).await;
+            assert!(keyed.workers.contains(&picked(&answer)), "{answer:?}");
+        }
+        assert_eq!(keyed.counts.hashes_cut(), 1);
     }
 
     #[tokio::test]

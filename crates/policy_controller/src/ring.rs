@@ -1158,6 +1158,44 @@ mod tests {
     }
 
     #[test]
+    fn a_request_hashed_as_deep_as_its_generation_reads_keeps_its_key() {
+        use crate::{
+            spec::{AppliedSpec, PolicySpec},
+            view::HashKind,
+        };
+        let mut document = PolicySpec::preset("prefix_hash").expect("a preset of this build");
+        document.generation = 1;
+        let applied = AppliedSpec::validate(&document).expect("the preset validates");
+        let gates = Gates::default();
+        let hashes: Vec<u64> = (1..=300).collect();
+        // Blocks of the view's size, under it and over it, in both kinds.
+        for (hash_kind, block_size) in [
+            (HashKind::Token, 0),
+            (HashKind::Token, 8),
+            (HashKind::Token, 64),
+            (HashKind::Text, 0),
+            (HashKind::Text, 8),
+            (HashKind::Text, 64),
+        ] {
+            let read = applied.block_hashes_read(hash_kind, block_size);
+            let handed = |count: usize| RequestFacts {
+                block_hashes: &hashes[..count],
+                hash_kind,
+                block_size,
+                ..RequestFacts::default()
+            };
+            // The blocks a host is told to hash give the key the whole
+            // list gives, and one block fewer gives another: the last one
+            // told is the block the key reads.
+            let key = prefix_key(256, gates, &handed(hashes.len()));
+            let told = prefix_key(256, gates, &handed(read));
+            let short = prefix_key(256, gates, &handed(read - 1));
+            assert_eq!(told, key, "{hash_kind:?} by {block_size}");
+            assert_ne!(short, key, "{hash_kind:?} by {block_size}");
+        }
+    }
+
+    #[test]
     fn the_prefix_form_declares_the_request_s_hashes() {
         let needs = prefixed(256).needs();
         assert!(needs.ring && needs.token_hashes && needs.text_hashes);

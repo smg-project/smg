@@ -101,6 +101,18 @@ impl Default for Gates {
     }
 }
 
+/// How many whole blocks of `block_size` lie within the first `tokens`
+/// tokens of a request hashed in `kind`: the tokens over the block size,
+/// under the text kind their characters over the character block size. A
+/// block size is one at least.
+pub(crate) fn blocks_within(tokens: u32, kind: HashKind, block_size: u32) -> u32 {
+    let units = match kind {
+        HashKind::Token => tokens,
+        HashKind::Text => tokens.saturating_mul(CHARS_PER_TOKEN),
+    };
+    units / block_size
+}
+
 impl Gates {
     /// The gates of a profile from the parameters its affinity stages wrote
     /// and the view's block size.
@@ -182,14 +194,10 @@ impl Gates {
     }
 
     /// How many whole blocks of the request lie within its first `tokens`
-    /// tokens: the tokens over the block size the request was counted with,
-    /// under the text kind their characters over the character block size.
+    /// tokens ([`blocks_within`]), at the block size the request was
+    /// counted with.
     pub(crate) fn whole_blocks(&self, tokens: u32, facts: &RequestFacts<'_>) -> u32 {
-        let units = match facts.hash_kind {
-            HashKind::Token => tokens,
-            HashKind::Text => tokens.saturating_mul(CHARS_PER_TOKEN),
-        };
-        units / self.block_size_of(facts)
+        blocks_within(tokens, facts.hash_kind, self.block_size_of(facts))
     }
 
     /// The request's size in blocks: its token count over the block size
