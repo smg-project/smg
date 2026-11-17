@@ -1313,8 +1313,9 @@ fn profile_index(binding: &Binding, phase: Phase) -> Option<u16> {
     }
 }
 
-/// The overload thresholds a binding hands the pools it matches: its block's
-/// two values, each else the spec's default, resolved once by validation.
+/// The overload thresholds a binding hands the pools decided under it
+/// ([`Engine::pool_binding`]): its block's two values, each else the spec's
+/// default, resolved once by validation.
 /// The host judges an engine's load reports against them and latches the
 /// verdict on the engine's rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1109,7 +1109,7 @@
       ]
     },
     "OverloadSpec": {
-      "description": "The overload veto's defaults for the binding's workers: evaluated per\nload report by the host and latched, never per request; a worker's own\nregistration thresholds resolve over these.",
+      "description": "The overload veto's defaults for the workers of the pools decided under\nthe binding, as the binding's `overload` field says: evaluated per load\nreport by the host and latched, never per request; a worker's own\nregistration thresholds resolve over these.",
       "type": "object",
       "properties": {
         "enabled": {
