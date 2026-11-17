@@ -30,12 +30,6 @@ impl EmbeddingResponseProcessingStage {
     }
 }
 
-impl Default for EmbeddingResponseProcessingStage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl ProcessStage for EmbeddingResponseProcessingStage {
     async fn process(

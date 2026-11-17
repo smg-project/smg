@@ -1919,12 +1919,6 @@ impl ChatDecode {
     }
 }
 
-impl Default for HarmonyStreamingProcessor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Whether the chunks before the usage-only one carry the `usage: null`
 /// placeholder the public API writes under `stream_options.include_usage`
 /// (the regular chat stream's rule, applied to this pipeline's chunks).

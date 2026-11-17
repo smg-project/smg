@@ -109,12 +109,6 @@ impl ClassifyResponseProcessingStage {
     }
 }
 
-impl Default for ClassifyResponseProcessingStage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl ProcessStage for ClassifyResponseProcessingStage {
     async fn process(

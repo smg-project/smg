@@ -40,12 +40,6 @@ impl HarmonyResponseProcessingStage {
     }
 }
 
-impl Default for HarmonyResponseProcessingStage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl ProcessStage for HarmonyResponseProcessingStage {
     async fn process(
