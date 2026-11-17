@@ -30,6 +30,7 @@ use openai_protocol::worker::{
     EngineAggregateMetricsSnapshot, FlushCacheResult, HealthCheckConfig, ProfileOptions,
     ProfileResult, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus,
 };
+use smg_worker::{labels::DISCOVERY_PROVIDER_LABEL, settings::UnhealthyRemovalScope};
 use tokio::{
     sync::{broadcast, mpsc, Notify},
     task::JoinHandle,
@@ -37,9 +38,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    config::UnhealthyRemovalScope,
     observability::metrics::{metrics_labels, Metrics},
-    service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
         health::liveness,
         identity::{basic::WorkerTypeExt, endpoint::Endpoint},

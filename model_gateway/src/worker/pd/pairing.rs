@@ -23,8 +23,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use openai_protocol::worker::{RuntimeType, WorkerSpec};
+pub use smg_worker::settings::PdPairingMode;
 
-pub use crate::config::types::PdPairingMode;
 use crate::worker::MORIIO_MODE_LABEL;
 
 /// Label under which the pairing protocol arrives when it is not on the
