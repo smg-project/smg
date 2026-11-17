@@ -22,8 +22,10 @@
 //! rank of the fleet. The call's bounds are the client's own door: an id at
 //! the range's end is answered, a frame past the size leaves cut at its
 //! tail, and a frame the call refuses ends the stream, the next ask opening
-//! a new one. The views the case still reads from the store give way to
-//! decisions next.
+//! a new one. Then the decisions follow the fleet, each read from the
+//! client's answers alone: a load-led pick leaves the engine that holds
+//! requests, a rotation names each row in turn, a routing key returns to its
+//! worker and a retry leaves it, and no decision names the dead engine.
 //!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
@@ -42,6 +44,7 @@ mod fleet;
 mod net;
 
 use std::{
+    collections::{HashMap, HashSet},
     io::Write,
     sync::mpsc,
     time::{Duration, Instant},
@@ -58,8 +61,8 @@ use smg_policy_controller::{
     client::{self, blocking, Answer, Client},
     controller::{State, PROTOCOL_VERSION},
     proto::{
-        completed::Class, decision::Outcome, principal, released, Completed, DecideRequest,
-        Decision, Released, RequestFacts, ShedReason, Side,
+        completed::Class, decision::Outcome, identity::Form, principal, released, Completed,
+        DecideRequest, Decision, Identity, Released, RequestFacts, ShedReason, Side,
     },
     store::{LaneCounts, WorkerStatus},
     view::{Role, SignalSource},
@@ -118,20 +121,64 @@ fn ask(id: &[u8]) -> DecideRequest {
     }
 }
 
-/// Asks, and reads the pick's first target as the engine and the rank of
-/// the fleet it names.
-async fn picked(harness: &mut Harness, ask: DecideRequest) -> Result<(usize, u16), String> {
+/// The asks an assertion makes where one draw could hide what it reads.
+const ASKS: u64 = 64;
+
+/// A pick's first target: the row of the fleet it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Picked {
+    engine: usize,
+    rank: u16,
+    /// The row's id, as a retry names it.
+    id: u64,
+}
+
+/// The `n`th ask of the run named `run`, with an id and a seed of its own.
+fn nth(run: &str, n: u64) -> DecideRequest {
+    let mut ask = ask(format!("{run}-{n}").as_bytes());
+    if let Some(facts) = &mut ask.facts {
+        facts.seed = n;
+    }
+    ask
+}
+
+/// `ask` under the routing key `key`.
+fn keyed(mut ask: DecideRequest, key: u64) -> DecideRequest {
+    if let Some(facts) = &mut ask.facts {
+        facts.session_key = Some(Identity {
+            form: Some(Form::Hash(key)),
+        });
+    }
+    ask
+}
+
+/// Asks, and reads the pick's first target as the row of the fleet it
+/// names. A pick that carries a lease is refused: the case releases none.
+async fn picked(harness: &mut Harness, ask: DecideRequest) -> Result<Picked, String> {
     let answer = harness.client().decide(ask).await;
     let Ok(Answer::Decision(Decision {
+        leases,
         outcome: Some(Outcome::Pick(pick)),
         ..
     })) = &answer
     else {
         return Err(format!("no pick: {answer:?}"));
     };
+    // The asserts by count lean on a served decision booking nothing: once
+    // a decision carries a lease, a pick releases it here, before the next
+    // ask reads the rows.
+    if !leases.is_empty() {
+        return Err(format!(
+            "a served decision carries a lease, released by no ask of this case: {leases:?}"
+        ));
+    }
     let target = pick.targets.first().ok_or("a pick with no target")?;
     match harness.named(target.id) {
-        Some((engine, rank)) if target.dp_rank == u32::from(rank) => Ok((engine, rank)),
+        Some((engine, rank)) if target.dp_rank == u32::from(rank) => Ok(Picked {
+            engine,
+            rank,
+            id: target.id,
+        }),
         _ => Err(format!("a target that is no row of the fleet: {target:?}")),
     }
 }
@@ -315,6 +362,93 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             );
         }
 
+        // A load-led decision follows the loads the engines told: under the
+        // least-load preset no pick names the engine that holds requests.
+        harness
+            .apply("least_load")
+            .expect("a preset of this build applies");
+        for n in 0..ASKS {
+            let pick = picked(&mut harness, nth("load", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(
+                pick.engine, busy,
+                "a load-led pick leaves the engine that holds requests: {pick:?}"
+            );
+        }
+
+        // Two draws compared by the loads the engines told: under the
+        // power-of-two preset no pick names the engine that holds requests.
+        // Unread, the loads leave the busy row one pick in six, so 64 asks
+        // miss it less than once in 100,000 runs.
+        harness
+            .apply("power_of_two")
+            .expect("a preset of this build applies");
+        for n in 0..ASKS {
+            let pick = picked(&mut harness, nth("two", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(
+                pick.engine, busy,
+                "of two draws the better load is taken: {pick:?}"
+            );
+        }
+
+        // The first row the filters keep, in the host's order: under the
+        // passthrough preset every pick names the view's first row, and an
+        // ask that names it tried is answered with the view's second.
+        harness
+            .apply("passthrough")
+            .expect("a preset of this build applies");
+        let pool = harness.view(MODEL, Role::Single).expect("the view");
+        let listed: Vec<(usize, u16)> = pool.iter().map(|row| (row.engine, row.rank)).collect();
+        let first = picked(&mut harness, nth("through", 0))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            Some((first.engine, first.rank)),
+            listed.first().copied(),
+            "a passthrough pick is the first row the host lists: {first:?} of {listed:?}"
+        );
+        for n in 1..8 {
+            let again = picked(&mut harness, nth("through", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, first,
+                "a passthrough pick is one row whatever its seed"
+            );
+        }
+        let mut retry = nth("through", 8);
+        let facts = retry.facts.as_mut().expect("the ask states facts");
+        facts.tried = vec![first.id];
+        facts.attempt = 1;
+        let next = picked(&mut harness, retry)
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            Some((next.engine, next.rank)),
+            listed.get(1).copied(),
+            "past its tried first row a passthrough pick is the second: {next:?} of {listed:?}"
+        );
+
+        // A rotation names every row before it names one again: under the
+        // round-robin preset two turns of asks name each row twice.
+        harness
+            .apply("round_robin")
+            .expect("a preset of this build applies");
+        let mut turns: HashMap<Picked, u32> = HashMap::new();
+        for n in (0u64..).take(2 * ranks) {
+            let pick = picked(&mut harness, nth("turn", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            *turns.entry(pick).or_default() += 1;
+        }
+        assert!(
+            turns.len() == ranks && turns.values().all(|asks| *asks == 2),
+            "two turns of a rotation name each row twice: {turns:?}"
+        );
+
         // The KV events follow the fleet: the busy engine's held requests
         // stored blocks, its stream's batches reached its rank's cursor, and
         // its row's index holds every block the engine holds.
@@ -367,6 +501,43 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             0,
             "an engine's own stream carries no snapshot chunk"
         );
+
+        // A keyed ask returns to its worker: under the ring preset one
+        // routing key names one row at each ask, and 64 keys do not all
+        // share it. On a ring of even shares a correct ring puts 64 keys
+        // on one row less than once in 10^40 runs.
+        harness
+            .apply("consistent_hashing")
+            .expect("a preset of this build applies");
+        let owner = picked(&mut harness, keyed(nth("key", 0), 1))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        for n in 1..8 {
+            let again = picked(&mut harness, keyed(nth("key", n), 1))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(again, owner, "one routing key returns to one worker");
+        }
+        let mut owners = HashSet::from([owner]);
+        for n in 1..ASKS {
+            let other = picked(&mut harness, keyed(nth("keys", n), n + 1))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            owners.insert(other);
+        }
+        assert!(
+            owners.len() > 1,
+            "{ASKS} routing keys do not share one worker: {owners:?}"
+        );
+        // A retry that names the worker it tried is answered with another.
+        let mut retry = keyed(nth("retry", 0), 1);
+        let facts = retry.facts.as_mut().expect("the ask states facts");
+        facts.tried = vec![owner.id];
+        facts.attempt = 1;
+        let next = picked(&mut harness, retry)
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_ne!(next, owner, "a retry leaves the worker it names as tried");
 
         // The death. The kill waits for a view that reads its engine
         // healthy, so the death alone moves its rows. Its promise is held
@@ -442,6 +613,21 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .map(|verdict| verdict.at.duration_since(death.at))
             .max()
             .unwrap_or_default();
+        // No decision names the dead engine: from the probe that heard it
+        // dead its rows are no candidates.
+        harness
+            .apply("random")
+            .expect("a preset of this build applies");
+        for n in 0..ASKS {
+            let pick = picked(&mut harness, nth("dead", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(
+                pick.engine, dead,
+                "a dead engine is named by no decision: {pick:?}"
+            );
+        }
+
         // The dead engine's event stream broke with it, and its subscriber
         // keeps what refuses it since: the dial of an engine that is gone.
         within(

@@ -305,6 +305,8 @@ pub struct Harness {
     held: Vec<AbortOnDropStream>,
     /// The requests sent so far: the next one's lease id.
     sent: u64,
+    /// The spec generations applied so far.
+    generation: u64,
     buffers: ViewBuffers,
     stop_feeds: watch::Sender<bool>,
     feeds: JoinSet<()>,
@@ -339,6 +341,30 @@ async fn bounded<T>(
 
 fn millis(duration: Duration) -> u32 {
     u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+}
+
+/// The health policy every registration states: one probe turn moves a
+/// rank between ready and unhealthy, at the stand-in prober's interval and
+/// under its dial bound.
+fn health_policy() -> HealthPolicy {
+    HealthPolicy {
+        failure_threshold: 1,
+        success_threshold: 1,
+        check_interval_ms: millis(PROBE_INTERVAL),
+        timeout_ms: millis(DIAL_TIMEOUT),
+        probes: true,
+    }
+}
+
+/// The policy in the contract's form, for an operator's add.
+fn wire_health(policy: HealthPolicy) -> proto::HealthPolicy {
+    proto::HealthPolicy {
+        failure_threshold: policy.failure_threshold,
+        success_threshold: policy.success_threshold,
+        check_interval_ms: policy.check_interval_ms,
+        timeout_ms: policy.timeout_ms,
+        disabled: !policy.probes,
+    }
 }
 
 /// `role` as the contract names it.
@@ -848,6 +874,7 @@ impl Harness {
             feeding: false,
             held: Vec::new(),
             sent: 0,
+            generation: 0,
             buffers: ViewBuffers::default(),
             stop_feeds,
             feeds: JoinSet::new(),
@@ -877,11 +904,12 @@ impl Harness {
         self.replica.gateway()
     }
 
-    /// Applies the preset named `preset` as the store's first generation,
+    /// Applies the preset named `preset` as the store's next generation,
     /// in the case's process: no call of the controller applies a spec yet.
-    pub fn apply(&self, preset: &str) -> Result<(), String> {
+    pub fn apply(&mut self, preset: &str) -> Result<(), String> {
         let mut document = PolicySpec::preset(preset).map_err(|error| error.to_string())?;
-        document.generation = 1;
+        self.generation += 1;
+        document.generation = self.generation;
         let spec = AppliedSpec::validate(&document).map_err(|error| error.to_string())?;
         self.store.apply(spec).map_err(|error| error.to_string())
     }
@@ -954,13 +982,7 @@ impl Harness {
                     events: true,
                     ..Signals::default()
                 },
-                health: HealthPolicy {
-                    failure_threshold: 1,
-                    success_threshold: 1,
-                    check_interval_ms: millis(PROBE_INTERVAL),
-                    timeout_ms: millis(DIAL_TIMEOUT),
-                    probes: true,
-                },
+                health: health_policy(),
                 ..WorkerFacts::default()
             })
             .id();
@@ -977,13 +999,7 @@ impl Harness {
                 role: wire_role(shape.role).into(),
                 runtime: RuntimeType::Vllm.as_str().to_owned(),
                 models: vec![shape.model.to_owned()],
-                health_policy: Some(proto::HealthPolicy {
-                    failure_threshold: 1,
-                    success_threshold: 1,
-                    check_interval_ms: millis(PROBE_INTERVAL),
-                    timeout_ms: millis(DIAL_TIMEOUT),
-                    disabled: false,
-                }),
+                health_policy: Some(wire_health(health_policy())),
                 signals: Some(proto::Signals {
                     events: true,
                     ..proto::Signals::default()
