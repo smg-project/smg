@@ -194,7 +194,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # assembled and wrapped into components of the committed world at test time:
 # no binary fixture and no cross target.
 wat = "1"
-wit-component = { version = "0.258.3", default-features = false }
+wit-component = { version = "0.263.0", default-features = false }
 # The controller's mutual-TLS test mints its authority, server and client
 # certificates when it runs; no certificate file lives in the repository.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
