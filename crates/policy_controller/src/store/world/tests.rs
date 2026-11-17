@@ -27,6 +27,7 @@ use crate::{
     AppliedSpec, PairPools, PairTable, PolicySpec, Scratch,
 };
 
+mod list_room;
 mod mode_and_overload;
 mod written;
 

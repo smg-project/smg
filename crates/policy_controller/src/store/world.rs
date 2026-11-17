@@ -289,6 +289,12 @@ impl Derived {
         let prefill = self.by_model.get(model)?[role_slot(Role::Prefill)]?;
         self.pools.get(prefill as usize)?.pairs.as_ref()
     }
+
+    /// How many members `pool` holds: none where there is no pool.
+    fn members(&self, pool: Option<u32>) -> usize {
+        pool.and_then(|pool| self.pools.get(pool as usize))
+            .map_or(0, |shape| shape.admitted_micros.len())
+    }
 }
 
 /// One standing veto as its gateway's run in a pool carries it: the row it
@@ -889,6 +895,18 @@ struct Entry<'a> {
     local: Option<GatewayId>,
     /// The thresholds its registration names.
     own: Overload,
+}
+
+/// The list a membership write fills for a pool that stood at `standing`
+/// members: room for them and one more, the most a membership write adds a
+/// pool, so the list is allocated once. A pool that did not stand takes no
+/// room, and its list grows as it fills.
+fn list_of<T>(standing: usize) -> Vec<T> {
+    if standing == 0 {
+        Vec::new()
+    } else {
+        Vec::with_capacity(standing + 1)
+    }
 }
 
 /// What the pairing rule reads of one side's entries, in place: each
@@ -1673,7 +1691,13 @@ impl Writer {
                 match groups.get_mut(model.as_str()) {
                     Some(sides) => sides[side].push(entry),
                     None => {
-                        let mut sides: [Vec<Entry<'a>>; ROLES] = Default::default();
+                        // Each side takes room for its pool's last members
+                        // and the one this write may add.
+                        let before = self.derived.by_model.get(model.as_str());
+                        let standing = before.map_or([0; ROLES], |pools| {
+                            pools.map(|pool| self.derived.members(pool))
+                        });
+                        let mut sides: [Vec<Entry<'a>>; ROLES] = standing.map(list_of);
                         sides[side].push(entry);
                         groups.insert(model.as_str().into(), sides);
                     }
