@@ -225,6 +225,23 @@ fn require_positive<T: Default + Ord + std::fmt::Display>(
     Ok(())
 }
 
+/// Refuse a NaN, an infinity or a value under 1.0 for a factor that starts
+/// at 1.0.
+fn require_at_least_one<T: Copy + Into<f64> + std::fmt::Display>(
+    field: &str,
+    value: T,
+) -> ConfigResult<()> {
+    let factor: f64 = value.into();
+    if !factor.is_finite() || factor < 1.0 {
+        return Err(ConfigError::invalid_value(
+            field,
+            value,
+            "Must be finite and >= 1.0",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a single worker URL: non-empty, an allowed scheme, a parseable
 /// host, and one address to both of its readers (`read_two_ways`: the URL
 /// library a client dials by and the gateway's own type every line names
@@ -1336,13 +1353,7 @@ impl ConfigValidator {
                     ));
                 }
 
-                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
-                    return Err(ConfigError::invalid_value(
-                        "balance_rel_threshold",
-                        balance_rel_threshold,
-                        "Must be finite and >= 1.0",
-                    ));
-                }
+                require_at_least_one("balance_rel_threshold", *balance_rel_threshold)?;
 
                 require_positive("eviction_interval_secs", *eviction_interval_secs)?;
 
@@ -1377,13 +1388,7 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 bucket_adjust_interval_secs,
             } => {
-                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
-                    return Err(ConfigError::invalid_value(
-                        "balance_rel_threshold",
-                        balance_rel_threshold,
-                        "Must be finite and >= 1.0",
-                    ));
-                }
+                require_at_least_one("balance_rel_threshold", *balance_rel_threshold)?;
 
                 if *bucket_adjust_interval_secs < 1 {
                     return Err(ConfigError::invalid_value(
@@ -1408,13 +1413,7 @@ impl ConfigValidator {
             } => {
                 require_positive("prefix_token_count", *prefix_token_count)?;
 
-                if !load_factor.is_finite() || *load_factor < 1.0 {
-                    return Err(ConfigError::invalid_value(
-                        "load_factor",
-                        load_factor,
-                        "Must be finite and >= 1.0",
-                    ));
-                }
+                require_at_least_one("load_factor", *load_factor)?;
 
                 Self::validate_cache_boundaries(cache_boundaries)?;
             }
@@ -2279,13 +2278,7 @@ impl ConfigValidator {
                 "Must be >= initial_backoff_ms",
             ));
         }
-        if !retry.backoff_multiplier.is_finite() || retry.backoff_multiplier < 1.0 {
-            return Err(ConfigError::invalid_value(
-                "retry.backoff_multiplier",
-                retry.backoff_multiplier,
-                "Must be finite and >= 1.0",
-            ));
-        }
+        require_at_least_one("retry.backoff_multiplier", retry.backoff_multiplier)?;
         if !(0.0..=1.0).contains(&retry.jitter_factor) {
             return Err(ConfigError::invalid_value(
                 "retry.jitter_factor",
@@ -2583,6 +2576,22 @@ mod tests {
             assert!(matches!(
                 require_positive("field", value),
                 Err(ConfigError::InvalidValue { reason, .. }) if reason == "Must be > 0"
+            ));
+        }
+    }
+
+    /// A factor is refused when it is not a number, not finite or under 1.0,
+    /// whichever float type holds it, and the error names it as it was written.
+    #[test]
+    fn require_at_least_one_refuses_nan_infinity_and_under_one() {
+        assert!(require_at_least_one("field", 1.0_f32).is_ok());
+        assert!(require_at_least_one("field", 1.25_f64).is_ok());
+        assert!(require_at_least_one("field", f64::NAN).is_err());
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.1] {
+            assert!(matches!(
+                require_at_least_one("field", value),
+                Err(ConfigError::InvalidValue { value: named, reason, .. })
+                    if named == value.to_string() && reason == "Must be finite and >= 1.0"
             ));
         }
     }

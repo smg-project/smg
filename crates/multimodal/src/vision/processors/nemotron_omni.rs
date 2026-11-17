@@ -396,9 +396,7 @@ impl VisionPreProcessor for NemotronOmniProcessor {
         images: &[&DynamicImage],
         context: &VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let sizes: Vec<_> = images
             .iter()
             .map(|image| (image.width(), image.height()))

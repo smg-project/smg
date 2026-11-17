@@ -13,6 +13,12 @@ license = "Apache-2.0"
 [dependencies]
 smg-policy-controller = { path = "../../crates/policy_controller", features = ["controller"] }
 
+# The allocator this binary registers: the one the stock controller's binary
+# registers, on the targets where its settings hold (an Apple target is left
+# out). The library registers none.
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl"), not(target_vendor = "apple")))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
 # The tests read the example's document as the controller reads one, and
 # bind a controller as the run loop does.
 [dev-dependencies]

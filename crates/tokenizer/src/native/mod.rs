@@ -80,6 +80,7 @@ use thread_local::ThreadLocal;
 use tokenizers::{models::ModelWrapper, Model};
 use unicode_normalization_alignments::UnicodeNormalization;
 
+mod block;
 mod cased;
 mod chain;
 mod long_entries;
@@ -3027,9 +3028,17 @@ impl NativeEncoder {
                 if matches!(stage.pieces.walk(), Walk::Apart { matches: true, .. }) =>
             {
                 // An all-ASCII unit has a copy of the stage's loop compiled
-                // for it (see `encode_single_stage`).
+                // for it (see `encode_single_stage`). Any other unit goes by
+                // blocks where its pattern gives that reader. The all-ASCII
+                // unit does not: its lean scan reads long words in fewer
+                // instructions than the block pass (measured: the pass costs
+                // a sixth more on a text of 18-byte words).
                 let encoded = if cache.unit_ascii {
                     self.encode_single_stage::<true>(model, stage, text, words, mapped, ids, cache)
+                } else if let Some(blocks) = stage.pattern.by_blocks(text) {
+                    self.encode_single_stage_by_blocks(
+                        model, blocks, text, words, mapped, ids, cache,
+                    )
                 } else {
                     self.encode_single_stage::<false>(model, stage, text, words, mapped, ids, cache)
                 };
@@ -3330,6 +3339,41 @@ impl NativeEncoder {
                 fallback = Some(declined);
             }
         }
+        fallback.map_or(Ok(()), Err)
+    }
+
+    /// [`Self::encode_single_stage`] for a unit its pattern reads by blocks,
+    /// a routine of its own: the block pass and the walk between its
+    /// stretches compile in here with a probe of their own, and
+    /// [`Self::encode_single_stage`] keeps its text and its loops as they
+    /// are. A pattern that gives a reader by blocks leaves no gap in any
+    /// text (`Pattern::by_blocks`), so there is none to tokenize here and
+    /// no cursor to keep.
+    #[inline(never)]
+    #[expect(clippy::too_many_arguments)]
+    fn encode_single_stage_by_blocks(
+        &self,
+        model: Option<&ModelWrapper>,
+        blocks: pattern::ByBlocks<'_>,
+        text: &str,
+        words: bool,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let mut fallback = None;
+        blocks.for_each_match(
+            text,
+            words,
+            #[inline(always)]
+            |start, end| {
+                if let Err(declined) =
+                    self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
+                {
+                    fallback = Some(declined);
+                }
+            },
+        );
         fallback.map_or(Ok(()), Err)
     }
 

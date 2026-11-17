@@ -438,8 +438,13 @@ pub(super) fn validate_constrained_decoding_label(
 ) -> WorkflowResult<()> {
     match labels.get(ConstrainedDecoding::LABEL) {
         Some(value) => {
-            ConstrainedDecoding::parse(value)
-                .map(drop)
+            // The value may be the worker's own report, and the refusal of an
+            // unknown policy repeats it: a control character is refused first,
+            // in a sentence that names the label and not the value.
+            let field = (ConstrainedDecoding::LABEL, Some(value.as_str()));
+            control_character_refusal([field])
+                .map_or(Ok(()), Err)
+                .and_then(|()| ConstrainedDecoding::parse(value).map(drop))
                 .map_err(|why| WorkflowError::StepFailed {
                     step_id: StepId::new(step),
                     message: format!("Worker {}: {why}", Endpoint::redacted_str(url)),
@@ -2012,6 +2017,32 @@ mod tests {
             ])
             .await,
             "Step failed: create_worker - models[].reasoning_parser must not contain control characters"
+        );
+    }
+
+    /// A `constrained_decoding` value the worker reports with a control
+    /// character in it is refused in a sentence that names the label and
+    /// does not repeat the value. A value on one line that names no policy
+    /// is refused by name, as before.
+    #[tokio::test]
+    async fn a_reported_decoding_policy_with_a_control_character_fails_the_registration() {
+        assert_eq!(
+            failure_of_a_worker_reporting(&[
+                ("served_model_name", "m"),
+                ("constrained_decoding", "sometimes\nINJECTED"),
+            ])
+            .await,
+            "Step failed: create_worker - Worker http://worker:8000: \
+             constrained_decoding must not contain control characters"
+        );
+        assert_eq!(
+            failure_of_a_worker_reporting(&[
+                ("served_model_name", "m"),
+                ("constrained_decoding", "sometimes"),
+            ])
+            .await,
+            "Step failed: create_worker - Worker http://worker:8000: constrained_decoding must be \
+             'requested' or 'always', not 'sometimes'"
         );
     }
 

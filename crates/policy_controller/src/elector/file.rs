@@ -155,6 +155,12 @@ mod tests {
 
     const S: Duration = Duration::from_secs(1);
 
+    /// How far ahead of the clock a case that steps through a wait starts its
+    /// instants: the elector dates a first sight at the later of the caller's
+    /// instant and its own clock, and an instant the real clock overtakes
+    /// moves the wait.
+    const AHEAD: Duration = S.saturating_mul(3_600);
+
     fn record(holder: &str, term: u64, renewed_at_micros: u64) -> LeaseRecord {
         LeaseRecord {
             holder: holder.to_string(),
@@ -287,7 +293,7 @@ mod tests {
         let path = dir.path().join("lease");
         let mut a = candidate(&path, "a@host:1");
         let mut b = candidate(&path, "b@host:2");
-        let t0 = Instant::now();
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
         assert_eq!(
             b.tick(t0).expect("tick"),

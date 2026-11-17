@@ -5,10 +5,13 @@
 //! It dials a controller's gateway listener, asks who leads and opens the
 //! gateway's session: a `Hello`, answered by the leader's `Welcome`. On that
 //! session it reports a request's life as its caller tells it: a
-//! `Dispatched`, a `Completed`, a `Released`. The term of every answer raises
-//! its term floor, and a frame of the session under a term below the floor
-//! is refused. What a gateway's own host adds is not here: a fallback
-//! engine, the decision a lease comes from, the spec push and its
+//! `Dispatched`, a `Completed`, a `Released`. It asks the controller which
+//! worker a request goes to on one decide stream, one ask at a time
+//! ([`Client::decide`]). The term of every answer raises its term floor, and
+//! a frame of the session or an answer of the decide stream under a term
+//! below the floor is refused. What a gateway's own host adds is not here: a
+//! fallback engine, asks in flight together and a second decide stream, the
+//! lease a decision books and its release, the spec push and its
 //! acknowledgement, and reconnection.
 //!
 //! The client takes its channel and makes no credential:
@@ -21,13 +24,21 @@
 //! No wait of the client for its peer outlasts [`ANSWER_WAIT`], on any
 //! endpoint: the dial, each call from its send to its answer's end, the
 //! session's call with its first frame, a report's wait for room in the
-//! session's queue and the wait for the session's end. An endpoint's own
+//! session's queue, the wait for the session's end, the decide stream's
+//! open and an ask's waits for room in its queue and for its answer. An
+//! endpoint's own
 //! time-outs end a wait sooner, and as the channel's error, not as the
 //! client's [`Error::NoAnswer`]: [`Error::Status`] for a call and
 //! [`Error::Connect`] for the dial.
 
-use std::{future::Future, time::Duration};
+use std::{
+    future::{poll_fn, Future},
+    pin::pin,
+    task::Poll,
+    time::Duration,
+};
 
+use prost::Message as _;
 use tokio::sync::mpsc;
 use tonic::{
     codegen::tokio_stream::wrappers::ReceiverStream,
@@ -38,16 +49,21 @@ use tonic::{
 };
 
 use crate::{
-    controller::{PRINCIPAL_ENTRY, PROTOCOL_VERSION},
+    controller::{MAX_FRAME, MAX_REQUEST_ID, PRINCIPAL_ENTRY, PROTOCOL_VERSION},
     proto::{
-        controller_frame, gateway_frame, policy_controller_client::PolicyControllerClient,
-        Completed, ControllerFrame, Dispatched, GatewayFrame, Hello, LeaderInfo, LeaderRequest,
-        Released, Welcome,
+        controller_frame, decide_answer, gateway_frame,
+        policy_controller_client::PolicyControllerClient, Busy, Completed, ControllerFrame,
+        DecideAnswer, DecideRequest, Decision, Dispatched, GatewayFrame, Hello, LeaderInfo,
+        LeaderRequest, Released, Welcome,
     },
 };
 
 /// Frames the client may queue toward the controller.
 const SESSION_QUEUE: usize = 16;
+
+/// The bytes one block hash takes in a frame: a fixed 64 bits of a packed
+/// list.
+const HASH: usize = 8;
 
 /// The bound on each wait of the client for its peer: an answer a leader
 /// under load can give, and a wait a blocking caller can afford. The client
@@ -72,8 +88,9 @@ pub enum Error {
     Connect(#[source] tonic::transport::Error),
     /// The peer did not answer inside the client's bound. Every wait that
     /// bound ends is this kind and names the wait: the dial, the `Leader`
-    /// ask, the session's welcome, the session's queue or the session's
-    /// end. A time-out the caller set on its own endpoint is not this
+    /// ask, the session's welcome, the session's queue, the session's
+    /// end, the decide stream's open, its queue, its end or the decision.
+    /// A time-out the caller set on its own endpoint is not this
     /// kind: it ends a call as [`Error::Status`] and the dial as
     /// [`Error::Connect`].
     #[error("no answer within {wait:?}: {what}")]
@@ -96,10 +113,11 @@ pub enum Error {
     /// welcome.
     #[error("the session answered the hello with no welcome: {0}")]
     NoWelcome(String),
-    /// A frame of the session came under a term below the client's floor.
-    /// A gateway rejects a frame below its floor whatever it carries. At
-    /// the open the session is not taken, and the address a `NotLeader`
-    /// names is not read; after the welcome the frame is read no further.
+    /// A frame of the session or an answer of the decide stream came
+    /// under a term below the client's floor. A gateway rejects a frame
+    /// below its floor whatever it carries. At the open the session is not
+    /// taken, and the address a `NotLeader` names is not read; after the
+    /// welcome the frame is read no further. A decide stream is dropped.
     #[error("a frame's term {term} is below the floor {floor}")]
     BelowFloor {
         /// The term the frame came under.
@@ -107,6 +125,26 @@ pub enum Error {
         /// The floor the frame was read under.
         floor: u64,
     },
+    /// An ask's request id is outside the call's range. The controller
+    /// ends a stream at such a frame, so the client refuses it at its own
+    /// door and sends nothing. A caller whose key is longer sends a digest
+    /// of it, never a cut: a cut key can be two requests'.
+    #[error("a request id of {0} bytes is outside the call's range of 1 to {most} bytes", most = MAX_REQUEST_ID)]
+    RequestId(usize),
+    /// An ask is over the call's bound on a frame as encoded and holds no
+    /// block hash to cut: the client drops no other field for size, and
+    /// sends nothing.
+    #[error("a DecideRequest of {0} bytes is over the call's limit of {limit} bytes with no block hash to cut", limit = MAX_FRAME)]
+    TooLarge(usize),
+    /// The decide stream has no credit left: the gateway decides this
+    /// request itself. Nothing was sent, and the stream stands.
+    #[error("the decide stream has no credit left: the gateway decides this request itself")]
+    NoCredit,
+    /// The decide stream answered an ask with a frame that is no answer
+    /// to it: one that names another request's id, or carries no answer
+    /// this client reads. The stream is dropped.
+    #[error("the decide stream answered an ask with no answer to it: {0}")]
+    NoDecision(String),
     /// The blocking form could not build its runtime.
     #[error("no runtime for the blocking client: {0}")]
     Runtime(#[source] std::io::Error),
@@ -324,6 +362,217 @@ async fn ask_leader(stub: &mut Stub, wait: Duration) -> Result<LeaderInfo, Error
         .into_inner())
 }
 
+/// What the controller answered one ask.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Answer {
+    /// The controller's decision as the wire says it: a pick, a shed or a
+    /// queue, with the leases it booked and its trace. One with no outcome
+    /// is a deadline miss.
+    Decision(Decision),
+    /// The controller decided nothing, for the reason it names: the gateway
+    /// decides this request itself.
+    Busy(Busy),
+}
+
+/// The client's decide stream between its asks. It holds nothing a new
+/// stream must find: its credit starts again at the welcome's window.
+#[derive(Debug)]
+struct Decide {
+    /// The queue toward the controller, of one ask. Its drop ends the
+    /// gateway's side of the stream.
+    requests: mpsc::Sender<DecideRequest>,
+    /// The controller's answers. Its drop cancels the stream.
+    answers: Streaming<DecideAnswer>,
+    /// The asks the stream may still send: an ask spends one, a `Credit`
+    /// frame adds its window, and the controller takes none back.
+    credit: u32,
+}
+
+impl Decide {
+    /// Opens the stream with `window` asks of credit; the call's answer
+    /// must come within `wait`. A controller refuses the open where no
+    /// session of the gateway stands.
+    async fn open(stub: &mut Stub, window: u32, wait: Duration) -> Result<Self, Error> {
+        let (requests, queued) = mpsc::channel(1);
+        let opened = stub.decide(ReceiverStream::new(queued));
+        let answers = answered("the decide stream's open", wait, opened)
+            .await??
+            .into_inner();
+        Ok(Self {
+            requests,
+            answers,
+            credit: window,
+        })
+    }
+
+    /// Queues `request` within `wait` and spends one credit. With none
+    /// left, the frames the stream already holds are read first, with no
+    /// wait ([`Decide::held`]); with none still, the ask is
+    /// [`Error::NoCredit`] and nothing is queued. A queue the stream's end
+    /// closed tells the status the stream ended with.
+    async fn send(
+        &mut self,
+        floor: &mut u64,
+        request: DecideRequest,
+        wait: Duration,
+    ) -> Result<(), Error> {
+        if self.credit == 0 {
+            self.held(floor).await?;
+        }
+        if self.credit == 0 {
+            return Err(Error::NoCredit);
+        }
+        let queued = self.requests.send(request);
+        match answered("the decide stream's queue", wait, queued).await? {
+            Ok(()) => {
+                self.credit -= 1;
+                Ok(())
+            }
+            Err(_) => Err(self.ended(floor, wait).await),
+        }
+    }
+
+    /// Reads the frames the stream holds at this instant, each polled for
+    /// once and never waited for: credit that has not come is none. A
+    /// frame that carries an answer answers no ask, since none stands.
+    async fn held(&mut self, floor: &mut u64) -> Result<(), Error> {
+        loop {
+            let polled = {
+                let mut next = pin!(self.answers.message());
+                poll_fn(|context| Poll::Ready(next.as_mut().poll(context))).await
+            };
+            let frame = match polled {
+                Poll::Ready(Ok(Some(frame))) => frame,
+                Poll::Ready(Ok(None)) => return Err(clean_end()),
+                Poll::Ready(Err(status)) => return Err(status.into()),
+                Poll::Pending => return Ok(()),
+            };
+            if let Some(unasked) = self.read(floor, frame)? {
+                return Err(Error::NoDecision(format!("{unasked:?}")));
+            }
+        }
+    }
+
+    /// One frame of the stream under the floor's check, which the frame
+    /// then raises: a `Credit` adds its window and is read no further
+    /// (`None`); any other frame is handed back.
+    fn read(
+        &mut self,
+        floor: &mut u64,
+        frame: DecideAnswer,
+    ) -> Result<Option<DecideAnswer>, Error> {
+        if frame.term < *floor {
+            return Err(Error::BelowFloor {
+                term: frame.term,
+                floor: *floor,
+            });
+        }
+        *floor = frame.term;
+        if let Some(decide_answer::Answer::Credit(credit)) = &frame.answer {
+            self.credit = self.credit.saturating_add(credit.window);
+            return Ok(None);
+        }
+        Ok(Some(frame))
+    }
+
+    /// The answer to the ask `id`, within `wait`: frames are read until
+    /// one carries an answer, a `Credit` on the way adding its window. The
+    /// id rides back on an answer as its request's key: an answer that
+    /// names another id, or carries no answer this client reads, is
+    /// [`Error::NoDecision`]. A stream that ends first tells its status.
+    async fn answer(
+        &mut self,
+        floor: &mut u64,
+        id: &[u8],
+        wait: Duration,
+    ) -> Result<Answer, Error> {
+        let read = async {
+            loop {
+                let Some(frame) = self.answers.message().await? else {
+                    return Err(clean_end());
+                };
+                let Some(frame) = self.read(floor, frame)? else {
+                    continue;
+                };
+                if frame.request_id != id {
+                    return Err(Error::NoDecision(format!("{frame:?}")));
+                }
+                return match frame.answer {
+                    Some(decide_answer::Answer::Decision(decision)) => {
+                        Ok(Answer::Decision(decision))
+                    }
+                    Some(decide_answer::Answer::Busy(busy)) => Ok(Answer::Busy(busy)),
+                    // A `Credit` was read above: what is left is no kind
+                    // of this client's protocol.
+                    _ => Err(Error::NoDecision(format!(
+                        "an answer of no kind this client reads, under the term {}",
+                        frame.term
+                    ))),
+                };
+            }
+        };
+        answered("the decision", wait, read).await?
+    }
+
+    /// Why a stream whose queue closed ended, awaited within `wait`: its
+    /// status, as an error. A frame that comes first takes the floor's
+    /// check and is read no further.
+    async fn ended(&mut self, floor: &mut u64, wait: Duration) -> Error {
+        let ended = async {
+            loop {
+                match self.answers.message().await {
+                    Ok(Some(frame)) => {
+                        self.read(floor, frame)?;
+                    }
+                    Ok(None) => return Ok(clean_end()),
+                    Err(status) => return Ok::<_, Error>(status.into()),
+                }
+            }
+        };
+        match answered("the decide stream's end", wait, ended).await {
+            Ok(Ok(error) | Err(error)) | Err(error) => error,
+        }
+    }
+}
+
+/// A decide stream's clean end, as the status an ask is told.
+fn clean_end() -> Error {
+    Status::ok("the decide stream ended").into()
+}
+
+/// The call's two bounds, held at the client's own door so that no frame
+/// of the client ends a stream by them: the id's range, then the frame's
+/// size as encoded. A frame over the size loses whole block hashes at its
+/// tail until it fits, and the count cut is returned: a controller reads
+/// a list from its head. No other field is dropped for size.
+fn fit(request: &mut DecideRequest) -> Result<usize, Error> {
+    let id = request.request_id.len();
+    if !(1..=MAX_REQUEST_ID).contains(&id) {
+        return Err(Error::RequestId(id));
+    }
+    let size = request.encoded_len();
+    if size <= MAX_FRAME {
+        return Ok(0);
+    }
+    let held = request
+        .facts
+        .as_ref()
+        .map_or(0, |facts| facts.block_hashes.len());
+    // A cut takes its hashes' bytes off the frame, and off the lengths
+    // written before the list less than one hash more: one hash fewer than
+    // the bytes over ask for is the least that can fit.
+    let mut kept = held.saturating_sub((size - MAX_FRAME).div_ceil(HASH) - 1);
+    loop {
+        if let Some(facts) = &mut request.facts {
+            facts.block_hashes.truncate(kept);
+        }
+        if request.encoded_len() <= MAX_FRAME {
+            return Ok(held - kept);
+        }
+        kept = kept.checked_sub(1).ok_or(Error::TooLarge(size))?;
+    }
+}
+
 /// One gateway's side of the protocol over one channel.
 #[derive(Debug)]
 pub struct Client {
@@ -332,8 +581,14 @@ pub struct Client {
     /// The bound on each wait for the peer.
     wait: Duration,
     session: Session,
+    /// The decide stream between asks: none before the first ask, during
+    /// one, and after one that ended with an error other than
+    /// [`Error::NoCredit`].
+    decide: Option<Decide>,
     /// The highest term an answer named.
     floor: u64,
+    /// The block hashes cut from the asks sent so far.
+    cut: usize,
 }
 
 impl Client {
@@ -389,7 +644,9 @@ impl Client {
             stub,
             wait,
             session,
+            decide: None,
             floor: floor.max(term),
+            cut: 0,
         })
     }
 
@@ -430,6 +687,58 @@ impl Client {
         self.session.send(&mut self.floor, frame, self.wait).await
     }
 
+    /// Asks the controller which worker one request goes to: one
+    /// `DecideRequest` on the client's decide stream, answered by the
+    /// controller's decision or by a `Busy`, for the gateway to decide
+    /// itself. One ask at a time: its answer is read before the call
+    /// returns. The client keeps no lease and decides nothing itself.
+    ///
+    /// The stream opens at the first ask, as a present gateway's: the
+    /// session's hello stands by then. Its credit starts at the welcome's
+    /// `decide_window`; an ask spends one, and a `Credit` frame read on the
+    /// way to an answer adds its window. An ask with none left is
+    /// [`Error::NoCredit`] and is sent nowhere.
+    ///
+    /// The call's two bounds are held before the send. An id outside the
+    /// call's range is [`Error::RequestId`]. A frame over the call's size
+    /// as encoded loses block hashes at its tail until it fits, counted by
+    /// [`Client::hashes_cut`] once the ask is queued; one with none left
+    /// to cut is [`Error::TooLarge`].
+    ///
+    /// An answer under a term below the floor is [`Error::BelowFloor`];
+    /// one that is no answer to the ask is [`Error::NoDecision`]; a stream
+    /// that ended tells its status ([`Error::Status`]); an open, a queue
+    /// or an answer that outlasts the client's bound is
+    /// [`Error::NoAnswer`]. Each of these drops the stream, as does a call
+    /// dropped before its end, and the next ask opens a new one at the
+    /// welcome's window: an answer that comes late is never read. An ask
+    /// given up may still be decided, and the lease it booked stands until
+    /// it expires.
+    pub async fn decide(&mut self, mut request: DecideRequest) -> Result<Answer, Error> {
+        let cut = fit(&mut request)?;
+        let wait = self.wait;
+        // The stream is the ask's own while it is asked: an ask that ends
+        // in an error, or is dropped, puts none back.
+        let mut stream = match self.decide.take() {
+            Some(stream) => stream,
+            None => {
+                let window = self.session.welcome.decide_window;
+                Decide::open(&mut self.stub, window, wait).await?
+            }
+        };
+        let id = request.request_id.clone();
+        if let Err(refused) = stream.send(&mut self.floor, request, wait).await {
+            if matches!(refused, Error::NoCredit) {
+                self.decide = Some(stream);
+            }
+            return Err(refused);
+        }
+        self.cut += cut;
+        let answer = stream.answer(&mut self.floor, &id, wait).await?;
+        self.decide = Some(stream);
+        Ok(answer)
+    }
+
     /// The session's end, awaited within the client's bound: the status the
     /// controller ended the stream with, the same at each ask once it is
     /// read. A frame that comes first raises the floor by its term and is
@@ -443,6 +752,12 @@ impl Client {
     /// The welcome that answered the session's hello.
     pub fn welcome(&self) -> &Welcome {
         &self.session.welcome
+    }
+
+    /// The block hashes the client cut from the tails of the asks it sent,
+    /// each cut to fit its ask in a frame ([`Client::decide`]).
+    pub fn hashes_cut(&self) -> usize {
+        self.cut
     }
 
     /// The gateway this client speaks as.
@@ -463,8 +778,8 @@ pub mod blocking {
     use tokio::runtime::{Builder, Runtime};
     use tonic::{transport::Endpoint, Status};
 
-    use super::Error;
-    use crate::proto::{Completed, Dispatched, LeaderInfo, Released, Welcome};
+    use super::{Answer, Error};
+    use crate::proto::{Completed, DecideRequest, Dispatched, LeaderInfo, Released, Welcome};
 
     /// [`super::Client`] driven to each call's end on a runtime of its own.
     /// It holds no protocol: every call is the async client's. The runtime
@@ -530,9 +845,19 @@ pub mod blocking {
             self.runtime.drive(self.inner.session_end())
         }
 
+        /// [`super::Client::decide`].
+        pub fn decide(&mut self, request: DecideRequest) -> Result<Answer, Error> {
+            self.runtime.drive(self.inner.decide(request))
+        }
+
         /// [`super::Client::welcome`].
         pub fn welcome(&self) -> &Welcome {
             self.inner.welcome()
+        }
+
+        /// [`super::Client::hashes_cut`].
+        pub fn hashes_cut(&self) -> usize {
+            self.inner.hashes_cut()
         }
 
         /// [`super::Client::gateway_id`].
@@ -606,7 +931,7 @@ mod tests {
     use tokio::{
         net::TcpListener,
         sync::mpsc::{unbounded_channel, UnboundedReceiver},
-        task::JoinSet,
+        task::{yield_now, JoinSet},
         time::timeout,
     };
     use tonic::{
@@ -618,11 +943,12 @@ mod tests {
     };
 
     use super::{
-        blocking, controller_frame, gateway_frame, hello, numbered, Client, ControllerFrame, Error,
+        blocking, controller_frame, decide_answer, fit, gateway_frame, hello, numbered, Answer,
+        Busy, Client, ControllerFrame, Decide, DecideAnswer, DecideRequest, Decision, Error,
         GatewayFrame, PolicyControllerClient, Principal, Session, Stub, Welcome, ANSWER_WAIT,
-        PRINCIPAL_ENTRY, PROTOCOL_VERSION,
+        MAX_FRAME, MAX_REQUEST_ID, PRINCIPAL_ENTRY, PROTOCOL_VERSION,
     };
-    use crate::proto::{Completed, Dispatched, NotLeader, Released};
+    use crate::proto::{busy, Completed, Credit, Dispatched, NotLeader, Released, RequestFacts};
 
     /// The bound a case gives a wait it wants ended.
     const SHORT: Duration = Duration::from_millis(300);
@@ -1263,7 +1589,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_report_after_a_kept_end_is_refused_while_the_queue_still_takes_frames() {
-        let (address, _serving, _kept) = keeping().await;
+        let (address, _serving, mut kept) = keeping().await;
         let mut stub = stub(address).await;
         let (mut session, _) = Session::open(&mut stub, "gateway-1", 0, ROOM)
             .await
@@ -1271,16 +1597,51 @@ mod tests {
         // The minute after the end is read and before the connection drops
         // the ended call's request: the status is kept and the queue still
         // takes frames. This peer never ends the stream, so the case keeps
-        // the status itself.
-        session.ended = Some(Status::invalid_argument("the frame reads wrong"));
+        // the status itself: an error's, then a clean end's.
         let mut floor = 0;
-        let report = gateway_frame::Frame::Released(Released::default());
-        let reported = session.send(&mut floor, report, ROOM).await;
+        let ends = [
+            (
+                Status::invalid_argument("the frame reads wrong"),
+                Code::InvalidArgument,
+            ),
+            (Status::ok("the session's stream ended"), Code::Ok),
+        ];
+        for (ended, code) in ends {
+            session.ended = Some(ended);
+            let report = gateway_frame::Frame::Released(Released::default());
+            let reported = session.send(&mut floor, report, ROOM).await;
+            assert!(
+                matches!(&reported, Err(Error::Status(status)) if status.code() == code),
+                "a report after a kept end tells its status and queues nothing: {reported:?}"
+            );
+            assert_eq!(session.seq, 1, "a refused report takes no number");
+        }
+        // The peer's own read: with the end taken back, the next report is
+        // the first frame to reach it after the hello.
+        session.ended = None;
+        let report = gateway_frame::Frame::Dispatched(Dispatched::default());
+        session
+            .send(&mut floor, report, ROOM)
+            .await
+            .expect("the report is queued");
+        let mut read = Vec::new();
+        for _ in 0..2 {
+            let frame = timeout(ROOM, kept.recv())
+                .await
+                .expect("the peer reads a frame")
+                .expect("the peer keeps each frame");
+            read.push((frame.seq, frame.frame));
+        }
         assert!(
-            matches!(&reported, Err(Error::Status(status)) if status.code() == Code::InvalidArgument),
-            "a report after a kept end tells its status and queues nothing: {reported:?}"
+            matches!(
+                read.as_slice(),
+                [
+                    (1, Some(gateway_frame::Frame::Hello(_))),
+                    (2, Some(gateway_frame::Frame::Dispatched(_)))
+                ]
+            ),
+            "no refused report reached the peer: {read:?}"
         );
-        assert_eq!(session.seq, 1, "a refused report takes no number");
     }
 
     #[test]
@@ -1307,5 +1668,553 @@ mod tests {
             .join()
             .expect("the dropping thread ends")
             .expect("the case took the drop's end");
+    }
+
+    /// How a scripted decide stream goes on after its frames: it stays
+    /// open (`None`), ends clean, or ends with the status.
+    type End = Option<Result<(), Status>>;
+
+    /// A decide stream's script: its frames, then its end.
+    type Script = fn() -> (Vec<DecideAnswer>, End);
+
+    /// The decide call of a peer that answers its script's frames in turn,
+    /// whatever the call sends, and goes on as the script's end says.
+    struct Decides(Script);
+
+    impl StreamingService<DecideRequest> for Decides {
+        type Response = DecideAnswer;
+        type ResponseStream = Pin<Box<dyn Stream<Item = Result<DecideAnswer, Status>> + Send>>;
+        type Future = Ready<Result<tonic::Response<Self::ResponseStream>, Status>>;
+
+        fn call(&mut self, _request: Request<Streaming<DecideRequest>>) -> Self::Future {
+            let (frames, end) = (self.0)();
+            let frames = iter(frames.into_iter().map(Ok));
+            let answers: Self::ResponseStream = match end {
+                None => Box::pin(frames.chain(pending())),
+                Some(end) => Box::pin(frames.chain(iter(end.err().map(Err)))),
+            };
+            ready(Ok(tonic::Response::new(answers)))
+        }
+    }
+
+    /// A peer that answers each call as [`Decides`] does, for as long as
+    /// the case holds its task.
+    async fn deciding(
+        script: Script,
+    ) -> (SocketAddr, JoinSet<Result<(), tonic::transport::Error>>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a listener");
+        let address = listener.local_addr().expect("its address");
+        let answer = Router::new().fallback(move |request: axum::extract::Request| async move {
+            Grpc::new(tonic_prost::ProstCodec::<DecideAnswer, DecideRequest>::default())
+                .streaming(Decides(script), request)
+                .await
+                .map(Body::new)
+        });
+        let mut serving = JoinSet::new();
+        serving.spawn(
+            Server::builder()
+                .add_routes(Routes::from(answer))
+                .serve_with_incoming(TcpIncoming::from(listener)),
+        );
+        (address, serving)
+    }
+
+    /// An answer frame under `term` that names the ask `id`.
+    fn told(
+        term: u64,
+        id: &[u8],
+        answer: impl Into<Option<decide_answer::Answer>>,
+    ) -> DecideAnswer {
+        DecideAnswer {
+            request_id: id.to_vec(),
+            term,
+            answer: answer.into(),
+        }
+    }
+
+    /// A decision that states nothing, and a credit of `window`, as answers.
+    fn decision() -> decide_answer::Answer {
+        decide_answer::Answer::Decision(Decision::default())
+    }
+
+    fn credit(window: u32) -> decide_answer::Answer {
+        decide_answer::Answer::Credit(Credit { window })
+    }
+
+    /// An ask named `id` that states nothing else.
+    fn ask(id: &[u8]) -> DecideRequest {
+        DecideRequest {
+            request_id: id.to_vec(),
+            ..DecideRequest::default()
+        }
+    }
+
+    /// A decide stream with `window` asks of credit over a dial of
+    /// `address`, and the stub that holds its channel.
+    async fn stream(address: SocketAddr, window: u32) -> (Decide, Stub) {
+        let mut stub = stub(address).await;
+        let stream = Decide::open(&mut stub, window, ROOM)
+            .await
+            .expect("the stream opens");
+        (stream, stub)
+    }
+
+    /// One ask on `stream`, queued and answered as the client's call does.
+    async fn asked(stream: &mut Decide, floor: &mut u64, id: &[u8]) -> Result<Answer, Error> {
+        stream.send(floor, ask(id), ROOM).await?;
+        stream.answer(floor, id, ROOM).await
+    }
+
+    #[tokio::test]
+    async fn a_credit_on_the_way_to_an_answer_adds_its_window() {
+        let (address, _serving) = deciding(|| {
+            (
+                vec![told(1, b"", credit(5)), told(1, b"a", decision())],
+                None,
+            )
+        })
+        .await;
+        let (mut stream, _stub) = stream(address, 1).await;
+        let mut floor = 0;
+        stream
+            .send(&mut floor, ask(b"a"), ROOM)
+            .await
+            .expect("the ask is queued");
+        assert_eq!(stream.credit, 0, "the ask spent the stream's one credit");
+        let answer = stream.answer(&mut floor, b"a", ROOM).await;
+        assert!(
+            matches!(&answer, Ok(Answer::Decision(told)) if *told == Decision::default()),
+            "{answer:?}"
+        );
+        assert_eq!(stream.credit, 5, "the credit frame added its window");
+        assert_eq!(floor, 1, "a frame's term raises the floor");
+    }
+
+    #[tokio::test]
+    async fn an_ask_with_no_credit_is_refused_at_the_door_and_queues_nothing() {
+        let (address, _serving) = deciding(|| (Vec::new(), None)).await;
+        let (mut stream, _stub) = stream(address, 0).await;
+        let refused = stream.send(&mut 0, ask(b"a"), ROOM).await;
+        assert!(
+            matches!(refused, Err(Error::NoCredit)),
+            "an ask with no credit is refused at the door: {refused:?}"
+        );
+        assert_eq!(
+            stream.requests.capacity(),
+            1,
+            "the queue's one place is free"
+        );
+    }
+
+    #[tokio::test]
+    async fn credit_the_stream_already_holds_is_read_at_the_door() {
+        let (address, _serving) = deciding(|| (vec![told(0, b"", credit(2))], None)).await;
+        let (mut stream, _stub) = stream(address, 0).await;
+        let mut floor = 0;
+        // The frame is on its way: an ask is refused until it has come, and
+        // the first ask after that reads it with no wait.
+        let queued = timeout(ROOM, async {
+            loop {
+                match stream.send(&mut floor, ask(b"a"), SHORT).await {
+                    Err(Error::NoCredit) => yield_now().await,
+                    queued => break queued,
+                }
+            }
+        })
+        .await
+        .expect("the credit frame comes and the door reads it");
+        queued.expect("the ask is queued on the credit the frame brought");
+        assert_eq!(stream.credit, 1, "two came and the ask spent one");
+    }
+
+    #[tokio::test]
+    async fn an_answer_no_ask_stands_for_is_no_decision_at_the_door() {
+        let (address, _serving) = deciding(|| (vec![told(0, b"a", decision())], None)).await;
+        let (mut stream, _stub) = stream(address, 0).await;
+        let read = timeout(ROOM, async {
+            loop {
+                match stream.send(&mut 0, ask(b"b"), SHORT).await {
+                    Err(Error::NoCredit) => yield_now().await,
+                    read => break read,
+                }
+            }
+        })
+        .await
+        .expect("the answer comes and the door reads it");
+        assert!(
+            matches!(read, Err(Error::NoDecision(_))),
+            "an answer no ask stands for is no decision: {read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_or_a_credit_under_a_term_below_the_floor_is_refused() {
+        let scripts: [Script; 2] = [
+            || (vec![told(3, b"a", decision())], None),
+            || (vec![told(3, b"", credit(9))], None),
+        ];
+        for script in scripts {
+            let (address, _serving) = deciding(script).await;
+            let (mut stream, _stub) = stream(address, 1).await;
+            let mut floor = 5;
+            let refused = asked(&mut stream, &mut floor, b"a").await;
+            assert!(
+                matches!(refused, Err(Error::BelowFloor { term: 3, floor: 5 })),
+                "a frame below the floor is refused: {refused:?}"
+            );
+            assert_eq!(
+                (floor, stream.credit),
+                (5, 0),
+                "a refused frame moves neither the floor nor the credit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_busy_is_handed_out_as_it_came_and_its_term_raises_the_floor() {
+        let (address, _serving) = deciding(|| {
+            let busy = Busy {
+                reason: busy::Reason::NotLeader.into(),
+                retry_after_micros: 7,
+            };
+            let busy = decide_answer::Answer::Busy(busy);
+            (vec![told(9, b"a", busy)], None)
+        })
+        .await;
+        let (mut stream, _stub) = stream(address, 1).await;
+        let mut floor = 5;
+        let answer = asked(&mut stream, &mut floor, b"a").await;
+        assert!(
+            matches!(&answer, Ok(Answer::Busy(busy))
+                if busy.reason() == busy::Reason::NotLeader && busy.retry_after_micros == 7),
+            "{answer:?}"
+        );
+        assert_eq!(floor, 9);
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_the_asks_own_is_no_decision() {
+        let scripts: [Script; 2] = [
+            || (vec![told(1, b"b", decision())], None),
+            || (vec![told(1, b"a", None::<decide_answer::Answer>)], None),
+        ];
+        for script in scripts {
+            let (address, _serving) = deciding(script).await;
+            let (mut stream, _stub) = stream(address, 1).await;
+            let answer = asked(&mut stream, &mut 0, b"a").await;
+            assert!(
+                matches!(answer, Err(Error::NoDecision(_))),
+                "an answer that is not the ask's own is no decision: {answer:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ask_on_a_stream_that_ended_tells_the_status_it_ended_with() {
+        let scripts: [(Script, Code); 2] = [
+            (
+                || {
+                    let closed = Status::unavailable("the listeners closed");
+                    (Vec::new(), Some(Err(closed)))
+                },
+                Code::Unavailable,
+            ),
+            (|| (Vec::new(), Some(Ok(()))), Code::Ok),
+        ];
+        for (script, code) in scripts {
+            let (address, _serving) = deciding(script).await;
+            let (mut stream, _stub) = stream(address, 1).await;
+            // The ask's send tells the end, or its answer does: whether the
+            // connection has dropped the ended call's queue yet is its own.
+            let answer = asked(&mut stream, &mut 0, b"a").await;
+            assert!(
+                matches!(&answer, Err(Error::Status(status)) if status.code() == code),
+                "an ask on an ended stream tells its status: {answer:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ask_into_a_queue_the_streams_end_closed_tells_that_end_and_spends_nothing() {
+        let (address, _serving) = deciding(|| {
+            let closed = Status::unavailable("the listeners closed");
+            (Vec::new(), Some(Err(closed)))
+        })
+        .await;
+        let (mut stream, _stub) = stream(address, 1).await;
+        timeout(ROOM, async {
+            while !stream.requests.is_closed() {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("the connection drops an ended call's queue");
+        let refused = stream.send(&mut 0, ask(b"a"), ROOM).await;
+        assert!(
+            matches!(&refused, Err(Error::Status(status)) if status.code() == Code::Unavailable),
+            "an ask into a closed queue tells the stream's end: {refused:?}"
+        );
+        assert_eq!(
+            stream.credit, 1,
+            "an ask the closed queue refused spent nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ask_no_answer_comes_for_ends_at_the_clients_bound() {
+        let (address, _serving) = deciding(|| (Vec::new(), None)).await;
+        let (mut stream, _stub) = stream(address, 1).await;
+        let mut floor = 0;
+        stream
+            .send(&mut floor, ask(b"a"), ROOM)
+            .await
+            .expect("the ask is queued");
+        let waited = timeout(ROOM, stream.answer(&mut floor, b"a", SHORT))
+            .await
+            .expect("the client's own bound ends the wait for a decision");
+        assert!(ran_out(&waited, "the decision", SHORT), "{waited:?}");
+    }
+
+    #[tokio::test]
+    async fn a_decide_call_nothing_answers_ends_its_open_at_the_bound() {
+        let (address, _serving) = mute().await;
+        let mut stub = stub(address).await;
+        let opened = timeout(ROOM, Decide::open(&mut stub, 1, SHORT))
+            .await
+            .expect("the client's own bound ends an open nothing answers");
+        assert!(
+            ran_out(&opened, "the decide stream's open", SHORT),
+            "{opened:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ask_into_a_stream_whose_peer_stopped_reading_ends_at_its_bound() {
+        let (address, _serving) = answering(headers_alone).await;
+        let (mut stream, _stub) = stream(address, u32::MAX).await;
+        // The peer reads no frame: the stream's window fills, then the
+        // queue's one place, and an ask waits for room.
+        let waited: Result<(), Error> = timeout(ROOM * 2, async {
+            loop {
+                let ask = sized(1, 4_000, MAX_FRAME);
+                stream.send(&mut 0, ask, SHORT).await?;
+            }
+        })
+        .await
+        .expect("a peer that reads nothing leaves an ask waiting for room");
+        assert!(
+            ran_out(&waited, "the decide stream's queue", SHORT),
+            "{waited:?}"
+        );
+    }
+
+    /// An ask named by `id` bytes that holds `hashes` block hashes, counted
+    /// from zero, and is `size` bytes as encoded: its model's name is as
+    /// long as the rest.
+    fn sized(id: usize, hashes: usize, size: usize) -> DecideRequest {
+        let mut request = DecideRequest {
+            request_id: vec![7; id],
+            facts: Some(RequestFacts {
+                block_hashes: (0u64..).take(hashes).collect(),
+                ..RequestFacts::default()
+            }),
+            constraints: None,
+        };
+        // A longer name is written with a longer length: fill, then mend.
+        let mut name = size - request.encoded_len();
+        for _ in 0..4 {
+            let facts = request.facts.as_mut().expect("the ask states facts");
+            facts.model = "m".repeat(name);
+            let now = request.encoded_len();
+            if now == size {
+                return request;
+            }
+            name = name + size - now;
+        }
+        panic!("no ask of {hashes} hashes is {size} bytes as encoded");
+    }
+
+    /// The block hashes `request` holds.
+    fn hashes(request: &DecideRequest) -> &[u64] {
+        request
+            .facts
+            .as_ref()
+            .map_or(&[], |facts| &facts.block_hashes)
+    }
+
+    #[test]
+    fn an_id_outside_the_calls_range_is_refused_at_the_door() {
+        assert_eq!((MAX_REQUEST_ID, MAX_FRAME), (256, 65_536));
+        for (id, taken) in [(0, false), (1, true), (256, true), (257, false)] {
+            match fit(&mut ask(&vec![7; id])) {
+                Ok(0) => assert!(taken, "an id of {id} bytes is in the range"),
+                Err(Error::RequestId(told)) => assert!(!taken && told == id, "{id}: {told}"),
+                other => panic!("an id of {id} bytes: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_frame_at_the_bound_keeps_its_hashes_and_one_past_it_loses_its_last() {
+        let mut whole = sized(1, 4_000, MAX_FRAME);
+        assert_eq!(fit(&mut whole).expect("a frame at the bound"), 0);
+        assert_eq!(hashes(&whole).len(), 4_000);
+        // The bytes over, and the hashes they cost: eight bytes a hash.
+        for (over, cut) in [(1, 1), (8, 1), (9, 2), (17, 3)] {
+            let mut request = sized(1, 4_000, MAX_FRAME + over);
+            let fitted = fit(&mut request).expect("hashes to cut");
+            assert_eq!(fitted, cut, "{over} bytes over");
+            assert!(request.encoded_len() <= MAX_FRAME, "{over} bytes over");
+            let head: Vec<u64> = (0u64..).take(4_000 - cut).collect();
+            assert_eq!(hashes(&request), head, "the head stays and the tail goes");
+            assert!(request
+                .facts
+                .is_some_and(|facts| facts.model.len() > 30_000));
+        }
+    }
+
+    #[test]
+    fn a_cut_that_shortens_the_lists_length_takes_one_hash_fewer() {
+        // 2,048 hashes are 16,384 bytes, the least a length of three bytes
+        // counts: with one hash fewer the length is written in two, so one
+        // hash pays for nine bytes over.
+        let mut request = sized(1, 2_048, MAX_FRAME + 9);
+        let fitted = fit(&mut request).expect("hashes to cut");
+        assert_eq!(fitted, 1, "one hash pays for nine bytes over");
+        assert_eq!(request.encoded_len(), MAX_FRAME);
+    }
+
+    #[test]
+    fn a_frame_past_the_bound_with_no_hash_left_is_the_callers_error() {
+        // A lone hash and its list take ten bytes off a frame eleven over.
+        for held in [0, 1] {
+            let mut request = sized(1, held, MAX_FRAME + 11);
+            let refused = fit(&mut request);
+            assert!(
+                matches!(refused, Err(Error::TooLarge(size)) if size == MAX_FRAME + 11),
+                "{held} hashes: {refused:?}"
+            );
+        }
+    }
+
+    /// A client whose session a welcoming peer opened, with `stream` as its
+    /// decide stream between asks and `wait` as its bound, and the
+    /// welcoming peer's task.
+    async fn holding(
+        stream: Decide,
+        wait: Duration,
+    ) -> (Client, JoinSet<Result<(), tonic::transport::Error>>) {
+        let (address, serving) = answering(|| welcome_under(0)).await;
+        let mut stub = stub(address).await;
+        let (session, _) = Session::open(&mut stub, "gateway-1", 0, ROOM)
+            .await
+            .expect("the welcome opens the session");
+        let client = Client {
+            gateway_id: "gateway-1".to_owned(),
+            stub,
+            wait,
+            session,
+            decide: Some(stream),
+            floor: 0,
+            cut: 0,
+        };
+        (client, serving)
+    }
+
+    #[tokio::test]
+    async fn an_ask_the_door_refuses_keeps_the_stream_and_one_that_fails_drops_it() {
+        let (address, _serving) = deciding(|| (Vec::new(), None)).await;
+        let (stream, _stub) = stream(address, 0).await;
+        let (mut client, _welcoming) = holding(stream, SHORT).await;
+
+        let unnamed = client.decide(ask(b"")).await;
+        assert!(matches!(unnamed, Err(Error::RequestId(0))), "{unnamed:?}");
+        // One hash over the bound: the door cuts it, then finds no credit.
+        let refused = client.decide(sized(1, 4_000, MAX_FRAME + 1)).await;
+        assert!(matches!(refused, Err(Error::NoCredit)), "{refused:?}");
+        assert_eq!(client.hashes_cut(), 0, "no cut frame was queued");
+        let stream = client
+            .decide
+            .as_mut()
+            .expect("an ask the door refused leaves the stream where it stood");
+        stream.credit = 1;
+
+        // Queued now, and the peer answers nothing: the bound ends the ask.
+        let waited = timeout(ROOM, client.decide(sized(1, 4_000, MAX_FRAME + 1)))
+            .await
+            .expect("the client's own bound ends the ask");
+        assert!(ran_out(&waited, "the decision", SHORT), "{waited:?}");
+        assert_eq!(client.hashes_cut(), 1, "the queued ask's cut is counted");
+        assert!(
+            client.decide.is_none(),
+            "an ask that failed drops the stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_ask_rides_the_stream_the_first_left_and_its_credit() {
+        // Each stream of this peer answers `a` and then `b`: on a stream of
+        // its own the ask `b` would read an answer that is not its own.
+        let (address, _serving) = deciding(|| {
+            let answers = vec![told(0, b"a", decision()), told(0, b"b", decision())];
+            (answers, None)
+        })
+        .await;
+        let (stream, _stub) = stream(address, 2).await;
+        let (mut client, _welcoming) = holding(stream, ROOM).await;
+
+        for id in [b"a", b"b"] {
+            let answer = client.decide(ask(id)).await;
+            assert!(
+                matches!(answer, Ok(Answer::Decision(_))),
+                "a second ask rides the stream the first one left: {answer:?}"
+            );
+        }
+        let refused = client.decide(ask(b"c")).await;
+        assert!(
+            matches!(refused, Err(Error::NoCredit)),
+            "the credit two asks spent binds the third: {refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_end_the_door_finds_is_told_and_drops_the_stream() {
+        let scripts: [(Script, Code); 2] = [
+            (
+                || {
+                    let closed = Status::unavailable("the listeners closed");
+                    (Vec::new(), Some(Err(closed)))
+                },
+                Code::Unavailable,
+            ),
+            (|| (Vec::new(), Some(Ok(()))), Code::Ok),
+        ];
+        for (script, code) in scripts {
+            let (address, _serving) = deciding(script).await;
+            let (stream, _stub) = stream(address, 0).await;
+            let (mut client, _welcoming) = holding(stream, ROOM).await;
+            // The end is on its way: an ask finds no credit until it has
+            // come, and the first ask after that is told it.
+            let found = timeout(ROOM, async {
+                loop {
+                    match client.decide(ask(b"a")).await {
+                        Err(Error::NoCredit) => yield_now().await,
+                        found => break found,
+                    }
+                }
+            })
+            .await
+            .expect("the stream's end comes and the door reads it");
+            assert!(
+                matches!(&found, Err(Error::Status(status)) if status.code() == code),
+                "the door tells the end it found: {found:?}"
+            );
+            assert!(
+                client.decide.is_none(),
+                "an end found at the door drops the stream"
+            );
+        }
     }
 }

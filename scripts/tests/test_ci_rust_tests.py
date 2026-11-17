@@ -363,7 +363,22 @@ class ShardTableTests(unittest.TestCase):
             ]
             dev = manifest["dev-dependencies"]
             self.assertEqual(dev["serde_yaml"], workspace["serde_yaml"])
+            # The allocator the example registers, as the workspace names it
+            # and under the target rule the example's own manifest names.
+            own_manifest = tomllib.loads((example / "Cargo.toml").read_text())
+            (rule,) = own_manifest["target"]
+            self.assertEqual(
+                manifest["target"][rule]["dependencies"]["tikv-jemallocator"],
+                workspace["tikv-jemallocator"],
+            )
             self.assertEqual(dev["tokio"]["version"], workspace["tokio"]["version"])
+            # The allocator's page setting, as the workspace's cargo
+            # configuration holds it: without it an aarch64 build of the
+            # copy runs on its build host's page size alone.
+            key = "AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE"
+            ours = tomllib.loads((REPO / ".cargo" / "config.toml").read_text())["env"][key]
+            written = tomllib.loads((dest / ".cargo" / "config.toml").read_text())
+            self.assertEqual(written, {"env": {key: ours}})
             for name in (
                 "src/main.rs",
                 "tests/serve.rs",

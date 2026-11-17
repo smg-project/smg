@@ -202,9 +202,7 @@ impl MuseSparkAudioProcessor {
         &self,
         clips: &[DecodedAudio],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if clips.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(clips)?;
         let samples_per_token = self.params.samples_per_token;
         let mut samples: Vec<f32> = Vec::new();
         let mut token_counts = Vec::with_capacity(clips.len());

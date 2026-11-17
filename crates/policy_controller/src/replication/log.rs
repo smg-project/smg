@@ -278,6 +278,17 @@ impl Log {
         self.term.load(Ordering::Relaxed)
     }
 
+    /// The term the store followed, `None` while the store leads the log's
+    /// term and its own writes stand under it. The store follows before
+    /// its first take (term `0`) and once it applied an event or restarted
+    /// at a snapshot. A take at or below a term the log has seen starts no
+    /// lead and leaves that term here: the store writes under no term
+    /// until it takes a later one.
+    pub fn followed(&self) -> Option<u64> {
+        let ring = self.ring.lock();
+        (!ring.leads).then(|| self.term.load(Ordering::Relaxed))
+    }
+
     /// Whether a reader of `kinds` that another store's history left at
     /// `at` continues from it: the log has that position under that term,
     /// so the two share the history before it (the replication contract's
@@ -287,9 +298,19 @@ impl Log {
     /// write until that ring lets its first go. Refused: another term at
     /// the position, a position past the head or one the log let go, and a
     /// position that names no term (nobody led term `0`: two stores may
-    /// each hold a write of their own there).
+    /// each hold a write of their own there, and so may one store before
+    /// and after its process restarts, since a number under no term lives
+    /// as long as the log and no longer). A log that carries no load row
+    /// holds no place for a reader of every kind ([`Log::read`]).
     pub fn holds(&self, kinds: Kinds, at: Position) -> bool {
-        (at.term != 0 || at.seq == 0) && self.ring.lock().continues(kinds, at)
+        self.serves(kinds) && (at.term != 0 || at.seq == 0) && self.ring.lock().continues(kinds, at)
+    }
+
+    /// Whether the log serves a reader of `kinds`. One that carries no load
+    /// row serves the watched kinds alone: a reader of every kind would
+    /// hold each load row as its cut left it and never be told.
+    fn serves(&self, kinds: Kinds) -> bool {
+        kinds == Kinds::Watched || self.carries_loads()
     }
 
     /// The writes of `kinds` after `after`, oldest first, into `out`
@@ -303,6 +324,8 @@ impl Log {
     /// retains every event of `kinds` after it: whatever befell the log
     /// between two reads (a ring let the place go, the log restarted at a
     /// snapshot), a reader is served the history it stands in or nothing.
+    /// A log that carries no load row is [`Lost`] to a reader of every
+    /// kind at every read, so a cut of every kind has no tail there.
     pub fn read(
         &self,
         kinds: Kinds,
@@ -312,6 +335,9 @@ impl Log {
     ) -> Result<(), Lost> {
         out.clear();
         let at_most = at_most.min(Self::BATCH);
+        if !self.serves(kinds) {
+            return Err(Lost);
+        }
         let ring = self.ring.lock();
         if !ring.continues(kinds, after) {
             return Err(Lost);
@@ -559,6 +585,10 @@ impl Journal for Log {
 
     fn head(&self, kinds: Kinds) -> Position {
         Log::head(self, kinds)
+    }
+
+    fn followed(&self) -> Option<u64> {
+        Log::followed(self)
     }
 }
 
@@ -1051,8 +1081,33 @@ mod tests {
         member(&log, 1);
         load(&log, 2);
         member(&log, 2);
-        assert_eq!(places(&all(&log)), [at(1, 0), at(2, 0)]);
-        assert_eq!(marks(&all(&log)), [MEMBER + 1, MEMBER + 2]);
+        let watched = all_after(&log, Watched, Position::default());
+        assert_eq!(places(&watched), [at(1, 0), at(2, 0)]);
+        assert_eq!(marks(&watched), [MEMBER + 1, MEMBER + 2]);
+    }
+
+    #[test]
+    fn a_log_that_carries_no_load_row_serves_no_reader_of_every_kind() {
+        let log = Log::new(4, 0);
+        member(&log, 1);
+        load(&log, 1);
+        let mut out = Vec::new();
+        // A reader of every kind would hold the load rows of its cut and
+        // never be told one moved: it is lost at the start and at the
+        // head, and no place holds for it.
+        for place in [Position::default(), at(1, 0)] {
+            assert_eq!(log.read(All, place, 8, &mut out), Err(Lost));
+        }
+        assert!(!log.holds(All, Position::default()));
+        // The watched kinds are served as on any log.
+        assert_eq!(log.read(Watched, Position::default(), 8, &mut out), Ok(()));
+        assert_eq!(out.len(), 1);
+        assert!(log.holds(Watched, Position::default()));
+        // A log with room for one load row serves both.
+        let log = Log::new(4, 1);
+        member(&log, 1);
+        assert_eq!(log.read(All, Position::default(), 8, &mut out), Ok(()));
+        assert!(log.holds(All, Position::default()));
     }
 
     #[test]
@@ -1363,6 +1418,75 @@ mod tests {
     }
 
     #[test]
+    fn a_store_leads_from_a_take_that_starts_a_term_until_it_follows() {
+        let log = Log::new(8, 8);
+        assert_eq!(log.followed(), Some(0), "before a take");
+        log.term_rose(3);
+        assert_eq!(log.followed(), None, "its take");
+        // Each way of following ends the lead: an applied event, a term's
+        // start marked, a restart at a snapshot.
+        apply(&log, at(2, 5), 1);
+        assert_eq!(log.followed(), Some(5), "an applied event");
+        log.term_rose(6);
+        assert_eq!(log.followed(), None, "a later take");
+        log.adopt(at(4, 7)).expect("the next position").mark();
+        assert_eq!(log.followed(), Some(7), "a term's start marked");
+        log.term_rose(8);
+        assert_eq!(log.followed(), None, "a later take");
+        log.restart(at(40, 9));
+        assert_eq!(log.followed(), Some(9), "a restart");
+        // A take at or below the term the log followed starts no lead: it
+        // writes no position, and the store's next write is under no term.
+        for take in [9, 4] {
+            log.term_rose(take);
+            assert_eq!(log.followed(), Some(9), "a take of term {take}");
+            assert_eq!(log.head(All), at(40, 9));
+        }
+        load(&log, 2);
+        assert_eq!(log.head(All), at(41, 0));
+        log.term_rose(10);
+        assert_eq!(log.followed(), None, "a take above every term seen");
+        assert_eq!(log.head(All), at(42, 10));
+    }
+
+    #[test]
+    fn a_reader_of_every_kind_one_place_behind_the_load_rings_floor_is_lost() {
+        let log = Log::new(8, 2);
+        log.term_rose(1);
+        member(&log, 1);
+        for mark in 0..3 {
+            load(&log, mark);
+        }
+        // The load ring let go the row at position 3, right after the
+        // membership event at 2: a reader of every kind there missed it.
+        assert!(log.holds(All, at(3, 1)), "the floor itself");
+        assert!(!log.holds(All, at(2, 1)), "one place behind it");
+        assert!(
+            log.holds(Watched, at(2, 1)),
+            "the watched kinds let nothing go"
+        );
+    }
+
+    #[test]
+    fn a_restart_under_an_open_guard_leaves_no_adopted_place() {
+        let log = Log::new(8, 8);
+        apply(&log, at(1, 3), 1);
+        // A snapshot is restored while a leader's event is half applied.
+        let adopting = log.adopt(at(2, 3)).expect("the next position");
+        log.restart(at(40, 5));
+        // The store's next write follows the snapshot's place: the place of
+        // the event that never landed went with its history.
+        load(&log, 2);
+        assert_eq!(log.head(All), at(41, 0));
+        assert!(!adopting.landed());
+        // The guard that outlived its history marks nothing.
+        adopting.mark();
+        drop(adopting);
+        assert_eq!(log.head(All), at(41, 0));
+        assert_eq!(log.adopt(at(42, 5)).err(), Some(Lost));
+    }
+
+    #[test]
     fn a_log_restarted_at_a_snapshot_has_that_place_alone_and_continues_after_it() {
         let log = Log::new(8, 8);
         log.term_rose(4);
@@ -1480,6 +1604,10 @@ mod tests {
         // leader's snapshot, and one write of its own lands a moment later.
         assert!(!behind.holds(All, first.head(All)));
         first.restart(behind.head(All));
+        assert!(
+            !first.holds(All, at(4, 1)),
+            "a place of the history it left"
+        );
         load(&first, 99);
         assert_eq!(
             first.head(All),

@@ -1009,7 +1009,7 @@ async fn usage_prompt_count_over_zmq_is_the_gateways_until_the_engine_reports_on
                         "messages": [{"role": "user", "content": user}],
                     }))
                     .expect("a messages request");
-                    router.route_messages(None, &meta, body, MODEL)
+                    router.route_messages(None, &meta, Arc::new(body), MODEL)
                 }
                 "responses" => {
                     let body: ResponsesRequest = serde_json::from_value(serde_json::json!({

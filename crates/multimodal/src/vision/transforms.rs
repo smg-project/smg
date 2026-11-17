@@ -3615,9 +3615,7 @@ pub fn pad_to_size_pil_rgb(
 ///
 /// All tensors must have the same shape.
 pub fn stack_batch(tensors: &[Array3<f32>]) -> Result<Array4<f32>> {
-    if tensors.is_empty() {
-        return Err(TransformError::EmptyBatch);
-    }
+    TransformError::if_empty(tensors)?;
 
     let shape = tensors[0].shape();
     let (c, h, w) = (shape[0], shape[1], shape[2]);

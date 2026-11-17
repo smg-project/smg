@@ -10,7 +10,8 @@
 //! the gateway. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document, watches the file and
-//! answers `GetPolicySpec` ([`Controller::spec_file`]).
+//! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
+//! ([`Controller::spec_file`]).
 //!
 //! A controller is bound first and served second ([`Controller::bind`], then
 //! [`Controller::serve`]): the bind takes every address (port `0` for an
@@ -39,6 +40,7 @@ mod membership;
 pub mod metrics;
 mod principal;
 pub mod readiness;
+mod replication;
 mod run;
 mod service;
 mod session;
@@ -60,6 +62,10 @@ use tonic::transport::{server::TcpIncoming, Server};
 use tonic_health::ServingStatus;
 use tracing::{error, info, warn};
 
+// The Decide call's two bounds, for the reference client: it holds them at
+// its own door and reads no second copy.
+#[cfg(feature = "client")]
+pub(crate) use self::wire::{MAX_FRAME, MAX_REQUEST_ID};
 pub use self::{
     admin::{Version, VERSION},
     config::{Config, ConfigError, Listener, Scope, Tls},
@@ -392,12 +398,13 @@ impl Controller {
         );
         let (standing, stood) = watch::channel(Standing::default());
         let (phase, readiness) = readiness::channel(elector.fence(), stood.clone());
+        let journal = replication::journaled(&config.election.lease);
         let shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
             &elector,
             stood,
-            Arc::new(MemoryStore::new()),
+            journal,
             Arc::clone(&catalog),
             config.decide_shards,
         )

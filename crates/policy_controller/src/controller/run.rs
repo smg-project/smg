@@ -478,13 +478,15 @@ fn runtime(worker_threads: Option<u16>) -> std::io::Result<Runtime> {
 /// file system that answers at all.
 const END_WAIT: Duration = Duration::from_secs(1);
 
-/// Ends the runtime once the serve has ended. A dropped runtime waits
-/// without end on a blocking call that has not returned, as a look at a
-/// file system that stopped answering: this waits [`END_WAIT`] and leaves
-/// it, so the process ends at its own stop and not at its supervisor's
-/// kill.
-fn end(runtime: Runtime) {
+/// Runs `serve` on `runtime`, then ends the runtime. A dropped runtime
+/// waits without end on a blocking call that has not returned, as a look at
+/// a file system that stopped answering: the end waits [`END_WAIT`] on one
+/// and leaves it, so the process ends at its own stop and not at its
+/// supervisor's kill.
+fn served<F: std::future::Future>(runtime: Runtime, serve: F) -> F::Output {
+    let answer = runtime.block_on(serve);
     runtime.shutdown_timeout(END_WAIT);
+    answer
 }
 
 /// Binds the controller over `catalog`, names the listeners that take
@@ -539,7 +541,7 @@ pub fn run(catalog: Catalog) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let code = runtime.block_on(async {
+    served(runtime, async {
         let bound = bind(
             config,
             catalog,
@@ -560,9 +562,7 @@ pub fn run(catalog: Catalog) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
-    });
-    end(runtime);
-    code
+    })
 }
 
 #[cfg(test)]
@@ -576,6 +576,7 @@ mod tests {
     };
 
     use clap::Parser;
+    use tokio::sync::oneshot;
 
     use super::{bind, color_for, set, truthy, Cli};
     use crate::{
@@ -1096,30 +1097,30 @@ mod tests {
         .is_err());
     }
 
-    /// A blocking call that has not returned does not hold the runtime's
-    /// end, as it holds a dropped runtime's.
+    /// A blocking call that has not returned does not hold the run's end:
+    /// the serve's answer is back inside five seconds, where a dropped
+    /// runtime waits on the call without end.
     #[test]
-    fn the_runtimes_end_waits_on_no_blocked_call() {
+    fn the_runs_end_waits_on_no_blocked_call() {
         let runtime = super::runtime(Some(1)).expect("a runtime");
-        let (started, start) = mpsc::channel::<()>();
         let (release, blocked) = mpsc::channel::<()>();
-        runtime.spawn_blocking(move || {
-            let _ = started.send(());
-            // Returns when `release` goes, at the case's end.
-            let _ = blocked.recv();
-        });
-        start
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the blocking call starts");
-
-        let (ended, end) = mpsc::channel::<()>();
+        let (ended, end) = mpsc::channel();
         thread::spawn(move || {
-            super::end(runtime);
-            let _ = ended.send(());
+            let answer = super::served(runtime, async move {
+                let (started, start) = oneshot::channel::<()>();
+                tokio::task::spawn_blocking(move || {
+                    let _ = started.send(());
+                    // Returns when `release` goes, at the case's end.
+                    let _ = blocked.recv();
+                });
+                start.await.expect("the blocking call starts");
+                7
+            });
+            let _ = ended.send(answer);
         });
-        let waited = end.recv_timeout(super::END_WAIT + Duration::from_secs(4));
+        let waited = end.recv_timeout(Duration::from_secs(5));
         drop(release);
-        waited.expect("the end returns with a call still blocked");
+        assert_eq!(waited, Ok(7), "the end returns with a call still blocked");
     }
 
     #[test]

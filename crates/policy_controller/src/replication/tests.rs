@@ -353,6 +353,10 @@ impl Journal for Told {
     fn head(&self, _: Kinds) -> Position {
         Position::default()
     }
+
+    fn followed(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[test]

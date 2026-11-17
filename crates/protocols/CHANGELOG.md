@@ -331,11 +331,22 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `null` metadata reads as the empty map (`deserialize_null_as_empty_map`, a map twin of
   `deserialize_null_as_empty_vec`), and `IncompleteReason`, `#[non_exhaustive]`, gains
   `MaxMessages` and `Steered`.
+- A Messages search result's text items are written with their `type`, which the public API
+  requires of them, in a message and in a tool result alike. They were read into untagged text
+  blocks, so a forwarded search result lost the `type` of each item. An item read without one
+  still reads, as text, and an item of another type is refused. Breaking:
+  `SearchResultBlock.content` holds the new `SearchResultTextBlock`, whose type is
+  `SearchResultTextType`.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
   `text.format` description into the Chat request it builds, but a gRPC engine still gets only the
   format's schema, as before. Breaking: `JsonSchemaFormat` gains `description: Option<String>`.
+- A Messages `mcp_toolset` keeps its pinned tool listing (`tools`), and a thinking config its
+  `block_binding` under `enabled` and `adaptive`, as the beta takes them. Both were dropped, so the
+  provider asked the MCP server for its tools again, and answered a failed thinking-block check
+  with its default instead of the behavior the client chose. Breaking: `McpToolset` gains `tools`,
+  and `ThinkingConfig::Enabled` and `ThinkingConfig::Adaptive` gain `block_binding`.
 - A Responses request's reasoning config keeps `mode`, `context` and the deprecated
   `generate_summary`, as the public API's `Reasoning` takes them, when the request is written back
   for an upstream, and a Response's `reasoning` echoes the ones the request set. The crate dropped
@@ -343,11 +354,6 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `ResponseReasoningParam` gains `mode: Option<String>`, `context: Option<ReasoningContext>` and
   `generate_summary: Option<ReasoningSummary>`, `ReasoningInfo` gains the three as
   `Option<String>`, and the crate gains `ReasoningContext`.
-- A Messages `mcp_toolset` keeps its pinned tool listing (`tools`), and a thinking config its
-  `block_binding` under `enabled` and `adaptive`, as the beta takes them. Both were dropped, so the
-  provider asked the MCP server for its tools again, and answered a failed thinking-block check
-  with its default instead of the behavior the client chose. Breaking: `McpToolset` gains `tools`,
-  and `ThinkingConfig::Enabled` and `ThinkingConfig::Adaptive` gain `block_binding`.
 - A usage object whose `prompt_tokens_details` leaves out `cached_tokens` parses, with no tokens
   cached, as the public API defaults the key. The crate refused the whole usage, and the
   completion around it, with ``missing field `cached_tokens` ``. The newer counters an upstream
@@ -407,9 +413,20 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   field (#5092). Two different texts are refused as a value (`invalid_value`; `param` names the
   message). Breaking: the `ChatMessage::Assistant` field `reasoning_content: Option<String>` is now
   `reasoning: AssistantReasoning`, whose `text` is that option.
+- A Messages answer with a content block of a kind this build does not read (a web fetch, code
+  execution, bash or text editor result, a container upload, or any block the public API adds)
+  parses, the block kept as written in `ContentBlock::Other`, as `ToolUseCaller::Other` keeps an
+  unknown caller. A whole answer with such a block failed: the provider route answered a 502, and
+  a streamed thread turn was left unstored. Breaking: `ContentBlock` gains `Other(Value)`.
 - `EmbeddingRequest` and `ClassifyRequest` keep the fields they do not model in a flattened
   `other` map, as `ChatCompletionRequest` and `CompletionRequest` do, so the HTTP relay forwards an
   embeddings or classify body as the client wrote it (`truncate_prompt_tokens`,
   `add_special_tokens`, `normalize`, `priority`, `extra_body`, ...). The relay re-serializes the
   typed body and dropped every key the types did not declare. Breaking: the two structs gain the
   field `other: serde_json::Map<String, Value>`.
+- A Messages conversation that replays the public API's server tool results (`web_fetch_tool_result`,
+  `code_execution_tool_result`, `bash_code_execution_tool_result`,
+  `text_editor_code_execution_tool_result`) or sends a `container_upload` block is accepted, and the
+  blocks are forwarded as written. Each was an unknown variant of `InputContentBlock`, which refused
+  the whole request, a token count included. Breaking: `InputContentBlock` gains the five variants,
+  and the crate gains `ServerToolResultBlock` and `ContainerUploadParam`.

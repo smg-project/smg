@@ -33,6 +33,16 @@ pub enum TransformError {
     },
 }
 
+impl TransformError {
+    /// Refuses a batch with no item: `Err(EmptyBatch)`.
+    pub(crate) fn if_empty<T>(batch: &[T]) -> Result<(), Self> {
+        if batch.is_empty() {
+            return Err(Self::EmptyBatch);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum MediaConnectorError {
     #[error("{modality} has {pixels} pixels after resizing, exceeding max_total_pixels={limit}")]

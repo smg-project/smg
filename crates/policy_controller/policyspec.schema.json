@@ -751,6 +751,18 @@
         {
           "type": "object",
           "properties": {
+            "best": {
+              "$ref": "#/$defs/BestParams"
+            }
+          },
+          "required": [
+            "best"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
             "best-with-temperature": {
               "$ref": "#/$defs/BestWithTemperatureParams"
             }
@@ -760,6 +772,23 @@
           ],
           "additionalProperties": false
         }
+      ]
+    },
+    "BestParams": {
+      "description": "The `best` picker's parameters.",
+      "type": "object",
+      "properties": {
+        "sample": {
+          "description": "How many rows the picker draws where the host names the request's\nholders and the pool's warming rows: a pool of more than twice this\nmany rows is decided by that sample and the named rows, any other by\nthe whole pool. From 1 to 64.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 64
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sample"
       ]
     },
     "BestWithTemperatureParams": {

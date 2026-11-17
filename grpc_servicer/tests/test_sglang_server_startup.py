@@ -20,6 +20,42 @@ def _module(name, **attrs):
     return module
 
 
+def test_object_storage_metadata_is_prepared_before_native_publish(server_mod, monkeypatch):
+    calls = []
+
+    class Published(Exception):
+        pass
+
+    monkeypatch.setattr(server_mod, "default_kv_events_config", lambda _args: None)
+    monkeypatch.setattr(
+        server_mod, "prepare_model_metadata", lambda args: calls.append(args.model_path)
+    )
+
+    def publish(args, *, role):
+        assert calls == [args.model_path]
+        assert role == "tokenizer"
+        raise Published
+
+    monkeypatch.setattr(server_mod, "publish", publish)
+    args = SimpleNamespace(model_path="s3://bucket/checkpoint", disaggregation_mode="null")
+    with pytest.raises(Published):
+        asyncio.run(server_mod.serve_grpc(args))
+
+
+def test_object_storage_download_failure_is_a_startup_configuration_error(server_mod, monkeypatch):
+    from smg_grpc_servicer.rust_lifecycle import ServicerConfigError
+
+    def denied(_args):
+        raise ServicerConfigError("object storage access denied")
+
+    monkeypatch.setattr(server_mod, "default_kv_events_config", lambda _args: None)
+    monkeypatch.setattr(server_mod, "prepare_model_metadata", denied)
+    args = SimpleNamespace(model_path="s3://bucket/checkpoint", disaggregation_mode="null")
+    with pytest.raises(SystemExit) as error:
+        asyncio.run(server_mod.serve_grpc(args))
+    assert error.value.code == 2
+
+
 @pytest.fixture(autouse=True)
 def python_servicer(monkeypatch):
     """These tests drive the Python servicer's start-up: since the Rust servicer

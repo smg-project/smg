@@ -50,7 +50,7 @@ use smg_policy_controller::{
 };
 use support::{
     grpc_plugin::{eventually, Behaviour, ServerTls, TestPlugin, ALL, FILTER, PICK, SCORE},
-    said::{lines, openings, panic_once_at, said, trap_spent},
+    said::{lines, openings, panic_at, said, trap_spent},
 };
 
 /// The decision budget of the answered cases, and the connect frame of
@@ -3189,14 +3189,14 @@ fn the_numbers_go_on_across_a_turn_that_panicked() {
     let last = first.seen().events.last().map(|event| event.seq);
     assert_eq!(last, Some(40));
     let path = first.socket.clone();
-    panic_once_at("numbers-over-a-panic", "observe stream failed");
+    panic_at("numbers-over-a-panic", "observe stream failed", 1);
     first.stop();
     // No event is raised while the first server goes: the call's own end is
     // then all the task sees, and its line panics where it is said. With an
     // event queued at that instant the send can see the end first, and that
     // end has no line.
     assert!(
-        eventually(trap_spent),
+        eventually(|| trap_spent("numbers-over-a-panic")),
         "the line of the first stream's end did not panic"
     );
     let second = TestPlugin::serve();
@@ -3209,9 +3209,7 @@ fn the_numbers_go_on_across_a_turn_that_panicked() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(
-        said().lock().expect("the kept lines").iter().any(|line| {
-            line.contains("observe task panicked") && line.contains("numbers-over-a-panic")
-        }),
+        !lines("numbers-over-a-panic", "observe task panicked").is_empty(),
         "the host said nothing of the task that panicked"
     );
     let seen = second.seen();
@@ -3223,6 +3221,39 @@ fn the_numbers_go_on_across_a_turn_that_panicked() {
     assert!(
         numbers.windows(2).all(|pair| pair[1] > pair[0]),
         "{numbers:?}"
+    );
+}
+
+/// A turn of the `Observe` task that panics at every start says its line
+/// once. Here the host's line of a failed stream panics three times in a
+/// row, a pause apart, with no event sent between them: the host says one
+/// line of the task, and the line names the plugin.
+#[test]
+fn a_streak_of_panicked_turns_says_its_line_once() {
+    let mut first = TestPlugin::serve();
+    let runtime = runtime();
+    let mut row = spec(&first, "panics-in-a-row");
+    row.connect_micros = 1_000_000;
+    let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    assert!(eventually(|| first.seen().events.len() == 1));
+    panic_at("panics-in-a-row", "observe stream failed", 3);
+    first.stop();
+    assert!(
+        eventually(|| trap_spent("panics-in-a-row")),
+        "three tellings did not panic"
+    );
+    // The fourth turn tells the failure with no panic: the streak's lines
+    // are all said by then.
+    assert!(eventually(|| {
+        lines("panics-in-a-row", "observe stream failed").len() >= 4
+    }));
+    assert_eq!(
+        lines("panics-in-a-row", "observe task panicked").len(),
+        1,
+        "{:?}",
+        lines("panics-in-a-row", "observe task panicked")
     );
 }
 

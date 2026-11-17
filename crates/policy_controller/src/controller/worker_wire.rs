@@ -9,17 +9,18 @@
 //! row past [`ROW_BYTES`] whole: an answer's two rows and a snapshot's page
 //! then fit a frame.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Instant};
 
 use prost::Message as _;
 
 use crate::{
     proto::{self, worker_event::Event},
+    replication::{Entry, Event as Written},
     store::{
-        HealthPolicy, Overload, Reachability, Signals, WorkerFacts, WorkerPatch, WorkerRow,
-        WorkerStatus,
+        HealthPolicy, LoadSample, MembershipChange, Overload, Reachability, Signals, WorkerFacts,
+        WorkerPatch, WorkerRow, WorkerStatus,
     },
-    view::{Role, WireModes, WorkerId},
+    view::{Role, SignalSource, WireModes, WorkerId},
 };
 
 /// A request field the door refuses: its path in the request, and why.
@@ -161,6 +162,9 @@ fn numbers(
             bootstrap_port: u32::from(port),
             ..Default::default()
         }),
+        // An instant's age is told where the send's clock is read: the
+        // snapshot sets it.
+        admitted_age_ms: 0,
         overload: Some(proto::OverloadThresholds {
             queue_limit: facts.overload.waiting_requests,
             kv_usage_permille: facts.overload.kv_usage_permille.map(u32::from),
@@ -318,6 +322,90 @@ fn label(name: &str, value: &str, path: &'static str) -> Result<(), Refused> {
 /// Whether a stated name holds a blank or a control character.
 fn blank(name: &str) -> bool {
     name.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// A log entry of a membership or status write in its envelope, at the
+/// entry's position and term. `None` for any other entry, and for a shape
+/// the store never tells.
+pub(crate) fn member(entry: &Entry) -> Option<proto::WorkerEvent> {
+    let Written::Member {
+        epoch,
+        change,
+        row,
+        left,
+    } = &entry.event
+    else {
+        return None;
+    };
+    let told = match (*change, row.as_deref(), left.as_deref()) {
+        (MembershipChange::Registered { .. }, Some(new), _) => registered(new),
+        (MembershipChange::Relabelled { .. } | MembershipChange::Resized { .. }, Some(now), _) => {
+            relabelled(now)
+        }
+        // A fresh row is pending: any other status the write left came
+        // over from the old incarnation.
+        (MembershipChange::Replaced { .. }, Some(new), Some(old)) => {
+            replaced(old, new, new.status != WorkerStatus::Pending)
+        }
+        (MembershipChange::Removed { .. }, _, Some(last)) => removed(last),
+        (MembershipChange::StatusChanged { id, from, to }, ..) => status_changed(id, from, to),
+        _ => return None,
+    };
+    Some(event(told, entry.at.seq, *epoch, entry.at.term))
+}
+
+const fn signal_source(source: SignalSource) -> proto::SignalSource {
+    match source {
+        SignalSource::None => proto::SignalSource::None,
+        SignalSource::Events => proto::SignalSource::Events,
+        SignalSource::Scrape => proto::SignalSource::Scrape,
+        SignalSource::Relay => proto::SignalSource::Relay,
+        SignalSource::Poll => proto::SignalSource::Poll,
+    }
+}
+
+/// One rank's load row as a standby is sent it at `now`. The age is the
+/// sample's at the send: never under the age the sample arrived with.
+/// Whether the report counts resident tokens crosses beside the row: the
+/// row's zero does not say it.
+pub(crate) fn load(
+    id: WorkerId,
+    rank: u16,
+    sample: &LoadSample,
+    now: Instant,
+) -> proto::LoadSample {
+    let row = &sample.row;
+    let age = now.saturating_duration_since(sample.sampled_at).as_millis();
+    proto::LoadSample {
+        worker_id: id.0,
+        dp_rank: u32::from(rank),
+        load: Some(proto::LoadRow {
+            running: row.running,
+            queued: row.queued,
+            waiting_uncached_tokens: row.waiting_uncached_tokens,
+            kv_usage_permille: u32::from(row.kv_usage_permille),
+            active_kv_permille: u32::from(row.active_kv_permille),
+            live_rate: row.live_rate,
+            resident_tokens: row.resident_tokens,
+            report_age_ms: u32::try_from(age).unwrap_or(u32::MAX),
+            source: signal_source(row.source) as i32,
+            max_running: row.max_running,
+        }),
+        resident_counted: row.resident_counted,
+    }
+}
+
+/// A log entry as a standby is sent it at `now`. An entry this build
+/// cannot tell is sent with no case set: the standby reads it as one it
+/// does not know, never as nothing.
+pub(crate) fn replication(entry: &Entry, now: Instant) -> proto::ReplicationEvent {
+    use proto::replication_event::Event as Sent;
+    let event = match &entry.event {
+        Written::Member { .. } => member(entry).map(Sent::Membership),
+        Written::Load { id, rank, sample } => Some(Sent::Load(load(*id, *rank, sample, now))),
+        Written::Term => Some(Sent::TermStart(proto::TermStart {})),
+    };
+    proto::ReplicationEvent { event }
 }
 
 /// `value`, or `default` where the wire's zero says unset.
@@ -685,21 +773,27 @@ pub(crate) fn patch(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, time::Instant};
+    use std::{
+        collections::BTreeMap,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use prost::Message as _;
 
     use super::{
-        event, patch, refused, registration, replaced, row, status, status_changed, Refused,
-        KEY_BYTES, LABELS, MODELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
+        event, load, member, patch, refused, registration, removed, replaced, replication, row,
+        status, status_changed, Refused, KEY_BYTES, LABELS, MODELS, NAME_BYTES, ROW_BYTES,
+        URL_BYTES, VALUE_BYTES,
     };
     use crate::{
-        proto::{self, worker_event::Event},
+        proto::{self, replication_event::Event as Sent, worker_event::Event},
+        replication::{Entry, Event as Written},
         store::{
-            identity, GatewayId, HealthPolicy, Overload, Reachability, Signals, WorkerFacts,
-            WorkerRow, WorkerStatus,
+            identity, GatewayId, HealthPolicy, LoadSample, LoadSource, MembershipChange, Overload,
+            Position, Reachability, Signals, WorkerFacts, WorkerRow, WorkerStatus,
         },
-        view::{Role, WireModes, WorkerId},
+        view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
     };
 
     const URL: &str = "grpc://10.0.0.5:8000";
@@ -833,6 +927,7 @@ mod tests {
                 bootstrap_port: 8_998,
                 ..Default::default()
             }),
+            admitted_age_ms: 0,
             overload: Some(proto::OverloadThresholds {
                 queue_limit: None,
                 kv_usage_permille: Some(875),
@@ -1861,5 +1956,195 @@ mod tests {
         // A replacement's answer carries two rows.
         let answer = event(replaced(&fat, &fat, true), u64::MAX, u64::MAX, u64::MAX);
         assert!(answer.encoded_len() <= 2 * ROW_BYTES + 64);
+    }
+
+    #[test]
+    fn a_log_entry_of_each_membership_write_has_its_case_at_the_entrys_place() {
+        let old = full();
+        let new = WorkerRow {
+            id: identity(URL, 4),
+            status: WorkerStatus::Ready,
+            ..full()
+        };
+        let at = Position { seq: 9, term: 4 };
+        let entry = |change, row: Option<&WorkerRow>, left: Option<&WorkerRow>| Entry {
+            at,
+            event: Written::Member {
+                epoch: 6,
+                change,
+                row: row.cloned().map(Arc::new),
+                left: left.cloned().map(Arc::new),
+            },
+        };
+        let told = |entry: &Entry| {
+            let sent = member(entry).expect("a membership event");
+            assert_eq!((sent.seq, sent.membership_epoch, sent.term), (9, 6, 4));
+            sent.event.expect("a case")
+        };
+
+        let registered = MembershipChange::Registered { id: new.id };
+        assert_eq!(
+            told(&entry(registered, Some(&new), None)),
+            Event::Registered(row(&new))
+        );
+        for change in [
+            MembershipChange::Relabelled { id: new.id },
+            MembershipChange::Resized { id: new.id },
+        ] {
+            assert_eq!(
+                told(&entry(change, Some(&new), None)),
+                Event::Relabelled(row(&new))
+            );
+        }
+        // The new incarnation's status came over from the old one's, or it
+        // is a fresh row's.
+        let replacement = MembershipChange::Replaced {
+            old: old.id,
+            new: new.id,
+        };
+        assert_eq!(
+            told(&entry(replacement, Some(&new), Some(&old))),
+            replaced(&old, &new, true)
+        );
+        let fresh = WorkerRow {
+            status: WorkerStatus::Pending,
+            ..new.clone()
+        };
+        assert_eq!(
+            told(&entry(replacement, Some(&fresh), Some(&old))),
+            replaced(&old, &fresh, false)
+        );
+        assert_eq!(
+            told(&entry(
+                MembershipChange::Removed { id: old.id },
+                None,
+                Some(&old)
+            )),
+            removed(&old)
+        );
+        let (from, to) = (WorkerStatus::Pending, WorkerStatus::Ready);
+        assert_eq!(
+            told(&entry(
+                MembershipChange::StatusChanged {
+                    id: new.id,
+                    from,
+                    to
+                },
+                Some(&new),
+                None
+            )),
+            status_changed(new.id, from, to)
+        );
+        // A shape the store never tells, and an entry that is no worker's
+        // event.
+        assert_eq!(member(&entry(registered, None, None)), None);
+        assert_eq!(
+            member(&Entry {
+                at,
+                event: Written::Term
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_load_row_is_sent_at_its_age_at_the_send() {
+        let sampled = Instant::now();
+        let sample = LoadSample {
+            row: LoadRow {
+                running: 3,
+                queued: 2,
+                waiting_uncached_tokens: 700,
+                kv_usage_permille: 815,
+                active_kv_permille: 410,
+                live_rate: 1_900,
+                resident_tokens: 64_000,
+                resident_counted: true,
+                report_age_ms: 40,
+                source: SignalSource::Events,
+                max_running: 96,
+            },
+            received_at: sampled + Duration::from_millis(40),
+            sampled_at: sampled,
+            source: LoadSource::Stream,
+        };
+        // Sent 25 ms after it arrived 40 ms old: 65 ms, never under 40.
+        let now = sampled + Duration::from_millis(65);
+        let sent = load(WorkerId(7), 2, &sample, now);
+        assert_eq!((sent.worker_id, sent.dp_rank), (7, 2));
+        assert!(sent.resident_counted, "the flag crosses beside the row");
+        assert_eq!(
+            sent.load,
+            Some(proto::LoadRow {
+                running: 3,
+                queued: 2,
+                waiting_uncached_tokens: 700,
+                kv_usage_permille: 815,
+                active_kv_permille: 410,
+                live_rate: 1_900,
+                resident_tokens: 64_000,
+                report_age_ms: 65,
+                source: proto::SignalSource::Events as i32,
+                max_running: 96,
+            })
+        );
+        // A send before the sample's own instant reads an age of zero.
+        assert_eq!(
+            load(WorkerId(7), 2, &sample, sampled)
+                .load
+                .map(|row| row.report_age_ms),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn every_kind_of_log_entry_is_sent_under_a_case_of_its_own() {
+        let at = Position { seq: 3, term: 2 };
+        let now = Instant::now();
+        let sample = LoadSample {
+            row: LoadRow::default(),
+            received_at: now,
+            sampled_at: now,
+            source: LoadSource::Poll,
+        };
+        let stored = full();
+        let entries = [
+            Written::Term,
+            Written::Load {
+                id: WorkerId(7),
+                rank: 1,
+                sample,
+            },
+            Written::Member {
+                epoch: 1,
+                change: MembershipChange::Registered { id: stored.id },
+                row: Some(Arc::new(stored.clone())),
+                left: None,
+            },
+        ]
+        .map(|event| replication(&Entry { at, event }, now).event);
+        assert_eq!(entries[0], Some(Sent::TermStart(proto::TermStart {})));
+        assert_eq!(
+            entries[1],
+            Some(Sent::Load(load(WorkerId(7), 1, &sample, now)))
+        );
+        assert_eq!(
+            entries[2],
+            Some(Sent::Membership(event(
+                Event::Registered(row(&stored)),
+                3,
+                1,
+                2
+            )))
+        );
+        // A membership entry in a shape the store never tells is sent with
+        // no case set: the standby reads an event it does not know.
+        let untold = Written::Member {
+            epoch: 1,
+            change: MembershipChange::Registered { id: stored.id },
+            row: None,
+            left: None,
+        };
+        assert_eq!(replication(&Entry { at, event: untold }, now).event, None);
     }
 }

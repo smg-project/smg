@@ -11,6 +11,38 @@ use smg_policy_controller::{
     controller, Candidate, Catalog, CatalogError, Lifecycle, Needs, RequestFacts, Scorer, TieBand,
 };
 
+/// The process's allocator, the one the stock controller's binary registers,
+/// on the targets where the settings below hold. An Apple target is left out:
+/// the allocator compiles no background thread there. The library registers
+/// none: a controller built on it chooses its own. A burst of registrations
+/// builds the store's world again at every write, and the system allocator
+/// keeps resident what those builds free.
+#[cfg(all(
+    not(target_env = "msvc"),
+    not(target_env = "musl"),
+    not(target_vendor = "apple")
+))]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// The allocator's settings, the stock binary's: a background thread hands
+/// freed pages back to the system ten seconds after their last use, the
+/// threads share sixteen arenas at most, and an allocation up to 32 MB takes
+/// the room the last one freed. The allocator reads them from this symbol as
+/// it starts.
+#[cfg(all(
+    not(target_env = "msvc"),
+    not(target_env = "musl"),
+    not(target_vendor = "apple")
+))]
+#[expect(
+    unsafe_code,
+    reason = "the allocator reads its settings from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
+)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 100] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
+
 /// Fills a worker before it opens the next: the worker with the most
 /// requests running, by its engine's own load report, scores highest, so a
 /// fleet under light traffic keeps whole workers idle. A worker with no

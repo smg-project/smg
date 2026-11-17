@@ -64,6 +64,7 @@ use smg_policy_controller::{
         WorkerFacts, WorkerStatus, WorkersStore,
     },
     view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
+    AppliedSpec, PolicySpec,
 };
 use tokio::{
     io::{copy, sink},
@@ -874,6 +875,21 @@ impl Harness {
     /// The gateway listener's address.
     pub fn gateway(&self) -> SocketAddr {
         self.replica.gateway()
+    }
+
+    /// Applies the preset named `preset` as the store's first generation,
+    /// in the case's process: no call of the controller applies a spec yet.
+    pub fn apply(&self, preset: &str) -> Result<(), String> {
+        let mut document = PolicySpec::preset(preset).map_err(|error| error.to_string())?;
+        document.generation = 1;
+        let spec = AppliedSpec::validate(&document).map_err(|error| error.to_string())?;
+        self.store.apply(spec).map_err(|error| error.to_string())
+    }
+
+    /// The engine and the rank of the row a decision names by `id`, where
+    /// it names a row of the fleet.
+    pub fn named(&self, id: u64) -> Option<(usize, u16)> {
+        self.members.get(&WorkerId(id)).copied()
     }
 
     /// Register: starts one mock engine per shape and registers each of its
