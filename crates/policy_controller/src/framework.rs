@@ -1216,9 +1216,9 @@ pub struct Binding {
     /// Sticky sessions: a keyed request of the `single` plan stays on the
     /// worker its key was placed on (design 4.6).
     pub sessions: Option<SessionRule>,
-    /// The overload thresholds of the pools the binding matches; `None`
-    /// when its block is switched off, and for a binding built by hand
-    /// that names none.
+    /// The overload thresholds of the pools decided under the binding
+    /// ([`Engine::pool_binding`]); `None` when its block is switched off,
+    /// and for a binding built by hand that names none.
     pub overload: Option<OverloadThresholds>,
 }
 
@@ -1879,15 +1879,37 @@ impl Engine {
         }
     }
 
-    /// The needs of the decode profile of the pair binding `model`'s prefill
-    /// lookup resolves to, nothing when that binding is not a pair.
+    /// The needs of the decode profile of `model`'s pair binding
+    /// ([`Self::pair_binding`]), nothing where the model has none.
     fn pair_decode_needs(&self, model: &str) -> Needs {
-        self.binding(model, Phase::Prefill)
-            .filter(|b| matches!(b.plan, Plan::PdPair | Plan::Epd { .. }))
+        self.pair_binding(model)
             .and_then(|b| profile_index(b, Phase::Decode))
             .and_then(|i| self.profiles.get(usize::from(i)))
             .map(Profile::needs)
             .unwrap_or_default()
+    }
+
+    /// The pair binding of `model`: the binding its prefill lookup resolves
+    /// to, where that binding's plan pairs (`pd-pair` or `epd`). Both sides
+    /// of a pair decision run under it ([`Self::decide_pair`]), whatever
+    /// binding covers the decode phase first.
+    fn pair_binding(&self, model: &str) -> Option<&Binding> {
+        self.binding(model, Phase::Prefill)
+            .filter(|b| matches!(b.plan, Plan::PdPair | Plan::Epd { .. }))
+    }
+
+    /// The binding a `phase` pool of `model` is decided under, whose
+    /// overload block judges the pool. Every decision resolves by its own
+    /// phase but a pair's decode side, which runs under the pair binding:
+    /// a decode pool is that binding's wherever the model has one. A
+    /// decode-phase binding ahead of it still decides a decode request
+    /// asked alone, and its block is not read for the pool.
+    pub fn pool_binding(&self, model: &str, phase: Phase) -> Option<&Binding> {
+        let pair = match phase {
+            Phase::Decode => self.pair_binding(model),
+            Phase::Single | Phase::Prefill | Phase::Encode => None,
+        };
+        pair.or_else(|| self.binding(model, phase))
     }
 
     /// What some decision of `phase` may read, over every binding that
@@ -2279,10 +2301,7 @@ impl Engine {
         // One binding for both sides: the prefill's lookup, whose decode
         // profile is the pair's decode side. A binding of the single plan
         // declines a pair decision: the host and the spec disagree.
-        let Some(binding) = self
-            .binding(facts.model, Phase::Prefill)
-            .filter(|b| matches!(b.plan, Plan::PdPair | Plan::Epd { .. }))
-        else {
+        let Some(binding) = self.pair_binding(facts.model) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
         let decode_index = binding.decode_profile.unwrap_or(binding.profile);
@@ -2831,6 +2850,59 @@ mod tests {
             decode_profile: None,
             ..pair_binding()
         }
+    }
+
+    /// A pair's decode side runs under the model's pair binding, so the
+    /// pool's lookup names that binding for a decode pool whatever covers
+    /// the decode phase first. Every other pool is its own phase's: an
+    /// encode item resolves by the encode phase under `epd` too.
+    #[test]
+    fn a_decode_pool_is_decided_under_its_models_pair_binding() {
+        let phase_first = |phase: Phase| Binding {
+            phases: vec![phase],
+            ..single_binding()
+        };
+        let pair = |plan: Plan| Binding {
+            model: "m".into(),
+            plan,
+            ..pair_binding()
+        };
+        let engine = |bindings: Vec<Binding>| {
+            Engine::new(
+                vec![least_requests_profile()],
+                bindings,
+                1,
+                Needs::default(),
+            )
+        };
+        let plan_of = |engine: &Engine, model: &str, phase: Phase| {
+            engine.pool_binding(model, phase).map(|b| b.plan)
+        };
+
+        let pd = engine(vec![phase_first(Phase::Decode), pair(Plan::PdPair)]);
+        // A decode request asked alone still resolves to the phase's first
+        // binding. The pool follows the pair, which is what decides over it.
+        assert_eq!(
+            pd.binding("m", Phase::Decode).map(|b| b.plan),
+            Some(Plan::Single)
+        );
+        assert_eq!(plan_of(&pd, "m", Phase::Decode), Some(Plan::PdPair));
+        assert_eq!(plan_of(&pd, "m", Phase::Prefill), Some(Plan::PdPair));
+        // A model the pair binding does not match has the phase's own.
+        assert_eq!(plan_of(&pd, "n", Phase::Decode), Some(Plan::Single));
+        assert_eq!(plan_of(&pd, "n", Phase::Prefill), None);
+
+        let epd = Plan::Epd { encode: 0 };
+        let with_encoders = engine(vec![
+            phase_first(Phase::Decode),
+            phase_first(Phase::Encode),
+            pair(epd),
+        ]);
+        assert_eq!(plan_of(&with_encoders, "m", Phase::Decode), Some(epd));
+        assert_eq!(
+            plan_of(&with_encoders, "m", Phase::Encode),
+            Some(Plan::Single)
+        );
     }
 
     /// One profile that keeps the healthy rows and leads with the deepest

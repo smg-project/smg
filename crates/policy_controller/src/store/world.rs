@@ -1271,7 +1271,10 @@ impl Writer {
     }
 
     /// Each pool's thresholds under the standing generation: those of the
-    /// first binding that matches the pool's model and its role's phase.
+    /// binding the pool is decided under, which is the first to match its
+    /// model and its role's phase, or the model's pair binding for a
+    /// decode pool
+    /// ([`Engine::pool_binding`](crate::framework::Engine::pool_binding)).
     /// Whether any pool has a pair.
     fn bind(&mut self) -> bool {
         let Self {
@@ -1291,7 +1294,7 @@ impl Writer {
                 };
                 pool.binding = spec
                     .engine()
-                    .binding(model, phase_of(role))
+                    .pool_binding(model, phase_of(role))
                     .and_then(|binding| binding.overload);
                 bound |= pool.binding.is_some();
             }

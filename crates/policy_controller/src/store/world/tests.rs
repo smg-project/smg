@@ -1,6 +1,8 @@
 //! The cases of the world and of a decision's build from it, over
 //! [`MemoryStore`]: every instant is handed in, none is slept.
 
+mod pool_binding;
+
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
