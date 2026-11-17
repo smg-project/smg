@@ -337,7 +337,7 @@ impl GrpcRouter {
     /// their state machines, not a copy of the 1 KiB request per hop.
     fn chat_request_for_pipeline(
         &self,
-        body: ChatCompletionRequest,
+        mut body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Result<(Arc<ChatCompletionRequest>, String, &RequestPipeline), Response> {
         if let Err(response) = super::validate_text_only_output(&body) {
@@ -367,9 +367,10 @@ impl GrpcRouter {
         // would no-op and otherwise leave the alias sitting in the body for
         // response metadata and parser selection to read.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
-        let mut canonical_body = body;
-        canonical_body.model.clone_from(&model_id_cloned);
-        Ok((Arc::new(canonical_body), model_id_cloned, pipeline))
+        if body.model != model_id_cloned {
+            Arc::make_mut(&mut body).model.clone_from(&model_id_cloned);
+        }
+        Ok((body, model_id_cloned, pipeline))
     }
 
     /// Main route_chat implementation, over the request
@@ -1184,7 +1185,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
         match self.chat_request_for_pipeline(body, model_id) {

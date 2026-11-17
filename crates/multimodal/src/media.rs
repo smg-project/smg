@@ -575,6 +575,24 @@ impl MediaConnector {
         Ok(RawMedia { bytes, source })
     }
 
+    /// The canonical form of a local media path. Refused when no local root is
+    /// configured or the path resolves outside it.
+    async fn allowed_local_path(&self, path: &Path) -> Result<PathBuf, MediaConnectorError> {
+        let allowed_root = self
+            .allowed_local_media_path
+            .as_ref()
+            .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
+        let canonical = fs::canonicalize(path)
+            .await
+            .map_err(MediaConnectorError::Io)?;
+        if !canonical.starts_with(allowed_root) {
+            return Err(MediaConnectorError::DisallowedLocalPath(
+                path.display().to_string(),
+            ));
+        }
+        Ok(canonical)
+    }
+
     async fn fetch_raw_bytes(
         &self,
         source: MediaSource,
@@ -603,17 +621,7 @@ impl MediaConnector {
                 Ok((bytes.into(), RawFetchSource::InlineBytes))
             }
             MediaSource::File(path) => {
-                let allowed_root = self.allowed_local_media_path.as_ref().ok_or_else(|| {
-                    MediaConnectorError::DisallowedLocalPath(path.display().to_string())
-                })?;
-                let canonical = fs::canonicalize(&path)
-                    .await
-                    .map_err(MediaConnectorError::Io)?;
-                if !canonical.starts_with(allowed_root) {
-                    return Err(MediaConnectorError::DisallowedLocalPath(
-                        path.display().to_string(),
-                    ));
-                }
+                let canonical = self.allowed_local_path(&path).await?;
                 let bytes = read_file_with_limit(&canonical, limit, media).await?;
                 Ok((bytes, RawFetchSource::File(canonical)))
             }
@@ -786,20 +794,7 @@ impl MediaConnector {
         path: &Path,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        let allowed_root = self
-            .allowed_local_media_path
-            .as_ref()
-            .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
-
-        let canonical = fs::canonicalize(path)
-            .await
-            .map_err(MediaConnectorError::Io)?;
-        if !canonical.starts_with(allowed_root) {
-            return Err(MediaConnectorError::DisallowedLocalPath(
-                path.display().to_string(),
-            ));
-        }
-
+        let canonical = self.allowed_local_path(path).await?;
         let bytes = read_file_with_limit(&canonical, image_max_input_bytes(), "image").await?;
         Self::decode_image(
             bytes,
@@ -964,40 +959,14 @@ impl MediaConnector {
         path: &Path,
         cfg: VideoFetchConfig,
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
-        let allowed_root = self
-            .allowed_local_media_path
-            .as_ref()
-            .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
-
-        let canonical = fs::canonicalize(path)
-            .await
-            .map_err(MediaConnectorError::Io)?;
-        if !canonical.starts_with(allowed_root) {
-            return Err(MediaConnectorError::DisallowedLocalPath(
-                path.display().to_string(),
-            ));
-        }
-
+        let canonical = self.allowed_local_path(path).await?;
         let bytes = read_file_with_limit(&canonical, video_max_input_bytes(), "video").await?;
         self.decode_video(bytes, cfg, VideoSource::File { path: canonical })
             .await
     }
 
     async fn fetch_audio_file(&self, path: &Path) -> Result<Arc<AudioClip>, MediaConnectorError> {
-        let allowed_root = self
-            .allowed_local_media_path
-            .as_ref()
-            .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
-
-        let canonical = fs::canonicalize(path)
-            .await
-            .map_err(MediaConnectorError::Io)?;
-        if !canonical.starts_with(allowed_root) {
-            return Err(MediaConnectorError::DisallowedLocalPath(
-                path.display().to_string(),
-            ));
-        }
-
+        let canonical = self.allowed_local_path(path).await?;
         let bytes = read_file_with_limit(&canonical, audio_max_input_bytes(), "audio").await?;
         self.decode_audio(bytes, AudioSource::File { path: canonical })
             .await
@@ -3472,6 +3441,23 @@ async fn run_video_command_output(
     }
 }
 
+/// [`run_video_command_output`] for a command whose exit status is the
+/// decoder's verdict on the clip: a failure is the media's
+/// ([`MediaConnectorError::VideoDecode`]), with the decoder's stderr.
+async fn run_video_command_checked(
+    command: Command,
+    program: &'static str,
+) -> Result<Output, MediaConnectorError> {
+    let output = run_video_command_output(command, program).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(MediaConnectorError::VideoDecode(format!(
+            "{program} failed: {stderr}"
+        )));
+    }
+    Ok(output)
+}
+
 async fn decode_video_with_ffmpeg_ppm(
     input_path: &Path,
     cfg: VideoFetchConfig,
@@ -3505,14 +3491,7 @@ async fn decode_video_with_ffmpeg_ppm(
         "rgb24",
         "pipe:1",
     ]);
-    let output = run_video_command_output(command, "ffmpeg").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffmpeg failed: {stderr}"
-        )));
-    }
+    let output = run_video_command_checked(command, "ffmpeg").await?;
 
     let mut video = parse_ppm_rgb_video(Bytes::from(output.stdout))?;
     if let Some(frame) = video.frames.first() {
@@ -3568,14 +3547,7 @@ async fn decode_video_with_ffmpeg_raw(
         "rgb24",
         "pipe:1",
     ]);
-    let output = run_video_command_output(command, "ffmpeg").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffmpeg failed: {stderr}"
-        )));
-    }
+    let output = run_video_command_checked(command, "ffmpeg").await?;
 
     let frame_count = output.stdout.len() / frame_size;
     checked_decoded_rgb_bytes(frame_count, frame_size)?;
@@ -3640,14 +3612,7 @@ async fn decode_video_with_ffmpeg_png(
         "png",
         "pipe:1",
     ]);
-    let output = run_video_command_output(command, "ffmpeg").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffmpeg failed: {stderr}"
-        )));
-    }
+    let output = run_video_command_checked(command, "ffmpeg").await?;
 
     let pngs = split_png_stream(&output.stdout)?;
     let mut frames = Vec::with_capacity(pngs.len());
@@ -3819,14 +3784,7 @@ async fn probe_video_info(input_path: &Path) -> Result<ProbedVideoInfo, MediaCon
             "json",
         ])
         .arg(input_path);
-    let output = run_video_command_output(command, "ffprobe").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffprobe failed: {stderr}"
-        )));
-    }
+    let output = run_video_command_checked(command, "ffprobe").await?;
 
     parse_ffprobe_video_info(&output.stdout)
 }
@@ -3848,14 +3806,7 @@ async fn probe_decoded_frame_count(input_path: &Path) -> Result<usize, MediaConn
             "json",
         ])
         .arg(input_path);
-    let output = run_video_command_output(command, "ffprobe").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffprobe failed: {stderr}"
-        )));
-    }
+    let output = run_video_command_checked(command, "ffprobe").await?;
 
     let probe: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         MediaConnectorError::VideoDecode(format!("failed to parse ffprobe output: {error}"))
@@ -3888,14 +3839,7 @@ async fn probe_frame_table(input_path: &Path) -> Result<Option<FrameTable>, Medi
             "csv",
         ])
         .arg(input_path);
-    let output = run_video_command_output(command, "ffprobe").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffprobe failed: {stderr}"
-        )));
-    }
+    let output = run_video_command_checked(command, "ffprobe").await?;
 
     Ok(FrameTable::parse(&output.stdout))
 }
@@ -3957,13 +3901,7 @@ async fn decode_video_with_ffmpeg_seek(
                 .saturating_add(picks.saturating_mul(64))
                 .min(video_max_decoded_bytes());
             let command = ffmpeg_seek_run_command(input_path, segment, output_limit, passthrough);
-            let output = run_video_command_output(command, "ffmpeg").await?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(MediaConnectorError::VideoDecode(format!(
-                    "ffmpeg failed: {stderr}"
-                )));
-            }
+            let output = run_video_command_checked(command, "ffmpeg").await?;
             // A run that comes back short ends the decode here, before the
             // other runs finish: its seek did not land where the plan says.
             let frames = if output.stdout.is_empty() {

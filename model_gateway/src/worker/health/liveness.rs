@@ -625,7 +625,7 @@ const DEFAULT_WARMUP: Warmup = Warmup {
     divert_every: 8,
 };
 
-/// Set the warm-up slice from the gateway configuration; the first call wins.
+/// Set the warm-up slice from the host; the first call wins.
 pub(crate) fn configure_warmup(warmup: Warmup) {
     let _ = WARMUP.set(warmup);
 }
@@ -634,7 +634,7 @@ pub(crate) fn warmup() -> Warmup {
     WARMUP.get().copied().unwrap_or(DEFAULT_WARMUP)
 }
 
-/// Set the stall, wedge and stale thresholds from the gateway configuration.
+/// Set the stall, wedge and stale thresholds from the host.
 /// The first call wins; the defaults are two, three and fifteen seconds.
 pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
     let _ = THRESHOLDS.set((stall, wedge, stale));
@@ -664,8 +664,9 @@ fn thresholds() -> (Duration, Duration, Duration) {
         .unwrap_or((DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE))
 }
 
-/// The liveness budgets in force in this process: what a configuration set
-/// through `configure_from`, or the defaults.
+/// A set of liveness budgets: what a host hands `configure_from`, and what
+/// `budgets()` reports as in force in this process (the first set configured,
+/// or the defaults).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Budgets {
     /// A worker that has not answered a contact for this long is stalled.
@@ -1239,6 +1240,16 @@ mod tests {
         Arc::new(BasicWorkerBuilder::new("http://w1:8000").build())
     }
 
+    /// Whether `age` counts from a stamp noted at or after `since` on the
+    /// gateway clock: such an age is within the time elapsed since then,
+    /// and an older stamp's is longer by the wait the test put before
+    /// `since`. The caller passes the age it read, so the clock is read
+    /// here after it and a scheduling stall only widens the bound; a fixed
+    /// margin (`age < 10 ms`) would race it.
+    fn noted_since(since: u64, age: Duration) -> bool {
+        age <= Duration::from_millis(now_ms() - since)
+    }
+
     /// A worker whose prompt was given up on by the silence verdict (a run
     /// the whole cold-shape grace long, released without an answer) is
     /// judged by its own rate once it answers: the wait it was given up on
@@ -1429,13 +1440,14 @@ mod tests {
         // counted from registration. It counts from the dispatch now.
         let w = worker();
         thread::sleep(Duration::from_millis(15));
+        let dispatched_at = now_ms();
         for _ in 0..3 {
             w.increment_load();
             w.runtime_state().unwrap().note_tracked_started();
         }
         let age = w.runtime_state().unwrap().token_progress_age();
         assert!(
-            age < Duration::from_millis(10),
+            noted_since(dispatched_at, age),
             "clock started at the dispatch"
         );
         sweep(&w);
@@ -2054,9 +2066,12 @@ mod tests {
         assert!(w.stall_reason().is_none(), "never pushed");
         // The stream delivers a record: from here on silence counts.
         w.runtime_state().unwrap().note_load_record();
+        let heard_at = now_ms();
         on_contact(&w);
-        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
-        assert!(w.stall_reason().is_none(), "just heard from");
+        assert!(
+            noted_since(heard_at, w.runtime_state().unwrap().contact_age()),
+            "just heard from"
+        );
         thread::sleep(Duration::from_millis(30));
         sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
         assert_eq!(w.stall_reason(), Some(StallReason::Unreachable));
@@ -2067,9 +2082,12 @@ mod tests {
         assert!(!w.routing_state().stalled);
         // A worker that still streams tokens is heard from: never stale.
         thread::sleep(Duration::from_millis(30));
+        let streamed_at = now_ms();
         on_token_progress(&w);
-        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
-        assert!(w.stall_reason().is_none(), "tokens are contact");
+        assert!(
+            noted_since(streamed_at, w.runtime_state().unwrap().contact_age()),
+            "tokens are contact"
+        );
         // Off at zero.
         thread::sleep(Duration::from_millis(30));
         sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, Duration::ZERO);
@@ -2089,7 +2107,7 @@ mod tests {
             Some(StallReason::Wedged),
             "test",
         );
-        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE);
         assert_eq!(
             w.stall_reason(),
             Some(StallReason::Wedged),
@@ -2227,12 +2245,17 @@ mod tests {
         let w = worker();
         tracked_pile(&w, 4);
         thread::sleep(Duration::from_millis(5));
+        let progressed_at = now_ms();
         on_token_progress(&w);
-        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(50), DEFAULT_STALE);
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE);
         assert!(
-            w.stall_reason().is_none(),
+            noted_since(
+                progressed_at,
+                w.runtime_state().unwrap().token_progress_age()
+            ),
             "finishing work is progress, whatever the request's shape"
         );
+        assert!(w.stall_reason().is_none(), "and the pile stays routable");
         thread::sleep(Duration::from_millis(55));
         sweep_with(&w, DEFAULT_STALL, Duration::from_millis(50), DEFAULT_STALE);
         assert_eq!(
@@ -2258,10 +2281,11 @@ mod tests {
         w.increment_load();
         thread::sleep(Duration::from_millis(15));
         assert!(w.runtime_state().unwrap().token_progress_age() >= Duration::from_millis(15));
+        let tracked_at = now_ms();
         w.increment_load();
         w.runtime_state().unwrap().note_tracked_started();
         assert!(
-            w.runtime_state().unwrap().token_progress_age() < Duration::from_millis(10),
+            noted_since(tracked_at, w.runtime_state().unwrap().token_progress_age()),
             "the clock restarted with the tracked run"
         );
     }
@@ -2481,16 +2505,16 @@ mod tests {
     fn re_admission_restarts_the_warm_up_clock() {
         let w = worker();
         thread::sleep(Duration::from_millis(20));
-        let before = w.admitted_age();
         set(
             &w,
             w.runtime_state().as_deref(),
             Some(StallReason::Unreachable),
             "test",
         );
+        let cleared_at = now_ms();
         on_contact(&w);
         assert!(
-            w.admitted_age() < before,
+            noted_since(cleared_at, w.admitted_age()),
             "cleared veto counts as an admission"
         );
     }

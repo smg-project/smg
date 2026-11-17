@@ -47,9 +47,11 @@ pub(crate) enum DpPlacement {
     /// The engine honors the per-request `data_parallel_rank` pin field, set
     /// on each side from its selected dp-aware virtual worker.
     PinField,
-    /// The room encodes the prefill rank so TokenSpeed's decode receiver can
-    /// locate its KV source. Each request also carries its selected rank pin;
-    /// TokenSpeed must support PD pins to honor independent decode placement.
+    /// The room encodes the prefill rank: the prefill engine places a request
+    /// by its room's residue, a rank pin yielding to it, and the decode
+    /// receiver locates its KV source there. Each request also carries its
+    /// selected rank pin; an engine must support PD pins to honor independent
+    /// decode placement.
     RoomResidue,
 }
 
@@ -90,7 +92,7 @@ impl PdProtocol {
             RuntimeType::Sglang => Some(Self {
                 dispatch: PdDispatch::Parallel,
                 rendezvous: PdRendezvous::SglangBootstrap,
-                dp_placement: DpPlacement::PinField,
+                dp_placement: DpPlacement::RoomResidue,
                 encode: None,
             }),
             RuntimeType::Vllm => Some(Self {
@@ -129,7 +131,7 @@ mod tests {
         let sglang = PdProtocol::for_runtime(RuntimeType::Sglang).unwrap();
         assert_eq!(sglang.dispatch, PdDispatch::Parallel);
         assert_eq!(sglang.rendezvous, PdRendezvous::SglangBootstrap);
-        assert_eq!(sglang.dp_placement, DpPlacement::PinField);
+        assert_eq!(sglang.dp_placement, DpPlacement::RoomResidue);
         assert_eq!(sglang.encode, None);
 
         let vllm = PdProtocol::for_runtime(RuntimeType::Vllm).unwrap();

@@ -181,7 +181,7 @@ fn fed_pool(
     Vec<Arc<dyn Worker>>,
     HashMap<String, WorkerLoadResponse>,
 ) {
-    let feed = TestFeed::attached_to(policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     let pool: Vec<Arc<dyn Worker>> = (0..workers)
         .map(|i| {
             Arc::new(

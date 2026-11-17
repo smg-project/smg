@@ -14,8 +14,9 @@ use smg_policy_controller::{
 /// Fills a worker before it opens the next: the worker with the most
 /// requests running, by its engine's own load report, scores highest, so a
 /// fleet under light traffic keeps whole workers idle. A worker with no
-/// report yet counts as idle. The profile's filter still drops a worker the
-/// prober takes out of rotation.
+/// report yet counts as idle. The profile's filters say where a fill ends:
+/// they drop a worker the prober takes out of rotation, and one whose
+/// engine reports over an overload threshold.
 #[derive(Debug)]
 struct Pack;
 
@@ -88,7 +89,7 @@ mod tests {
     use smg_policy_controller::{
         controller::{Config, Controller, Election, Listener, Scope},
         store::{
-            Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers,
+            Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Overload, ViewBuffers,
             WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
         },
         Constraints, Engine, LoadRow, PolicySpec, RequestFacts, Role, Scorer, Scratch, SpecError,
@@ -101,6 +102,10 @@ mod tests {
     const POLICY: &str = include_str!("../policy.yaml");
 
     const MODEL: &str = "a-model";
+
+    /// The queue at which each worker of the fleet names itself overloaded,
+    /// at its registration.
+    const QUEUE: u32 = 4;
 
     fn read(document: &str) -> PolicySpec {
         serde_yaml::from_str(document).expect("a well-formed document")
@@ -117,7 +122,8 @@ mod tests {
     /// A store as the controller keeps one, fed through the doors its
     /// ingestion uses: two workers of one model, registered, proven ready
     /// and each with a load report on file. One runs three requests, one is
-    /// idle. No row a decision reads is written by hand.
+    /// idle. Each names its own overload threshold, a queue of [`QUEUE`]
+    /// requests. No row a decision reads is written by hand.
     struct Fleet {
         store: MemoryStore,
         busy: WorkerId,
@@ -158,6 +164,10 @@ mod tests {
                     incarnation: 1,
                     models: vec![MODEL.to_owned()],
                     dp_size: 1,
+                    overload: Overload {
+                        waiting_requests: Some(QUEUE),
+                        ..Overload::default()
+                    },
                     ..WorkerFacts::default()
                 })
                 .id();
@@ -200,10 +210,12 @@ mod tests {
             self.publish();
         }
 
-        /// Records a load report as an engine's stream delivers one.
-        fn report(&mut self, id: WorkerId, running: u32) {
+        /// Records a load report as an engine's stream delivers one: its
+        /// requests running and queued.
+        fn report(&mut self, id: WorkerId, running: u32, queued: u32) {
             let report = LoadRow {
                 running,
+                queued,
                 ..LoadRow::default()
             };
             self.store
@@ -307,7 +319,7 @@ mod tests {
         // The busy worker drains and nothing runs. An idle fleet ties: every
         // worker takes the same whole score, and the picker draws among
         // equals, so each of them takes picks.
-        fleet.report(fleet.busy, 0);
+        fleet.report(fleet.busy, 0, 0);
         assert_eq!(fleet.scores(), [1.0; 3]);
         let picks: Vec<_> = (0..64).map(|seed| fleet.pick_at(&engine, seed)).collect();
         for worker in [fleet.busy, fleet.idle, unreported] {
@@ -329,6 +341,22 @@ mod tests {
         assert_eq!(fleet.pick(&engine), Some(fleet.idle));
         // The veto cleared, the busy worker fills again.
         fleet.veto(GatewayId::LOCAL, fleet.busy, false);
+        assert_eq!(fleet.pick(&engine), Some(fleet.busy));
+    }
+
+    #[test]
+    fn a_worker_at_its_overload_threshold_is_passed_over_and_the_next_opens() {
+        let mut fleet = Fleet::new();
+        let engine = engine(POLICY);
+        // A queue under the worker's threshold: `pack` still fills it.
+        fleet.report(fleet.busy, 3, QUEUE - 1);
+        assert_eq!(fleet.pick(&engine), Some(fleet.busy));
+        // At the threshold the store judges the worker's engine overloaded
+        // and the document's `not-overloaded` drops it: the next opens.
+        fleet.report(fleet.busy, 3, QUEUE);
+        assert_eq!(fleet.pick(&engine), Some(fleet.idle));
+        // The queue drains and the worker fills again.
+        fleet.report(fleet.busy, 3, 0);
         assert_eq!(fleet.pick(&engine), Some(fleet.busy));
     }
 
@@ -364,6 +392,7 @@ mod tests {
                 listener("replication", &[Scope::Replication]),
             ],
             admin: loopback,
+            decide_shards: Config::default_decide_shards(),
             shutdown_settle: Config::DEFAULT_SHUTDOWN_SETTLE,
             shutdown_grace: Config::DEFAULT_SHUTDOWN_GRACE,
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,

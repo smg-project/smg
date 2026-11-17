@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-pub use crate::plugins::config::{BreakerSpec, Exposure, Failure, HeaderSet, Reveal};
+pub use crate::plugins::config::{BreakerSpec, Exposure, Failure, FrameBudget, HeaderSet, Reveal};
 use crate::spec::Needs;
 
 /// The `smg:policy` package versions the host accepts: one major, every
@@ -150,38 +150,6 @@ impl PluginSpec {
     /// breaker.
     pub fn frame_micros(&self, request_budget_micros: u32) -> u32 {
         self.frame().frame_micros(request_budget_micros)
-    }
-}
-
-/// A plugin's frame budget per stage call (`0` takes the request's) and the
-/// fuel per microsecond it is metered at: the one place the frame is clamped
-/// to the request's and turned into fuel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FrameBudget {
-    pub micros: u32,
-    pub fuel_per_micro: u64,
-}
-
-impl FrameBudget {
-    /// The frame of one call under `request_budget_micros` left: the
-    /// plugin's own, clamped to the request's.
-    pub fn frame_micros(self, request_budget_micros: u32) -> u32 {
-        if self.micros == 0 {
-            request_budget_micros
-        } else {
-            self.micros.min(request_budget_micros)
-        }
-    }
-
-    /// The fuel of one call's frame under `request_budget_micros` left; `0`
-    /// means no call.
-    pub fn fuel_for(self, request_budget_micros: u32) -> u64 {
-        self.fuel_of(self.frame_micros(request_budget_micros))
-    }
-
-    /// The fuel of `micros` of wall time at this calibration.
-    pub fn fuel_of(self, micros: u32) -> u64 {
-        u64::from(micros).saturating_mul(self.fuel_per_micro)
     }
 }
 

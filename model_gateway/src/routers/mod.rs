@@ -1,6 +1,6 @@
 //! Router implementations
 
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 use axum::{body::Body, extract::Request, http::HeaderMap, response::Response};
@@ -111,12 +111,14 @@ pub trait RouterTrait: Send + Sync + Debug {
         )
     }
 
-    /// Route a chat completion request
+    /// Route a chat completion request. The request comes in the `Arc` its
+    /// handler built: a router that shares the request with its pipeline
+    /// moves the pointer, and one that forwards the body takes it out once.
     async fn route_chat(
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: ChatCompletionRequest,
+        _body: Arc<ChatCompletionRequest>,
         _model_id: &str,
     ) -> Response {
         error::not_implemented(
@@ -441,7 +443,7 @@ mod tests {
                 "Generate endpoint not implemented",
             ),
             (
-                router.route_chat(None, &meta, body(chat.clone()), "m").await,
+                router.route_chat(None, &meta, Arc::new(body(chat.clone())), "m").await,
                 "chat_completions_not_implemented",
                 "Chat completions not implemented",
             ),

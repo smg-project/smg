@@ -431,7 +431,9 @@ impl Endpoint {
                     "messages": [{"role": "user", "content": PROMPT_TEXT}],
                     "stream": stream,
                 }));
-                router.route_chat(None, &tenant, body, MODEL).await
+                router
+                    .route_chat(None, &tenant, Arc::new(body), MODEL)
+                    .await
             }
             Self::Completion => {
                 let body = request::<CompletionRequest>(json!({
@@ -620,7 +622,9 @@ async fn every_input_the_request_carries_is_reserved() {
             }]},
         ],
     }));
-    router.route_chat(None, &tenant, tool_call, MODEL).await;
+    router
+        .route_chat(None, &tenant, Arc::new(tool_call), MODEL)
+        .await;
 
     worker.answer(Endpoint::Messages.usage_body(1, 1));
     let tool_result = request::<CreateMessageRequest>(json!({

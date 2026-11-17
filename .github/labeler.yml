@@ -79,7 +79,9 @@ multimodal:
 
 protocols:
   - changed-files:
-      - any-glob-to-any-file: 'crates/protocols/**/*'
+      - any-glob-to-any-file:
+          - 'crates/protocols/**/*'
+          - 'crates/worker/**/*'
 
 workflow:
   - changed-files:

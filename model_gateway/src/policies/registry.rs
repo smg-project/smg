@@ -34,7 +34,7 @@ use crate::{
         extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
     },
     worker::{
-        identity::endpoint::Endpoint, load::state::LoadReceiver, KvEventMonitor,
+        identity::endpoint::Endpoint, load::state::LoadReceiver, KvEventMonitor, LoadConsumer,
         RequestCompletionSink, Worker, WorkerType,
     },
 };
@@ -1152,6 +1152,16 @@ impl std::fmt::Debug for PolicyRegistry {
                 &TextNeeds(self.text_needs.load(Ordering::Relaxed)),
             )
             .finish()
+    }
+}
+
+impl LoadConsumer for PolicyRegistry {
+    fn needs_loads(&self) -> bool {
+        self.needs_backend_loads() || self.get_dp_rank_policy().is_some()
+    }
+
+    fn reconcile_in_flight(&self, worker: &dyn Worker) {
+        PolicyRegistry::reconcile_in_flight(self, worker);
     }
 }
 
@@ -2356,6 +2366,23 @@ mod tests {
         );
         let default = Arc::as_ptr(&registry.default_policy) as *const ();
         assert_eq!(visits.iter().filter(|p| **p == default).count(), 1);
+    }
+
+    /// What the load monitor is told through `LoadConsumer`: loads are wanted
+    /// when a policy reads them, and when a DP-rank policy is set though no
+    /// policy reads them.
+    #[test]
+    fn loads_are_wanted_for_a_policy_that_reads_them_or_a_dp_rank_policy() {
+        let plain = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert!(!LoadConsumer::needs_loads(&plain));
+
+        let reading = PolicyRegistry::new(PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096));
+        assert!(LoadConsumer::needs_loads(&reading));
+
+        let ranked = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        ranked.set_dp_rank_policy(Arc::new(crate::policies::MinimumTokensPolicy::new(None)));
+        assert!(!ranked.needs_backend_loads());
+        assert!(LoadConsumer::needs_loads(&ranked));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::{
 use openai_protocol::worker::HttpPoolConfig;
 use tracing::{debug, warn};
 
-use crate::server::{http_client, http_client_builder};
+use crate::worker::connection::client_factory::{http_client, http_client_builder};
 
 /// Default pool settings for worker-directed HTTP clients.
 const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
@@ -108,22 +108,14 @@ pub struct WorkerHttpClientSettings {
 /// are pruned on the next build, and cardinality is bounded by live distinct
 /// configs — a churning fleet cannot grow the map.
 pub struct WorkerHttpClientCache {
-    client_identity: Option<Vec<u8>>,
-    ca_certificates: Vec<Vec<u8>>,
-    upstream_http2: bool,
-    request_timeout_secs: u64,
-    pool_idle_timeout_secs: u64,
+    settings: WorkerHttpClientSettings,
     clients: Mutex<HashMap<ClientKey, Weak<reqwest::Client>>>,
 }
 
 impl WorkerHttpClientCache {
     pub fn new(settings: WorkerHttpClientSettings) -> Self {
         Self {
-            client_identity: settings.client_identity,
-            ca_certificates: settings.ca_certificates,
-            upstream_http2: settings.upstream_http2,
-            request_timeout_secs: settings.request_timeout_secs,
-            pool_idle_timeout_secs: settings.pool_idle_timeout_secs,
+            settings,
             clients: Mutex::new(HashMap::new()),
         }
     }
@@ -150,7 +142,7 @@ impl WorkerHttpClientCache {
     fn key(&self, pool_config: &HttpPoolConfig, http2: bool) -> ClientKey {
         let timeout_secs = pool_config
             .timeout_secs
-            .unwrap_or(self.request_timeout_secs);
+            .unwrap_or(self.settings.request_timeout_secs);
         let connect_timeout_secs = connect_timeout_secs_below(
             pool_config
                 .connect_timeout_secs
@@ -164,7 +156,7 @@ impl WorkerHttpClientCache {
                 .unwrap_or(DEFAULT_POOL_MAX_IDLE_PER_HOST),
             pool_idle_timeout_secs: pool_config
                 .pool_idle_timeout_secs
-                .unwrap_or(self.pool_idle_timeout_secs),
+                .unwrap_or(self.settings.pool_idle_timeout_secs),
             timeout_secs,
             http2,
         }
@@ -180,7 +172,8 @@ impl WorkerHttpClientCache {
     }
 
     fn build(&self, key: &ClientKey) -> Result<reqwest::Client, String> {
-        let has_tls = self.client_identity.is_some() || !self.ca_certificates.is_empty();
+        let has_tls =
+            self.settings.client_identity.is_some() || !self.settings.ca_certificates.is_empty();
 
         // Idle pooled connections must expire before the backend server's
         // keep-alive closes them (vLLM/SGLang default: 5s), or checkout races
@@ -190,12 +183,14 @@ impl WorkerHttpClientCache {
             secs => Some(Duration::from_secs(secs)),
         };
         let identity = self
+            .settings
             .client_identity
             .as_deref()
             .map(reqwest::Identity::from_pem)
             .transpose()
             .map_err(|e| format!("Failed to create client identity: {e}"))?;
         let ca_certificates = self
+            .settings
             .ca_certificates
             .iter()
             .map(|pem| reqwest::Certificate::from_pem(pem))
@@ -211,7 +206,7 @@ impl WorkerHttpClientCache {
                 .tcp_nodelay(true)
                 .tcp_keepalive(Some(Duration::from_secs(30)));
 
-            if self.upstream_http2 {
+            if self.settings.upstream_http2 {
                 builder = tune_http2(builder);
             }
             if key.http2 {

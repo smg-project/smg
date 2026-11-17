@@ -20,6 +20,8 @@ mod thinking_display;
 mod usage;
 mod usage_chunk;
 
+use openai_protocol::chat::ChatCompletionStreamResponse;
+
 use super::{frames::TextDelta, *};
 
 /// The frames write exactly the bytes of the serialized whole chunk
@@ -134,13 +136,36 @@ fn chunk_frames_write_the_bytes_of_the_whole_structs() {
                 choices: vec![choice.clone()],
                 usage: usage.clone(),
             };
+            let mut expected = serde_json::to_vec(&whole).unwrap();
+            if emit_usage_null {
+                expected.pop();
+                expected.extend_from_slice(b",\"usage\":null}");
+            }
             assert_eq!(
                 event(&buffer),
-                serde_json::to_vec(&ChatChunkWithUsage::new(&whole, emit_usage_null)).unwrap(),
+                expected,
                 "chat, fingerprint {fingerprint:?}, usage {}, placeholder {emit_usage_null}",
                 usage.is_some()
             );
         }
+
+        let usage = Usage::from_counts(3, 2);
+        let mut buffer = BytesMut::new();
+        frame.write_usage_chunk(&mut buffer, &usage);
+        let whole = ChatCompletionStreamResponse {
+            id: "chatcmpl-1".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1_700_000_000,
+            model: "model-x".to_string(),
+            system_fingerprint: fingerprint.map(str::to_string),
+            choices: Vec::new(),
+            usage: Some(usage),
+        };
+        assert_eq!(
+            event(&buffer),
+            serde_json::to_vec(&whole).unwrap(),
+            "chat usage chunk, fingerprint {fingerprint:?}"
+        );
     }
 }
 

@@ -22,6 +22,14 @@ use crate::{
     view::{Candidate, Constraints, RequestFacts},
 };
 
+/// The three stages a profile may bind a plugin as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    Filter,
+    Score,
+    Pick,
+}
+
 /// The stage takes its fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fallback;
@@ -44,6 +52,12 @@ pub trait BoundPlugin: DecisionScope + 'static {
     /// Claims the lifecycle for the adapter that asks: `true` for the first
     /// of an engine build, so an event reaches the plugin once per build.
     fn take_observer(&self) -> bool;
+    /// The profile binds the plugin as `stage`: an adapter says so when it
+    /// is made. A kind asked stage by stage ignores it; a kind asked once
+    /// per decision names its frame's stages from it.
+    fn bound_to(&self, stage: Stage) {
+        let _ = stage;
+    }
     /// The filter's answer: `kept` keeps the positions the plugin kept.
     fn retain(&self, facts: &RequestFacts<'_>, kept: &mut Vec<u32>) -> Result<(), Fallback>;
     /// One row of the filter's answer.
@@ -96,6 +110,7 @@ pub struct PluginFilter<B> {
 
 impl<B: BoundPlugin> PluginFilter<B> {
     pub fn new(bound: Arc<B>, fallback: Option<Box<dyn Filter>>) -> Self {
+        bound.bound_to(Stage::Filter);
         Self {
             bound,
             fallback,
@@ -169,6 +184,7 @@ pub struct PluginScorer<B> {
 
 impl<B: BoundPlugin> PluginScorer<B> {
     pub fn new(bound: Arc<B>, fallback: Option<Box<dyn Scorer>>) -> Self {
+        bound.bound_to(Stage::Score);
         let observes = bound.take_observer();
         Self {
             bound,
@@ -224,6 +240,7 @@ pub struct PluginPicker<B> {
 
 impl<B: BoundPlugin> PluginPicker<B> {
     pub fn new(bound: Arc<B>, fallback: Option<Box<dyn Picker>>) -> Self {
+        bound.bound_to(Stage::Pick);
         let observes = bound.take_observer();
         Self {
             bound,
