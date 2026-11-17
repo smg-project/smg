@@ -548,7 +548,7 @@ struct Workers {
     epoch: u64,
     log: VecDeque<(u64, MembershipChange)>,
     /// The store's journal: every membership and status write passes
-    /// [`Workers::record`], which tells it.
+    /// [`Writing::record`], which tells it.
     journal: Option<Arc<dyn Journal>>,
 }
 

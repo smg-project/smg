@@ -254,7 +254,11 @@ pub(crate) struct Source {
 }
 
 impl Source {
-    /// Whether this replica leads under the watch's term at this instant.
+    /// Whether this replica leads under the watch's term at this instant:
+    /// the fence alone. The open was admitted where the store's log led
+    /// that term. The log itself would follow a later term's event or a
+    /// snapshot's place; while the fence holds the term no other replica
+    /// leads a later one, so there is no leader to send either.
     fn leads(&self) -> bool {
         self.fence.leader_term(Instant::now()) == Some(self.term)
     }

@@ -89,11 +89,14 @@
 // under the id; DEADLINE_EXCEEDED a Session stream that said no Hello within
 // 5 s of its open; UNAVAILABLE a standby not yet synced, a read a standby
 // cannot serve yet (WatchWorkers until its replica follows the leader's log,
-// a NotLeader in the status details), a leader that does not write under its
-// term (the moment after its take: retry; and for as long as its log
-// followed a term at or above the one it took: no registration numbers a
-// life under it), or a Decide stream open when the controller closes its
-// listeners at its shutdown (its gateway opens the next one on the leader);
+// a NotLeader in the status details), a leader whose store does not lead its
+// term, on a membership write, a spec write, its dry run and a rollback,
+// GetSnapshot, Replicate and the open of a WatchWorkers (the moment after
+// its take, until its store is told the term, and a call admitted under a
+// take its store has since passed: retry; or its whole lead, until a later
+// take, where its log followed a term at or above the one it took), or a
+// Decide stream open when the controller closes its listeners at its
+// shutdown (its gateway opens the next one on the leader);
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read
 // under a term the election left before its seat was taken, or a session
 // a newer one of its gateway replaced, or a worker row that moved under a

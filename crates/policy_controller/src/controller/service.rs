@@ -62,12 +62,24 @@ use crate::{
         self,
         policy_controller_server::{PolicyController, PolicyControllerServer},
     },
+    replication::Unled,
     store::MemoryStore,
 };
 
 /// A leader's refusal in the instant between its take of the lease and its
 /// store's entry into the term.
 const NOT_IN_TERM: &str = "this replica leads a term its store has not entered yet";
+
+/// A leader's refusal for its whole lead, where its take started no term in
+/// its store's log: the log followed a term at or above the one taken.
+const NO_TERM_LED: &str =
+    "this replica holds the lease and its store leads no term: this call is not served until a later take";
+
+/// A leader's refusal of a call admitted under a take its store has since
+/// passed: the fence was read before the later take, the log after it. A
+/// moment: the next call reads the later term.
+const TAKE_OVER: &str =
+    "this replica's store leads a later term than this call was admitted under: retry";
 
 /// A watch's refusal by a replica that does not lead.
 const FOLLOWS_NO_LOG: &str = "this replica does not lead and follows no leader's log";
@@ -496,9 +508,15 @@ impl Service {
     /// names the holder as `Leader` does (no address: no leader known). That
     /// address is the holder's gateway listener; a control client finds the
     /// leader's control listener by the health service's word. The lease is
-    /// taken before the store is told its term; in between the answer is
-    /// `UNAVAILABLE`, so no write is numbered under the term this replica
-    /// followed.
+    /// taken before the store is told its term: in between the answer is
+    /// `UNAVAILABLE`. A take at or below a term the log followed starts no
+    /// term: the answer is `UNAVAILABLE` for that whole lead. A call
+    /// admitted under a take the store has since passed is told to retry.
+    /// So a call that reads this guard is not served under a term the store
+    /// does not lead: a membership write, a spec write, its dry run and a
+    /// rollback, the snapshot and a standby's stream here, a watch's open
+    /// through [`Service::watched`]. A session and a `Decide` read the
+    /// fence alone.
     pub(crate) fn leading(&self, now: Instant) -> Result<u64, Status> {
         self.led(now, Code::FailedPrecondition, "this replica does not lead")
     }
@@ -512,16 +530,20 @@ impl Service {
         self.led(now, Code::Unavailable, FOLLOWS_NO_LOG)
     }
 
-    /// The term this replica leads under at `now`, once its store stands in
-    /// it. A replica that does not lead refuses under `code` with `message`:
-    /// the details are the `google.rpc.Status` that says both again and
-    /// holds the `NotLeader`.
+    /// The term this replica leads under at `now`, once its store leads it:
+    /// one read of the log ([`Log::leads`](crate::replication::Log::leads)),
+    /// whose refusal says whether it is a moment or the whole lead. A
+    /// replica that does not lead refuses under `code` with `message`: the
+    /// details are the `google.rpc.Status` that says both again and holds
+    /// the `NotLeader`.
     fn led(&self, now: Instant, code: Code, message: &'static str) -> Result<u64, Status> {
         if let Some(term) = self.shared.fence.leader_term(now) {
-            if self.shared.feed.log.term() == term {
-                return Ok(term);
-            }
-            return Err(Status::unavailable(NOT_IN_TERM));
+            return match self.shared.feed.log.leads(term) {
+                Ok(()) => Ok(term),
+                Err(Unled::NotYet) => Err(Status::unavailable(NOT_IN_TERM)),
+                Err(Unled::Follows(_)) => Err(Status::unavailable(NO_TERM_LED)),
+                Err(Unled::Past(_)) => Err(Status::unavailable(TAKE_OVER)),
+            };
         }
         let holder = self.leader_info(now).address;
         Err(not_leader(code, message, holder))
@@ -903,7 +925,7 @@ mod tests {
             MemoryLease, Tick, Written,
         },
         proto::{self, policy_controller_server::PolicyController},
-        store::{LeasesStore, WorkersStore},
+        store::{Kinds, LeasesStore, Position, WorkersStore},
     };
 
     const ID: &str = "controller-0";
@@ -2002,6 +2024,144 @@ mod tests {
             assert!(answer.read_only, "{answer:?}");
         }
         assert_eq!(control.shared.generations.standing(), stands);
+    }
+
+    /// A take at or below a term the log followed starts no term in it: the
+    /// replica holds the lease and its store's writes stand under no term.
+    /// A watch's open, a registration, a patch, a removal and the snapshot
+    /// are refused then, `UNAVAILABLE`, and the words say that it lasts the
+    /// lead.
+    #[tokio::test]
+    async fn a_take_that_started_no_term_serves_no_watch_membership_or_snapshot_call() {
+        for followed in [1, 5] {
+            let scopes = [Scope::Gateway, Scope::Control, Scope::Replication];
+            let (mut elector, _standing, service) = service_alone(&scopes);
+            // The log followed a term: a restart at a snapshot's place of
+            // it. The take is of term 1, and the store is told it.
+            let place = Position {
+                seq: 40,
+                term: followed,
+            };
+            service.shared.feed.log.restart(place);
+            elector.lead_at(Instant::now());
+            service.shared.store.set_term(1);
+            assert_eq!(service.shared.feed.log.followed(), Some(followed));
+
+            let refused = |answer: Option<tonic::Status>, call: &str| {
+                let Some(status) = answer else {
+                    panic!("{call} was served where the log followed term {followed}");
+                };
+                assert_eq!(
+                    (status.code(), status.message()),
+                    (Code::Unavailable, super::NO_TERM_LED),
+                    "{call}, the log followed term {followed}"
+                );
+            };
+            let watch = from("gateway-a", proto::WatchWorkersRequest::default());
+            refused(service.watch_workers(watch).await.err(), "a watch's open");
+            let register = from("operator-a", proto::RegisterWorkerRequest::default());
+            refused(
+                service.register_worker(register).await.err(),
+                "a registration",
+            );
+            let patch = from("operator-a", proto::PatchWorkerRequest::default());
+            refused(service.patch_worker(patch).await.err(), "a patch");
+            let removal = from("operator-a", proto::DeregisterWorkerRequest::default());
+            refused(service.deregister_worker(removal).await.err(), "a removal");
+            let snapshot = from("standby-a", proto::SnapshotRequest::default());
+            refused(service.get_snapshot(snapshot).await.err(), "the snapshot");
+            assert_eq!(service.shared.feed.log.head(Kinds::Watched), place);
+        }
+    }
+
+    /// A spec write, its dry run and a rollback are refused the same way,
+    /// and the standing generation does not move.
+    #[tokio::test]
+    async fn a_take_that_started_no_term_serves_no_spec_call() {
+        let (mut elector, standing, control) = sourced(false);
+        let place = Position { seq: 40, term: 1 };
+        control.shared.feed.log.restart(place);
+        elector.lead_at(Instant::now());
+        control.shared.store.set_term(1);
+        standing.send_replace(saw(IDENTITY, 1));
+        let stands = control.shared.generations.standing();
+        let answers = [
+            control
+                .apply_policy_spec(apply(proto::ApplyMode::Enforce, RANDOM, "yaml", ""))
+                .await,
+            control
+                .apply_policy_spec(apply(proto::ApplyMode::DryRun, RANDOM, "yaml", ""))
+                .await,
+            control
+                .rollback_policy_spec(from("operator-a", proto::RollbackRequest { generation: 1 }))
+                .await,
+        ];
+        for answer in answers {
+            let refused = answer.expect_err("refused");
+            assert_eq!(
+                (refused.code(), refused.message()),
+                (Code::Unavailable, super::NO_TERM_LED)
+            );
+        }
+        assert_eq!(control.shared.generations.standing(), stands);
+    }
+
+    /// A standby's stream is refused the same way. Its handler takes the
+    /// request as a stream of frames, so the call goes over a socket.
+    #[tokio::test]
+    async fn a_take_that_started_no_term_serves_no_standbys_stream() {
+        let (mut elector, _standing, service) = service_alone(&[Scope::Replication]);
+        let place = Position { seq: 40, term: 1 };
+        service.shared.feed.log.restart(place);
+        elector.lead_at(Instant::now());
+        service.shared.store.set_term(1);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        // Aborted at its drop, at the end of the case.
+        let mut serving = JoinSet::new();
+        serving.spawn(
+            Server::builder()
+                .add_routes(service.routes(Layer::AsTold))
+                .serve_with_incoming(TcpIncoming::from(listener)),
+        );
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .expect("a uri")
+            .connect()
+            .await
+            .expect("the listener accepts");
+        let mut client = Grpc::new(channel);
+        client.ready().await.expect("the channel is ready");
+        let path = PathAndQuery::from_static("/smg.policy.v1.PolicyController/Replicate");
+        // An empty message opens the stream: the lead is read before a frame.
+        let refused = client
+            .unary(stating("standby-a"), path, ProstCodec::<(), ()>::default())
+            .await
+            .expect_err("no stream is served");
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (Code::Unavailable, super::NO_TERM_LED)
+        );
+    }
+
+    /// A call admitted under a take its store has since passed is told to
+    /// retry: the fence read the earlier term, the log leads the later one.
+    #[tokio::test]
+    async fn a_call_under_a_take_its_store_has_passed_is_told_to_retry() {
+        let (mut elector, _standing, service) = service_alone(&[Scope::Gateway]);
+        elector.lead_at(Instant::now());
+        service.shared.store.set_term(1);
+        // The store is told a later take than the fence reads.
+        service.shared.store.set_term(2);
+        let watch = from("gateway-a", proto::WatchWorkersRequest::default());
+        let Err(refused) = service.watch_workers(watch).await else {
+            panic!("a watch was opened under a take that is over");
+        };
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (Code::Unavailable, super::TAKE_OVER)
+        );
     }
 
     /// The checks of a write call run in one order, each neighbour pair by

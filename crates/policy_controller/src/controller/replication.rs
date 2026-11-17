@@ -34,8 +34,8 @@ use super::{election::LeasePlace, service::not_leader, watch_workers, worker_wir
 use crate::{
     elector::Fence,
     proto::{self, replica_frame::Frame},
-    replication::{Entry, Log},
-    store::{Journal, Kinds, LeasesStore, MemoryStore, Position},
+    replication::{Entry, Log, Unled},
+    store::{Journal, Kinds, MemoryStore, Position},
 };
 
 /// The watched kinds' ring: the membership and status events a watcher or a
@@ -110,35 +110,30 @@ impl Replication {
         Self { store, log, fence }
     }
 
-    /// Refuses a controller no standby can follow, and a leader that does
-    /// not write under `term`: the moment between its take and the take's
-    /// own write, and for as long as its log followed a term at or above
-    /// the take, which started no term in it.
+    /// Refuses a controller no standby can follow, and a leader whose store
+    /// does not lead `term`: the log's one read ([`Log::leads`]), made again
+    /// in this call's turn behind the service's guard. That read has three
+    /// refusals: the moment between a take and the take's own write; the
+    /// whole lead, where the log followed a term at or above the take; and
+    /// a call admitted under a take the store has since passed.
     fn serves(&self, term: u64) -> Result<(), Status> {
         if !self.log.carries_loads() {
             return Err(Status::failed_precondition(
                 "this controller's lease lives in its own process: no standby follows it",
             ));
         }
-        // The store's term only rises: under the take's it has not taken
-        // the take's write yet.
-        let stored = self.store.term();
-        if stored < term {
-            return Err(Status::unavailable(format!(
+        match self.log.leads(term) {
+            Ok(()) => Ok(()),
+            Err(Unled::NotYet) => Err(Status::unavailable(format!(
                 "this replica has not yet written under term {term}"
-            )));
-        }
-        if let Some(followed) = self.log.followed() {
-            return Err(Status::unavailable(format!(
+            ))),
+            Err(Unled::Follows(followed)) => Err(Status::unavailable(format!(
                 "this replica took term {term} and its log followed term {followed}: its writes stand under no term until a later take"
-            )));
-        }
-        if stored > term {
-            return Err(Status::unavailable(format!(
+            ))),
+            Err(Unled::Past(stored)) => Err(Status::unavailable(format!(
                 "this replica's store is under term {stored}, a later take than term {term}"
-            )));
+            ))),
         }
-        Ok(())
     }
 
     /// `Replicate`, admitted under `term` from the principal `standby`: the
@@ -612,8 +607,8 @@ mod tests {
         elector::{ElectionSettings, Elector, Tick},
         proto::replication_event::Event as Sent,
         store::{
-            LoadSample, LoadSink, LoadSource, MembershipChange, WorkerFacts, WorkerRow,
-            WorkersStore,
+            LeasesStore, LoadSample, LoadSink, LoadSource, MembershipChange, WorkerFacts,
+            WorkerRow, WorkersStore,
         },
         view::{LoadRow, WorkerId},
     };
@@ -1460,7 +1455,7 @@ mod tests {
             refused.message()
         );
         // A replica that led before: its log leads the earlier term still,
-        // so the store's term alone says the later take has not reached it.
+        // and has seen no term as high as the later take's.
         leader.store.set_term(leader.term);
         let refused = leader
             .replication()
@@ -1476,20 +1471,26 @@ mod tests {
 
     #[test]
     fn a_leader_whose_take_started_no_term_in_its_log_serves_no_standby() {
-        // The log followed term 7 before the take of term 1.
+        // The log followed term 7 before the take of term 1. The answer is
+        // one before the store is told the take and after it: no write of
+        // that take starts the term.
         let leader = Leader::elected();
         leader.log.restart(Position { seq: 9, term: 7 });
-        leader.store.set_term(leader.term);
-        let refused = leader
-            .replication()
-            .snapshot(leader.term, "controller-0", leader.at)
-            .expect_err("its writes stand under no term");
-        assert_eq!(refused.code(), Code::Unavailable);
-        let said = refused.message();
-        assert!(
-            said.contains("took term 1") && said.contains("followed term 7"),
-            "{said}"
-        );
+        for told in [false, true] {
+            if told {
+                leader.store.set_term(leader.term);
+            }
+            let refused = leader
+                .replication()
+                .snapshot(leader.term, "controller-0", leader.at)
+                .expect_err("its writes stand under no term");
+            assert_eq!(refused.code(), Code::Unavailable);
+            let said = refused.message();
+            assert!(
+                said.contains("took term 1") && said.contains("followed term 7"),
+                "the store told its take: {told}: {said}"
+            );
+        }
 
         // The same where the store holds the followed term, as a standby
         // that applied that term's start does: a take does not lower it,
