@@ -87,7 +87,12 @@ async fn http_stream_cancelled_mid_way_reports_one_completion() {
     let (router, spy) = router_with_spy(&upstream_url).await;
     let meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
     let response = router
-        .route_chat(None, &meta, streaming_chat_request(), "mock-model")
+        .route_chat(
+            None,
+            &meta,
+            Arc::new(streaming_chat_request()),
+            "mock-model",
+        )
         .await;
     assert_eq!(response.status(), 200);
     let mut body = response.into_body();

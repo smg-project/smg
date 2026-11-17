@@ -1,3 +1,4 @@
+mod cut_jpeg;
 mod decode_limit;
 mod exif_orientation;
 mod hop_budget;
@@ -7,6 +8,7 @@ mod seek_decode;
 mod sixteen_bit_colour;
 mod sixteen_bit_grey;
 mod transparency;
+mod video_decoder_gap;
 mod video_frame_cap;
 mod video_sampling;
 
@@ -17,7 +19,8 @@ use std::{
     process::Command,
 };
 
-use crate::test_support::{skip_for, video_tools_available};
+use super::ImageFetchConfig;
+use crate::test_support::{http_client_builder, skip_for, video_tools_available};
 
 /// Whether this ffmpeg build carries `encoder`. `ffmpeg -h encoder=<name>`
 /// exits 0 for a name it does not know as well, so the answer is what it
@@ -325,6 +328,57 @@ const TINY_PNG: &[u8] = &[
     9, 141, 84, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
 
+/// A base64 source decodes as the data URL it stands for: the same bytes,
+/// the same frame hash, the same size, through the one decode both share.
+#[test]
+fn a_base64_source_decodes_as_its_data_url() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let data = STANDARD.encode(TINY_PNG);
+    let data_url = format!("data:image/png;base64,{data}");
+    let from_data_url = MediaConnector::fetch_data_url(&data_url, ImageFetchConfig::default())
+        .expect("the data url decodes");
+    let from_base64 = MediaConnector::fetch_base64(&data, ImageFetchConfig::default())
+        .expect("the base64 text decodes");
+    assert_eq!(from_base64.raw_bytes, from_data_url.raw_bytes);
+    assert_eq!(from_base64.hash, from_data_url.hash);
+    assert_eq!(from_base64.size(), from_data_url.size());
+    assert!(matches!(from_base64.source, super::ImageSource::DataUrl));
+}
+
+/// A data URL header may carry parameters before the marker: the fetch
+/// decodes the frame of the plain header from it. The marker before a
+/// parameter is not a base64 header.
+#[test]
+fn a_data_url_with_parameters_before_the_marker_decodes_the_same() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let data = STANDARD.encode(TINY_PNG);
+    let plain = MediaConnector::fetch_data_url(
+        &format!("data:image/png;base64,{data}"),
+        ImageFetchConfig::default(),
+    )
+    .expect("the plain header decodes");
+    for header in [
+        "data:image/png;charset=x;base64,",
+        "data:image/png;charset=x;name=a.png;base64,",
+    ] {
+        let frame =
+            MediaConnector::fetch_data_url(&format!("{header}{data}"), ImageFetchConfig::default())
+                .expect(header);
+        assert_eq!(frame.raw_bytes, plain.raw_bytes, "{header}");
+        assert_eq!(frame.hash, plain.hash, "{header}");
+    }
+    let Err(error) = MediaConnector::fetch_data_url(
+        &format!("data:image/png;base64;charset=x,{data}"),
+        ImageFetchConfig::default(),
+    ) else {
+        panic!("the marker before a parameter is refused");
+    };
+    assert_eq!(
+        error.to_string(),
+        "data URL parse error: only base64 encoded data URLs are supported"
+    );
+}
+
 #[test]
 fn splits_concatenated_png_stream() {
     let mut stream = Vec::new();
@@ -610,6 +664,38 @@ fn enforces_media_payload_limit_for_each_label() {
     }
 
     assert!(checked_payload_length(usize::MAX, 1, usize::MAX, "audio").is_err());
+}
+
+#[tokio::test]
+async fn raw_inline_fetch_enforces_limit_for_each_media_type() {
+    let connector = MediaConnector::new(http_client_builder(), MediaConnectorConfig::default())
+        .expect("default connector");
+
+    for media in ["image", "video", "audio"] {
+        let raw = connector
+            .fetch_raw_bytes(
+                MediaSource::InlineBytes(b"1234".to_vec()),
+                std::time::Duration::ZERO,
+                4,
+                media,
+            )
+            .await
+            .expect("inline payload at limit");
+        assert_eq!(raw.0, Bytes::from_static(b"1234"));
+
+        assert!(matches!(
+            connector
+                .fetch_raw_bytes(
+                    MediaSource::InlineBytes(b"12345".to_vec()),
+                    std::time::Duration::ZERO,
+                    4,
+                    media,
+                )
+                .await,
+            Err(MediaConnectorError::PayloadTooLarge { media: actual, limit: 4 })
+                if actual == media
+        ));
+    }
 }
 
 #[test]
@@ -1058,11 +1144,8 @@ fn decoder_threads_share_cpu_budget_across_active_decodes() {
 /// spends a decode on the clip, exactly as the image decoder does.
 #[tokio::test]
 async fn decode_video_rejects_an_invalid_long_side_cap() {
-    let connector = MediaConnector::new(
-        crate::test_support::http_client_builder(),
-        MediaConnectorConfig::default(),
-    )
-    .expect("default connector");
+    let connector = MediaConnector::new(http_client_builder(), MediaConnectorConfig::default())
+        .expect("default connector");
     for value in [0, 505] {
         let cfg = VideoFetchConfig {
             max_long_side_pixel: Some(value),
@@ -1081,4 +1164,119 @@ async fn decode_video_rejects_an_invalid_long_side_cap() {
             "cap {value}: unexpected error {err:?}"
         );
     }
+}
+
+/// A URL of a scheme the connector does not fetch is refused in the
+/// connector's own words before any client is built for it, as a redirect to
+/// such a scheme is; the client library's builder error (its words, repeated
+/// through the error chain) never reaches the caller.
+#[tokio::test]
+async fn a_url_scheme_the_connector_does_not_fetch_is_refused_before_the_client() {
+    let connector = MediaConnector::new(http_client_builder(), MediaConnectorConfig::default())
+        .expect("default connector");
+    for (url, scheme) in [
+        ("ftp://media.example/a.jpg", "ftp"),
+        ("file:///etc/hostname", "file"),
+    ] {
+        let error = connector
+            .fetch_image(
+                MediaSource::Url(std::sync::Arc::new(url.to_string())),
+                ImageFetchConfig::default(),
+            )
+            .await
+            .expect_err("a scheme the connector does not fetch");
+        assert!(
+            matches!(&error, MediaConnectorError::UnsupportedScheme(got) if got == scheme),
+            "{url}: {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("unsupported media scheme: {scheme}")
+        );
+    }
+}
+
+/// The connector over a default client whose local media root is `root`.
+fn connector_with_local_root(root: Option<&Path>) -> MediaConnector {
+    let config = MediaConnectorConfig {
+        allowed_local_media_path: root.map(Path::to_path_buf),
+        ..MediaConnectorConfig::default()
+    };
+    MediaConnector::new(http_client_builder(), config).expect("connector")
+}
+
+/// With no local root configured every local path is refused, and before the
+/// file system is asked about it: a path that does not exist gets the same
+/// refusal, not an I/O error.
+#[tokio::test]
+async fn a_local_path_is_refused_without_a_configured_root() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("missing.bin");
+    let error = connector_with_local_root(None)
+        .allowed_local_path(&path)
+        .await
+        .expect_err("no root configured");
+    assert!(
+        matches!(&error, MediaConnectorError::DisallowedLocalPath(got) if *got == path.display().to_string()),
+        "{error:?}"
+    );
+}
+
+/// A file under the root comes back as its canonical path, whatever way the
+/// caller spelled it.
+#[tokio::test]
+async fn a_local_path_under_the_root_comes_back_canonical() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir(root.join("sub")).expect("sub directory");
+    std::fs::write(root.join("a.bin"), b"x").expect("file");
+    let canonical = connector_with_local_root(Some(&root))
+        .allowed_local_path(&root.join("sub").join("..").join("a.bin"))
+        .await
+        .expect("a file under the root");
+    assert_eq!(canonical, root.join("a.bin"));
+}
+
+/// A path that starts under the root and climbs out of it resolves outside
+/// the root and is refused, in the caller's own spelling.
+#[tokio::test]
+async fn a_local_path_that_climbs_out_of_the_root_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical base");
+    let root = base.join("root");
+    std::fs::create_dir(&root).expect("root directory");
+    std::fs::write(base.join("outside.bin"), b"x").expect("file");
+    let path = root.join("..").join("outside.bin");
+    let error = connector_with_local_root(Some(&root))
+        .allowed_local_path(&path)
+        .await
+        .expect_err("a path outside the root");
+    assert!(
+        matches!(&error, MediaConnectorError::DisallowedLocalPath(got) if *got == path.display().to_string()),
+        "{error:?}"
+    );
+}
+
+/// A link under the root is followed before the test of the root: one that
+/// points outside the root is refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_under_the_root_that_points_outside_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical base");
+    let root = base.join("root");
+    std::fs::create_dir(&root).expect("root directory");
+    std::fs::write(base.join("outside.bin"), b"x").expect("file");
+    let link = root.join("link.bin");
+    symlink(base.join("outside.bin"), &link).expect("link");
+    let error = connector_with_local_root(Some(&root))
+        .allowed_local_path(&link)
+        .await
+        .expect_err("a link that leaves the root");
+    assert!(
+        matches!(&error, MediaConnectorError::DisallowedLocalPath(got) if *got == link.display().to_string()),
+        "{error:?}"
+    );
 }

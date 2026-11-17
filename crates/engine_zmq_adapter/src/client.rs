@@ -34,8 +34,9 @@ use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto a
 use tokio::time::Instant;
 
 #[cfg(unix)]
-use crate::sockets::unlink_stale_socket;
+use crate::sockets::{is_leftover_handshake_socket, unlink_stale_socket};
 use crate::{
+    abort_status::engine_abort_status,
     eos::EosTokenIds,
     pin_yield::PinYieldNote,
     sglang::{
@@ -190,6 +191,8 @@ pub(crate) struct ZmqConnectionMeta {
     /// disagrees yielding to it
     /// (see [`ZmqEngineClient::note_engine_places_by_rendezvous_room`]).
     engine_places_by_rendezvous_room: OnceLock<()>,
+    /// See [`ZmqEngineClient::note_engine_ranks_are_replicas`].
+    engine_ranks_are_replicas: OnceLock<()>,
     /// A pin's yield to the room on this connection: the first is logged at
     /// WARN, the rest at DEBUG (`PinYieldNote`).
     pin_yield: PinYieldNote,
@@ -302,6 +305,13 @@ pub async fn connect_with_eos(
     {
         unlink_stale_socket(&input).await?;
         unlink_stale_socket(&output).await?;
+        // The handshake's directory is the caller's choice and is not
+        // verified above, and nothing keeps its address to one process: its
+        // leftover is swept only where the directory and the socket are this
+        // user's own and no listener answers.
+        if is_leftover_handshake_socket(&handshake).await {
+            unlink_stale_socket(&handshake).await?;
+        }
     }
     tracing::info!(
         "Binding ZMQ client for worker {base_url} (handshake={handshake}, engines={engine_count:?})"
@@ -427,6 +437,7 @@ impl ZmqEngineClient {
                 supported_tasks: tokio::sync::OnceCell::new(),
                 engine_truncates_long_prompts: OnceLock::new(),
                 engine_places_by_rendezvous_room: OnceLock::new(),
+                engine_ranks_are_replicas: OnceLock::new(),
                 pin_yield: PinYieldNote::default(),
                 request_timeout: OnceLock::new(),
             }),
@@ -530,6 +541,15 @@ impl ZmqEngineClient {
     /// nothing.
     pub fn note_engine_places_by_rendezvous_room(&self) {
         let _ = self.meta.engine_places_by_rendezvous_room.set(());
+    }
+
+    /// The ranks of an engine that places by the room
+    /// ([`Self::note_engine_places_by_rendezvous_room`]) are plain
+    /// data-parallel replicas, as the launcher that started it knows: from
+    /// now a room-placed request names its rank to the engine, whose KV
+    /// sender fails an unnamed one on every replica but the first.
+    pub fn note_engine_ranks_are_replicas(&self) {
+        let _ = self.meta.engine_ranks_are_replicas.set(());
     }
 
     /// The window the prompt admission applies on this connection: the
@@ -863,10 +883,11 @@ impl ZmqEngineClient {
             let top_logprobs = ranked_candidate_count(sampling.and_then(|sp| sp.logprobs));
             let prompt_top_logprobs =
                 ranked_candidate_count(sampling.and_then(|sp| sp.prompt_logprobs));
-            let first_prompt_token = request
-                .prompt_token_ids
-                .as_ref()
-                .and_then(|ids| ids.first().copied());
+            let prompt_token_ids = request.prompt_token_ids.as_deref().unwrap_or_default();
+            let first_prompt_token = prompt_token_ids.first().copied();
+            // The usage's prompt count until the engine's prefill stats
+            // report their own.
+            let prompt_tokens = u32::try_from(prompt_token_ids.len()).unwrap_or(u32::MAX);
             // Sub-streams submitted before a mid-loop failure are dropped with
             // the error, which auto-aborts their engine-side requests.
             let stream = client
@@ -879,6 +900,7 @@ impl ZmqEngineClient {
                 top_logprobs,
                 prompt_top_logprobs,
                 first_prompt_token,
+                prompt_tokens,
             ));
         }
         Ok(streams)
@@ -1184,10 +1206,12 @@ impl ZmqEngineClient {
         // pin, or on a prefill side that follows the room by its room's
         // residue ([`Self::note_engine_places_by_rendezvous_room`]).
         let ranks = client.engines().len();
-        let placement = if self.meta.engine_places_by_rendezvous_room.get().is_some() {
-            RankPlacement::RoomResidue
-        } else {
+        let placement = if self.meta.engine_places_by_rendezvous_room.get().is_none() {
             RankPlacement::Pin
+        } else if self.meta.engine_ranks_are_replicas.get().is_some() {
+            RankPlacement::ReplicaRoomResidue
+        } else {
+            RankPlacement::RoomResidue
         };
         let mut streams = Vec::new();
         // Fan-out clones share identical media; cache only within this request.
@@ -1306,10 +1330,7 @@ impl ZmqEngineClient {
                         .as_deref()
                         .unwrap_or("no reason reported")
                 );
-                return Err(crate::abort_status::engine_abort_status(
-                    output.finish_status,
-                    message,
-                ));
+                return Err(engine_abort_status(output.finish_status, message));
             }
             let embedding = output.embedding.unwrap_or_default();
             return Ok(sglang_proto::EmbedResponse {
@@ -1870,8 +1891,10 @@ impl ZmqEngineClient {
                     world_size: ready
                         .map_or(1, |r| i32::try_from(r.world_size).unwrap_or(i32::MAX)),
                     // The handshake does not say which structural-tag
-                    // vocabulary the engine's grammar compiler takes.
+                    // vocabulary the engine's grammar compiler takes, nor
+                    // where the engine starts a grammar.
                     structural_tag_vocabulary: String::new(),
+                    constrained_decoding_start: String::new(),
                 }))
             }
         }
@@ -2200,6 +2223,36 @@ mod tests {
         assert_eq!(client.effective_eos(), &resolved);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_handshake_listener_is_not_swept() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = format!("ipc://{}", dir.path().join("w").display());
+        let path = dir.path().join("hs.sock");
+        let handshake = format!("ipc://{}", path.display());
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        let Err(reason) = connect_with_eos(
+            &base_url,
+            "m".to_string(),
+            RuntimeType::Vllm,
+            Handshake::TcpOrIpc(&handshake),
+            1,
+            EosTokenIds::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        else {
+            panic!("a bind over a live listener's socket must fail");
+        };
+        assert!(reason.contains("in use"), "{reason}");
+        crate::sockets::knock_ipc_socket(&path)
+            .await
+            .expect("the listener still answers at its path");
+    }
+
     /// The gateway's connect path across a retry: the first handshake greets
     /// the engine and gives up its READY wait while the engine is still
     /// loading (the startup bound is shorter than the engine's init); the
@@ -2256,19 +2309,39 @@ mod tests {
         assert_eq!(client.dialect(), ZmqDialect::Vllm);
     }
 
-    /// A `tcp://` worker serves engines on other hosts: they dial its own
-    /// address, and the INIT hands them data-plane addresses on the same
-    /// host with the ports the gateway bound.
-    #[tokio::test]
-    async fn a_tcp_worker_connects_its_engines_through_its_own_address() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
+    /// A loopback port nothing listens on at the moment of asking (bound and
+    /// released): free only until a neighbour binds it, another test's probe
+    /// or a connection's ephemeral port, so a worker told this port can
+    /// still lose it. [`connect_tcp_worker`] probes again when that happens.
+    fn probed_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
-            .port();
-        let base_url = format!("tcp://127.0.0.1:{port}");
-        let (client, engine) = tokio::join!(
-            connect_with_eos(
+            .port()
+    }
+
+    /// Which side of a `tcp://` worker's start finished first.
+    enum First<W, E> {
+        Worker(W),
+        Engine(E),
+    }
+
+    /// A `tcp://` worker on a port `probe` names, with one mock engine dialing
+    /// it. The worker's handshake address is the one the engine dials, so the
+    /// test has to name the port before the worker binds it, and a port a
+    /// probe named is free only until a neighbour takes it. The worker's
+    /// connect is raced against the engine's dial: a bind that finds the port
+    /// taken ends that attempt at once, its engine dial abandoned with it,
+    /// and the next attempt starts on a fresh probe. The panic after the last
+    /// attempt carries the last bind error and the address it failed on, the
+    /// bind's own words rather than the neighbour sentence alone.
+    async fn connect_tcp_worker(mut probe: impl FnMut() -> u16) -> (ZmqEngineClient, MockEngine) {
+        const ATTEMPTS: usize = 8;
+        let mut last_bind_error = String::new();
+        for _ in 0..ATTEMPTS {
+            let base_url = format!("tcp://127.0.0.1:{}", probe());
+            let mut worker = std::pin::pin!(connect_with_eos(
                 &base_url,
                 "m".to_string(),
                 RuntimeType::TokenSpeed,
@@ -2276,15 +2349,96 @@ mod tests {
                 1,
                 EosTokenIds::default(),
                 Duration::from_secs(10),
-            ),
-            connect_to_frontend(
+            ));
+            let mut engine = std::pin::pin!(connect_to_frontend(
                 &base_url,
                 EngineId::from_engine_index(0),
                 default_ready_response()
-            ),
+            ));
+            let first = tokio::select! {
+                worker = &mut worker => First::Worker(worker),
+                engine = &mut engine => First::Engine(engine),
+            };
+            match first {
+                First::Worker(Err(error)) if error.contains("Address already in use") => {
+                    last_bind_error = format!("{base_url}: {error}");
+                    continue;
+                }
+                First::Worker(worker) => {
+                    let client = worker.expect("the tcp worker connects");
+                    let engine = engine.await.expect("mock engine connected");
+                    return (client, engine);
+                }
+                First::Engine(engine) => {
+                    let engine = engine.expect("mock engine connected");
+                    let client = worker.await.expect("the tcp worker connects");
+                    return (client, engine);
+                }
+            }
+        }
+        panic!(
+            "{ATTEMPTS} probed ports were taken before the worker could bind them; \
+             the last bind: {last_bind_error}"
         );
-        let client = client.expect("the tcp worker connects");
-        let engine = engine.expect("mock engine connected");
+    }
+
+    /// A port held through every attempt exhausts them, and the panic names
+    /// the address the last bind failed on with the bind's own error, not
+    /// the neighbours alone.
+    #[tokio::test]
+    async fn a_port_held_through_every_attempt_puts_the_bind_error_in_the_panic() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = holder.local_addr().unwrap().port();
+        let Err(panic) = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            connect_tcp_worker(|| held),
+        ))
+        .await
+        else {
+            panic!("the worker bound the held port");
+        };
+        let message = *panic
+            .downcast::<String>()
+            .expect("the retry's panic is a formatted message");
+        assert!(
+            message.contains(&format!("the last bind: tcp://127.0.0.1:{held}")),
+            "the panic names the address: {message}"
+        );
+        assert!(
+            message.contains("Address already in use"),
+            "the panic carries the bind's own error: {message}"
+        );
+    }
+
+    /// A probed port a neighbour took before the worker bound it is probed
+    /// again: the worker connects on a later probe, the engine with it.
+    #[tokio::test]
+    async fn a_probed_port_a_neighbour_took_is_probed_again() {
+        let neighbour = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = neighbour.local_addr().unwrap().port();
+        let probes = std::cell::Cell::new(0);
+        let (client, _engine) = connect_tcp_worker(|| {
+            probes.set(probes.get() + 1);
+            if probes.get() == 1 {
+                taken
+            } else {
+                probed_port()
+            }
+        })
+        .await;
+        drop(neighbour);
+        assert_eq!(client.engine_count(), 1);
+        assert!(
+            probes.get() >= 2,
+            "the worker bound the port the neighbour held"
+        );
+    }
+
+    /// A `tcp://` worker serves engines on other hosts: they dial its own
+    /// address, and the INIT hands them data-plane addresses on the same
+    /// host with the ports the gateway bound.
+    #[tokio::test]
+    async fn a_tcp_worker_connects_its_engines_through_its_own_address() {
+        let (client, engine) = connect_tcp_worker(probed_port).await;
         assert_eq!(client.engine_count(), 1);
         for address in engine
             .init

@@ -1,0 +1,18 @@
+{{- if and (.Values.policyController).enabled (include "smg.policyControllerElection" .) }}
+{{- /* Follows role-policy-controller.yaml: the controller's account alone. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "smg.policyControllerName" . }}
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: policy-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "smg.policyControllerName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "smg.policyControllerName" . }}
+    namespace: {{ .Release.Namespace | quote }}
+{{- end }}

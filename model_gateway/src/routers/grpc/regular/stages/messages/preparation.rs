@@ -7,7 +7,7 @@ use openai_protocol::{
     messages::CreateMessageRequest,
     profile::ProviderProfile,
 };
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     routers::{
@@ -81,7 +81,10 @@ impl MessagePreparationStage {
         // narrowed by tool_choice and shared with count_tokens so both render
         // the same prompt; the constraints read the narrowed tools too, the
         // parsers read them all from the spec.
-        let spec = Box::new(MessagesResponseSpec::from(request));
+        let spec = Box::new(MessagesResponseSpec::with_tools(
+            request,
+            ctx.state.messages_tools.clone(),
+        ));
         let filtered_tools =
             message_utils::template_tools(&spec.chat_tools, request.tool_choice.as_ref());
         let chat_tool_choice = request.tool_choice.as_ref().map(ToolChoice::from);
@@ -96,6 +99,7 @@ impl MessagePreparationStage {
             &*tokenizer,
             &request.messages,
             true,
+            tools_for_template.is_some(),
         )
         .await?;
         let media_order = media.media_order;
@@ -117,8 +121,21 @@ impl MessagePreparationStage {
         ) {
             Ok(msgs) => msgs,
             Err(e) => {
-                error!(function = "MessagePreparationStage::execute", error = %e, "Failed to process messages");
-                return Err(error::bad_request("process_messages_failed", e));
+                // As in the chat preparation: one WARN and the mark only for
+                // a refusal typed as the request's own; every other failure
+                // keeps ERROR and stays unmarked.
+                let refused = e.is_refusal();
+                if refused {
+                    warn!(function = "MessagePreparationStage::execute", error = %e, "Failed to process messages");
+                } else {
+                    error!(function = "MessagePreparationStage::execute", error = %e, "Failed to process messages");
+                }
+                let answer = error::bad_request("process_messages_failed", String::from(e));
+                return Err(if refused {
+                    utils::reported(answer)
+                } else {
+                    answer
+                });
             }
         };
 
@@ -163,6 +180,7 @@ impl MessagePreparationStage {
             symphony::Asks::Messages {
                 request,
                 continues: request.continues_final_assistant(),
+                has_tools: spec.has_tools,
             },
             &filtered_tools,
             &processed_messages.text,
@@ -176,7 +194,7 @@ impl MessagePreparationStage {
             "MessagePreparationStage::execute",
         )?;
         ctx.state.parser_names = Some(parser_names);
-        ctx.state.prompt_thought = prompt_thought;
+        ctx.state.prompt_thought = Some(prompt_thought);
         ctx.state.reading = reading;
 
         // Derive skip_special_tokens from parser and constraint type:
@@ -280,6 +298,7 @@ mod tests {
         use serde_json::{json, Value};
 
         use crate::{
+            config::ParserChoice,
             routers::grpc::{
                 common::stages::PipelineStage,
                 context::{PreparationOutput, RequestContext},
@@ -301,7 +320,7 @@ mod tests {
         let components = components_over(
             tokenizer_registry,
             Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
+            ParserChoice::Legacy,
         );
         for (output_config, rendered) in [
             (json!({"effort": "high"}), Ok("effort=high")),
@@ -314,7 +333,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}]
             }))
             .unwrap();
-            let mut ctx = RequestContext::for_messages(
+            let mut ctx = RequestContext::for_messages_carrying_its_tools(
                 Arc::new(request),
                 None,
                 MODEL.into(),
@@ -334,10 +353,10 @@ mod tests {
     }
 
     /// The stage derives the request model's profile once, keeps it on the
-    /// request state and hands that one to the render: under a MiniMax model
-    /// id `output_config.effort: none` leaves the template's default, under a
-    /// self-hosted id it switches thinking off, and the stored profile is the
-    /// model's in both cases.
+    /// request state and hands that one to the render: `output_config.effort:
+    /// none` switches thinking off under both, renders no effort under a
+    /// MiniMax model id and renders as sent under a self-hosted id, and the
+    /// stored profile is the model's in both cases.
     #[tokio::test]
     async fn the_stage_hands_the_render_the_request_models_profile() {
         use std::sync::Arc;
@@ -347,6 +366,7 @@ mod tests {
         use serde_json::json;
 
         use crate::{
+            config::ParserChoice,
             routers::grpc::{
                 common::stages::PipelineStage,
                 context::{PreparationOutput, RequestContext},
@@ -357,7 +377,8 @@ mod tests {
 
         let (_dir, tokenizer) = byte_tokenizer_with_template(
             "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
-             thinking={{ enable_thinking | default('unset') }}",
+             thinking={{ enable_thinking | default('unset') }} \
+             effort={{ reasoning_effort | default('unset') }}",
         );
         let tokenizer_registry = Arc::new(TokenizerRegistry::new());
         for model in ["MiniMax-M3", "self-hosted-model"] {
@@ -370,14 +391,18 @@ mod tests {
         let components = components_over(
             tokenizer_registry,
             Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
+            ParserChoice::Legacy,
         );
         for (model, profile, rendered) in [
-            ("MiniMax-M3", ProviderProfile::Minimax, "thinking=unset"),
+            (
+                "MiniMax-M3",
+                ProviderProfile::Minimax,
+                "thinking=False effort=unset",
+            ),
             (
                 "self-hosted-model",
                 ProviderProfile::Generic,
-                "thinking=False",
+                "thinking=False effort=none",
             ),
         ] {
             let request: CreateMessageRequest = serde_json::from_value(json!({
@@ -385,7 +410,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}]
             }))
             .unwrap();
-            let mut ctx = RequestContext::for_messages(
+            let mut ctx = RequestContext::for_messages_carrying_its_tools(
                 Arc::new(request),
                 None,
                 model.into(),
@@ -421,6 +446,7 @@ mod tests {
         use serde_json::json;
 
         use crate::{
+            config::ParserChoice,
             routers::grpc::{
                 common::stages::PipelineStage,
                 context::{PreparationOutput, RequestContext},
@@ -444,7 +470,7 @@ mod tests {
         let components = components_over(
             tokenizer_registry,
             Arc::new(WorkerRegistry::new()),
-            crate::config::ParserChoice::Legacy,
+            ParserChoice::Legacy,
         );
         let schema = json!({
             "type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]
@@ -464,7 +490,7 @@ mod tests {
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
             let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
-            let mut ctx = RequestContext::for_messages(
+            let mut ctx = RequestContext::for_messages_carrying_its_tools(
                 Arc::new(request),
                 None,
                 MODEL.into(),
@@ -484,6 +510,7 @@ mod tests {
                 Ok(symphony::Prepared::Constraint {
                     constraint,
                     first_token,
+                    ..
                 }) => {
                     assert!(!first_token, "{extra}");
                     Some(constraint.to_tuple())
@@ -496,6 +523,87 @@ mod tests {
                 constrained.then(|| ("json_schema".to_string(), schema.to_string())),
                 "{extra}"
             );
+        }
+    }
+
+    /// Media of a model without a media spec is judged by the template the
+    /// request renders through, the one for requests with tools when the
+    /// request declares tools and the default one otherwise: refused where
+    /// that template takes one string per message, served where it takes
+    /// content parts.
+    #[tokio::test]
+    async fn media_without_a_spec_is_judged_by_the_template_the_request_renders_through() {
+        use std::sync::Arc;
+
+        use llm_tokenizer::{chat_template::ChatTemplateContentFormat, mock::MockTokenizer};
+        use openai_protocol::messages::CreateMessageRequest;
+        use serde_json::json;
+
+        use crate::routers::grpc::{
+            common::stages::PipelineStage,
+            context::RequestContext,
+            regular::stages::{
+                messages::MessagePreparationStage, testing::components_forwarding_media_of,
+            },
+        };
+
+        for (default, with_tools) in [
+            (
+                ChatTemplateContentFormat::String,
+                ChatTemplateContentFormat::OpenAI,
+            ),
+            (
+                ChatTemplateContentFormat::OpenAI,
+                ChatTemplateContentFormat::String,
+            ),
+        ] {
+            let tokenizer = MockTokenizer::new()
+                .with_deferred_chat_ids(vec![1, 2, 3])
+                .with_content_format(default)
+                .with_tool_content_format(with_tools);
+            let (_dir, components) = components_forwarding_media_of("m", Arc::new(tokenizer)).await;
+            for (declares_tools, format) in [(true, with_tools), (false, default)] {
+                let mut body = json!({
+                    "model": "m", "max_tokens": 8,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "What is this?"},
+                        {"type": "image", "source": {
+                            "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                        }}
+                    ]}]
+                });
+                if declares_tools {
+                    body["tools"] = json!([{
+                        "name": "lookup", "description": "Look a thing up",
+                        "input_schema": {"type": "object", "properties": {}}
+                    }]);
+                }
+                let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
+                let mut ctx = RequestContext::for_messages_carrying_its_tools(
+                    Arc::new(request),
+                    None,
+                    "m".into(),
+                    components.clone(),
+                );
+                let refused_with = MessagePreparationStage::new(&[])
+                    .execute(&mut ctx)
+                    .await
+                    .err()
+                    .map(|response| {
+                        response
+                            .headers()
+                            .get("x-smg-error-code")
+                            .and_then(|code| code.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned()
+                    });
+                assert_eq!(
+                    refused_with.as_deref(),
+                    (format == ChatTemplateContentFormat::String)
+                        .then_some("multimodal_not_supported"),
+                    "declares tools: {declares_tools}"
+                );
+            }
         }
     }
 }

@@ -15,16 +15,20 @@ pub use local::{
     create_worker_removal_workflow, create_worker_removal_workflow_data,
     create_worker_update_workflow, create_worker_update_workflow_data, CreateLocalWorkerStep,
     DetectConnectionModeStep, DiscoverDPInfoStep, DiscoverMetadataStep, DpInfo,
-    FindWorkerToUpdateStep, FindWorkersToRemoveStep, RemoveFromPolicyRegistryStep,
-    RemoveFromWorkerRegistryStep, UpdatePoliciesForWorkerStep, UpdateRemainingPoliciesStep,
-    UpdateWorkerPropertiesStep, WorkerRemovalRequest,
+    FindWorkerToUpdateStep, FindWorkersToRemoveStep, ReleaseTokenizerStep,
+    RemoveFromPolicyRegistryStep, RemoveFromWorkerRegistryStep, UpdatePoliciesForWorkerStep,
+    UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep, WorkerRemovalRequest,
 };
 use local::{
     DetectBackendStep, DiscoverDPInfoStep as DPStep, EnsureHarmonyEncodingStep,
     SubmitTokenizerJobStep,
 };
 use openai_protocol::worker::WorkerSpec;
-pub use shared::{ActivateWorkersStep, RegisterWorkersStep, UpdatePoliciesStep, WorkerList};
+use shared::REGISTER_WORKERS_STEP;
+pub use shared::{
+    registered_entries, registered_in, ActivateWorkersStep, RegisterWorkersStep,
+    UpdatePoliciesStep, WorkerList,
+};
 use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
 use crate::{
@@ -228,7 +232,7 @@ pub fn create_worker_registration_workflow(
         // Step 4: Register workers
         .add_step(
             StepDefinition::new(
-                "register_workers",
+                REGISTER_WORKERS_STEP,
                 "Register Workers",
                 Arc::new(RegisterWorkersStep),
             )
@@ -249,7 +253,7 @@ pub fn create_worker_registration_workflow(
             )
             .with_timeout(Duration::from_secs(5))
             .with_failure_action(FailureAction::ContinueNextStep)
-            .depends_on(&["register_workers"]),
+            .depends_on(&[REGISTER_WORKERS_STEP]),
         )
         // Step 5b: Update policies
         .add_step(
@@ -260,7 +264,7 @@ pub fn create_worker_registration_workflow(
             )
             .with_timeout(Duration::from_secs(5))
             .with_failure_action(FailureAction::ContinueNextStep)
-            .depends_on(&["register_workers"]),
+            .depends_on(&[REGISTER_WORKERS_STEP]),
         )
         // Step 5c: Activate workers
         .add_step(
@@ -271,7 +275,7 @@ pub fn create_worker_registration_workflow(
             )
             .with_timeout(Duration::from_secs(5))
             .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["register_workers"]),
+            .depends_on(&[REGISTER_WORKERS_STEP]),
         )
 }
 

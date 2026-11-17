@@ -73,7 +73,6 @@ rand.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
 tonic.workspace = true
-tonic-prost.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zeromq.workspace = true
@@ -105,7 +104,6 @@ smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-rl.workspace = true
-smg-policy-controller.workspace = true
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true
@@ -296,9 +294,24 @@ harness = false
 path = "benches/sse_rechunk.rs"
 
 [[bench]]
+name = "dispatch_tickets"
+harness = false
+path = "benches/dispatch_tickets.rs"
+
+[[bench]]
 name = "stream_state_machines"
 harness = false
 path = "benches/stream_state_machines.rs"
+
+[[bench]]
+name = "forced_call_stream"
+harness = false
+path = "benches/forced_call_stream.rs"
+
+[[bench]]
+name = "symphony_messages_stream"
+harness = false
+path = "benches/symphony_messages_stream.rs"
 
 [lints]
 workspace = true

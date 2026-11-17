@@ -424,13 +424,34 @@ bindings/golang/
 │   ├── preprocessor.rs    # Request preprocessing
 │   ├── postprocessor.rs   # Response postprocessing
 │   ├── tokenizer.rs       # Tokenizer FFI
-│   ├── tool_parser.rs     # Tool call parsing
+│   ├── reader.rs          # Tool calls and reasoning read through Symphony
 │   ├── runtime.rs         # Shared runtime
 │   ├── stream_state.rs    # Stream state management
 │   └── proto_parse.rs     # Proto parsing utilities
 └── internal/               # Internal packages
     └── ffi/               # FFI bindings
 ```
+
+### Response parsing
+
+The converter reads every choice of a model's output through the Symphony crate
+(`crates/symphony`), as the gateway reads every chat response: the model's own table for its
+tool-call and reasoning syntax (a thinking model's thought arrives as `reasoning_content`),
+without its calls when the request declares no tools; the `forced` and `json` tables for a
+request whose `tool_choice` names a function or requires a call (the engine is held to the JSON
+schema those tables read); under `tool_choice: none` a call the model writes anyway is withheld.
+The readers replay the rendered prompt, so a thought the template opens inside the prompt reads as
+reasoning on the Rust chat path, and the converter keeps the part of the prompt they replay (from
+the table's last turn opener), as the gateway's readers keep it; the C entry point does not receive
+the prompt yet, so on the Go path such a thought reads as content. A forced call on a model whose table keeps the call's header
+as its id (the Kimi K2 line) carries that shape, `functions.NAME:INDEX`.
+The registry lists a checkpoint by its exact stem, so a renamed or quantized checkpoint
+(`Qwen3-8B-FP8`) reads as plain content, as the gateway reads it without an operator's parser name;
+the binding takes no such name yet. `Message` and `MessageDelta` carry the thought in
+`ReasoningContent`, and the non-streaming `CreateChatCompletion` adds it up as it adds up the
+content. A `tool_choice` that needs a tool on a request without tools is refused before the
+request leaves, with the gateway's own words. The older C entry points `sgl_tool_parser_*`, which
+no Go code called, are gone.
 
 ## Troubleshooting
 

@@ -7,6 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     marker::PhantomData,
+    sync::Arc,
 };
 
 use serde::{
@@ -16,6 +17,9 @@ use serde::{
 use serde_json::{Map, Value};
 use validator::Validate;
 
+/// The request rules that read the betas of the request beside its body
+/// ([`MessagesBetas`]), applied by the gateway's Messages handler.
+pub use crate::messages_validation::validate_with_betas;
 use crate::{
     chat::deserialize_reasoning_effort,
     common::{self, invalid, CachePartition, GenerationRequest},
@@ -82,8 +86,9 @@ pub struct CreateMessageRequest {
     pub top_p: Option<f64>,
 
     // Beta features
-    /// Container configuration for code execution (beta).
-    pub container: Option<ContainerConfig>,
+    /// The container for code execution to reuse (beta): its id, or its
+    /// configuration.
+    pub container: Option<MessagesContainer>,
 
     /// MCP servers to be utilized in this request (beta).
     pub mcp_servers: Option<Vec<McpServerConfig>>,
@@ -127,6 +132,88 @@ impl Normalizable for CreateMessageRequest {
 pub enum MessageThread {
     Create,
     Continue { previous_message_id: String },
+}
+
+/// The betas a Messages request names in its `anthropic-beta` header, read
+/// once per request. The public API names a beta in its dated form,
+/// `name-YYYY-MM-DD`; the header may repeat, and each value may list several
+/// betas, comma separated. The set keeps the two betas the request rules
+/// ([`validate_with_betas`]) read, as flags filled in one pass over the
+/// values (no allocation per request); the request's raw headers reach the
+/// backend unchanged, dates and all, and another name is asked of the raw
+/// values through [`MessagesBetas::values_name`]. A token without the dated
+/// suffix names no beta, and a longer name that begins with a known one is
+/// another beta, not that one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessagesBetas {
+    /// `interleaved-thinking` is named.
+    interleaved_thinking: bool,
+    /// `message-threads` is named.
+    message_threads: bool,
+}
+
+impl MessagesBetas {
+    /// The beta under which `thinking.budget_tokens` may reach `max_tokens`.
+    pub const INTERLEAVED_THINKING: &'static str = "interleaved-thinking";
+    /// The beta a `thread` field needs.
+    pub const MESSAGE_THREADS: &'static str = "message-threads";
+
+    /// The set named by the header's values, each a comma-separated list.
+    pub fn from_header_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut betas = Self::default();
+        for name in dated_beta_names(values) {
+            match name {
+                Self::INTERLEAVED_THINKING => betas.interleaved_thinking = true,
+                Self::MESSAGE_THREADS => betas.message_threads = true,
+                _ => {}
+            }
+        }
+        betas
+    }
+
+    /// Whether the header's values name `name` in its dated form: the
+    /// reading for a name the set does not keep.
+    pub fn values_name<'a>(values: impl IntoIterator<Item = &'a str>, name: &str) -> bool {
+        dated_beta_names(values).any(|named| named == name)
+    }
+
+    /// Whether the interleaved-thinking beta is named.
+    pub fn interleaved_thinking(self) -> bool {
+        self.interleaved_thinking
+    }
+
+    /// Whether the message-threads beta is named.
+    pub fn message_threads(self) -> bool {
+        self.message_threads
+    }
+}
+
+/// `-YYYY-MM-DD`, the suffix a public beta's name ends with.
+const DATED_SUFFIX_LEN: usize = 11;
+
+/// The names of the dated betas in `values`, in their order.
+fn dated_beta_names<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> impl Iterator<Item = &'a str> {
+    values
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| dated_beta_name(token.trim()))
+}
+
+/// `token` as `name-YYYY-MM-DD`: its name, or `None` when the token does not
+/// end with the dated suffix (the shape alone, not the calendar).
+fn dated_beta_name(token: &str) -> Option<&str> {
+    let bytes = token.as_bytes();
+    let at = bytes.len().checked_sub(DATED_SUFFIX_LEN)?;
+    let dated = bytes[at..].iter().enumerate().all(|(i, b)| {
+        if i == 0 || i == 5 || i == 8 {
+            *b == b'-'
+        } else {
+            b.is_ascii_digit()
+        }
+    });
+    (dated && at > 0 && token.is_char_boundary(at)).then(|| &token[..at])
 }
 
 /// `output_config`: `effort` is read as a Chat `reasoning_effort` is (a
@@ -218,9 +305,21 @@ impl CreateMessageRequest {
         continues_final_assistant(&self.messages)
     }
 
-    /// `output_config.effort`, the `reasoning_effort` the template renders.
+    /// `output_config.effort`, the request's `reasoning_effort`
+    /// ([`Self::template_reasoning_effort_for`] is the one the template renders).
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.output_config.as_ref()?.effort.as_deref()
+    }
+
+    /// The `reasoning_effort` the prompt is rendered with: the effort as the
+    /// model's provider profile hands it to the template
+    /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
+    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
+        provider.template_reasoning_effort(
+            self.reasoning_effort(),
+            self.template_thinking_for(provider),
+        )
     }
 
     /// The thinking preference the `thinking` block states, none without one.
@@ -606,6 +705,11 @@ pub enum InputContentBlock {
     ToolSearchToolResult(ToolSearchToolResultBlock),
     /// Tool reference block
     ToolReference(ToolReferenceBlock),
+    /// MCP tool use block (an assistant message of the MCP beta, replayed
+    /// or read back from a stored turn)
+    McpToolUse(McpToolUseBlock),
+    /// MCP tool result block (the same message, beside its use)
+    McpToolResult(McpToolResultBlock),
 }
 
 /// Whether `messages` end with an assistant message that has text and no
@@ -658,8 +762,14 @@ pub struct ImageBlock {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
-    Base64 { media_type: String, data: String },
-    Url { url: String },
+    /// Base64 text with its media type; the text is shared with the readers
+    /// that decode it, never re-encoded into a data URL.
+    Base64 {
+        media_type: String,
+        data: Arc<String>,
+    },
+    /// A URL or `data:` URL, shared with its readers.
+    Url { url: Arc<String> },
 }
 
 /// Document content block
@@ -689,7 +799,27 @@ pub enum DocumentSource {
     Base64 { media_type: String, data: String },
     Text { data: String },
     Url { url: String },
-    Content { content: Vec<InputContentBlock> },
+    Content { content: DocumentContent },
+}
+
+/// A content source's content, as the public API takes it: a string, or an
+/// array of content blocks
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum DocumentContent {
+    String(String),
+    Blocks(Vec<InputContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for DocumentContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match string_or_blocks(deserializer, "a string or an array of content blocks")? {
+                StringOrBlocks::String(text) => Self::String(text),
+                StringOrBlocks::Blocks(blocks) => Self::Blocks(blocks),
+            },
+        )
+    }
 }
 
 /// Tool use block (in assistant messages)
@@ -853,6 +983,12 @@ pub enum WebSearchToolResultContent {
 /// Web search result block
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WebSearchResultBlock {
+    /// Block type (always "web_search_result"). The public API writes it on
+    /// every result and requires it on a replayed one, so a result read
+    /// without it is written with it.
+    #[serde(rename = "type", default = "WebSearchResultBlock::default_type")]
+    pub block_type: String,
+
     /// Title of the search result
     pub title: String,
 
@@ -862,9 +998,16 @@ pub struct WebSearchResultBlock {
     /// Encrypted content
     pub encrypted_content: String,
 
-    /// Page age (if available)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Page age, null when the search does not know it, as the public API
+    /// writes it
+    #[serde(default)]
     pub page_age: Option<String>,
+}
+
+impl WebSearchResultBlock {
+    fn default_type() -> String {
+        "web_search_result".to_string()
+    }
 }
 
 /// Web search tool result error
@@ -884,6 +1027,7 @@ pub enum WebSearchToolResultErrorCode {
     MaxUsesExceeded,
     TooManyRequests,
     QueryTooLong,
+    RequestTooLarge,
 }
 
 /// Cache control configuration
@@ -987,7 +1131,9 @@ pub enum Tool {
     /// it and falls through, while CustomTool JSON with "type" would incorrectly
     /// match ToolSearchTool's less-restrictive shape if tried first)
     Custom(CustomTool),
-    /// Tool search tool
+    /// Tool search tool, and every other Anthropic-defined tool: a tool with a
+    /// `type` and a `name` and no `input_schema` that reads as one reads here,
+    /// its configuration kept in [`ToolSearchTool::extra`].
     ToolSearch(ToolSearchTool),
     /// Bash tool (computer use)
     Bash(BashTool),
@@ -1045,47 +1191,67 @@ pub struct InputSchema {
     pub additional: Map<String, Value>,
 }
 
-impl From<&InputSchema> for Value {
-    /// The schema as the JSON object a chat tool's `parameters` holds.
-    fn from(schema: &InputSchema) -> Self {
+impl From<InputSchema> for Value {
+    /// The schema as the JSON object a chat tool's `parameters` holds: the
+    /// properties and the additional fields move in, the `type` and the
+    /// `required` names are written as the strings they are.
+    fn from(schema: InputSchema) -> Self {
         let mut object = Map::new();
-        object.insert(
-            "type".to_string(),
-            Value::String(schema.schema_type.clone()),
-        );
-        if let Some(properties) = &schema.properties {
-            object.insert("properties".to_string(), Value::Object(properties.clone()));
+        object.insert("type".to_string(), Value::String(schema.schema_type));
+        if let Some(properties) = schema.properties {
+            object.insert("properties".to_string(), Value::Object(properties));
         }
-        if let Some(required) = &schema.required {
+        if let Some(required) = schema.required {
             object.insert(
                 "required".to_string(),
-                Value::Array(required.iter().cloned().map(Value::String).collect()),
+                Value::Array(required.into_iter().map(Value::String).collect()),
             );
         }
-        object.extend(
-            schema
-                .additional
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
+        object.extend(schema.additional);
         Value::Object(object)
     }
 }
 
-impl From<&CustomTool> for common::Tool {
+impl From<&InputSchema> for Value {
+    /// The same object from a borrowed schema: its fields are copied once, as
+    /// a caller that keeps its schema must.
+    fn from(schema: &InputSchema) -> Self {
+        Self::from(schema.clone())
+    }
+}
+
+impl From<CustomTool> for common::Tool {
     /// The chat tool a custom tool reads as: a function with the input
-    /// schema as its parameters.
-    fn from(tool: &CustomTool) -> Self {
+    /// schema as its parameters; the name, the description and the schema
+    /// move in.
+    fn from(tool: CustomTool) -> Self {
         Self {
             tool_type: "function".to_string(),
             function: common::Function {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: Some(Value::from(&tool.input_schema)),
+                name: tool.name,
+                description: tool.description,
+                parameters: Some(Value::from(tool.input_schema)),
                 strict: None,
                 extra: Default::default(),
             },
         }
+    }
+}
+
+impl From<&CustomTool> for common::Tool {
+    /// The same tool from a borrowed custom tool: the name, the description
+    /// and the schema are copied once; the fields a chat tool does not carry
+    /// (`extra`, `cache_control`, ...) are not.
+    fn from(tool: &CustomTool) -> Self {
+        Self::from(CustomTool {
+            name: tool.name.clone(),
+            tool_type: None,
+            description: tool.description.clone(),
+            input_schema: tool.input_schema.clone(),
+            defer_loading: None,
+            cache_control: None,
+            extra: Map::new(),
+        })
     }
 }
 
@@ -1094,6 +1260,19 @@ impl From<&CustomTool> for common::Tool {
 pub fn chat_tools(tools: &[Tool]) -> Vec<common::Tool> {
     tools
         .iter()
+        .filter_map(|tool| match tool {
+            Tool::Custom(custom) => Some(common::Tool::from(custom)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The custom tools among the owned `tools` as chat tools, in order: their
+/// names, descriptions and schemas move into the chat tools instead of being
+/// copied; the other kinds are dropped here, as [`chat_tools`] leaves them out.
+pub fn into_chat_tools(tools: Vec<Tool>) -> Vec<common::Tool> {
+    tools
+        .into_iter()
         .filter_map(|tool| match tool {
             Tool::Custom(custom) => Some(common::Tool::from(custom)),
             _ => None,
@@ -1436,7 +1615,7 @@ pub enum ContentBlock {
     /// Tool search tool result
     ToolSearchToolResult {
         tool_use_id: String,
-        content: ToolSearchResultContent,
+        content: ToolSearchToolResultContent,
     },
     /// Tool reference (returned by tool search)
     ToolReference {
@@ -1648,6 +1827,34 @@ pub enum MessageStreamEvent {
     Ping,
     /// Error event
     Error { error: ErrorResponse },
+}
+
+impl MessageStreamEvent {
+    /// The events that close a streamed `thinking` block at `index` as the
+    /// public API closes one: a `signature_delta` just before the
+    /// `content_block_stop`, preceded by one empty `thinking_delta` when the
+    /// block's text was withheld (`thinking.display: omitted`). The gateway
+    /// has no signature to give, so the delta carries the empty string the
+    /// whole answer reports too.
+    pub fn thinking_block_close(index: u32, text_withheld: bool) -> impl Iterator<Item = Self> {
+        text_withheld
+            .then(|| Self::ContentBlockDelta {
+                index,
+                delta: ContentBlockDelta::ThinkingDelta {
+                    thinking: String::new(),
+                },
+            })
+            .into_iter()
+            .chain([
+                Self::ContentBlockDelta {
+                    index,
+                    delta: ContentBlockDelta::SignatureDelta {
+                        signature: String::new(),
+                    },
+                },
+                Self::ContentBlockStop { index },
+            ])
+    }
 }
 
 /// Message delta for streaming updates: the public API writes all four
@@ -1866,9 +2073,21 @@ impl CountMessageTokensRequest {
         continues_final_assistant(&self.messages)
     }
 
-    /// `output_config.effort`, the `reasoning_effort` the template renders.
+    /// `output_config.effort`, the request's `reasoning_effort`
+    /// ([`Self::template_reasoning_effort_for`] is the one the template renders).
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.output_config.as_ref()?.effort.as_deref()
+    }
+
+    /// The `reasoning_effort` the prompt is rendered with: the effort as the
+    /// model's provider profile hands it to the template
+    /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
+    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
+        provider.template_reasoning_effort(
+            self.reasoning_effort(),
+            self.template_thinking_for(provider),
+        )
     }
 
     /// The thinking preference the prompt is rendered with.
@@ -2152,6 +2371,46 @@ impl ListModelsResponse {
 // ============================================================================
 // Beta Features - Container & MCP Configuration
 // ============================================================================
+
+/// The request's container (beta), in either form the public API takes: the
+/// id of a container to reuse, or its configuration. It is read by hand, as
+/// [`SystemContent`] is, so a malformed container is refused with the error
+/// of the form it took, not an untagged enum's "did not match any variant".
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum MessagesContainer {
+    Id(String),
+    Config(ContainerConfig),
+}
+
+impl<'de> Deserialize<'de> for MessagesContainer {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ContainerVisitor;
+
+        impl<'de> Visitor<'de> for ContainerVisitor {
+            type Value = MessagesContainer;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a container id or a container configuration")
+            }
+
+            fn visit_str<E: de::Error>(self, id: &str) -> Result<Self::Value, E> {
+                Ok(MessagesContainer::Id(id.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, id: String) -> Result<Self::Value, E> {
+                Ok(MessagesContainer::Id(id))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                ContainerConfig::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(MessagesContainer::Config)
+            }
+        }
+
+        deserializer.deserialize_any(ContainerVisitor)
+    }
+}
 
 /// Container configuration for code execution (beta)
 #[serde_with::skip_serializing_none]
@@ -2601,7 +2860,10 @@ pub enum WebFetchToolResultErrorCode {
 // Beta Features - Tool Search Types
 // ============================================================================
 
-/// Tool search tool (beta)
+/// Tool search tool (beta). The untagged [`Tool`] reads every
+/// Anthropic-defined tool (web search, web fetch, computer use, bash, the text
+/// editor, ...) as this one, so the keys those tools take beyond `type` and
+/// `name` ride in [`Self::extra`].
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ToolSearchTool {
@@ -2615,6 +2877,12 @@ pub struct ToolSearchTool {
 
     /// Cache control for this tool
     pub cache_control: Option<CacheControl>,
+
+    /// The tool's other keys (a web search tool's domain filters and use cap,
+    /// a computer tool's display size, `defer_loading`, `strict`, ...),
+    /// forwarded as written.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Tool reference block (beta) - returned by tool search
@@ -2629,6 +2897,11 @@ pub struct ToolReferenceBlock {
     /// Tool description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Cache control for this reference, which a replayed tool search result
+    /// may set, as a tool result's reference does
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// Tool search result content — wraps tool references returned by tool search
@@ -2641,14 +2914,43 @@ pub struct ToolSearchResultContent {
     pub tool_references: Vec<ToolReferenceBlock>,
 }
 
+/// A tool search's result: the tool references it found, or the error it
+/// ended with, as the web search's result is
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ToolSearchToolResultContent {
+    Results(ToolSearchResultContent),
+    Error(ToolSearchToolResultError),
+}
+
+/// Tool search tool result error
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolSearchToolResultError {
+    #[serde(rename = "type")]
+    pub error_type: String, // "tool_search_tool_result_error"
+    pub error_code: ToolSearchToolResultErrorCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// Tool search tool result error codes
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSearchToolResultErrorCode {
+    InvalidToolInput,
+    Unavailable,
+    TooManyRequests,
+    ExecutionTimeExceeded,
+}
+
 /// Tool search tool result block (beta)
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ToolSearchToolResultBlock {
     /// The ID of the tool use this is a result for
     pub tool_use_id: String,
 
-    /// The search results
-    pub content: ToolSearchResultContent,
+    /// The search results or error
+    pub content: ToolSearchToolResultContent,
 
     /// Cache control for this block
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2842,7 +3144,7 @@ pub enum BetaContentBlock {
     // Beta tool search types
     ToolSearchToolResult {
         tool_use_id: String,
-        content: ToolSearchResultContent,
+        content: ToolSearchToolResultContent,
     },
     ToolReference {
         tool_name: String,
@@ -2938,6 +3240,36 @@ mod tests {
         );
     }
 
+    /// An assistant message carrying an MCP exchange, as the Messages API
+    /// answers one under the MCP beta, is read as input: a stored MCP turn
+    /// continues and a client's replay of it is accepted.
+    #[test]
+    fn an_mcp_exchange_is_read_as_input() {
+        let message: InputMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
+                {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}]},
+                {"type": "text", "text": "it is 42"}
+            ]
+        }))
+        .expect("an MCP exchange is input");
+        let InputContent::Blocks(blocks) = &message.content else {
+            panic!("blocks");
+        };
+        assert!(matches!(
+            &blocks[..],
+            [
+                InputContentBlock::McpToolUse(mcp_use),
+                InputContentBlock::McpToolResult(result),
+                InputContentBlock::Text(_)
+            ] if mcp_use.server_name == "s" && result.tool_use_id == "mcptoolu_1"
+        ));
+        let written = serde_json::to_value(&message).expect("serializes");
+        assert_eq!(written["content"][0]["type"], "mcp_tool_use");
+        assert_eq!(written["content"][1]["type"], "mcp_tool_result");
+    }
+
     /// A content field that is neither a string nor an array of blocks, or
     /// holds a block that cannot be read, is refused with the block's own
     /// reason: the unknown `type` with the accepted ones, the missing field,
@@ -2950,12 +3282,12 @@ mod tests {
                 .to_string()
         };
         let unknown_block = refusal(json!({
-            "role": "assistant",
-            "content": [{"type": "mcp_tool_use", "id": "m1", "name": "echo", "server_name": "s", "input": {}}]
+            "role": "user",
+            "content": [{"type": "container_upload", "file_id": "file_1"}]
         }));
         assert!(
             unknown_block.starts_with(
-                "unknown variant `mcp_tool_use`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
+                "unknown variant `container_upload`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
             ),
             "{unknown_block}"
         );
@@ -3105,6 +3437,82 @@ mod tests {
         }))
         .expect("a count_tokens request");
         assert!(count.continues_final_assistant());
+    }
+
+    /// The effort the template renders is the profile's reading of
+    /// `output_config.effort`, with the `thinking` block's toggle: as sent
+    /// under the default profile; under MiniMax a level the contract names
+    /// only (`minimal` as `low`), and none while thinking is off. The
+    /// count_tokens request reads the same.
+    #[test]
+    fn template_reasoning_effort_follows_the_profile() {
+        let body = |output_config: Value, thinking: Value| {
+            json!({
+                "model": "m", "max_tokens": 8, "output_config": output_config, "thinking": thinking,
+                "messages": [{"role": "user", "content": "Hello"}]
+            })
+        };
+        for (output_config, thinking, minimax, generic) in [
+            (
+                json!({"effort": "high"}),
+                Value::Null,
+                Some("high"),
+                Some("high"),
+            ),
+            (
+                json!({"effort": "max"}),
+                json!({"type": "enabled", "budget_tokens": 1024}),
+                Some("max"),
+                Some("max"),
+            ),
+            (json!({"effort": "none"}), Value::Null, None, Some("none")),
+            (
+                json!({"effort": "minimal"}),
+                Value::Null,
+                Some("low"),
+                Some("minimal"),
+            ),
+            (json!({"effort": "64"}), Value::Null, None, Some("64")),
+            (
+                json!({"effort": "high"}),
+                json!({"type": "disabled"}),
+                None,
+                Some("high"),
+            ),
+            (
+                json!({"effort": "none"}),
+                json!({"type": "enabled", "budget_tokens": 1024}),
+                None,
+                Some("none"),
+            ),
+            (json!({}), Value::Null, None, None),
+        ] {
+            let request: CreateMessageRequest =
+                serde_json::from_value(body(output_config.clone(), thinking.clone()))
+                    .expect("a Messages request");
+            assert_eq!(
+                request.template_reasoning_effort_for(ProviderProfile::Minimax),
+                minimax,
+                "MiniMax {output_config} {thinking}"
+            );
+            assert_eq!(
+                request.template_reasoning_effort_for(ProviderProfile::Generic),
+                generic,
+                "generic {output_config} {thinking}"
+            );
+            let count: CountMessageTokensRequest = serde_json::from_value(json!({
+                "model": "m", "messages": [], "output_config": output_config, "thinking": thinking
+            }))
+            .expect("a count_tokens request");
+            assert_eq!(
+                count.template_reasoning_effort_for(ProviderProfile::Minimax),
+                minimax
+            );
+            assert_eq!(
+                count.template_reasoning_effort_for(ProviderProfile::Generic),
+                generic
+            );
+        }
     }
 
     /// `output_config.effort` reads as a Chat `reasoning_effort`: a string
@@ -3458,6 +3866,44 @@ mod tests {
         }
     }
 
+    /// An Anthropic-defined tool reads as `ToolSearch` and is written back as
+    /// the client sent it, its configuration included: a web search tool's
+    /// domain filters, use cap and location, a web fetch tool's, a computer
+    /// tool's display size, a text editor's `max_characters`, and a bash
+    /// tool's `defer_loading`, `strict` and `input_examples`.
+    #[test]
+    fn an_anthropic_defined_tool_keeps_its_configuration() {
+        for tool in [
+            json!({
+                "type": "web_search_20250305", "name": "web_search",
+                "allowed_domains": ["example.com"], "max_uses": 3,
+                "user_location": {"type": "approximate", "city": "Paris", "country": "FR"}
+            }),
+            json!({
+                "type": "web_fetch_20250910", "name": "web_fetch",
+                "blocked_domains": ["example.org"], "max_uses": 2,
+                "max_content_tokens": 1000, "citations": {"enabled": true}
+            }),
+            json!({
+                "type": "computer_20250124", "name": "computer",
+                "display_width_px": 1024, "display_height_px": 768, "display_number": 1
+            }),
+            json!({
+                "type": "text_editor_20250728", "name": "str_replace_based_edit_tool",
+                "max_characters": 10000
+            }),
+            json!({
+                "type": "bash_20250124", "name": "bash", "defer_loading": true,
+                "strict": true, "input_examples": [{"command": "ls"}]
+            }),
+        ] {
+            let parsed: Tool =
+                serde_json::from_value(tool.clone()).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(matches!(parsed, Tool::ToolSearch(_)), "{tool}");
+            assert_eq!(serde_json::to_value(&parsed).unwrap(), tool);
+        }
+    }
+
     #[test]
     fn test_tool_search_tool_deserialization() {
         let json = r#"{
@@ -3499,10 +3945,176 @@ mod tests {
                 content,
             } => {
                 assert_eq!(tool_use_id, "srvtoolu_015dw5iXvktXLmqwpyzo4Dp2");
+                let ToolSearchToolResultContent::Results(content) = content else {
+                    panic!("Expected the search's results");
+                };
                 assert_eq!(content.tool_references.len(), 1);
                 assert_eq!(content.tool_references[0].tool_name, "get_weather");
             }
             _ => panic!("Expected ToolSearchToolResult variant"),
+        }
+    }
+
+    /// A web search's results and errors read and write as the public API
+    /// writes them: each result with its `type` and its null `page_age`, and
+    /// the `request_too_large` error. A result read without its `type` is
+    /// written with it, which the public API requires of a replayed one.
+    #[test]
+    fn a_web_search_result_reads_and_writes_as_the_public_api_writes_it() {
+        let results = json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": [{
+                "type": "web_search_result",
+                "title": "Claude Shannon",
+                "url": "https://en.wikipedia.org/wiki/Claude_Shannon",
+                "encrypted_content": "EqgfCioIARgBIiQ3",
+                "page_age": null
+            }]
+        });
+        let block: ContentBlock = serde_json::from_value(results.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&block).unwrap(), results);
+
+        let error = json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_2",
+            "content": {"type": "web_search_tool_result_error", "error_code": "request_too_large"}
+        });
+        let block: ContentBlock = serde_json::from_value(error.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&block).unwrap(), error);
+
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "Who was Claude Shannon?"},
+                {"role": "assistant", "content": [{
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_1",
+                    "content": [{
+                        "title": "Claude Shannon",
+                        "url": "https://en.wikipedia.org/wiki/Claude_Shannon",
+                        "encrypted_content": "EqgfCioIARgBIiQ3"
+                    }]
+                }]}
+            ]
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            written["messages"][1]["content"][0]["content"],
+            results["content"]
+        );
+    }
+
+    /// A tool search that ended with an error reads and writes as the public
+    /// API writes it, in an answer and replayed in a request.
+    #[test]
+    fn a_tool_search_error_reads_and_writes_as_the_public_api_writes_it() {
+        let error = json!({
+            "type": "tool_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": {
+                "type": "tool_search_tool_result_error",
+                "error_code": "execution_time_exceeded",
+                "error_message": "The tool search took too long."
+            }
+        });
+        let block: ContentBlock = serde_json::from_value(error.clone()).unwrap();
+        let ContentBlock::ToolSearchToolResult {
+            content: ToolSearchToolResultContent::Error(ref reason),
+            ..
+        } = block
+        else {
+            panic!("Expected the search's error, got {block:?}");
+        };
+        assert!(matches!(
+            reason.error_code,
+            ToolSearchToolResultErrorCode::ExecutionTimeExceeded
+        ));
+        assert_eq!(serde_json::to_value(&block).unwrap(), error);
+
+        let replayed: InputContentBlock = serde_json::from_value(error.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&replayed).unwrap(), error);
+    }
+
+    /// A tool reference in a replayed tool search result keeps its cache
+    /// breakpoint, as the public API takes it.
+    #[test]
+    fn a_replayed_tool_reference_keeps_its_cache_breakpoint() {
+        let references = json!({
+            "type": "tool_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": {
+                "type": "tool_search_tool_search_result",
+                "tool_references": [{
+                    "type": "tool_reference",
+                    "tool_name": "get_weather",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }
+        });
+        let replayed: InputContentBlock = serde_json::from_value(references.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&replayed).unwrap(), references);
+    }
+
+    /// A document's content source and the request's container take the
+    /// string form the public API allows beside their other form, and each
+    /// form is written back as sent.
+    #[test]
+    fn a_content_source_and_a_container_take_their_string_forms() {
+        for content in [
+            json!("The document's text."),
+            json!([{"type": "text", "text": "The document's text."}]),
+        ] {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": [{
+                    "type": "document",
+                    "source": {"type": "content", "content": content}
+                }]}]
+            }))
+            .unwrap();
+            let written = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                written["messages"][0]["content"][0]["source"]["content"],
+                content
+            );
+        }
+
+        for container in [json!("container_011CZ"), json!({"id": "container_011CZ"})] {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Run the script again."}],
+                "container": container
+            }))
+            .unwrap();
+            let written = serde_json::to_value(&request).unwrap();
+            assert_eq!(written["container"], container);
+        }
+
+        // a malformed container is refused with the error of the form it took
+        for (container, expected) in [
+            (
+                json!(5),
+                "invalid type: integer `5`, expected a container id",
+            ),
+            (
+                json!({"id": 5}),
+                "invalid type: integer `5`, expected a string",
+            ),
+        ] {
+            let refused = serde_json::from_value::<CreateMessageRequest>(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Run the script again."}],
+                "container": container
+            }))
+            .expect_err("a malformed container")
+            .to_string();
+            assert!(refused.contains(expected), "{refused}");
         }
     }
 
@@ -4391,6 +5003,43 @@ mod tests {
                 .expect_err("no such entry")
                 .as_str(),
             "after_id: no model \"nope\" in the list"
+        );
+    }
+
+    /// The owned conversion and the borrowed one read the same chat tools: the
+    /// custom tools in order, each a function whose parameters are the input
+    /// schema with the client's keys in their order, the other kinds left out.
+    #[test]
+    fn into_chat_tools_moves_what_chat_tools_copies() {
+        let tools: Vec<Tool> = serde_json::from_value(json!([
+            {"name": "weather", "description": "Get weather", "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "unit": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": false
+            }},
+            {"type": "web_search_20250305", "name": "web_search"},
+            {"name": "calc", "input_schema": {"type": "object"}}
+        ]))
+        .expect("the tools deserialize");
+        let borrowed = serde_json::to_value(chat_tools(&tools)).unwrap();
+        let owned = serde_json::to_value(into_chat_tools(tools)).unwrap();
+        assert_eq!(owned, borrowed);
+        assert_eq!(
+            owned.as_array().map(Vec::len),
+            Some(2),
+            "the server tool is left out"
+        );
+        let keys: Vec<&str> = owned[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["city", "unit"], "the client's key order is kept");
+        assert_eq!(
+            owned[0]["function"]["parameters"]["additionalProperties"],
+            json!(false)
         );
     }
 }

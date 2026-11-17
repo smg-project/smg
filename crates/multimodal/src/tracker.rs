@@ -1,5 +1,6 @@
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{collections::HashMap, future::Future, panic::AssertUnwindSafe, sync::Arc};
 
+use futures::FutureExt;
 use tokio::task::JoinHandle;
 
 use super::{
@@ -11,7 +12,11 @@ use super::{
         ImageDetail, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, TrackedMedia,
     },
 };
-use crate::types::TransparencyPolicy;
+use crate::{
+    error::{MediaErrorCode, MediaFault},
+    minimax_resize,
+    types::TransparencyPolicy,
+};
 
 type PendingTask = JoinHandle<MultiModalResult<TrackedMedia>>;
 
@@ -133,7 +138,7 @@ impl FetchSourceKind {
     fn of(source: &FetchSource) -> Self {
         match source {
             FetchSource::Url(_) => Self::Url,
-            FetchSource::DataUrl(_) => Self::DataUrl,
+            FetchSource::DataUrl(_) | FetchSource::Base64 { .. } => Self::DataUrl,
             FetchSource::InlineBytes(_) => Self::InlineBytes,
             FetchSource::File(_) => Self::File,
         }
@@ -174,7 +179,7 @@ pub enum FetchOutcome {
     /// decode, a host the policy refuses.
     ClientFault,
     /// Not the caller's fault: a fetch that timed out, a host that failed,
-    /// a decoder this process lacks.
+    /// a decoder this process lacks, a fetch task that panicked.
     HostFault,
 }
 
@@ -183,9 +188,9 @@ impl FetchOutcome {
         match result {
             Ok(_) => Self::Ok,
             Err(MultiModalError::Media(error)) => {
-                if error.code() == crate::error::MediaErrorCode::TooLarge {
+                if error.code() == MediaErrorCode::TooLarge {
                     Self::TooLarge
-                } else if error.fault() == crate::error::MediaFault::Client {
+                } else if error.fault() == MediaFault::Client {
                     Self::ClientFault
                 } else {
                     Self::HostFault
@@ -336,6 +341,20 @@ impl AsyncMultiModalTracker {
                     max_long_side_pixel,
                 );
             }
+            MediaContentPart::ImageBase64 {
+                media_type,
+                data,
+                detail,
+                uuid,
+                max_long_side_pixel,
+            } => {
+                self.enqueue_image(
+                    MediaSource::Base64 { media_type, data },
+                    detail.unwrap_or_default(),
+                    uuid,
+                    max_long_side_pixel,
+                );
+            }
             MediaContentPart::ImageData {
                 data,
                 mime_type: _,
@@ -355,6 +374,13 @@ impl AsyncMultiModalTracker {
             MediaContentPart::AudioUrl { url, uuid } => {
                 let source = media_url_source(url, "data:audio/");
                 self.enqueue_audio(source, uuid);
+            }
+            MediaContentPart::AudioBase64 {
+                media_type,
+                data,
+                uuid,
+            } => {
+                self.enqueue_audio(MediaSource::Base64 { media_type, data }, uuid);
             }
             MediaContentPart::AudioData {
                 data,
@@ -459,7 +485,7 @@ impl AsyncMultiModalTracker {
         }
         // Past them the bucket is matched by digest: one pass over this
         // payload, and only its digest is kept.
-        let digest: [u8; 32] = blake3::hash(source.payload()).into();
+        let digest = source.digest();
         if let Some(first) = bucket
             .hashed
             .iter()
@@ -479,9 +505,8 @@ impl AsyncMultiModalTracker {
         max_long_side_pixel: Option<u32>,
     ) {
         let sglang = self.minimax_sglang_resize;
-        let minimax_cap = (self.minimax_image_resize || sglang).then_some(
-            max_long_side_pixel.unwrap_or(crate::minimax_resize::IMAGE_DEFAULT_LONG_SIDE),
-        );
+        let minimax_cap = (self.minimax_image_resize || sglang)
+            .then_some(max_long_side_pixel.unwrap_or(minimax_resize::IMAGE_DEFAULT_LONG_SIDE));
         let config = ImageFetchConfig {
             detail,
             max_long_side_pixel: if minimax_cap.is_some() {
@@ -504,9 +529,9 @@ impl AsyncMultiModalTracker {
                 let frame = connector.fetch_image_from(&source, config).await?;
                 let frame = if let Some(cap) = minimax_cap {
                     if sglang {
-                        crate::minimax_resize::image_for_runtime(frame, cap, true)?
+                        minimax_resize::image_for_runtime(frame, cap, true)?
                     } else {
-                        crate::minimax_resize::image(frame, cap)?
+                        minimax_resize::image(frame, cap)?
                     }
                 } else {
                     frame
@@ -605,18 +630,29 @@ impl AsyncMultiModalTracker {
                         let fetching = fetch(connector, source);
                         tokio::spawn(async move {
                             let started = std::time::Instant::now();
-                            let result = fetching.await;
+                            // A fetch that panics is reported too (the host's fault:
+                            // nobody's request), then its panic goes on to the join in
+                            // `finalize`. The future is not touched again after it,
+                            // hence the assertion.
+                            let result = AssertUnwindSafe(fetching).catch_unwind().await;
+                            let (outcome, bytes) = match &result {
+                                Ok(fetched) => (
+                                    FetchOutcome::of(fetched),
+                                    fetched.as_ref().map_or(0, fetched_bytes),
+                                ),
+                                Err(_) => (FetchOutcome::HostFault, 0),
+                            };
                             observer(
                                 &label,
                                 &FetchReport {
                                     modality,
                                     source: kind,
-                                    outcome: FetchOutcome::of(&result),
+                                    outcome,
                                     duration: started.elapsed(),
-                                    bytes: result.as_ref().map_or(0, fetched_bytes),
+                                    bytes,
                                 },
                             );
-                            result
+                            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                         })
                     }
                 };
@@ -632,7 +668,7 @@ impl AsyncMultiModalTracker {
 // (`data:image/`, `data:audio/`, `data:video/`); noncanonical forms and
 // invalid data:// authorities retain URL parsing. Connector validation still
 // receives the original input unchanged.
-fn media_url_source(url: String, canonical_data_prefix: &str) -> MediaSource {
+fn media_url_source(url: Arc<String>, canonical_data_prefix: &str) -> MediaSource {
     if is_data_url(&url, canonical_data_prefix) {
         MediaSource::DataUrl(url)
     } else {
@@ -803,7 +839,11 @@ mod video_param_tests {
 mod repeat_tests {
 
     use super::*;
-    use crate::media::MediaConnectorConfig;
+    use crate::{
+        hasher::{hash_image, hash_image_with_transparency, hash_video_with_sampling},
+        media::MediaConnectorConfig,
+        test_support::{http_client_builder, video_tools_available},
+    };
 
     const TINY_PNG_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
 
@@ -834,14 +874,14 @@ mod repeat_tests {
             }
             for input in cases {
                 let expected = url::Url::parse(&input).is_ok_and(|url| url.scheme() == "data");
-                match media_url_source(input.clone(), prefix) {
+                match media_url_source(Arc::new(input.clone()), prefix) {
                     MediaSource::DataUrl(actual) => {
                         assert!(expected, "{input:?}");
-                        assert_eq!(actual, input);
+                        assert_eq!(*actual, input);
                     }
                     MediaSource::Url(actual) => {
                         assert!(!expected, "{input:?}");
-                        assert_eq!(actual, input);
+                        assert_eq!(*actual, input);
                     }
                     _ => panic!("unexpected media source"),
                 }
@@ -859,11 +899,8 @@ mod repeat_tests {
     }
 
     fn tracker() -> AsyncMultiModalTracker {
-        let connector = MediaConnector::new(
-            crate::test_support::http_client_builder(),
-            MediaConnectorConfig::default(),
-        )
-        .expect("default connector");
+        let connector = MediaConnector::new(http_client_builder(), MediaConnectorConfig::default())
+            .expect("default connector");
         AsyncMultiModalTracker::new(Arc::new(connector))
     }
 
@@ -966,7 +1003,7 @@ mod repeat_tests {
             .expect("the same part again: no fetch of its own");
         tracker
             .push_part(MediaContentPart::ImageUrl {
-                url: "data:image/png;base64,AAAA".to_string(),
+                url: "data:image/png;base64,AAAA".to_string().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
@@ -999,7 +1036,7 @@ mod repeat_tests {
     #[tokio::test]
     async fn minimax_video_cap_is_deferred_only_for_sglang() {
         use base64::{engine::general_purpose::STANDARD, Engine};
-        if !crate::test_support::video_tools_available() {
+        if !video_tools_available() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1032,7 +1069,7 @@ mod repeat_tests {
                 let mut tracker = tracker().with_minimax_sglang_resize(sglang);
                 tracker
                     .push_part(MediaContentPart::VideoUrl {
-                        url: format!("data:video/mp4;base64,{}", STANDARD.encode(&bytes)),
+                        url: format!("data:video/mp4;base64,{}", STANDARD.encode(&bytes)).into(),
                         uuid: None,
                         fps: Some(1.0),
                         max_long_side_pixel: cap,
@@ -1050,12 +1087,7 @@ mod repeat_tests {
                 if !sglang {
                     assert_eq!(
                         clip.hash,
-                        crate::hasher::hash_video_with_sampling(
-                            &bytes,
-                            1.0,
-                            cap,
-                            FrameSampling::default()
-                        )
+                        hash_video_with_sampling(&bytes, 1.0, cap, FrameSampling::default())
                     );
                 }
                 let frame = &clip.rgb_video().unwrap().frames[0];
@@ -1071,7 +1103,7 @@ mod repeat_tests {
 
     fn image_part(max_long_side_pixel: Option<u32>) -> MediaContentPart {
         MediaContentPart::ImageUrl {
-            url: TINY_PNG_URL.to_string(),
+            url: TINY_PNG_URL.to_string().into(),
             detail: None,
             uuid: None,
             max_long_side_pixel,
@@ -1108,7 +1140,7 @@ mod repeat_tests {
             assert_eq!(frame.transparency(), policy);
             assert_eq!(
                 frame.hash,
-                crate::hasher::hash_image_with_transparency(&png, None, policy),
+                hash_image_with_transparency(&png, None, policy),
                 "{policy:?}"
             );
         }
@@ -1119,7 +1151,7 @@ mod repeat_tests {
             panic!("the slot must hold an image");
         };
         assert_eq!(frame.transparency(), TransparencyPolicy::KeepAlpha);
-        assert_eq!(frame.hash, crate::hasher::hash_image(&png));
+        assert_eq!(frame.hash, hash_image(&png));
     }
 
     #[tokio::test]
@@ -1161,9 +1193,13 @@ mod repeat_tests {
     #[test]
     fn a_fetch_is_shared_only_with_the_same_media_and_settings() {
         let mut tracker = tracker();
-        let clip = Arc::new(FetchSource::Url("https://example.test/clip.mp4".into()));
+        let clip = Arc::new(FetchSource::Url(Arc::new(
+            "https://example.test/clip.mp4".to_string(),
+        )));
         // Same length and kind, different bytes: never merged.
-        let other = Arc::new(FetchSource::Url("https://example.test/clop.mp4".into()));
+        let other = Arc::new(FetchSource::Url(Arc::new(
+            "https://example.test/clop.mp4".to_string(),
+        )));
         let one = FetchSettings::video(&VideoFetchConfig::default(), false);
         let two = FetchSettings::video(
             &VideoFetchConfig {
@@ -1250,12 +1286,66 @@ mod repeat_tests {
             .collect()
     }
 
+    /// The media type and base64 text of `TINY_PNG_URL`, the base64 source
+    /// form of the same payload.
+    fn tiny_png_base64() -> (String, Arc<String>) {
+        let (media_type, data) = TINY_PNG_URL
+            .strip_prefix("data:")
+            .and_then(|rest| rest.split_once(";base64,"))
+            .expect("a base64 data url");
+        (media_type.to_string(), Arc::new(data.to_string()))
+    }
+
+    /// A base64 source and the data URL it stands for are one payload to the
+    /// tracker: equal, of one length, kind and digest, so the second of the
+    /// two in a request joins the first's fetch.
+    #[test]
+    fn a_base64_source_is_the_data_url_it_stands_for() {
+        let as_data_url = FetchSource::DataUrl(Arc::new(TINY_PNG_URL.to_string()));
+        let (media_type, data) = tiny_png_base64();
+        let as_base64 = FetchSource::Base64 {
+            media_type: media_type.clone(),
+            data: Arc::clone(&data),
+        };
+        assert_eq!(as_base64, as_data_url);
+        assert_eq!(as_data_url, as_base64);
+        assert_eq!(as_base64.len(), as_data_url.len());
+        assert_eq!(as_base64.kind(), as_data_url.kind());
+        assert_eq!(as_base64.digest(), as_data_url.digest());
+        let other_type = FetchSource::Base64 {
+            media_type: "image/jpeg".to_string(),
+            data,
+        };
+        assert_ne!(
+            other_type, as_data_url,
+            "the media type is part of the payload"
+        );
+        assert_ne!(other_type.digest(), as_data_url.digest());
+
+        let mut tracker = tracker();
+        let first = Arc::new(as_data_url);
+        assert_eq!(
+            tracker.same_media_as(Modality::Image, image_settings(), &first),
+            None
+        );
+        tracker
+            .pending
+            .entry(Modality::Image)
+            .or_default()
+            .push(Slot::SameAs(usize::MAX));
+        assert_eq!(
+            tracker.same_media_as(Modality::Image, image_settings(), &Arc::new(as_base64)),
+            Some(0),
+            "the base64 form joins the data url's fetch"
+        );
+    }
+
     #[test]
     fn a_crowded_bucket_matches_by_digest_past_the_first_few_candidates() {
         let mut tracker = tracker();
         let sources: Vec<Arc<FetchSource>> = same_length_variants(10)
             .into_iter()
-            .map(|url| Arc::new(FetchSource::DataUrl(url)))
+            .map(|url| Arc::new(FetchSource::DataUrl(Arc::new(url))))
             .collect();
         for source in &sources {
             assert_eq!(
@@ -1297,7 +1387,7 @@ mod repeat_tests {
             );
         }
         // A lone payload of another length is neither compared nor hashed.
-        let lone = Arc::new(FetchSource::DataUrl(format!("{TINY_PNG_URL}=")));
+        let lone = Arc::new(FetchSource::DataUrl(Arc::new(format!("{TINY_PNG_URL}="))));
         assert_eq!(
             tracker.same_media_as(Modality::Image, image_settings(), &lone),
             None
@@ -1311,6 +1401,41 @@ mod repeat_tests {
         assert_eq!(Arc::strong_count(&lone), 2);
     }
 
+    /// One image pushed as a data URL and again as a base64 source is one
+    /// fetch: the second part joins the first's slot, and the base64 source
+    /// reports under the data URL kind.
+    #[tokio::test]
+    async fn a_base64_part_joins_the_fetch_of_its_data_url_twin() {
+        let mut tracker = tracker();
+        tracker
+            .push_part(image_part(None))
+            .expect("the data url part");
+        let (media_type, data) = tiny_png_base64();
+        assert_eq!(
+            FetchSourceKind::of(&FetchSource::Base64 {
+                media_type: media_type.clone(),
+                data: Arc::clone(&data),
+            }),
+            FetchSourceKind::DataUrl
+        );
+        tracker
+            .push_part(MediaContentPart::ImageBase64 {
+                media_type,
+                data,
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            })
+            .expect("the base64 part");
+        let slots = tracker.pending.get(&Modality::Image).expect("image slots");
+        assert_eq!(slots.len(), 2);
+        assert!(matches!(slots[0], Slot::Fetch(_)), "the first part fetches");
+        assert!(
+            matches!(slots[1], Slot::SameAs(0)),
+            "the base64 form of the same bytes joins the first fetch"
+        );
+    }
+
     #[tokio::test]
     async fn many_same_length_data_urls_are_fetched_once_each() {
         let mut tracker = tracker();
@@ -1319,7 +1444,7 @@ mod repeat_tests {
             for url in &variants {
                 tracker
                     .push_part(MediaContentPart::ImageUrl {
-                        url: url.clone(),
+                        url: url.clone().into(),
                         detail: None,
                         uuid: None,
                         max_long_side_pixel: None,
@@ -1353,7 +1478,7 @@ mod repeat_tests {
         tracker.push_part(image_part(None)).expect("first part");
         tracker
             .push_part(MediaContentPart::ImageUrl {
-                url: other,
+                url: other.into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
@@ -1368,5 +1493,92 @@ mod repeat_tests {
             .filter(|slot| matches!(slot, Slot::Fetch(_)))
             .count();
         assert_eq!(slots, 2);
+    }
+
+    /// A fetch whose task panics is reported once, as the host's fault with
+    /// no bytes, and the request still fails with the task's join error.
+    #[tokio::test]
+    async fn a_fetch_that_panics_is_reported_as_the_host_fault() {
+        static REPORTS: std::sync::Mutex<Vec<FetchReport>> = std::sync::Mutex::new(Vec::new());
+        fn observe(_: &str, report: &FetchReport) {
+            REPORTS.lock().expect("reports").push(*report);
+        }
+        let mut tracker = tracker().with_fetch_observer(Arc::from("m"), observe);
+        tracker.enqueue(
+            Modality::Audio,
+            None,
+            FetchSettings::Audio,
+            MediaSource::Url("https://example.test/a.wav".to_string().into()),
+            |_, _| {
+                std::future::poll_fn(|_| -> std::task::Poll<MultiModalResult<TrackedMedia>> {
+                    panic!("a fetch that dies")
+                })
+            },
+        );
+        let error = tracker
+            .finalize()
+            .await
+            .expect_err("the dead fetch fails the request");
+        assert!(
+            matches!(&error, MultiModalError::Join(join) if join.is_panic()),
+            "{error:?}"
+        );
+        let reports = REPORTS.lock().expect("reports").clone();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].outcome, FetchOutcome::HostFault);
+        assert_eq!(reports[0].bytes, 0);
+        assert_eq!(reports[0].modality, Modality::Audio);
+    }
+
+    #[test]
+    fn a_base64_source_with_a_comma_in_its_type_is_no_data_url_twin() {
+        let (_, data) = tiny_png_base64();
+        let comma = FetchSource::Base64 {
+            media_type: "image/png,x".to_string(),
+            data: Arc::clone(&data),
+        };
+        let same_text = FetchSource::DataUrl(Arc::new(format!("data:image/png,x;base64,{data}")));
+        assert_ne!(comma, same_text);
+        assert_ne!(same_text, comma);
+    }
+
+    #[test]
+    fn a_comma_typed_base64_source_never_joins_its_text_twin() {
+        // Four distinct data URLs fill the bucket's compare window, the fifth
+        // (the twin text) is kept by digest alone; the comma-typed base64
+        // source has a kind of its own and never reaches that bucket.
+        let mut tracker = tracker();
+        let data = "A".repeat(16);
+        let text = |payload: &str| {
+            Arc::new(FetchSource::DataUrl(Arc::new(format!(
+                "data:image/png,x;base64,{payload}"
+            ))))
+        };
+        for payload in ["B", "C", "D", "E"] {
+            let filler = text(&payload.repeat(16));
+            assert_eq!(
+                tracker.same_media_as(Modality::Image, image_settings(), &filler),
+                None
+            );
+        }
+        let twin = text(&data);
+        assert_eq!(
+            tracker.same_media_as(Modality::Image, image_settings(), &twin),
+            None
+        );
+        let comma = Arc::new(FetchSource::Base64 {
+            media_type: "image/png,x".to_string(),
+            data: Arc::new(data),
+        });
+        assert_ne!(comma.kind(), twin.kind());
+        assert_eq!(
+            tracker.same_media_as(Modality::Image, image_settings(), &comma),
+            None,
+            "the comma-typed source took the twin's slot"
+        );
+        assert_eq!(
+            tracker.same_media_as(Modality::Image, image_settings(), &comma),
+            Some(0)
+        );
     }
 }

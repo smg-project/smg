@@ -1,7 +1,9 @@
 //! The policy controller's two wire contracts, compiled and parsed at test
 //! time (`contracts/README.md`): the gRPC protocol in package `smg.policy.v1`
-//! and the WebAssembly world `smg:policy@1.0.0`. No code is generated and
-//! nothing at run time reads the files. The tests hold four things: the
+//! and the WebAssembly world `smg:policy@1.0.0`. Nothing at run time reads
+//! the files; the world's `types` interface is rendered from the crate's
+//! types by the `wit` module and held to the committed file by `tests/wit.rs`.
+//! The tests here hold four things: the
 //! files compile; the view, decision and lifecycle messages and records
 //! mirror this crate's types field for field, in the crate's order; the
 //! versioned names a plugin author builds against (the package, the RPCs and
@@ -23,9 +25,10 @@ use prost_types::{
     DescriptorProto, FileDescriptorProto, FileDescriptorSet, ServiceDescriptorProto,
 };
 use smg_policy_controller::{
-    Candidate, Constraints, HashKind, Health, Lease, LeaseKind, LoadRow, MediaCounts, Membership,
-    Outcome, OverloadRegime, Pair, Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role,
-    Shed, ShedReason, Side, Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    fingerprint, spec::DENIED_HEADERS, AffinityFacts, Candidate, Constraints, HashKind, Health,
+    Identity, Lease, LeaseKind, LoadRow, MediaCounts, Membership, Outcome, OverloadRegime, Pair,
+    Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason, Side, Signal,
+    SignalSource, Target, Trace, TransportClass, ZoneCapacity,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -38,18 +41,43 @@ const WIT_NAMESPACE: &str = "smg";
 const WIT_PACKAGE: &str = "policy";
 const WIT_VERSION: &str = "1.0.0";
 
+/// The header deny-list of design section 4.6: the names no view may read
+/// and no routing-key override may key on, lowercase, in this order, each
+/// once. A name added or moved here is a contract change.
+const DENIED_HEADER_NAMES: [&str; 7] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
+
+#[test]
+fn the_header_deny_list_holds_its_seven_names() {
+    assert_eq!(DENIED_HEADERS, DENIED_HEADER_NAMES, "the deny-list moved");
+    for name in DENIED_HEADERS {
+        assert_eq!(name, name.to_ascii_lowercase(), "{name} is not lowercase");
+    }
+}
+
 /// A record's field names in declaration order. The pattern names every
 /// field without `..`, so the crate's type cannot gain, lose or rename one
 /// without this file failing to compile: the wire tables below cannot drift
-/// from the record silently.
+/// from the record silently. A field written `name as "spelled"` is listed
+/// under the name the contracts spell, the pattern still naming the
+/// struct's own: a pair, both sides checked.
 macro_rules! record {
-    ($ty:ty, $name:ident { $($field:ident),+ $(,)? }) => {{
+    (@spelled $field:ident) => { stringify!($field) };
+    (@spelled $field:ident $spelled:literal) => { $spelled };
+    ($ty:ty, $name:ident { $($field:ident $(as $spelled:literal)?),+ $(,)? }) => {{
         // Never called: its pattern is the exhaustiveness proof.
         fn exhaustive(value: $ty) {
             let $name { $($field: _),+ } = value;
         }
         let _: fn($ty) = exhaustive;
-        &[$(stringify!($field)),+][..]
+        &[$(record!(@spelled $field $($spelled)?)),+][..]
     }};
 }
 
@@ -81,20 +109,34 @@ fn candidate_record() -> &'static [&'static str] {
             in_flight,
             load,
             load_sampled_at_micros,
-            overlap_blocks,
-            predicted_blocks,
             session_hit,
             session_in_flight,
             pair_class,
             has_capacity,
             has_room,
-            admitted_age_ms,
-            indexed_growth,
             zone,
             labels,
             ec_compatible,
             vision,
             host_local,
+            active_sessions,
+            key,
+        }
+    )
+}
+
+/// A candidate's affinity facts: a column beside the rows in the crate, five
+/// fields of the candidate's own record on both wires, at the numbers they
+/// were given as fields of the row.
+fn affinity_record() -> &'static [&'static str] {
+    record!(
+        AffinityFacts,
+        AffinityFacts {
+            overlap_blocks,
+            predicted_blocks,
+            admitted_age_ms,
+            indexed_growth,
+            indexed_blocks,
         }
     )
 }
@@ -120,7 +162,11 @@ fn request_record() -> &'static [&'static str] {
             headers,
             media,
             seed,
+            block_size,
             now_micros,
+            affinity,
+            named,
+            model_fingerprint,
         }
     )
 }
@@ -136,6 +182,7 @@ fn load_row_record() -> &'static [&'static str] {
             active_kv_permille,
             live_rate,
             resident_tokens,
+            resident_counted,
             report_age_ms,
             source,
             max_running,
@@ -165,6 +212,7 @@ fn pool_record() -> &'static [&'static str] {
             regime,
             generation,
             zones,
+            reach,
         }
     )
 }
@@ -266,6 +314,9 @@ fn trace_record() -> &'static [&'static str] {
     )
 }
 
+/// The lease's session crosses under the name both contracts still spell,
+/// `session_key`: the change that first reads a lease from the wire renames
+/// the field in both and takes this pair out.
 fn lease_record() -> &'static [&'static str] {
     record!(
         Lease,
@@ -275,7 +326,8 @@ fn lease_record() -> &'static [&'static str] {
             side,
             target_index,
             generation,
-            session_key,
+            session as "session_key",
+            session_verdict,
             issued_micros,
             tokens,
         }
@@ -423,6 +475,8 @@ fn enum_mirrors() -> Vec<(
                     LateDecision,
                     ClientGone,
                     CommitFailed,
+                    Expired,
+                    WorkerRemoved,
                 }
             ),
         ),
@@ -480,11 +534,13 @@ struct ProtoMirror {
     record: &'static [&'static str],
     /// Record fields the wire does not carry: a host instant, a host-local
     /// position, the in-process length of a fixed array, the trace the wire
-    /// hoists into `Decision`.
+    /// hoists into `Decision`, whether a report counts resident tokens, a
+    /// fingerprint the host carries of a name the wire carries.
     host_only: &'static [&'static str],
-    /// Wire fields outside the record: an event's key before it, controller
-    /// facts, a wire-only input and the observability record's fields after
-    /// it.
+    /// Wire fields outside the record, in the wire's order: an event's key
+    /// before it, controller facts, a wire-only input, the observability
+    /// record's fields after it, and the fields of a record the crate keeps
+    /// beside this one (a candidate's affinity facts).
     wire_only: &'static [&'static str],
     /// Every wire field in number order with its scalar kind.
     wire: &'static [(&'static str, Type)],
@@ -500,7 +556,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "LoadRow",
             record: load_row_record(),
-            host_only: &[],
+            host_only: &["resident_counted"],
             wire_only: &[],
             wire: &[
                 ("running", Type::Uint32),
@@ -535,7 +591,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
             message: "Candidate",
             record: candidate_record(),
             host_only: &["position", "load_sampled_at_micros"],
-            wire_only: &[],
+            wire_only: affinity_record(),
             wire: &[
                 ("id", Type::Fixed64),
                 ("role", Type::Enum),
@@ -561,6 +617,9 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("ec_compatible", Type::Bool),
                 ("vision", Type::Bool),
                 ("host_local", Type::Bool),
+                ("active_sessions", Type::Uint32),
+                ("key", Type::Uint32),
+                ("indexed_blocks", Type::Uint32),
             ],
             repeated: &[],
             optional: &[],
@@ -568,7 +627,9 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "RequestFacts",
             record: request_record(),
-            host_only: &["now_micros"],
+            // The affinity column rides the request in the crate; the wire
+            // carries each entry in its candidate.
+            host_only: &["now_micros", "affinity", "named", "model_fingerprint"],
             wire_only: &["prompt_text"],
             wire: &[
                 ("model", Type::String),
@@ -589,6 +650,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("media", Type::Message),
                 ("seed", Type::Fixed64),
                 ("prompt_text", Type::Bytes),
+                ("block_size", Type::Uint32),
             ],
             repeated: &["block_hashes", "tried", "headers"],
             optional: &[],
@@ -610,7 +672,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &[],
+            host_only: &["reach"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -695,6 +757,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 "shadow_pick",
                 "fallback",
                 "affinity_source",
+                // The record reads it from its count ([`Trace::drew_first`]).
+                "drew_first",
             ],
             wire: &[
                 ("profile", Type::Uint32),
@@ -708,14 +772,15 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("shadow_pick", Type::Fixed64),
                 ("fallback", Type::Bool),
                 ("affinity_source", Type::Enum),
+                ("drew_first", Type::Bool),
             ],
             repeated: &["top", "drops"],
-            optional: &[],
+            optional: &["survivors"],
         },
         ProtoMirror {
             message: "Lease",
             record: lease_record(),
-            host_only: &["issued_micros"],
+            host_only: &["session_verdict", "issued_micros"],
             wire_only: &["term", "dispatch_ttl_ms", "origin"],
             wire: &[
                 ("id", Type::Fixed64),
@@ -761,6 +826,10 @@ struct WitMirror {
     host_only: &'static [&'static str],
     /// Fields the WIT record carries before the crate's (an event's lease).
     before: &'static [&'static str],
+    /// The fields of a record the crate keeps beside this one and the WIT
+    /// record carries inside it, in that record's order (a candidate's
+    /// affinity facts).
+    beside: &'static [&'static str],
 }
 
 fn wit_mirrors() -> Vec<WitMirror> {
@@ -768,62 +837,72 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "load",
             crate_record: load_row_record(),
-            host_only: &[],
+            host_only: &["resident_counted"],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "candidate",
             crate_record: candidate_record(),
             host_only: &["position", "load_sampled_at_micros"],
             before: &[],
+            beside: affinity_record(),
         },
         WitMirror {
             record: "media",
             crate_record: media_record(),
             host_only: &[],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "request",
             crate_record: request_record(),
-            host_only: &["now_micros"],
+            host_only: &["now_micros", "affinity", "named", "model_fingerprint"],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "zone-capacity",
             crate_record: zone_record(),
             host_only: &[],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &[],
+            host_only: &["reach"],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "lease",
             crate_record: lease_record(),
-            host_only: &["issued_micros"],
+            host_only: &["session_verdict", "issued_micros"],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "pair",
             crate_record: pair_record(),
             host_only: &["decode_position"],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "target",
             crate_record: target_record(),
             host_only: &["position"],
             before: &[],
+            beside: &[],
         },
         WitMirror {
             record: "completed",
             crate_record: outcome_record(),
             host_only: &[],
             before: &["lease"],
+            beside: &[],
         },
     ]
 }
@@ -1319,6 +1398,18 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
             table, record,
             "{message_name}: the wire table is not the crate's record"
         );
+        // The wire's own fields are in the table, in the order listed: a
+        // record the wire carries inside this one keeps its field order.
+        let outside: Vec<&str> = mirror
+            .wire
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| mirror.wire_only.contains(name))
+            .collect();
+        assert_eq!(
+            outside, mirror.wire_only,
+            "{message_name}: the wire's own fields are not in the table in their order"
+        );
         // The compiled message is the wire table, numbered 1..=n in order.
         let compiled = message(plugin, message_name)
             .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
@@ -1400,7 +1491,16 @@ fn the_wasm_world_resolves_and_mirrors_the_engine_record() {
         let found = world
             .record_fields(record_name)
             .unwrap_or_else(|| panic!("record {record_name} is missing from types"));
+        // The fields of a record the crate keeps beside this one are in the
+        // world's record in their own order; the rest is the crate's record.
+        let beside: Vec<String> = mirror.beside.iter().map(|name| kebab_field(name)).collect();
+        let (inside, found): (Vec<String>, Vec<String>) =
+            found.into_iter().partition(|name| beside.contains(name));
         assert_eq!(found, expected, "record {record_name} is not the crate's");
+        assert_eq!(
+            inside, beside,
+            "record {record_name}: the record beside it is not in the world's in its order"
+        );
     }
     assert_eq!(
         world
@@ -1565,11 +1665,148 @@ fn the_versioned_names_a_plugin_author_builds_against_are_pinned() {
     );
 }
 
-/// The packed request block's layout as the world's comment states it: a
-/// 72-byte header, the model bytes, zero bytes to the next multiple of 8,
+/// The resume fields a watcher hands back: `WorkerEvent.seq` is the
+/// replication log position and `term` the term it was written under,
+/// `WatchWorkersRequest` carries both back, and `SnapshotRequired` names the
+/// oldest position the log still holds.
+type ResumeField = (&'static str, i32, Type);
+
+const RESUME_FIELDS: &[(&str, &[ResumeField])] = &[
+    (
+        "WatchWorkersRequest",
+        &[
+            ("models", 1, Type::String),
+            ("resume_seq", 2, Type::Uint64),
+            ("with_needs", 3, Type::Bool),
+            ("resume_term", 4, Type::Uint64),
+        ],
+    ),
+    (
+        "WorkerEvent",
+        &[
+            ("seq", 1, Type::Uint64),
+            ("membership_epoch", 2, Type::Uint64),
+            ("term", 11, Type::Uint64),
+        ],
+    ),
+    ("SnapshotRequired", &[("oldest_seq", 1, Type::Uint64)]),
+];
+
+#[test]
+fn the_watch_workers_resume_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, expected) in RESUME_FIELDS {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a resume field moved");
+    }
+}
+
+/// What a registration states and its answer tells, by name and number: the
+/// prober's settings (one message for the registration and the row), the
+/// row's rank and engine, and the two thresholds a row is judged by.
+const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
+    (
+        "HealthPolicy",
+        &[
+            ("failure_threshold", 1, Type::Uint32),
+            ("success_threshold", 2, Type::Uint32),
+            ("check_interval_ms", 3, Type::Uint32),
+            ("timeout_ms", 4, Type::Uint32),
+            ("disabled", 5, Type::Bool),
+        ],
+    ),
+    (
+        "OverloadThresholds",
+        &[
+            ("queue_limit", 1, Type::Uint32),
+            ("kv_usage_permille", 2, Type::Uint32),
+        ],
+    ),
+    (
+        "WorkerRow",
+        &[
+            ("dp_rank", 23, Type::Uint32),
+            ("engine", 24, Type::String),
+            ("health_policy", 25, Type::Message),
+        ],
+    ),
+    ("WorkerSpec", &[("health_policy", 14, Type::Message)]),
+];
+
+#[test]
+fn the_membership_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, expected) in MEMBERSHIP_FIELDS {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        // The two small messages are pinned whole, the two rows by the
+        // fields named here.
+        let whole = matches!(*message_name, "HealthPolicy" | "OverloadThresholds");
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                whole
+                    || expected
+                        .iter()
+                        .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a membership field moved");
+    }
+
+    // The two thresholds no judge read left the message: their numbers and
+    // names stay reserved, so a reader brings one back under a new number.
+    let overload = message(controller, "OverloadThresholds")
+        .expect("OverloadThresholds is in the controller file");
+    let reserved: Vec<i32> = overload
+        .reserved_range
+        .iter()
+        .flat_map(|range| range.start()..range.end())
+        .collect();
+    assert_eq!(reserved, [3, 4], "the reserved numbers");
+    assert_eq!(
+        overload.reserved_name,
+        strings(&["in_flight_limit", "waiting_tokens_limit"])
+    );
+
+    // A status keeps its number; the failed one is the last.
+    assert_eq!(
+        enum_values(controller, "WorkerStatus"),
+        Some(proto_enum(
+            "WORKER_STATUS",
+            &["Pending", "Ready", "NotReady", "Draining", "Failed"]
+        ))
+    );
+}
+
+/// The packed request block's layout as the world's comment states it: an
+/// 80-byte header, the model bytes, zero bytes to the next multiple of 8,
 /// then the u64 sections. The arithmetic is mirrored here so the alignment
 /// rule is pinned beside the sentence that states it.
-const PACKED_REQUEST_HEADER: usize = 72;
+const PACKED_REQUEST_HEADER: usize = 80;
 
 fn packed_hashes_offset(model_len: usize) -> usize {
     (PACKED_REQUEST_HEADER + model_len).div_ceil(8) * 8
@@ -1577,7 +1814,7 @@ fn packed_hashes_offset(model_len: usize) -> usize {
 
 #[test]
 fn the_packed_request_block_keeps_its_u64_sections_aligned() {
-    assert_eq!(packed_hashes_offset(12), 88, "a 12-byte model name");
+    assert_eq!(packed_hashes_offset(12), 96, "a 12-byte model name");
     for model_len in 0..=255usize {
         let hashes = packed_hashes_offset(model_len);
         assert_eq!(hashes % 8, 0, "block hashes at a {model_len}-byte name");
@@ -1591,14 +1828,301 @@ fn the_packed_request_block_keeps_its_u64_sections_aligned() {
     let wit =
         std::fs::read_to_string(contracts_dir().join(WORLD_WIT)).expect("the world file reads");
     for sentence in [
-        "Request block: a 72-byte header",
+        "Request block: an 80-byte header",
         "zero bytes to the next multiple of 8",
-        "puts the hashes at 88",
+        "puts the hashes at 96",
         "returns 8-aligned memory for these lists",
     ] {
         assert!(
             wit.contains(sentence),
             "the world states the alignment rule: {sentence:?}"
         );
+    }
+}
+
+/// The lease-id layout's bounds as `LeaseOrigin` states them: terms below
+/// 2^31 fit the 31 id bits, the per-term counter starts at 1 and never wraps
+/// into the term bits, so a controller-minted id is never 0 and never repeats
+/// across terms. The sentences are pinned beside the layout they bound.
+#[test]
+fn the_lease_id_layout_states_its_bounds() {
+    let proto = std::fs::read_to_string(contracts_dir().join(PLUGIN_PROTO))
+        .expect("the plugin protocol reads");
+    for sentence in [
+        "terms\n// stay below 2^31",
+        "the counter starts at 1",
+        "bumps its term before it mints again",
+        "never 0 and\n// never repeats across terms",
+    ] {
+        assert!(
+            proto.contains(sentence),
+            "LeaseOrigin states the id bounds: {sentence:?}"
+        );
+    }
+}
+
+/// The hello version fields: `PluginHello` offers a range on a Decide stream
+/// and one version (`protocol_min` = `protocol_max`) on an Observe stream;
+/// `PluginHelloAck.protocol` is the version a Decide stream settled, the one
+/// every Observe hello of that instance then names.
+type HelloField = (&'static str, i32, Type);
+
+const HELLO_FIELDS: &[(&str, &[HelloField])] = &[
+    (
+        "PluginHello",
+        &[
+            ("protocol_min", 1, Type::Uint32),
+            ("protocol_max", 2, Type::Uint32),
+        ],
+    ),
+    ("PluginHelloAck", &[("protocol", 1, Type::Uint32)]),
+];
+
+#[test]
+fn the_hello_version_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in HELLO_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "{message_name}: a hello version field moved"
+        );
+    }
+}
+
+/// The decline a plugin answers a stage with: `stage` is Stage bits, `reason`
+/// the enum, `detail` free text; a frame declining a stage and filling that
+/// stage's answer field is invalid.
+type DeclineField = (&'static str, i32, Type);
+
+const DECLINE_FIELDS: &[(&str, &[DeclineField])] = &[(
+    "Decline",
+    &[
+        ("stage", 1, Type::Uint32),
+        ("reason", 2, Type::Enum),
+        ("detail", 3, Type::String),
+    ],
+)];
+
+#[test]
+fn the_decline_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in DECLINE_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a decline field moved");
+    }
+}
+
+/// Every lease end names exactly one lifecycle event: a completion, or a
+/// release with its reason. An end with no event is the leak a stateful plugin
+/// cannot see, so a `LeaseEnd` cause without a row here fails the test.
+const LEASE_END_EVENTS: &[(&str, &str)] = &[
+    ("CAUSE_COMPLETED", "completed"),
+    ("CAUSE_RELEASED", "released(reason)"),
+    ("CAUSE_EXPIRED", "released(REASON_EXPIRED)"),
+    ("CAUSE_WORKER_REMOVED", "released(REASON_WORKER_REMOVED)"),
+];
+
+#[test]
+fn every_lease_end_cause_names_one_lifecycle_event() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    let causes: Vec<String> = enum_values(controller, "LeaseEnd.Cause")
+        .expect("LeaseEnd.Cause is an enum")
+        .into_iter()
+        .filter(|(_, number)| *number != 0)
+        .map(|(name, _)| name)
+        .collect();
+    let mapped: Vec<String> = LEASE_END_EVENTS
+        .iter()
+        .map(|(cause, _)| (*cause).to_owned())
+        .collect();
+    assert_eq!(causes, mapped, "a LeaseEnd cause has no lifecycle event");
+    let reasons: Vec<String> = enum_values(plugin, "Released.Reason")
+        .expect("Released.Reason is an enum")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for (cause, event) in LEASE_END_EVENTS {
+        if let Some(reason) = event
+            .strip_prefix("released(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .filter(|reason| reason.starts_with("REASON_"))
+        {
+            assert!(
+                reasons.iter().any(|r| r == reason),
+                "{cause}: {reason} is not a Released.Reason"
+            );
+        }
+    }
+}
+
+/// The decide frame's budget beside the request's: `PluginDecide.budget_micros`
+/// is the plugin's own deadline, clamped to at most `request.budget_micros`.
+type DecideField = (&'static str, i32, Type);
+
+const DECIDE_FIELDS: &[(&str, &[DecideField])] = &[
+    (
+        "PluginDecide",
+        &[
+            ("stages", 5, Type::Uint32),
+            ("budget_micros", 7, Type::Uint32),
+        ],
+    ),
+    ("RequestFacts", &[("budget_micros", 14, Type::Uint32)]),
+];
+
+#[test]
+fn the_decide_budget_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let plugin = file(&set, PLUGIN_PROTO).expect("the plugin file is in the descriptor set");
+    for (message_name, expected) in DECIDE_FIELDS {
+        let compiled = message(plugin, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {PLUGIN_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a budget field moved");
+    }
+}
+
+/// The replication rejoin: `ReplicaHello` names its last applied position and
+/// the term it was written under, every batch names the write term of its
+/// events, a snapshot names the write term of the position it is consistent
+/// with. The pin holds names, numbers and types; the mismatch answer is the
+/// conformance suite's to check.
+type ReplicaField = (&'static str, i32, Type);
+
+const REPLICA_FIELDS: &[(&str, &[ReplicaField])] = &[
+    (
+        "ReplicaHello",
+        &[
+            ("replica_id", 1, Type::String),
+            ("last_applied_seq", 2, Type::Uint64),
+            ("term_seen", 3, Type::Uint64),
+            ("max_backlog", 4, Type::Uint32),
+            ("last_applied_term", 5, Type::Uint64),
+        ],
+    ),
+    (
+        "ReplicationBatch",
+        &[
+            ("first_seq", 1, Type::Uint64),
+            ("term", 2, Type::Uint64),
+            ("events", 3, Type::Message),
+            ("resync_required", 4, Type::Bool),
+        ],
+    ),
+    (
+        "Snapshot",
+        &[
+            ("term", 1, Type::Uint64),
+            ("replication_seq", 15, Type::Uint64),
+            ("replication_term", 18, Type::Uint64),
+        ],
+    ),
+];
+
+#[test]
+fn the_replica_rejoin_fields_are_pinned() {
+    let set = compile_protocol().expect("protoc compiles the two protocol files");
+    let controller =
+        file(&set, CONTROLLER_PROTO).expect("the controller file is in the descriptor set");
+    for (message_name, expected) in REPLICA_FIELDS {
+        let compiled = message(controller, message_name)
+            .unwrap_or_else(|| panic!("{message_name} is missing from {CONTROLLER_PROTO}"));
+        let found: Vec<(String, i32, Type)> = fields(compiled)
+            .into_iter()
+            .filter(|(name, _, _, _, _)| {
+                expected
+                    .iter()
+                    .any(|(pinned, _, _)| *pinned == name.as_str())
+            })
+            .map(|(name, number, kind, _, _)| (name, number, kind))
+            .collect();
+        let expected: Vec<(String, i32, Type)> = expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect();
+        assert_eq!(found, expected, "{message_name}: a rejoin field moved");
+    }
+}
+
+/// The session's value is stated once, beside `Identity` in the plugin
+/// protocol, with a worked example: its numbers are what this crate makes,
+/// so the published formula and the one function cannot part unseen.
+#[test]
+fn the_published_session_example_is_what_the_crate_makes() {
+    let text = std::fs::read_to_string(contracts_dir().join(PLUGIN_PROTO))
+        .expect("the plugin protocol is readable");
+    let mut stated = vec![("the key's fingerprint", fingerprint(b"conversation-7"))];
+    for (name, phase) in [
+        ("single", Phase::Single),
+        ("prefill", Phase::Prefill),
+        ("decode", Phase::Decode),
+        ("encode", Phase::Encode),
+    ] {
+        let session = RequestFacts {
+            model: "model-a",
+            session_key: Identity::plain("conversation-7"),
+            phase,
+            ..RequestFacts::default()
+        }
+        .session();
+        stated.push((name, session.get()));
+    }
+    for (what, value) in stated {
+        let literal = format!("{value:#018x}");
+        assert!(
+            text.contains(&literal),
+            "{PLUGIN_PROTO} does not state {literal} ({what})"
+        );
+    }
+    // The formula's own constants and the example's inputs are in the text.
+    for part in [
+        "0x9e3779b97f4a7c15",
+        "0xbf58476d1ce4e5b9",
+        "0x94d049bb133111eb",
+        "\"conversation-7\"",
+        "\"model-a\"",
+    ] {
+        assert!(text.contains(part), "{PLUGIN_PROTO} does not state {part}");
     }
 }

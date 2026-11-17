@@ -31,6 +31,7 @@ use tracing::warn;
 
 use crate::routers::grpc::common::responses::{
     history::hosted_call_result,
+    streaming::OutputItemKind,
     utils::{
         custom_tool_input, custom_tool_names, cut_call, decode_reasoning_content,
         encode_reasoning_content, extract_tools_from_response_tools, function_call_status,
@@ -195,10 +196,10 @@ fn push_item(
                 StringOrContentParts::String(s) => MessageContent::Text(s.clone()),
                 StringOrContentParts::Array(parts) => response_parts_to_message_content(parts)?,
             };
-            push_role_message(messages, role, content);
+            push_role_message(messages, role, content)?;
         }
         ResponseInputOutputItem::Message { role, content, .. } => {
-            push_role_message(messages, role, response_parts_to_message_content(content)?);
+            push_role_message(messages, role, response_parts_to_message_content(content)?)?;
         }
         ResponseInputOutputItem::FunctionToolCall {
             call_id,
@@ -408,11 +409,12 @@ fn chat_tools(
     mcp_chat_tools: Option<&[Tool]>,
 ) -> (Option<Arc<[Tool]>>, Option<ToolChoice>) {
     let tool_choice = req.tool_choice.as_ref().map(|tc| tc.to_chat_tool_choice());
-    let function_tools = extract_tools_from_response_tools(req.tools.as_deref());
+    // Under `none` the request's own tools are withheld, so their schemas are
+    // not copied out of the request at all.
     let function_tools = if matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None))) {
         Vec::new()
     } else {
-        function_tools
+        extract_tools_from_response_tools(req.tools.as_deref())
     };
     let tools = match mcp_chat_tools {
         Some(mcp_chat_tools) => {
@@ -516,7 +518,7 @@ fn response_parts_to_message_content(
             } => {
                 parts.push(ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        url: url.clone(),
+                        url: url.clone().into(),
                         detail: None,
                         max_long_side_pixel: None,
                     },
@@ -538,22 +540,40 @@ fn response_parts_to_message_content(
             }
         }
     }
-    // Plain text stays a string, as it did before parts were carried at all.
-    Ok(match parts.as_slice() {
-        [] => MessageContent::Text(String::new()),
-        [ContentPart::Text { text }] => MessageContent::Text(text.clone()),
-        _ => MessageContent::Parts(parts),
+    // Plain text stays a string, as it did before parts were carried at all;
+    // the one text part moves out of the list instead of being copied again.
+    Ok(match parts.pop() {
+        None => MessageContent::Text(String::new()),
+        Some(ContentPart::Text { text }) if parts.is_empty() => MessageContent::Text(text),
+        Some(last) => {
+            parts.push(last);
+            MessageContent::Parts(parts)
+        }
     })
 }
 
 /// Append a role-tagged input message. A `developer` turn folds into the
 /// leading system message: OpenAI ranks it with `system`, above `user`, and
 /// appended unlabelled it reads as one more conversational turn that the
-/// latest user message is free to override.
-fn push_role_message(messages: &mut Vec<ChatMessage>, role: &str, content: MessageContent) {
+/// latest user message is free to override. The fold carries text only, so a
+/// media part in a developer item is refused here instead of being dropped on
+/// the way: media parts are taken in user messages.
+fn push_role_message(
+    messages: &mut Vec<ChatMessage>,
+    role: &str,
+    content: MessageContent,
+) -> Result<(), ConversionError> {
     if role != "developer" {
         push_chat_message(messages, role_to_chat_message(role, content));
-        return;
+        return Ok(());
+    }
+    if let MessageContent::Parts(parts) = &content {
+        if let Some(part) = parts.iter().find_map(unfoldable_part_name) {
+            return Err(ConversionError::UnsupportedContentPart {
+                part,
+                why: "a developer message folds into the system text, and media parts are taken in user messages",
+            });
+        }
     }
     let text = content.to_simple_string();
     match messages.first_mut() {
@@ -572,6 +592,22 @@ fn push_role_message(messages: &mut Vec<ChatMessage>, role: &str, content: Messa
                 ext: Default::default(),
             },
         ),
+    }
+    Ok(())
+}
+
+/// The name of a part the developer fold would drop (`ContentPart::text` has
+/// no text for it). The Responses conversion produces `image_url` parts from
+/// `input_image` and no other media part, so that is the name a client sees;
+/// the chat kinds this conversion never produces keep their own tag.
+fn unfoldable_part_name(part: &ContentPart) -> Option<&'static str> {
+    match part {
+        ContentPart::Text { .. } | ContentPart::Refusal { .. } => None,
+        ContentPart::ImageUrl { .. } => Some("input_image"),
+        ContentPart::AudioUrl { .. } => Some("audio_url"),
+        ContentPart::InputAudio { .. } => Some("input_audio"),
+        ContentPart::VideoUrl { .. } => Some("video_url"),
+        ContentPart::Unknown(_) => Some("unknown"),
     }
 }
 
@@ -750,8 +786,8 @@ pub(crate) fn chat_to_responses(
     // The assistant message as output items. Reasoning comes first (OpenAI
     // order), so items replayed in emitted order rebuild the same turn.
     let mut output: Vec<ResponseOutputItem> = Vec::new();
-    output.extend(reasoning_output_item(choice, &chat_resp.id, original_req));
-    output.extend(message_output_item(choice, &chat_resp.id));
+    output.extend(reasoning_output_item(choice, original_req));
+    output.extend(message_output_item(choice));
     // The cut-call read comes before the calls become items: a custom tool's
     // item carries no status.
     let cut = cut_call(
@@ -790,14 +826,13 @@ pub(crate) fn chat_to_responses(
 /// reasoned: with the opaque encrypted copy when the request asked for it.
 fn reasoning_output_item(
     choice: &ChatChoice,
-    chat_id: &str,
     original_req: &ResponsesRequest,
 ) -> Option<ResponseOutputItem> {
     let reasoning = choice.message.reasoning_content.as_ref()?;
     if reasoning.is_empty() {
         return None;
     }
-    let id = format!("reasoning_{chat_id}");
+    let id = OutputItemKind::Reasoning.new_id();
     let content = vec![ReasoningText {
         text: reasoning.clone(),
     }];
@@ -821,13 +856,13 @@ fn reasoning_output_item(
 
 /// The assistant's text as a message item, when it said any; a generation
 /// that failed leaves the message in progress.
-fn message_output_item(choice: &ChatChoice, chat_id: &str) -> Option<ResponseOutputItem> {
+fn message_output_item(choice: &ChatChoice) -> Option<ResponseOutputItem> {
     let content = choice.message.content.as_ref()?;
     if content.is_empty() {
         return None;
     }
     Some(ResponseOutputItem::Message {
-        id: format!("msg_{chat_id}"),
+        id: OutputItemKind::Message.new_id(),
         role: "assistant".to_string(),
         content: vec![ResponseContentPart::OutputText {
             text: content.clone(),
@@ -851,10 +886,10 @@ fn push_tool_call_output_items(
     choice: &ChatChoice,
     original_req: &ResponsesRequest,
 ) {
-    let custom_names = custom_tool_names(original_req.tools.as_deref());
     let Some(tool_calls) = &choice.message.tool_calls else {
         return;
     };
+    let custom_names = custom_tool_names(original_req.tools.as_deref());
     for tool_call in tool_calls {
         let (name, namespace) =
             resolve_function_identity(original_req.tools.as_deref(), &tool_call.function.name);
@@ -865,13 +900,13 @@ fn push_tool_call_output_items(
                     tool_call.function.arguments.as_deref().unwrap_or_default(),
                 ),
                 name,
-                id: Some(tool_call.id.clone()),
+                id: Some(OutputItemKind::CustomToolCall.new_id()),
                 namespace,
             });
             continue;
         }
         output.push(ResponseOutputItem::FunctionToolCall {
-            id: Some(tool_call.id.clone()),
+            id: Some(OutputItemKind::FunctionCall.new_id()),
             call_id: tool_call.id.clone(),
             name,
             namespace,
@@ -1033,7 +1068,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plain["output"][0]["type"], "reasoning");
-        assert_eq!(plain["output"][0]["id"], "reasoning_chat_test");
+        assert!(
+            plain["output"][0]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("rs_")),
+            "{plain}"
+        );
         assert_eq!(plain["output"][0]["content"][0]["text"], "because");
         assert!(
             plain["output"][0]["encrypted_content"].is_null(),
@@ -1268,6 +1308,9 @@ mod tests {
             reasoning: Some(ResponseReasoningParam {
                 effort: Some(ReasoningEffort::High),
                 summary: None,
+                mode: None,
+                context: None,
+                generate_summary: None,
             }),
             ..Default::default()
         };
@@ -1292,6 +1335,9 @@ mod tests {
                 reasoning: Some(ResponseReasoningParam {
                     effort: Some(effort),
                     summary: None,
+                    mode: None,
+                    context: None,
+                    generate_summary: None,
                 }),
                 ..Default::default()
             };
@@ -1764,7 +1810,7 @@ mod tests {
                 );
                 assert!(matches!(
                     &parts[1],
-                    ContentPart::ImageUrl { image_url } if image_url.url == "data:image/png;base64,iVBORw0KGgo="
+                    ContentPart::ImageUrl { image_url } if *image_url.url == "data:image/png;base64,iVBORw0KGgo="
                 ));
             }
             other => panic!("the user turn carries parts: {other:?}"),
@@ -1781,6 +1827,81 @@ mod tests {
             "unsupported_content_part"
         );
     }
+
+    /// A `developer` item folds into the leading system message as text, so a
+    /// media part in it has nowhere to go: the conversion refuses the request
+    /// under `unsupported_content_part`, naming the part, instead of folding
+    /// the text and dropping the image (the request used to answer 200 as if
+    /// the part had not been sent). A text-only developer item folds as
+    /// before, in the message form and in the simple-input form.
+    #[test]
+    fn a_media_part_in_a_developer_item_is_refused_not_folded_away() {
+        let developer = |parts: serde_json::Value| serde_json::json!([{"type": "message", "role": "developer", "content": parts}]);
+        let image = responses_to_chat(&items_request(
+            "local-model",
+            developer(serde_json::json!([
+                {"type": "input_text", "text": "Describe what you see."},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ])),
+        ))
+        .expect_err("a developer item's image has no place in the fold");
+        assert_eq!(image.code(), "unsupported_content_part");
+        assert!(image.to_string().contains("\"input_image\""), "{image}");
+        assert!(image.to_string().contains("developer message"), "{image}");
+
+        let simple = responses_to_chat(&items_request(
+            "local-model",
+            serde_json::json!([{"role": "developer", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ]}]),
+        ))
+        .expect_err("a simple developer message is read the same way");
+        assert_eq!(simple.code(), "unsupported_content_part");
+
+        let chat = responses_to_chat(&items_request(
+            "local-model",
+            serde_json::json!([
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Answer in French."}]},
+                {"role": "developer", "content": "Keep it short."},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello"}]}
+            ]),
+        ))
+        .expect("text-only developer items fold");
+        assert_eq!(chat.messages.len(), 2, "{:?}", chat.messages);
+        match &chat.messages[0] {
+            ChatMessage::System {
+                content: MessageContent::Text(text),
+                ..
+            } => assert_eq!(
+                text,
+                "Developer instructions:\nAnswer in French.\n\nDeveloper instructions:\nKeep it short."
+            ),
+            other => panic!("the developer turns fold into the leading system message: {other:?}"),
+        }
+    }
+
+    /// A function output with a part that has no text (an image, a file, a
+    /// refusal) is refused under the chat route's `unsupported_content_part`,
+    /// and the refusal names the part, as the refusal of a message part does;
+    /// it used to answer one fixed message whatever the part was.
+    #[test]
+    fn a_function_output_part_without_text_is_refused_by_name() {
+        let input = serde_json::json!([
+            {"type": "message", "role": "user", "content": "What is in the picture?"},
+            {"type": "function_call", "call_id": "call_1", "name": "take_picture", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": [
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ]}
+        ]);
+        let refused = responses_to_chat(&items_request("local-model", input))
+            .expect_err("an image part in a function output has no text form");
+        assert_eq!(refused.code(), "unsupported_content_part");
+        assert_eq!(
+            refused.to_string(),
+            "Unsupported content part type \"input_image\" in a function output for text-only backends: only text parts are carried as a tool result"
+        );
+    }
+
     #[test]
     fn namespace_chat_response_roundtrips_identity() {
         let request: ResponsesRequest = namespace_test_request();
@@ -1977,6 +2098,8 @@ mod tests {
                 "{finish_reason}"
             );
             assert_eq!(wire["output"][0]["call_id"], "call_c", "{finish_reason}");
+            let id = wire["output"][0]["id"].as_str().unwrap_or_default();
+            assert!(id.starts_with("ctc_"), "{finish_reason}: {wire}");
         }
     }
 
@@ -2023,5 +2146,42 @@ mod tests {
             Some(Vec::new())
         );
         assert_eq!(names(&responses_to_chat(&bare).unwrap()), None);
+    }
+
+    /// The message content of an input item's parts: no part is an empty
+    /// string, one text part is that text, one part of another kind stays a
+    /// one-part list, and several parts stay a list in their order.
+    #[test]
+    fn input_parts_become_text_or_an_ordered_list() {
+        let text = |text: &str| ResponseContentPart::InputText {
+            text: text.to_string(),
+        };
+        let image = ResponseContentPart::InputImage {
+            image_url: Some("https://example.com/a.png".to_string()),
+            file_id: None,
+            detail: None,
+        };
+        assert_eq!(
+            response_parts_to_message_content(&[]).unwrap(),
+            MessageContent::Text(String::new())
+        );
+        assert_eq!(
+            response_parts_to_message_content(&[text("one")]).unwrap(),
+            MessageContent::Text("one".to_string())
+        );
+        let lone_image = response_parts_to_message_content(std::slice::from_ref(&image)).unwrap();
+        assert!(
+            matches!(&lone_image, MessageContent::Parts(parts) if parts.len() == 1 && matches!(parts[0], ContentPart::ImageUrl { .. })),
+            "a lone part of another kind stays a one-part list, got {lone_image:?}"
+        );
+        let several =
+            response_parts_to_message_content(&[text("first"), image, text("last")]).unwrap();
+        let MessageContent::Parts(parts) = several else {
+            panic!("several parts stay a list, got {several:?}");
+        };
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0], ContentPart::Text { text } if text == "first"));
+        assert!(matches!(&parts[1], ContentPart::ImageUrl { .. }));
+        assert!(matches!(&parts[2], ContentPart::Text { text } if text == "last"));
     }
 }

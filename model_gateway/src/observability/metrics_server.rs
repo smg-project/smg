@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use super::metrics::UPKEEP_INTERVAL_SECS;
+use crate::config::bind_socket_addr;
 
 #[derive(Clone)]
 struct MetricsState {
@@ -47,8 +48,7 @@ pub async fn start_metrics_server(
     // The same spellings as `--host` (`::` and `[::]` both bind IPv6), and a
     // bad host is a startup error: a silent fallback to 0.0.0.0 would hide a
     // typo and leave an IPv6-only network without metrics.
-    let addr =
-        crate::config::bind_socket_addr(&host, port).map_err(|e| format!("metrics server: {e}"))?;
+    let addr = bind_socket_addr(&host, port).map_err(|e| format!("metrics server: {e}"))?;
 
     let listener = bind_metrics_listener(addr).await?;
     let bound_addr = listener
@@ -93,6 +93,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;
+    use crate::server::http_client;
 
     #[tokio::test]
     async fn ipv6_host_binds_ipv6_with_or_without_brackets() {
@@ -108,7 +109,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(addr.ip().is_ipv6(), "host {host} bound {addr}");
-            let resp = crate::server::http_client()
+            let resp = http_client()
                 .get(format!("http://{addr}/metrics"))
                 .send()
                 .await
@@ -153,7 +154,7 @@ mod tests {
             .unwrap();
         assert_ne!(addr.port(), 0);
 
-        let resp = crate::server::http_client()
+        let resp = http_client()
             .get(format!("http://{addr}/metrics"))
             .send()
             .await

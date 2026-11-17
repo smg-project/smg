@@ -48,7 +48,13 @@ if ! dpkg -l cuda-keyring 2>/dev/null | grep -q '^ii'; then
 fi
 
 bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
-$RETRY 3 10 sudo apt-get update
+# A partial refresh can otherwise succeed while leaving Ubuntu packages unavailable.
+# Refresh all sources because the install needs both Ubuntu and NVIDIA packages.
+if ! sudo apt-get -o APT::Update::Error-Mode=any update; then
+    $RETRY 2 10 bash -c '
+        bash "$1" --reprobe && sudo apt-get -o APT::Update::Error-Mode=any update
+    ' _ "${SCRIPT_DIR}/ci_apt_mirror.sh"
+fi
 # Runtime deps: wheel links against CUDA 13 + TensorRT libs
 $RETRY 3 10 sudo apt-get install -y libopenmpi-dev libnvinfer10 cuda-toolkit-13-0
 

@@ -1,0 +1,203 @@
+name: PR Policy Controller Image
+
+# The controller image's own check on a pull request that touches its
+# Dockerfile, the crate's manifest, build script, source or contracts, the
+# engine wire's messages the protocol imports, the toolchain pin, or what the
+# Helm chart's controller cases read: the image builds, and the built
+# image runs: the version, the help, then the controller started in a container
+# under the security context the Helm chart gives it, its probes read, a
+# clean stop and a log with no escape byte. The chart's controller cases then
+# run on the binary copied out of the image: every argument the chart renders
+# is parsed by the binary the image ships. The example controller's image
+# (examples/policy-controller) is then built by the same file, as its guide
+# builds it, and started: its log names the scorer the example adds. Nothing
+# is pushed and no cache is saved.
+on:
+  pull_request:
+    paths:
+      - 'docker/policy-controller.Dockerfile'
+      - 'crates/policy_controller/Cargo.toml'
+      - 'crates/policy_controller/build.rs'
+      - 'crates/policy_controller/src/**'
+      # The index crate the binary links.
+      - 'crates/kv_index/**'
+      # The contracts: the binary's protocol and plugin bindings are compiled
+      # from them, the protocol's with the engine wire's messages it imports.
+      - 'crates/policy_controller/contracts/**'
+      - 'crates/grpc_client/proto/common.proto'
+      - 'rust-toolchain.toml'
+      # The example controller, whose image the last steps build.
+      - 'examples/policy-controller/**'
+      # What the chart's controller cases read: the cases, what configures
+      # their run and what a render reads. The chart's alert rule tests are
+      # read by no case and start nothing here. Its README is read by one
+      # render case and by no case on the binary: the unit job runs that one.
+      - 'bindings/python/tests/test_helm_chart_policy_controller.py'
+      - 'bindings/python/tests/conftest.py'
+      - 'bindings/python/pyproject.toml'
+      - 'deploy/helm/smg/.helmignore'
+      - 'deploy/helm/smg/Chart.yaml'
+      - 'deploy/helm/smg/values.yaml'
+      - 'deploy/helm/smg/values.schema.json'
+      - 'deploy/helm/smg/templates/**'
+      - 'deploy/helm/smg/examples/**'
+      - '.github/workflows/pr-policy-controller-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-policy-controller-image-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Build the controller image and run it
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      IMAGE: smg-policy-controller:pr
+      EXAMPLE_IMAGE: policy-controller-example:pr
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build the image
+        run: docker build --progress plain --file docker/policy-controller.Dockerfile --tag "$IMAGE" .
+
+      - name: Read the version and the help
+        run: |
+          docker run --rm "$IMAGE" --version
+          docker run --rm "$IMAGE" --help
+
+      # The container runs under the security context the chart gives the
+      # controller (deploy/helm/smg/values.yaml): a read-only root
+      # filesystem, no capability, no privilege escalation, UID 65532. The
+      # controller's id is the container's host name, as under Kubernetes.
+      - name: Start the controller, read its probes and stop it
+        run: |
+          docker run --detach --name controller \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --publish 127.0.0.1:30103:30103 "$IMAGE"
+          # The admin listener answers within a second of the start. A
+          # controller that refused to start has exited: the wait ends at
+          # once and the reads below fail the step.
+          for _ in $(seq 1 30); do
+            if curl -fs --max-time 2 -o /dev/null http://127.0.0.1:30103/liveness; then
+              break
+            fi
+            [ "$(docker inspect --format '{{.State.Running}}' controller)" = "true" ] || break
+            sleep 1
+          done
+          for path in liveness readiness version; do
+            curl -fsS --max-time 5 "http://127.0.0.1:30103/${path}"
+            echo
+          done
+          user="$(docker exec controller id -u)"
+          if [ "$user" != "65532" ]; then
+            echo "::error::the controller runs as UID ${user}, not 65532"
+            exit 1
+          fi
+          # SIGTERM drains: readiness fails, the settle window passes, the
+          # listeners close and the process exits 0.
+          docker stop -t 60 controller
+          code="$(docker inspect --format '{{.State.ExitCode}}' controller)"
+          if [ "$code" != "0" ]; then
+            echo "::error::the controller exited ${code} after SIGTERM"
+            exit 1
+          fi
+          # The container has no terminal, so its log is plain text. An
+          # empty log would pass that read for the wrong reason.
+          docker logs controller > "${RUNNER_TEMP}/controller.log" 2>&1
+          if [ ! -s "${RUNNER_TEMP}/controller.log" ]; then
+            echo "::error::the controller wrote no log"
+            exit 1
+          fi
+          if grep -q $'\033' "${RUNNER_TEMP}/controller.log"; then
+            echo "::error::the controller's log carries escape bytes with no terminal"
+            exit 1
+          fi
+
+      # The chart's controller cases take every argument the chart's
+      # Deployment renders and have the image's own binary parse it and start
+      # on it. The binary comes out of a container that is created and never
+      # started.
+      - name: Copy the binary out of the image
+        run: |
+          docker create --name binary "$IMAGE"
+          docker cp binary:/usr/local/bin/smg-policy-controller "${RUNNER_TEMP}/smg-policy-controller"
+          docker rm binary
+          "${RUNNER_TEMP}/smg-policy-controller" --version
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.17.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # This job has helm and the binary, so a skipped case is a case that
+      # did not run: it fails the step.
+      - name: Run the chart's controller cases on the image's binary
+        env:
+          SMG_POLICY_CONTROLLER_BIN: ${{ runner.temp }}/smg-policy-controller
+        run: |
+          set -o pipefail
+          python3 -m pip install pytest pyyaml
+          python3 -m pytest -q -rs bindings/python/tests/test_helm_chart_policy_controller.py \
+            | tee "${RUNNER_TEMP}/chart-cases.txt"
+          if grep -q "skipped" "${RUNNER_TEMP}/chart-cases.txt"; then
+            echo "::error::a chart case was skipped in the job that has helm and the binary"
+            exit 1
+          fi
+
+      # The example controller's image, by its guide's own line: the same
+      # file with PACKAGE naming the example's package. The layers up to the
+      # source are the stock build's, and the example is compiled. It starts
+      # under the same security context, and its start-up line names the
+      # scorer the example adds, which the stock binary does not hold.
+      - name: Build the example controller's image
+        run: >-
+          docker build --progress plain --file docker/policy-controller.Dockerfile
+          --build-arg PACKAGE=policy-controller-example --tag "$EXAMPLE_IMAGE" .
+
+      - name: Start the example controller, read its stages and stop it
+        run: |
+          docker run --detach --name example \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --publish 127.0.0.1:30113:30103 "$EXAMPLE_IMAGE"
+          for _ in $(seq 1 30); do
+            if curl -fs --max-time 2 -o /dev/null http://127.0.0.1:30113/liveness; then
+              break
+            fi
+            [ "$(docker inspect --format '{{.State.Running}}' example)" = "true" ] || break
+            sleep 1
+          done
+          for path in liveness readiness; do
+            curl -fsS --max-time 5 "http://127.0.0.1:30113/${path}"
+            echo
+          done
+          docker stop -t 60 example
+          code="$(docker inspect --format '{{.State.ExitCode}}' example)"
+          if [ "$code" != "0" ]; then
+            echo "::error::the example controller exited ${code} after SIGTERM"
+            exit 1
+          fi
+          docker logs example > "${RUNNER_TEMP}/example.log" 2>&1
+          if ! grep -q 'stages held.*"pack"' "${RUNNER_TEMP}/example.log"; then
+            echo "::error::the example controller's start-up line names no pack scorer"
+            exit 1
+          fi
+
+      - name: The controller's log
+        if: always()
+        run: docker logs controller || true
+
+      - name: The example controller's log
+        if: always()
+        run: docker logs example || true

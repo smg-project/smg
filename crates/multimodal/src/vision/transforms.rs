@@ -22,13 +22,15 @@ pub type Result<T> = std::result::Result<T, TransformError>;
 
 /// Extract RGB pixel data from a DynamicImage, avoiding a copy when already RGB8.
 /// Returns (width, height, raw_bytes) where raw_bytes is interleaved R,G,B,R,G,B,...
+/// and exactly `3 * width * height` long: an RGB8 image's container may be
+/// longer than its pixels (`ImageBuffer::from_raw` takes any that is long
+/// enough), and the bytes behind them are not the image.
 pub fn rgb_bytes(image: &DynamicImage) -> (usize, usize, std::borrow::Cow<'_, [u8]>) {
     match image {
-        DynamicImage::ImageRgb8(rgb) => (
-            rgb.width() as usize,
-            rgb.height() as usize,
-            std::borrow::Cow::Borrowed(rgb.as_raw()),
-        ),
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+            (w, h, std::borrow::Cow::Borrowed(&rgb.as_raw()[..3 * w * h]))
+        }
         _ => {
             let rgb = image.to_rgb8();
             let w = rgb.width() as usize;
@@ -340,66 +342,34 @@ fn build_planar_tensor_by_table(
 /// the canvas is cropped at its right and bottom edges.
 pub fn paint_rgb_onto_planes(
     rgb: &[u8],
-    image: (usize, usize),
-    canvas: (usize, usize),
+    (image_w, image_h): (usize, usize),
+    (canvas_w, canvas_h): (usize, usize),
     scale: [f32; 3],
     bias: [f32; 3],
     planes: &mut [f32],
 ) {
-    paint_rows(rgb, image, canvas, bias, planes, |row, r, g, b| {
-        deinterleave_rgb_to_planes(row, r, g, b, scale, bias);
-    });
-}
-
-/// [`paint_rgb_onto_planes`] through a per-channel table: every painted byte
-/// maps through `table[c][byte]` and the canvas outside the image holds
-/// `table[c][0]`, what a zero byte of padding maps to under the same
-/// arithmetic.
-pub(crate) fn paint_rgb_onto_planes_by_table(
-    rgb: &[u8],
-    image: (usize, usize),
-    canvas: (usize, usize),
-    table: &[[f32; 256]; 3],
-    planes: &mut [f32],
-) {
-    let black = [table[0][0], table[1][0], table[2][0]];
-    paint_rows(rgb, image, canvas, black, planes, |row, r, g, b| {
-        deinterleave_rgb_to_planes_by_table(row, r, g, b, table);
-    });
-}
-
-/// The canvas fill and the row walk of the paints: `black` fills the canvas,
-/// then `paint_row` maps each image row's bytes onto its three plane slices.
-fn paint_rows<K>(
-    rgb: &[u8],
-    (image_w, image_h): (usize, usize),
-    (canvas_w, canvas_h): (usize, usize),
-    black: [f32; 3],
-    planes: &mut [f32],
-    paint_row: K,
-) where
-    K: Fn(&[u8], &mut [f32], &mut [f32], &mut [f32]),
-{
     let canvas_pixels = canvas_w * canvas_h;
     debug_assert_eq!(planes.len(), 3 * canvas_pixels);
     debug_assert!(rgb.len() >= image_w * image_h * 3);
     let (r_plane, rest) = planes.split_at_mut(canvas_pixels);
     let (g_plane, b_plane) = rest.split_at_mut(canvas_pixels);
 
-    r_plane.fill(black[0]);
-    g_plane.fill(black[1]);
-    b_plane.fill(black[2]);
+    r_plane.fill(bias[0]);
+    g_plane.fill(bias[1]);
+    b_plane.fill(bias[2]);
 
     let painted_w = image_w.min(canvas_w);
     let painted_h = image_h.min(canvas_h);
     for y in 0..painted_h {
         let src_row = &rgb[y * image_w * 3..(y * image_w + painted_w) * 3];
         let dst = y * canvas_w;
-        paint_row(
+        deinterleave_rgb_to_planes(
             src_row,
             &mut r_plane[dst..dst + painted_w],
             &mut g_plane[dst..dst + painted_w],
             &mut b_plane[dst..dst + painted_w],
+            scale,
+            bias,
         );
     }
 }
@@ -553,7 +523,7 @@ fn to_fir_algorithm(filter: FilterType) -> ResizeAlg {
     clippy::slow_vector_initialization,
     reason = "the zero-filled `vec!` is the calloc this helper exists to avoid; see its doc comment"
 )]
-fn plain_buffer(len: usize) -> Vec<u8> {
+pub(crate) fn plain_buffer(len: usize) -> Vec<u8> {
     let mut buffer = Vec::with_capacity(len);
     buffer.resize(len, 0);
     buffer
@@ -1091,6 +1061,49 @@ enum WidthPass {
     Avx512(GroupTaps),
 }
 
+/// The vector width kernels' per-row scratch (the AVX2 arm's spread rows,
+/// the AVX-512 arm's row tails and 32-bit sums), owned by the pass's caller:
+/// a band loop sizes it once and every band reuses it, where a buffer per
+/// band was a zeroed allocation per band (and, past the sizes the allocator
+/// keeps cached pages for, one faulted in page by page: about 280 of them per
+/// 8k-class image). The kernels write the bytes their rows cover and zero the
+/// padding they read past them at the top of every band, so the scratch only
+/// keeps the allocation: nothing a kernel reads depends on what it held.
+#[derive(Default)]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    expect(dead_code, reason = "the portable width kernel keeps no scratch")
+)]
+struct BandScratch {
+    bytes: Vec<u8>,
+    sums: Vec<i32>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl BandScratch {
+    /// `len` bytes, zeroed when the length is new to this scratch.
+    fn bytes(&mut self, len: usize) -> &mut [u8] {
+        Self::sized(&mut self.bytes, len)
+    }
+
+    /// `bytes` bytes and `sums` 32-bit lanes, each zeroed when its length is
+    /// new to this scratch.
+    fn parts(&mut self, bytes: usize, sums: usize) -> (&mut [u8], &mut [i32]) {
+        (
+            Self::sized(&mut self.bytes, bytes),
+            Self::sized(&mut self.sums, sums),
+        )
+    }
+
+    fn sized<T: Clone + Default>(buf: &mut Vec<T>, len: usize) -> &mut [T] {
+        if buf.len() != len {
+            buf.clear();
+            buf.resize(len, T::default());
+        }
+        buf
+    }
+}
+
 impl WidthPass {
     #[cfg(target_arch = "x86_64")]
     fn new<const C: usize>(kernel: &FixedKernel) -> Self {
@@ -1113,13 +1126,18 @@ impl WidthPass {
 
     /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass;
     /// a vector arm detects its features and calls in one place, as the
-    /// crate's NEON kernels and the FMA pass keep them.
+    /// crate's NEON kernels and the FMA pass keep them, and works in the
+    /// caller's `scratch` (one per band loop, reused band after band).
     #[cfg_attr(
         target_arch = "x86_64",
         expect(
             unsafe_code,
             reason = "the target-feature function runs only after this function detected its features"
         )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pass's scratch rides along so every band of a pass reuses it"
     )]
     fn rows<const C: usize>(
         &self,
@@ -1129,6 +1147,14 @@ impl WidthPass {
         out_w: usize,
         y0: usize,
         band: &mut [u8],
+        #[cfg_attr(
+            not(target_arch = "x86_64"),
+            expect(
+                unused_variables,
+                reason = "the portable width kernel keeps no scratch"
+            )
+        )]
+        scratch: &mut BandScratch,
     ) {
         match self {
             Self::Portable => pil_h_band::<C>(src, kernel, in_w, out_w, y0, band),
@@ -1140,7 +1166,7 @@ impl WidthPass {
                 // SAFETY: `is_x86_feature_detected!("avx2")` answered true just
                 // above, the only requirement of a `target_feature(enable =
                 // "avx2")` function.
-                unsafe { avx2::h_band::<C>(src, kernel, split, in_w, out_w, y0, band) }
+                unsafe { avx2::h_band::<C>(src, kernel, split, in_w, out_w, y0, band, scratch) }
             }
             #[cfg(target_arch = "x86_64")]
             Self::Avx512(groups) => {
@@ -1150,7 +1176,7 @@ impl WidthPass {
                 // SAFETY: `avx512::detected()` answered true just above: the
                 // processor reports every feature the `target_feature`
                 // function enables, its only requirement.
-                unsafe { avx512::h_band::<C>(src, kernel, groups, in_w, out_w, y0, band) }
+                unsafe { avx512::h_band::<C>(src, kernel, groups, in_w, out_w, y0, band, scratch) }
             }
         }
     }
@@ -1504,7 +1530,7 @@ mod avx2 {
         _mm_cvtsi32_si128, _mm_loadu_si128, _mm_setr_epi8, _mm_shuffle_epi8, _mm_storeu_si128,
     };
 
-    use super::{FixedKernel, SplitTaps, SPLIT_LOW_BITS};
+    use super::{BandScratch, FixedKernel, SplitTaps, SPLIT_LOW_BITS};
 
     /// Pixels a scratch row carries past the source row: a window padded to
     /// a multiple of four taps reads at most three pixels past its last tap.
@@ -1520,6 +1546,10 @@ mod avx2 {
     /// lane, the high and the low halves of the taps into accumulators of
     /// their own. A band's odd last row runs alone in both halves.
     #[target_feature(enable = "avx2")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pass's scratch rides along so every band of a pass reuses it"
+    )]
     pub(super) fn h_band<const C: usize>(
         src: &[u8],
         kernel: &FixedKernel,
@@ -1528,12 +1558,18 @@ mod avx2 {
         out_w: usize,
         y0: usize,
         band: &mut [u8],
+        scratch: &mut BandScratch,
     ) {
         let row_in = in_w * C;
         let row_out = out_w * C;
         let scratch_len = (in_w + PADDING_PIXELS) * 4;
-        let mut scratch = vec![0_u8; 2 * scratch_len];
+        let scratch = scratch.bytes(2 * scratch_len);
         let (first, second) = scratch.split_at_mut(scratch_len);
+        // The spread rows are read PADDING_PIXELS past their end as zeros;
+        // zero that padding here, so the kernel owes nothing to what the
+        // scratch held before this band.
+        first[in_w * 4..].fill(0);
+        second[in_w * 4..].fill(0);
         let mut pairs = band.chunks_exact_mut(2 * row_out);
         let mut y = y0;
         for pair in pairs.by_ref() {
@@ -1830,7 +1866,7 @@ mod avx512 {
         _mm512_unpacklo_epi16, _mm512_unpacklo_epi8, _mm_cvtsi32_si128,
     };
 
-    use super::{ChunkTaps, FixedKernel, GroupTaps, CHUNK_BITS};
+    use super::{BandScratch, ChunkTaps, FixedKernel, GroupTaps, CHUNK_BITS};
 
     /// The processor reports every feature the arms enable.
     pub(super) fn detected() -> bool {
@@ -1849,6 +1885,10 @@ mod avx512 {
     /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass,
     /// [`ROWS`] rows at a time by [`h_rows`] and the last rows one by one.
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pass's scratch rides along so every band of a pass reuses it"
+    )]
     pub(super) fn h_band<const C: usize>(
         src: &[u8],
         kernel: &FixedKernel,
@@ -1857,24 +1897,32 @@ mod avx512 {
         out_w: usize,
         y0: usize,
         band: &mut [u8],
+        scratch: &mut BandScratch,
     ) {
         let row_in = in_w * C;
         let row_out = out_w * C;
         let tail_len = groups.tail.min(row_in);
-        let mut tails = vec![0_u8; ROWS * (tail_len + GroupTaps::WINDOW)];
         // A group's sixteen lanes land whole; the last group's lanes past the
         // row and the narrowing's last loads stay inside a row's scratch.
-        let mut sums = vec![0_i32; ROWS * (row_out.next_multiple_of(64) + 16)];
+        let (tails, sums) = scratch.parts(
+            ROWS * (tail_len + GroupTaps::WINDOW),
+            ROWS * (row_out.next_multiple_of(64) + 16),
+        );
+        // Each tail row is read WINDOW bytes past its end as zeros; zero that
+        // padding here, so the kernel owes nothing to what the scratch held
+        // before this band (the sums need no zeros: the narrowing's masked
+        // store drops the lanes past the row).
+        for tail in tails.chunks_exact_mut(tail_len + GroupTaps::WINDOW) {
+            tail[tail_len..].fill(0);
+        }
         let mut blocks = band.chunks_exact_mut(ROWS * row_out);
         let mut y = y0;
         for block in blocks.by_ref() {
-            h_rows::<C, ROWS>(src, kernel, groups, row_in, y, block, &mut tails, &mut sums);
+            h_rows::<C, ROWS>(src, kernel, groups, row_in, y, block, tails, sums);
             y += ROWS;
         }
         for out_row in blocks.into_remainder().chunks_exact_mut(row_out) {
-            h_rows::<C, 1>(
-                src, kernel, groups, row_in, y, out_row, &mut tails, &mut sums,
-            );
+            h_rows::<C, 1>(src, kernel, groups, row_in, y, out_row, tails, sums);
             y += 1;
         }
     }
@@ -2195,7 +2243,15 @@ fn pil_resample_horizontal<const C: usize>(
     let pass = &WidthPass::new::<C>(kernel);
     let tasks = par_threads(out.len(), rows);
     if tasks <= 1 {
-        pass.rows::<C>(src, kernel, in_w, out_w, 0, &mut out);
+        pass.rows::<C>(
+            src,
+            kernel,
+            in_w,
+            out_w,
+            0,
+            &mut out,
+            &mut BandScratch::default(),
+        );
         return out;
     }
     let band_rows = rows.div_ceil(tasks);
@@ -2207,7 +2263,17 @@ fn pil_resample_horizontal<const C: usize>(
             let (band, tail) = rest.split_at_mut(n * row_out);
             rest = tail;
             let start = y0;
-            scope.spawn(move |_| pass.rows::<C>(src, kernel, in_w, out_w, start, band));
+            scope.spawn(move |_| {
+                pass.rows::<C>(
+                    src,
+                    kernel,
+                    in_w,
+                    out_w,
+                    start,
+                    band,
+                    &mut BandScratch::default(),
+                );
+            });
             y0 += n;
         }
     });
@@ -2283,6 +2349,7 @@ impl<const C: usize> BandedPasses<'_, C> {
         let row_len = self.out_w * C;
         // The width-pass rows `mid` holds: source rows `[mid_start, mid_end)`.
         let mut mid = Vec::new();
+        let mut scratch = BandScratch::default();
         let (mut mid_start, mut mid_end) = (0, 0);
         let mut y = y0;
         let end = y0 + out.len() / row_len;
@@ -2322,6 +2389,7 @@ impl<const C: usize> BandedPasses<'_, C> {
                     self.out_w,
                     kept,
                     &mut mid[(kept - start) * row_len..],
+                    &mut scratch,
                 );
             }
             (mid_start, mid_end) = (start, stop);
@@ -2581,12 +2649,11 @@ pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
 /// interpolation, and so what an image processor that resizes the decoded
 /// image before converting it to a tensor runs.
 pub fn resize_bilinear_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
+    let (in_w, in_h, rgb) = rgb_bytes(image);
     let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
+        &rgb,
+        in_w as u32,
+        in_h as u32,
         out_w,
         out_h,
         PilResizeFilter::Bilinear,
@@ -3299,6 +3366,14 @@ pub fn center_crop(image: &DynamicImage, crop_w: u32, crop_h: u32) -> DynamicIma
     }
 }
 
+/// The pixel bytes of `image`, exactly `3 * width * height` of them: a
+/// container may be longer than its image (`ImageBuffer::from_raw` takes any
+/// that is long enough), and the bytes behind the pixels are not the image.
+pub(crate) fn rgb_pixels(image: &RgbImage) -> &[u8] {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    &image.as_raw()[..3 * width * height]
+}
+
 /// The `width` x `height` crop of `image` at (`x`, `y`), clipped to the
 /// image as the generic crop clips it, as row copies out of the image's own
 /// bytes. The generic crop builds a zeroed image and copies pixel by pixel;
@@ -3325,6 +3400,40 @@ pub(crate) fn crop_rgb(image: &RgbImage, x: u32, y: u32, width: u32, height: u32
         reason = "data holds exactly width * height * 3 bytes by construction"
     )]
     RgbImage::from_raw(width, height, data).expect("crop buffer size")
+}
+
+/// The columns of the image that one pass of [`transpose_rgb`] moves: their
+/// pixels of an image row and the output rows they go to stay in the cache.
+const TRANSPOSE_BLOCK: usize = 32;
+
+/// `image` flipped over its main diagonal (PIL's `Image.TRANSPOSE`): the
+/// pixel at (`x`, `y`) goes to (`y`, `x`), so the result is `height` wide and
+/// `width` high. The generic way, a horizontal flip and then a quarter turn,
+/// copies the image twice, pixel by pixel. Here a block of columns at a time
+/// is gathered in a scratch block that stays in the cache, each image row
+/// giving one pixel to each of its output rows, and joins the output whole.
+pub(crate) fn transpose_rgb(image: &RgbImage) -> RgbImage {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    // A zero-sized image has no rows; a chunk size of 0 would panic.
+    let (stride, out_stride) = ((width * 3).max(1), (height * 3).max(1));
+    let mut data = Vec::with_capacity(width * height * 3);
+    let mut block = vec![0_u8; TRANSPOSE_BLOCK.min(width) * height * 3];
+    for first in (0..width).step_by(TRANSPOSE_BLOCK) {
+        let columns = TRANSPOSE_BLOCK.min(width - first);
+        let block = &mut block[..columns * height * 3];
+        for (y, row) in rgb_pixels(image).chunks_exact(stride).enumerate() {
+            let (pixels, _) = row[first * 3..(first + columns) * 3].as_chunks::<3>();
+            for (out_row, pixel) in block.chunks_exact_mut(out_stride).zip(pixels) {
+                out_row[y * 3..y * 3 + 3].copy_from_slice(pixel);
+            }
+        }
+        data.extend_from_slice(block);
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "data holds exactly height * width * 3 bytes by construction"
+    )]
+    RgbImage::from_raw(image.height(), image.width(), data).expect("transpose buffer size")
 }
 
 /// `image` pasted at (`x`, `y`) on a `width` x `height` canvas of
@@ -4512,7 +4621,15 @@ mod tests {
         ) {
             let kernel = FixedKernel::new(in_w, out_w, filter, quantization);
             let mut portable = vec![0_u8; in_h * out_w * C];
-            WidthPass::Portable.rows::<C>(data, &kernel, in_w, out_w, 0, &mut portable);
+            WidthPass::Portable.rows::<C>(
+                data,
+                &kernel,
+                in_w,
+                out_w,
+                0,
+                &mut portable,
+                &mut BandScratch::default(),
+            );
             #[cfg_attr(
                 not(target_arch = "x86_64"),
                 expect(unused_mut, reason = "only the x86-64 arms are pushed")
@@ -4532,7 +4649,15 @@ mod tests {
             }
             for (name, arm) in &arms {
                 let mut detected = vec![0_u8; in_h * out_w * C];
-                arm.rows::<C>(data, &kernel, in_w, out_w, 0, &mut detected);
+                arm.rows::<C>(
+                    data,
+                    &kernel,
+                    in_w,
+                    out_w,
+                    0,
+                    &mut detected,
+                    &mut BandScratch::default(),
+                );
                 assert_same_bytes(
                     &detected,
                     &portable,
@@ -5227,6 +5352,48 @@ mod tests {
         );
     }
 
+    /// The one-pass transpose makes the image that the flip and the quarter
+    /// turn make, on sizes around its block of columns and over a container
+    /// longer than the pixels.
+    #[test]
+    fn transpose_rgb_is_the_flip_and_the_quarter_turn() {
+        let sizes = [
+            (1, 1),
+            (1, 7),
+            (7, 1),
+            (31, 5),
+            (32, 33),
+            (33, 32),
+            (65, 97),
+            (200, 130),
+        ];
+        for (width, height) in sizes {
+            let image = lcg_rgb_image(width, height, 11);
+            let rgb = image.to_rgb8();
+            let generic = image.fliph().rotate270().to_rgb8();
+            let fast = transpose_rgb(&rgb);
+            assert_eq!(fast.dimensions(), (height, width), "{width}x{height}");
+            assert_eq!(fast.as_raw(), generic.as_raw(), "{width}x{height}");
+
+            let mut container = rgb.into_raw();
+            container.extend_from_slice(&[0xAB; 7]);
+            let longer = RgbImage::from_raw(width, height, container).expect("longer container");
+            let fast_of_longer = transpose_rgb(&longer);
+            assert_eq!(fast_of_longer.as_raw(), fast.as_raw(), "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn transpose_rgb_stays_total_on_an_empty_image() {
+        // No row to chunk and no block to fill: the result is the empty
+        // image with its two sides swapped.
+        for (width, height) in [(0, 7), (7, 0), (0, 0)] {
+            let transposed = transpose_rgb(&RgbImage::new(width, height));
+            assert_eq!(transposed.dimensions(), (height, width), "{width}x{height}");
+            assert!(transposed.as_raw().is_empty(), "{width}x{height}");
+        }
+    }
+
     #[test]
     fn test_expand_to_square_horizontal() {
         let img = create_test_image(100, 50, Rgb([255, 0, 0]));
@@ -5451,34 +5618,6 @@ mod tests {
                     assert_eq!(
                         planes[c * 6 + y * 3 + x].to_bits(),
                         expected.to_bits(),
-                        "channel {c} at ({x}, {y})"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn paint_rgb_onto_planes_by_table_maps_through_the_table_and_fills_the_margin_with_its_zero() {
-        // A 2x2 image on a 3x2 canvas: the right column is margin. The table
-        // tells the channels and the levels apart, and no multiply-add
-        // produces it.
-        let rgb: [u8; 12] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
-        let table: [[f32; 256]; 3] = std::array::from_fn(|c| {
-            std::array::from_fn(|level| {
-                let sign = if level % 2 == 0 { 1.0 } else { -1.0 };
-                (level as f32 * 0.5 + 1.0) * sign + (c as f32 + 1.0) * 1000.0
-            })
-        });
-        let mut planes = vec![f32::NAN; 3 * 3 * 2];
-        paint_rgb_onto_planes_by_table(&rgb, (2, 2), (3, 2), &table, &mut planes);
-        for c in 0..3 {
-            for y in 0..2 {
-                for x in 0..3 {
-                    let level = if x < 2 { rgb[(y * 2 + x) * 3 + c] } else { 0 };
-                    assert_eq!(
-                        planes[c * 6 + y * 3 + x].to_bits(),
-                        table[c][usize::from(level)].to_bits(),
                         "channel {c} at ({x}, {y})"
                     );
                 }

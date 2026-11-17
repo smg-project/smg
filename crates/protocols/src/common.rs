@@ -1,19 +1,21 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 
 use serde::{
     de::{
         self,
         value::{MapDeserializer, SeqAccessDeserializer},
-        SeqAccess, Visitor,
+        DeserializeSeed, SeqAccess, Visitor,
     },
     Deserialize, Deserializer, Serialize,
 };
 use serde_json::{Map, Value};
 use validator;
+
+use crate::strict_value::StrictValue;
 
 // ============================================================================
 // Default value helpers
@@ -30,18 +32,6 @@ use validator;
 /// (`1e2` is `100.0`, `-0` is `-0.0`).
 pub fn to_value_exact<T: Serialize>(value: &T) -> serde_json::Result<Value> {
     serde_json::from_slice(&serde_json::to_vec(value)?)
-}
-
-/// The JSON type of a value, for validation messages (`a string`, `an array`, ...).
-pub(crate) fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    }
 }
 
 /// The routing text of a JSON `input`: the string itself, an array's string
@@ -118,6 +108,21 @@ where
     T: Deserialize<'de>,
 {
     Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+/// Deserialize a map that also accepts JSON `null` (mapped to the empty map).
+///
+/// Use with `#[serde(default, deserialize_with = "deserialize_null_as_empty_map")]`
+/// on always-present maps an upstream may write as `null`.
+pub fn deserialize_null_as_empty_map<'de, D, K, V>(
+    deserializer: D,
+) -> Result<HashMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Deserialize<'de> + Eq + std::hash::Hash,
+    V: Deserialize<'de>,
+{
+    Option::<HashMap<K, V>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// Deserialize an `Option<bool>` where JSON `null` means the default `true`.
@@ -297,6 +302,10 @@ impl<'a> Iterator for StringOrArrayIter<'a> {
 
 impl<'a> ExactSizeIterator for StringOrArrayIter<'a> {}
 
+// ============================================================================
+// Validation helpers
+// ============================================================================
+
 /// A validation error with the public API's `code` and message.
 pub(crate) fn invalid(
     code: &'static str,
@@ -331,6 +340,32 @@ pub(crate) fn on_field(
 ) -> validator::ValidationError {
     error.add_param(Cow::Borrowed(FIELD_PARAM), &field.into());
     error
+}
+
+/// The refusal of a tool the model calls by name (a function, a custom tool,
+/// a namespace or one of its members) declared with an empty name at `field`,
+/// in the public API's words: the model can be made to call such a tool, and
+/// the client cannot dispatch a call that names nothing.
+pub(crate) fn empty_tool_name(field: &str) -> validator::ValidationError {
+    invalid(
+        "empty_string",
+        format!(
+            "Invalid '{field}': empty string. Expected a string with minimum length 1, but got \
+             an empty string instead."
+        ),
+    )
+}
+
+/// The JSON type of a value, for validation messages (`a string`, `an array`, ...).
+pub fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// Validates `logit_bias` as the public API bounds it: every key a
@@ -419,7 +454,7 @@ pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationEr
 // Content Parts (for multimodal messages)
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum ContentPart {
     #[serde(rename = "text")]
@@ -436,13 +471,94 @@ pub enum ContentPart {
     /// replays it in the history; the renderers read it as the turn's text.
     #[serde(rename = "refusal")]
     Refusal { refusal: String },
-    /// Pass through unknown content objects to HTTP backends.
-    /// Also matches malformed known types; gRPC backends reject this variant.
+    /// Pass through unknown content objects to HTTP backends; gRPC backends
+    /// reject this variant. A known `type` whose body does not fit it is no
+    /// unknown part: it refuses with serde's reason for the field.
     #[serde(untagged)]
     Unknown(Map<String, Value>),
 }
 
+/// The parts the gateway knows, read by their `type` as serde reads a tagged
+/// enum, so a malformed one carries serde's reason for the field.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum KnownContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "audio_url")]
+    AudioUrl { audio_url: AudioUrl },
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudio },
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrl },
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
+}
+
+impl KnownContentPart {
+    /// The `type` names a kind the gateway knows.
+    fn names(kind: &str) -> bool {
+        matches!(
+            kind,
+            "text" | "image_url" | "audio_url" | "input_audio" | "video_url" | "refusal"
+        )
+    }
+}
+
+impl From<KnownContentPart> for ContentPart {
+    fn from(part: KnownContentPart) -> Self {
+        match part {
+            KnownContentPart::Text { text } => Self::Text { text },
+            KnownContentPart::ImageUrl { image_url } => Self::ImageUrl { image_url },
+            KnownContentPart::AudioUrl { audio_url } => Self::AudioUrl { audio_url },
+            KnownContentPart::InputAudio { input_audio } => Self::InputAudio { input_audio },
+            KnownContentPart::VideoUrl { video_url } => Self::VideoUrl { video_url },
+            KnownContentPart::Refusal { refusal } => Self::Refusal { refusal },
+        }
+    }
+}
+
+/// A part is an object; one whose `type` the gateway knows must fit that
+/// kind (its refusal is serde's, naming the field's reason), any other is
+/// kept whole for the backends that read it.
+impl<'de> Deserialize<'de> for ContentPart {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = Map::<String, Value>::deserialize(deserializer)?;
+        Self::from_fields(fields).map_err(de::Error::custom)
+    }
+}
+
+/// Serde's reason for a known part's refusal, opening with serde's words so
+/// a reader keeps its code: a field missing from the kind's body is named
+/// under the kind (`missing field `image_url.url``), any other reason names
+/// the body after itself (`..., in `image_url``), since serde's own path
+/// stops at the message a tagged enum buffers.
+fn known_part_reason(kind: &str, error: &serde_json::Error) -> String {
+    let reason = error.to_string();
+    let missing = reason
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'));
+    match missing {
+        Some(field) if field != kind => format!("missing field `{kind}.{field}`"),
+        Some(_) => reason,
+        None => format!("{reason}, in `{kind}`"),
+    }
+}
+
 impl ContentPart {
+    /// The part an object's fields make, for a reader that holds them already.
+    pub(crate) fn from_fields(fields: Map<String, Value>) -> Result<Self, serde_json::Error> {
+        let kind = match fields.get("type").and_then(Value::as_str) {
+            Some(kind) if KnownContentPart::names(kind) => kind.to_string(),
+            _ => return Ok(Self::Unknown(fields)),
+        };
+        serde_json::from_value::<KnownContentPart>(Value::Object(fields))
+            .map(Self::from)
+            .map_err(|error| de::Error::custom(known_part_reason(&kind, &error)))
+    }
+
     /// The text a renderer reads from the part: a text part's text, a
     /// refusal's text (the engines' own servers render a refusal part as the
     /// turn's text); none for a media or an unknown part.
@@ -456,7 +572,9 @@ impl ContentPart {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct ImageUrl {
-    pub url: String,
+    /// The image's URL or `data:` URL, shared with every reader of the
+    /// request (the media plan among them) instead of copied.
+    pub url: Arc<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
     /// MiniMax-M3 extension: cap the image's long side before preprocessing.
@@ -474,20 +592,22 @@ pub struct ImageUrl {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct AudioUrl {
-    pub url: String,
+    /// The clip's URL or `data:` URL, shared with its readers.
+    pub url: Arc<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct InputAudio {
-    /// Base64-encoded audio bytes.
-    pub data: String,
+    /// Base64-encoded audio bytes, shared with the readers that decode them.
+    pub data: Arc<String>,
     /// Encoded audio format. The OpenAI Chat API supports `wav` and `mp3`.
     pub format: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
 pub struct VideoUrl {
-    pub url: String,
+    /// The clip's URL or `data:` URL, shared with its readers.
+    pub url: Arc<String>,
     /// MiniMax-M3 extension: frames per second to sample the clip at.
     ///
     /// Valid range is 0.2 to 5.0 inclusive.
@@ -927,8 +1047,13 @@ impl<'de> Deserialize<'de> for KeptSchema {
 /// Walks `properties`, `items`, `prefixItems`, `anyOf`/`oneOf`/`allOf`,
 /// `$defs`/`definitions` and `not`; returns the JSON-pointer-like path of the
 /// first object node that lacks the pin.
+///
+/// A schema that holds the rule is walked without an allocation: the path is
+/// put together on the way back from a miss, a segment a level.
 pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<String> {
-    fn walk(node: &Value, path: &str) -> Option<String> {
+    // The path from `node` to the first unpinned object node under it, empty
+    // when `node` is that node.
+    fn walk(node: &Value) -> Option<String> {
         let obj = node.as_object()?;
         let is_object_node = obj.get("type").and_then(Value::as_str) == Some("object")
             || obj
@@ -937,17 +1062,13 @@ pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<Str
                 .is_some_and(|types| types.iter().any(|t| t.as_str() == Some("object")))
             || (obj.get("type").is_none() && obj.contains_key("properties"));
         if is_object_node && obj.get("additionalProperties") != Some(&Value::Bool(false)) {
-            return Some(if path.is_empty() {
-                "()".to_string()
-            } else {
-                path.to_string()
-            });
+            return Some(String::new());
         }
         for key in ["properties", "$defs", "definitions"] {
             if let Some(children) = obj.get(key).and_then(Value::as_object) {
                 for (name, child) in children {
-                    if let Some(found) = walk(child, &format!("{path}/{key}/{name}")) {
-                        return Some(found);
+                    if let Some(rest) = walk(child) {
+                        return Some(format!("/{key}/{name}{rest}"));
                     }
                 }
             }
@@ -955,22 +1076,27 @@ pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<Str
         for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
             if let Some(children) = obj.get(key).and_then(Value::as_array) {
                 for (index, child) in children.iter().enumerate() {
-                    if let Some(found) = walk(child, &format!("{path}/{key}/{index}")) {
-                        return Some(found);
+                    if let Some(rest) = walk(child) {
+                        return Some(format!("/{key}/{index}{rest}"));
                     }
                 }
             }
         }
         for key in ["items", "not"] {
             if let Some(child) = obj.get(key) {
-                if let Some(found) = walk(child, &format!("{path}/{key}")) {
-                    return Some(found);
+                if let Some(rest) = walk(child) {
+                    return Some(format!("/{key}{rest}"));
                 }
             }
         }
         None
     }
-    walk(schema, "")
+    let path = walk(schema)?;
+    Some(if path.is_empty() {
+        "()".to_string()
+    } else {
+        path
+    })
 }
 
 /// Shared shape rules for a json_schema format: name non-empty, schema a JSON object.
@@ -1505,7 +1631,8 @@ impl Serialize for FunctionCall {
 
 impl<'de> Deserialize<'de> for FunctionCall {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(deserializer)?;
+        // Buffered strictly: the plain value reader keeps the last of a repeated `name`.
+        let value = StrictValue.deserialize(deserializer)?;
         match &value {
             Value::String(s) => match s.as_str() {
                 "none" => Ok(FunctionCall::None),
@@ -1663,6 +1790,27 @@ impl Usage {
         self
     }
 
+    /// Report the prompt's image tokens: the tokens the gateway's multimodal
+    /// expansion wrote into the prompt for the request's images, as
+    /// `prompt_tokens_details.image_tokens`. `None` leaves the details as they
+    /// are: a request without an image the gateway expanded reports no image
+    /// count, as before. The count is kept within `prompt_tokens`, the total
+    /// the details break down.
+    pub fn with_image_tokens(mut self, image_tokens: Option<u32>) -> Self {
+        if let Some(image_tokens) = image_tokens {
+            self.prompt_tokens_details
+                .get_or_insert(PromptTokenUsageInfo {
+                    cached_tokens: 0,
+                    audio_tokens: None,
+                    text_tokens: None,
+                    image_tokens: None,
+                    cache_write_tokens: None,
+                })
+                .image_tokens = Some(image_tokens.min(self.prompt_tokens));
+        }
+        self
+    }
+
     /// Default detail counters to zero, except unknown speculative rejections.
     /// With explicit accepted tokens, unavailable/inconsistent drafts leave rejected
     /// absent. Default zeros for non-speculative usage are schema defaults, not
@@ -1713,6 +1861,10 @@ pub struct CompletionTokensDetails {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct UsageInfo {
     pub prompt_tokens: u32,
+    /// Generated tokens. The public API's embeddings usage has no such key
+    /// (only `prompt_tokens` and `total_tokens`), so a usage written without
+    /// it reads as none generated.
+    #[serde(default)]
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub reasoning_tokens: Option<u32>,
@@ -1969,6 +2121,8 @@ pub enum PromptVariableTyped {
     },
     #[serde(rename = "input_file")]
     ResponseInputFile {
+        /// The file's detail level, as an input file part takes it.
+        detail: Option<crate::responses::FileDetail>,
         file_data: Option<String>,
         file_id: Option<String>,
         file_url: Option<String>,
@@ -1995,10 +2149,11 @@ pub enum Detail {
 
 /// Retention policy for prompt-cache entries on the Responses API.
 ///
-/// Spec: `prompt_cache_retention: "in-memory" | "24h"`.
+/// Spec: `prompt_cache_retention: "in_memory" | "24h"` (`PromptCacheRetentionEnum`).
+/// `in-memory`, the spelling this crate wrote before, still reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum PromptCacheRetention {
-    #[serde(rename = "in-memory")]
+    #[serde(rename = "in_memory", alias = "in-memory")]
     InMemory,
     #[serde(rename = "24h")]
     Duration24h,
@@ -2274,6 +2429,55 @@ mod tests {
     }
 
     #[test]
+    fn image_tokens_are_reported_within_the_prompt_or_not_at_all() {
+        let none = Usage::from_counts(10, 4).with_image_tokens(None);
+        assert!(
+            none.prompt_tokens_details.is_none(),
+            "no image count opens no details"
+        );
+        let kept = Usage::from_counts(10, 4)
+            .with_cached_tokens(2)
+            .with_image_tokens(None);
+        assert_eq!(
+            kept.prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((2, None)),
+            "no image count leaves the cache details as they are"
+        );
+
+        let reported = Usage::from_counts(535, 4).with_image_tokens(Some(324));
+        assert_eq!(
+            reported
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((0, Some(324))),
+            "the details the count opens default the cache to zero"
+        );
+        let beside_cache = Usage::from_counts(535, 4)
+            .with_cached_tokens(100)
+            .with_image_tokens(Some(324));
+        assert_eq!(
+            beside_cache
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((100, Some(324)))
+        );
+
+        let clamped = Usage::from_counts(10, 4).with_image_tokens(Some(12));
+        assert_eq!(
+            clamped
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.image_tokens),
+            Some(10),
+            "the count stays within the prompt"
+        );
+    }
+
+    #[test]
     fn content_part_deserializes_audio_url() {
         let value = json!({
             "type": "audio_url",
@@ -2286,10 +2490,97 @@ mod tests {
             part,
             ContentPart::AudioUrl {
                 audio_url: AudioUrl {
-                    url: "https://example.com/audio.wav".to_string(),
+                    url: "https://example.com/audio.wav".to_string().into(),
                 },
             }
         );
+    }
+
+    /// A known `type` whose body does not fit it is refused with serde's
+    /// reason for the field, not read as an unknown part.
+    #[test]
+    fn content_part_refuses_a_malformed_known_type_with_the_fields_reason() {
+        for (value, reason) in [
+            (
+                json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA==", "max_long_side_pixel": -1}}),
+                "invalid value: integer `-1`, expected u32, in `image_url`",
+            ),
+            (
+                json!({"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AA==", "fps": "1"}}),
+                "invalid type: string \"1\", expected f64, in `video_url`",
+            ),
+            (
+                json!({"type": "image_url", "image_url": {"detail": "high"}}),
+                "missing field `image_url.url`",
+            ),
+            (json!({"type": "image_url"}), "missing field `image_url`"),
+            (
+                json!({"type": "text", "text": 5}),
+                "invalid type: integer `5`, expected a string, in `text`",
+            ),
+            (
+                json!({"type": "refusal", "refusal": null}),
+                "invalid type: null, expected a string, in `refusal`",
+            ),
+        ] {
+            let error = serde_json::from_value::<ContentPart>(value.clone()).unwrap_err();
+            assert_eq!(error.to_string(), reason, "{value}");
+        }
+    }
+
+    /// Every typed kind reads back typed: the `ContentPart` variants, the
+    /// `KnownContentPart` mirror and `KnownContentPart::names` name the same
+    /// set, and the match below has no wildcard, so a new variant does not
+    /// compile until it has a sample here (a kind missing from the mirror or
+    /// the names would read back as an unknown part and fail the round trip).
+    #[test]
+    fn every_typed_content_part_reads_back_typed() {
+        let samples = [
+            ContentPart::Text {
+                text: "t".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "u".to_string().into(),
+                    detail: None,
+                    max_long_side_pixel: None,
+                },
+            },
+            ContentPart::AudioUrl {
+                audio_url: AudioUrl {
+                    url: "u".to_string().into(),
+                },
+            },
+            ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "d".to_string().into(),
+                    format: "wav".to_string(),
+                },
+            },
+            ContentPart::VideoUrl {
+                video_url: VideoUrl {
+                    url: "u".to_string().into(),
+                    fps: None,
+                    max_long_side_pixel: None,
+                },
+            },
+            ContentPart::Refusal {
+                refusal: "r".to_string(),
+            },
+        ];
+        for part in samples {
+            match &part {
+                ContentPart::Text { .. }
+                | ContentPart::ImageUrl { .. }
+                | ContentPart::AudioUrl { .. }
+                | ContentPart::InputAudio { .. }
+                | ContentPart::VideoUrl { .. }
+                | ContentPart::Refusal { .. } => {}
+                ContentPart::Unknown(_) => panic!("a typed sample"),
+            }
+            let value = serde_json::to_value(&part).unwrap();
+            assert_eq!(serde_json::from_value::<ContentPart>(value).unwrap(), part);
+        }
     }
 
     #[test]
@@ -2350,7 +2641,7 @@ mod tests {
             part,
             ContentPart::InputAudio {
                 input_audio: InputAudio {
-                    data: "UklGRg==".to_string(),
+                    data: "UklGRg==".to_string().into(),
                     format: "wav".to_string(),
                 },
             }
@@ -2575,6 +2866,147 @@ mod tests {
                 }
                 None => assert!(result.is_ok(), "{name:?}/{schema} should pass"),
             }
+        }
+    }
+
+    /// The strict walk names the first object node that lacks the pin by its
+    /// path from the root, a segment a step, and the root itself as `()`; a
+    /// schema that pins every object node names none.
+    #[test]
+    fn the_strict_walk_names_the_first_unpinned_node_by_its_path() {
+        let open = || json!({"type": "object", "properties": {"x": {"type": "string"}}});
+        let pinned = |key: &str, child: Value| {
+            let mut node = json!({"type": "object", "additionalProperties": false});
+            node[key] = child;
+            node
+        };
+        let text = json!({"type": "string"});
+        let cases = [
+            (open(), Some("()")),
+            (json!({"type": ["object", "null"]}), Some("()")),
+            (json!({"properties": {}}), Some("()")),
+            (
+                pinned("properties", json!({"a": open()})),
+                Some("/properties/a"),
+            ),
+            (
+                pinned("properties", json!({"": open()})),
+                Some("/properties/"),
+            ),
+            (pinned("$defs", json!({"a": open()})), Some("/$defs/a")),
+            (
+                pinned("definitions", json!({"a": open()})),
+                Some("/definitions/a"),
+            ),
+            (pinned("anyOf", json!([text, open()])), Some("/anyOf/1")),
+            (pinned("oneOf", json!([open()])), Some("/oneOf/0")),
+            (
+                pinned("allOf", json!([text, text, open()])),
+                Some("/allOf/2"),
+            ),
+            (
+                pinned("prefixItems", json!([text, open()])),
+                Some("/prefixItems/1"),
+            ),
+            (pinned("items", open()), Some("/items")),
+            (pinned("not", open()), Some("/not")),
+            (
+                pinned(
+                    "properties",
+                    json!({"a": {"type": "array", "items": {"anyOf": [
+                        text,
+                        pinned("properties", json!({"b": open()}))
+                    ]}}}),
+                ),
+                Some("/properties/a/items/anyOf/1/properties/b"),
+            ),
+            // First is depth first: the node under the first name, not its nearer sibling.
+            (
+                pinned(
+                    "properties",
+                    json!({"a": pinned("properties", json!({"deep": open()})), "b": open()}),
+                ),
+                Some("/properties/a/properties/deep"),
+            ),
+            // First is by kind: named children, then the lists, then `items` and `not`.
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open(), "anyOf": [open()], "properties": {"p": open()}
+                }),
+                Some("/properties/p"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open(), "anyOf": [open()]
+                }),
+                Some("/anyOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open()
+                }),
+                Some("/items"),
+            ),
+            // First within a kind is by key: `properties`, `$defs`, `definitions`,
+            // and `anyOf`, `oneOf`, `allOf`, `prefixItems`.
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "definitions": {"d": open()}, "$defs": {"d": open()},
+                    "properties": {"p": open()}
+                }),
+                Some("/properties/p"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "definitions": {"d": open()}, "$defs": {"d": open()}
+                }),
+                Some("/$defs/d"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()],
+                    "oneOf": [open()], "anyOf": [open()]
+                }),
+                Some("/anyOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()], "oneOf": [open()]
+                }),
+                Some("/oneOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()]
+                }),
+                Some("/allOf/0"),
+            ),
+            // First in a list is its first element.
+            (pinned("anyOf", json!([open(), open()])), Some("/anyOf/0")),
+            (
+                pinned(
+                    "properties",
+                    json!({"a": text, "b": pinned("items", text.clone())}),
+                ),
+                None,
+            ),
+            (text.clone(), None),
+            (json!(true), None),
+        ];
+        for (schema, path) in cases {
+            assert_eq!(
+                strict_schema_missing_additional_properties(&schema).as_deref(),
+                path,
+                "{schema}"
+            );
         }
     }
 
@@ -3273,5 +3705,16 @@ mod tests {
         assert_eq!(routing_text_of_input(&json!([[1, 2], [3]])), "");
         assert_eq!(routing_text_of_input(&json!({"text": "x"})), "");
         assert_eq!(routing_text_of_input(&json!(7)), "");
+    }
+
+    /// The type names the validation messages print, one per JSON shape.
+    #[test]
+    fn a_json_values_type_name_is_the_word_a_validation_message_prints() {
+        assert_eq!(json_type_name(&Value::Null), "null");
+        assert_eq!(json_type_name(&json!(true)), "a boolean");
+        assert_eq!(json_type_name(&json!(1)), "a number");
+        assert_eq!(json_type_name(&json!("x")), "a string");
+        assert_eq!(json_type_name(&json!([])), "an array");
+        assert_eq!(json_type_name(&json!({})), "an object");
     }
 }

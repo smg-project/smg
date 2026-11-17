@@ -53,6 +53,18 @@ pub(crate) fn request_body_too_large_response() -> Response {
     )
 }
 
+/// The refusal of a body whose client made no progress for the stall
+/// timeout, under [`REQUEST_BODY_STALLED`]: one code and one message for
+/// every framing (the buffered read here, the streamed read in the HTTP
+/// router).
+pub(crate) fn request_body_stalled_response(timeout_secs: u64) -> Response {
+    create_error(
+        StatusCode::REQUEST_TIMEOUT,
+        REQUEST_BODY_STALLED,
+        format!("No request body bytes arrived from the client for {timeout_secs} seconds"),
+    )
+}
+
 const READING: u8 = 0;
 const STALLED: u8 = 1;
 const TIMED_OUT: u8 = 2;
@@ -103,11 +115,7 @@ fn settled(timeouts: RequestBodyTimeouts, outcome: &AtomicU8, response: Response
                 timeout_secs,
                 "Request body stalled waiting on the client; ending the request"
             );
-            create_error(
-                StatusCode::REQUEST_TIMEOUT,
-                REQUEST_BODY_STALLED,
-                format!("No request body bytes arrived from the client for {timeout_secs} seconds"),
-            )
+            request_body_stalled_response(timeout_secs)
         }
         TIMED_OUT => {
             let timeout_secs = timeouts.total.as_secs();
@@ -241,9 +249,10 @@ struct TimedBody {
 }
 
 /// `now + total`, saturated to a far future when the sum does not fit an
-/// instant: a `request_timeout_secs` too large to hold (the "no timeout"
-/// idiom) is a deadline that never comes, as `tokio::time::sleep` treats it.
-fn deadline_from_now(total: Duration) -> tokio::time::Instant {
+/// instant: seconds too large to hold (the "no timeout" idiom of
+/// `request_timeout_secs`, a shutdown grace written as the largest number)
+/// are a deadline that never comes, as `tokio::time::sleep` treats them.
+pub(crate) fn deadline_from_now(total: Duration) -> tokio::time::Instant {
     let now = tokio::time::Instant::now();
     now.checked_add(total)
         .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
@@ -340,7 +349,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{super::request_start::RequestStarted, *};
-    use crate::middleware::test_support::{echo_request, echo_route, json_of, ECHO_PATH};
+    use crate::middleware::{
+        test_support::{echo_request, echo_route, json_of, ECHO_PATH},
+        RequestBodyLimitLayer,
+    };
 
     fn app(timeouts: RequestBodyTimeouts) -> Router {
         Router::new()
@@ -520,7 +532,7 @@ mod tests {
     /// more, past where the extractors look for it.
     #[tokio::test(start_paused = true)]
     async fn a_body_over_the_payload_limit_is_413_request_body_too_large() {
-        let app = app(timeouts(5, 60)).layer(crate::middleware::RequestBodyLimitLayer::new(8));
+        let app = app(timeouts(5, 60)).layer(RequestBodyLimitLayer::new(8));
         let response = app
             .oneshot(echo_request(Body::from("more than eight bytes")))
             .await

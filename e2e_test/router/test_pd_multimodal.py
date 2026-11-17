@@ -17,7 +17,7 @@ grid-less model takes the fully stripped decode side, while the M-RoPE model
 cannot pair with such a pool and must be rejected with a clear 400.
 
 Usage:
-    E2E_RUNTIME=vllm pytest e2e_test/router/test_pd_multimodal.py -v
+    E2E_RUNTIME=vllm E2E_ENGINE=vllm pytest e2e_test/router/test_pd_multimodal.py -v
 """
 
 from __future__ import annotations

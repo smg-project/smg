@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator
 from contextlib import aclosing
 from datetime import datetime, timezone
 from pathlib import Path
+from traceback import format_exc as get_exception_traceback
 
 import grpc
 import msgspec
@@ -25,7 +26,6 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.kv_events import (
     KVEventsConfig,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     ProfileReq,
@@ -33,21 +33,19 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.engine_status import abort_for_constraint_failure
 from smg_grpc_servicer.health_probe import await_probe
+from smg_grpc_servicer.sglang.compat import (
+    get_disaggregation_types,
+    get_multimodal_types,
+    get_tokenizer,
+)
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.hidden_states import (
@@ -61,6 +59,7 @@ from smg_grpc_servicer.sglang.loads import (
     load_record,
     ranks_with_a_window,
 )
+from smg_grpc_servicer.sglang.lora import PreloadedLoras
 from smg_grpc_servicer.sglang.request_manager import (
     GrpcRequestManager,
     _validate_token_ids_logprobs,
@@ -82,6 +81,10 @@ from ..constrained_decoding import (
 )
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
+
+DisaggregationMode, FAKE_BOOTSTRAP_HOST = get_disaggregation_types()
+
+Modality, MultimodalDataItem, MultimodalProcessorOutput = get_multimodal_types()
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -174,6 +177,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.scheduler_info = scheduler_info
         self.start_time = time.time()
         self.health_servicer = health_servicer
+        self.loras = PreloadedLoras(server_args)
         # SamplingParams.normalize requires a tokenizer whenever string stops
         # are used; the scheduler matches them with its own tokenizer.
         if server_args.skip_tokenizer_init:
@@ -218,6 +222,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.request_manager.auto_create_handle_loop()
 
         logger.info("gRPC scheduler servicer initialized")
+
+    async def ListLoadedLoRAAdapters(
+        self,
+        request: sglang_scheduler_pb2.ListLoadedLoRAAdaptersRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.ListLoadedLoRAAdaptersResponse:
+        return sglang_scheduler_pb2.ListLoadedLoRAAdaptersResponse(
+            loaded_adapters=self.loras.adapters
+        )
 
     async def Generate(
         self,
@@ -590,6 +603,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 return str(obj)
 
         serializable_args = make_serializable(server_args_dict)
+        from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
+
+        serializable_args["multimodal_encoder_dtype"] = encoder_dtype(
+            None, lambda: self.model_config.dtype
+        )
         # The operator's PD pairing protocol rides with the server args, so
         # the gateway reads it as the worker's `pairing_protocol` label.
         pairing_protocol = pairing_protocol_from_env()
@@ -1010,7 +1028,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ),
             top_logprobs_num=grpc_req.top_logprobs_num or 0,
             stream=grpc_req.stream or False,
-            lora_id=grpc_req.lora_id if grpc_req.lora_id else None,
+            lora_id=self.loras.resolve(grpc_req.lora_id) if grpc_req.lora_id else None,
             token_ids_logprob=(
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
             ),

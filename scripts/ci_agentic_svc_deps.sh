@@ -158,18 +158,8 @@ cmd_create_postgres_db() {
     local postgres_host="${1:-postgres-db}"
     local admin_url="postgresql://postgres:postgres@${postgres_host}:5432/postgres"
 
-    local apt_mirror
-    apt_mirror="$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
-    bash "$apt_mirror" || return "$?"
-    sudo apt-get update -qq || return "$?"
-    if ! sudo apt-get install -y -qq postgresql-client; then
-        # A live mirror can serve an index whose .deb objects return 404.
-        # Reuse the mirror helper's bounded reprobe once, then fail closed.
-        echo "Postgres client install failed; reprobe the Ubuntu mirror and refresh once" >&2
-        bash "$apt_mirror" --reprobe || return "$?"
-        sudo apt-get update -qq || return "$?"
-        sudo apt-get install -y -qq postgresql-client || return "$?"
-    fi
+    # Keep PostgreSQL setup fail-closed while sharing main's retried install unit.
+    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_install.sh" --strict-mirror sudo -y -qq postgresql-client || return "$?"
 
     TEST_DB="$(ci_postgres_dbname)"
     echo "Creating Postgres test database: $TEST_DB"
@@ -194,12 +184,26 @@ cmd_cleanup_postgres_db() {
         || echo "Warning: failed to drop Postgres test database $CI_POSTGRES_TEST_DB"
 }
 
+# The package of the asynchronous I/O library on this release: libaio1t64 from
+# Ubuntu 24.04 on, libaio1 before. CI_OS_RELEASE names the release file, as it
+# does for ci_apt_mirror.sh (default /etc/os-release).
+ci_libaio_package() {
+    local major
+    major="$(sed -n 's/^VERSION_ID="\{0,1\}\([0-9]*\).*/\1/p' "${CI_OS_RELEASE:-/etc/os-release}")"
+    if [ "${major:-0}" -ge 24 ]; then
+        echo libaio1t64
+    else
+        echo libaio1
+    fi
+}
+
 cmd_setup_oracle_client() {
     set -e
-    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
-    sudo apt-get update
-    sudo apt-get install -y unzip wget
-    sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
+    local libaio
+    libaio="$(ci_libaio_package)"
+    # The name is settled before the install: a fallback from one name to the
+    # other would retry, three times, a package the release does not have.
+    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_install.sh" sudo -y unzip wget "${libaio}"
 
     LIBAIO_PATH=$(find /usr/lib -name "libaio.so*" -type f 2>/dev/null | head -1)
     INSTANT_CLIENT_DIR="$HOME/instant-client"

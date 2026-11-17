@@ -40,9 +40,6 @@
 
 use std::{borrow::Cow, ops::Deref};
 
-#[path = "minimax_sglang_video.rs"]
-mod sglang_video;
-
 use image::DynamicImage;
 
 use super::{
@@ -50,14 +47,18 @@ use super::{
     qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode},
 };
 use crate::{
+    minimax_resize::{IMAGE_MAX_TOTAL_PIXELS, RESIZED_KEY, SGLANG_RESIZE_KEY},
     types::RgbFrameRef,
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
-        transforms::TransformError,
+        transforms::{rgb_pixels, TransformError},
     },
     EncoderDtype,
 };
+
+#[path = "minimax_sglang_video.rs"]
+mod sglang_video;
 
 /// Default patch size.
 pub const DEFAULT_PATCH_SIZE: usize = 14;
@@ -234,9 +235,7 @@ impl MiniMaxM3VisionProcessor {
             .unwrap_or_else(|| self.inner.merge_size());
         let temporal_patch_size = Self::declared_temporal_patch_size(config)?
             .unwrap_or_else(|| self.inner.temporal_patch_size());
-        let source_resized = config
-            .get_extra::<bool>(crate::minimax_resize::RESIZED_KEY)
-            .unwrap_or(false);
+        let source_resized = config.get_extra::<bool>(RESIZED_KEY).unwrap_or(false);
         if source_resized
             && config
                 .get_patch_size(self.inner.patch_size())
@@ -249,7 +248,7 @@ impl MiniMaxM3VisionProcessor {
         }
         // Source planning already aligned and checked the fixed image budget.
         let max_pixels = if source_resized {
-            crate::minimax_resize::IMAGE_MAX_TOTAL_PIXELS as usize
+            IMAGE_MAX_TOTAL_PIXELS as usize
         } else {
             config.max_pixels.unwrap_or_else(|| self.inner.max_pixels())
         };
@@ -273,9 +272,7 @@ impl MiniMaxM3VisionProcessor {
             video_max_pixels,
         );
         layered.inner = layered.inner.with_preprocessor_config(config);
-        layered.sglang_resize = config
-            .get_extra::<bool>(crate::minimax_resize::SGLANG_RESIZE_KEY)
-            .unwrap_or(false);
+        layered.sglang_resize = config.get_extra::<bool>(SGLANG_RESIZE_KEY).unwrap_or(false);
         layered.explicit_max_pixels = self.explicit_max_pixels || config.max_pixels.is_some();
         Ok(layered)
     }
@@ -356,7 +353,7 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
                 .map(|frame| RgbFrameRef {
                     width: frame.width(),
                     height: frame.height(),
-                    data: frame.as_raw(),
+                    data: rgb_pixels(frame),
                 })
                 .collect();
             return self.preprocess_sglang_video(&borrowed, clip);
@@ -431,10 +428,9 @@ mod tests {
             }))
         });
         let mut resized = m3_config();
-        resized.extra.insert(
-            crate::minimax_resize::RESIZED_KEY.to_owned(),
-            serde_json::json!(true),
-        );
+        resized
+            .extra
+            .insert(RESIZED_KEY.to_owned(), serde_json::json!(true));
         let mut unnormalized = m3_config();
         unnormalized.do_normalize = Some(false);
         for config in [

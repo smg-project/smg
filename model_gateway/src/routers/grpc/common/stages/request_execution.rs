@@ -8,36 +8,46 @@ use std::{
 };
 
 use axum::response::Response;
-use futures::future::{join_all, try_join_all};
+use futures::{
+    future::try_join_all,
+    stream::{FuturesUnordered, Stream, StreamExt},
+};
 use smg_grpc_client::{
     is_transport_failure, media_identity::sglang as media_contract, RequestDeadline,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
+    grouped_dp::hash_rank,
     helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
     pd_protocol::{PdDispatch, PdProtocol},
 };
 use crate::{
+    config::GroupedDpSticky,
     observability::{
         cache_trace,
         metrics::{metrics_labels, Metrics},
     },
     routers::{
         common::{
-            attempt_ledger::{mark_failed_side, mark_upstream_answer, AttemptLedger},
+            attempt_ledger::{
+                is_definitive_failure, mark_failed_side, mark_upstream_answer, AttemptLedger,
+            },
             pd_admission,
             pd_failure::{PdSide, SidePhase},
+            prefill_admission::PrefillLoadGuard,
             retry::mark_non_retryable,
         },
         error,
         grpc::{
+            backend_client::BackendClient,
             common::stages::encode::EncodeDispatchPlan,
             context::{
                 stage_output, ClientSelection, DispatchContext, EncodeOutputs, ExecutionPlan,
                 ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
             },
+            multimodal::ec_push::PushCleanup,
             proto_wrapper::{
                 DispatchBooking, FanoutStream, FirstItem, PrefillTicket, ProtoEmbedRequest,
                 ProtoGenerateRequest, ProtoGenerateResponse, ProtoRequest, ProtoStream,
@@ -51,9 +61,9 @@ use crate::{
         },
     },
     worker::{
-        basic::WorkerTypeExt,
-        liveness::{self, SideReprieve},
-        ConnectionModeExt, PrefillLoadGuard, Worker,
+        health::liveness::{self, SideReprieve},
+        identity::basic::WorkerTypeExt,
+        ConnectionModeExt, Worker,
     },
 };
 
@@ -106,6 +116,7 @@ fn plan_sub_requests(plan: &ExecutionPlan, workers: Option<&WorkerSelection>) ->
             width(request)
         }
         ExecutionPlan::Single(_) => 1,
+        ExecutionPlan::EmbedBatch { requests, .. } => requests.len(),
     }
 }
 
@@ -196,6 +207,26 @@ fn fan_out_pd_request(
         .collect()
 }
 
+/// The sub-requests [`execute_fanout_pd`] dispatches for an n>1 request: each
+/// gets the PD metadata and a room of its own, moved into `room_residue`'s
+/// class when the request's sticky key pinned its prefill rank (see
+/// [`pin_grouped_dp_prefill_room`]), so every sample runs on the key's
+/// prefill engine.
+fn pd_fanout_requests(
+    request: &ProtoGenerateRequest,
+    n: u32,
+    workers: &WorkerSelection,
+    room_residue: Option<RoomResidue>,
+) -> Vec<ProtoGenerateRequest> {
+    fan_out_pd_request(request, n, |sub| {
+        maybe_inject_pd_metadata(sub, workers);
+        maybe_inject_pd_rendezvous(sub, workers);
+        if let Some(residue) = room_residue {
+            residue.apply(sub);
+        }
+    })
+}
+
 /// Metric connection labels for the PD sides (a side can be gRPC or ZMQ).
 fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
     match workers {
@@ -222,12 +253,17 @@ fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// deadline, counted from its dispatch (after the admission gate below,
 /// which has a bound of its own) over the calls that open the streams and
 /// over every message on them (see [`RequestDeadline`]); `None` leaves the
-/// attempt unbounded.
+/// attempt unbounded. `grouped_dp_sticky` is `--grouped-dp-sticky`: whether,
+/// and how, a sticky request to a grouped data-parallel worker is pinned to
+/// one of its engines (see [`pin_grouped_dp_rank`]), and a disaggregated
+/// one's bootstrap room to its grouped prefill rank (see
+/// [`pin_grouped_dp_prefill_room`]).
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     mut execution_plan: ExecutionPlan,
     last_attempt: bool,
     request_timeout: Option<Duration>,
+    grouped_dp_sticky: GroupedDpSticky,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
     // completion fans out one PD dispatch per sub-request, so admission has
@@ -258,6 +294,9 @@ pub(crate) async fn execute_plan(
     // their SHM Drop guards here: dispatch consumes them, while an early
     // error before dispatch drops them and reclaims the SHM.
     let encode = ctx.encode_outputs.take();
+    // The watch on a rendezvous plan's encode dispatch: made by the first
+    // attempt's launch, read by its replays (see `prepare_epd_attempt`).
+    let encode_watch = &mut ctx.encode_watch;
 
     let clients = stage_output(ctx.clients.as_mut(), "execute_plan")?;
 
@@ -274,15 +313,34 @@ pub(crate) async fn execute_plan(
         admission,
         LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
     ));
+    // A sticky request to a grouped data-parallel worker goes to its key's
+    // engine.
+    pin_grouped_dp_rank(
+        &mut execution_plan,
+        workers,
+        || clients.single().and_then(BackendClient::pinnable_ranks),
+        ctx.sticky_key.as_deref(),
+        grouped_dp_sticky,
+    );
+    // A sticky disaggregated request's room carries its key's prefill rank
+    // on a grouped prefill worker; an n>1 request's samples, which get rooms
+    // of their own at dispatch, take the same residue.
+    let room_residue = pin_grouped_dp_prefill_room(
+        &mut execution_plan,
+        workers,
+        || match &*clients {
+            ClientSelection::Disaggregated { prefill, .. } => prefill.connected_engines(),
+            ClientSelection::Single { .. } => None,
+        },
+        ctx.sticky_key.as_deref(),
+        grouped_dp_sticky,
+    );
     // The Prefill admission slot worker selection took for this attempt. It
     // is released when the Prefill phase ends, not with the load guards.
     let prefill_guard = ctx.pd_prefill_guard.take();
 
     // Extract dispatch metadata for the tracing span and PD metric labels.
-    let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
-        error!(function = "execute_plan", "Dispatch metadata not set");
-        error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
-    })?;
+    let dispatch = stage_output(ctx.dispatch.as_ref(), "execute_plan")?;
     let request_id = dispatch.request_id.as_str();
     let model = dispatch.model.as_str();
     let request_type = execution_plan.request_type();
@@ -327,12 +385,29 @@ pub(crate) async fn execute_plan(
                     execute_single(req, clients, workers, ledger, dispatched_at.into_std()).await
                 }
                 ProtoRequest::Embed(req) => {
-                    execute_single_embed(req, clients, workers, ledger).await
+                    execute_embed(vec![req], clients, workers, ledger).await
                 }
             },
+            ExecutionPlan::EmbedBatch { requests, .. } => {
+                execute_embed(requests, clients, workers, ledger).await
+            }
+            // The two disaggregated arms are boxed: their futures are over ten
+            // times the single arm's, and by value they would size every
+            // attempt's dispatch future (and the run's one box) for a path the
+            // request does not take.
             ExecutionPlan::PrefillDecode(req) => {
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
+                Box::pin(execute_pd_dispatch(
+                    req,
+                    clients,
+                    workers,
+                    model,
+                    prefill_guard,
+                    ledger,
+                    room_residue,
+                    None,
+                ))
+                .await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
                 let push_encode = matches!(encode, Some(EncodeOutputs::Push(_)));
@@ -340,15 +415,16 @@ pub(crate) async fn execute_plan(
                 // request at request building and its encode jobs go with the
                 // prefill/decode pair; a push plan runs its encode call first.
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_epd_dispatch(
+                Box::pin(execute_epd_dispatch(
                     request,
                     clients,
                     workers,
                     model,
                     encode,
+                    encode_watch,
                     prefill_guard,
                     ledger,
-                )
+                ))
                 .await
                 .map_err(|mut response| {
                     // A push may already have reserved buffers on this
@@ -475,6 +551,13 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
     })
 }
 
+/// Dispatch one disaggregated request in its runtime's shape.
+/// `room_residue` is the prefill rank the request's sticky key pinned its
+/// room to ([`pin_grouped_dp_prefill_room`]), which the rooms of an n>1
+/// request's samples take too.
+/// `encode` is the watch on an EPD request's encode dispatch (see
+/// [`launch_encode_dispatch`]), `None` for every other request.
+#[expect(clippy::too_many_arguments)]
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -482,6 +565,8 @@ async fn execute_pd_dispatch(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    room_residue: Option<RoomResidue>,
+    encode: Option<EncodeWatch>,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -522,10 +607,28 @@ async fn execute_pd_dispatch(
         }
         PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
             Some(n) => {
-                execute_fanout_pd(proto_request, n, clients, workers, prefill_guard, ledger).await
+                execute_fanout_pd(
+                    proto_request,
+                    n,
+                    clients,
+                    workers,
+                    prefill_guard,
+                    ledger,
+                    room_residue,
+                    encode,
+                )
+                .await
             }
             None => {
-                execute_parallel_pd(proto_request, clients, workers, prefill_guard, ledger).await
+                execute_parallel_pd(
+                    proto_request,
+                    clients,
+                    workers,
+                    prefill_guard,
+                    ledger,
+                    encode,
+                )
+                .await
             }
         },
     }?;
@@ -579,9 +682,11 @@ fn attribute_pd_sides(result: ExecutionResult, workers: &WorkerSelection) -> Exe
 }
 
 /// Dispatch an n>1 request as `n` concurrent single-sample PD pairs, each
-/// with its own rendezvous room, and merge their sides into one PD result
-/// whose responses carry the sample index. Fail-fast: the first pair that
-/// fails to start fails the request, and dropping the others aborts them.
+/// with its own rendezvous room ([`pd_fanout_requests`]), and merge their
+/// sides into one PD result whose responses carry the sample index.
+/// Fail-fast: the first pair that fails to start fails the request, and
+/// dropping the others aborts them.
+#[expect(clippy::too_many_arguments)]
 async fn execute_fanout_pd(
     proto_request: ProtoGenerateRequest,
     n: u32,
@@ -589,11 +694,10 @@ async fn execute_fanout_pd(
     workers: &WorkerSelection,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    room_residue: Option<RoomResidue>,
+    encode: Option<EncodeWatch>,
 ) -> Result<ExecutionResult, Response> {
-    let subs = fan_out_pd_request(&proto_request, n, |sub| {
-        maybe_inject_pd_metadata(sub, workers);
-        maybe_inject_pd_rendezvous(sub, workers);
-    });
+    let subs = pd_fanout_requests(&proto_request, n, workers, room_residue);
     debug!(
         request_id = proto_request.request_id(),
         samples = n,
@@ -604,7 +708,8 @@ async fn execute_fanout_pd(
     let guards = prefill_guard.replicate_to(subs.len());
     let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
         let mut clients = clients.clone();
-        async move { execute_parallel_pd(sub, &mut clients, workers, guard, ledger).await }
+        let encode = encode.clone();
+        async move { execute_parallel_pd(sub, &mut clients, workers, guard, ledger, encode).await }
     });
     let results = try_join_all(dispatches).await?;
 
@@ -658,32 +763,23 @@ async fn execute_fanout_pd(
 
 /// Dispatch an EPD request by the encode stage's plan: a push plan's encoder
 /// completes before the prefill/decode pair is sent; a rendezvous plan's
-/// encode jobs launch beside the pair.
+/// encode jobs launch beside the pair, and a failure of their dispatch ends
+/// the prefill side's wait (see [`launch_encode_dispatch`]) on this attempt
+/// and on a replay (see [`prepare_epd_attempt`]). `encode_watch` is the
+/// dispatch context's slot for the watch on that dispatch.
+#[expect(clippy::too_many_arguments)]
 async fn execute_epd_dispatch(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     model: &str,
     encode: Option<EncodeOutputs>,
+    encode_watch: &mut Option<EncodeWatch>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let mut cleanup = None;
-    match encode {
-        // The built prompt goes to the encoder first; its completion has
-        // replaced the pixels by the time the prefill side sees it.
-        Some(EncodeOutputs::Push(plan)) => {
-            cleanup = Some(plan.encode(&mut proto_request).await?);
-        }
-        // The encode jobs go beside the prefill/decode pair; the prefill side
-        // drops its pixels, its embeddings come from the encode workers.
-        Some(EncodeOutputs::Rendezvous { dispatch, .. }) => {
-            spawn_encode_dispatch(dispatch);
-            proto_request.clear_mm_pixel_values();
-        }
-        // Text-only, or a retry whose first dispatch took the plan.
-        None => proto_request.clear_mm_pixel_values(),
-    }
+    let mut cleanup = prepare_epd_attempt(&mut proto_request, encode, encode_watch).await?;
+    // An EPD request's room is left as minted: no sticky prefill rank.
     let result = execute_pd_dispatch(
         proto_request,
         clients,
@@ -691,6 +787,8 @@ async fn execute_epd_dispatch(
         model,
         prefill_guard,
         ledger,
+        None,
+        encode_watch.clone(),
     )
     .await;
     if result.is_ok() {
@@ -703,17 +801,72 @@ async fn execute_epd_dispatch(
     result
 }
 
+/// Ready an EPD attempt's prefill request for its encode handoff, and leave
+/// the watch its prefill side races on `carried`, the dispatch context's
+/// slot. A push plan's encoder answers first: its completion has replaced
+/// the pixels by the time the prefill side sees the prompt, and its
+/// cleanups come back armed until the pair's dispatch is in. A rendezvous
+/// plan's first attempt launches the encode jobs beside the pair and makes
+/// the watch; the prefill side drops its pixels, its embeddings come from
+/// the encode workers. A replay gets `None` (the first attempt took the
+/// plan) and waits at the same rooms on the same jobs, so the watch the
+/// first attempt left stands: a send that fails after the first attempt
+/// returned ends the replay's wait as it would have the first attempt's.
+/// Text-only leaves nothing.
+async fn prepare_epd_attempt(
+    proto_request: &mut ProtoGenerateRequest,
+    encode: Option<EncodeOutputs>,
+    carried: &mut Option<EncodeWatch>,
+) -> Result<Option<Vec<PushCleanup>>, Response> {
+    match encode {
+        Some(EncodeOutputs::Push(plan)) => Ok(Some(plan.encode(proto_request).await?)),
+        Some(EncodeOutputs::Rendezvous { dispatch, .. }) => {
+            *carried = launch_encode_dispatch(dispatch);
+            proto_request.clear_mm_pixel_values();
+            Ok(None)
+        }
+        None => {
+            proto_request.clear_mm_pixel_values();
+            Ok(None)
+        }
+    }
+}
+
+/// The watch on an EPD request's encode dispatch: `None` until a send has
+/// failed, then the first failure's words (see [`launch_encode_dispatch`]).
+pub(crate) type EncodeWatch = watch::Receiver<Option<String>>;
+
+/// The watch on an EPD request's encode dispatch as the parallel dispatch
+/// races it beside both sides (see [`dispatch_pd_sides`]), with what the
+/// prefill side's verdict needs: the worker the side was sent to, its
+/// connection label and the request.
+struct EncodeRace {
+    watch: EncodeWatch,
+    worker: Arc<dyn Worker>,
+    connection: &'static str,
+    request_id: String,
+}
+
+/// Launch a rendezvous plan's encode jobs beside the prefill/decode pair and
+/// supervise them in the background. The prefill side blocks on the
+/// embedding receive; a job the encoder never took (the connection failed,
+/// the RPC was refused, the request was not accepted) leaves nothing at the
+/// rendezvous, so the first such failure is published on the returned watch
+/// the moment it lands and the prefill side's wait ends on it (the dispatch
+/// phase in [`dispatch_pd_sides`], the first-response phase in
+/// [`first_prefill_response_within`]) instead of running to its silence
+/// bound. `None` for an empty plan.
 #[expect(
     clippy::disallowed_methods,
     reason = "EPD encode dispatch is intentionally supervised in the background while the prefill side blocks on embedding receive."
 )]
-fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
+fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeWatch> {
     if encode_dispatch.is_empty() {
-        return;
+        return None;
     }
 
     let num_encode_items = encode_dispatch.len();
-    let sends: Vec<_> = encode_dispatch
+    let sends: FuturesUnordered<_> = encode_dispatch
         .into_jobs()
         .into_iter()
         .map(|job| tokio::spawn(async move { job.dispatch().await }))
@@ -724,27 +877,67 @@ fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
         "EPD encode dispatch issued with prefill/decode"
     );
 
-    tokio::spawn(async move {
-        for join_res in join_all(sends).await {
-            match join_res {
-                Ok(Ok(())) => {}
-                Ok(Err(message)) => {
-                    error!(
-                        function = "execute_epd_dispatch",
-                        error = %message,
-                        "Backend encode dispatch failed after EPD dispatch; embedding-receive timeout will abort the request"
-                    );
-                }
-                Err(join_err) => {
-                    error!(
-                        function = "execute_epd_dispatch",
-                        error = %join_err,
-                        "Encode dispatch task panicked after EPD dispatch"
-                    );
-                }
-            }
+    // Each send's outcome as it lands, a panicked task counted as a failed
+    // send: one refused encoder is published while its siblings still run.
+    let outcomes = sends.map(|join_res| match join_res {
+        Ok(outcome) => outcome,
+        Err(join_err) => {
+            error!(
+                function = "execute_epd_dispatch",
+                error = %join_err,
+                "Encode dispatch task panicked after EPD dispatch"
+            );
+            Err(join_err.to_string())
         }
     });
+    let (failed_tx, failed_rx) = watch::channel(None);
+    tokio::spawn(supervise_encode_sends(outcomes, failed_tx));
+    Some(failed_rx)
+}
+
+/// Supervise an EPD request's encode sends: the first failure among
+/// `outcomes` goes on `failed` the moment it lands, a sibling still in
+/// flight notwithstanding; later failures are logged. Nobody listening (the
+/// side answered, or failed on its own) is fine.
+async fn supervise_encode_sends(
+    mut outcomes: impl Stream<Item = Result<(), String>> + Unpin,
+    failed: watch::Sender<Option<String>>,
+) {
+    while let Some(outcome) = outcomes.next().await {
+        let Err(failure) = outcome else {
+            continue;
+        };
+        error!(
+            function = "execute_epd_dispatch",
+            error = %failure,
+            "Backend encode dispatch failed after EPD dispatch; the prefill side's wait ends on it"
+        );
+        failed.send_if_modified(|failed| {
+            if failed.is_none() {
+                *failed = Some(failure);
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+/// Wait for the encode dispatch `watch` to report a failure, and give its
+/// words. Pending for good without a watch, and once the supervisor has
+/// gone without a failure (every job was taken).
+async fn encode_dispatch_failed(watch: Option<&mut EncodeWatch>) -> String {
+    let Some(watch) = watch else {
+        return std::future::pending().await;
+    };
+    loop {
+        if let Some(failure) = &*watch.borrow_and_update() {
+            return failure.clone();
+        }
+        if watch.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
 }
 
 /// Dispatch one backend request per batched prompt concurrently, preserving
@@ -782,7 +975,8 @@ async fn execute_batch_dispatch(
                     ExecutionPlanKind::Single => {
                         execute_single(request, &mut clients, workers, ledger, dispatched_at).await
                     }
-                    // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
+                    // Completion EPD carries no encode jobs; sub-requests dispatch as PD,
+                    // each with the room it was minted (no sticky prefill rank).
                     ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
                         let prefill_guard = require_prefill_guard(prefill_guard)?;
                         execute_pd_dispatch(
@@ -792,6 +986,8 @@ async fn execute_batch_dispatch(
                             model,
                             prefill_guard,
                             ledger,
+                            None, // the room as minted: no sticky prefill rank
+                            None, // no encode dispatch on this path
                         )
                         .await
                     }
@@ -801,6 +997,159 @@ async fn execute_batch_dispatch(
 
     let results = try_join_all(dispatches).await?;
     Ok(ExecutionResult::Batch { results })
+}
+
+/// A grouped data-parallel worker (one ZMQ socket set that several engines
+/// dial, no `dp_rank`) leaves each request to the connector's least-loaded
+/// pick, which scatters one conversation's turns over the ranks' separate
+/// prefix caches. With a sticky key, pin the plan's single generate request
+/// to the key's rank instead, stable per key as dp-aware expansion pins gRPC
+/// and HTTP rank workers: under `sticky`, the key's hash rank. A batch's
+/// prompts, an embedding and a disaggregated request (on TokenSpeed, its
+/// bootstrap room carries its prefill rank instead; see
+/// [`pin_grouped_dp_prefill_room`]) are left as they are. The ranks are the worker's `dp_size`, or, for a
+/// worker given no count (its engines declare the group at the handshake),
+/// the ranks its connection places a pin on, fixed for the connection's
+/// life: `pinnable_ranks` reads them, when the connection says (see
+/// [`BackendClient::pinnable_ranks`]), and only for a request that may be
+/// pinned. A key whose rank is not below `pinnable_ranks` (on vLLM, one at
+/// or past the first index the group's engines lack) is left to the
+/// connector's pick, which takes any engine, rather than pinned where the
+/// connector may refuse it; each such request is logged at debug.
+fn pin_grouped_dp_rank(
+    plan: &mut ExecutionPlan,
+    workers: &WorkerSelection,
+    pinnable_ranks: impl FnOnce() -> Option<usize>,
+    sticky_key: Option<&str>,
+    sticky: GroupedDpSticky,
+) {
+    if sticky == GroupedDpSticky::Off {
+        return;
+    }
+    let (ExecutionPlan::Single(ProtoRequest::Generate(request)), Some(key)) = (plan, sticky_key)
+    else {
+        return;
+    };
+    let Some(worker) = workers.single() else {
+        return;
+    };
+    if worker.dp_rank().is_some() {
+        return;
+    }
+    let pinnable_ranks = pinnable_ranks();
+    let Some(size) = worker.dp_size().or(pinnable_ranks).filter(|&size| size > 1) else {
+        return;
+    };
+    let rank = match sticky {
+        GroupedDpSticky::Off => return,
+        GroupedDpSticky::Hash => hash_rank(key, size),
+    };
+    if pinnable_ranks.is_none_or(|ranks| rank < ranks) {
+        request.set_data_parallel_rank(rank as i32);
+    } else {
+        debug!(
+            request_id = request.request_id(),
+            worker = worker.redacted_url(),
+            rank,
+            size,
+            pinnable_ranks,
+            "Sticky key's grouped data-parallel rank is past the ranks its worker's connection \
+             places a pin on; the request keeps the connector's pick"
+        );
+    }
+}
+
+/// A sticky key's prefill rank as a disaggregated request's bootstrap room
+/// carries it: the room's residue modulo the prefill side's `ranks` engines
+/// is `rank` (see [`pin_grouped_dp_prefill_room`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoomResidue {
+    rank: usize,
+    ranks: usize,
+}
+
+impl RoomResidue {
+    /// Move `request`'s bootstrap room into this residue class, its other
+    /// bits kept as minted; false, and nothing changed, for a request
+    /// without a room.
+    fn apply(self, request: &mut ProtoGenerateRequest) -> bool {
+        request.set_kv_bootstrap_room_residue(self.rank, self.ranks)
+    }
+}
+
+/// The disaggregated counterpart of [`pin_grouped_dp_rank`]. A grouped
+/// data-parallel prefill worker (a ZMQ worker several engines dial, no
+/// `dp_rank`) runs a TokenSpeed request on the rank its bootstrap room's
+/// residue names, modulo the engines its connection connected: on the
+/// prefill side a rank pin yields to the room, and the decode side reads the
+/// KV from that rank. The room is minted at random, which scatters one
+/// conversation's turns over the prefill engines' separate prefix caches.
+/// With a sticky key, the room moves into the residue class of the key's
+/// rank under `sticky` instead. This runs on every attempt, over the room
+/// the attempt minted for its own prefill worker. The ranks are
+/// `prefill_engines`, the engines the prefill side's connection connected
+/// (the modulus the engine places by), or, where the connection does not
+/// say, the worker's `dp_size`. The decode side gets the same room and,
+/// unpinned, places the request on its residue modulo its own engines, so a
+/// decode group the size of the prefill group follows the prefill rank.
+///
+/// Returns the residue, for the rooms of an n>1 request's samples (see
+/// [`pd_fanout_requests`]). Nothing is pinned for a dp-aware prefill worker,
+/// whose minted room already carries its rank, or for one with a single
+/// engine. A batched or EPD request, or one on a runtime other than
+/// TokenSpeed, keeps its random room, which is logged once.
+fn pin_grouped_dp_prefill_room(
+    plan: &mut ExecutionPlan,
+    workers: &WorkerSelection,
+    prefill_engines: impl FnOnce() -> Option<usize>,
+    sticky_key: Option<&str>,
+    sticky: GroupedDpSticky,
+) -> Option<RoomResidue> {
+    if sticky == GroupedDpSticky::Off {
+        return None;
+    }
+    let key = sticky_key?;
+    let prefill = workers.prefill_worker()?;
+    if prefill.dp_rank().is_some() {
+        return None;
+    }
+    let ranks = prefill_engines()
+        .or_else(|| prefill.dp_size())
+        .filter(|&ranks| ranks > 1)?;
+    let rank = match sticky {
+        GroupedDpSticky::Off => return None,
+        GroupedDpSticky::Hash => hash_rank(key, ranks),
+    };
+    let residue = RoomResidue { rank, ranks };
+    let unpinned = match plan {
+        ExecutionPlan::PrefillDecode(request) => {
+            if residue.apply(request) {
+                return Some(residue);
+            }
+            "a request on a runtime other than TokenSpeed"
+        }
+        ExecutionPlan::EncodePrefillDecode { .. } => "an EPD request",
+        ExecutionPlan::Batch { .. } => "a batched request",
+        ExecutionPlan::Single(_) | ExecutionPlan::EmbedBatch { .. } => return None,
+    };
+    note_unpinned_prefill_room(prefill.as_ref(), unpinned);
+    None
+}
+
+/// Log, once per gateway process, that `--grouped-dp-sticky` left a sticky
+/// disaggregated request on its random bootstrap room although its prefill
+/// worker has several engines to choose from; `request` says which kind.
+fn note_unpinned_prefill_room(prefill: &dyn Worker, request: &'static str) {
+    static NOTED: OnceLock<()> = OnceLock::new();
+    NOTED.get_or_init(|| {
+        warn!(
+            prefill_worker = %prefill.redacted_url(),
+            request,
+            "--grouped-dp-sticky carries a sticky key's prefill rank only in the bootstrap room \
+             of a single TokenSpeed disaggregated request; this one keeps its random room, so \
+             its prefill rank is not pinned (logged once)"
+        );
+    });
 }
 
 async fn execute_single(
@@ -939,23 +1288,90 @@ pub(crate) fn start_failure_response(
     response
 }
 
-async fn execute_single_embed(
-    proto_request: ProtoEmbedRequest,
+/// The embed calls a request holds open on its worker at once. A batch of
+/// this many inputs or fewer goes out whole; a longer one keeps this many in
+/// flight, wide enough that the engine still fills its own batches from
+/// them, and the worker's queue is no longer one request's to fill.
+pub(crate) const MAX_IN_FLIGHT_EMBED_CALLS: usize = 256;
+
+/// The calls of a batch past the window, at most the window of them in
+/// flight, their answers in the inputs' order. Unordered, so a slow call
+/// does not hold the window's other slots: each answer is put back at its
+/// input's place. The index rides the call's own future: an async block
+/// around the call would hold that future twice and double every call's
+/// task.
+async fn embed_in_window<C>(calls: impl ExactSizeIterator<Item = C>) -> Vec<C::Output>
+where
+    C: Future,
+{
+    use futures::FutureExt;
+
+    let mut calls = calls.enumerate();
+    let mut in_flight = FuturesUnordered::new();
+    let mut answers = Vec::with_capacity(calls.len());
+    loop {
+        while in_flight.len() < MAX_IN_FLIGHT_EMBED_CALLS {
+            let Some((index, call)) = calls.next() else {
+                break;
+            };
+            in_flight.push(call.map(move |answer| (index, answer)));
+        }
+        let Some(answer) = in_flight.next().await else {
+            break;
+        };
+        answers.push(answer);
+    }
+    answers.sort_unstable_by_key(|(index, _)| *index);
+    answers.into_iter().map(|(_, answer)| answer).collect()
+}
+
+/// The embed calls of a request, one per input, at most
+/// [`MAX_IN_FLIGHT_EMBED_CALLS`] of them in flight together on the one worker
+/// and answered in the inputs' order (the wire takes one input per call). The
+/// first failure fails the request as a failed single call does, once every
+/// call has answered: a sibling in flight is never dropped mid-way, so the
+/// worker's own account of the calls it admitted stays whole.
+/// The worker's request count takes one per call, as the batched completions
+/// route counts its sub-requests.
+/// The circuit breaker takes one sample for the request, the worst answer by
+/// the worker's reading ([`batch_breaker_status`]).
+async fn execute_embed(
+    requests: Vec<ProtoEmbedRequest>,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let client = clients.single_or_mismatch("execute_single_embed")?;
+    // The file's own `join_all` import goes with the last other call that
+    // uses it; this one names the function here, so the call stands whether
+    // or not that import remains.
+    use futures::future::join_all;
 
-    if let Some(worker) = workers.single() {
-        Metrics::record_worker_request(worker.url(), worker.model_id());
-    }
-    let result = client.embed(proto_request).await;
-    if let Some(status) = result.breaker_status() {
+    let client = &*clients.single_or_mismatch("execute_embed")?;
+
+    let worker = workers.single();
+    let calls = requests.into_iter().map(|request| {
+        if let Some(worker) = worker {
+            Metrics::record_worker_request(worker.url(), worker.model_id());
+        }
+        client.embed(request)
+    });
+    // A batch within the window is one plain join, as a single input is. The
+    // window's queue is a future of its own, boxed: only the batch that
+    // needs the window pays for it, in its calls and in this future's size.
+    let answers = if calls.len() <= MAX_IN_FLIGHT_EMBED_CALLS {
+        join_all(calls).await
+    } else {
+        Box::pin(embed_in_window(calls)).await
+    };
+    // One breaker sample for the request, read from every answer: a worker
+    // failure on any input counts whatever its place in the batch.
+    if let Some(status) = worker.and_then(|worker| batch_breaker_status(&answers, worker.as_ref()))
+    {
         workers.record_outcome(ledger, status);
     }
+    let result: Result<Vec<_>, _> = answers.into_iter().collect();
 
-    let complete = result.map_err(|e| {
+    let responses = result.map_err(|e| {
         if let Some(worker) = workers.single() {
             UpstreamClass::account_dispatch_failure(
                 worker.worker_type().as_metric_label(),
@@ -965,18 +1381,48 @@ async fn execute_single_embed(
         }
         start_failure_response(
             &e,
-            "execute_single_embed",
+            "execute_embed",
             "Failed to start embedding",
             "start_embedding_failed",
         )
     })?;
 
-    Ok(ExecutionResult::Embedding { response: complete })
+    Ok(ExecutionResult::Embedding { responses })
+}
+
+/// The circuit breaker's one sample for a request the gateway dispatched as
+/// several calls, one per input: the worst answer by the worker's own
+/// reading, a failure it charges over its capacity pushback over the
+/// request's own fault (a rejection of one input) over the successes, so a
+/// worker failure counts whatever its place in the batch and a rejection
+/// ahead of it hides nothing; `None` when no answer says anything about the
+/// worker (a media fault, a constraint the engine could not continue under).
+fn batch_breaker_status<T>(
+    answers: &[Result<T, tonic::Status>],
+    worker: &dyn Worker,
+) -> Option<u16> {
+    let rank = |status: u16| {
+        if worker.is_breaker_failure(status) {
+            3
+        } else if worker.resilience().capacity_status_codes.contains(&status) {
+            2
+        } else {
+            u8::from(status >= 400)
+        }
+    };
+    answers
+        .iter()
+        .filter_map(TonicResultExt::breaker_status)
+        .max_by_key(|status| rank(*status))
 }
 
 /// What addresses both sides of a disaggregated dispatch: the pair and the
 /// request's ledger, each side's transport label, the request id both sides
-/// carry, and the prompt's size, which bounds each side's silence.
+/// carry, the prompt's size, which bounds each side's silence, and whether
+/// the client's request streams, which gives the decode side a first token
+/// to watch for (the caller's flag: the sequential shape sends its prefill
+/// request unstreamed whatever the client asked, so the prefill request
+/// cannot say).
 pub(crate) struct PdSides<'a> {
     pub(crate) workers: &'a WorkerSelection,
     pub(crate) ledger: &'a AttemptLedger,
@@ -984,6 +1430,7 @@ pub(crate) struct PdSides<'a> {
     pub(crate) decode_label: &'static str,
     pub(crate) request_id: String,
     pub(crate) prompt_tokens: u64,
+    pub(crate) streaming: bool,
 }
 
 impl<'a> PdSides<'a> {
@@ -991,6 +1438,7 @@ impl<'a> PdSides<'a> {
         workers: &'a WorkerSelection,
         ledger: &'a AttemptLedger,
         prefill_request: &ProtoGenerateRequest,
+        streaming: bool,
     ) -> Self {
         let (prefill_label, decode_label) = pd_side_labels(workers);
         let prompt_tokens = u64::try_from(prefill_request.prompt_len()).unwrap_or(u64::MAX);
@@ -1002,6 +1450,7 @@ impl<'a> PdSides<'a> {
             decode_label,
             request_id,
             prompt_tokens,
+            streaming,
         }
     }
 }
@@ -1019,7 +1468,9 @@ async fn execute_parallel_pd(
     workers: &WorkerSelection,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    encode: Option<EncodeWatch>,
 ) -> Result<ExecutionResult, Response> {
+    let streaming = proto_request.stream();
     let runtime = workers
         .disaggregated_runtime_type()
         .map(|r| r.as_str())
@@ -1041,14 +1492,21 @@ async fn execute_parallel_pd(
     // it on this path), so prefill duration cannot be measured — only TTFT,
     // recorded at the first decode token in streaming. prefill_start anchors it.
     let prefill_start = Instant::now();
-    let sides = PdSides::of(workers, ledger, &prefill_request);
+    let sides = PdSides::of(workers, ledger, &prefill_request, streaming);
     // The prefill side's silence is bounded from its dispatch: a call that
     // returns no stream, or a stream with nothing on it, within the bound
     // fails the attempt instead of holding the request (and the decode room
-    // the admission gate claimed for it) until its own timeout.
+    // the admission gate claimed for it) until its own timeout. A side whose
+    // embeddings come from an encode worker has the encoder's forward and
+    // the transfer in front of its first response as well.
     let prefill_worker = workers.prefill_worker();
-    let bound = prefill_worker
-        .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
+    let bound = prefill_worker.and_then(|worker| {
+        if prefill_request.awaits_encode() {
+            PrefillBound::behind_encode(worker, sides.prompt_tokens, prefill_start)
+        } else {
+            PrefillBound::at(worker, sides.prompt_tokens, prefill_start)
+        }
+    });
     // Each side owns its client handle (a cheap channel clone, the same one
     // batched dispatch takes per sub-request) so the side still in flight when
     // its partner fails can be moved off the request path.
@@ -1068,7 +1526,10 @@ async fn execute_parallel_pd(
     let prefill_ticket =
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
     let prefill_dispatch: SideDispatch = Box::pin(dispatch_prefill_within(
-        bound.clone(),
+        PrefillWait {
+            bound: bound.clone(),
+            encode: encode.clone(),
+        },
         Box::pin(async move {
             let mut stream = prefill_client.generate(prefill_request).await?;
             if await_identity {
@@ -1118,13 +1579,24 @@ async fn execute_parallel_pd(
 
     // The prefill worker's handoffs are watched for only where its side has a bound.
     let handoff_to = bound.as_ref().and(prefill_worker);
-    match dispatch_pd_sides(prefill_dispatch, decode_dispatch, handoff_to).await {
+    // The request's encode dispatch is raced beside both sides' dispatches,
+    // bound or not (the prefill's first-response wait races it again).
+    let encode_race = encode
+        .clone()
+        .zip(prefill_worker.cloned())
+        .map(|(watch, worker)| EncodeRace {
+            watch,
+            worker,
+            connection: sides.prefill_label,
+            request_id: sides.request_id.clone(),
+        });
+    match dispatch_pd_sides(prefill_dispatch, decode_dispatch, handoff_to, encode_race).await {
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
             parallel_sides_answered(
                 &sides,
                 prefill_result,
                 decode_result,
-                bound,
+                PrefillWait { bound, encode },
                 prefill_ticket,
                 prefill_guard,
                 // Both sides were dispatched together, so the decode side's
@@ -1192,31 +1664,41 @@ async fn parallel_sides_answered(
     sides: &PdSides<'_>,
     prefill_result: StreamResult,
     decode_result: StreamResult,
-    bound: Option<PrefillBound>,
+    wait: PrefillWait,
     prefill_ticket: Option<PrefillTicket>,
     prefill_guard: PrefillLoadGuard,
     pd_timing: PdTiming,
 ) -> Result<ExecutionResult, Response> {
     let workers = sides.workers;
     record_pd_dispatch_outcomes(workers, sides.ledger, &prefill_result, &decode_result);
+    // A non-streaming request's decode side has no first-token signal (its
+    // one response is its whole answer), so the wait its deferred abort
+    // makes for that response is bounded by the pair's decode bound (see
+    // below).
+    let plain_decode_bound = wait
+        .bound
+        .as_ref()
+        .filter(|_| !sides.streaming)
+        .map(|bound| bound.partner_bound);
 
     // Both sides are translated before either is propagated: a
     // decode-side failure is logged and counted even when the prefill
     // error is the one the client sees.
-    let prefill_silence = prefill_result
-        .as_ref()
-        .is_err_and(|e| is_prefill_silence(e) || is_decode_silence(e));
+    let prefill_silence = prefill_result.as_ref().is_err_and(|e| {
+        is_prefill_silence(e) || is_decode_silence(e) || is_encode_dispatch_failure(e)
+    });
     let prefill = prefill_result
         .map_err(|e| pd_side_error(PdSide::Prefill, sides.prefill_label, &e, workers));
     let decode =
         decode_result.map_err(|e| pd_side_error(PdSide::Decode, sides.decode_label, &e, workers));
     let (prefill_stream, mut decode_stream) = match (prefill, decode) {
         (Ok(prefill), Ok(decode)) => (prefill, decode),
-        // A prefill given up on for a silence verdict (its own, or
-        // its stalled decode partner's) may yet start the handoff
-        // into the decode's room: the decode's abort is deferred
-        // until its first item, as the other two paths of the
-        // verdict defer it (30 s at most), not fired by the drop.
+        // A prefill given up on for a verdict (its own silence, its
+        // stalled decode partner's, or its request's failed encode
+        // dispatch) may yet start the handoff into the decode's
+        // room: the decode's abort is deferred until its first item,
+        // as the other two paths of the verdict defer it (30 s at
+        // most), not fired by the drop.
         (Err(response), Ok(decode)) if prefill_silence => {
             drop(decode.defer_abort_until_first_item());
             return Err(response);
@@ -1242,7 +1724,7 @@ async fn parallel_sides_answered(
     };
     match first_prefill_response_within(
         &mut prefill_stream,
-        bound,
+        wait,
         prefill_worker,
         workers
             .decode_worker()
@@ -1282,10 +1764,20 @@ async fn parallel_sides_answered(
     // while it is still receiving the KV handoff from prefill — tearing
     // the request down mid-transfer can crash or leak on the engine — so
     // its abort is deferred until the first decode response (the proof
-    // the handoff completed). The prefill side keeps the immediate abort:
-    // if prefill is still running there is nothing to hand off yet, and
-    // stopping it promptly frees capacity.
-    let decode_stream = decode_stream.defer_abort_until_first_item();
+    // the handoff completed). A non-streaming request's first decode
+    // response is its whole answer, so a client that left would hold the
+    // decode engine for the answer's length (the house cap at most); its
+    // wait is bounded instead by the pair's decode bound, taken as the
+    // estimate of the handoff's length (set once the prefill side answered,
+    // after the transfer on this shape): a shorter protection window than
+    // the cap, by design. A plain side has no silence verdict of its own,
+    // and a streaming side keeps the cap. The prefill side keeps the
+    // immediate abort: if prefill is still running there is nothing to
+    // hand off yet, and stopping it promptly frees capacity.
+    let decode_stream = match plain_decode_bound {
+        Some(bound) => decode_stream.defer_abort_within(bound),
+        None => decode_stream.defer_abort_until_first_item(),
+    };
 
     Ok(ExecutionResult::PrefillDecode {
         prefill: prefill_stream,
@@ -1337,8 +1829,14 @@ fn parallel_side_failed_first(
         // the decode is waiting for) and uncharged: a late failure
         // of a handoff that never came is not the decode's fault.
         // The decode partner the verdict charged for stalling is
-        // retired the same way: charged once, at the verdict.
-        let retirement = if is_prefill_silence(error) || is_decode_silence(error) {
+        // retired the same way: charged once, at the verdict. A
+        // prefill given up on for its request's failed encode
+        // dispatch leaves its partner the same way: a job the
+        // encoder took after all could still start the handoff.
+        let retirement = if is_prefill_silence(error)
+            || is_decode_silence(error)
+            || is_encode_dispatch_failure(error)
+        {
             Retirement::PartnerSilent
         } else {
             Retirement::PartnerFailed
@@ -1372,6 +1870,7 @@ async fn dispatch_pd_sides(
     mut prefill: SideDispatch,
     mut decode: SideDispatch,
     handoff_to: Option<&Arc<dyn Worker>>,
+    mut encode: Option<EncodeRace>,
 ) -> PdDispatchOutcome {
     /// One turn of the dispatch loop. The `select!` handlers may only
     /// classify — moving a still-pending side out happens after the macro's
@@ -1386,6 +1885,9 @@ async fn dispatch_pd_sides(
         /// The decode side's first item came while the prefill side was
         /// still dispatching: whether it was output, a handoff.
         Witnessed(bool),
+        /// The request's encode dispatch failed: the prefill side is given
+        /// up on, whatever either side has answered.
+        EncodeFailed(String),
     }
 
     // At most one of these is `Some` at the top of the loop: the second
@@ -1397,13 +1899,17 @@ async fn dispatch_pd_sides(
 
     loop {
         let witnessing = watching && prefill_result.is_none() && decode_result.is_some();
-        // Biased: the decode side's first item, then the decode side, then
-        // the prefill side, so a decode answer (and the item a servicer that
-        // holds its headers sends with it) landing in the wakeup of the
-        // prefill side's deadline is credited before the side is judged.
-        // Each comes once, so neither starves the prefill side.
+        // Biased: the request's encode failure first (the embedding is not
+        // coming, whatever the sides have answered), then the decode side's
+        // first item, then the decode side, then the prefill side, so a
+        // decode answer (and the item a servicer that holds its headers
+        // sends with it) landing in the wakeup of the prefill side's
+        // deadline is credited before the side is judged. Each comes once,
+        // so neither starves the prefill side.
         let step = tokio::select! {
             biased;
+            failure = encode_dispatch_failed(encode.as_mut().map(|race| &mut race.watch)),
+                if encode.is_some() => DispatchStep::EncodeFailed(failure),
             handed_off = decode_handed_off(decode_result.as_mut().and_then(|r| r.as_mut().ok())),
                 if witnessing => DispatchStep::Witnessed(handed_off),
             result = &mut decode, if decode_result.is_none() => match result {
@@ -1417,6 +1923,39 @@ async fn dispatch_pd_sides(
         };
 
         match step {
+            DispatchStep::EncodeFailed(failure) => {
+                // The arm exists only with a race: take it for the verdict.
+                let Some(race) = encode.take() else {
+                    continue;
+                };
+                let error =
+                    encode_failure_verdict(&race.worker, &race.request_id, &failure, "dispatch");
+                // The prefill side is given up on: a call still pending is
+                // retired off the request path (its clock stops with the
+                // watch, see `dispatch_prefill_within`; its room is aborted
+                // when it lands), a stream it returned is dropped (its room
+                // is aborted now). The decode side is its partner either way:
+                // still dispatching, it is handed back; answered, its
+                // stream goes up with the verdict for its deferred abort.
+                match prefill_result.take() {
+                    Some(_answered) => {}
+                    None => retire_pd_side(
+                        PdSide::Prefill,
+                        race.connection,
+                        Arc::clone(&race.worker),
+                        prefill,
+                        Retirement::Silent,
+                    ),
+                }
+                return match decode_result.take() {
+                    Some(decode_answer) => PdDispatchOutcome::Both(Err(error), decode_answer),
+                    None => PdDispatchOutcome::FailedFirst {
+                        side: PdSide::Prefill,
+                        error,
+                        partner: decode,
+                    },
+                };
+            }
             DispatchStep::Witnessed(handed_off) => {
                 watching = false;
                 if let Some(worker) = handoff_to.filter(|_| handed_off) {
@@ -1469,6 +2008,9 @@ fn pd_side_error(
     error: &tonic::Status,
     workers: &WorkerSelection,
 ) -> Response {
+    if side == PdSide::Prefill && is_encode_dispatch_failure(error) {
+        return encode_dispatch_failure_response();
+    }
     if side == PdSide::Prefill && is_prefill_silence(error) {
         if let Some(prefill) = workers.prefill_worker() {
             return prefill_silence_response(error, prefill);
@@ -1481,12 +2023,43 @@ fn pd_side_error(
     }
     UpstreamClass::account_dispatch_failure(side.name(), connection, error);
     account_pd_side_failure(side.name(), error);
-    start_failure_response(
+    let worker = match side {
+        PdSide::Prefill => workers.prefill_worker(),
+        PdSide::Decode => workers.decode_worker(),
+    };
+    pd_start_failure_response(side, worker, error, "execute_parallel_pd")
+}
+
+/// The client answer for a disaggregated side that failed to start, under the
+/// side's start code (see [`start_failure_response`]). A status the side's
+/// worker answered for the payload itself (its own `INTERNAL`, definitive for
+/// the retry layer) names that worker as the failed side, so the retry window
+/// closes on it alone and the answer stands when no other worker of its kind
+/// is available (see `attempt_ledger::FailedSide`): one side's own 500 is not
+/// its partner's, and a free worker of the side's kind still takes the
+/// request. Left unnamed, the definitive answer closed the window on both
+/// workers of the pair while a worker of the other kind still counted as an
+/// alternative, so the retry found no pair to admit and the client read a
+/// `no_available_workers` refusal in place of the worker's own answer. Any
+/// other status names no side and is replayed as before.
+pub(crate) fn pd_start_failure_response(
+    side: PdSide,
+    worker: Option<&Arc<dyn Worker>>,
+    error: &tonic::Status,
+    function: &'static str,
+) -> Response {
+    let mut response = start_failure_response(
         error,
-        "execute_parallel_pd",
+        function,
         side.description(SidePhase::Start),
         side.code(SidePhase::Start),
-    )
+    );
+    if is_definitive_failure(&response) {
+        if let Some(worker) = worker {
+            mark_failed_side(&mut response, worker.as_ref());
+        }
+    }
+    response
 }
 
 /// Why a PD side still dispatching is retired off the request path (see
@@ -1579,7 +2152,7 @@ pub(crate) fn retire_pd_side(
         match result {
             Ok(stream) => {
                 debug!(
-                    leg = side.name(),
+                    side = side.name(),
                     worker = worker.redacted_url(),
                     cause,
                     "Aborting the room of an abandoned PD side"
@@ -1594,7 +2167,7 @@ pub(crate) fn retire_pd_side(
                 UpstreamClass::account_dispatch_failure(side.name(), connection, &error);
                 error!(
                     function = "retire_pd_side",
-                    leg = side.name(),
+                    side = side.name(),
                     worker = worker.redacted_url(),
                     cause,
                     error = %error,
@@ -1603,7 +2176,7 @@ pub(crate) fn retire_pd_side(
             }
             Err(error) => {
                 debug!(
-                    leg = side.name(),
+                    side = side.name(),
                     worker = worker.redacted_url(),
                     cause,
                     error = %error,
@@ -1649,12 +2222,36 @@ impl PrefillBound {
         prompt_tokens: u64,
         dispatched: Instant,
     ) -> Option<Self> {
+        let bound = liveness::prefill_side_bound(worker, prompt_tokens)?;
+        Self::on(worker, prompt_tokens, bound, dispatched)
+    }
+
+    /// [`Self::at`] for a side whose embeddings come from an encode worker:
+    /// a worker that has answered nothing gets what is left of the
+    /// cold-shape grace, its first prompt being the encoder's first as well
+    /// (see [`liveness::prefill_side_bound_behind_encode`]). A stalled
+    /// decode partner is read once the side's bound has passed, as under
+    /// the cold-shape grace: at the grace while it is in force.
+    pub(crate) fn behind_encode(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        dispatched: Instant,
+    ) -> Option<Self> {
+        let bound = liveness::prefill_side_bound_behind_encode(worker, prompt_tokens)?;
+        Self::on(worker, prompt_tokens, bound, dispatched)
+    }
+
+    /// A bound of `bound` from `dispatched` on a side of `prompt_tokens` to
+    /// `worker`, a stalled decode partner judged by a decode side's bound
+    /// for the same prompt.
+    fn on(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        bound: Duration,
+        dispatched: Instant,
+    ) -> Option<Self> {
         let partner_bound = liveness::decode_side_bound(worker, prompt_tokens)?;
-        Self::of(
-            liveness::prefill_side_bound(worker, prompt_tokens)?,
-            dispatched,
-        )
-        .map(|bound| Self {
+        Self::of(bound, dispatched).map(|bound| Self {
             partner_bound,
             ..bound
         })
@@ -1673,6 +2270,16 @@ impl PrefillBound {
             backlog: Arc::default(),
         })
     }
+}
+
+/// What a prefill side's dispatch and first response are awaited under (see
+/// [`dispatch_prefill_within`] and [`first_prefill_response_within`]): the
+/// side's bound while the silence
+/// rule is on, and the watch on its request's encode dispatch for the
+/// prefill side of an EPD request (see [`launch_encode_dispatch`]).
+pub(crate) struct PrefillWait {
+    pub(crate) bound: Option<PrefillBound>,
+    pub(crate) encode: Option<EncodeWatch>,
 }
 
 /// What a prefill side's silence verdict was judged on (see
@@ -1760,6 +2367,59 @@ fn prefill_side_silent(
 pub(crate) fn is_prefill_silence(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::DeadlineExceeded
         && status.message().starts_with(PREFILL_SILENCE_MESSAGE)
+}
+
+/// The words a prefill side's verdict for a failed encode dispatch begins with.
+const ENCODE_DISPATCH_FAILED_MESSAGE: &str = "the request's encode dispatch failed";
+
+/// The verdict on a prefill side whose request's encode dispatch failed, in
+/// `phase` (the phases of [`prefill_side_silent`]): the embedding the side
+/// waits for at its rendezvous is not coming, so the side is given up on
+/// at once instead of at its silence bound. One WARN naming the worker,
+/// the request and the encode's failure; nothing is charged to the prefill
+/// worker, which never got to answer (see [`record_pd_dispatch_outcomes`]).
+/// The attempt fails here and is not replayed (see
+/// [`encode_dispatch_failure_response`]).
+fn encode_failure_verdict(
+    worker: &Arc<dyn Worker>,
+    request_id: &str,
+    failure: &str,
+    phase: &'static str,
+) -> tonic::Status {
+    warn!(
+        request_id = %request_id,
+        worker = worker.redacted_url(),
+        worker_type = metrics_labels::WORKER_PREFILL,
+        phase,
+        error = %failure,
+        "PD prefill side given up on: the request's encode dispatch failed, so its embedding is not coming"
+    );
+    tonic::Status::failed_precondition(format!(
+        "{ENCODE_DISPATCH_FAILED_MESSAGE} ({phase}): {failure}"
+    ))
+}
+
+/// Whether `status` is a prefill side's verdict for a failed encode dispatch.
+pub(crate) fn is_encode_dispatch_failure(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.message().starts_with(ENCODE_DISPATCH_FAILED_MESSAGE)
+}
+
+/// The client answer for a failed encode dispatch: a 502 under its own
+/// error code with one fixed message, final for the retry layer. The
+/// failure's own words name the encode worker's address as registered, so
+/// they stay in the log, where the dispatch was supervised and the verdict
+/// was logged; the client learns that the embedding is not coming and
+/// nothing about the worker. The plan's encode jobs are spent (their items
+/// and SHM went with them), so a replay on another prefill worker would
+/// wait for the same embedding; the client retries with the request.
+pub(crate) fn encode_dispatch_failure_response() -> Response {
+    let mut response = error::bad_gateway(
+        "encode_dispatch_failed",
+        "Encode dispatch failed: the request's encode dispatch was not taken, so its embedding is not coming; the request can be retried",
+    );
+    mark_non_retryable(&mut response);
+    response
 }
 
 /// The decode partner of a prefill side whose silence bound passed, when the
@@ -1866,6 +2526,9 @@ fn record_pd_dispatch_outcomes(
     decode_result: &StreamResult,
 ) {
     match prefill_result {
+        // The encode's failure, not the sides': the prefill worker never
+        // got to answer, and its partner is retired uncharged.
+        Err(e) if is_encode_dispatch_failure(e) => {}
         Err(e) if is_decode_silence(e) => record_silence_outcome(workers, ledger, e),
         _ => workers.record_prefill_decode_outcomes(
             ledger,
@@ -1886,6 +2549,9 @@ fn record_silence_outcome(
     ledger: &AttemptLedger,
     error: &tonic::Status,
 ) {
+    if is_encode_dispatch_failure(error) {
+        return;
+    }
     if let Some(status) = error.breaker_status() {
         if is_decode_silence(error) {
             workers.record_outcome_decode(ledger, status);
@@ -1971,9 +2637,16 @@ fn judge_prefill_side(
 /// request path (its room is aborted when it lands) and the silence verdict
 /// takes its place: the prefill's, or its decode `partner`'s when the
 /// partner had stalled mid-stream. Without a bound or a worker to charge,
-/// the call is awaited as it is.
+/// the call is awaited as it is. The request's encode dispatch, when one is
+/// watched (`wait`), is raced beside both sides' dispatches by the caller
+/// ([`dispatch_pd_sides`]), bound or not, and here beside the clock: once it
+/// has failed the caller has given the side up and retired it off the
+/// request path, so from then on the call is awaited as it is, with no
+/// silence verdict to charge the worker for the embedding that is not
+/// coming. The first-response phase races the watch again
+/// ([`first_prefill_response_within`], through its own [`PrefillWait`]).
 pub(crate) async fn dispatch_prefill_within(
-    bound: Option<PrefillBound>,
+    wait: PrefillWait,
     mut dispatch: SideDispatch,
     worker: Option<Arc<dyn Worker>>,
     partner: Option<Arc<dyn Worker>>,
@@ -1981,12 +2654,25 @@ pub(crate) async fn dispatch_prefill_within(
     request_id: String,
     prompt_tokens: u64,
 ) -> StreamResult {
+    let PrefillWait { bound, mut encode } = wait;
     let (Some(bound), Some(worker)) = (bound, worker) else {
         return dispatch.await;
     };
     let mut deadline = bound.deadline;
     loop {
-        if let Ok(result) = tokio::time::timeout_at(deadline.into(), &mut dispatch).await {
+        let timed = tokio::select! {
+            biased;
+            _ = encode_dispatch_failed(encode.as_mut()) => None,
+            timed = tokio::time::timeout_at(deadline.into(), &mut dispatch) => Some(timed),
+        };
+        let Some(timed) = timed else {
+            // The request's encode dispatch failed: the caller gives this
+            // side up and retires it off the request path, where the call
+            // is awaited as it is. A silence verdict here would charge the
+            // worker with the embedding that is not coming.
+            return dispatch.await;
+        };
+        if let Ok(result) = timed {
             return result;
         }
         match judge_prefill_side(
@@ -2017,22 +2703,41 @@ pub(crate) async fn dispatch_prefill_within(
 /// with the same reprieves as [`dispatch_prefill_within`], and say what it
 /// was. The item stays on the stream for its reader; past the bound, with
 /// the worker silent, the silence verdict (the caller drops the side, which
-/// aborts its room). Without a bound nothing is pulled ahead and the side
-/// counts as answered, as its dispatch did. The decode `partner` comes with
-/// its stream: its first output, pulled ahead once, is a handoff of the
-/// prefill worker's (see [`dispatch_pd_sides`]); an item its dispatch already
-/// pulled was credited then, not again.
+/// aborts its room). Beside the clock the request's encode watch is raced
+/// (`wait`; the prefill side of an EPD request): a failure reported on it
+/// ends the wait at once, bound or not. Without a bound and without a watch
+/// nothing is pulled ahead and the side counts as answered, as its dispatch
+/// did. The decode `partner` comes with its stream: its first output, pulled
+/// ahead once, is a handoff of the prefill worker's (see
+/// [`dispatch_pd_sides`]); an item its dispatch already pulled was credited
+/// then, not again.
 pub(crate) async fn first_prefill_response_within(
     stream: &mut ProtoStream,
-    bound: Option<PrefillBound>,
+    wait: PrefillWait,
     worker: Option<&Arc<dyn Worker>>,
     partner: Option<(&Arc<dyn Worker>, &mut ProtoStream)>,
     connection: &'static str,
     request_id: &str,
     prompt_tokens: u64,
 ) -> Result<FirstItem, tonic::Status> {
-    let (Some(bound), Some(worker)) = (bound, worker) else {
+    let Some(worker) = worker else {
         return Ok(FirstItem::Response);
+    };
+    let PrefillWait { bound, mut encode } = wait;
+    let Some(bound) = bound else {
+        // The rule off: no clock judges the side, but an embedding that is
+        // not coming still ends its wait here, where the retry layer can
+        // take the request elsewhere.
+        let Some(watch) = encode.as_mut() else {
+            return Ok(FirstItem::Response);
+        };
+        return tokio::select! {
+            biased;
+            failure = encode_dispatch_failed(Some(watch)) => {
+                Err(encode_failure_verdict(worker, request_id, &failure, "first_response"))
+            }
+            first = stream.first_response() => Ok(first),
+        };
     };
     let partner_worker = partner.as_ref().map(|(partner, _)| *partner);
     let mut decode = partner
@@ -2042,6 +2747,11 @@ pub(crate) async fn first_prefill_response_within(
     loop {
         tokio::select! {
             biased;
+            failure = encode_dispatch_failed(encode.as_mut()), if encode.is_some() => {
+                // The embedding is not coming: the verdict names the
+                // encode; the caller drops the side, which aborts its room.
+                return Err(encode_failure_verdict(worker, request_id, &failure, "first_response"));
+            }
             handed_off = decode_handed_off(decode.as_deref_mut()), if decode.is_some() => {
                 if handed_off {
                     worker.note_prefill_handoff();
@@ -2070,7 +2780,7 @@ pub(crate) async fn first_prefill_response_within(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use smg_grpc_client::{sglang_proto as sglang, tokenspeed_proto as ts, vllm_proto as vllm};
 
@@ -2078,10 +2788,13 @@ pub(crate) mod tests {
     use crate::{
         routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
         worker::{
-            BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RuntimeType, Worker,
-            WorkerType,
+            test_support::no_health_check, BasicWorkerBuilder, CircuitBreakerConfig,
+            ConnectionMode, ResolvedResilience, RuntimeType, Worker, WorkerType,
         },
     };
+
+    /// A boxed encode send, as the supervisor's tests build them.
+    type EncodeSend = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
     /// A decode side retired because its prefill fell silent is not charged
     /// for failing late: the handoff it waited for never came, and the
@@ -2126,7 +2839,7 @@ pub(crate) mod tests {
     /// the next one opens a breaker set to two.
     #[tokio::test]
     async fn the_late_stream_of_a_side_retired_for_its_partners_failure_earns_no_breaker_success() {
-        use crate::worker::circuit_breaker::CircuitState;
+        use crate::worker::health::circuit_breaker::CircuitState;
         let decode: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://decode:30002")
                 .worker_type(WorkerType::Decode)
@@ -2418,6 +3131,105 @@ pub(crate) mod tests {
         }
     }
 
+    /// A side's own `INTERNAL` before its first byte is the worker's
+    /// definitive answer for the payload, and names the side's worker as the
+    /// failed side: the retry window closes on that worker alone, its partner
+    /// stays selectable, the request moves to another worker of the side's
+    /// kind when one is available, and the answer stands when none is. A
+    /// status that is not the worker's own answer names no side and is
+    /// replayed as before.
+    #[test]
+    fn a_sides_own_500_before_its_first_byte_closes_the_window_on_its_worker_alone() {
+        use crate::routers::common::attempt_ledger::is_definitive_failure;
+
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+        let code = |response: &Response| {
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        // The sole prefill worker's own 500: its answer stands.
+        let ledger = AttemptLedger::default();
+        let mut answered = pd_side_error(
+            PdSide::Prefill,
+            metrics_labels::CONNECTION_GRPC,
+            &tonic::Status::internal("engine died"),
+            &workers,
+        );
+        assert_eq!(answered.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            code(&answered).as_deref(),
+            Some("prefill_worker_failed_to_start")
+        );
+        assert!(is_definitive_failure(&answered));
+        assert!(
+            answered.extensions().get::<FailedSide>().is_some(),
+            "the side's worker is named"
+        );
+        ledger.settle(&mut answered, workers.workers(), [&prefill, &decode]);
+        assert!(
+            !ledger.admits(prefill.as_ref()),
+            "the prefill worker that answered is out"
+        );
+        assert!(ledger.admits(decode.as_ref()), "its decode partner is not");
+        assert!(
+            !is_retryable_response(&answered),
+            "no other prefill worker: the worker's own answer is the client's"
+        );
+
+        // One decode worker's own 500 with another decode worker available
+        // (ready, as the pool holds one: the ledger's alternative must be
+        // available): the request moves there, with the same prefill.
+        let other_decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-2:30000")
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let ledger = AttemptLedger::default();
+        let mut answered = pd_side_error(
+            PdSide::Decode,
+            metrics_labels::CONNECTION_GRPC,
+            &tonic::Status::internal("engine died"),
+            &workers,
+        );
+        assert_eq!(
+            code(&answered).as_deref(),
+            Some("decode_worker_failed_to_start")
+        );
+        ledger.settle(
+            &mut answered,
+            workers.workers(),
+            [&prefill, &decode, &other_decode],
+        );
+        assert!(!ledger.admits(decode.as_ref()));
+        assert!(ledger.admits(prefill.as_ref()));
+        assert!(ledger.admits(other_decode.as_ref()));
+        assert!(
+            is_retryable_response(&answered),
+            "the other decode worker takes the request"
+        );
+
+        // A status that is not the worker's own answer names no side.
+        let refused = pd_side_error(
+            PdSide::Decode,
+            metrics_labels::CONNECTION_GRPC,
+            &tonic::Status::unavailable("the engine is busy"),
+            &workers,
+        );
+        assert_eq!(refused.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!is_definitive_failure(&refused));
+        assert!(refused.extensions().get::<FailedSide>().is_none());
+        assert!(is_retryable_response(&refused));
+    }
+
     #[test]
     fn a_spent_sidecar_budget_is_not_retried_but_a_fast_sidecar_failure_is() {
         use crate::routers::common::retry::is_retryable_response;
@@ -2603,7 +3415,7 @@ pub(crate) mod tests {
     async fn a_failed_prefill_answers_without_waiting_for_the_decode_side() {
         let started = tokio::time::Instant::now();
         let outcome =
-            dispatch_pd_sides(fails_now("bootstrap timeout"), never_answers(), None).await;
+            dispatch_pd_sides(fails_now("bootstrap timeout"), never_answers(), None, None).await;
 
         assert_eq!(
             started.elapsed(),
@@ -2627,6 +3439,7 @@ pub(crate) mod tests {
             answers_after(Duration::from_secs(120)),
             fails_now("decode refused"),
             None,
+            None,
         )
         .await;
 
@@ -2649,7 +3462,7 @@ pub(crate) mod tests {
         let ends: SideDispatch =
             Box::pin(async { Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new()))) });
         let prefill_dispatch = answers_after(Duration::from_secs(1));
-        match dispatch_pd_sides(prefill_dispatch, ends, Some(&prefill)).await {
+        match dispatch_pd_sides(prefill_dispatch, ends, Some(&prefill), None).await {
             PdDispatchOutcome::Both(_, Ok(decode)) => assert!(decode.holds_item_ahead()),
             _ => panic!("both sides answered"),
         }
@@ -2677,6 +3490,474 @@ pub(crate) mod tests {
         PrefillBound::of(bound, dispatched).expect("a bound within the clock's range")
     }
 
+    /// The encode race of a dispatch test: the watch's receiver, the prefill
+    /// worker and the request.
+    fn encode_race(prefill: &Arc<dyn Worker>, watch: EncodeWatch) -> EncodeRace {
+        EncodeRace {
+            watch,
+            worker: Arc::clone(prefill),
+            connection: metrics_labels::CONNECTION_GRPC,
+            request_id: "chatcmpl-encode-failed".to_string(),
+        }
+    }
+
+    /// A watch on an encode dispatch, with the sender its failure is
+    /// published on.
+    fn encode_watch() -> (EncodeWatch, watch::Sender<Option<String>>) {
+        let (failed_tx, failed_rx) = watch::channel(None);
+        (failed_rx, failed_tx)
+    }
+
+    /// The encode dispatch failing `after` a while: its failure published on
+    /// `failed_tx` (joined with the wait under test; nothing is spawned).
+    async fn encode_fails_after(after: Duration, failed_tx: watch::Sender<Option<String>>) {
+        tokio::time::sleep(after).await;
+        let _ = failed_tx.send(Some(
+            "connect to encode worker grpc://encode:30002 failed: connection refused".to_string(),
+        ));
+    }
+
+    /// The request's encode dispatch fails while both sides still dispatch,
+    /// no bound on either (the silence rule off): the prefill side is given
+    /// up on the moment the failure is known, the decode dispatch comes
+    /// back as its partner, and the attempt answers a 502 under its own
+    /// code that the retry layer does not replay (the plan's encode jobs
+    /// are spent), names no failed side and carries neither the encode
+    /// worker's address nor the failure's words.
+    #[tokio::test(start_paused = true)]
+    async fn a_pd_dispatch_whose_encode_dispatch_failed_is_given_up_on_at_once() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let (failed_tx, failed_rx) = watch::channel(None);
+        let started = tokio::time::Instant::now();
+        let (outcome, ()) = tokio::join!(
+            dispatch_pd_sides(
+                never_answers(),
+                never_answers(),
+                None,
+                Some(encode_race(&prefill, failed_rx)),
+            ),
+            encode_fails_after(Duration::from_millis(200), failed_tx),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(1),
+            "given up on at the encode's failure: {elapsed:?}"
+        );
+        let PdDispatchOutcome::FailedFirst {
+            side,
+            error,
+            partner,
+        } = outcome
+        else {
+            panic!("the prefill side's verdict, the decode dispatch as its partner");
+        };
+        assert_eq!(side, PdSide::Prefill);
+        drop(partner);
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(is_encode_dispatch_failure(&error), "{error:?}");
+        assert!(!is_prefill_silence(&error));
+        assert!(error.message().contains("connection refused"), "{error:?}");
+
+        let response = pd_side_error(
+            PdSide::Prefill,
+            metrics_labels::CONNECTION_GRPC,
+            &error,
+            &workers,
+        );
+        assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|value| value.to_str().ok()),
+            Some("encode_dispatch_failed")
+        );
+        assert!(
+            response.extensions().get::<FailedSide>().is_none(),
+            "the prefill worker is not the failed side"
+        );
+        assert!(
+            !is_retryable_response(&response),
+            "the plan's encode jobs are spent: no replay"
+        );
+        // The failure's words name the worker as registered: the log has
+        // them (the verdict's WARN), the client body does not.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("encode_dispatch_failed")
+                && !body.contains("encode:30002")
+                && !body.contains("connection refused"),
+            "the client learns the code, not the worker or the failure's words: {body}"
+        );
+    }
+
+    /// The prefill side answered its dispatch first (a servicer that returns
+    /// on submission) and the decode side still dispatches (one that holds
+    /// its headers until the KV arrives): the encode's failure still ends
+    /// the dispatch, the answered prefill stream dropped, the decode
+    /// dispatch handed back as the partner.
+    #[tokio::test(start_paused = true)]
+    async fn an_encode_dispatch_failure_after_the_prefill_answered_still_ends_the_dispatch() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let (failed_tx, failed_rx) = watch::channel(None);
+        let answered: SideDispatch =
+            Box::pin(async { Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new()))) });
+        let started = tokio::time::Instant::now();
+        let (outcome, ()) = tokio::join!(
+            dispatch_pd_sides(
+                answered,
+                never_answers(),
+                Some(&prefill),
+                Some(encode_race(&prefill, failed_rx)),
+            ),
+            encode_fails_after(Duration::from_millis(200), failed_tx),
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        match outcome {
+            PdDispatchOutcome::FailedFirst { side, error, .. } => {
+                assert_eq!(side, PdSide::Prefill);
+                assert!(is_encode_dispatch_failure(&error), "{error:?}");
+            }
+            PdDispatchOutcome::Both(..) => panic!("the decode side had not answered"),
+        }
+    }
+
+    /// The decode side answered first and the prefill still dispatches: the
+    /// encode's failure ends the dispatch with both verdicts in, the
+    /// prefill's being the encode verdict and the decode's answer kept for
+    /// its deferred abort.
+    #[tokio::test(start_paused = true)]
+    async fn an_encode_dispatch_failure_after_the_decode_answered_ends_the_dispatch_with_both_in() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let (failed_tx, failed_rx) = watch::channel(None);
+        let answered: SideDispatch =
+            Box::pin(async { Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new()))) });
+        let (outcome, ()) = tokio::join!(
+            dispatch_pd_sides(
+                never_answers(),
+                answered,
+                None,
+                Some(encode_race(&prefill, failed_rx)),
+            ),
+            encode_fails_after(Duration::from_millis(200), failed_tx),
+        );
+        match outcome {
+            PdDispatchOutcome::Both(Err(error), Ok(_decode)) => {
+                assert!(is_encode_dispatch_failure(&error), "{error:?}");
+            }
+            _ => panic!("the prefill's encode verdict beside the decode's answer"),
+        }
+    }
+
+    /// One refused send is published while a sibling send is still in
+    /// flight: the supervisor reads the outcomes as they land, not after
+    /// the last one.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_failed_encode_send_is_published_while_a_sibling_is_still_pending() {
+        let (failed_tx, mut failed_rx) = watch::channel(None);
+        let outcomes: FuturesUnordered<EncodeSend> = FuturesUnordered::new();
+        outcomes.push(Box::pin(async {
+            Err(
+                "connect to encode worker grpc://encode:30002 failed: connection refused"
+                    .to_string(),
+            )
+        }));
+        outcomes.push(Box::pin(std::future::pending()));
+        let (first, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                encode_dispatch_failed(Some(&mut failed_rx))
+            ),
+            async {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    supervise_encode_sends(outcomes, failed_tx),
+                )
+                .await;
+            },
+        );
+        let first = first.expect("published before the pending sibling ends");
+        assert!(first.contains("connection refused"), "{first}");
+    }
+
+    /// An encode dispatch that was taken (the supervisor goes without a
+    /// failure) changes nothing: the side is judged by its bound as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_prefill_dispatch_behind_a_taken_encode_is_judged_by_its_bound_as_before() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let (watch, supervisor) = encode_watch();
+        drop(supervisor);
+        let started = tokio::time::Instant::now();
+        let result = dispatch_prefill_within(
+            PrefillWait {
+                bound: Some(three_second_bound()),
+                encode: Some(watch),
+            },
+            never_answers(),
+            Some(prefill),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-encode-taken".to_string(),
+            256,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(4),
+            "{elapsed:?}"
+        );
+        assert!(is_prefill_silence(&failure(result)));
+    }
+
+    /// A prefill dispatch whose request's encode dispatch failed is retired
+    /// by the caller ([`dispatch_pd_sides`]) and awaited off the request
+    /// path as it is: past its bound it is not judged silent, so the
+    /// embedding that is not coming charges its worker neither the timeout
+    /// error nor the warning.
+    #[tokio::test(start_paused = true)]
+    async fn a_prefill_dispatch_behind_a_failed_encode_is_not_judged_silent_past_its_bound() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let (watch, supervisor) = encode_watch();
+        let mut dispatch = Box::pin(dispatch_prefill_within(
+            PrefillWait {
+                bound: Some(three_second_bound()),
+                encode: Some(watch),
+            },
+            never_answers(),
+            Some(prefill),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-encode-failed-retired".to_string(),
+            256,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut dispatch)
+                .await
+                .is_err(),
+            "in flight before the failure"
+        );
+        supervisor
+            .send(Some("encode worker refused".to_string()))
+            .expect("the dispatch holds the watch");
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut dispatch)
+                .await
+                .is_err(),
+            "the retired call is awaited as it is, past its bound"
+        );
+    }
+
+    /// The encode verdict is its own kind: neither a prefill nor a decode
+    /// silence, so no silence accounting applies to it, and its client
+    /// answer is a final 502 under its own code. Its breaker accounting is
+    /// `the_encode_verdict_charges_neither_sides_breaker`.
+    #[test]
+    fn the_encode_verdict_is_neither_a_silence_nor_a_sides_fault() {
+        let status = tonic::Status::failed_precondition(format!(
+            "{ENCODE_DISPATCH_FAILED_MESSAGE} (dispatch): encode worker refused"
+        ));
+        assert!(is_encode_dispatch_failure(&status));
+        assert!(!is_prefill_silence(&status));
+        assert!(!is_decode_silence(&status));
+        assert!(!is_encode_dispatch_failure(
+            &tonic::Status::failed_precondition("the engine's own precondition")
+        ));
+        let response = encode_dispatch_failure_response();
+        assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+        assert!(!is_retryable_response(&response));
+    }
+
+    /// The first-response phase races the watch too, ahead of the stream:
+    /// a failure already reported ends the wait at the first poll with the
+    /// `first_response` phase named, before the stream is read. (No engine
+    /// stream can be held open in a unit test without its transport, so the
+    /// stream here would end at once; the timing of the race is the
+    /// dispatch test's and the bed's.)
+    #[tokio::test]
+    async fn a_prefill_first_response_wait_ends_on_a_reported_encode_dispatch_failure() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let (watch, failed_tx) = encode_watch();
+        encode_fails_after(Duration::ZERO, failed_tx).await;
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .tracked_prefill_side_booked(Arc::clone(&prefill), PrefillTicket::book(&prefill, 256));
+        let status = first_prefill_response_within(
+            &mut stream,
+            PrefillWait {
+                bound: Some(three_second_bound()),
+                encode: Some(watch),
+            },
+            Some(&prefill),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-encode-failed-late",
+            256,
+        )
+        .await
+        .expect_err("the encode verdict, not the stream's end");
+        assert!(is_encode_dispatch_failure(&status), "{status:?}");
+        assert!(status.message().contains("(first_response)"), "{status:?}");
+        assert!(!is_prefill_silence(&status) && !is_decode_silence(&status));
+    }
+
+    /// With the rule off there is no bound, and still a prefill side behind
+    /// an encode worker does not wait for an embedding that is not coming:
+    /// its first response is awaited beside the watch alone, and a failure
+    /// reported on it ends the wait with the `first_response` phase named.
+    #[tokio::test]
+    async fn a_prefill_first_response_wait_without_a_bound_still_ends_on_an_encode_failure() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let (watch, failed_tx) = encode_watch();
+        encode_fails_after(Duration::ZERO, failed_tx).await;
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .tracked_prefill_side_booked(Arc::clone(&prefill), PrefillTicket::book(&prefill, 256));
+        let status = first_prefill_response_within(
+            &mut stream,
+            PrefillWait {
+                bound: None,
+                encode: Some(watch),
+            },
+            Some(&prefill),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-encode-failed-rule-off",
+            256,
+        )
+        .await
+        .expect_err("the encode verdict, not the stream's end");
+        assert!(is_encode_dispatch_failure(&status), "{status:?}");
+        assert!(status.message().contains("(first_response)"), "{status:?}");
+    }
+
+    /// With the rule off and no encode worker (plain PD) nothing is pulled
+    /// ahead: the side counts as answered without its stream being read.
+    #[tokio::test]
+    async fn a_prefill_first_response_wait_without_a_bound_or_a_watch_reads_nothing() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .tracked_prefill_side_booked(Arc::clone(&prefill), PrefillTicket::book(&prefill, 256));
+        let first = first_prefill_response_within(
+            &mut stream,
+            PrefillWait {
+                bound: None,
+                encode: None,
+            },
+            Some(&prefill),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-plain-pd-rule-off",
+            256,
+        )
+        .await
+        .expect("no verdict without a bound or a watch");
+        assert!(matches!(first, FirstItem::Response), "{first:?}");
+    }
+
+    /// A replay gets `None` (the first attempt took the plan) and races the
+    /// watch the first attempt left on the context: an encode send that
+    /// fails after the first attempt returned ends the replay's wait as it
+    /// would have the first attempt's.
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_races_the_watch_the_first_attempt_left() {
+        let (first_attempts_watch, failed_tx) = encode_watch();
+        let mut carried = Some(first_attempts_watch);
+        let mut request = tokenspeed_request(1, None);
+        let cleanups = prepare_epd_attempt(&mut request, None, &mut carried)
+            .await
+            .expect("nothing to encode");
+        assert!(cleanups.is_none(), "no push plan, nothing to disarm");
+        let mut watch = carried
+            .clone()
+            .expect("the first attempt's watch stands for the replay");
+        let started = tokio::time::Instant::now();
+        let (failure, ()) = tokio::join!(
+            encode_dispatch_failed(Some(&mut watch)),
+            encode_fails_after(Duration::from_millis(200), failed_tx),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(1),
+            "the replay's wait ends at the first attempt's encode failure: {elapsed:?}"
+        );
+        assert!(failure.contains("connection refused"), "{failure}");
+    }
+
+    /// A text-only EPD request has no encode dispatch to watch, on its first
+    /// attempt or a replay: both are judged by their bounds as before.
+    #[tokio::test]
+    async fn a_text_only_attempt_and_its_replay_race_no_watch() {
+        let mut carried = None;
+        let mut request = tokenspeed_request(1, None);
+        for _attempt in 0..2 {
+            let cleanups = prepare_epd_attempt(&mut request, None, &mut carried)
+                .await
+                .expect("nothing to encode");
+            assert!(cleanups.is_none());
+            assert!(carried.is_none());
+        }
+    }
+
+    /// The encode verdict charges neither side's breaker: the prefill worker
+    /// never got to answer and its decode partner waited for a handoff that
+    /// could not come. The verdict's 400 would count as a breaker success if
+    /// it were sampled, so each breaker starts one failure short of opening:
+    /// a sampled success would reset that streak, and the one failure after
+    /// the recorders would not open it.
+    #[test]
+    fn the_encode_verdict_charges_neither_sides_breaker() {
+        let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .circuit_breaker_config(CircuitBreakerConfig {
+                        failure_threshold: 2,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+        };
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
+            decode: worker("grpc://decode:30000", WorkerType::Decode),
+            runtime_type: RuntimeType::TokenSpeed,
+        };
+        let ledger = AttemptLedger::default();
+        let status = tonic::Status::failed_precondition(format!(
+            "{ENCODE_DISPATCH_FAILED_MESSAGE} (dispatch): encode worker refused"
+        ));
+        let prefill_result: StreamResult = Err(status.clone());
+        let decode_result: StreamResult = Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new())));
+        let (prefill, decode) = workers.disaggregated_pair().expect("a pair");
+        prefill.record_circuit_breaker_outcome(false);
+        decode.record_circuit_breaker_outcome(false);
+        record_pd_dispatch_outcomes(&workers, &ledger, &prefill_result, &decode_result);
+        record_silence_outcome(&workers, &ledger, &status);
+        prefill.record_circuit_breaker_outcome(false);
+        decode.record_circuit_breaker_outcome(false);
+        assert!(
+            !prefill.circuit_breaker_can_execute(),
+            "the encode verdict sampled nothing on the prefill worker: its streak was not reset"
+        );
+        assert!(
+            !decode.circuit_breaker_can_execute(),
+            "the encode verdict sampled nothing on the decode worker: its streak was not reset"
+        );
+    }
+
     /// A prefill call that has returned no stream by its bound is given up on
     /// at the bound, not at the request's timeout: the verdict names the
     /// silence, and the attempt answers a 504 under its own code that the
@@ -2687,7 +3968,10 @@ pub(crate) mod tests {
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
         let started = tokio::time::Instant::now();
         let result = dispatch_prefill_within(
-            Some(three_second_bound()),
+            PrefillWait {
+                bound: Some(three_second_bound()),
+                encode: None,
+            },
             never_answers(),
             Some(Arc::clone(&prefill)),
             None,
@@ -2729,6 +4013,151 @@ pub(crate) mod tests {
         );
     }
 
+    /// The first media prompt of a fresh deployment (95 tokens) dispatched to
+    /// a prefill worker that has answered nothing, with the encoder's first
+    /// forward in front of its answer: the side as `dispatch_prefill_within`
+    /// drives it under `bound`, answering as `side` does (the stubs answer
+    /// with a failure of their own, which passes through as a late side's
+    /// does, or never).
+    async fn first_media_prompt(
+        prefill: &Arc<dyn Worker>,
+        bound: PrefillBound,
+        side: SideDispatch,
+    ) -> StreamResult {
+        dispatch_prefill_within(
+            PrefillWait {
+                bound: Some(bound),
+                encode: None,
+            },
+            side,
+            Some(Arc::clone(prefill)),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-first-image".to_string(),
+            95,
+        )
+        .await
+    }
+
+    /// The first media request of a fresh encode-prefill-decode deployment:
+    /// the prefill side's first response waits on the encoder's first
+    /// forward and the transfer before the prefill worker's own, and its
+    /// worker has answered nothing. A plain side's bound (a request that
+    /// carries no encode rooms) gives it up at the threshold while the
+    /// encoder still runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_prefill_dispatch_under_a_plain_bound_is_given_up_on_while_the_encoder_runs() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let started = tokio::time::Instant::now();
+        let plain = PrefillBound::at(&prefill, 95, Instant::now()).expect("the rule is on");
+        assert_eq!(
+            plain.bound,
+            Duration::from_secs(3),
+            "a plain side on a worker that has answered nothing: the threshold"
+        );
+        let answer = answers_after(Duration::from_millis(3_500));
+        let status = failure(first_media_prompt(&prefill, plain, answer).await);
+        assert!(
+            is_prefill_silence(&status),
+            "given up on at the threshold while the encoder runs: {status:?}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_millis(3_500),
+            "at the threshold, before the answer: {elapsed:?}"
+        );
+    }
+
+    /// The same first media request behind an encode worker: the side's
+    /// bound is the cold-shape grace, so the answer that comes at 3.5 s
+    /// passes through, and a stalled decode partner is still judged by a
+    /// decode side's bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_prefill_dispatch_behind_an_encode_worker_waits_out_the_encoders_first_forward()
+    {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let encoder_forward = Duration::from_millis(3_500);
+        let started = tokio::time::Instant::now();
+        let behind =
+            PrefillBound::behind_encode(&prefill, 95, Instant::now()).expect("the rule is on");
+        assert_eq!(
+            behind.bound,
+            Duration::from_secs(120),
+            "behind an encode worker: the cold-shape grace"
+        );
+        assert_eq!(
+            behind.partner_bound,
+            Duration::from_secs(3),
+            "the partner's own bound is unchanged; it is read once the side's bound has passed, as under the cold-shape grace"
+        );
+        let answer = answers_after(encoder_forward);
+        let status = failure(first_media_prompt(&prefill, behind, answer).await);
+        assert!(
+            !is_prefill_silence(&status),
+            "the side's answer passed through: {status:?}"
+        );
+        assert_eq!(status.message(), "late side");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= encoder_forward && elapsed < Duration::from_secs(4),
+            "the answer's own time, not a verdict: {elapsed:?}"
+        );
+    }
+
+    /// A first media request behind an encode worker whose prefill side
+    /// never answers is still given up on, at the grace and not later, with
+    /// the verdict naming the window it was judged against.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_prefill_dispatch_behind_an_encode_worker_that_never_answers_is_given_up_on_at_the_grace(
+    ) {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let started = tokio::time::Instant::now();
+        let behind =
+            PrefillBound::behind_encode(&prefill, 95, Instant::now()).expect("the rule is on");
+        let status = failure(first_media_prompt(&prefill, behind, never_answers()).await);
+        assert!(is_prefill_silence(&status), "{status:?}");
+        assert!(
+            status
+                .message()
+                .contains("never answered (a 120.0s window)"),
+            "the verdict names the grace it was judged against: {status:?}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(120) && elapsed < Duration::from_secs(121),
+            "given up on at the grace, not later: {elapsed:?}"
+        );
+        // The grace is spent: a run released without an answer leaves its
+        // silence on the worker's book, and the next side reads the
+        // threshold. The side given up on above still holds its prompt (its
+        // stream never ends here; the late failure would release it), so the
+        // test releases it, then banks a run the grace long, stamped forward
+        // (the gateway clock is young in a test).
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended(95, true, None);
+        let t0 = liveness::now_ms().max(1);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started_at(95, true, t0);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended_at(95, true, None, t0 + 120_000);
+        let spent =
+            PrefillBound::behind_encode(&prefill, 95, Instant::now()).expect("the rule is on");
+        assert_eq!(
+            spent.bound,
+            Duration::from_secs(3),
+            "the grace spent: the threshold until the worker answers"
+        );
+    }
+
     /// A prefill that answers, or fails on its own, within its bound passes
     /// through as it is; an engine's own deadline is not the verdict; without
     /// a bound the call is awaited as before.
@@ -2738,7 +4167,10 @@ pub(crate) mod tests {
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
         let status = failure(
             dispatch_prefill_within(
-                Some(three_second_bound()),
+                PrefillWait {
+                    bound: Some(three_second_bound()),
+                    encode: None,
+                },
                 answers_after(Duration::from_secs(1)),
                 Some(prefill),
                 None,
@@ -2755,7 +4187,10 @@ pub(crate) mod tests {
         )));
         let status = failure(
             dispatch_prefill_within(
-                None,
+                PrefillWait {
+                    bound: None,
+                    encode: None,
+                },
                 fails_now("refused"),
                 None,
                 None,
@@ -2779,7 +4214,10 @@ pub(crate) mod tests {
             .tracked_prefill_side_booked(Arc::clone(&prefill), PrefillTicket::book(&prefill, 256));
         let first = first_prefill_response_within(
             &mut stream,
-            Some(three_second_bound()),
+            PrefillWait {
+                bound: Some(three_second_bound()),
+                encode: None,
+            },
             Some(&prefill),
             None,
             metrics_labels::CONNECTION_GRPC,
@@ -2806,13 +4244,22 @@ pub(crate) mod tests {
         let answered_at = Duration::from_millis(500);
         let other_side = async {
             tokio::time::sleep(answered_at).await;
-            prefill.note_prefill_started(256, true);
-            prefill.note_prefill_ended(256, true, Some(0));
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_started(256, true);
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_ended(256, true, Some(0));
         };
         let started = Instant::now();
         let (result, ()) = tokio::join!(
             dispatch_prefill_within(
-                Some(bound_from(started, bound)),
+                PrefillWait {
+                    bound: Some(bound_from(started, bound)),
+                    encode: None
+                },
                 never_answers(),
                 Some(Arc::clone(&prefill)),
                 None,
@@ -2841,21 +4288,36 @@ pub(crate) mod tests {
     async fn a_prefill_dispatch_in_flight_before_a_longer_prompt_waits_through_the_build() {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
-        prefill.note_prefill_started(256, true);
-        prefill.note_prefill_ended(256, true, Some(0));
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(256, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended(256, true, Some(0));
         let bound = Duration::from_secs(1);
         let landed_at = Duration::from_millis(500);
         let shown_at = Duration::from_millis(2_500);
         let longer_prompt = async {
             tokio::time::sleep(landed_at).await;
-            prefill.note_prefill_started(8_192, true);
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_started(8_192, true);
             tokio::time::sleep(shown_at - landed_at).await;
-            prefill.note_prefill_ended(8_192, true, Some(0));
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_ended(8_192, true, Some(0));
         };
         let started = Instant::now();
         let (result, ()) = tokio::join!(
             dispatch_prefill_within(
-                Some(bound_from(started, bound)),
+                PrefillWait {
+                    bound: Some(bound_from(started, bound)),
+                    encode: None
+                },
                 never_answers(),
                 Some(Arc::clone(&prefill)),
                 None,
@@ -2889,16 +4351,28 @@ pub(crate) mod tests {
     async fn a_prefill_dispatch_in_a_burst_after_an_idle_spell_waits_on_past_its_bound() {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
-        prefill.note_prefill_started(10_000, true);
-        prefill.note_prefill_ended(10_000, true, Some(0));
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(10_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended(10_000, true, Some(0));
         tokio::time::sleep(Duration::from_millis(2_500)).await;
         for _ in 0..2 {
-            prefill.note_prefill_started(10_000, true);
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_started(10_000, true);
         }
         let bound = Duration::from_secs(1);
         let started = Instant::now();
         let result = dispatch_prefill_within(
-            Some(bound_from(started, bound)),
+            PrefillWait {
+                bound: Some(bound_from(started, bound)),
+                encode: None,
+            },
             answers_after(Duration::from_millis(1_500)),
             Some(Arc::clone(&prefill)),
             None,
@@ -2925,12 +4399,18 @@ pub(crate) mod tests {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
         for _ in 0..40 {
-            prefill.note_prefill_started(100_000, true);
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_started(100_000, true);
         }
         let bound = Duration::from_secs(1);
         let started = Instant::now();
         let result = dispatch_prefill_within(
-            Some(bound_from(started, bound)),
+            PrefillWait {
+                bound: Some(bound_from(started, bound)),
+                encode: None,
+            },
             answers_after(Duration::from_millis(2_500)),
             Some(Arc::clone(&prefill)),
             None,
@@ -2963,20 +4443,26 @@ pub(crate) mod tests {
         // short of the window when the verdict is given.
         let started = Instant::now();
         for _ in 0..2 {
-            prefill.note_prefill_started(10_000, true);
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_started(10_000, true);
         }
         let bound = Duration::from_secs(1);
         let backlog = Duration::from_secs(2);
         let arrivals = async {
             tokio::time::sleep(bound + Duration::from_millis(500)).await;
             loop {
-                prefill.note_prefill_started(2_000, true);
+                prefill
+                    .runtime_state()
+                    .unwrap()
+                    .note_prefill_started(2_000, true);
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
         let result = tokio::select! {
             result = dispatch_prefill_within(
-                Some(bound_from(started, bound)),
+                PrefillWait { bound: Some(bound_from(started, bound)), encode: None },
                 never_answers(),
                 Some(Arc::clone(&prefill)),
                 None,
@@ -2992,6 +4478,8 @@ pub(crate) mod tests {
         // below, a millisecond of the worker's clock allowed, and from
         // above.
         let silent = prefill
+            .runtime_state()
+            .unwrap()
             .prefill_unanswered_run()
             .expect("the run never answered");
         let status = failure(result);
@@ -3018,21 +4506,33 @@ pub(crate) mod tests {
     ) {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
-        prefill.note_prefill_started(20_000, true);
-        prefill.note_prefill_started(2_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(20_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(2_000, true);
         tokio::time::sleep(Duration::from_millis(1_100)).await;
-        prefill.note_prefill_ended(20_000, true, Some(0));
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended(20_000, true, Some(0));
         let answered = Instant::now();
         let bound = Duration::from_secs(1);
         let arrivals = async {
             loop {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                prefill.note_prefill_started(2_000, true);
+                prefill
+                    .runtime_state()
+                    .unwrap()
+                    .note_prefill_started(2_000, true);
             }
         };
         let result = tokio::select! {
             result = dispatch_prefill_within(
-                Some(bound_from(answered, bound)),
+                PrefillWait { bound: Some(bound_from(answered, bound)), encode: None },
                 never_answers(),
                 Some(Arc::clone(&prefill)),
                 None,
@@ -3062,21 +4562,33 @@ pub(crate) mod tests {
     ) {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
-        prefill.note_prefill_started(20_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(20_000, true);
         tokio::time::sleep(Duration::from_millis(1_100)).await;
-        prefill.note_prefill_ended(20_000, true, Some(0));
-        prefill.note_prefill_started(2_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended(20_000, true, Some(0));
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(2_000, true);
         let bound = Duration::from_secs(1);
         let started = Instant::now();
         let arrivals = async {
             loop {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                prefill.note_prefill_started(2_000, true);
+                prefill
+                    .runtime_state()
+                    .unwrap()
+                    .note_prefill_started(2_000, true);
             }
         };
         let result = tokio::select! {
             result = dispatch_prefill_within(
-                Some(bound_from(started, bound)),
+                PrefillWait { bound: Some(bound_from(started, bound)), encode: None },
                 never_answers(),
                 Some(Arc::clone(&prefill)),
                 None,
@@ -3106,24 +4618,36 @@ pub(crate) mod tests {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
         let decode = Arc::clone(workers.decode_worker().expect("a pair"));
-        prefill.note_prefill_started(20_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(20_000, true);
         tokio::time::sleep(Duration::from_millis(1_100)).await;
-        prefill.note_prefill_ended(20_000, true, Some(0));
-        decode.note_output_started();
-        decode.note_token_progress();
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended(20_000, true, Some(0));
+        decode.runtime_state().unwrap().note_output_started();
+        decode.runtime_state().unwrap().note_token_progress();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        prefill.note_prefill_started(2_000, true);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started(2_000, true);
         let bound = Duration::from_secs(1);
         let started = Instant::now();
         let arrivals = async {
             loop {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                prefill.note_prefill_started(2_000, true);
+                prefill
+                    .runtime_state()
+                    .unwrap()
+                    .note_prefill_started(2_000, true);
             }
         };
         let result = tokio::select! {
             result = dispatch_prefill_within(
-                Some(bound_from(started, bound)),
+                PrefillWait { bound: Some(bound_from(started, bound)), encode: None },
                 never_answers(),
                 Some(Arc::clone(&prefill)),
                 Some(Arc::clone(&decode)),
@@ -3140,7 +4664,7 @@ pub(crate) mod tests {
             elapsed >= bound && elapsed < 2 * bound,
             "the decode verdict comes at the prefill's bound: {elapsed:?}"
         );
-        decode.note_output_ended();
+        decode.runtime_state().unwrap().note_output_ended();
     }
 
     /// The partner is judged by a decode side's bound for the prompt, which
@@ -3153,8 +4677,8 @@ pub(crate) mod tests {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
         let decode = Arc::clone(workers.decode_worker().expect("a pair"));
-        decode.note_output_started();
-        decode.note_token_progress();
+        decode.runtime_state().unwrap().note_output_started();
+        decode.runtime_state().unwrap().note_token_progress();
         std::thread::sleep(Duration::from_millis(600));
         let dispatched = Instant::now()
             .checked_sub(Duration::from_secs(2))
@@ -3174,7 +4698,7 @@ pub(crate) mod tests {
         )
         .expect_err("its worker answered nothing within the side's bound");
         assert!(is_decode_silence(&status), "{status:?}");
-        decode.note_output_ended();
+        decode.runtime_state().unwrap().note_output_ended();
     }
 
     /// On the parallel shape a prefill side's first response waits for the
@@ -3205,13 +4729,16 @@ pub(crate) mod tests {
 
                 // The decode holds a stream it had been producing for, and
                 // has produced nothing since: stalled mid-stream.
-                decode.note_output_started();
-                decode.note_token_progress();
+                decode.runtime_state().unwrap().note_output_started();
+                decode.runtime_state().unwrap().note_token_progress();
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let started = Instant::now();
                 let status = failure(
                     dispatch_prefill_within(
-                        at(started),
+                        PrefillWait {
+                            bound: at(started),
+                            encode: None,
+                        },
                         never_answers(),
                         Some(Arc::clone(&prefill)),
                         Some(Arc::clone(&decode)),
@@ -3256,13 +4783,13 @@ pub(crate) mod tests {
                 // beside the dispatch and ends with it.)
                 let producing = async {
                     loop {
-                        decode.note_token_progress();
+                        decode.runtime_state().unwrap().note_token_progress();
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 };
                 let status = tokio::select! {
                     result = dispatch_prefill_within(
-                        at(Instant::now()),
+                        PrefillWait { bound: at(Instant::now()), encode: None },
                         never_answers(),
                         Some(Arc::clone(&prefill)),
                         Some(Arc::clone(&decode)),
@@ -3277,11 +4804,14 @@ pub(crate) mod tests {
                 // The decode's producing stream ended (quiet since, but with
                 // nothing in flight it had shown output on): the prefill's
                 // verdict.
-                decode.note_output_ended();
+                decode.runtime_state().unwrap().note_output_ended();
                 assert!(decode.output_silence().is_none());
                 let status = failure(
                     dispatch_prefill_within(
-                        at(Instant::now()),
+                        PrefillWait {
+                            bound: at(Instant::now()),
+                            encode: None,
+                        },
                         never_answers(),
                         Some(Arc::clone(&prefill)),
                         Some(Arc::clone(&decode)),
@@ -3326,7 +4856,7 @@ pub(crate) mod tests {
     #[test]
     fn a_decode_verdict_on_the_prefills_dispatch_is_charged_to_the_decode_when_both_sides_answered()
     {
-        use crate::worker::circuit_breaker::CircuitState;
+        use crate::worker::health::circuit_breaker::CircuitState;
         let pair = || {
             let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
                 Arc::new(
@@ -3915,7 +5445,10 @@ pub(crate) mod tests {
     async fn a_single_dispatch_is_booked_on_its_worker_before_its_call_answers() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w1:30000").build());
         fn books(worker: &Arc<dyn Worker>) -> (Duration, usize) {
-            (worker.prefill_backlog(), worker.tracked_load())
+            (
+                worker.runtime_state().unwrap().prefill_backlog(),
+                worker.runtime_state().unwrap().tracked_load(),
+            )
         }
         // 4,096 prompt tokens at the cold prior read as 409 ms of backlog.
         let pending = Duration::from_millis(409);
@@ -3963,5 +5496,494 @@ pub(crate) mod tests {
             none,
             "a call that fails gives the booking back"
         );
+    }
+
+    /// A grouped ZMQ worker: `size` engines behind one socket set, no rank.
+    fn grouped_worker(url: &str, size: usize) -> WorkerSelection {
+        WorkerSelection::Single {
+            worker: Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .connection_mode(ConnectionMode::Zmq)
+                    .zmq_engine_group(size)
+                    .build(),
+            ),
+        }
+    }
+
+    fn pinned_rank(request: &ProtoGenerateRequest) -> Option<i32> {
+        let ProtoGenerateRequest::TokenSpeed(request) = request else {
+            panic!("expected a TokenSpeed request");
+        };
+        request.data_parallel_rank
+    }
+
+    /// One attempt of a single generate request (sticky `key`) to `workers`,
+    /// pinned as `execute_plan` pins it under `sticky`: the rank the request
+    /// carries. The worker's connection does not say which ranks it places a
+    /// pin on.
+    fn attempt(
+        sticky: GroupedDpSticky,
+        workers: &WorkerSelection,
+        key: Option<&str>,
+    ) -> Option<i32> {
+        attempt_on(sticky, workers, None, key)
+    }
+
+    /// [`attempt`] through a connection that places a pin on its first
+    /// `pinnable_ranks` ranks.
+    fn attempt_on(
+        sticky: GroupedDpSticky,
+        workers: &WorkerSelection,
+        pinnable_ranks: Option<usize>,
+        key: Option<&str>,
+    ) -> Option<i32> {
+        let mut plan = ExecutionPlan::Single(ProtoRequest::Generate(tokenspeed_request(1, None)));
+        pin_grouped_dp_rank(&mut plan, workers, || pinnable_ranks, key, sticky);
+        let ExecutionPlan::Single(ProtoRequest::Generate(request)) = &plan else {
+            panic!("the plan stays a single generate request");
+        };
+        pinned_rank(request)
+    }
+
+    /// Under `--grouped-dp-sticky off` (the default) a sticky request to a
+    /// grouped worker is left to the connector's pick.
+    #[test]
+    fn with_pinning_off_no_request_is_pinned() {
+        let workers = grouped_worker("ipc:///tmp/unpinned.ipc", 2);
+        assert_eq!(attempt(GroupedDpSticky::Off, &workers, Some("conv")), None);
+    }
+
+    /// Under hash placement a sticky key is pinned to `xxh3(key) % dp_size`,
+    /// the same rank for every request of the key.
+    #[test]
+    fn hash_placement_pins_every_key_to_its_hash_rank() {
+        fn hashed(key: &str, size: usize) -> i32 {
+            (xxhash_rust::xxh3::xxh3_64(key.as_bytes()) % size as u64) as i32
+        }
+
+        for size in [2, 3, 8] {
+            let workers = grouped_worker(&format!("ipc:///tmp/hash-{size}.ipc"), size);
+            for i in 0..100 {
+                let key = format!("conv-{i}");
+                for _ in 0..2 {
+                    let rank = attempt(GroupedDpSticky::Hash, &workers, Some(&key));
+                    assert_eq!(rank, Some(hashed(&key, size)), "{key} of {size}");
+                }
+            }
+        }
+    }
+
+    /// A key whose rank the worker's connection places no pin on (on vLLM, one
+    /// at or past the first index the group's engines lack) is left to the
+    /// connector's pick, which takes any engine, rather than pinned where the
+    /// connector may refuse it, and each such request is logged at debug; a
+    /// key whose rank the connection places keeps it.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_key_whose_rank_the_connection_cannot_place_is_left_to_the_connector() {
+        let workers = grouped_worker("ipc:///tmp/partial.ipc", 4);
+        let hash = |ranks: usize, key: &str| {
+            attempt_on(GroupedDpSticky::Hash, &workers, Some(ranks), Some(key))
+        };
+        let mut left = 0;
+        for i in 0..32 {
+            let key = format!("conv-{i}");
+            let hashed = hash_rank(&key, 4) as i32;
+            let rank = hash(2, &key);
+            assert_eq!(rank, (hashed < 2).then_some(hashed), "{key}, 2 of 4 placed");
+            left += usize::from(rank.is_none());
+            assert_eq!(hash(4, &key), Some(hashed), "{key}, all 4 placed");
+            assert_eq!(hash(0, &key), None, "{key}, none placed");
+        }
+        assert!((1..32).contains(&left), "keys on either side: {left} left");
+        // One debug line per request left to the connector, naming the
+        // worker, its size and the ranks its connection places.
+        logs_assert(|lines: &[&str]| {
+            let logged: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("keeps the connector's pick"))
+                .collect();
+            let placing = |ranks: usize| {
+                let ranks = format!("pinnable_ranks={ranks}");
+                logged
+                    .iter()
+                    .filter(|line| {
+                        line.contains("ipc:///tmp/partial.ipc")
+                            && line.contains("size=4")
+                            && line.contains(&ranks)
+                    })
+                    .count()
+            };
+            if (logged.len(), placing(2), placing(0)) == (left + 32, left, 32) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{left} lines placing 2 and 32 placing none expected: {logged:?}"
+                ))
+            }
+        });
+    }
+
+    /// A worker given no count has no `dp_size`: its ranks are the ones its
+    /// connection places a pin on (on TokenSpeed, every engine of the group
+    /// its engines declared at the handshake), and a sticky key is pinned to
+    /// its hash rank among them. A connection with one engine has none to
+    /// choose.
+    #[test]
+    fn a_group_its_engines_declared_is_pinned_by_the_engines_connected() {
+        let workers = WorkerSelection::Single {
+            worker: Arc::new(
+                BasicWorkerBuilder::new("ipc:///tmp/declared.ipc")
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .connection_mode(ConnectionMode::Zmq)
+                    .build(),
+            ),
+        };
+        let hash = |ranks: usize, key: &str| {
+            attempt_on(GroupedDpSticky::Hash, &workers, Some(ranks), Some(key))
+        };
+        for i in 0..32 {
+            let key = format!("conv-{i}");
+            assert_eq!(hash(4, &key), Some(hash_rank(&key, 4) as i32), "{key}");
+        }
+        assert_eq!(hash(1, "conv"), None, "one engine");
+    }
+
+    /// Only a grouped worker is pinned: a rank-expanded worker carries its
+    /// own rank (set at dispatch), a worker without a group or with one
+    /// engine has none to choose, and a disaggregated pair's ranks are its
+    /// protocol's.
+    #[test]
+    fn only_a_grouped_worker_is_pinned() {
+        let single = |builder: BasicWorkerBuilder| WorkerSelection::Single {
+            worker: Arc::new(builder.connection_mode(ConnectionMode::Zmq).build()),
+        };
+        for workers in [
+            single(BasicWorkerBuilder::new("ipc:///tmp/ranked.ipc").dp_config(1, 2)),
+            single(BasicWorkerBuilder::new("ipc:///tmp/ungrouped.ipc")),
+            single(BasicWorkerBuilder::new("ipc:///tmp/one.ipc").zmq_engine_group(1)),
+            tokenspeed_pair(),
+        ] {
+            assert_eq!(attempt(GroupedDpSticky::Hash, &workers, Some("conv")), None);
+        }
+    }
+
+    /// Only a single generate request with a sticky key is pinned: one
+    /// without a key and a batch's prompts are left to the connector's pick.
+    #[test]
+    fn only_a_single_generate_request_with_a_sticky_key_is_pinned() {
+        let workers = grouped_worker("ipc:///tmp/unkeyed.ipc", 2);
+        assert_eq!(
+            attempt(GroupedDpSticky::Hash, &workers, None),
+            None,
+            "no sticky key"
+        );
+
+        let mut batch = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::Single,
+            shared_request_id: "batch".to_string(),
+            requests: vec![tokenspeed_request(1, None), tokenspeed_request(1, None)],
+        };
+        pin_grouped_dp_rank(
+            &mut batch,
+            &workers,
+            || None,
+            Some("conv"),
+            GroupedDpSticky::Hash,
+        );
+        assert!(
+            batch
+                .generate_requests_mut()
+                .all(|request| pinned_rank(request).is_none()),
+            "a batch's prompts"
+        );
+    }
+
+    /// A TokenSpeed pair on the ZMQ lane: its prefill worker grouped with
+    /// `prefill` engines (`None`: given no count), its decode worker with
+    /// `decode`.
+    fn grouped_pair(prefill: Option<usize>, decode: Option<usize>) -> WorkerSelection {
+        let worker = |url: &str, worker_type, engines: Option<usize>| -> Arc<dyn Worker> {
+            let mut builder = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .connection_mode(ConnectionMode::Zmq);
+            if let Some(engines) = engines {
+                builder = builder.zmq_engine_group(engines);
+            }
+            Arc::new(builder.build())
+        };
+        WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: worker("ipc:///tmp/pd-prefill.ipc", WorkerType::Prefill, prefill),
+            decode: worker("ipc:///tmp/pd-decode.ipc", WorkerType::Decode, decode),
+            runtime_type: RuntimeType::TokenSpeed,
+        }
+    }
+
+    /// The PD room a request carries: `None` on one without (not TokenSpeed,
+    /// or not disaggregated).
+    fn room_of(request: &ProtoGenerateRequest) -> Option<i64> {
+        match request {
+            ProtoGenerateRequest::TokenSpeed(request) => request
+                .kv_bootstrap_info
+                .as_ref()
+                .map(|info| info.bootstrap_room),
+            _ => None,
+        }
+    }
+
+    /// One attempt of a single PD request (sticky `key`) to `workers`, its
+    /// room minted as request building and a retry's re-stamp mint it, then
+    /// pinned as `execute_plan` pins it under `sticky`, through a prefill
+    /// connection that connected `engines` (when it says): the residue the
+    /// pin returned, which the room is checked to carry, and the room.
+    fn pd_attempt(
+        sticky: GroupedDpSticky,
+        workers: &WorkerSelection,
+        engines: Option<usize>,
+        key: Option<&str>,
+    ) -> (Option<RoomResidue>, i64) {
+        let mut request = tokenspeed_request(1, None);
+        maybe_inject_pd_rendezvous(&mut request, workers);
+        let mut plan = ExecutionPlan::PrefillDecode(request);
+        let residue = pin_grouped_dp_prefill_room(&mut plan, workers, || engines, key, sticky);
+        let ExecutionPlan::PrefillDecode(request) = &plan else {
+            panic!("the plan stays a PD request");
+        };
+        assert_eq!(pinned_rank(request), None, "no rank pin on the request");
+        let room = room_of(request).expect("a PD request carries a room");
+        assert!(room >= 0);
+        if let Some(RoomResidue { rank, ranks }) = residue {
+            assert_eq!(room % ranks as i64, rank as i64, "{room}");
+        }
+        (residue, room)
+    }
+
+    /// A grouped prefill worker of a PD pair runs a request on the engine
+    /// `room % engines`: with hash placement the room carries the key's hash
+    /// rank on every attempt, a fresh room each time, and with pinning off it
+    /// is left as minted.
+    #[test]
+    fn a_pd_prefill_room_carries_the_sticky_keys_rank() {
+        for size in [2, 4, 8] {
+            let workers = grouped_pair(Some(size), Some(size));
+            let attempt = |sticky, key: &str| pd_attempt(sticky, &workers, Some(size), Some(key));
+            let mut seen = HashSet::new();
+            for i in 0..64 {
+                let key = format!("conv-{i}");
+                let rank = hash_rank(&key, size);
+                let (first, first_room) = attempt(GroupedDpSticky::Hash, &key);
+                let (again, again_room) = attempt(GroupedDpSticky::Hash, &key);
+                assert_eq!(first, Some(RoomResidue { rank, ranks: size }), "{key}");
+                assert_eq!(again, first, "{key}, retried");
+                assert_ne!(first_room, again_room, "each attempt mints a fresh room");
+                seen.insert(rank);
+            }
+            assert_eq!(seen.len(), size, "64 keys reach every engine of {size}");
+            // Unpinned: residues follow the random rooms (all of them seen).
+            let unpinned: HashSet<i64> = (0..256)
+                .map(|_| attempt(GroupedDpSticky::Off, "conv-0"))
+                .map(|(residue, room)| {
+                    assert_eq!(residue, None, "pinning off");
+                    room % size as i64
+                })
+                .collect();
+            assert_eq!(unpinned.len(), size);
+        }
+    }
+
+    /// A prefill worker given no count (no `dp_size`: a gateway whose decode
+    /// engines are TP, where no one `--zmq-engine-count` fits both pools) is
+    /// pinned by the engines its connection connected. That count, the
+    /// modulus the engine places by, also wins over a `dp_size`, which sizes
+    /// the ranks only where the connection does not say; with neither, the
+    /// room stays random.
+    #[test]
+    fn an_unsized_pd_prefill_room_is_pinned_by_its_engine_count() {
+        let unsized_pair = grouped_pair(None, None);
+        let (sized_2, sized_4) = (grouped_pair(Some(2), None), grouped_pair(Some(4), None));
+        for i in 0..64 {
+            let key = format!("conv-{i}");
+            let pin = |workers: &WorkerSelection, engines| {
+                pd_attempt(GroupedDpSticky::Hash, workers, engines, Some(&key)).0
+            };
+            let rank = hash_rank(&key, 4);
+            let expected = Some(RoomResidue { rank, ranks: 4 });
+            assert_eq!(pin(&unsized_pair, Some(4)), expected, "{key}: connected");
+            assert_eq!(pin(&sized_2, Some(4)), expected, "{key}: over dp_size");
+            assert_eq!(pin(&sized_4, None), expected, "{key}: dp_size alone");
+        }
+        let unpinned: HashSet<i64> = (0..256)
+            .map(|_| pd_attempt(GroupedDpSticky::Hash, &unsized_pair, None, Some("conv")))
+            .map(|(residue, room)| {
+                assert_eq!(residue, None, "no size and no count");
+                room % 4
+            })
+            .collect();
+        assert_eq!(unpinned.len(), 4, "the room stays random");
+    }
+
+    /// Each sample of a sticky n>1 PD request is dispatched with a room of
+    /// its own, every one in the residue class of the key's prefill rank, so
+    /// all the samples prefill on the key's engine; unpinned, the samples'
+    /// rooms stay random.
+    #[test]
+    fn every_sample_of_a_sticky_pd_request_carries_the_keys_prefill_rank() {
+        let workers = grouped_pair(Some(4), Some(4));
+        let mut request = tokenspeed_request(8, None);
+        maybe_inject_pd_rendezvous(&mut request, &workers);
+        let mut plan = ExecutionPlan::PrefillDecode(request);
+        let residue = pin_grouped_dp_prefill_room(
+            &mut plan,
+            &workers,
+            || Some(4),
+            Some("conv-7"),
+            GroupedDpSticky::Hash,
+        );
+        let rank = hash_rank("conv-7", 4);
+        assert_eq!(residue, Some(RoomResidue { rank, ranks: 4 }));
+        let ExecutionPlan::PrefillDecode(request) = &plan else {
+            panic!("the plan stays a PD request");
+        };
+
+        let rooms_of = |residue| -> Vec<i64> {
+            pd_fanout_requests(request, 8, &workers, residue)
+                .iter()
+                .map(|sub| room_of(sub).expect("a sample carries a room"))
+                .collect()
+        };
+        let rooms: HashSet<i64> = rooms_of(residue).into_iter().collect();
+        assert_eq!(rooms.len(), 8, "a room per sample");
+        for room in rooms {
+            assert!(room >= 0);
+            assert_eq!(room % 4, rank as i64, "{room}");
+        }
+        let unpinned: HashSet<i64> = (0..32)
+            .flat_map(|_| rooms_of(None))
+            .map(|room| room % 4)
+            .collect();
+        assert_eq!(unpinned.len(), 4, "unpinned samples' rooms stay random");
+    }
+
+    /// Only a single TokenSpeed PD request with a sticky key to a grouped
+    /// prefill worker has its room pinned: a dp-aware prefill worker's room
+    /// carries the worker's own rank already, a prefill worker of one engine
+    /// has none to choose, and a batched, an EPD or another runtime's request
+    /// keeps the room it was minted.
+    #[test]
+    fn only_a_single_tokenspeed_pd_request_to_a_grouped_prefill_worker_is_pinned() {
+        let workers = grouped_pair(Some(4), Some(4));
+        let hashed = |workers: &WorkerSelection, engines, key| {
+            pd_attempt(GroupedDpSticky::Hash, workers, engines, key).0
+        };
+        assert_eq!(hashed(&workers, Some(4), None), None, "no sticky key");
+        let one = grouped_pair(None, None);
+        assert_eq!(hashed(&one, Some(1), Some("conv")), None, "one engine");
+
+        let ranked = |url, worker_type| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .dp_config(3, 4)
+                    .build(),
+            )
+        };
+        let dp_aware = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: ranked("grpc://prefill:30000", WorkerType::Prefill),
+            decode: ranked("grpc://decode:30000", WorkerType::Decode),
+            runtime_type: RuntimeType::TokenSpeed,
+        };
+        let (residue, room) = pd_attempt(GroupedDpSticky::Hash, &dp_aware, None, Some("conv"));
+        assert_eq!((residue, room % 4), (None, 3), "dp-aware: as minted");
+
+        let minted = || {
+            let mut request = tokenspeed_request(1, None);
+            maybe_inject_pd_rendezvous(&mut request, &workers);
+            request
+        };
+        for mut plan in [
+            ExecutionPlan::Batch {
+                kind: ExecutionPlanKind::PrefillDecode,
+                shared_request_id: "batch".to_string(),
+                requests: vec![minted(), minted()],
+            },
+            ExecutionPlan::EncodePrefillDecode { request: minted() },
+            ExecutionPlan::PrefillDecode(ProtoGenerateRequest::Vllm(Box::default())),
+        ] {
+            let rooms = |plan: &mut ExecutionPlan| -> Vec<Option<i64>> {
+                plan.generate_requests_mut()
+                    .map(|request| room_of(request))
+                    .collect()
+            };
+            let minted_rooms = rooms(&mut plan);
+            let residue = pin_grouped_dp_prefill_room(
+                &mut plan,
+                &workers,
+                || Some(4),
+                Some("conv"),
+                GroupedDpSticky::Hash,
+            );
+            assert_eq!(residue, None, "{minted_rooms:?}");
+            assert_eq!(rooms(&mut plan), minted_rooms, "left as minted");
+        }
+    }
+
+    /// The batch's one breaker sample is the worst answer by the worker's own
+    /// reading, whatever the answers' order: a failure the worker charges over
+    /// its capacity pushback over the request's own fault over a success; an
+    /// answer that says nothing about the worker (a media fault) is not in
+    /// the running, so a success beside it is credited; an operator's
+    /// capacity set moves a status out of the failure rank.
+    #[test]
+    fn the_batch_breaker_sample_is_the_worst_answer_by_the_workers_reading() {
+        use tonic::{Code, Status};
+        let worker_with = |resilience: ResolvedResilience| {
+            BasicWorkerBuilder::new("grpc://worker:30000")
+                .connection_mode(ConnectionMode::Grpc)
+                .resilience(resilience)
+                .build()
+        };
+        let default = worker_with(ResolvedResilience::default());
+        let err = |code: Code| Err::<(), _>(Status::new(code, "the stub's answer"));
+        let sample = |answers: &[Result<(), Status>]| batch_breaker_status(answers, &default);
+
+        assert_eq!(sample(&[Ok(()), err(Code::ResourceExhausted)]), Some(429));
+        assert_eq!(
+            sample(&[err(Code::ResourceExhausted), err(Code::Unavailable)]),
+            Some(503)
+        );
+        assert_eq!(
+            sample(&[err(Code::InvalidArgument), err(Code::ResourceExhausted)]),
+            Some(429)
+        );
+        assert_eq!(
+            sample(&[err(Code::InvalidArgument), Ok(()), err(Code::Unavailable)]),
+            Some(503)
+        );
+        assert_eq!(
+            sample(&[err(Code::Unavailable), Ok(()), err(Code::InvalidArgument)]),
+            Some(503)
+        );
+        assert_eq!(sample(&[Ok(()), Ok(())]), Some(200));
+        assert_eq!(sample(&[]), None);
+        let media_fault = Err::<(), _>(Status::unavailable(
+            "HTTP error while fetching media: 404 Not Found",
+        ));
+        assert_eq!(sample(&[media_fault, Ok(())]), Some(200));
+
+        let capacity_503 = worker_with(ResolvedResilience {
+            capacity_status_codes: [503].into_iter().collect(),
+            ..ResolvedResilience::default()
+        });
+        let answers = [err(Code::Internal), err(Code::Unavailable)];
+        assert!(matches!(
+            batch_breaker_status(&answers, &default),
+            Some(500 | 503)
+        ));
+        assert_eq!(batch_breaker_status(&answers, &capacity_503), Some(500));
     }
 }

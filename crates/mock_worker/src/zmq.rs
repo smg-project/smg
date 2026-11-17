@@ -23,13 +23,17 @@ use engine_zmq_client::{
     mock_engine::{
         default_ready_response, hello_in_group, wait_for_endpoint, EngineInbound, MockEngineOutput,
     },
-    protocol::vllm::{
-        logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
-        output::{
-            DpControlMessage, DpControlOutput, EngineCoreFinishReason, EngineCoreOutput,
-            EngineCoreOutputs, RequestBatchOutputs, StopReason, UtilityCallOutput, UtilityOutput,
+    protocol::{
+        handshake::REQUEST_KIND_ADD,
+        vllm::{
+            logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
+            output::{
+                DpControlMessage, DpControlOutput, EngineCoreFinishReason, EngineCoreOutput,
+                EngineCoreOutputs, RequestBatchOutputs, StopReason, UtilityCallOutput,
+                UtilityOutput,
+            },
+            stats::{PrefillStats, SchedulerStats},
         },
-        stats::{PrefillStats, SchedulerStats},
     },
     EngineId, Error,
 };
@@ -43,9 +47,11 @@ use tokio::{
 };
 
 use crate::{
-    config::Config,
+    bootstrap::{accept_and_close, bind},
+    config::{Config, Role},
     drain::InFlight,
     engine::{Engine, GenEvent, LoadSnapshot, NewRequest},
+    kv_zmq,
     script::{self, Answer, MatchedStop},
 };
 
@@ -396,6 +402,16 @@ fn wave_complete(engine_index: u32, wave: u64) -> EngineCoreOutputs {
     })
 }
 
+/// Stops a prefill rank's bootstrap acceptor when the rank's serve returns,
+/// whichever way it returns.
+struct StopOnDrop(watch::Sender<bool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
+
 /// Run one mock ZMQ EngineCore rank: connect to `handshake_address`, then serve
 /// requests until the frontend disconnects.
 pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u32) {
@@ -429,6 +445,41 @@ pub async fn serve_until(
     let group_size = cfg.zmq_lockstep.then(|| usize::from(cfg.zmq_count));
     if let Some(size) = group_size {
         ready.data_parallel_size = size as u64;
+    }
+    // The request types this rank takes and its disaggregation role, as an
+    // engine declares them in its handshake: a worker registered for a role
+    // is checked against the role here (a rank listing no types predates the
+    // field, which skips that check).
+    ready.request_types = vec![REQUEST_KIND_ADD.to_string(), "abort".to_string()];
+    if let Some(role) = cfg.role {
+        ready.disaggregation_mode = Some(role.as_str().to_string());
+    }
+    // A prefill rank binds its bootstrap port, numbered after the gRPC
+    // workers as its KV publisher is, and declares it: a prefill registration
+    // whose engine declares none is refused. The acceptor ends with the rank.
+    let bootstrap_port = u16::try_from(engine_index)
+        .ok()
+        .and_then(|index| cfg.grpc_count.checked_add(index))
+        .and_then(|index| cfg.bootstrap_port_for(index));
+    let bootstrap = match bind(&cfg.host, bootstrap_port).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("zmq engine {engine_index}: {e}");
+            return;
+        }
+    };
+    let _bootstrap_stop = bootstrap.map(|listener| {
+        let (stop, stopped) = watch::channel(false);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the acceptor ends with the rank: the guard's drop stops it"
+        )]
+        tokio::spawn(accept_and_close(listener, stopped));
+        StopOnDrop(stop)
+    });
+    if let Some(port) = bootstrap_port {
+        ready.bootstrap_host = Some(cfg.host.clone());
+        ready.bootstrap_port = Some(port);
     }
 
     // The frontend's handshake endpoint, waited for in rounds: a round that
@@ -491,7 +542,7 @@ pub async fn serve_until(
     let (mut input, output) = mock.split();
     let engine = cfg
         .realistic
-        .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
+        .then(|| Engine::spawn_named(cfg.engine_for(&name), name.clone(), true));
     // The rank's KV-event publisher, numbered after the gRPC workers and
     // stamping the batches with the rank this engine advertised.
     let publisher = engine.as_ref().and_then(|engine| {
@@ -506,7 +557,7 @@ pub async fn serve_until(
         clippy::disallowed_methods,
         reason = "publisher self-terminates when the engine's event channel closes"
     )]
-    let _publisher = publisher.map(|(engine, kv)| tokio::spawn(crate::kv_zmq::serve(engine, kv)));
+    let _publisher = publisher.map(|(engine, kv)| tokio::spawn(kv_zmq::serve(engine, kv)));
 
     // A single writer owns the output PUSH socket; per-request forwarders funnel
     // their outputs here so concurrent requests serialize onto the one socket.
@@ -760,6 +811,18 @@ pub async fn serve_until(
             Ok(EngineInbound::Add(request)) => {
                 inflight.retain(|_, forwarder| !forwarder.is_finished());
                 let request_id = request.request_id.clone();
+                // A prefill rank's answer: the prompt side's completion alone,
+                // as on the gRPC wires. The decode side of the pair has the
+                // prompt and generates the output, so nothing is scripted
+                // here and nothing counts as a miss.
+                if cfg.role == Some(Role::Prefill) {
+                    let _ = out_tx.send(terminal_batch(
+                        engine_index,
+                        request_id,
+                        EngineCoreFinishReason::Stop,
+                    ));
+                    continue;
+                }
                 let prompt = request.prompt_token_ids.clone().unwrap_or_default();
                 // Honor the request's max_tokens; fall back to the worker default.
                 let max_new = request
@@ -836,6 +899,7 @@ pub async fn serve_until(
                             request_id,
                             prompt_token_ids: prompt,
                             max_new,
+                            choice: 0,
                             events: gen_tx,
                         }),
                         None => {
@@ -864,7 +928,7 @@ pub async fn serve_until(
                             forward.await;
                         })
                     }
-                    late => forwarders.spawn(async move {
+                    late @ HandOver::After(..) => forwarders.spawn(async move {
                         let _unfinished = late.landed().await;
                         start();
                         forward.await;
@@ -1336,9 +1400,10 @@ mod tests {
         connect_handshake, protocol::vllm::request::EngineCoreRequest, EngineCoreClient,
     };
     use futures::StreamExt;
+    use tokio::io::AsyncReadExt;
 
     use super::*;
-    use crate::engine::EngineParams;
+    use crate::engine::{fleet_engines, EngineParams};
 
     fn test_config() -> Config {
         Config {
@@ -1614,6 +1679,175 @@ mod tests {
             4,
             "a request without max_tokens gets output_tokens tokens"
         );
+    }
+
+    /// A rank of a role declares it in its handshake, with its request types
+    /// and, for a prefill, the bootstrap port it binds (numbered after the
+    /// gRPC workers), and a prefill rank answers the prompt side alone: the
+    /// decode side of the pair has the prompt and generates.
+    #[tokio::test]
+    async fn a_prefill_rank_declares_its_role_binds_its_bootstrap_port_and_answers_the_prompt_side_alone(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (
+            endpoint("hs.sock"),
+            endpoint("in.sock"),
+            endpoint("out.sock"),
+        );
+        // A free port for the rank's bootstrap server, released before it binds.
+        let bootstrap_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut cfg = test_config();
+        cfg.role = Some(Role::Prefill);
+        // Two gRPC workers (none spawned here) hold the first two ports: the
+        // rank's port is numbered after them.
+        cfg.grpc_count = 2;
+        cfg.bootstrap_base_port = Some(bootstrap_port - 2);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "serve loops until the test drops its handles"
+        )]
+        let _engine = tokio::spawn(serve(Arc::new(cfg), handshake.clone(), 0));
+
+        let transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(10))
+            .await
+            .expect("frontend handshake");
+        let client = EngineCoreClient::new(transport);
+        let ready = &client.engines()[0].ready_response;
+        assert_eq!(ready.disaggregation_role(), Some("prefill"));
+        assert_eq!(
+            ready.bootstrap_address(),
+            Some(("127.0.0.1", bootstrap_port))
+        );
+        assert_eq!(ready.request_types, ["add", "abort"]);
+
+        // The bootstrap port accepts and closes, which is what the gateway's
+        // probe of a prefill worker's port asks.
+        let mut probe = tokio::net::TcpStream::connect(("127.0.0.1", bootstrap_port))
+            .await
+            .expect("the bootstrap port accepts");
+        let mut byte = [0u8; 1];
+        assert_eq!(probe.read(&mut byte).await.expect("the acceptor closes"), 0);
+
+        let mut stream = client
+            .submit(EngineCoreRequest {
+                request_id: "p1".to_string(),
+                prompt_token_ids: Some(vec![1, 2, 3]),
+                ..Default::default()
+            })
+            .await
+            .expect("submit");
+        let first = stream.next().await.expect("an output").expect("output ok");
+        assert!(first.finished(), "the prompt side's completion: {first:?}");
+        assert!(
+            first.new_token_ids.is_empty(),
+            "no output tokens: {first:?}"
+        );
+    }
+
+    /// The rank `--worker-kv-tokens` names, by its engine index, runs its
+    /// engine with its own KV pool.
+    #[tokio::test]
+    async fn the_rank_an_override_names_runs_its_engine_with_its_own_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (
+            endpoint("hs.sock"),
+            endpoint("in.sock"),
+            endpoint("out.sock"),
+        );
+        // An index no other test's rank takes: the fleet registry is
+        // process-wide.
+        let index = 4_217;
+        let name = format!("zmq:{index}");
+        let cfg = Config {
+            engine: EngineParams {
+                kv_capacity_tokens: 131_072,
+                ..EngineParams::default()
+            },
+            worker_kv_tokens: [(name.clone(), 65_536)].into(),
+            ..test_config()
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "serve loops until the test drops its handles"
+        )]
+        let _engine = tokio::spawn(serve(Arc::new(cfg), handshake.clone(), index));
+        let _transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(10))
+            .await
+            .expect("frontend handshake");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let engine = loop {
+            let found = fleet_engines()
+                .into_iter()
+                .find(|engine| engine.name() == name);
+            if let Some(engine) = found {
+                break engine;
+            }
+            assert!(Instant::now() < deadline, "the rank's engine did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(engine.load().max_total_num_tokens, 65_536);
+    }
+
+    /// A decode rank declares its role, binds no bootstrap port, and
+    /// generates as a regular rank does.
+    #[tokio::test]
+    async fn a_decode_rank_declares_its_role_and_generates() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (
+            endpoint("hs.sock"),
+            endpoint("in.sock"),
+            endpoint("out.sock"),
+        );
+        let mut cfg = test_config();
+        cfg.role = Some(Role::Decode);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "serve loops until the test drops its handles"
+        )]
+        let _engine = tokio::spawn(serve(Arc::new(cfg), handshake.clone(), 0));
+
+        let transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(10))
+            .await
+            .expect("frontend handshake");
+        let client = EngineCoreClient::new(transport);
+        let ready = &client.engines()[0].ready_response;
+        assert_eq!(ready.disaggregation_role(), Some("decode"));
+        assert_eq!(ready.bootstrap_address(), None);
+        assert_eq!(prompt(&client, "d1", 0).await, 4);
+    }
+
+    /// A rank without a role lists its request types and declares no role
+    /// and no bootstrap port: a regular worker's handshake.
+    #[tokio::test]
+    async fn a_rank_without_a_role_lists_its_request_types_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (
+            endpoint("hs.sock"),
+            endpoint("in.sock"),
+            endpoint("out.sock"),
+        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "serve loops until the test drops its handles"
+        )]
+        let _engine = tokio::spawn(serve(Arc::new(test_config()), handshake.clone(), 0));
+
+        let transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(10))
+            .await
+            .expect("frontend handshake");
+        let client = EngineCoreClient::new(transport);
+        let ready = &client.engines()[0].ready_response;
+        assert_eq!(ready.request_types, ["add", "abort"]);
+        assert_eq!(ready.disaggregation_role(), None);
+        assert_eq!(ready.bootstrap_address(), None);
     }
 
     /// Two mock ranks dial one socket set — the grouped-worker topology the

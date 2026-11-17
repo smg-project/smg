@@ -3,7 +3,11 @@
 //! naming one function takes that function's `parameters` as the schema), the one shape known from
 //! the request rather than from the model. The table ([`formats::forced`]) has one state, an
 //! arguments state the output starts in, and no marker, so this assembler sees every byte of the
-//! output, and the stream's end closes the call.
+//! output, and the stream's end closes the call. The variant a forced call makes of a model's
+//! table ([`Format::with_forced_call`](crate::Format::with_forced_call)) enters the assembler
+//! after the thought too, and keeps the table's markers: one moves the reader only before the
+//! value's first byte, and from that byte to the value's last every marker is the value's text,
+//! one the table ignores included.
 //!
 //! The value reads through [`Arguments`]: the whitespace before it is dropped, its bytes are
 //! fragments, a JSON prefix until a `Malformed { InvalidArguments }` event of no bytes says where
@@ -125,8 +129,24 @@ impl crate::engine::CallAssembler for Assembler {
         self.feed(text, declared, out)
     }
 
+    /// A terminal with a row out of the state leaves it only before the value's first byte, where
+    /// a table that reads a thought before the call has the thought's opener
+    /// ([`Format::with_forced_call`](crate::Format::with_forced_call)). Once the value began,
+    /// every terminal is its text, as a JSON string may hold any, or text after it.
+    fn closes(&mut self, _terminal: &str) -> bool {
+        !self.started && !self.unnamed
+    }
+
+    /// A terminal the table ignores is the value's text from the value's first byte to its
+    /// last, as any other terminal is there; before the value and after it the terminal is the
+    /// template's wrapping, which the engine drops.
+    fn markers_are_text(&self) -> bool {
+        self.started && !self.ended
+    }
+
     fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {
-        // The table has no terminal that closes the region; the end of the stream does.
+        // No terminal closes the call; the end of the stream does. A terminal that leaves the
+        // state before the value began ([`Self::closes`]) finds nothing to end.
         (*self).finish(out);
         false
     }

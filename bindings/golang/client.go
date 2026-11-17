@@ -174,29 +174,29 @@ type ChatCompletionRequest struct {
 	// Model specifies the model to use for completion (e.g., "default")
 	Model string `json:"model"`
 	// Messages is the list of messages in the conversation
-	Messages            []ChatMessage    `json:"messages"`
-	Temperature         *float32         `json:"temperature,omitempty"`
-	TopP                *float32         `json:"top_p,omitempty"`
-	TopK                *int             `json:"top_k,omitempty"`
-	MaxCompletionTokens *int             `json:"max_completion_tokens,omitempty"`
-	Stream              bool             `json:"stream"`
-	StreamOptions       *StreamOptions   `json:"stream_options,omitempty"`
-	Tools               []Tool           `json:"tools,omitempty"`
-	ToolChoice          interface{}      `json:"tool_choice,omitempty"`
-	Stop                interface{}      `json:"stop,omitempty"`
-	StopTokenIDs        []int            `json:"stop_token_ids,omitempty"`
-	SkipSpecialTokens   bool             `json:"skip_special_tokens,omitempty"`
-	IgnoreEos           bool             `json:"ignore_eos,omitempty"`
-	NoStopTrim          bool             `json:"no_stop_trim,omitempty"`
-	FrequencyPenalty    *float32         `json:"frequency_penalty,omitempty"`
-	PresencePenalty     *float32         `json:"presence_penalty,omitempty"`
-	MinP                *float32         `json:"min_p,omitempty"`
-	RepetitionPenalty   *float32         `json:"repetition_penalty,omitempty"`
-	ResponseFormat      *ResponseFormat  `json:"response_format,omitempty"`
-	Seed                *int             `json:"seed,omitempty"`
-	Logprobs            bool             `json:"logprobs,omitempty"`
-	TopLogprobs         *int             `json:"top_logprobs,omitempty"`
-	User                string           `json:"user,omitempty"`
+	Messages            []ChatMessage   `json:"messages"`
+	Temperature         *float32        `json:"temperature,omitempty"`
+	TopP                *float32        `json:"top_p,omitempty"`
+	TopK                *int            `json:"top_k,omitempty"`
+	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
+	Stream              bool            `json:"stream"`
+	StreamOptions       *StreamOptions  `json:"stream_options,omitempty"`
+	Tools               []Tool          `json:"tools,omitempty"`
+	ToolChoice          interface{}     `json:"tool_choice,omitempty"`
+	Stop                interface{}     `json:"stop,omitempty"`
+	StopTokenIDs        []int           `json:"stop_token_ids,omitempty"`
+	SkipSpecialTokens   bool            `json:"skip_special_tokens,omitempty"`
+	IgnoreEos           bool            `json:"ignore_eos,omitempty"`
+	NoStopTrim          bool            `json:"no_stop_trim,omitempty"`
+	FrequencyPenalty    *float32        `json:"frequency_penalty,omitempty"`
+	PresencePenalty     *float32        `json:"presence_penalty,omitempty"`
+	MinP                *float32        `json:"min_p,omitempty"`
+	RepetitionPenalty   *float32        `json:"repetition_penalty,omitempty"`
+	ResponseFormat      *ResponseFormat `json:"response_format,omitempty"`
+	Seed                *int            `json:"seed,omitempty"`
+	Logprobs            bool            `json:"logprobs,omitempty"`
+	TopLogprobs         *int            `json:"top_logprobs,omitempty"`
+	User                string          `json:"user,omitempty"`
 	// Rid is forwarded to the backend as the request id for log correlation
 	Rid *string `json:"rid,omitempty"`
 }
@@ -256,9 +256,12 @@ type Choice struct {
 
 // Message represents a message in the response
 type Message struct {
-	Role      string     `json:"role"`
-	Content   string     `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+	// The thought a thinking model wrote apart from its answer, as the
+	// converter separates it; empty when the model wrote none.
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // ToolCall represents a tool call in the response
@@ -301,9 +304,11 @@ type StreamChoice struct {
 
 // MessageDelta represents incremental message updates
 type MessageDelta struct {
-	Role      string          `json:"role,omitempty"`
-	Content   string          `json:"content,omitempty"`
-	ToolCalls []ToolCallDelta `json:"tool_calls,omitempty"`
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
+	// A piece of the thought, apart from the content.
+	ReasoningContent string          `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCallDelta `json:"tool_calls,omitempty"`
 }
 
 // CreateChatCompletion creates a non-streaming chat completion with context support.
@@ -335,7 +340,21 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 	}
 	defer stream.Close()
 
+	return collectChatCompletion(stream)
+}
+
+// chunkSource is a stream of chat completion chunks, one JSON chunk per
+// RecvJSON, io.EOF at its end.
+type chunkSource interface {
+	RecvJSON() (string, error)
+}
+
+// collectChatCompletion reads a stream to its end into one non-streaming
+// response: the content, the reasoning and the tool calls of its choice added
+// up, the last finish reason, the last usage and identity the chunks carried.
+func collectChatCompletion(stream chunkSource) (*ChatCompletionResponse, error) {
 	var fullContent strings.Builder
+	var fullReasoning strings.Builder
 	var toolCalls toolCallAssembler
 	var finishReason string
 	var usage Usage
@@ -375,6 +394,9 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 			if choice.Delta.Content != "" {
 				fullContent.WriteString(choice.Delta.Content)
 			}
+			if choice.Delta.ReasoningContent != "" {
+				fullReasoning.WriteString(choice.Delta.ReasoningContent)
+			}
 			toolCalls.add(choice.Delta.ToolCalls)
 			if choice.FinishReason != "" {
 				finishReason = choice.FinishReason
@@ -387,9 +409,10 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 	}
 
 	message := Message{
-		Role:      "assistant",
-		Content:   fullContent.String(),
-		ToolCalls: toolCalls.toolCalls(),
+		Role:             "assistant",
+		Content:          fullContent.String(),
+		ReasoningContent: fullReasoning.String(),
+		ToolCalls:        toolCalls.toolCalls(),
 	}
 
 	if finishReason == "" {

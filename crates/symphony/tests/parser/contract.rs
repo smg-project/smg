@@ -139,6 +139,14 @@ fn hy4() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Hy4.format(), keyed_tools()))
 }
 
+fn hy_v3() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::HyV3.format(), keyed_tools()))
+}
+
+fn longcat() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::LongCat.format(), keyed_tools()))
+}
+
 fn ling() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Ling.format(), keyed_tools()))
 }
@@ -460,12 +468,25 @@ fn inkling() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Inkling.format(), Declared::default()))
 }
 
+/// Inkling 2 reads the same messages after the opener: the contract feeds every subject an empty
+/// prompt, which no table reads as an unopened turn, so the outputs are the shapes after
+/// `<|message_model|>`; the turn the model opens itself is the table's own tests' and the corpus's.
+fn inkling2() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Inkling2.format(), Declared::default()))
+}
+
 /// Inkling as a request without tools reads it: the message header content, its markers dropped.
 fn inkling_without_calls() -> Box<dyn Parser> {
     Box::new(Engine::new(
         Table::Inkling.format().without_calls(),
         Declared::default(),
     ))
+}
+
+/// Inkling as a JSON answer reads it (`Engine::reads_json_answer`): a marker's spelling inside a
+/// string of the answer is the answer's text, a frame outside the strings a call.
+fn inkling_json_answer() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Inkling.format(), Declared::default()).reads_json_answer())
 }
 
 /// `\w` as these outputs need it: the ASCII letters, digits and `_` their names are written in.
@@ -838,6 +859,18 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::Hy4),
     },
     Subject {
+        name: "hy_v3",
+        new: hy_v3,
+        outputs: HY_V3_OUTPUTS,
+        table: Some(Table::HyV3),
+    },
+    Subject {
+        name: "longcat",
+        new: longcat,
+        outputs: LONGCAT_OUTPUTS,
+        table: Some(Table::LongCat),
+    },
+    Subject {
         name: "ling",
         new: ling,
         outputs: LING_OUTPUTS,
@@ -1018,9 +1051,21 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::Inkling),
     },
     Subject {
+        name: "inkling2",
+        new: inkling2,
+        outputs: INKLING_OUTPUTS,
+        table: Some(Table::Inkling2),
+    },
+    Subject {
         name: "inkling, no tools",
         new: inkling_without_calls,
         outputs: INKLING_NO_TOOLS_OUTPUTS,
+        table: None,
+    },
+    Subject {
+        name: "inkling, json answer",
+        new: inkling_json_answer,
+        outputs: INKLING_JSON_ANSWER_OUTPUTS,
         table: None,
     },
     Subject {
@@ -1673,6 +1718,29 @@ const HY4_OUTPUTS: &[&str] = &[
      </tool_calls:opensource>",
 ];
 
+/// Keyed arguments in Hy V3's spelling: the recorded shapes with `<tool_sep>` after the name and
+/// K2-Horizon's newlines, a cut stream, a call without arguments, prose where a call should be,
+/// a name without its separator, text after the separator.
+const HY_V3_OUTPUTS: &[&str] = &[
+    "The user asks.</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n\
+     <arg_value>Paris</arg_value>\n<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n</tool_call>\n\
+     <tool_call>get_weather<tool_sep>\n</tool_call>\n</tool_calls>",
+    "</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n<arg_value>Par",
+    "</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n<arg_value>Par\
+     </tool_call>\n</tool_calls>",
+    "</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>note</arg_key>\n\
+     <arg_value>null</arg_value>\n<arg_key>extra</arg_key>\n<arg_value>[1, 2]</arg_value>\n\
+     </tool_call>\n</tool_calls>",
+    "</think><tool_calls>\nprose<tool_call>get_weather<tool_sep>\n</tool_call>\n</tool_calls>",
+    "</think>Hello!",
+    "</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n<arg_value>a <\
+     </tool_call>\n</tool_calls>",
+    "<tool_calls>\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n\
+     </tool_call>\n</tool_calls>",
+    "<tool_calls>\n<tool_call>get_weather<tool_sep>prose<arg_key>city</arg_key>\n\
+     <arg_value>Paris</arg_value>\n</tool_call>\n</tool_calls>",
+];
+
 /// Keyed arguments in Ling's spelling, with its newlines.
 const LING_OUTPUTS: &[&str] = &[
     "</think><tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\
@@ -2124,6 +2192,32 @@ const DOTS3_OUTPUTS: &[&str] = &[
     "<think>\nThe user asks about Paris: <dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nParis\n</parameter>\n</invoke>\n</dots_function_call>",
 ];
 
+/// Keyed arguments in LongCat's spelling: the recorded shapes with GLM 4.6's newlines under the
+/// prefixed tags and the template's newline after each close, a cut stream, a call without
+/// arguments, a null and a list, prose where a tag should be, the plain syntax quoted in content.
+const LONGCAT_OUTPUTS: &[&str] = &[
+    "The user asks.</longcat_think>Let me check.<longcat_tool_call>get_weather\n\
+     <longcat_arg_key>city</longcat_arg_key>\n<longcat_arg_value>Paris</longcat_arg_value>\n\
+     <longcat_arg_key>days</longcat_arg_key>\n<longcat_arg_value>3</longcat_arg_value>\n\
+     </longcat_tool_call>\n",
+    "<longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n\
+     <longcat_arg_value>Paris</longcat_arg_value>\n</longcat_tool_call>\n\
+     <longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n\
+     <longcat_arg_value>Rome</longcat_arg_value>\n</longcat_tool_call>\n",
+    "<longcat_tool_call>get_weather\n</longcat_tool_call>\n",
+    "Hello!",
+    "<longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n<longcat_arg_value>Par",
+    "<longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n<longcat_arg_value>Par\
+     </longcat_tool_call>\n",
+    "<longcat_tool_call>get_weather\n<longcat_arg_key>note</longcat_arg_key>\n\
+     <longcat_arg_value>null</longcat_arg_value>\n<longcat_arg_key>extra</longcat_arg_key>\n\
+     <longcat_arg_value>[1, 2]</longcat_arg_value>\n</longcat_tool_call>\n",
+    "<longcat_tool_call>get_weather\nprose<longcat_arg_key>city</longcat_arg_key>\n\
+     <longcat_arg_value>Paris</longcat_arg_value>\n</longcat_tool_call>\n",
+    "The syntax is:\n\n```\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\
+     \n</tool_call>\n```\n\nThat is all.",
+];
+
 /// The outputs bellwether's common set records for GLM 4.6, and one cut short.
 const GLM4_OUTPUTS: &[&str] = &[
     "\n<think>The user asks about Paris.</think>\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>",
@@ -2208,6 +2302,22 @@ const INKLING_NO_TOOLS_OUTPUTS: &[&str] = &[
     "<|content_thinking|>The user asks: \"Give the facts about Tokyo.\" The system instruction says: \"Answer with a JSON object with the keys city, country and population.\"\n\nSo I need to provide facts about Tokyo, but specifically format the answer as a JSON object with keys: city, country, population.\n\nI should include the relevant values:\n- city: Tokyo\n- country: Japan\n- population: Approximately 13.9 million (for Tokyo proper) or 37 million (for Greater Tokyo Area). Usually \"Tokyo\" as a city refers to the prefecture/capital, but the city proper is about 14 million. I should provide a clear figure. Let's use ~13.96 million (as of recent estimates) or just \"13.9 million\". To be safe and accurate, I can specify the metropolitan area, but the key is just population. Let's provide \"13.9 million\" for the city proper, or mention both? The instruction is strict: JSON object with those keys. So just those three.\n\nLet's construct:\n{\n  \"city\": \"Tokyo\",\n  \"country\": \"Japan\",\n  \"population\": \"13.9 million\"\n}\n\nThis satisfies. I will not add extra text outside JSON? The instruction says \"Answer with a JSON object...\". Usually that means the response should be just the JSON. I will provide just the JSON.<|end_message|><|message_model|><|content_text|><|content_text|>{\"city\": \"Tokyo\", \"country\": \"Japan\", \"population\": \"13.9 million\"}<|end_message|>",
     "<|content_thinking|>The user asks about Paris.<|end_message|><|message_model|><|content_text|><|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>",
     "<|content_thinking|>Short.<|end_message|><|message_model|><|content_text|>The answer is cut he",
+];
+
+/// JSON answers under the engine's JSON-answer option, the family's parsers' own cases: a marker's
+/// spelling in a value and in a key, every spelling as a key and in a value with escapes after a
+/// thought that holds an unmatched quote, a list and a bare string of spellings, a whole call frame
+/// quoted in a value beside a real call, and strings the stream's end leaves open.
+const INKLING_JSON_ANSWER_OUTPUTS: &[&str] = &[
+    "<|content_text|>{\"literal\":\"<|content_thinking|>quoted<|end_message|>\"}<|end_message|>",
+    "<|content_thinking|>unmatched quote: \"<|end_message|><|message_model|><|content_text|>{\"<|message_model|>\":\"\u{3b1}\\\"<|content_text|>\\\\\u{7d42}\",\"<|end_message|>\":\"<|content_thinking|><|content_model_end_sampling|>\"}<|end_message|><|content_model_end_sampling|>",
+    "<|content_text|>[\"<|message_model|>\",\"<|end_message|>\"]<|end_message|>",
+    "<|content_text|>\"<|content_thinking|>\"<|end_message|>",
+    "<|content_text|>{\"note\":\"get_weather<|content_invoke_tool_json|>{\\\"name\\\":\\\"get_weather\\\",\\\"args\\\":{}}<|end_message|>\"}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>",
+    "<|content_text|>{\"value\":\"<|content_thinking|>unfinished<|end_mes",
+    "<|content_text|>{\"value\":\"escaped quote: \\\"<|end_message|>",
+    "<|content_text|>{\"note\":\"<|end_message|>\"}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>\
+     {\"name\":\"get_weather\",\"args\":{\"city\":\"\\\"<|end_message|>\"}}<|end_message|>",
 ];
 
 /// Every subject with each of its outputs.
@@ -2751,6 +2861,11 @@ const CALLS_WITHOUT_ARGUMENTS: &[(&str, &str)] = &[
         "<tool_calls:opensource><tool_call:opensource>get_weather</tool_call:opensource>\
          </tool_calls:opensource>",
     ),
+    (
+        "hy_v3",
+        "<tool_calls>\n<tool_call>get_weather<tool_sep>\n</tool_call>\n</tool_calls>",
+    ),
+    ("longcat", "<longcat_tool_call>get_weather\n</longcat_tool_call>"),
     ("ling", "<tool_call>get_weather\n</tool_call>"),
     ("glm", "<tool_call>get_weather</tool_call>"),
     ("glm4", "<tool_call>get_weather\n</tool_call>"),

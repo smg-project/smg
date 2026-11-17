@@ -30,7 +30,7 @@ use crate::{
     eos::EosTokenIds,
     fanout::fan_out_n,
     multimodal,
-    stream::{poll_mapped, MappedGenerateStream, StreamState},
+    stream::{finish, poll_mapped, FinishParts, MappedGenerateStream, StreamState},
     structured_outputs::{
         refuse_unenforceable_constraint, ConstraintRef, StructuredOutputsBackendConfig,
         StructuredOutputsSupport,
@@ -108,16 +108,24 @@ pub struct VllmGenerateStream {
 
 impl VllmGenerateStream {
     /// Start one choice with no observed timing or capacity sample.
+    /// `prompt_tokens` is the number of prompt ids the request carries: the
+    /// usage's prompt count until the engine's prefill stats report their own
+    /// (an engine whose first output carries none would otherwise bill zero
+    /// input).
     pub(crate) fn new(
         inner: EngineCoreStream,
         index: u32,
         top_logprobs: usize,
         prompt_top_logprobs: usize,
         first_prompt_token: Option<u32>,
+        prompt_tokens: u32,
     ) -> Self {
         Self {
             inner,
-            state: StreamState::default(),
+            state: StreamState {
+                prompt_tokens,
+                ..StreamState::default()
+            },
             index,
             top_logprobs,
             prompt_top_logprobs,
@@ -152,60 +160,20 @@ impl VllmGenerateStream {
     pub fn engine_index(&self) -> Option<u32> {
         self.inner.engine_index()
     }
+}
 
-    /// Whether the engine already finished this choice and its terminal
-    /// `Complete` is parked behind the chunk just yielded (the finish tick
-    /// carried new tokens). A frontend that matched a stop on that chunk must
-    /// not synthesize its own `Complete`: the accumulated state has already
-    /// been drained into the parked one.
-    pub fn has_parked_complete(&self) -> bool {
-        self.pending.is_some()
+impl finish::Parts for VllmGenerateStream {
+    fn parked(&self) -> Option<&vllm::GenerateResponse> {
+        self.pending.as_ref()
     }
 
-    /// End this choice now on a frontend-matched string stop: the terminal
-    /// `Complete` built from the accumulated state, exactly as if the engine
-    /// had reported `stop` with that string. The engine-side request is
-    /// aborted when the stream is dropped, so the caller drops it next.
-    pub fn complete_with_matched_stop(&mut self, matched: String) -> vllm::GenerateResponse {
-        self.complete_with_finish(
-            "stop".to_string(),
-            Some(vllm::generate_complete::MatchedStop::MatchedStopStr(
-                matched,
-            )),
-        )
-    }
-
-    /// End this choice as aborted: the engine's own parked `Complete` when it
-    /// already finished, else the terminal `Complete` the Python servicer
-    /// yields after an `Abort` RPC (`finish_reason = "abort"`).
-    pub fn complete_aborted(&mut self) -> vllm::GenerateResponse {
-        if let Some(parked) = self.pending.take() {
-            return parked;
+    fn finish_parts(&mut self) -> FinishParts<'_> {
+        FinishParts {
+            state: &mut self.state,
+            index: self.index,
+            pending: &mut self.pending,
+            input_logprobs_emitted: &mut self.input_logprobs_emitted,
         }
-        self.complete_with_finish("abort".to_string(), None)
-    }
-
-    fn complete_with_finish(
-        &mut self,
-        finish_reason: String,
-        matched: Option<vllm::generate_complete::MatchedStop>,
-    ) -> vllm::GenerateResponse {
-        let mut pending = None;
-        // No new tokens on a frontend finish, so `emit_tick` yields the
-        // `Complete` directly and parks nothing.
-        let mut response = self.state.emit_tick(
-            self.index,
-            Vec::new(),
-            None,
-            Some((finish_reason, matched)),
-            &mut pending,
-        );
-        self.state.attach_input_logprobs(
-            &mut self.pending,
-            &mut self.input_logprobs_emitted,
-            &mut response,
-        );
-        response
     }
 }
 
@@ -254,6 +222,8 @@ impl MappedGenerateStream for VllmGenerateStream {
         }
         let top_k = self.top_logprobs;
         let state = &mut self.state;
+        // The engine's own prompt count replaces the request's; an output
+        // without the stats leaves it.
         if let Some(stats) = &output.prefill_stats {
             state.prompt_tokens = stats.num_prompt_tokens;
             state.cached_tokens = stats.num_cached_tokens;
@@ -491,7 +461,9 @@ impl Stream for VllmGenerateStream {
 ///   make all n samples identical, and deriving distinct per-sample seeds from
 ///   the request seed is the established engine convention (each of the n
 ///   sequences gets its own sampler state for exactly this reason) while
-///   staying deterministic for repeat runs.
+///   staying deterministic for repeat runs. The wire carries each seed word
+///   in its unsigned form (see the translation), so a derived seed never
+///   reaches the engine as `-1`, which it reads as "no seed".
 /// - Usage: every sub reports the full `prompt_tokens` on its `Complete` (the
 ///   subs share one prompt), matching the gRPC engines' n>1 contract — the
 ///   pipeline de-duplicates (max per prompt), so nothing is counted n times.
@@ -924,7 +896,10 @@ pub(crate) fn translate_sampling(
         stop_token_ids,
         eos_token_id: (!sp.ignore_eos).then_some(eos.primary).flatten(),
         all_stop_token_ids,
-        seed: sp.seed.map(i64::from),
+        // The seed word in its unsigned form: the engine reads a seed of -1 as "no seed", and a
+        // word that is never negative never is one, whether it came from the request or was
+        // derived per sub by an offset; the form is one-to-one, so distinct words stay distinct.
+        seed: sp.seed.map(|seed| i64::from(seed as u32)),
         logprobs: sp.logprobs,
         prompt_logprobs: sp.prompt_logprobs,
         logit_bias,

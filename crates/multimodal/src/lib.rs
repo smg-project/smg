@@ -33,8 +33,8 @@ pub use error::{
     TransformError,
 };
 pub use media::{
-    init_log_video_decode_timing, FrameSampling, ImageFetchConfig, MediaConnector,
-    MediaConnectorConfig, MediaSource, VideoFetchConfig,
+    init_log_video_decode_timing, missing_video_decoder, FrameSampling, ImageFetchConfig,
+    MediaConnector, MediaConnectorConfig, MediaSource, RawMedia, VideoFetchConfig,
 };
 pub use registry::{
     EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec,
@@ -68,6 +68,7 @@ pub(crate) mod test_support {
 
     use crate::{
         audio::DecodedAudio,
+        jpeg_turbo::{turbojpeg_available, turbojpeg_reads_warnings},
         vision::processor::{ModelSpecificValue, PreprocessedEncoderInputs},
     };
 
@@ -91,7 +92,7 @@ pub(crate) mod test_support {
         reason = "a skip says so; the harness shows it under --nocapture"
     )]
     pub(crate) fn turbojpeg_or_skip(test: &str) -> bool {
-        if crate::jpeg_turbo::turbojpeg_available() {
+        if turbojpeg_available() {
             return true;
         }
         let required = std::env::var_os(REQUIRE_TURBOJPEG).is_some_and(|value| !value.is_empty());
@@ -100,6 +101,31 @@ pub(crate) mod test_support {
             "libturbojpeg not found, and {REQUIRE_TURBOJPEG} is set: {test}"
         );
         eprintln!("libturbojpeg not found: skipping {test}");
+        false
+    }
+
+    /// Whether the TurboJPEG library loads and reads a call's warning
+    /// (`tjGetErrorCode`, TurboJPEG 2.0 and later), for a test of a frame
+    /// kept after a warning: a 1.x library decodes the same files and keeps
+    /// none, so where the reading is missing, a failure where
+    /// [`REQUIRE_TURBOJPEG`] is set, else a skip said on stderr.
+    #[expect(
+        clippy::print_stderr,
+        reason = "a skip says so; the harness shows it under --nocapture"
+    )]
+    pub(crate) fn warned_decode_or_skip(test: &str) -> bool {
+        if !turbojpeg_or_skip(test) {
+            return false;
+        }
+        if turbojpeg_reads_warnings() {
+            return true;
+        }
+        let required = std::env::var_os(REQUIRE_TURBOJPEG).is_some_and(|value| !value.is_empty());
+        assert!(
+            !required,
+            "libturbojpeg reads no warning (TurboJPEG 1.x), and {REQUIRE_TURBOJPEG} is set: {test}"
+        );
+        eprintln!("libturbojpeg reads no warning: skipping {test}");
         false
     }
 

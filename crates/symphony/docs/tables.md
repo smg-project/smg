@@ -139,7 +139,9 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   names the thought as the state an unopened turn starts in, with `<｜end▁of▁sentence｜>` as the end of
   a turn the model wrote: a prompt with no opener, or whose last opener's turn ended, starts the
   output in the thought, and nothing of it is replayed (an earlier turn's markers and a `</think>`
-  quoted in a tool result move nothing). A prompt that is the thought's markers with no opener
+  quoted in a tool result move nothing). Where such a prompt ends with `<｜end▁of▁sentence｜>` itself,
+  the engine keeps and reads that marker alone, under every variant of the table a request reads
+  with. A prompt that is the thought's markers with no opener
   before them is such a prompt too: the corpus replay feeds the turn opener before the template's
   tail for this reason (the tail alone read a thinking-off turn's text as reasoning; the gateway
   replays the whole prompt and never meets it). The legacy reasoning parser for this checkpoint starts
@@ -359,6 +361,10 @@ What this table says beyond the DSML one:
   the empty one, both dropped; later in the content both are text. With `thinking_mode` set,
   the generation prompt ends with `<mm:think>` (`enabled`) or `</mm:think>` (`disabled`) after
   the turn opener `]~b]ai\n`, and the replay puts the output inside the thought or in content.
+- **MiniMax-M3.1-Flash reads with the table.** The same tokenizer, special tokens, think tags,
+  separator and XML call tree. Its template writes an effort tag in the system block and has
+  no `thinking_mode` branch, so its generation prompt adds nothing and the output starts in
+  `start`, as in the primary's adaptive default.
 - **A calls block ends the thought** (`reasoning + calls_open = calls`), as the design's table
   has it; the recorded outputs close the thought first.
 - **A forced call admits the thought first, and the separator.** The structural tag for a forced
@@ -497,12 +503,75 @@ What the table says beyond the others:
   what the engine's own server delivers for it. A request with no tools anywhere still reads with
   the variant without calls, whatever its `tool_choice`.
 
+- **A JSON answer's quoted spellings are the answer's text under the engine's JSON-answer
+  option.** A model held to a JSON answer may spell a marker in a key or a value, and the
+  table alone reads the spelling as the marker: the answer's own marker inside a string starts
+  its text over and drops the bytes, a quoted thinking marker opens a thought, a quoted close
+  ends the message early, and a quoted close inside a call's arguments ends the call there. The
+  family's own parsers keep such spellings under their JSON mode, in the answer and in a call's
+  arguments alike, and the table reads the same under `Engine::reads_json_answer`, which the
+  gateway sets from the request's response format (`docs/engine.md`): the quote state is read
+  over the answer's text and over a call's arguments (a named-JSON call is one JSON value), a
+  marker inside a string takes no row, and a frame outside the strings is a call as before, its
+  arguments whole when they quote a spelling. The cases are the parsers' own, in the table's
+  tests (`json_answer_tests`), and
+  the recorded `json-string` set of the group replays through the corpus harness, whose
+  engine takes the option from each case's `response_format`.
+
 What the table leaves out, for want of fixtures: image and audio messages, which the template writes
 for the user and never for the model; and the text-mode invocation, `<|content_invoke_tool_text|>`,
 which the gateway's older Inkling parsers drop as protocol data. No recorded set holds one. The
 table has no terminal for it, so such a message sits in the named-JSON header until
 `<|end_message|>` and comes back whole as `Malformed` (a name without a call), no byte lost; a
 recording of one decides what it is.
+
+## Inkling 2 (`inkling2`)
+
+What the table says beyond `inkling`, whose rows it shares:
+
+- **The model opens its own turn.** Inkling 2's template writes the message headers and closes
+  as tokens and no generation opener for the model: a prompt ends with the last message's close,
+  `<|end_message|>`, whatever the request says, and the model writes `<|message_model|>` itself.
+  The table's unopened row (`Format::unopened_turn_starts_in("ended", "<|end_message|>")`)
+  starts such a turn between the messages, where `<|message_model|>` opens the header as it does
+  after any message's close; a prompt whose last `<|message_model|>` is followed by
+  `<|end_message|>` (an assistant message in the history) starts there too, and a prompt that
+  continues an assistant message (`<|message_model|><|content_text|>Partial`, the template's
+  continuation) replays from the opener as Inkling's does: the message's own, the first after the
+  last close, since an opener said again inside the body the prompt left open opens nothing.
+  Every recorded output of the group starts with the opener, and the corpus replay feeds the
+  close alone before it, no opener. The engine keeps and reads that close alone as well: a
+  prompt that ends with it opens no turn wherever its last opener stands, so nothing before it
+  is searched or kept, whatever the prompt's length.
+- **A JSON answer's tag writes the opener first.** The way into the answer from where the turn
+  starts is `<|message_model|>` and then `<|content_text|>`: `Format::answer_grammar` leads the
+  tag with the rows from the unopened state to the turn's own state, owed outright before the
+  thought the model may write first where the engine starts the grammar at the first token, and
+  inside the optional way in otherwise, as an engine that starts after its reasoning parser has
+  consumed them with the kind's marker. Without the lead the derivation, which starts from the
+  turn's own state, wrote Inkling's tag: from the first token it owed the thought's or the
+  answer's marker where the model writes `<|message_model|>`, a marker with no row out of the
+  state the turn starts in. The forced call's tag is Inkling's unchanged: the call marker
+  triggers it inside whatever message the model is writing, and the opener before it is free
+  text.
+- **The opener said again inside a message is the opener.** A row on `<|message_model|>` from
+  each body back into it, framing as a kind said again is, the kind marker after it the kind.
+  The answer tag's optional way in admits the opener and the kind marker after an engine that
+  has consumed them (a start other than the first token cannot say), and Inkling's rows read
+  `<|message_model|>` out of `ended` alone, so without the rows a second opener was the answer's
+  text in front of the JSON; with them every prefix the tag admits parses as framing, whichever
+  way the engine started.
+- **The JSON-answer option reads as for Inkling.** The group's native set holds a JSON answer
+  with a quoted spelling; under `Engine::reads_json_answer` the spelling is the answer's text
+  (`docs/engine.md`).
+- **One table for the group.** Inkling-2-Small and its MXFP8 build ship one template and read
+  with the one table; the recorded sets (16 common, 3 native and 12 multi-turn parse cases)
+  replay through the corpus harness, which feeds no opener for the group.
+
+What the table leaves out: the two contracts of a JSON answer (the reasoning kept apart from the
+content; no continued message) are the renderer's, checked before any parse, so the table carries
+no copy of them; image parts are the prompt's and never in the output; the text-mode invocation,
+as for Inkling.
 
 ## Mistral v13 (`mistral_v13`)
 
@@ -707,17 +776,35 @@ which writes the bare list as the `xlam` table's does and is not yet proven on a
 
 ## The forced call (`forced`)
 
-Not a table an operator names: the gateway picks this format for a request whose `tool_choice`
-names a function and whose constraint is the JSON schema the older path builds for it (the
-function's `parameters`), so the whole output is that function's arguments, with no marker and no
-name in it. The name comes from the request (`Declared::forcing`), and `ToolCallStart` carries it
+Not a table an operator names: the format of a request whose `tool_choice` names a function and
+whose constraint is the JSON schema the older path builds for it (the function's `parameters`), so
+the whole output is that function's arguments, with no marker and no name in it. The name comes
+from the request (`Declared::forcing`), and `ToolCallStart` carries it
 with no source byte of its own. The value streams through `json::Arguments` (`json::forced` drives
 it): the whitespace before it is dropped, a fragment for every byte, a JSON prefix until a
 `Malformed { InvalidArguments }` event of no bytes says where it stopped being one, and the call's
 end where the value is whole or where the stream ends; the engine reports text after a whole value
 as text after the object. A required call
-under the same path is a list of `{"name": …, "parameters": …}` objects, which the `json` table
-reads.
+under the same path is a list of `{"name": …, "parameters": …}` objects, read as the `json` table
+reads a list with no marker (`CallSyntax::ForcedList`) but for the end of the stream. The engine
+held the output to the list, so what an open list still held there (the separators after a call, an
+object cut before its arguments began, what a started call's object held behind its arguments) is
+refused and counted, never content. A call whose arguments began keeps the argument bytes that
+arrived, and the bracket alone, with no object after it, reads as the `json` table reads it.
+
+A model that thinks first writes its thought before the JSON, where the engine holds the output to
+the schema only once the thought is over. `Format::with_forced_call` makes the variant of the
+model's own table that reads such an output: the thought's states stay, with every row into, out
+of and between them, and every other state is one arguments state, the first, which reads the JSON
+as this format does (`ForcedCall::Arguments`) or as the required call's list above is read
+(`ForcedCall::List`). A row out of that state is taken only before the JSON's first byte: the
+thought's opener enters the thought, and any other marker with a row is the template's framing,
+dropped. From the first byte on every marker is the call's text, as a JSON string may hold any:
+the two assemblers close at no terminal once their value began (`CallAssembler::closes`), and a
+marker the table ignores is the value's text inside it (`CallAssembler::markers_are_text`), the
+template's wrapping before the value and after it, dropped as everywhere. With no thought written
+the variant reads what this format reads, so the gateway reads every such request with the
+variant of the model's table and the output counts under that table.
 
 What the format leaves open: it derives no grammar, since its constraint is the request's own
 schema; bellwether #19 records the constrained outputs, which replay here when they land, so the
@@ -844,6 +931,43 @@ What the table leaves out, for want of fixtures: the template picks the thought'
 the calls as JSON objects or with a typed tag per argument (`tool_call_format`); the recorded sets
 hold the default thought and the default calls, read here. A thought under one of the other tags is
 content until a set shows it.
+
+## Hy V3 (`hy_v3`)
+
+The template decides the thought by `reasoning_effort`, and the table reads the decision from the
+prompt: `no_think` (the default, and any value the template does not know) writes `<think></think>`
+after the turn opener, so the output starts in content; `low` and `high` write `<think>` alone, so it
+starts inside the thought. `enable_thinking` moves nothing. The recorded sets hold the default alone
+(bellwether refused every thought-bearing probe at record time), so the thought's shapes rest on the
+table's rows, which are Hy4's under the plain markers.
+
+What the table leaves out, for want of fixtures: the template can spell every marker with a suffix of
+its own (`<think:…>`, `<tool_sep:…>`; Hy4's `:opensource` is that spelling), and its search mode renders
+tool outputs under other markers; the recorded sets hold the plain spelling, read here. A turn under a
+suffixed spelling is content until a set shows it.
+
+## LongCat (`longcat`)
+
+The template writes the thinking switch into the user turn, not the assistant header: `/think_on`
+after the user's text when the request's `enable_thinking` is true, `/think_off` otherwise (the
+default; `reasoning_effort` moves nothing). The assistant header follows the switch, and the table
+reads the decision from the prompt's tail: `<longcat_think>` alone when thinking is on, so the
+output starts inside the thought; `<longcat_think>\n\n</longcat_think>\n` otherwise, so it starts in
+content. The recorded sets hold the default alone (bellwether refused every thought-bearing probe at
+record time), so the thought's shapes rest on the table's rows, which are GLM 4.6's under the
+prefixed markers.
+
+The template writes each call right after the content's last byte and a newline after each call's
+close, the last one before the turn's end: between two calls, and after the last, that newline is a
+stay of whitespace alone, the template's spacing, dropped (`Dropped { Whitespace }`), as GLM 4.6's
+between its calls; a newline the model writes before words stays content, as under every table
+without a trim row (bellwether #17's question). The tools' declaration block
+(`<longcat_tool_declare>`) and the observation turn that carries tool results
+(`<longcat_observation>`, `<longcat_tool_response>`) are the prompt's, before the turn opener the
+replay starts at; the model writes neither.
+
+What the table leaves open, for want of fixtures: a thought under the opened header, which no
+recorded case shows, read by the rows alone.
 
 ## Muse Spark (`muse_spark`)
 

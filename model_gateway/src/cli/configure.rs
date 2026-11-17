@@ -15,8 +15,8 @@ use smg::{
         ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig,
         HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig,
         MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
-        PolicyEngineMode, PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig,
-        RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, SlurmDiscoveryConfig,
+        PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig,
+        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, SlurmDiscoveryConfig,
         TokenizerCacheConfig, TraceConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh::discovery::MeshDiscoveryConfig,
@@ -29,7 +29,7 @@ use smg::{
     },
     service_discovery::RuntimeDiscoveryConfig,
     version,
-    worker::{ConnectionMode, RuntimeType},
+    worker::{identity::endpoint::Endpoint, ConnectionMode, RuntimeType},
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
@@ -533,7 +533,10 @@ impl CliArgs {
     }
 
     /// Build Oracle storage settings after validating authentication and pool bounds.
-    fn build_oracle_config(&self, schema: Option<SchemaConfig>) -> ConfigResult<OracleConfig> {
+    pub(crate) fn build_oracle_config(
+        &self,
+        schema: Option<SchemaConfig>,
+    ) -> ConfigResult<OracleConfig> {
         let (wallet_path, connect_descriptor) = match self.resolve_oracle_connect_details()? {
             OracleConnectSource::Dsn { descriptor } => (None, descriptor),
             OracleConnectSource::Wallet { path, alias } => (Some(path), alias),
@@ -591,7 +594,7 @@ impl CliArgs {
             .oracle_pool_timeout_secs
             .unwrap_or_else(OracleConfig::default_pool_timeout_secs);
 
-        Ok(OracleConfig {
+        let ocf = OracleConfig {
             wallet_path,
             connect_descriptor,
             external_auth: self.integrations.oracle_external_auth,
@@ -600,8 +603,15 @@ impl CliArgs {
             pool_min,
             pool_max,
             pool_timeout_secs,
+            op_timeout_secs: self
+                .integrations
+                .oracle_op_timeout_secs
+                .unwrap_or_else(OracleConfig::default_op_timeout_secs),
             schema,
-        })
+        };
+        ocf.validate_bounds()
+            .map_err(|e| ConfigError::ValidationFailed { reason: e })?;
+        Ok(ocf)
     }
 
     /// Build PostgreSQL storage settings, requiring a URL and valid pool bounds.
@@ -1301,7 +1311,7 @@ impl CliArgs {
             .pd_pairing_mode(
                 PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
             )
-            .policy_engine(PolicyEngineMode::parse(&self.routing.policy_engine).unwrap_or_default())
+            .grouped_dp_sticky(self.routing.grouped_dp_sticky)
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing.routing_key_override,
                 eviction_interval_secs: self.routing.eviction_interval,
@@ -1439,15 +1449,46 @@ impl CliArgs {
             return;
         }
         println!("Policy: {}", self.routing.policy);
+        for line in self.node_lines(prefill_urls, encode_urls) {
+            println!("{line}");
+        }
+    }
+
+    /// The banner's lines that name the worker nodes of the two
+    /// disaggregated modes. Each address is written through
+    /// [`Endpoint::redacted_url`]: one with no userinfo, query or fragment
+    /// reads as it was given, byte for byte, a userinfo is masked whole and a
+    /// query or fragment is cut, and one the address parser refuses reads as
+    /// its marker. An address on the command line may carry a credential;
+    /// what every start prints may not.
+    pub(crate) fn node_lines(
+        &self,
+        prefill_urls: &[(String, Option<u16>)],
+        encode_urls: &[(String, Option<u16>)],
+    ) -> Vec<String> {
+        let shown = |nodes: &[(String, Option<u16>)]| -> Vec<(String, Option<u16>)> {
+            nodes
+                .iter()
+                .map(|(url, port)| (Endpoint::redacted_url(url), *port))
+                .collect()
+        };
+        let decode: Vec<String> = self
+            .workers
+            .decode
+            .iter()
+            .map(|url| Endpoint::redacted_url(url))
+            .collect();
+        let mut lines = Vec::new();
         if self.workers.pd_disaggregation && !prefill_urls.is_empty() {
-            println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", self.workers.decode);
+            lines.push(format!("Prefill nodes: {:?}", shown(prefill_urls)));
+            lines.push(format!("Decode nodes: {decode:?}"));
         }
         if self.workers.epd_disaggregation {
-            println!("Encode nodes: {encode_urls:?}");
-            println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", self.workers.decode);
+            lines.push(format!("Encode nodes: {:?}", shown(encode_urls)));
+            lines.push(format!("Prefill nodes: {:?}", shown(prefill_urls)));
+            lines.push(format!("Decode nodes: {decode:?}"));
         }
+        lines
     }
 
     /// Phase 3, configure: the router configuration, validated once by the

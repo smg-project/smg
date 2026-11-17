@@ -564,7 +564,7 @@ fn assemble_tokenspeed_v41_layouts_stay_inline_when_shm_disabled() {
         TokenSpeedAssemblyOptions {
             shm_enabled: false,
             shm_min_bytes: 0,
-            encoder_input_dtype: "bfloat16".to_string(),
+            encoder_input_dtype: "bfloat16".into(),
             skip_pixel_values: false,
         },
         None,
@@ -686,7 +686,7 @@ fn a_qwen3_vl_video_batch_assembles_with_its_own_sizes_key() {
     let assembled = assemble_vllm(
         intermediate,
         &VllmAssembly {
-            encoder_dtype: "bfloat16".to_string(),
+            encoder_dtype: "bfloat16".into(),
             device_normalizes: false,
             shm_enabled: false,
             shm_min_bytes: 0,
@@ -1416,7 +1416,7 @@ fn a_mixed_size_batch_is_refused_by_a_worker_that_normalizes_on_device() {
         }
     };
     let normalizes_on_device = VllmAssembly {
-        encoder_dtype: "bfloat16".to_string(),
+        encoder_dtype: "bfloat16".into(),
         device_normalizes: true,
         shm_enabled: false,
         shm_min_bytes: 0,
@@ -1446,4 +1446,56 @@ fn a_mixed_size_batch_is_refused_by_a_worker_that_normalizes_on_device() {
     let floats = assemble_vllm(intermediate([(32, 32), (48, 32)]), &normalizes_on_host)
         .expect("a worker that normalizes on host takes the floats");
     assert_eq!(floats.pixel_values_dtype, "bfloat16");
+}
+
+/// Selected SGLang workers receive their declared precision in every batch;
+/// unknown or absent labels retain float32 and integer metadata stays intact.
+#[test]
+fn sglang_assembly_honors_worker_dtype_for_all_batches() {
+    use crate::worker::BasicWorkerBuilder;
+
+    for (label, expected, width) in [
+        (None, "float32", 4),
+        (Some("bfloat16"), "bfloat16", 2),
+        (Some("float16"), "float16", 2),
+        (Some("float32"), "float32", 4),
+        (Some("uint8"), "float32", 4),
+        (Some("float64"), "float32", 4),
+        (Some(""), "float32", 4),
+    ] {
+        let mut builder =
+            BasicWorkerBuilder::new("http://sglang").runtime_type(RuntimeType::Sglang);
+        if let Some(dtype) = label {
+            builder = builder.label("multimodal_encoder_dtype", dtype);
+        }
+        let workers = WorkerSelection::Single {
+            worker: Arc::new(builder.build()),
+        };
+        let expected_image =
+            assemble_sglang_with_dtype(single_image_intermediate(), expected).unwrap();
+        let expected_video =
+            assemble_sglang_with_dtype(one_video_intermediate(2, 2), expected).unwrap();
+        let intermediate = MultimodalIntermediate::try_new(vec![
+            single_image_intermediate(),
+            one_video_intermediate(2, 2),
+        ])
+        .unwrap();
+        let MultimodalData::Sglang(data) =
+            assemble_sglang_data(intermediate, Some(&workers)).unwrap()
+        else {
+            panic!("SGLang data expected");
+        };
+        let (first, extra) = data.into_protos();
+        assert_eq!(extra.len(), 1);
+        for (batch, (reference, elements, grid)) in std::iter::once(first).chain(extra).zip([
+            (expected_image, 8, "patches_per_image"),
+            (expected_video, 4, "patches_per_video"),
+        ]) {
+            let pixels = batch.pixel_values.unwrap();
+            assert_eq!(pixels.dtype, expected);
+            assert_eq!(pixels.data.len(), elements * width);
+            assert_eq!(pixels.data.as_ref(), reference.pixel_values.as_slice());
+            assert_eq!(batch.model_specific_tensors[grid].dtype, "uint32");
+        }
+    }
 }

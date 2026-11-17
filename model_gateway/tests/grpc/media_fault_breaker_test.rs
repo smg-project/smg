@@ -24,8 +24,8 @@ use smg::{
     routers::RouterFactory,
     tenant::TenantKey,
     worker::{
-        circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker,
-        WorkerType,
+        health::circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType,
+        Worker, WorkerType,
     },
 };
 use smg_grpc_client::{
@@ -54,7 +54,7 @@ impl TokenSpeedAnswers for RefusingWorker {
     ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
         let refused = self
             .refusals
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(1)
             })
             .is_ok();
@@ -154,7 +154,7 @@ async fn answers_of(
     for _ in 0..requests {
         let answer = timeout(Duration::from_secs(30), async {
             let response = router
-                .route_chat(None, &tenant, request.clone(), MODEL)
+                .route_chat(None, &tenant, Arc::new(request.clone()), MODEL)
                 .await;
             let status = response.status();
             let code_header = response
@@ -215,6 +215,18 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
                 "media_too_large",
             ),
             "media_too_large",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "media refused as the request sent it, with its code in the trailer",
+            stamp_media_code(
+                WorkerMediaFault::Client.stamp(Status::invalid_argument(
+                    "Failed to finalize multimodal tracker: data URL parse error: missing comma \
+                     in data url",
+                )),
+                "invalid_multimodal_request",
+            ),
+            "invalid_multimodal_request",
             StatusCode::BAD_REQUEST,
         ),
         (

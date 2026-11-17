@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context as _;
 use futures::StreamExt;
 use mock_worker::{
     config::{Config, ReplayConfig},
@@ -63,14 +64,14 @@ fn request(request_id: &str, input_ids: &[u32], text: &str) -> ts::GenerateReque
 }
 
 /// The capture file's lines, each parsed as JSON.
-fn captured(path: &Path) -> Vec<Value> {
-    let text = std::fs::read_to_string(path).expect("read the capture file");
+fn captured(path: &Path) -> anyhow::Result<Vec<Value>> {
+    let text = std::fs::read_to_string(path).context("read the capture file")?;
     assert!(
         text.is_empty() || text.ends_with('\n'),
         "every line ends with a newline: {text:?}"
     );
     text.lines()
-        .map(|line| serde_json::from_str(line).expect("each line is one JSON object"))
+        .map(|line| serde_json::from_str(line).context("each line is one JSON object"))
         .collect()
 }
 
@@ -78,7 +79,9 @@ fn captured(path: &Path) -> Vec<Value> {
 async fn writes_one_line_per_request_in_order() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("generate.jsonl");
-    let client = start(config(Some(path.clone()))).await;
+    let client = start(config(Some(path.clone())))
+        .await
+        .expect("the worker starts");
 
     // A newline inside the text must not split the line; ids span the u32 range.
     let sent: [(&str, Vec<u32>, &str, bool); 3] = [
@@ -99,10 +102,10 @@ async fn writes_one_line_per_request_in_order() {
     for (request_id, input_ids, text, stream) in &sent {
         let mut req = request(request_id, input_ids, text);
         req.stream = *stream;
-        generate(&client, req).await;
+        generate(&client, req).await.expect("the worker answers");
     }
 
-    let lines = captured(&path);
+    let lines = captured(&path).expect("the capture file reads");
     assert_eq!(lines.len(), sent.len(), "one line per request: {lines:?}");
     for (line, (request_id, input_ids, text, stream)) in lines.iter().zip(&sent) {
         assert_eq!(line["request_id"], *request_id);
@@ -129,7 +132,7 @@ async fn line_is_on_disk_before_the_first_frame() {
         decode_base_ms: 200.0,
         decode_per_req_ms: 0.35,
     };
-    let client = start(cfg).await;
+    let client = start(cfg).await.expect("the worker starts");
 
     let mut req = request("early", &[1, 2, 3], "early");
     if let Some(sampling) = req.sampling_params.as_mut() {
@@ -137,7 +140,7 @@ async fn line_is_on_disk_before_the_first_frame() {
     }
     let mut stream = client.generate(req).await.expect("generate");
 
-    let lines = captured(&path);
+    let lines = captured(&path).expect("the capture file reads");
     assert_eq!(lines.len(), 1, "the line is written before any frame");
     assert_eq!(lines[0]["request_id"], "early");
 
@@ -155,13 +158,17 @@ async fn line_is_on_disk_before_the_first_frame() {
 async fn canned_output_is_unchanged_with_capture_on() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("generate.jsonl");
-    let with_capture = start(config(Some(path.clone()))).await;
-    let without_capture = start(config(None)).await;
+    let with_capture = start(config(Some(path.clone())))
+        .await
+        .expect("the worker starts");
+    let without_capture = start(config(None)).await.expect("the worker starts");
 
     for stream in [true, false] {
         let mut req = request("canned", &[1, 2, 3], "canned");
         req.stream = stream;
-        let frames = generate(&with_capture, req.clone()).await;
+        let frames = generate(&with_capture, req.clone())
+            .await
+            .expect("the worker answers");
         assert!(
             matches!(
                 frames.last().and_then(|frame| frame.response.as_ref()),
@@ -171,11 +178,17 @@ async fn canned_output_is_unchanged_with_capture_on() {
         );
         assert_eq!(
             frames,
-            generate(&without_capture, req).await,
+            generate(&without_capture, req)
+                .await
+                .expect("the worker answers"),
             "stream={stream}"
         );
     }
-    assert_eq!(captured(&path).len(), 2, "both requests were captured");
+    assert_eq!(
+        captured(&path).expect("the capture file reads").len(),
+        2,
+        "both requests were captured"
+    );
 }
 
 /// An optional the client leaves unset is `null`; a field it sets comes back
@@ -184,9 +197,13 @@ async fn canned_output_is_unchanged_with_capture_on() {
 async fn unset_optionals_are_null_and_set_values_come_back_as_sent() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("generate.jsonl");
-    let client = start(config(Some(path.clone()))).await;
+    let client = start(config(Some(path.clone())))
+        .await
+        .expect("the worker starts");
 
-    generate(&client, request("unset", &[1], "unset")).await;
+    generate(&client, request("unset", &[1], "unset"))
+        .await
+        .expect("the worker answers");
 
     let mut set = request("set", &[2], "set");
     set.sampling_params = Some(ts::SamplingParams {
@@ -215,13 +232,37 @@ async fn unset_optionals_are_null_and_set_values_come_back_as_sent() {
     set.logprob_start_len = Some(0);
     set.top_logprobs_num = 5;
     set.token_ids_logprob = vec![7, 8];
-    set.mm_inputs = Some(ts::MultimodalInputs::default());
-    set.encode_bootstrap_info = Some(ts::EncodeBootstrapInfo::default());
+    // One well-formed media item with its encode room: the wire refuses an
+    // empty items list and a bootstrap info that leaves an item without a room.
+    set.mm_inputs = Some(ts::MultimodalInputs {
+        items: vec![ts::MultimodalItem {
+            modality: smg_grpc_client::common_proto::Modality::Image as i32,
+            content_hash: vec![1; 8],
+            encoder_input: Some(ts::TensorData {
+                shape: vec![1, 4],
+                dtype: "float32".to_string(),
+                payload: Some(ts::tensor_data::Payload::Inline(vec![0; 16].into())),
+            }),
+            placeholders: vec![ts::PlaceholderRange {
+                offset: 0,
+                length: 1,
+            }],
+            ..Default::default()
+        }],
+    });
+    set.encode_bootstrap_info = Some(ts::EncodeBootstrapInfo {
+        items: vec![ts::EncodeItemBootstrapInfo {
+            item_index: 0,
+            bootstrap_host: "127.0.0.1".to_string(),
+            bootstrap_port: 8999,
+            bootstrap_room: 11,
+        }],
+    });
     set.kv_bootstrap_info = Some(ts::KvBootstrapInfo::default());
     set.data_parallel_rank = Some(0);
-    generate(&client, set).await;
+    generate(&client, set).await.expect("the worker answers");
 
-    let lines = captured(&path);
+    let lines = captured(&path).expect("the capture file reads");
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert_eq!(
         lines[0],
@@ -306,7 +347,9 @@ async fn constraint_is_captured_with_its_kind_and_value() {
 
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("generate.jsonl");
-    let client = start(config(Some(path.clone()))).await;
+    let client = start(config(Some(path.clone())))
+        .await
+        .expect("the worker starts");
 
     /// Builds one arm of the constraint oneof from its value.
     type Arm = fn(String) -> Constraint;
@@ -334,10 +377,10 @@ async fn constraint_is_captured_with_its_kind_and_value() {
         if let Some(sampling) = req.sampling_params.as_mut() {
             sampling.constraint = Some(constraint(value.to_string()));
         }
-        generate(&client, req).await;
+        generate(&client, req).await.expect("the worker answers");
     }
 
-    let lines = captured(&path);
+    let lines = captured(&path).expect("the capture file reads");
     assert_eq!(lines.len(), cases.len(), "{lines:?}");
     for (line, (kind, _, value)) in lines.iter().zip(&cases) {
         assert_eq!(
@@ -372,7 +415,7 @@ async fn unopenable_capture_file_fails_at_startup() {
     let dir = tempfile::tempdir().expect("temp dir");
     // The parent directory does not exist, so the file cannot be created.
     let path = dir.path().join("missing").join("generate.jsonl");
-    let port = free_port();
+    let port = free_port().expect("a free port");
     let port_arg = port.to_string();
 
     let mut mock_worker = tokio::process::Command::new(env!("CARGO_BIN_EXE_mock-worker"));
@@ -405,7 +448,9 @@ async fn unopenable_capture_file_fails_at_startup() {
 async fn the_same_request_gives_byte_identical_lines() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("generate.jsonl");
-    let client = start(config(Some(path.clone()))).await;
+    let client = start(config(Some(path.clone())))
+        .await
+        .expect("the worker starts");
 
     let tokens = [
         0, 1, 5, 7, 9, 13, 31, 42, 64, 77, 100, 256, 2000, 128000, 151643, 151645,
@@ -417,8 +462,10 @@ async fn the_same_request_gives_byte_identical_lines() {
             .map(|token| (token.to_string(), -1.5))
             .collect();
     }
-    generate(&client, req.clone()).await;
-    generate(&client, req).await;
+    generate(&client, req.clone())
+        .await
+        .expect("the worker answers");
+    generate(&client, req).await.expect("the worker answers");
 
     let text = std::fs::read_to_string(&path).expect("read the capture file");
     let lines: Vec<&str> = text.lines().collect();

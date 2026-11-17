@@ -24,7 +24,7 @@ use serde_json::{json, Value};
     clippy::expect_used,
     reason = "test helper — panicking on bad input is intentional"
 )]
-fn parse_sse_events(raw: &[u8]) -> Vec<(String, Value)> {
+pub(super) fn parse_sse_events(raw: &[u8]) -> Vec<(String, Value)> {
     let text = std::str::from_utf8(raw).expect("UTF-8");
     let mut out = Vec::new();
     for block in text.split("\n\n") {

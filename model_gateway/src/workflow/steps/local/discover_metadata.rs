@@ -12,8 +12,8 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
     worker::{
-        endpoint::Endpoint, sampling_defaults::SamplingDefaults, ConnectionMode,
-        DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
+        identity::{endpoint::Endpoint, sampling_defaults::SamplingDefaults},
+        ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
@@ -100,7 +100,6 @@ struct VersionResponse {
 // HTTP fetchers
 // ---------------------------------------------------------------------------
 
-/// GET JSON with optional bearer auth, with 404 fallback to `/get_<endpoint>`.
 /// Why a metadata endpoint gave no answer: the engine does not offer it (a
 /// 404 on every spelling), or the read failed (transport, timeout, a non-2xx
 /// other than 404, an unparsable body). Registration tolerates both; a strict
@@ -138,61 +137,18 @@ async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
     endpoint: &str,
     api_key: Option<&str>,
 ) -> Result<T, MetadataError> {
-    let url = format!("{base_url}/{endpoint}");
-    // The addresses as every failure below names them: a userinfo in them
-    // masked (the texts end in the step's failure message and its lines).
-    let shown = Endpoint::redacted_str(&url);
-    let mut req = client.get(&url).timeout(METADATA_TIMEOUT);
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
-    }
-
-    let response = req
-        .send()
-        .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown}: {e}")))?;
-
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        // Fallback to deprecated /get_<endpoint> prefix
-        warn!("'/{endpoint}' returned 404, falling back to deprecated '/get_{endpoint}'");
-        let old_url = format!("{base_url}/get_{endpoint}");
-        let shown_old = Endpoint::redacted_str(&old_url);
-        let mut req = client.get(&old_url).timeout(METADATA_TIMEOUT);
-        if let Some(key) = api_key {
-            req = req.bearer_auth(key);
+    match http_get_json_classified(client, &format!("{base_url}/{endpoint}"), api_key).await {
+        Err(MetadataError::NotOffered) => {
+            // Fallback to deprecated /get_<endpoint> prefix
+            warn!("'/{endpoint}' returned 404, falling back to deprecated '/get_{endpoint}'");
+            http_get_json_classified(client, &format!("{base_url}/get_{endpoint}"), api_key).await
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown_old}: {e}")))?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(MetadataError::NotOffered);
-        }
-        if !resp.status().is_success() {
-            return Err(MetadataError::Failed(format!(
-                "status {} from {shown_old}",
-                resp.status()
-            )));
-        }
-        return resp
-            .json::<T>()
-            .await
-            .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown_old}: {e}")));
+        read => read,
     }
-
-    if !response.status().is_success() {
-        return Err(MetadataError::Failed(format!(
-            "status {} from {shown}",
-            response.status()
-        )));
-    }
-
-    response
-        .json::<T>()
-        .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
 }
 
+/// GET JSON with optional bearer auth under the metadata timeout: a 404 is
+/// `NotOffered`, any other failure `Failed`, each text naming the address masked.
 async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     client: &Client,
     url: &str,
@@ -203,10 +159,9 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown}: {e}")))?;
+    let resp = req.send().await.map_err(|e| {
+        MetadataError::Failed(format!("Failed to connect to {shown}: {}", e.without_url()))
+    })?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(MetadataError::NotOffered);
     }
@@ -218,7 +173,7 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     }
     resp.json::<T>()
         .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {}", e.without_url())))
 }
 
 pub async fn get_server_info(
@@ -629,7 +584,8 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
 
         debug!(
             "Discovering metadata for {} ({:?})",
-            config.url, connection_mode
+            Endpoint::redacted_str(&config.url),
+            connection_mode
         );
 
         let (discovered_labels, detected_runtime) = match connection_mode {
@@ -641,7 +597,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .unwrap_or_else(|| {
                         warn!(
                             "No detected_runtime_type for {}, defaulting to sglang",
-                            config.url
+                            Endpoint::redacted_str(&config.url)
                         );
                         "sglang"
                     });
@@ -688,14 +644,18 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             }
         }
         .unwrap_or_else(|e| {
-            warn!("Failed to fetch metadata for {}: {}", config.url, e);
+            warn!(
+                "Failed to fetch metadata for {}: {}",
+                Endpoint::redacted_str(&config.url),
+                e
+            );
             (HashMap::new(), None)
         });
 
         debug!(
             "Discovered {} labels for {}",
             discovered_labels.len(),
-            config.url
+            Endpoint::redacted_str(&config.url)
         );
         context.data.discovered_labels = discovered_labels;
         if let Some(runtime) = detected_runtime {
@@ -771,7 +731,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::workflow::steps::local::test_support::labels_of;
+    use crate::{server::http_client, workflow::steps::local::test_support::labels_of};
 
     /// A ZMQ worker's labels say its grammars start at the first generated
     /// token (the gateway's own link holds them there), with or without the
@@ -871,7 +831,7 @@ mod tests {
         ])
         .await;
 
-        let labels = fetch_sglang_http_metadata(&crate::server::http_client(), &base, None).await;
+        let labels = fetch_sglang_http_metadata(&http_client(), &base, None).await;
         assert_eq!(
             label(&labels, "model_path"),
             Some("org/model-a"),
@@ -915,7 +875,7 @@ mod tests {
             ),
         ])
         .await;
-        let client = crate::server::http_client();
+        let client = http_client();
 
         let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
         assert_eq!(label(&tolerant, "model_path"), Some("org/model-b"));
@@ -960,7 +920,7 @@ mod tests {
             ),
         ])
         .await;
-        let client = crate::server::http_client();
+        let client = http_client();
 
         let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
         assert_eq!(label(&tolerant, "model_path"), Some("org/model-c"));
@@ -987,7 +947,7 @@ mod tests {
         let models = serde_json::json!({"data": [
             {"id": "served-d", "root": "org/model-d", "max_model_len": 8192}
         ]});
-        let client = crate::server::http_client();
+        let client = http_client();
 
         let base = serve_json_routes(vec![
             ("/v1/models", StatusCode::OK, models.clone()),
@@ -1021,7 +981,7 @@ mod tests {
 
         let refused = RefusedAddress::reserve();
         let base = refused.http_url();
-        let client = crate::server::http_client();
+        let client = http_client();
 
         assert!(fetch_vllm_http_metadata(&client, &base, None)
             .await
@@ -1331,7 +1291,7 @@ mod tests {
         )])
         .await;
 
-        let labels = fetch_sglang_http_metadata(&crate::server::http_client(), &base, None).await;
+        let labels = fetch_sglang_http_metadata(&http_client(), &base, None).await;
 
         assert_eq!(
             labels.get("served_model_name").map(String::as_str),
@@ -1372,7 +1332,7 @@ mod tests {
         });
 
         let err = get_server_info(
-            &crate::server::http_client(),
+            &http_client(),
             &format!("http://user:secret@127.0.0.1:{port}"),
             None,
         )
@@ -1388,5 +1348,55 @@ mod tests {
             )),
             "{err}"
         );
+    }
+
+    /// An address registered with a query, at a port nobody listens on: the
+    /// failure does not repeat the query. The HTTP client's own error text
+    /// ends with the request URL, the query kept.
+    #[tokio::test]
+    async fn a_refused_connection_goes_without_the_clients_url() {
+        use crate::worker::test_support::RefusedAddress;
+
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}?token=s3cret", refused.http_url());
+
+        let err = get_server_info(&http_client(), &url, None)
+            .await
+            .expect_err("nothing listens at the address");
+
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    /// An address registered with a query that answers a body that is no
+    /// JSON: the failure does not repeat the query. The HTTP client's text of
+    /// a failed body read ends with the request URL too.
+    #[tokio::test]
+    async fn an_unparsed_answer_goes_without_the_clients_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only server answering no JSON; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|| async { "not json" }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let err = get_server_info(
+            &http_client(),
+            &format!("http://127.0.0.1:{port}?token=s3cret"),
+            None,
+        )
+        .await
+        .expect_err("a body that is no JSON is a failure");
+        server.abort();
+
+        assert!(err.contains("Failed to parse"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
     }
 }

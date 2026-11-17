@@ -2,7 +2,12 @@
 
 Three files, two contracts, one vocabulary. Nothing here is compiled into the
 gateway or the engine crate; a crate test compiles and parses the files and
-holds them to the crate's own types.
+holds them to the crate's own types. The WIT's `types` interface is generated
+from those types: `smg-policy.wit.in` is the hand-written template, the
+crate's `wit` module renders the interface into it from descriptors tied to
+the engine's structs, and `smg-policy.wit` is the committed rendering
+(`SMG_POLICY_WIT_WRITE=1 cargo test -p smg-policy-controller --test wit`
+rewrites it; the test fails on any other difference).
 
 | file | what it is | design |
 |---|---|---|
@@ -27,7 +32,9 @@ clock, a lease's issue instant), and each file's comments name them.
   decline. An empty filter mask is a present, empty `survivors` message and
   sheds the request; it is never a decline. `Hello` carries the protocol
   range and `Welcome` the chosen version; the controller speaks N and N-1 and
-  upgrades first. No absolute instant crosses the wire.
+  upgrades first. No absolute instant crosses the decide, session, plugin and
+  lifecycle wires (budgets, ages and vetoes are durations relative to receipt);
+  the control scope's audit records carry wall-clock instants on purpose.
 - The WIT package carries the world version. The engine accepts
   `smg:policy@1.x` within a stated range and the spec may pin `abi: 1.0`. The
   component model types a record, variant, flags or function by its exact
@@ -36,6 +43,8 @@ clock, a lease's issue instant), and each file's comments name them.
   extra exports are ignored, and a changed shape is a new type or the next
   major. The loader's error names the module's version and the accepted
   range.
+- Both are pre-release until the first shipped release that carries them; the
+  rules above bind from then on.
 - `tests/contracts.rs` pins the names: the RPC list of each service with its
   streaming shape, the cases of every `oneof`, the worlds, the interfaces and
   their functions, and the package names and versions. An additive change
@@ -76,16 +85,19 @@ a replay rebuilds the view from the fixture, which keeps them beside the
 record, checks it against `view_digest`, then runs the plugin in place of the
 recorded stages. The verdicts cover determinism, validity, budget, fallback,
 exposure, replay agreement, lifecycle, version, transport and the packed
-layout. The fixtures (the records with their views) live in the fixture
-repository (bellwether) under a pinned tree, never in this repository.
+layout. The fixtures (the records with their views) live in this
+repository beside the tests that read them, as the recorded policy sheets
+do (`tests/classic/sheets`).
 
 ## Wire budgets
 
 Measured with prost 0.14 over these files (typical frames; proto3 omits a
 field at its default): a decision costs about 110 bytes plus 8 per block hash
-and the headers in and about 170 bytes out (a pair with two decode alternates
-260); a candidate row with its load row is about 80 bytes, so a gRPC plugin's
-record view is about 42 KB at 512 candidates, hence `plugins[].max_candidates`
+and the headers in (up to 6 more when the request carries its block size) and
+about 170 bytes out (a pair with two decode alternates 260); a candidate row
+with its load row is about 90 bytes (up to 6 more with the index's block count
+set), so a gRPC plugin's record view is about 42 KB at 512 candidates, hence
+`plugins[].max_candidates`
 (default 128); a credit grant (a delta: each decide request spends one, no
 answer returns one, a new stream starts at the welcome's window) is 6 bytes
 in its envelope (20 on the wire); a
@@ -102,5 +114,7 @@ resolves and its records and enums are the crate's (by field and case names,
 not their types: a width change such as `u8` to `u16` passes this check,
 which a type table in a later head closes); the versioned names are the
 pinned lists; the packed request block's padding keeps its u64 sections
-8-byte aligned and the world's comment states the rule. No code is generated
-and nothing at run time reads the files.
+8-byte aligned and the world's comment states the rule. `--test wit` holds the
+committed WIT to its rendering byte for byte and every record to the engine's
+struct in name and type (the type table the earlier head left open); the WIT order is the descriptor's, held by the byte-for-byte test.
+Nothing at run time reads the files.

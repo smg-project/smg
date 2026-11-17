@@ -413,6 +413,64 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A fan-out's open choices end on an `Abort` RPC with their own indexes: the
+/// terminal the servicer builds for the second choice carries index 1, as the
+/// engine's own completes do.
+#[tokio::test]
+async fn an_abort_ends_each_choice_of_a_fan_out_with_its_own_index() {
+    let mut h = harness(model_info()).await;
+    let mut req = generate_request("r7", true);
+    req.sampling_config.as_mut().unwrap().num_return_sequences = 2;
+    let mut stream = h.client.generate(req).await.expect("generate").into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r7-1", vec![21], 1, None, None)).await;
+    assert_eq!(
+        chunk(stream.message().bounded().await.unwrap().unwrap()).token_ids,
+        vec![21]
+    );
+
+    let response = h
+        .client
+        .abort(trt::AbortRequest {
+            request_id: "r7".to_string(),
+        })
+        .await
+        .expect("abort")
+        .into_inner();
+    assert!(response.success);
+    let mut terminals = [
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+    ];
+    terminals.sort_by_key(|done| done.sequence_index);
+    let seen: Vec<_> = terminals
+        .iter()
+        .map(|done| {
+            (
+                done.sequence_index,
+                done.finish_reason.clone(),
+                done.output_token_ids.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (0, "abort".to_string(), vec![]),
+            (1, "abort".to_string(), vec![21])
+        ]
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    let mut aborted = recv_abort(&mut h.engine_in).await;
+    while aborted.len() < 2 {
+        aborted.extend(recv_abort(&mut h.engine_in).await);
+    }
+    aborted.sort();
+    assert_eq!(aborted, vec!["r7-0".to_string(), "r7-1".to_string()]);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 #[tokio::test]
 async fn duplicate_in_flight_request_ids_are_refused() {
     let mut h = harness(model_info()).await;
@@ -682,6 +740,9 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     // The vocabulary of structural-tag nodes the launcher read off the
     // engine's xgrammar rides along for the router's label.
     assert_eq!(info.structural_tag_vocabulary, "older");
+    // Under a backend that compiles grammars the servicer also says where
+    // the engine starts one.
+    assert_eq!(info.constrained_decoding_start, "first_token");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
     // A launcher that reported no bounds and no sizes: the handshake's; one
@@ -909,8 +970,8 @@ async fn an_idle_shims_record_stays_zero_filled_once_a_sibling_reports() {
     );
     // The record the relay pushes for a rank is the poll's entry for it: one
     // field set on both wires, the token counts and the KV capacity included,
-    // so a gateway's DP-rank token cache reads the same from a push as from
-    // a poll.
+    // so a gateway's load report for the worker reads the same from a push as
+    // from a poll.
     for load in &loads.loads {
         let pushed = kv_events::LoadSource::load(&source, Some(load.dp_rank))
             .expect("the rank's pushed record");
@@ -1067,6 +1128,24 @@ fn structured_outputs_support_follows_the_launcher_facts() {
     );
     assert_eq!(support(""), StructuredOutputsBackendConfig::Other.into());
     let _ = Arc::new(());
+}
+
+/// Where a grammar starts follows the same fact: the first generated token
+/// under the two backends that compile one, nothing under `none` or under a
+/// backend the launcher could not name.
+#[test]
+fn constrained_decoding_start_follows_the_launcher_facts() {
+    let start = |backend: &str| {
+        constrained_decoding_start(&TrtllmModelInfo {
+            guided_decoding_backend: backend.to_string(),
+            ..model_info()
+        })
+    };
+    assert_eq!(start("xgrammar"), "first_token");
+    assert_eq!(start("llguidance"), "first_token");
+    assert_eq!(start("none"), "");
+    assert_eq!(start(""), "");
+    assert_eq!(start("another"), "");
 }
 
 /// After the shim's first output for a request (one of its three prompt
@@ -1321,8 +1400,6 @@ async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch()
 /// record.
 #[tokio::test]
 async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
-    use crate::kv_events::RankLoads;
-
     let mut h = harness(model_info()).await;
     let idle = h
         .client
@@ -1342,4 +1419,35 @@ async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
     assert_eq!(state.rank_load(None), state.rank_load(Some(0)));
     assert!(state.rank_load(Some(1)).is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_leftover_handshake_endpoint_does_not_fail_the_link() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    // A bound-then-dropped listener leaves its socket file behind, as a
+    // process that died without cleanup does.
+    drop(UnixListener::bind(&endpoint).unwrap());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = TrtllmServicerServer::start(config).unwrap();
+
+    // Only the link's own bind answers a connect: the leftover refuses it.
+    wait_until(|| {
+        assert_eq!(
+            server.last_error().unwrap(),
+            None,
+            "the link failed on the leftover"
+        );
+        UnixStream::connect(&endpoint).is_ok()
+    })
+    .await;
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        std::fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
 }

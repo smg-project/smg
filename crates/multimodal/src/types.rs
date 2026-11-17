@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt,
     path::PathBuf,
@@ -15,6 +16,7 @@ use crate::{
     buffer_pool,
     error::MediaConnectorError,
     media::{apply_transparency, decode_image_bytes},
+    minimax_resize::resize_image,
     vision::{execution, transforms::resize_bicubic_pil},
 };
 
@@ -57,12 +59,26 @@ pub enum MediaContentPart {
         text: String,
     },
     ImageUrl {
-        url: String,
+        /// The URL or `data:` URL, shared with the request that carries it.
+        url: Arc<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<ImageDetail>,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
         /// MiniMax-M3 extension: cap the image's long side before preprocessing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_long_side_pixel: Option<u32>,
+    },
+    /// An image carried as base64 text with its media type (a base64 source
+    /// of the Messages API): the decoder reads the text in place, as it reads
+    /// a data URL's payload; nothing re-encodes it into one.
+    ImageBase64 {
+        media_type: String,
+        data: Arc<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<ImageDetail>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uuid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_long_side_pixel: Option<u32>,
     },
@@ -81,7 +97,16 @@ pub enum MediaContentPart {
         uuid: Option<String>,
     },
     AudioUrl {
-        url: String,
+        /// The URL or `data:` URL, shared with the request that carries it.
+        url: Arc<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uuid: Option<String>,
+    },
+    /// Audio carried as base64 text with its media type (a chat `input_audio`
+    /// part): read in place, as a data URL's payload.
+    AudioBase64 {
+        media_type: String,
+        data: Arc<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
     },
@@ -93,7 +118,8 @@ pub enum MediaContentPart {
         uuid: Option<String>,
     },
     VideoUrl {
-        url: String,
+        /// The URL or `data:` URL, shared with the request that carries it.
+        url: Arc<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
         /// MiniMax-M3 extension: frames per second to sample at.
@@ -403,14 +429,17 @@ impl VideoClip {
         self.sampling.as_ref()
     }
 
-    pub fn materialized_frames(&self) -> Result<Vec<DynamicImage>, String> {
+    /// The clip's frames: lent when the decode produced them, materialised
+    /// from the RGB video otherwise.
+    pub fn materialized_frames(&self) -> Result<Cow<'_, [DynamicImage]>, String> {
         if !self.frames.is_empty() {
-            return Ok(self.frames.clone());
+            return Ok(Cow::Borrowed(&self.frames));
         }
         self.rgb_video
             .as_ref()
             .ok_or_else(|| "video clip has no decoded frames".to_string())?
             .to_dynamic_images()
+            .map(Cow::Owned)
     }
 
     pub fn raw_bytes(&self) -> &[u8] {
@@ -534,7 +563,7 @@ impl ImageFrame {
             Ok(if self.minimax_sglang_resize {
                 resize_bicubic_pil(&image, self.size.width, self.size.height)
             } else if self.minimax_resize {
-                crate::minimax_resize::resize_image(image, self.size.width, self.size.height)
+                resize_image(image, self.size.width, self.size.height)
             } else {
                 image
             })
@@ -941,6 +970,12 @@ mod tests {
         const CHILD: &str = "SMG_CAPPED_DECODE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             // Isolate the process-wide pool and bound a deadlock regression.
+            // The bound reads the child's own clock: a blocked child accrues
+            // no CPU time, while a child starved of the core by the other
+            // test threads accrues it slowly as it progresses, and a wall
+            // clock cannot tell the two apart. No CPU across a whole quiet
+            // window is the deadlock; the wall ceiling is the last resort,
+            // and the wall bound alone where there is no process table.
             let directory = tempfile::tempdir().expect("completion directory");
             let completed = directory.path().join("completed");
             let name = format!(
@@ -952,7 +987,11 @@ mod tests {
                 .env(CHILD, &completed)
                 .spawn()
                 .expect("start child");
-            let deadline = Instant::now() + Duration::from_secs(10);
+            const QUIET: Duration = Duration::from_secs(3);
+            const CEILING: Duration = Duration::from_secs(120);
+            const WALL_ONLY: Duration = Duration::from_secs(10);
+            let started = Instant::now();
+            let mut progressed = (started, Duration::ZERO);
             loop {
                 if let Some(status) = child.try_wait().expect("child status") {
                     assert!(status.success(), "shared capped decode failed: {status}");
@@ -962,10 +1001,38 @@ mod tests {
                     );
                     return;
                 }
-                if Instant::now() >= deadline {
+                // The quiet window runs from just after the read that last
+                // saw progress to just before the current read, so the span
+                // it judges is never longer than the span between the two:
+                // a parent held off the core, inside a read or after it,
+                // must not turn an unobserved stretch into a deadlock.
+                let observed = Instant::now();
+                let blocked = match process_cpu_time(child.id()) {
+                    Some(cpu) => {
+                        if cpu > progressed.1 {
+                            // Stamped after the read: the child may have
+                            // accrued its last tick just before it.
+                            progressed = (Instant::now(), cpu);
+                        }
+                        if observed.saturating_duration_since(progressed.0) >= QUIET {
+                            Some(format!(
+                                "no CPU accrued for {QUIET:?} (child CPU time {cpu:?})"
+                            ))
+                        } else if observed.duration_since(started) >= CEILING {
+                            Some(format!(
+                                "wall ceiling {CEILING:?} passed, child still on CPU ({cpu:?})"
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    None => (observed.duration_since(started) >= WALL_ONLY)
+                        .then(|| format!("{WALL_ONLY:?} of wall clock, no process table to read")),
+                };
+                if let Some(reason) = blocked {
                     child.kill().expect("kill blocked child");
                     child.wait().expect("reap child");
-                    panic!("shared capped decode blocked the vision pool");
+                    panic!("shared capped decode blocked the vision pool: {reason}");
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -1026,6 +1093,20 @@ mod tests {
             b"completed",
         )
         .expect("record completed regression test");
+    }
+
+    /// The CPU time a process has used so far, user plus system, read from the
+    /// host's process table; `None` where there is no table to read.
+    fn process_cpu_time(pid: u32) -> Option<std::time::Duration> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command name sits in parentheses and may hold spaces; the
+        // fixed fields follow it, utime and stime the 14th and 15th of the line.
+        let after_name = stat.rsplit_once(')')?.1;
+        let mut fields = after_name.split_whitespace().skip(11);
+        let user: u64 = fields.next()?.parse().ok()?;
+        let system: u64 = fields.next()?.parse().ok()?;
+        // The table counts in USER_HZ ticks, a hundred a second.
+        Some(std::time::Duration::from_millis((user + system) * 10))
     }
 
     /// A 2x1 RGBA PNG: a fully transparent black pixel, then an opaque colour.

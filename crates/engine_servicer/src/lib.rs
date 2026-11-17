@@ -68,7 +68,7 @@ pub use engine_zmq_adapter::{
 pub use error::ServicerError;
 use futures::Stream;
 pub use server::init_tracing;
-pub(crate) use server::{lock, record_error, ServerThread, SharedError, Shutdown};
+pub(crate) use server::{lock, record_error, ServerThread, SharedError, Shutdown, STOP_MARGIN};
 pub use servicer_config::ServicerConfig;
 pub use sglang::{
     SglangMediaProcessor, SglangModelInfo, SglangServicerConfig, SglangServicerServer,

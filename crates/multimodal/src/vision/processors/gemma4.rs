@@ -793,6 +793,7 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
+    use crate::test_support::gradient_rgb;
 
     const IMAGE_CONFIG: &str = r#"{
         "do_convert_rgb": true, "do_normalize": false, "do_rescale": true, "do_resize": true,
@@ -925,7 +926,7 @@ mod tests {
         let params = params();
         let side = params.side_mult();
         let (width, height) = (2 * side, side);
-        let pixels = crate::test_support::gradient_rgb(width, height, 7);
+        let pixels = gradient_rgb(width, height, 7);
         let frame = DynamicImage::ImageRgb8(
             RgbImage::from_raw(width as u32, height as u32, pixels.clone()).unwrap(),
         );
@@ -941,14 +942,14 @@ mod tests {
             for patch_x in 0..grid_w {
                 for dy in 0..patch {
                     for dx in 0..patch {
-                        for channel in 0..CHANNELS {
+                        for (channel, lut) in pipeline.lut.iter().enumerate() {
                             let source = ((patch_y * patch + dy) * width + patch_x * patch + dx)
                                 * CHANNELS
                                 + channel;
                             let index = (patch_y * grid_w + patch_x) * patch_pixels
                                 + (dy * patch + dx) * CHANNELS
                                 + channel;
-                            expected[index] = pipeline.lut[channel][pixels[source] as usize];
+                            expected[index] = lut[pixels[source] as usize];
                         }
                     }
                 }
@@ -1088,7 +1089,7 @@ mod tests {
     }
 
     fn gradient(width: u32, height: u32, seed: usize) -> DynamicImage {
-        let pixels = crate::test_support::gradient_rgb(width as usize, height as usize, seed);
+        let pixels = gradient_rgb(width as usize, height as usize, seed);
         DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, pixels).unwrap())
     }
 

@@ -112,12 +112,41 @@ pub fn entries_of(text: &str, separators: &[char]) -> Vec<String> {
         .collect()
 }
 
-/// Parse a control-plane API key entry, `id:name:role:key`. A malformed
+/// The parts of a control-plane API key entry, `id:name:role:key`, as
+/// [`control_plane_api_key_parts`] reads them: the gateway hashes the key
+/// into an [`ApiKeyEntry`], a language binding builds its own entry with
+/// the key as given.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ControlPlaneApiKeyParts<'a> {
+    /// The key's identifier.
+    pub id: &'a str,
+    /// The key's name.
+    pub name: &'a str,
+    /// The key itself, as the entry gives it.
+    pub key: &'a str,
+    /// The role the entry names.
+    pub role: Role,
+}
+
+/// The key is written `<redacted>`, as the other key-carrying types write
+/// it: a logged or expected value never shows the credential.
+impl std::fmt::Debug for ControlPlaneApiKeyParts<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneApiKeyParts")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("key", &"<redacted>")
+            .field("role", &self.role)
+            .finish()
+    }
+}
+
+/// Read a control-plane API key entry, `id:name:role:key`. A malformed
 /// entry is a configuration error, never a dropped key: a dropped key would
 /// leave the control plane open (or lock an operator out) with nothing but
 /// a stderr line to show for it. The entry is not echoed, since it carries
 /// the credential.
-pub fn parse_control_plane_api_key(key_str: &str) -> ConfigResult<ApiKeyEntry> {
+pub fn control_plane_api_key_parts(key_str: &str) -> ConfigResult<ControlPlaneApiKeyParts<'_>> {
     let parts: Vec<&str> = key_str.splitn(4, ':').collect();
     if parts.len() != 4 {
         return Err(ConfigError::InvalidValue {
@@ -126,12 +155,7 @@ pub fn parse_control_plane_api_key(key_str: &str) -> ConfigResult<ApiKeyEntry> {
             reason: "expected 'id:name:role:key'".to_string(),
         });
     }
-    let id = parts[0];
-    let name = parts[1];
-    let role_str = parts[2];
-    let key = parts[3];
-
-    let role = match role_str.to_lowercase().as_str() {
+    let role = match parts[2].to_lowercase().as_str() {
         "admin" => Role::Admin,
         "user" => Role::User,
         // The field is not named either: with the fields out of order it is the credential.
@@ -143,8 +167,22 @@ pub fn parse_control_plane_api_key(key_str: &str) -> ConfigResult<ApiKeyEntry> {
             });
         }
     };
+    Ok(ControlPlaneApiKeyParts {
+        id: parts[0],
+        name: parts[1],
+        key: parts[3],
+        role,
+    })
+}
 
-    Ok(ApiKeyEntry::new(id, name, key, role))
+/// Parse a control-plane API key entry into the gateway's entry, which
+/// keeps the key's hash alone ([`control_plane_api_key_parts`] reads and
+/// checks the entry).
+pub fn parse_control_plane_api_key(key_str: &str) -> ConfigResult<ApiKeyEntry> {
+    let parts = control_plane_api_key_parts(key_str)?;
+    Ok(ApiKeyEntry::new(
+        parts.id, parts.name, parts.key, parts.role,
+    ))
 }
 
 /// Parse a tenant-scoped data-plane API key entry, `tenant_id:key`. Only
@@ -279,6 +317,22 @@ mod tests {
             );
             assert!(!reason.contains("s3cret"), "{reason}");
         }
+    }
+
+    /// The parts' debug form names the entry's id, name and role and writes
+    /// the key redacted, so a logged or expected value never shows it.
+    #[test]
+    fn the_control_plane_parts_debug_form_redacts_the_key() {
+        let parts = control_plane_api_key_parts("ops:Operators:Admin:cp-s3cret").expect("parsed");
+        let shown = format!("{parts:?}");
+        assert!(shown.contains("key: \"<redacted>\""), "{shown}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(
+            shown.contains("id: \"ops\"")
+                && shown.contains("name: \"Operators\"")
+                && shown.contains("Admin"),
+            "{shown}"
+        );
     }
 
     #[test]

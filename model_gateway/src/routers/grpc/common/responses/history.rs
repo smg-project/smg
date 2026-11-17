@@ -91,7 +91,11 @@ pub(crate) async fn load_history(
 
     let mut loaded = request.clone();
     if continues {
-        history.extend(current_input_items(&request.input));
+        // The copy of the request's own input made just above is the one that
+        // joins the history, moved out of the loaded request; the normaliser
+        // reshapes it in place instead of copying every item a second time.
+        let own_input = std::mem::replace(&mut loaded.input, ResponseInput::Items(Vec::new()));
+        history.extend(current_input_items(own_input));
         loaded.input = ResponseInput::Items(history);
         loaded.previous_response_id = None;
     }
@@ -150,17 +154,18 @@ pub(crate) async fn load_history(
 
 /// The request's own input as items: a text input is the user message it
 /// stands for; an item list is normalized (a bare `{role, content}` message
-/// becomes a message item), every other item kept as it came.
-pub(crate) fn current_input_items(input: &ResponseInput) -> Vec<ResponseInputOutputItem> {
+/// becomes a message item), every other item kept as it came. The input is
+/// taken by value: what is not reshaped moves, nothing is copied.
+pub(crate) fn current_input_items(input: ResponseInput) -> Vec<ResponseInputOutputItem> {
     match input {
         ResponseInput::Text(text) => vec![ResponseInputOutputItem::Message {
             id: generate_id("msg"),
             role: "user".to_string(),
-            content: vec![ResponseContentPart::InputText { text: text.clone() }],
+            content: vec![ResponseContentPart::InputText { text }],
             status: Some("completed".to_string()),
             phase: None,
         }],
-        ResponseInput::Items(items) => items.iter().map(normalize_input_item).collect(),
+        ResponseInput::Items(items) => items.into_iter().map(normalize_input_item).collect(),
     }
 }
 
@@ -199,15 +204,16 @@ fn replays(item: &ResponseInputOutputItem) -> bool {
 
 /// The pipeline a loaded history is replayed into. A stored message replays
 /// the content parts that pipeline carried when the turn was answered: the
-/// chat conversion never carried an `input_file` or an `input_image` without
-/// an `image_url` (a `file_id` is not resolvable here), the Harmony builder
-/// no `input_image` at all. Such parts are left out when the history loads,
-/// as an unreplayed item is ([`unreplayed_kind`]): the turn was answered
-/// without them, and a continuation refused on them until the client edits a
-/// chain it cannot edit is a conversation the client cannot carry on. A
-/// request's own input is not filtered and keeps its refusal, and so does a
-/// conversation item the client added itself (no response wrote it, so no
-/// pipeline ever answered without its parts).
+/// chat conversion never carried an `input_file`, an `input_image` without
+/// an `image_url` (a `file_id` is not resolvable here) or a media part of a
+/// `developer` message (the developer turn folds into the system text), the
+/// Harmony builder no `input_image` at all. Such parts are left out when the
+/// history loads, as an unreplayed item is ([`unreplayed_kind`]): the turn
+/// was answered without them, and a continuation refused on them until the
+/// client edits a chain it cannot edit is a conversation the client cannot
+/// carry on. A request's own input is not filtered and keeps its refusal, and
+/// so does a conversation item the client added itself (no response wrote
+/// it, so no pipeline ever answered without its parts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplayInto {
     /// The chat conversion (`responses_to_chat`).
@@ -217,12 +223,13 @@ pub(crate) enum ReplayInto {
 }
 
 impl ReplayInto {
-    /// Whether the pipeline carried `part` when a stored turn was answered.
-    fn carried(self, part: &ResponseContentPart) -> bool {
+    /// Whether the pipeline carried `part` of a message with `role` when a
+    /// stored turn was answered.
+    fn carried(self, role: &str, part: &ResponseContentPart) -> bool {
         match part {
             ResponseContentPart::InputFile { .. } => false,
             ResponseContentPart::InputImage { image_url, .. } => match self {
-                Self::Chat => image_url.is_some(),
+                Self::Chat => image_url.is_some() && role != "developer",
                 Self::Harmony => false,
             },
             ResponseContentPart::OutputText { .. }
@@ -235,9 +242,9 @@ impl ReplayInto {
 /// `item` with the content parts `into` never carried left out (see
 /// [`ReplayInto`]); an item that is not a message is returned as it is.
 fn replayed_parts(mut item: ResponseInputOutputItem, into: ReplayInto) -> ResponseInputOutputItem {
-    fn keep_carried(parts: &mut Vec<ResponseContentPart>, into: ReplayInto) {
+    fn keep_carried(role: &str, parts: &mut Vec<ResponseContentPart>, into: ReplayInto) {
         parts.retain(|part| {
-            let carried = into.carried(part);
+            let carried = into.carried(role, part);
             if !carried {
                 let part_type = match part {
                     ResponseContentPart::InputFile { .. } => "input_file",
@@ -252,11 +259,12 @@ fn replayed_parts(mut item: ResponseInputOutputItem, into: ReplayInto) -> Respon
         });
     }
     match &mut item {
-        ResponseInputOutputItem::Message { content, .. } => keep_carried(content, into),
+        ResponseInputOutputItem::Message { role, content, .. } => keep_carried(role, content, into),
         ResponseInputOutputItem::SimpleInputMessage {
+            role,
             content: StringOrContentParts::Array(parts),
             ..
-        } => keep_carried(parts, into),
+        } => keep_carried(role, parts, into),
         _ => {}
     }
     item
@@ -334,17 +342,19 @@ pub(crate) fn hosted_call_result(
 /// content parts and the phase label it may carry, a reasoning row added
 /// through the conversations API from the bare content it stores, any other
 /// row from the whole item it stores. `None` for a row that has no input form
-/// (a built-in tool call, an older schema), which is left out.
-fn conversation_item_as_input(item: &ConversationItem) -> Option<ResponseInputOutputItem> {
+/// (a built-in tool call, an older schema), which is left out. The row is
+/// consumed: its strings become the item's, with no copy; a row that carries
+/// its id on the row only has that id written into the item.
+fn conversation_item_as_input(item: ConversationItem) -> Option<ResponseInputOutputItem> {
     match item.item_type.as_str() {
         "message" => {
-            let (content, phase) = split_stored_message_content(item.content.clone());
+            let (content, phase) = split_stored_message_content(item.content);
             match serde_json::from_value::<Vec<ResponseContentPart>>(content) {
                 Ok(content) => Some(ResponseInputOutputItem::Message {
-                    id: item.id.0.clone(),
-                    role: item.role.clone().unwrap_or_else(|| "user".to_string()),
+                    id: item.id.0,
+                    role: item.role.unwrap_or_else(|| "user".to_string()),
                     content,
-                    status: item.status.clone(),
+                    status: item.status,
                     phase,
                 }),
                 Err(e) => {
@@ -353,31 +363,36 @@ fn conversation_item_as_input(item: &ConversationItem) -> Option<ResponseInputOu
                 }
             }
         }
-        "reasoning" if item.content.is_array() => {
-            match serde_json::from_value(item.content.clone()) {
-                Ok(content) => Some(ResponseInputOutputItem::new_reasoning(
-                    item.id.0.clone(),
-                    vec![],
-                    content,
-                    item.status.clone(),
-                )),
-                Err(e) => {
-                    warn!(item_id = %item.id.0, error = %e, "Stored reasoning item has no readable content; left out of the history");
-                    None
-                }
+        "reasoning" if item.content.is_array() => match serde_json::from_value(item.content) {
+            Ok(content) => Some(ResponseInputOutputItem::new_reasoning(
+                item.id.0,
+                vec![],
+                content,
+                item.status,
+            )),
+            Err(e) => {
+                warn!(item_id = %item.id.0, error = %e, "Stored reasoning item has no readable content; left out of the history");
+                None
             }
-        }
+        },
         _ => {
             // A whole-item row keeps the item under its own fields; a row
             // added through the conversations API carries its id on the row
             // only, and an item is found by id when referenced.
-            let mut whole = item.content.clone();
+            let mut whole = item.content;
+            let id = item.id.0;
             if let Some(fields) = whole.as_object_mut() {
                 fields
                     .entry("id")
-                    .or_insert_with(|| Value::String(item.id.0.clone()));
+                    .or_insert_with(|| Value::String(id.clone()));
             }
-            stored_item_as_input(&whole)
+            match serde_json::from_value(whole) {
+                Ok(input) => Some(input),
+                Err(e) => {
+                    warn!(item_id = %id, item_type = %item.item_type, error = %e, "Stored item has no readable form; left out of the history");
+                    None
+                }
+            }
         }
     }
 }
@@ -455,10 +470,11 @@ async fn conversation_items(
     // itself (no response id) was answered by nobody and keeps every part,
     // so the conversion refuses it as it would the request's own.
     let items: Vec<ResponseInputOutputItem> = stored
-        .iter()
+        .into_iter()
         .filter_map(|row| {
+            let answered = row.response_id.is_some();
             let item = conversation_item_as_input(row).filter(replays)?;
-            Some(if row.response_id.is_some() {
+            Some(if answered {
                 replayed_parts(item, into)
             } else {
                 item
@@ -536,7 +552,7 @@ async fn resolve_item_references(
         };
         // a stored item that has no input form (a built-in tool call, an older
         // schema) exists but cannot be re-injected: say so, not "not found"
-        match serde_json::from_value::<ResponseInputOutputItem>(candidate.clone()) {
+        match ResponseInputOutputItem::deserialize(candidate) {
             Ok(found) => resolved.push(found),
             Err(e) => {
                 let item_type = candidate
@@ -721,6 +737,77 @@ pub(crate) mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// A stored `developer` turn whose message carried an `input_image` with
+    /// a URL replays without it on the chat path too: the developer turn
+    /// folded into the system text when it was answered, and the fold refuses
+    /// such a part now, so a continuation refused on a turn the client cannot
+    /// edit would end the conversation. The request's own developer item keeps
+    /// its parts and meets the refusal itself.
+    #[tokio::test]
+    async fn a_stored_developer_image_is_left_out_of_the_replay() {
+        let stores = Stores::with_conversation().await;
+        let developer_turn: ResponseInputOutputItem = serde_json::from_value(json!({
+            "type": "message", "id": "msg_d1", "role": "developer", "content": [
+                {"type": "input_text", "text": "Describe what you see."},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ]
+        }))
+        .expect("a developer message item");
+        let turn_1 = ResponsesRequest {
+            input: ResponseInput::Items(vec![developer_turn.clone()]),
+            conversation: Some(ConversationRef::Id("conv_1".to_string())),
+            ..Default::default()
+        };
+        stores
+            .store_turn(
+                "resp_1",
+                &turn_1,
+                json!([{"type": "message", "id": "msg_1", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Nothing to see.", "annotations": []}]}]),
+            )
+            .await;
+
+        for into in [ReplayInto::Chat, ReplayInto::Harmony] {
+            for continuation in [
+                ResponsesRequest {
+                    input: ResponseInput::Items(vec![developer_turn.clone()]),
+                    previous_response_id: Some("resp_1".to_string()),
+                    ..Default::default()
+                },
+                ResponsesRequest {
+                    input: ResponseInput::Items(vec![developer_turn.clone()]),
+                    conversation: Some(ConversationRef::Id("conv_1".to_string())),
+                    ..Default::default()
+                },
+            ] {
+                let loaded = load_history(stores.history(), &continuation, None, into)
+                    .await
+                    .expect("the history loads");
+                let ResponseInput::Items(items) = &loaded.input else {
+                    panic!("the loaded input is an item list");
+                };
+                assert_eq!(
+                    shape(items),
+                    [
+                        "message:developer",
+                        "message:assistant",
+                        "message:developer"
+                    ]
+                );
+                assert_eq!(
+                    part_types(&items[0]),
+                    ["input_text"],
+                    "{into:?}: the stored developer turn replays its text alone"
+                );
+                assert_eq!(
+                    part_types(&items[2]),
+                    ["input_text", "input_image"],
+                    "{into:?}: the request's own input keeps every part"
+                );
+            }
+        }
     }
 
     /// A stored turn whose message carried a part the pipeline never took
@@ -1298,7 +1385,7 @@ pub(crate) mod tests {
             tenant: None,
         };
 
-        let message = conversation_item_as_input(&row(
+        let message = conversation_item_as_input(row(
             "message",
             Some("assistant"),
             json!({"content": [{"type": "output_text", "text": "hi", "annotations": []}], "phase": "final_answer"}),
@@ -1310,7 +1397,7 @@ pub(crate) mod tests {
                 if id == "message_1" && role == "assistant"
         ));
 
-        let reasoning = conversation_item_as_input(&row(
+        let reasoning = conversation_item_as_input(row(
             "reasoning",
             None,
             json!([{"type": "reasoning_text", "text": "thinking"}]),
@@ -1323,7 +1410,7 @@ pub(crate) mod tests {
         ));
 
         // a row with no input form is left out, not an error
-        assert!(conversation_item_as_input(&row(
+        assert!(conversation_item_as_input(row(
             "web_search_call",
             None,
             json!({"type": "web_search_call", "status": "completed"})
@@ -1355,7 +1442,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let user = normalize_input_item(
-            &serde_json::from_value(json!({"role": "user", "content": "continue"})).unwrap(),
+            serde_json::from_value(json!({"role": "user", "content": "continue"})).unwrap(),
         );
 
         let resolved = resolve_item_references(&storage, vec![reference("msg_stored"), user], None)

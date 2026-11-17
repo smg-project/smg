@@ -3,11 +3,25 @@
 //! arguments of Mistral and of DeepSeek V3 and V3.1. Each builder writes the tag the family's assembler reads back, the tool's schema as
 //! the arguments' grammar.
 
+use std::sync::Arc;
+
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{calls, CallMarkers, Count, Grammar, Tag, WayIn};
 use crate::format::{Emits, Format, Whitespace};
+
+/// The arguments a tool's schema accepts, written as free JSON: no engine style, no word left
+/// out, the whitespace between tokens as JSON has it. Every JSON spelling's call puts this grammar
+/// after the tool's name, and so does the shaped syntax's JSON arguments.
+pub(super) fn arguments(tool: &Tool) -> Grammar {
+    Grammar::JsonSchema {
+        schema: Arc::new(tool.function.parameters_schema().clone()),
+        style: None,
+        excludes: Vec::new(),
+        whitespace: Whitespace::Free,
+    }
+}
 
 /// The JSON family: each call is the call markers around one JSON object whose `name` is the
 /// tool's and whose `arguments` the tool's schema accepts, the template's newlines included.
@@ -18,12 +32,7 @@ pub(super) fn calls(markers: &CallMarkers<'_>, tools: &[&Tool], count: Count<'_>
             let name = Value::String(tool.function.name.clone());
             Tag::new(
                 format!("{}\n{{\"name\": {name}, \"arguments\": ", markers.call_open),
-                Grammar::JsonSchema {
-                    schema: tool.function.parameters_schema().clone(),
-                    style: None,
-                    excludes: Vec::new(),
-                    whitespace: Whitespace::Free,
-                },
+                arguments(tool),
                 format!("}}\n{}", markers.call_close),
             )
         })
@@ -61,12 +70,7 @@ pub(super) fn named_calls(
             let quoted = Value::String(tool.function.name.clone());
             Tag::new(
                 format!("{marker}{{\"name\":{quoted},\"args\":"),
-                Grammar::JsonSchema {
-                    schema: tool.function.parameters_schema().clone(),
-                    style: None,
-                    excludes: Vec::new(),
-                    whitespace: Whitespace::Free,
-                },
+                arguments(tool),
                 format!("}}{close}"),
             )
         })
@@ -103,12 +107,6 @@ pub(super) fn named_arguments_calls(
     count: Count<'_>,
 ) -> Option<Grammar> {
     let marker = syntax.marker;
-    let arguments = |tool: &Tool| Grammar::JsonSchema {
-        schema: tool.function.parameters_schema().clone(),
-        style: None,
-        excludes: Vec::new(),
-        whitespace: Whitespace::Free,
-    };
     if let Some(markers) = markers {
         let calls = tools
             .iter()
@@ -164,12 +162,7 @@ fn list_open(tools: &[&Tool], count: Count<'_>) -> Vec<Grammar> {
                 let name = Value::String(tool.function.name.clone());
                 Grammar::Sequence(vec![
                     Grammar::ConstString(format!("{{\"name\": {name}, \"arguments\": ")),
-                    Grammar::JsonSchema {
-                        schema: tool.function.parameters_schema().clone(),
-                        style: None,
-                        excludes: Vec::new(),
-                        whitespace: Whitespace::Free,
-                    },
+                    arguments(tool),
                     Grammar::ConstString("}".to_string()),
                 ])
             })

@@ -53,9 +53,10 @@
 //! the engine starts its grammar after its reasoning parser has seen `</think>`, the tag is the
 //! block at once there, so a thinking model keeps its thought and the forced call follows it in
 //! the model's own syntax, which the table reads back (the tests below hold the recorded forced
-//! answers of a live cell in that shape, whole and at every cut). Without the tag the gateway
-//! hands such a request to its older path, whose JSON-schema constraint makes the model write the
-//! bare arguments after the thought, which the table reads as content (pinned below too).
+//! answers of a live cell in that shape, whole and at every cut). Without the tag such a request
+//! goes under a JSON-schema constraint, which makes the model write the bare arguments after the
+//! thought: this table reads them as content (pinned below too), and its variant for a forced
+//! call reads them as the call ([`Format::with_forced_call`](crate::Format::with_forced_call)).
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 

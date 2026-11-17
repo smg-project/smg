@@ -11,26 +11,29 @@
 use axum::http;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{Tool, ToolChoice, ToolChoiceValue, Usage},
+    common::{Tool, ToolChoice, ToolChoiceValue, ToolReference, Usage},
     responses::{
-        self, InputTokensDetails, OutputTokensDetails, ResponseInput, ResponseInputOutputItem,
-        ResponseOutputItem, ResponseUsage, ResponsesRequest,
+        self, ResponseInput, ResponseInputOutputItem, ResponseOutputItem, ResponseUsage,
+        ResponsesRequest,
     },
 };
 use serde_json::{json, Value};
 use smg_mcp::{McpToolSession, ToolExecutionOutput};
 use tracing::{trace, warn};
 
+pub(super) use crate::routers::grpc::common::responses::utils::McpToolCallLimit;
 use crate::{
     middleware::TenantRequestMeta,
     observability::metrics::{metrics_labels, Metrics},
     routers::{
         common::{
-            mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
+            mcp_utils::prepare_hosted_dispatch_args,
             openai_bridge::{self, ResponseFormat},
         },
         grpc::common::responses::{
-            history::current_input_items, tool_call_limit, utils::resolve_function_identity,
+            history::current_input_items,
+            tool_call_limit,
+            utils::{add_model_call_usage, resolve_function_identity, tool_call_overflow},
         },
     },
 };
@@ -40,18 +43,28 @@ use crate::{
 // ============================================================================
 
 /// State for tracking multi-turn tool calling loop
+///
+/// The state holds no copy of the request: the loop owns its request and
+/// rebuilds it in place each iteration ([`build_next_request`]), so the input
+/// the loop started from (the request's history loaded, a stored turn's tool
+/// calls and outputs in front of the calls this loop executes) is carried by
+/// the request itself and copied by no iteration.
+#[derive(Default)]
 pub(super) struct ToolLoopState {
-    tools: Option<Vec<responses::ResponseTool>>,
     pub iteration: usize,
     pub total_calls: usize,
     pub usage: Option<ResponseUsage>,
-    /// The calls this loop executed, each with its output, in order.
-    pub conversation_history: Vec<ResponseInputOutputItem>,
-    /// The input the loop started from, the request's history loaded: every
-    /// later iteration is rebuilt on it, so a stored turn's tool calls and
-    /// their outputs stay in front of the calls this loop executes.
-    pub base_input: ResponseInput,
+    /// The calls this loop executed since its request was last built, each
+    /// with its output, in order: the next build moves them into the request
+    /// behind the items it already carries.
+    pub calls_to_carry: Vec<ResponseInputOutputItem>,
     pub mcp_call_items: Vec<ResponseOutputItem>,
+    /// The request's `max_tool_calls` is spent: the next generation is the
+    /// response's final turn, made with the server tools withheld so the
+    /// model answers on the results it has, and its answer ends the loop
+    /// whatever it holds (a server call made anyway stays hidden and does
+    /// not run).
+    pub final_turn: bool,
 }
 
 /// Per-request parameters for chat pipeline execution.
@@ -64,65 +77,26 @@ pub(super) struct ResponsesCallContext {
 }
 
 impl ToolLoopState {
-    /// `request` is the request the loop starts from, its history loaded.
-    pub fn new(request: &ResponsesRequest) -> Self {
-        Self {
-            tools: request.tools.clone(),
-            iteration: 0,
-            total_calls: 0,
-            usage: None,
-            conversation_history: Vec::new(),
-            base_input: request.input.clone(),
-            mcp_call_items: Vec::new(),
-        }
-    }
-
     /// Usage is per model request; missing reports must not erase prior totals.
     pub fn record_usage(&mut self, usage: Option<&Usage>) {
-        let Some(usage) = usage else {
-            return;
-        };
-        let total = self.usage.get_or_insert_with(|| ResponseUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-            input_tokens_details: InputTokensDetails::default(),
-            output_tokens_details: OutputTokensDetails::default(),
-        });
-        total.input_tokens = total.input_tokens.saturating_add(usage.prompt_tokens);
-        total.output_tokens = total.output_tokens.saturating_add(usage.completion_tokens);
-        total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
-        if let Some(details) = &usage.prompt_tokens_details {
-            total.input_tokens_details.cached_tokens = total
-                .input_tokens_details
-                .cached_tokens
-                .saturating_add(details.cached_tokens);
-        }
-        if let Some(tokens) = usage
-            .completion_tokens_details
-            .as_ref()
-            .and_then(|details| details.reasoning_tokens)
-        {
-            total.output_tokens_details.reasoning_tokens = total
-                .output_tokens_details
-                .reasoning_tokens
-                .saturating_add(tokens);
-        }
+        add_model_call_usage(&mut self.usage, usage);
     }
 
+    /// `tools` are the request's own tool definitions, read for the call's
+    /// namespace; the loop's request carries them, so the state keeps no copy.
     pub fn record_call(
         &mut self,
+        tools: Option<&[responses::ResponseTool]>,
         call_id: String,
         tool_name: String,
         args_json_str: String,
         output_str: String,
         output_item: ResponseOutputItem,
-        _success: bool,
     ) {
         // Add function_tool_call item with both arguments and output
         let id = call_id.clone();
-        let (name, namespace) = resolve_function_identity(self.tools.as_deref(), &tool_name);
-        self.conversation_history
+        let (name, namespace) = resolve_function_identity(tools, &tool_name);
+        self.calls_to_carry
             .push(ResponseInputOutputItem::FunctionToolCall {
                 id: Some(id),
                 call_id,
@@ -143,12 +117,37 @@ impl ToolLoopState {
 // ============================================================================
 
 /// Set tool_choice based on iteration (the MCP tools join the request's tools
-/// where the chat request is built: `conversions::responses_to_chat_with_mcp_tools`)
-pub(super) fn prepare_tool_choice(chat_request: &mut ChatCompletionRequest, iteration: usize) {
+/// where the chat request is built: `conversions::responses_to_chat_with_mcp_tools`).
+/// The final turn allows the request's own tools only, the ones
+/// `is_server_tool` does not name: the prompt renders the allowed tools, so
+/// the model is offered no server tool, while the response is read against
+/// the whole list as on every turn. A legacy streaming parser takes a call to
+/// a tool outside that list for text, so a list without the server tools
+/// would leave a repeated server call's markup in the message.
+pub(super) fn prepare_tool_choice(
+    chat_request: &mut ChatCompletionRequest,
+    state: &ToolLoopState,
+    is_server_tool: impl Fn(&str) -> bool,
+) {
     // Set tool_choice based on iteration
     // - Iteration 0: Use user's tool_choice or default to auto
     // - Iteration 1+: Always use auto to avoid infinite loops
-    chat_request.tool_choice = if iteration == 0 {
+    chat_request.tool_choice = if state.final_turn {
+        Some(ToolChoice::AllowedTools {
+            tool_type: "allowed_tools".to_string(),
+            mode: "auto".to_string(),
+            tools: chat_request
+                .tools
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|tool| !is_server_tool(&tool.function.name))
+                .map(|tool| ToolReference::Function {
+                    name: tool.function.name.clone(),
+                })
+                .collect(),
+        })
+    } else if state.iteration == 0 {
         chat_request
             .tool_choice
             .take()
@@ -164,13 +163,6 @@ pub(super) struct ExtractedToolCall {
     pub call_id: String,
     pub name: String,
     pub arguments: String,
-}
-
-/// Why a generated MCP batch must stop after its permitted calls execute.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum McpToolCallLimit {
-    User,
-    Safety,
 }
 
 /// One iteration's extracted tool calls, traced and split into the MCP
@@ -226,28 +218,17 @@ fn apply_mcp_tool_call_limit(
     total_calls: usize,
     max_tool_calls: Option<usize>,
 ) -> Option<McpToolCallLimit> {
-    let effective_limit = tool_call_limit(max_tool_calls);
-    let remaining = effective_limit.saturating_sub(total_calls);
-    if calls.len() <= remaining {
-        return None;
-    }
-
-    if max_tool_calls.is_none_or(|limit| limit > DEFAULT_MAX_ITERATIONS) {
+    let (limit, remaining) = tool_call_overflow(max_tool_calls, total_calls, calls.len())?;
+    if limit == McpToolCallLimit::Safety {
         warn!(
             total_calls,
             batch_size = calls.len(),
-            effective_limit,
+            effective_limit = tool_call_limit(max_tool_calls),
             "Internal MCP tool call safety limit reached"
         );
     }
     calls.truncate(remaining);
-    Some(
-        if max_tool_calls.is_some_and(|limit| limit <= DEFAULT_MAX_ITERATIONS) {
-            McpToolCallLimit::User
-        } else {
-            McpToolCallLimit::Safety
-        },
-    )
+    Some(limit)
 }
 
 /// Whether a server call among `calls` has arguments that are not JSON. A
@@ -316,15 +297,18 @@ pub(super) fn dispatch_arguments(
     arguments
 }
 
-/// An executed MCP call's metrics and its place in the loop's history.
+/// An executed MCP call's metrics and its place in the loop's history;
+/// `request` is the loop's current request (its model labels the metrics, its
+/// tools name the call's namespace).
 pub(super) fn record_mcp_call(
     state: &mut ToolLoopState,
-    model: &str,
+    request: &ResponsesRequest,
     output: ToolExecutionOutput,
     output_str: String,
     output_item: ResponseOutputItem,
 ) {
     let success = !output.is_error;
+    let model = request.model.as_str();
     Metrics::record_mcp_tool_duration(model, &output.tool_name, output.duration);
     Metrics::record_mcp_tool_call(
         model,
@@ -336,12 +320,12 @@ pub(super) fn record_mcp_call(
         },
     );
     state.record_call(
+        request.tools.as_deref(),
         output.call_id,
         output.tool_name,
         output.arguments_str,
         output_str,
         output_item,
-        success,
     );
 }
 
@@ -350,13 +334,17 @@ pub(super) fn convert_mcp_tools_to_chat_tools(session: &McpToolSession<'_>) -> V
 }
 
 /// Build next request with updated conversation history: the input the loop
-/// started from, then every call this loop executed with its output.
+/// started from, then every call this loop executed with its output. The
+/// items the request already carries are moved into the next request as they
+/// are (the loaded input is turned into items once, on the first build) and
+/// the calls recorded since the last build are moved in behind them: no
+/// iteration copies the base input or the calls before it.
 pub(super) fn build_next_request(
-    state: &ToolLoopState,
+    state: &mut ToolLoopState,
     current_request: ResponsesRequest,
 ) -> ResponsesRequest {
-    let mut input_items = current_input_items(&state.base_input);
-    input_items.extend_from_slice(&state.conversation_history);
+    let mut input_items = current_input_items(current_request.input);
+    input_items.append(&mut state.calls_to_carry);
 
     // Build new request for next iteration, moving fields from old request to avoid cloning
     ResponsesRequest {
@@ -412,8 +400,9 @@ mod namespace_tests {
     #[test]
     fn namespace_replay_preserves_structured_identity() {
         let request: ResponsesRequest = namespace_test_request();
-        let mut state = ToolLoopState::new(&request);
+        let mut state = ToolLoopState::default();
         state.record_call(
+            request.tools.as_deref(),
             "call_test".into(),
             "weather.lookup".into(),
             "{}".into(),
@@ -426,13 +415,53 @@ mod namespace_tests {
                 None,
                 "completed".into(),
             ),
-            true,
         );
-        let wire = serde_json::to_value(&state.conversation_history[0]).unwrap();
+        let wire = serde_json::to_value(&state.calls_to_carry[0]).unwrap();
 
         assert_eq!(wire["name"], "lookup");
         assert_eq!(wire["namespace"], "weather");
         assert_eq!(wire["call_id"], "call_test");
+    }
+}
+
+#[cfg(test)]
+mod final_turn_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::routers::grpc::{spec::ChatResponseSpec, utils::request_as_rendered};
+
+    fn names(tools: Option<&[Tool]>) -> Vec<&str> {
+        tools
+            .unwrap_or_default()
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn the_final_turn_renders_the_requests_own_tools_and_is_read_against_every_tool() {
+        let mut chat_request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "final-turn-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}},
+            ],
+        }))
+        .unwrap();
+        let state = ToolLoopState {
+            iteration: 2,
+            final_turn: true,
+            ..Default::default()
+        };
+
+        prepare_tool_choice(&mut chat_request, &state, |name| name == "search");
+
+        let rendered = request_as_rendered(&chat_request);
+        assert_eq!(names(rendered.tools.as_deref()), ["lookup"]);
+        let spec = ChatResponseSpec::from(&chat_request);
+        assert_eq!(names(spec.tools.as_deref()), ["lookup", "search"]);
     }
 }
 
@@ -479,7 +508,7 @@ mod usage_tests {
 
     #[test]
     fn mcp_usage_accumulates_reasoning_and_cache_and_survives_missing_usage() {
-        let mut state = ToolLoopState::new(&ResponsesRequest::default());
+        let mut state = ToolLoopState::default();
         state.record_usage(None);
         assert!(state.usage.is_none());
         state.record_usage(Some(
@@ -516,6 +545,47 @@ mod history_tests {
         history::tests::{function_call_output, function_call_output_input, shape, Stores},
         load_history, ReplayInto,
     };
+
+    /// The request the rebuild tests load: one completed user message and
+    /// nothing else, so a rebuilt request's items read as that message
+    /// followed by the calls recorded since.
+    fn one_message_request() -> ResponsesRequest {
+        ResponsesRequest {
+            input: ResponseInput::Items(vec![ResponseInputOutputItem::Message {
+                id: "msg_1".to_string(),
+                role: "user".to_string(),
+                content: vec![responses::ResponseContentPart::InputText {
+                    text: "What is 6*7?".to_string(),
+                }],
+                status: Some("completed".to_string()),
+                phase: None,
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// Records in the state the executed call `call_<tag>` of the tool
+    /// `search`, answered `found`: what the loop records between a response
+    /// and the rebuild that follows it. The call id is what `shape` prints,
+    /// so the tests assert it (two tags tell a second rebuild's calls
+    /// apart); the output item's id `fc_<tag>` is read by none of them.
+    fn record_search_call(state: &mut ToolLoopState, request: &ResponsesRequest, tag: &str) {
+        state.record_call(
+            request.tools.as_deref(),
+            format!("call_{tag}"),
+            "search".to_string(),
+            "{}".to_string(),
+            "found".to_string(),
+            ResponseOutputItem::new_function_tool_call(
+                format!("fc_{tag}"),
+                format!("call_{tag}"),
+                "search".to_string(),
+                "{}".to_string(),
+                None,
+                "completed".to_string(),
+            ),
+        );
+    }
 
     /// Turn 2 answers the call a stored turn issued: the engine sees the
     /// question, the call and its answer on the first iteration, and the
@@ -557,23 +627,9 @@ mod history_tests {
             .collect();
         assert_eq!(turns, ["user", "assistant+tool_calls", "tool"]);
 
-        let mut state = ToolLoopState::new(&loaded);
-        state.record_call(
-            "call_B".to_string(),
-            "search".to_string(),
-            "{}".to_string(),
-            "found".to_string(),
-            ResponseOutputItem::new_function_tool_call(
-                "fc_B".to_string(),
-                "call_B".to_string(),
-                "search".to_string(),
-                "{}".to_string(),
-                None,
-                "completed".to_string(),
-            ),
-            true,
-        );
-        let next = build_next_request(&state, loaded);
+        let mut state = ToolLoopState::default();
+        record_search_call(&mut state, &loaded, "B");
+        let next = build_next_request(&mut state, loaded);
 
         let ResponseInput::Items(items) = &next.input else {
             panic!("the next request's input is an item list");
@@ -589,6 +645,81 @@ mod history_tests {
         );
         assert_eq!(next.conversation, None);
         assert_eq!(next.store, Some(false));
+    }
+
+    /// The rebuild carries the loaded items themselves: the loaded message's
+    /// content buffer sits at the same address in the next request (moved,
+    /// not copied), the call this loop executed is moved in behind it, and
+    /// the state keeps no copy of the input. Pinned so the next change that
+    /// clones the input into the state, or rebuilds the request from that
+    /// copy, fails here instead of restoring a per-request copy of a whole
+    /// thread that the bed's counts would show only as drift.
+    #[test]
+    fn the_rebuild_moves_the_loaded_items_instead_of_copying_them() {
+        let loaded = one_message_request();
+        let ResponseInput::Items(items) = &loaded.input else {
+            panic!("the loaded request's input is an item list");
+        };
+        let ResponseInputOutputItem::Message { content, .. } = &items[0] else {
+            panic!("the loaded message leads the loaded input");
+        };
+        let content_before = content.as_ptr();
+
+        let mut state = ToolLoopState::default();
+        record_search_call(&mut state, &loaded, "B");
+        let next = build_next_request(&mut state, loaded);
+
+        let ResponseInput::Items(items) = &next.input else {
+            panic!("the next request's input is an item list");
+        };
+        assert_eq!(
+            shape(items),
+            ["message:user", "function_call:call_B+output"]
+        );
+        let ResponseInputOutputItem::Message { content, .. } = &items[0] else {
+            panic!("the loaded message leads the next request's input");
+        };
+        assert!(
+            std::ptr::eq(content.as_ptr(), content_before),
+            "the loaded message's content was copied into the next request instead of moved"
+        );
+        assert!(
+            state.calls_to_carry.is_empty(),
+            "the executed call was copied into the next request instead of moved"
+        );
+    }
+
+    /// An earlier iteration's calls stay in every later request: the second
+    /// rebuild takes the first rebuild's output as it is and moves only the
+    /// calls recorded since in behind it, so the loaded items are followed by
+    /// both calls in order and the state carries nothing over. Pinned so a
+    /// rebuild from anything but the previous request (a fresh copy of the
+    /// loaded input, say) fails here instead of dropping the earlier calls.
+    #[test]
+    fn calls_recorded_in_earlier_iterations_stay_in_every_later_request() {
+        let loaded = one_message_request();
+        let mut state = ToolLoopState::default();
+
+        record_search_call(&mut state, &loaded, "B");
+        let second = build_next_request(&mut state, loaded);
+        record_search_call(&mut state, &second, "C");
+        let third = build_next_request(&mut state, second);
+
+        let ResponseInput::Items(items) = &third.input else {
+            panic!("the third request's input is an item list");
+        };
+        assert_eq!(
+            shape(items),
+            [
+                "message:user",
+                "function_call:call_B+output",
+                "function_call:call_C+output",
+            ]
+        );
+        assert!(
+            state.calls_to_carry.is_empty(),
+            "a call recorded before a build stayed in the state"
+        );
     }
 
     /// A chain longer than the store keeps reloads as its newest turns, and

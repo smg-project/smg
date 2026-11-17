@@ -2,6 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "properties": {
+    "global": {
+      "properties": {
+        "image": {
+          "properties": {
+            "tag": {
+              "type": ["string", "null"],
+              "description": "The router's image tag, and a worker's that names none of its own. A tag is text: a tag of digits alone is quoted. A number is not rendered as written: 1.10 is read as 1.1."
+            }
+          }
+        }
+      }
+    },
     "router": {
       "type": "object",
       "properties": {
@@ -300,6 +312,189 @@
               }
             },
             "poolMax": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "policyController": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "if": {
+        "required": ["enabled"],
+        "properties": { "enabled": { "const": true } }
+      },
+      "then": {
+        "required": [
+          "replicas",
+          "ports",
+          "service",
+          "logging",
+          "runtimeWorkerThreads",
+          "podDisruptionBudget",
+          "securityContext",
+          "livenessProbe",
+          "readinessProbe",
+          "shutdownGracePeriodSeconds",
+          "terminationGraceMarginSeconds"
+        ],
+        "properties": {
+          "replicas": { "type": "integer" },
+          "ports": {
+            "type": "object",
+            "required": ["gateway", "control", "replication", "admin"],
+            "properties": {
+              "gateway": { "type": "integer" },
+              "control": { "type": "integer" },
+              "replication": { "type": "integer" },
+              "admin": { "type": "integer" }
+            }
+          },
+          "service": {
+            "type": "object",
+            "required": ["type"],
+            "properties": { "type": { "type": "string" } }
+          },
+          "logging": {
+            "type": "object",
+            "required": ["level"],
+            "properties": { "level": { "type": "string" } }
+          },
+          "runtimeWorkerThreads": { "type": "integer" },
+          "podDisruptionBudget": {
+            "type": "object",
+            "required": ["minAvailable"],
+            "properties": { "minAvailable": { "type": ["integer", "string"] } }
+          },
+          "securityContext": { "type": "object" },
+          "livenessProbe": {
+            "type": "object",
+            "required": ["path", "initialDelaySeconds", "periodSeconds"],
+            "properties": {
+              "path": { "type": "string" },
+              "initialDelaySeconds": { "type": "integer" },
+              "periodSeconds": { "type": "integer" }
+            }
+          },
+          "readinessProbe": {
+            "type": "object",
+            "required": ["path", "initialDelaySeconds", "periodSeconds"],
+            "properties": {
+              "path": { "type": "string" },
+              "initialDelaySeconds": { "type": "integer" },
+              "periodSeconds": { "type": "integer" }
+            }
+          },
+          "shutdownGracePeriodSeconds": { "type": "integer" },
+          "terminationGraceMarginSeconds": { "type": "integer" }
+        }
+      },
+      "properties": {
+        "enabled": { "type": ["boolean", "null"] },
+        "image": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "registry": { "type": ["string", "null"] },
+            "repository": { "type": ["string", "null"] },
+            "tag": { "type": ["string", "null"] }
+          }
+        },
+        "replicas": { "type": ["integer", "null"], "minimum": 1 },
+        "election": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": ["boolean", "null"] },
+            "leaseName": {
+              "type": ["string", "null"],
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+            }
+          }
+        },
+        "ports": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "gateway": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "control": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "replication": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "admin": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 }
+          }
+        },
+        "identityAsTold": {
+          "description": "Nothing is verified on a listener named here: whoever reaches its port acts as any principal of its scopes.",
+          "type": ["array", "null"],
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["gateway", "control", "replication"] }
+        },
+        "service": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "type": ["string", "null"], "minLength": 1 },
+            "annotations": { "type": ["object", "null"] }
+          }
+        },
+        "logging": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "level": { "type": ["string", "null"], "enum": ["debug", "info", "warn", "error", null] },
+            "json": { "type": ["boolean", "null"] }
+          }
+        },
+        "resources": { "type": ["object", "null"] },
+        "runtimeWorkerThreads": { "type": ["integer", "null"], "minimum": 0, "maximum": 4096 },
+        "nodeSelector": { "type": ["object", "null"] },
+        "tolerations": { "type": ["array", "null"] },
+        "affinity": { "type": ["object", "null"] },
+        "podAnnotations": { "type": ["object", "null"] },
+        "podLabels": { "type": ["object", "null"] },
+        "extraArgs": { "type": ["array", "null"] },
+        "extraEnv": { "type": ["array", "null"] },
+        "podDisruptionBudget": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": ["boolean", "null"] },
+            "minAvailable": { "type": ["integer", "string", "null"], "minLength": 1 }
+          }
+        },
+        "securityContext": { "type": ["object", "null"] },
+        "livenessProbe": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": ["string", "null"], "minLength": 1 },
+            "initialDelaySeconds": { "type": ["integer", "null"], "minimum": 0 },
+            "periodSeconds": { "type": ["integer", "null"], "minimum": 1 }
+          }
+        },
+        "readinessProbe": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": ["string", "null"], "minLength": 1 },
+            "initialDelaySeconds": { "type": ["integer", "null"], "minimum": 0 },
+            "periodSeconds": { "type": ["integer", "null"], "minimum": 1 }
+          }
+        },
+        "shutdownGracePeriodSeconds": { "type": ["integer", "null"], "minimum": 1 },
+        "shutdownSettleSeconds": { "type": ["integer", "null"], "minimum": 0 },
+        "terminationGraceMarginSeconds": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "workers": {
+      "items": {
+        "properties": {
+          "image": {
+            "properties": {
+              "tag": {
+                "type": ["string", "null"],
+                "description": "The worker's image tag; none takes the router's. A tag is text: a tag of digits alone is quoted."
+              }
+            }
           }
         }
       }

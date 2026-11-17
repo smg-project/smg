@@ -10,13 +10,13 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 #[cfg(test)]
 use super::create_worker::labels_for_rank;
 use super::create_worker::{
-    model_card_for_labels, report_for_rank, validate_parser_overrides,
+    kv_transfer_value, model_card_for_labels, report_for_rank, validate_parser_overrides,
     warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
 };
 use crate::{
     service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
-        basic::merge_labels, overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker,
+        identity::basic::merge_labels, registry::service::MAX_WORKER_LABELS, BasicWorker,
         BasicWorkerBuilder, RuntimeType, Worker,
     },
     workflow::data::WorkerUpdateWorkflowData,
@@ -127,7 +127,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                                         "worker {} is owned by the '{provider}' discovery provider \
                                          since this update was accepted; its labels come from its \
                                          discovery source",
-                                        worker.url()
+                                        worker.redacted_url()
                                     ),
                                 });
                             }
@@ -151,7 +151,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                             message: format!(
                                 "{} labels on worker {} after this update ({} now, {} new); at most {MAX_WORKER_LABELS} are accepted",
                                 updated_labels.len(),
-                                worker.url(),
+                                worker.redacted_url(),
                                 existing.len(),
                                 updated_labels.len() - existing.len()
                             ),
@@ -206,14 +206,14 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 && !fresh_kv.fills_a_field_of(&worker.metadata().spec)
             {
                 debug!(
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     "Engine labels unchanged; the worker is kept as it is"
                 );
                 continue;
             }
             if !card_fields.is_empty() {
                 info!(
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     fields = ?card_fields,
                     "The worker's model card follows its labels"
                 );
@@ -289,9 +289,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .cost(updated_cost)
                 // The effective overload thresholds re-resolve against the
                 // same gateway defaults registration used.
-                .overload_defaults(OverloadThresholds::from_gateway_config(
-                    &app_context.router_config,
-                ))
+                .overload_defaults(app_context.router_config.worker_overload_thresholds())
                 .status(next_status);
             if refresh {
                 // A connector or role the operator configured none of follows
@@ -345,7 +343,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 }
                 _ if refresh => {
                     debug!(
-                        worker_url = %worker.url(),
+                        worker_url = %worker.redacted_url(),
                         "Worker changed or left during the label refresh; not rebuilt"
                     );
                     continue;
@@ -356,18 +354,11 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                         message: format!(
                             "worker {} was replaced or removed since this update found it, so \
                              the update was dropped",
-                            worker.url()
+                            worker.redacted_url()
                         ),
                     });
                 }
             };
-
-            // The rebuilt handle stands at the old one's URL: tell the policy
-            // registry, as a removal would, so the engine's rows of the
-            // retired handle do not outlive it.
-            app_context
-                .policy_registry
-                .on_worker_replaced(worker.as_ref(), new_worker.as_ref());
 
             // Same-URL replace preserves the existing shared runtime. If the
             // update disables health checks, force the lifecycle to Ready so
@@ -384,7 +375,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
 
         // Log result
         if updated_workers.len() == 1 {
-            info!("Updated worker {}", updated_workers[0].url());
+            info!("Updated worker {}", updated_workers[0].redacted_url());
         } else {
             info!("Updated {} workers", updated_workers.len());
         }
@@ -432,9 +423,10 @@ struct EngineKvMetadata {
 }
 
 impl EngineKvMetadata {
-    /// Takes the three keys out of the report; an empty value is none.
+    /// Takes the three keys out of the report, an empty value being none
+    /// (`kv_transfer_value`, the registration's reading of the same keys).
     fn take(report: &mut HashMap<String, String>) -> Self {
-        let mut take = |key: &str| report.remove(key).filter(|value| !value.is_empty());
+        let mut take = |key: &str| kv_transfer_value(report.remove(key));
         Self {
             connector: take("kv_connector"),
             role: take("kv_role"),
@@ -471,7 +463,7 @@ impl EngineKvMetadata {
         let previous = worker.kv_engine_id();
         if worker.refresh_kv_engine_id(Some(engine_id.clone())) {
             info!(
-                worker_url = %worker.url(),
+                worker_url = %worker.redacted_url(),
                 ?previous,
                 engine_id,
                 "The worker's KV engine id follows its engine's report"

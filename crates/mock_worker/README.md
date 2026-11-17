@@ -54,12 +54,38 @@ mock, so the gateway forwards media references to it), and answers every
 completion, the media identity (the prompt ids as sent, one hash per media
 item) and one pull handle per hash naming its own address. On the TokenSpeed
 wire the worker mounts the engine's encoder service beside the scheduler's:
-its `Encode` takes a request's media with one rendezvous room per item
-(refused without), runs the realistic engine's admission hooks, counts in the
-admin API's `encodes` and answers accepted; its `Generate` is refused as the
-wrong pool, and a prefill worker on that wire refuses a request whose
-`encode_bootstrap_info` does not name a rendezvous for each media item once.
-The SGLang wire has no encode role.
+its `Encode` takes a request's one media item with its rendezvous room and a
+request id (refused without, as the engine's adapter refuses them), runs the
+realistic engine's admission hooks, counts in the admin API's `encodes` and
+answers accepted; it reports health under the encoder service's name, as the
+engine does in that role; its `Generate` is refused as the wrong pool, and a
+prefill worker on that wire refuses a request whose `encode_bootstrap_info`
+does not name a rendezvous for each media item once.
+The SGLang wire has no encode role. On the TokenSpeed and the SGLang wires a
+request's media items are checked against the shape the engine's adapter
+requires before the canned answer: a known modality, the TokenSpeed item's
+content hash and, on the prefill and regular roles, its encoder input (or the
+encode room that hands the item over; a decode worker takes the gateway's
+pixel-free clone, metadata alone), the SGLang batch's pixel tensor (or its
+feature hash) and a video's placeholder token id, every tensor read as the
+engine reads it (bytes matching the shape at the dtype's width; the SGLang
+reader refuses a dtype outside its six, the TokenSpeed reader passes one it
+does not know; on the TokenSpeed wire an inline payload through the adapter's
+reader, an SHM handle with the servicer's checks: that byte length, a bare
+name and, for the scheduler's feature, a dtype of bfloat16, float16 or float32,
+the encoder reading its feature generically, a remote handle on a feature as
+it came, pulled by the servicer, and a remote handle on a side tensor refused
+as the servicer's generic reader refuses it), one SGLang batch per modality
+(image or
+video, an empty list reading as image) beside a primary batch, placeholder spans
+inside the prompt and disjoint across the request's items, and, when the item
+names its placeholder token id, spans that cover exactly the prompt's tokens of
+that id; a wrong item is refused with `InvalidArgument` naming the item and the
+field, so a gateway regression in a wire's items reads as a red row on the mock.
+A reference batch on the SGLang wire (media URLs without a pixel tensor, the
+form the gateway hands a worker that processes media itself) is the primary
+batch's alone, travels with no extra batch, and is accepted as it stands: the
+worker's processor or an encoder would resolve it, and the mock has neither.
 `--capture` records the TokenSpeed wire's requests only. Beside the scheduler
 service the server hosts the standard `grpc.health.v1` service (`Check`,
 `Watch`): the empty name and the served scheduler service are SERVING exactly
@@ -140,12 +166,28 @@ experiments against it transfer to engines:
   prefill `16.50142 + 1.518344e-2·T + 4.209989e-7·T²` ms over the uncached
   tokens `T` of the pass, decode `max(1, 5.74 + 54.01·u − 25.74·u²)` ms over
   the KV utilisation `u` of the decoding requests; a pass lasts prefill plus
-  decode, and the first token of a prefill adds no decode time.
+  decode (plus any restore from the shared KV tier, below), and the first
+  token of a prefill adds no decode time.
   `--timing linear` is the simpler model: prefill at `--prefill-tps` tokens/s,
   decode `base + per-request · batch` ms.
 - **cached tokens** — a request sharing a prefix with cached blocks pays less
   prefill and reports `cached_tokens` (gRPC chunks, HTTP
   `usage.prompt_tokens_details.cached_tokens`).
+- **shared KV tier** — `--global-l3-blocks <n>` gives the process one LRU
+  store of `n` blocks that every engine writes its completed blocks to, as
+  engines do behind a 3FS- or Mooncake-style pool; a pass's blocks become
+  restorable at its end, as its events become visible. An admitted prompt
+  restores the run of blocks the tier holds right after its local prefix
+  hit: those blocks take KV room but no token budget, count in
+  `cached_tokens`, and add `--global-l3-ms-per-token` per restored token to
+  the pass (a synchronous load). The tier is per process (a fleet split over
+  several processes has one tier each), and a reset (`POST /admin/reset`)
+  leaves it as it is: a restarted engine does not empty a shared store. A
+  queued request's `num_waiting_uncached_tokens` leaves out what the tier
+  would restore. The tier needs generating workers (a prefill or encode worker
+  runs no passes), `--prefix-cache true` and one main-attention KV cache group
+  (`full_attention`, `mla_attention` or `sink_full_attention`): the tier holds
+  whole blocks of one group.
 - **repeatable output** — `--output-seed prompt` derives synthetic output from
   the complete prompt token sequence, including its partial last block. Equal
   token inputs then produce equal output regardless of transport request ID,
@@ -169,6 +211,10 @@ experiments against it transfer to engines:
 | `--max-batched-tokens` | 8192 | token budget per pass |
 | `--max-running` | 256 | sequences per pass |
 | `--kv-tokens` / `--kv-blocks` | 524288 tokens | KV pool capacity |
+| `--worker-kv-tokens` | none | `worker=tokens,...`: the named workers' pool capacity instead, at most the fleet's or a calibration's pool, whichever is larger (any size under `--timing linear`, whose decode reads no utilisation; workers named `grpc:<port>`, `http:<port>` or `zmq:<index>`; a data-parallel worker is named once and every rank takes the override). The pool's size is room, not speed: the worker's decode keeps the fleet's pool as its utilisation reference (a calibration's reference when one gave it), so it steps as fast as its peers on the same context. Generating workers only: a prefill or encode worker answers without running its engine |
+| `--worker-pass-time-scale` | none | `worker=factor,...`: every pass of the named workers takes `factor` times the timing model's duration (0.001 to 1000; above 1 a slower engine, below 1 a faster one); the rates the worker reports follow, as a servicer measures them. Named and limited as `--worker-kv-tokens` |
+| `--global-l3-blocks` | 0 (off) | capacity of the process-wide shared KV tier, in blocks (above) |
+| `--global-l3-ms-per-token` | 0 | pass time per token restored from the shared tier |
 | `--block-size` | 16 | cache block/page size (tokens); must match the worker's `kv_block_size` |
 | `--prefix-cache` | true | prefix caching + KV events |
 | `--prefill-first` | false | SGLang-style prefill-only passes |
@@ -267,11 +313,16 @@ engines do not expose:
   alone (a realistic process lists its engines alone, since a listener
   registers before its engine spawns; a listener joins the fleet once its
   bootstrap port, when it has one, is bound, so a worker that stopped at
-  that bind is never listed);
+  that bind is never listed); with the shared KV tier on, `global_l3` beside
+  them: `blocks`, what the tier holds, and `restored_tokens`, every token
+  restored from it (a preempted request's restores on re-admission included,
+  which its record does not count);
 - `GET /admin/requests?since=<seq>&limit=<n>` — admitted requests with the
-  serving worker, prompt/cached tokens, queue wait and the **arrival-time
+  serving worker, prompt/cached tokens (`restored_tokens`: those of the cached
+  tokens restored from the shared KV tier), queue wait and the **arrival-time
   oracle**: the most cached tokens any worker of the process held when the
-  request arrived (the best a router could have obtained). Join on the
+  request arrived, with the shared tier on counting what the worker would
+  restore after its own hit (the best a router could have obtained). Join on the
   gateway's response `id`. `injected_failures` beside the records counts, per
   worker, the requests the `fail` hook answered before admission (they left no
   record) and the streams it cut;
@@ -318,8 +369,8 @@ path has no engine to hook.
 
 | Endpoint | Answer |
 |----------|--------|
-| `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `block_size` (the engine's own prefix match, last-block rule included) |
-| `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, so a gateway's hit-rate claim can be checked against what the engines actually served; `injected_failures` and `cut_streams` count what the `fail` hook refused before admission and cut after output |
+| `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `restored_tokens`, `block_size` (the engine's own prefix match and, with the shared KV tier on, the run the tier holds after it, as `restored_tokens`; last-block rule included) |
+| `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, `restored_tokens` (the shared tier's share of `cached_tokens`), so a gateway's hit-rate claim can be checked against what the engines actually served; `injected_failures` and `cut_streams` count what the `fail` hook refused before admission and cut after output |
 | `GET /admin/zmq/{worker}` | a ZMQ rank's output counts since it connected: `batch_messages`, the messages that carried request outputs, and `outputs`, the outputs in them (one per message without a step period, several with one; a utility reply is neither); cumulative, `POST /admin/reset` does not clear them; a rank name, not `all` |
 
 A circuit-breaker or retry drill arms `fail` on one worker (`status=503&count=N`
@@ -334,15 +385,27 @@ the request arrives); an HTTP worker answers the bare 499.
 
 ## Prefill/decode roles
 
-`--worker-type prefill|decode` gives the HTTP or the gRPC workers of a
-process a role in a disaggregated fleet, so a gateway in PD mode (`--prefill
-<url> <bootstrap port> --decode <url>`) runs with no engine behind it. The
+`--worker-type prefill|decode` gives a process's HTTP workers alone, or its
+gRPC workers and ZMQ ranks together, a role in a disaggregated fleet, so a
+gateway in PD mode (`--prefill <url> <bootstrap port> --decode <url>`) runs
+with no engine behind it. The
 gateway detects the mock by the scheduler service it serves (or, on the HTTP
 wire, by its model list) and runs that wire's PD protocol: both sides get the
 same request, with the rendezvous the gateway mints (the wire's rendezvous
 field on the gRPC wires, named below; `bootstrap_host`, `bootstrap_port` and
 `bootstrap_room` in the request body on the HTTP wire, whose PD router is its
 own code path), and the client reads the decode side's output.
+
+A ZMQ rank declares the role in its handshake's ready response as the engines
+do (`disaggregation_mode`, the request types it takes, and for a prefill the
+`bootstrap_host` and `bootstrap_port` of the port it binds, numbered after
+the gRPC workers: rank `I`, counting `--zmq-start-index`, binds
+`base + grpc_count + I` of `--bootstrap-base-port <base>`), which is where a
+gateway checks a worker registered for a role. A ZMQ prefill rank needs the
+base port: its handshake is the only place the port reaches the gateway, so
+the flags are refused without one. A prefill rank answers the prompt side
+alone, as on the gRPC wires; the vLLM dialect's request carries no
+rendezvous, so there is none to read. The encode role stays the gRPC wire's.
 
 - A **prefill** worker answers every request with the prompt side's
   completion alone (`prompt_tokens`, no output, `stop`), ahead of the script
@@ -362,8 +425,9 @@ own code path), and the client reads the decode side's output.
   `bootstrap_room`, on the gRPC wires `InvalidArgument` for a missing
   `kv_bootstrap_info` (TokenSpeed), `disaggregated_params` (SGLang) or
   `kv_transfer_params_json` (vLLM, the typed `kv_transfer_params` also
-  taken), or for a named rendezvous without a host or a port (a room of 0 is
-  one the gateway can mint, and is taken). On the
+  taken, and refused under its own name when it names no host or port), or
+  for a named rendezvous without a host or a port (a room of 0 is one the
+  gateway can mint, and is taken). On the
   vLLM wire the decode side alone refuses: the gateway names the pair to it,
   and the prefill request carries the connector's parameters only when a
   connector relays them. A prefill worker refuses one whose bootstrap port is
@@ -373,10 +437,11 @@ own code path), and the client reads the decode side's output.
   for a prefill worker registered without a port): the worker on that port
   takes it, one on another refuses it.
 
-No KV moves between the two: the decode side has the prompt. ZMQ workers
-take no role, and one process gives the role to one wire's workers (worker
-`i` of either wire would bind the same bootstrap port); the encode role is
-the vLLM and the TokenSpeed gRPC wires'.
+No KV moves between the two: the decode side has the prompt. One process
+gives the role to its HTTP workers alone or to its gRPC workers and ZMQ ranks
+together (an HTTP worker `i` and a gRPC worker `i` would bind the same
+bootstrap port; the ZMQ ranks bind after the gRPC workers); the encode role
+is the vLLM and the TokenSpeed gRPC wires'.
 
 Every gRPC worker advertises the pairing protocol its environment names
 (`SMG_PAIRING_PROTOCOL`) as `pairing_protocol`, as the engine servicers do:
@@ -623,7 +688,10 @@ engine cached_tokens, implied overlap, agree`. The implied overlap is the
 gateway's stated credit when its log carries one (`overlap_tokens=`,
 `overlap_blocks=` or the tree path's `matched_ratio=`); otherwise `agree`
 compares the branch's claim of an overlap (`event_hit`, `event_spill`) with
-whether the engine served cached tokens. With `--admin` the summary also
+whether the engine served cached tokens. With `--admin`, both comparisons read
+the engine's cached tokens less those it restored from the mock's shared KV
+tier (the gateway's index sees the workers' own caches), while the table's
+`engine cached_tokens` column shows them all. With `--admin` the summary also
 carries `engine_truth_per_worker`, each engine's own account of the prompt,
 cached and oracle tokens it served, and `fleet.csv` samples every worker's
 load, cached blocks, preemptions and KV batches once a second for the whole
@@ -632,6 +700,20 @@ run.
 The mock fleet it is meant for is `mock-worker --engine realistic --admin-port`
 (the [Realistic engine](#realistic-engine) above; note the caveat that its timing
 polynomials were validated against hardware only with prefix caching off).
+
+`scripts/multiturn_trace.py` writes a synthetic trace in this format, shaped like
+multi-turn chat or agent sessions: Poisson session arrivals, tenant system
+prompts drawn by Zipf, and every turn of a session re-sending the conversation so
+far with the previous answer and a new message appended (`--help` lists the
+knobs). Its blocks are 64 tokens, not 512: replay it with `--words-per-block 64`
+(about one token a word), and to calibrate against a real tokenizer as above,
+count `blocks = trace_input_length / 64` and set `--words-per-block` to
+`64 * 64 / b`.
+
+```bash
+python3 scripts/multiturn_trace.py --out trace.jsonl --duration-s 480 --sessions-per-s 10
+replay --trace trace.jsonl --words-per-block 64 --max-output 200 --speedup 1 --limit 0 ...
+```
 
 ### Long runs
 

@@ -33,6 +33,7 @@ serde = { workspace = true, features = ["derive"] }
 smg-grpc-client.workspace = true
 llm-tokenizer.workspace = true
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
+engine-zmq-adapter.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic.workspace = true
@@ -51,3 +52,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tempfile = "3"
 engine-servicer = { path = "../engine_servicer" }
 rmp-serde.workspace = true
+
+[lints]
+workspace = true

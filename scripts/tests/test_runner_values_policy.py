@@ -194,3 +194,60 @@ def test_vendor_secret_alias_is_rejected(tmp_path, monkeypatch, scope):
     )
     with pytest.raises(AssertionError, match="vendor job exports a real credential: OPENAI_TOKEN"):
         test_vendor_job_cannot_restore_real_keys_into_the_runner_environment()
+
+
+REVIEW = RESOURCES / "runner-values-review.yaml"
+
+
+def test_the_review_set_is_a_small_docker_free_pod_of_its_own():
+    # A set of its own, so a review never waits behind the test jobs that fill k8s-runner-cpu
+    # (2026-11-12: review jobs waited 52 minutes for a runner and worked for three).
+    values = yaml.safe_load(REVIEW.read_text())
+    cpu = yaml.safe_load(CPU.read_text())
+    assert values["runnerScaleSetName"] == "k8s-runner-review"
+    for key in ("githubConfigUrl", "githubConfigSecret", "controllerServiceAccount"):
+        assert values[key] == cpu[key]
+    assert (values["minRunners"], values["maxRunners"]) == (4, 32)
+    spec = values["template"]["spec"]
+    assert [c["name"] for c in spec["containers"]] == ["runner"]
+    runner = spec["containers"][0]
+    assert runner["image"] == cpu["template"]["spec"]["containers"][0]["image"]
+    assert not runner.get("env")  # no credential, and no docker socket to wait for
+    assert not (runner.get("securityContext") or {}).get("privileged")
+    # a review mostly waits on the model: a quarter of a test runner's request
+    assert runner["resources"]["requests"] == {"cpu": "2", "memory": "4Gi"}
+    assert runner["resources"]["limits"] == {"cpu": "4", "memory": "8Gi"}
+    # no docker: the reviews use none, so nothing in the pod is privileged
+    assert [c["name"] for c in spec["initContainers"]] == [KEY_HOLDER]
+    assert not any((c.get("securityContext") or {}).get("privileged") for c in containers(values))
+    assert sorted(v["name"] for v in spec["volumes"]) == ["codex-github-app", "work"]
+    assert spec["tolerations"] == cpu["template"]["spec"]["tolerations"]
+
+
+def test_the_review_set_runs_the_cpu_sets_key_proxy_without_the_xai_key():
+    # One proxy, two sets: a change to the sidecar that reaches only one file would leave the
+    # reviews or the vendor lanes on an old proxy, so the two copies are held equal here. The
+    # review pods hold only the keys the reviewers use.
+    review = yaml.safe_load(REVIEW.read_text())["template"]["spec"]
+    cpu = yaml.safe_load(CPU.read_text())["template"]["spec"]
+    review_proxy = next(c for c in review["initContainers"] if c["name"] == KEY_HOLDER)
+    cpu_proxy = next(c for c in cpu["initContainers"] if c["name"] == KEY_HOLDER)
+    expected = {
+        **cpu_proxy,
+        "env": [e for e in cpu_proxy["env"] if e["name"] != "XAI_API_KEY"],
+    }
+    assert review_proxy == expected, "copy the ai-key-proxy container from runner-values-cpu.yaml"
+    assert [e["name"] for e in review_proxy["env"]] == [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "NGINX_TEMPLATE",
+        "NGINX_JS",
+    ]
+    volume = next(v for v in review["volumes"] if v["name"] == "codex-github-app")
+    assert volume == next(v for v in cpu["volumes"] if v["name"] == "codex-github-app")
+
+
+def test_the_gpu_render_check_leaves_the_review_set_alone():
+    # check-runner-values.sh renders every other values file over the GPU base
+    script = (RESOURCES / "check-runner-values.sh").read_text()
+    assert "*-review.yaml" in script

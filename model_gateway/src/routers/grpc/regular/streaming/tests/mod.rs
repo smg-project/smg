@@ -20,13 +20,25 @@ mod thinking_display;
 mod usage;
 mod usage_chunk;
 
-use super::*;
+use openai_protocol::chat::ChatCompletionStreamResponse;
+
+use super::{frames::TextDelta, *};
 
 /// The frames write exactly the bytes of the serialized whole chunk
 /// structs, so a field added to a struct turns up here, not on the wire
-/// of the per-token chunks alone.
+/// of the per-token chunks alone. The completion choice, written in one
+/// pass, is pinned over the shapes the stream writes: texts that need
+/// escaping (quotes, a backslash, control bytes, a tab, a newline, a
+/// carriage return, characters of two, three and four bytes, a line
+/// separator, an empty text, a JSON-looking text), four indices, the
+/// logprobs absent and present (a missing and a non-finite value among
+/// them; a top-logprobs entry present, missing and empty) and the finish
+/// reason absent, `stop` and `length`, with and without the fingerprint and
+/// the usage placeholder.
 #[test]
 fn chunk_frames_write_the_bytes_of_the_whole_structs() {
+    use openai_protocol::common::LogProbs;
+
     fn event(frame: &BytesMut) -> Vec<u8> {
         frame
             .strip_prefix(b"data: ")
@@ -34,30 +46,77 @@ fn chunk_frames_write_the_bytes_of_the_whole_structs() {
             .expect("one SSE data event")
             .to_vec()
     }
+    let texts = [
+        "",
+        "a",
+        " ",
+        "hello world",
+        "he said \"hi\" \\ done",
+        "\ttab\nnewline\rreturn",
+        "\u{0}\u{1f}\u{7f}",
+        " caf\u{e9}",
+        " \u{65e5}\u{672c}\u{8a9e}",
+        " \u{1f600}",
+        " \u{2028}",
+        "<|im_end|>",
+        "{\"json\":[1,2]}",
+    ];
+    let logprobs = LogProbs {
+        tokens: vec!["he".to_string(), " said".to_string(), " \"hi\"".to_string()],
+        token_logprobs: vec![Some(-0.25), None, Some(f32::NEG_INFINITY)],
+        top_logprobs: vec![
+            Some(HashMap::from([("he".to_string(), -0.25)])),
+            None,
+            Some(HashMap::new()),
+        ],
+        text_offset: vec![0, 2, 7],
+    };
     for fingerprint in [None, Some("v7")] {
-        let choice = CompletionStreamChoice {
-            text: "he said \"hi\"\n".to_string(),
-            index: 1,
-            logprobs: None,
-            finish_reason: Some("stop".to_string()),
-        };
-        let frame = CompletionChunkFrame::new("cmpl-1", "model-x", 1_700_000_000, fingerprint);
-        let mut buffer = BytesMut::new();
-        frame.write_chunk(&mut buffer, &choice);
-        let whole = CompletionStreamResponse {
-            id: "cmpl-1".to_string(),
-            object: "text_completion".to_string(),
-            created: 1_700_000_000,
-            choices: vec![choice],
-            model: "model-x".to_string(),
-            system_fingerprint: fingerprint.map(str::to_string),
-            usage: None,
-        };
-        assert_eq!(
-            event(&buffer),
-            serde_json::to_vec(&whole).unwrap(),
-            "completion, fingerprint {fingerprint:?}"
-        );
+        for usage_null_placeholder in [false, true] {
+            let frame = CompletionChunkFrame::new(
+                "cmpl-1",
+                "model-x",
+                1_700_000_000,
+                fingerprint,
+                usage_null_placeholder,
+            );
+            for text in texts {
+                for index in [0u32, 1, 7, u32::MAX] {
+                    for with_logprobs in [false, true] {
+                        for finish_reason in [None, Some("stop"), Some("length")] {
+                            let choice = CompletionStreamChoice {
+                                text: text.to_string(),
+                                index,
+                                logprobs: with_logprobs.then(|| logprobs.clone()),
+                                finish_reason: finish_reason.map(str::to_string),
+                            };
+                            let whole = CompletionStreamResponse {
+                                id: "cmpl-1".to_string(),
+                                object: "text_completion".to_string(),
+                                created: 1_700_000_000,
+                                choices: vec![choice.clone()],
+                                model: "model-x".to_string(),
+                                system_fingerprint: fingerprint.map(str::to_string),
+                                usage: None,
+                            };
+                            let mut buffer = BytesMut::new();
+                            frame.write_chunk(&mut buffer, &choice);
+                            // The placeholder goes where a serialized `usage` would: last.
+                            let mut expected = serde_json::to_vec(&whole).unwrap();
+                            if usage_null_placeholder {
+                                expected.pop();
+                                expected.extend_from_slice(b",\"usage\":null}");
+                            }
+                            assert_eq!(
+                                event(&buffer),
+                                expected,
+                                "completion {text:?} index {index} logprobs {with_logprobs} finish {finish_reason:?}, fingerprint {fingerprint:?}, placeholder {usage_null_placeholder}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let choice = assistant_choice(0, Some("tok".to_string()), None, None);
         let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, fingerprint);
@@ -77,13 +136,36 @@ fn chunk_frames_write_the_bytes_of_the_whole_structs() {
                 choices: vec![choice.clone()],
                 usage: usage.clone(),
             };
+            let mut expected = serde_json::to_vec(&whole).unwrap();
+            if emit_usage_null {
+                expected.pop();
+                expected.extend_from_slice(b",\"usage\":null}");
+            }
             assert_eq!(
                 event(&buffer),
-                serde_json::to_vec(&ChatChunkWithUsage::new(&whole, emit_usage_null)).unwrap(),
+                expected,
                 "chat, fingerprint {fingerprint:?}, usage {}, placeholder {emit_usage_null}",
                 usage.is_some()
             );
         }
+
+        let usage = Usage::from_counts(3, 2);
+        let mut buffer = BytesMut::new();
+        frame.write_usage_chunk(&mut buffer, &usage);
+        let whole = ChatCompletionStreamResponse {
+            id: "chatcmpl-1".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1_700_000_000,
+            model: "model-x".to_string(),
+            system_fingerprint: fingerprint.map(str::to_string),
+            choices: Vec::new(),
+            usage: Some(usage),
+        };
+        assert_eq!(
+            event(&buffer),
+            serde_json::to_vec(&whole).unwrap(),
+            "chat usage chunk, fingerprint {fingerprint:?}"
+        );
     }
 }
 
@@ -126,7 +208,8 @@ fn text_delta_frames_write_the_bytes_of_the_serialized_choice() {
                 "\u{0}\u{1f}\u{7f}",
             ] {
                 let choice = bare(index, field, text);
-                assert_eq!(text_delta(&choice), Some((field, text)));
+                let (read_field, read_text) = text_delta(&choice).expect("a bare text delta");
+                assert_eq!((read_field, read_text), (field, text));
                 for (usage, emit_usage_null) in [
                     (None, false),
                     (None, true),
@@ -156,22 +239,22 @@ fn text_delta_frames_write_the_bytes_of_the_serialized_choice() {
 
     let mut finished = bare(0, TextDelta::Content, "x");
     finished.finish_reason = Some(Cow::Borrowed("stop"));
-    assert_eq!(text_delta(&finished), None, "a finished choice");
+    assert!(text_delta(&finished).is_none(), "a finished choice");
     let mut stopped = bare(0, TextDelta::Content, "x");
     stopped.matched_stop = Some(serde_json::json!(7));
-    assert_eq!(text_delta(&stopped), None, "a matched stop");
+    assert!(text_delta(&stopped).is_none(), "a matched stop");
     let mut with_role = bare(0, TextDelta::Content, "x");
     with_role.delta.role = Some(Cow::Borrowed("assistant"));
-    assert_eq!(text_delta(&with_role), None, "a role");
+    assert!(text_delta(&with_role).is_none(), "a role");
     let mut with_call = bare(0, TextDelta::Content, "x");
     with_call.delta.tool_calls = Some(vec![]);
-    assert_eq!(text_delta(&with_call), None, "tool calls");
+    assert!(text_delta(&with_call).is_none(), "tool calls");
     let mut both = bare(0, TextDelta::Content, "x");
     both.delta.reasoning_content = Some(Cow::Borrowed("y"));
-    assert_eq!(text_delta(&both), None, "two texts");
+    assert!(text_delta(&both).is_none(), "two texts");
     let mut neither = bare(0, TextDelta::Content, "x");
     neither.delta.content = None;
-    assert_eq!(text_delta(&neither), None, "no text");
+    assert!(text_delta(&neither).is_none(), "no text");
 }
 
 /// A generate event written from the choice's escaped text is byte for byte
@@ -179,8 +262,10 @@ fn text_delta_frames_write_the_bytes_of_the_serialized_choice() {
 /// control bytes, a tab, a newline, a carriage return, characters of two,
 /// three and four bytes, a line separator, an empty chunk, a JSON-looking
 /// text) pushed one at a time, each step written as a chunk event and as a
-/// finish event, with and without logprobs, over several indices, with and
-/// without the frame's room owed.
+/// finish event (the finish reasons length, stop, a raw object and a raw
+/// string), without logprobs and with each of the two logprob lists present
+/// or absent, over several indices, ids and weight versions that are empty,
+/// escaped and non-ASCII, with and without the frame's room owed.
 #[test]
 fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
     /// The event as serde serializes it from the raw text: the oracle.
@@ -205,7 +290,10 @@ fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
         " {\"json\":[1,2]}",
     ];
     let input_logprobs = [vec![None], vec![Some(-0.25)]];
-    let output_logprobs = [vec![Some(-0.5)], vec![None, Some(-1.0)]];
+    let output_logprobs = [
+        vec![Some(-0.5)],
+        vec![None, Some(-1.0), Some(f64::NEG_INFINITY)],
+    ];
     for index in [0u32, 1, 7, u32::MAX] {
         let mut escaped = EscapedText::default();
         let mut raw = String::new();
@@ -213,27 +301,63 @@ fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
             escaped.push_str(chunk);
             raw.push_str(chunk);
             let ids: Vec<u32> = chunk.chars().map(u32::from).collect();
-            for with_logprobs in [false, true] {
+            for (logprob_lists, id, weight_version) in [
+                (None, "gen-frames-0", "v7"),
+                (Some((true, true)), "gen-frames-0", "v7"),
+                (Some((true, false)), "", ""),
+                (Some((false, true)), "gen-frames-0", "v7"),
+                (Some((false, false)), "gen-frames-0", "v7"),
+                (
+                    None,
+                    "gen \"quoted\" back\\slash\ttab",
+                    "v7 \u{2028} caf\u{e9}",
+                ),
+                (
+                    Some((true, true)),
+                    "\u{65e5}\u{672c}\u{8a9e} \u{1f600}",
+                    "\u{0}\u{1f}\u{7f}",
+                ),
+            ] {
                 for (what, finish_reason, e2e_latency) in [
                     ("chunk", None, None),
                     (
-                        "finish",
+                        "finish-length",
                         Some(utils::parse_finish_reason("length", 7)),
                         Some(0.0123),
                     ),
+                    (
+                        "finish-stop",
+                        Some(utils::parse_finish_reason("stop", 7)),
+                        Some(1.5),
+                    ),
+                    (
+                        "finish-raw-object",
+                        Some(utils::parse_finish_reason(
+                            "{\"type\":\"abort\",\"why\":\"x\"}",
+                            7,
+                        )),
+                        Some(0.0),
+                    ),
+                    (
+                        "finish-raw-string",
+                        Some(utils::parse_finish_reason("eos", 7)),
+                        Some(12345.678),
+                    ),
                 ] {
-                    let logprobs = with_logprobs.then_some(GenerateLogprobs {
-                        input_token_logprobs: Some(input_logprobs.as_slice()),
-                        output_token_logprobs: Some(output_logprobs.as_slice()),
-                    });
+                    let logprobs =
+                        logprob_lists.map(|(with_input, with_output)| GenerateLogprobs {
+                            input_token_logprobs: with_input.then_some(input_logprobs.as_slice()),
+                            output_token_logprobs: with_output
+                                .then_some(output_logprobs.as_slice()),
+                        });
                     let event = GenerateEvent {
                         text: &escaped,
                         output_ids: &ids,
                         meta_info: GenerateMetaInfo {
-                            id: "gen-frames-0",
+                            id,
                             finish_reason,
                             prompt_tokens: 10,
-                            weight_version: "v7",
+                            weight_version,
                             logprobs,
                             completion_tokens: step as u32 + 1,
                             cached_tokens: 3,
@@ -262,7 +386,7 @@ fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
                         assert_eq!(
                             got.as_ref(),
                             expected.as_slice(),
-                            "index {index}, step {step} {chunk:?}, logprobs {with_logprobs}, {what}, room owed {room_owed}"
+                            "index {index}, step {step} {chunk:?}, logprob lists {logprob_lists:?}, id {id:?}, weight version {weight_version:?}, {what}, room owed {room_owed}"
                         );
                         assert_eq!(owed, 0, "the write takes the room owed");
                     }
@@ -290,7 +414,7 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
             },
         ));
     }
-    let usage = serde_json::to_value(tracker.snapshot(0)).unwrap();
+    let usage = serde_json::to_value(tracker.snapshot(0, None)).unwrap();
     assert_eq!(usage["prompt_tokens"], 10);
     assert_eq!(usage["completion_tokens"], 9);
     assert_eq!(usage["total_tokens"], 19);
@@ -307,7 +431,7 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
         spec_draft_tokens: 3,
         ..Default::default()
     }));
-    let usage = tracker.snapshot(0);
+    let usage = tracker.snapshot(0, None);
     assert_eq!(usage.completion_tokens, 10);
     let details = usage.completion_tokens_details.unwrap();
     assert_eq!(details.accepted_prediction_tokens, Some(2));
@@ -321,7 +445,7 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
         spec_draft_tokens: 1,
         ..Default::default()
     }));
-    let details = tracker.snapshot(0).completion_tokens_details.unwrap();
+    let details = tracker.snapshot(0, None).completion_tokens_details.unwrap();
     assert_eq!(details.accepted_prediction_tokens, Some(3));
     assert_eq!(details.rejected_prediction_tokens, Some(1));
 }
@@ -340,7 +464,7 @@ fn continuous_chat_usage_accumulates_delta_ids_without_double_counting_complete(
             },
         ));
     }
-    assert_eq!(tracker.snapshot(0).completion_tokens, 3);
+    assert_eq!(tracker.snapshot(0, None).completion_tokens, 3);
     tracker.record_complete(&ProtoGenerateComplete::Vllm(Box::new(
         proto::GenerateComplete {
             prompt_tokens: 10,
@@ -348,7 +472,7 @@ fn continuous_chat_usage_accumulates_delta_ids_without_double_counting_complete(
             ..Default::default()
         },
     )));
-    assert_eq!(tracker.snapshot(0).completion_tokens, 3);
+    assert_eq!(tracker.snapshot(0, None).completion_tokens, 3);
 }
 
 /// Wire contract: cache counters serialize as integer zeros, never null,
@@ -615,4 +739,210 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
         formatted(&stop),
         b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n"
     );
+}
+
+/// The chat writer stops at the flush bound and resumes: a step of many
+/// events (content and reasoning in turns, since consecutive content events
+/// merge on push) is written by calls that each return at the bound, the
+/// caller splitting the frame off between them, and the frames hold every
+/// event's text in order, each frame at most the bound plus the event that
+/// crossed it.
+#[test]
+fn the_chat_writer_returns_at_the_bound_and_resumes_with_the_next_event() {
+    use super::character_tokenizer::CharacterTokenizer;
+
+    const EVENTS: usize = 600;
+    const ONE_EVENT: usize = 1024;
+    let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, Some("v7"));
+    let texts: Vec<String> = (0..EVENTS)
+        .map(|i| {
+            format!(
+                "{}{i:04}-{}",
+                if i % 2 == 0 { 'c' } else { 'r' },
+                "x".repeat(40)
+            )
+        })
+        .collect();
+    let mut events = Events::new();
+    for (i, text) in texts.iter().enumerate() {
+        let text = symphony::event::Text::new(text.as_str(), 1);
+        if i % 2 == 0 {
+            events.push(Event::Content(text));
+        } else {
+            events.push(Event::Reasoning(text));
+        }
+    }
+    let mut buffer = BytesMut::new();
+    let mut logprobs = None;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut pending = events.consume();
+    while StreamingProcessor::write_events(
+        &mut buffer,
+        &frame,
+        0,
+        &mut pending,
+        &mut logprobs,
+        &tokenizer,
+        None,
+        None,
+        false,
+    ) {
+        assert!(
+            buffer.len() >= CHUNK_FLUSH_BYTES && buffer.len() < CHUNK_FLUSH_BYTES + ONE_EVENT,
+            "the writer returned at the bound: {} bytes",
+            buffer.len()
+        );
+        frames.push(buffer.split().to_vec());
+    }
+    drop(pending);
+    frames.push(buffer.split().to_vec());
+    assert!(
+        frames.len() > 2,
+        "the step left in more than two frames: {}",
+        frames.len()
+    );
+    let all: Vec<u8> = frames.concat();
+    let mut at = 0;
+    for text in &texts {
+        let found = all[at..]
+            .windows(text.len())
+            .position(|window| window == text.as_bytes())
+            .unwrap_or_else(|| panic!("{text} missing or out of order"));
+        at += found + text.len();
+    }
+    assert_eq!(
+        all.windows(6).filter(|&window| window == b"data: ").count(),
+        EVENTS,
+        "every event left exactly once across the flushes"
+    );
+}
+
+/// A bare text delta's logprobs written straight from the engine message's
+/// view are byte for byte the serialized choice carrying the converted
+/// object (which [`text_delta`] reads as a bare delta): over a column wire
+/// and the record wire, requested candidate counts of none, fewer than, as
+/// many as and more than the engine ranked, a position without candidates,
+/// tokens whose text needs escaping, is empty or holds a replacement
+/// character, logprobs that are negative, zero, large, tiny and not finite,
+/// an empty view (`"content":null`), both text fields and the usage tail's
+/// three shapes.
+#[test]
+fn text_delta_logprobs_frames_write_the_bytes_of_the_serialized_choice() {
+    use std::borrow::Cow;
+
+    use openai_protocol::chat::{ChatMessageDeltaRef, ChatStreamChoiceRef};
+    use smg_grpc_client::{trtllm_proto as trtllm, vllm_proto as vllm};
+
+    use crate::routers::grpc::{proto_wrapper::ProtoOutputLogProbs, utils::convert_proto_logprobs};
+
+    let decode = |id: u32| -> String {
+        match id {
+            1 => "he".to_string(),
+            2 => " said \"hi\" \\".to_string(),
+            3 => "\n".to_string(),
+            4 => "\u{FFFD}".to_string(),
+            5 => String::new(),
+            6 => " \u{1F642} ünïcödé".to_string(),
+            other => format!("<token_{other}>"),
+        }
+    };
+    let columns = vllm::OutputLogProbs {
+        token_logprobs: vec![-0.125, -0.0, f32::NEG_INFINITY, 0.0],
+        token_ids: vec![1, 2, 4, 5],
+        top_logprobs: vec![
+            vllm::TopLogProbs {
+                values: vec![-0.125, -1.5, -2.0, -3.25, -1e-7, f32::NAN],
+                token_ids: vec![1, 2, 3, 4, 5, 6],
+            },
+            vllm::TopLogProbs {
+                values: vec![],
+                token_ids: vec![],
+            },
+            vllm::TopLogProbs {
+                values: vec![1234.5678],
+                token_ids: vec![9],
+            },
+            vllm::TopLogProbs {
+                values: vec![f32::INFINITY, -0.5],
+                token_ids: vec![5, 6],
+            },
+        ],
+    };
+    let candidate = |token_id, logprob| trtllm::TopLogprob { token_id, logprob };
+    let records = vec![
+        trtllm::TokenLogprob {
+            token_id: 1,
+            logprob: -0.125,
+            top_logprobs: vec![candidate(1, -0.125), candidate(3, -1.5)],
+        },
+        trtllm::TokenLogprob {
+            token_id: 6,
+            logprob: -2.0,
+            top_logprobs: vec![],
+        },
+    ];
+    let empty = vllm::OutputLogProbs {
+        token_logprobs: vec![],
+        token_ids: vec![],
+        top_logprobs: vec![],
+    };
+    let views = [
+        ProtoOutputLogProbs::Vllm(&columns),
+        ProtoOutputLogProbs::Trtllm(&records),
+        ProtoOutputLogProbs::Vllm(&empty),
+    ];
+    let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, Some("v7"));
+    for view in views {
+        for requested in [0usize, 1, 2, 6, 20] {
+            let converted = convert_proto_logprobs(view, Some(requested), decode);
+            for field in [TextDelta::Content, TextDelta::Reasoning] {
+                for text in ["a", "he said \"hi\" \\ done", ""] {
+                    let choice = ChatStreamChoiceRef {
+                        index: 3,
+                        delta: ChatMessageDeltaRef {
+                            role: None,
+                            content: (field == TextDelta::Content).then_some(Cow::Borrowed(text)),
+                            tool_calls: None,
+                            reasoning_content: (field == TextDelta::Reasoning)
+                                .then_some(Cow::Borrowed(text)),
+                        },
+                        logprobs: Some(converted.clone()),
+                        finish_reason: None,
+                        matched_stop: None,
+                    };
+                    let Some((read_field, read_text)) = text_delta(&choice) else {
+                        panic!("a bare delta with logprobs reads as one: {field:?} {text:?}");
+                    };
+                    assert_eq!((read_field, read_text), (field, text));
+                    for (usage, emit_usage_null) in [
+                        (None, false),
+                        (None, true),
+                        (Some(Usage::from_counts(3, 2)), false),
+                    ] {
+                        let mut expected = BytesMut::new();
+                        frame.write_chunk(&mut expected, &choice, usage.as_ref(), emit_usage_null);
+                        let mut got = BytesMut::new();
+                        frame.write_text_delta_logprobs_view(
+                            &mut got,
+                            3,
+                            field,
+                            text,
+                            view,
+                            requested,
+                            decode,
+                            usage.as_ref(),
+                            emit_usage_null,
+                        );
+                        assert_eq!(
+                            got,
+                            expected,
+                            "{view:?} requested {requested} {field:?} {text:?} usage {} placeholder {emit_usage_null}",
+                            usage.is_some()
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

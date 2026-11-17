@@ -3,6 +3,8 @@
 //! answers with `BatchTokenIDSlimOutput` batches, as the SMG plugin inside a
 //! headless scheduler does.
 
+mod lora;
+
 use std::{
     collections::BTreeMap,
     sync::{
@@ -40,9 +42,10 @@ use tonic_health::pb::{
 
 use super::*;
 use crate::{
+    kv_events::{LoadFromState, LoadSource},
     testing::{
         assert_bucket_edges, assert_golden, bound_port, captured_logs, handshake_address, http_get,
-        next_batch, servicer_config, Bounded,
+        next_batch, reported_alive, servicer_config, Bounded,
     },
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
     EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq, ServicerError,
@@ -309,17 +312,17 @@ async fn a_slow_scheduler_stays_linked_while_the_launcher_reports_it_alive() {
     let silence = Duration::from_millis(300);
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
-    let server = SglangServicerServer::start(config).unwrap();
+    let server = Arc::new(SglangServicerServer::start(config).unwrap());
+    // The launcher reports through the whole start, as it polls the process
+    // it launched: the silence bound then meets the scheduler's quiet load
+    // alone, not the time this host takes over the dial-in or over READY.
+    let _alive = reported_alive(server.clone(), SglangServicerServer::note_engine_alive);
     // The scheduler dials in at once, then "loads" for four silences.
     let loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
         .expect("HELLO answered with INIT");
-    let load_time = Instant::now() + 4 * silence;
-    while Instant::now() < load_time {
-        server.note_engine_alive();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    tokio::time::sleep(4 * silence).await;
     assert_eq!(
         server.last_error().unwrap(),
         None,
@@ -347,13 +350,18 @@ async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound()
     let silence = Duration::from_millis(300);
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
-    let server = SglangServicerServer::start(config).unwrap();
+    let server = Arc::new(SglangServicerServer::start(config).unwrap());
+    // Reported alive until HELLO is answered: the silence under test starts
+    // there, whatever time this host takes over the dial-in, and counts
+    // from a sign of life no earlier than `before_hello`.
+    let alive = reported_alive(server.clone(), SglangServicerServer::note_engine_alive);
+    let before_hello = Instant::now();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
         .expect("HELLO answered with INIT");
-    let since_hello = Instant::now();
-    let deadline = since_hello + Duration::from_secs(10);
+    drop(alive);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let error = loop {
         if let Some(error) = server.last_error().unwrap() {
             break error;
@@ -361,7 +369,7 @@ async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound()
         assert!(Instant::now() < deadline, "no link failure reported");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert!(since_hello.elapsed() >= silence);
+    assert!(before_hello.elapsed() >= silence);
     assert!(
         error.contains("timed out while waiting for READY"),
         "{error}"
@@ -381,15 +389,14 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
     config.servicer.engine_startup_ceiling = Some(ceiling);
-    let server = SglangServicerServer::start(config).unwrap();
+    // Read before the start, which the ceiling counts from.
     let started = Instant::now();
-    let _loading = hello(&handshake, EngineId::from_engine_index(0))
-        .bounded()
-        .await
-        .expect("HELLO answered with INIT");
+    let server = Arc::new(SglangServicerServer::start(config).unwrap());
+    // The scheduler does not dial in: a dial-in would race the ceiling at this
+    // host's pace, and the ceiling bounds every wait of the handshake alike.
+    let _alive = reported_alive(server.clone(), SglangServicerServer::note_engine_alive);
     let deadline = started + Duration::from_secs(10);
     let error = loop {
-        server.note_engine_alive();
         if let Some(error) = server.last_error().unwrap() {
             break error;
         }
@@ -1051,7 +1058,7 @@ async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
     let logs = captured_logs();
     let mut model = model_info();
     model.data_parallel_size = 2;
-    model.server_args_json = r#"{"model_path":"org/model","dp_size":2,"disaggregation_mode":"prefill","load_balance_method":"follow_bootstrap_room"}"#.to_string();
+    model.server_args_json = r#"{"model_path":"org/model","dp_size":2,"enable_dp_attention":true,"disaggregation_mode":"prefill","load_balance_method":"follow_bootstrap_room"}"#.to_string();
     let mut h = harness_with(model, |config| config.servicer.engine_count = 2).await;
     let (mut rank1_in, mut rank1_out) = h.more_ranks.pop().expect("the second rank");
 
@@ -1067,6 +1074,7 @@ async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
         (add.rid.as_str(), add.routed_dp_rank, add.bootstrap_room),
         ("room7", Some(1), Some(7))
     );
+    assert_eq!(add.disagg_prefill_dp_rank, None);
     rank1_out
         .send_frames(vec![Bytes::from(
             encode_msgpack(&BatchTokenIDSlimOutput {
@@ -1152,6 +1160,94 @@ async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
     assert_scheduler_idle(&mut rank1_in).await;
     wait_until(|| h.server.active_requests() == 0).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+#[tokio::test]
+async fn a_prefill_side_of_replicas_names_the_replica_a_request_runs_on() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    model.server_args_json = r#"{"model_path":"org/model","dp_size":2,"enable_dp_attention":false,"disaggregation_mode":"prefill","load_balance_method":"follow_bootstrap_room"}"#.to_string();
+    let mut h = harness_with(model, |config| config.servicer.engine_count = 2).await;
+    let (mut rank1_in, mut rank1_out) = h.more_ranks.pop().expect("the second rank");
+
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("replica1", 7, 1))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (
+            add.routed_dp_rank,
+            add.disagg_prefill_dp_rank,
+            add.bootstrap_room
+        ),
+        (Some(1), Some(1), Some(7))
+    );
+    rank1_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&BatchTokenIDSlimOutput {
+                engine_index: 1,
+                ..batch("replica1", vec![10], 1, Some("stop"), None)
+            })
+            .unwrap(),
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("replica0", 8, 0))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        (
+            add.routed_dp_rank,
+            add.disagg_prefill_dp_rank,
+            add.bootstrap_room
+        ),
+        (Some(0), Some(0), Some(8))
+    );
+    send(
+        &mut h.engine_out,
+        &batch("replica0", vec![11], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_scheduler_idle(&mut rank1_in).await;
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+#[test]
+fn replicas_are_told_from_attention_dp_in_either_spelling() {
+    let replicas = |server_args: &str| {
+        let mut model = model_info();
+        model.server_args_json = server_args.to_string();
+        ranks_are_replicas(&model)
+    };
+    assert!(replicas(r#"{"dp_size":2}"#));
+    assert!(replicas(
+        r#"{"dp_size":2,"attn_dp_size":1,"enable_dp_attention":false}"#
+    ));
+    assert!(!replicas(r#"{"dp_size":2,"enable_dp_attention":true}"#));
+    assert!(!replicas(
+        r#"{"dp_size":1,"attn_dp_size":2,"enable_dp_attention":false}"#
+    ));
+    assert!(!replicas(r#"{"dp_size":1}"#));
+    assert!(!replicas("{}"));
 }
 
 /// The decode side of a disaggregated pair places a request by its pin, as
@@ -1424,6 +1520,67 @@ async fn abort_rpc_ends_the_stream_and_reaches_the_scheduler() {
         .into_inner();
     assert!(!unknown.success, "an unknown id is reported as not found");
     assert!(unknown.message.contains("not found"));
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A fan-out's open choices end on an `Abort` RPC with their own indexes: the
+/// terminal the servicer builds for the second choice carries index 1, as the
+/// engine's own completes do.
+#[tokio::test]
+async fn an_abort_ends_each_choice_of_a_fan_out_with_its_own_index() {
+    let mut h = harness(model_info()).await;
+    let mut req = generate_request("r7", true, Vec::new());
+    if let Some(params) = req.sampling_params.as_mut() {
+        params.n = 2;
+    }
+    let mut stream = h.client.generate(req).await.expect("generate").into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r7-1", vec![21], 1, None, None)).await;
+    assert_eq!(
+        chunk(stream.message().bounded().await.unwrap().unwrap()).token_ids,
+        vec![21]
+    );
+
+    let response = h
+        .client
+        .abort(sg::AbortRequest {
+            request_id: "r7".to_string(),
+            reason: "client left".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success);
+    let mut terminals = [
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+    ];
+    terminals.sort_by_key(|done| done.index);
+    let seen: Vec<_> = terminals
+        .iter()
+        .map(|done| {
+            (
+                done.index,
+                done.finish_reason.clone(),
+                done.output_ids.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (0, "abort".to_string(), vec![]),
+            (1, "abort".to_string(), vec![21])
+        ]
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    let mut aborted = recv_abort(&mut h.engine_in).await;
+    while aborted.len() < 2 {
+        aborted.extend(recv_abort(&mut h.engine_in).await);
+    }
+    aborted.sort();
+    assert_eq!(aborted, vec!["r7-0".to_string(), "r7-1".to_string()]);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -3970,11 +4127,10 @@ async fn the_zero_filled_loads_count_the_connected_ranks() {
             .collect::<Vec<_>>(),
         vec![(1, 0)]
     );
-    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
-    let record =
-        crate::kv_events::LoadSource::load(&source, Some(1)).expect("the idle rank's record");
+    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    let record = LoadSource::load(&source, Some(1)).expect("the idle rank's record");
     assert_eq!((record.running_requests, record.waiting_requests), (0, 0));
-    assert!(crate::kv_events::LoadSource::load(&source, Some(2)).is_none());
+    assert!(LoadSource::load(&source, Some(2)).is_none());
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
@@ -4278,8 +4434,8 @@ async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
     assert!(rate > 0.0 && rate <= 125.0, "{rate} tokens per second");
     assert!((rank0.cache_hit_rate - 1.0 / 6.0).abs() < 1e-9);
     assert_eq!(rank0.num_waiting_uncached_tokens, 0);
-    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
-    let record = crate::kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    let record = LoadSource::load(&source, Some(0)).expect("rank 0's record");
     assert_eq!(record.prefill_throughput, Some(rate));
     assert_eq!(record.waiting_uncached_tokens, Some(0));
     assert_eq!(record.cache_hit_rate, Some(rank0.cache_hit_rate));
@@ -4418,8 +4574,6 @@ async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch()
 /// connected ones has no record.
 #[tokio::test]
 async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
-    use crate::kv_events::RankLoads;
-
     let record_of = |load: &sg::SchedulerLoad| {
         let mut record = common::EngineLoad::from(load);
         record.waiting_uncached_tokens =
@@ -4469,4 +4623,35 @@ async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
     assert_eq!(state.rank_load(None), state.rank_load(Some(0)));
     assert!(state.rank_load(Some(1)).is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_leftover_handshake_endpoint_does_not_fail_the_link() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    // A bound-then-dropped listener leaves its socket file behind, as a
+    // process that died without cleanup does.
+    drop(UnixListener::bind(&endpoint).unwrap());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = SglangServicerServer::start(config).unwrap();
+
+    // Only the link's own bind answers a connect: the leftover refuses it.
+    wait_until(|| {
+        assert_eq!(
+            server.last_error().unwrap(),
+            None,
+            "the link failed on the leftover"
+        );
+        UnixStream::connect(&endpoint).is_ok()
+    })
+    .await;
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        std::fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
 }

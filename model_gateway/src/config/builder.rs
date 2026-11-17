@@ -6,8 +6,8 @@ use smg_mcp::McpConfig;
 
 use super::{
     AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig, MetricsConfig,
-    OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig, PolicyEngineMode,
+    GroupedDpSticky, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
+    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
     PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
@@ -736,8 +736,8 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn policy_engine(mut self, mode: PolicyEngineMode) -> Self {
-        self.config.policy_engine = mode;
+    pub fn grouped_dp_sticky(mut self, mode: GroupedDpSticky) -> Self {
+        self.config.grouped_dp_sticky = mode;
         self
     }
 
@@ -957,48 +957,33 @@ impl RouterConfigBuilder {
 
     /// Internal method to read mTLS certificates from paths
     fn read_mtls_certificates(mut self) -> ConfigResult<Self> {
-        // Read client certificate and key
-        match (&self.client_cert_path, &self.client_key_path) {
-            (Some(cert_path), Some(key_path)) => {
-                let cert = std::fs::read(cert_path).map_err(|e| ConfigError::ValidationFailed {
-                    reason: format!("Failed to read client certificate from {cert_path}: {e}"),
-                })?;
-                let key = std::fs::read(key_path).map_err(|e| ConfigError::ValidationFailed {
-                    reason: format!("Failed to read client key from {key_path}: {e}"),
-                })?;
+        let pair = cert_and_key(
+            self.client_cert_path.as_deref(),
+            self.client_key_path.as_deref(),
+            "--client-cert-path and --client-key-path",
+        )?;
+        if let Some((cert_path, key_path)) = pair {
+            let cert = read_file(cert_path, "client certificate")?;
+            let key = read_file(key_path, "client key")?;
 
-                // Combine cert and key into single PEM for reqwest::Identity
-                // When using rustls, certificate must come first, then key
-                // Ensure proper PEM formatting with newlines
-                let mut combined = cert;
-                if !combined.ends_with(b"\n") {
-                    combined.push(b'\n');
-                }
-                combined.extend_from_slice(&key);
-                if !combined.ends_with(b"\n") {
-                    combined.push(b'\n');
-                }
+            // Combine cert and key into single PEM for reqwest::Identity
+            // When using rustls, certificate must come first, then key
+            // Ensure proper PEM formatting with newlines
+            let mut combined = cert;
+            if !combined.ends_with(b"\n") {
+                combined.push(b'\n');
+            }
+            combined.extend_from_slice(&key);
+            if !combined.ends_with(b"\n") {
+                combined.push(b'\n');
+            }
 
-                self.config.client_identity = Some(combined);
-                self.config.client_key_path = Some(key_path.clone());
-            }
-            (None, None) => {
-                // No client cert configured, that's fine
-            }
-            _ => {
-                return Err(ConfigError::ValidationFailed {
-                    reason:
-                        "Both --client-cert-path and --client-key-path must be specified together"
-                            .to_string(),
-                });
-            }
+            self.config.client_identity = Some(combined);
+            self.config.client_key_path = Some(key_path.to_string());
         }
 
-        // Read CA certificates
         for path in &self.ca_cert_paths {
-            let cert = std::fs::read(path).map_err(|e| ConfigError::ValidationFailed {
-                reason: format!("Failed to read CA certificate from {path}: {e}"),
-            })?;
+            let cert = read_file(path, "CA certificate")?;
             self.config.ca_certificates.push(cert);
         }
 
@@ -1007,25 +992,15 @@ impl RouterConfigBuilder {
 
     /// Internal method to read Server TLS certificates from paths
     fn read_server_certificates(mut self) -> ConfigResult<Self> {
-        match (&self.server_cert_path, &self.server_key_path) {
-            (Some(cert_path), Some(key_path)) => {
-                let cert = std::fs::read(cert_path).map_err(|e| ConfigError::ValidationFailed {
-                    reason: format!("Failed to read server certificate from {cert_path}: {e}"),
-                })?;
-                let key = std::fs::read(key_path).map_err(|e| ConfigError::ValidationFailed {
-                    reason: format!("Failed to read server key from {key_path}: {e}"),
-                })?;
-                self.config.server_cert = Some(cert);
-                self.config.server_key = Some(key);
-                self.config.server_key_path = Some(key_path.clone());
-            }
-            (None, None) => {}
-            _ => {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "Both --tls-cert-path and --tls-key-path must be specified together"
-                        .to_string(),
-                });
-            }
+        let pair = cert_and_key(
+            self.server_cert_path.as_deref(),
+            self.server_key_path.as_deref(),
+            "--tls-cert-path and --tls-key-path",
+        )?;
+        if let Some((cert_path, key_path)) = pair {
+            self.config.server_cert = Some(read_file(cert_path, "server certificate")?);
+            self.config.server_key = Some(read_file(key_path, "server key")?);
+            self.config.server_key_path = Some(key_path.to_string());
         }
         Ok(self)
     }
@@ -1047,6 +1022,26 @@ impl RouterConfigBuilder {
 
         Ok(self)
     }
+}
+
+fn cert_and_key<'a>(
+    cert_path: Option<&'a str>,
+    key_path: Option<&'a str>,
+    flags: &str,
+) -> ConfigResult<Option<(&'a str, &'a str)>> {
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => Ok(Some((cert_path, key_path))),
+        (None, None) => Ok(None),
+        _ => Err(ConfigError::ValidationFailed {
+            reason: format!("Both {flags} must be specified together"),
+        }),
+    }
+}
+
+fn read_file(path: &str, what: &str) -> ConfigResult<Vec<u8>> {
+    std::fs::read(path).map_err(|e| ConfigError::ValidationFailed {
+        reason: format!("Failed to read {what} from {path}: {e}"),
+    })
 }
 
 impl From<RouterConfigBuilder> for RouterConfig {

@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::json;
 use tracing::error;
 
-use crate::routers::grpc::spec::ChatResponseSpec;
+use crate::routers::grpc::{proto_wrapper::ProtoOutputLogProbs, spec::ChatResponseSpec};
 
 /// The frame buffer as serde's sink: every write is one `extend_from_slice`,
 /// the shape a `Vec<u8>` gives serde. The `bytes` writer adapter instead slices
@@ -63,6 +63,24 @@ pub(super) const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 /// not by doubling).
 pub(super) const FRAME_ROOM: usize = 2 * CHUNK_FLUSH_BYTES;
 
+/// The unsent bytes at which a chat burst's frame takes [`CHAT_BURST_ROOM`]
+/// (`ChatStream::read_engine`): an eighth of a frame, half the stream's first
+/// room, so a paced engine's frames, one event each, stay under it and keep
+/// the room they have.
+pub(super) const CHAT_BURST_MARK: usize = CHUNK_FLUSH_BYTES / 8;
+
+/// The room the chat loop's frame buffer takes once a burst's unsent bytes
+/// reach [`CHAT_BURST_MARK`] (`ChatStream::read_engine`): one frame and two
+/// such marks. The frame leaves at the flush bound plus the event that
+/// crossed it, and what it leaves behind still holds the next burst up to
+/// its own mark, so each frame of a burst costs one reservation: taken back
+/// in place when the connection has dropped the sent frame, a fresh
+/// allocation while it is in flight. One frame's room and not [`FRAME_ROOM`]:
+/// the chat loop reserves at every frame's mark, before it knows the frame
+/// will fill, so a second frame's room would never be written, and a frame
+/// in flight pins its whole allocation.
+pub(super) const CHAT_BURST_ROOM: usize = CHUNK_FLUSH_BYTES + 2 * CHAT_BURST_MARK;
+
 /// The SSE frame of the per-token chat chunks of one stream.
 ///
 /// Every chunk of a stream repeats the same `id`, `object`, `created`,
@@ -70,13 +88,14 @@ pub(super) const FRAME_ROOM: usize = 2 * CHUNK_FLUSH_BYTES;
 /// head up to and including `"choices":[` is serialized once per stream and
 /// copied in front of each chunk, so a chunk costs the serialization of its
 /// choice and usage only. The bytes are exactly those of a serialized
-/// [`super::ChatChunkWithUsage`] (the chunk-level `usage: null` placeholder included).
-pub(super) struct ChatChunkFrame {
+/// `ChatCompletionStreamResponse`, plus the chunk-level `usage: null`
+/// placeholder where the wire asks for one.
+pub(crate) struct ChatChunkFrame {
     head: Vec<u8>,
 }
 
 impl ChatChunkFrame {
-    pub(super) fn new(
+    pub(crate) fn new(
         request_id: &str,
         model: &str,
         created: u64,
@@ -99,7 +118,7 @@ impl ChatChunkFrame {
 
     /// Append `data: {...}\n\n` for `choice` (and `usage`, or the `null`
     /// placeholder when `emit_usage_null`) to `buffer`.
-    pub(super) fn write_chunk<C: Serialize>(
+    pub(crate) fn write_chunk<C: Serialize>(
         &self,
         buffer: &mut BytesMut,
         choice: &C,
@@ -135,6 +154,57 @@ impl ChatChunkFrame {
         push_json(FrameSink(buffer), text);
         buffer.extend_from_slice(b"},\"logprobs\":null,\"finish_reason\":null}");
         Self::close_chunk(buffer, start, Ok(()), usage, emit_usage_null);
+    }
+
+    /// [`Self::write_text_delta`] for a bare text delta that carries the
+    /// token's logprobs ([`text_delta`] with the engine message's logprobs
+    /// view): the choice's constant text and the logprobs object's structure
+    /// (its keys, brackets and `refusal` null) are written as literals; serde
+    /// writes the index, the text and each entry's token and logprob alone,
+    /// through the calls it makes for them inside the struct, so each is the
+    /// bytes it writes there; the entries are written straight from the view,
+    /// each token decoded once (through `decode`, the conversion's own) and its
+    /// byte list written in decimal from that text, the candidates cut to
+    /// `requested` before any is decoded. Walked as a struct, the converted
+    /// object costs its construction (six strings, six byte copies and two
+    /// lists for a one-token delta with five candidates), an escape scan and
+    /// three writes per key (22 keys a token at five candidates) and serde's
+    /// dispatch per byte of the lists: about a quarter of a logprobs stream
+    /// request's user instructions. The bytes are those [`Self::write_chunk`]
+    /// writes for the same choice carrying the converted view (pinned by test).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the delta writer's inputs plus the logprobs view, its cut and its decode, not state"
+    )]
+    pub(super) fn write_text_delta_logprobs_view(
+        &self,
+        buffer: &mut BytesMut,
+        index: u32,
+        field: TextDelta,
+        text: &str,
+        view: ProtoOutputLogProbs<'_>,
+        requested: usize,
+        decode: impl Fn(u32) -> String,
+        usage: Option<&Usage>,
+        emit_usage_null: bool,
+    ) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head);
+        buffer.extend_from_slice(b"{\"index\":");
+        push_json(FrameSink(buffer), &index);
+        buffer.extend_from_slice(field.opener());
+        push_json(FrameSink(buffer), text);
+        buffer.extend_from_slice(b"},\"logprobs\":");
+        push_logprobs_view(buffer, view, requested, &decode);
+        buffer.extend_from_slice(b",\"finish_reason\":null}");
+        Self::close_chunk(buffer, start, Ok(()), usage, emit_usage_null);
+    }
+
+    /// Append the chunk that closes a stream with its usage and no choice.
+    pub(crate) fn write_usage_chunk(&self, buffer: &mut BytesMut, usage: &Usage) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head);
+        Self::close_chunk(buffer, start, Ok(()), Some(usage), false);
     }
 
     /// The chunk's end after its choice: `]`, the usage or its `null`
@@ -187,41 +257,130 @@ impl TextDelta {
 }
 
 /// The field and the text of `choice` when it is a bare per-token delta: one
-/// text field and nothing else (no role, no tool calls, no logprobs, not
-/// finished, no matched stop), the shape [`ChatChunkFrame::write_text_delta`]
-/// writes; `None` for every other choice, which stays serde's. Both structs
-/// are matched field by field with no rest pattern, so a field added to
-/// either is a compile error here until this read says what it does.
+/// text field and nothing else (no role, no tool calls, not finished, no
+/// matched stop), the shape [`ChatChunkFrame::write_text_delta`] writes and,
+/// when the token's logprobs ride along,
+/// [`ChatChunkFrame::write_text_delta_logprobs_view`]; `None` for every other
+/// choice, which stays serde's. The choice's own logprobs are not read: the
+/// caller writes the token's from the engine message's view. Both structs are
+/// matched field by field with no rest pattern, so a field added to either is
+/// a compile error here until this read says what it does.
 pub(super) fn text_delta<'a>(choice: &'a ChatStreamChoiceRef<'_>) -> Option<(TextDelta, &'a str)> {
     let ChatStreamChoiceRef {
         index: _,
         delta,
-        logprobs: None,
+        logprobs: _,
         finish_reason: None,
         matched_stop: None,
     } = choice
     else {
         return None;
     };
-    match delta {
+    let (field, text) = match delta {
         ChatMessageDeltaRef {
             role: None,
             content: Some(text),
             tool_calls: None,
             reasoning_content: None,
-        } => Some((TextDelta::Content, text.as_ref())),
+        } => (TextDelta::Content, text.as_ref()),
         ChatMessageDeltaRef {
             role: None,
             content: None,
             tool_calls: None,
             reasoning_content: Some(text),
-        } => Some((TextDelta::Reasoning, text.as_ref())),
-        _ => None,
-    }
+        } => (TextDelta::Reasoning, text.as_ref()),
+        _ => return None,
+    };
+    Some((field, text))
 }
 
-/// Serializing a string or an integer into memory cannot fail.
-fn push_json<W: io::Write, T: Serialize + ?Sized>(writer: W, value: &T) {
+/// The logprobs object of a chat choice written from the engine message's
+/// view, byte for byte as serde writes the converted
+/// [`ChatLogProbs`](openai_protocol::common::ChatLogProbs):
+/// `{"content":<entries or null>,"refusal":null}`, each entry's token decoded
+/// once and its byte list the bytes of that text (what the conversion copies
+/// into the entry), the candidates in the engine's order cut to `requested`
+/// before any is decoded; a view without a position is `"content":null`, as
+/// the conversion leaves the content list out.
+fn push_logprobs_view(
+    buffer: &mut BytesMut,
+    view: ProtoOutputLogProbs<'_>,
+    requested: usize,
+    decode: &impl Fn(u32) -> String,
+) {
+    buffer.extend_from_slice(b"{\"content\":");
+    if view.is_empty() {
+        buffer.extend_from_slice(b"null");
+    } else {
+        buffer.extend_from_slice(b"[");
+        for (at, position) in view.positions().enumerate() {
+            if at > 0 {
+                buffer.extend_from_slice(b",");
+            }
+            let token = decode(position.token_id);
+            push_logprob_token(buffer, &token, position.logprob, Some(token.as_bytes()));
+            buffer.extend_from_slice(b",\"top_logprobs\":[");
+            let candidates = position.top_logprobs.iter().take(requested);
+            for (at, (token_id, logprob)) in candidates.enumerate() {
+                if at > 0 {
+                    buffer.extend_from_slice(b",");
+                }
+                let text = decode(token_id);
+                push_logprob_token(buffer, &text, logprob, Some(text.as_bytes()));
+                buffer.extend_from_slice(b"}");
+            }
+            buffer.extend_from_slice(b"]}");
+        }
+        buffer.extend_from_slice(b"]");
+    }
+    buffer.extend_from_slice(b",\"refusal\":null}");
+}
+
+/// The opening of a token's entry, `{"token":…,"logprob":…,"bytes":…`: the
+/// three fields an entry and a candidate share, as serde writes them inside
+/// the struct (the token escaped, the logprob formatted or `null` when it is
+/// not finite, both through serde; the bytes in decimal). The caller closes
+/// the entry after whatever follows.
+fn push_logprob_token(buffer: &mut BytesMut, token: &str, logprob: f32, bytes: Option<&[u8]>) {
+    buffer.extend_from_slice(b"{\"token\":");
+    push_json(FrameSink(buffer), token);
+    buffer.extend_from_slice(b",\"logprob\":");
+    push_json(FrameSink(buffer), &logprob);
+    buffer.extend_from_slice(b",\"bytes\":");
+    push_byte_list(buffer, bytes);
+}
+
+/// An `Option<Vec<u8>>` as serde writes it: `null`, or the bytes in decimal
+/// between brackets, comma-separated.
+fn push_byte_list(buffer: &mut BytesMut, bytes: Option<&[u8]>) {
+    let Some(bytes) = bytes else {
+        buffer.extend_from_slice(b"null");
+        return;
+    };
+    buffer.extend_from_slice(b"[");
+    for (at, &byte) in bytes.iter().enumerate() {
+        if at > 0 {
+            buffer.extend_from_slice(b",");
+        }
+        let mut digits = [0u8; 3];
+        let mut rest = byte;
+        let mut from = digits.len();
+        loop {
+            from -= 1;
+            digits[from] = b'0' + rest % 10;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
+        }
+        buffer.extend_from_slice(&digits[from..]);
+    }
+    buffer.extend_from_slice(b"]");
+}
+
+/// Serializing a string, an integer, a float or a value made of them into
+/// memory cannot fail.
+pub(super) fn push_json<W: io::Write, T: Serialize + ?Sized>(writer: W, value: &T) {
     let _ = serde_json::to_writer(writer, value);
 }
 
@@ -265,10 +424,14 @@ impl EscapedText {
 /// `model` and `system_fingerprint`; only its choice differs, and it sits
 /// between them. The head up to and including `"choices":[` and the tail
 /// from `]` to the end of the event are serialized once per stream and
-/// copied around each chunk's choice, so a chunk costs the serialization of
-/// its choice only. The bytes are exactly those of a serialized
-/// [`openai_protocol::completion::CompletionStreamResponse`] without `usage`, which a chunk of this
-/// stream never carries.
+/// copied around each chunk's choice, which is written in one pass
+/// ([`Self::write_chunk`]), so a chunk costs its own bytes only. The bytes
+/// are exactly those of a serialized
+/// [`openai_protocol::completion::CompletionStreamResponse`] whose `usage` is
+/// `None` (a per-token chunk never carries the counts), except that a stream
+/// that asks for usage writes `"usage":null` last, where serde writes
+/// `usage`: the public API writes the placeholder on every chunk before the
+/// usage chunk, as a chat stream does.
 pub(super) struct CompletionChunkFrame {
     head: Vec<u8>,
     tail: Vec<u8>,
@@ -280,6 +443,7 @@ impl CompletionChunkFrame {
         model: &str,
         created: u64,
         system_fingerprint: Option<&str>,
+        usage_null_placeholder: bool,
     ) -> Self {
         let mut head = Vec::with_capacity(128);
         head.extend_from_slice(b"data: {\"id\":");
@@ -294,15 +458,20 @@ impl CompletionChunkFrame {
             tail.extend_from_slice(b",\"system_fingerprint\":");
             push_json(&mut tail, system_fingerprint);
         }
+        if usage_null_placeholder {
+            tail.extend_from_slice(b",\"usage\":null");
+        }
         tail.extend_from_slice(b"}\n\n");
         Self { head, tail }
     }
 
-    /// Append `data: {...}\n\n` for `choice` to `buffer`.
+    /// Append `data: {...}\n\n` for `choice` to `buffer`: the choice through
+    /// [`Self::write_choice`] between the head and the tail; a choice that
+    /// failed to serialize leaves an error event in its place.
     pub(super) fn write_chunk(&self, buffer: &mut BytesMut, choice: &CompletionStreamChoice) {
         let start = buffer.len();
         buffer.extend_from_slice(&self.head);
-        match serde_json::to_writer(FrameSink(buffer), choice) {
+        match Self::write_choice(buffer, choice) {
             Ok(()) => buffer.extend_from_slice(&self.tail),
             Err(e) => {
                 error!("Failed to serialize completion SSE chunk: {}", e);
@@ -319,6 +488,46 @@ impl CompletionChunkFrame {
                 buffer.extend_from_slice(b"\n\n");
             }
         }
+    }
+
+    /// Append the choice's JSON object to `buffer`: the bytes serde writes
+    /// for the struct, its keys and brackets as literals and its values
+    /// through the calls serde makes for them (the text escaped, the index in
+    /// decimal, the logprobs and the finish reason where the derive writes
+    /// them and `null` where they are absent). Walked as a struct, the choice
+    /// cost an escape scan and three writes per key on every chunk, four keys
+    /// a token around the text and the index. Pinned against the serialized
+    /// struct by `tests::chunk_frames_write_the_bytes_of_the_whole_structs`.
+    fn write_choice(
+        buffer: &mut BytesMut,
+        choice: &CompletionStreamChoice,
+    ) -> serde_json::Result<()> {
+        // Matched field by field with no rest pattern, so a field added to the
+        // choice is a compile error here until this write says where it goes.
+        let CompletionStreamChoice {
+            text,
+            index,
+            logprobs,
+            finish_reason,
+        } = choice;
+        buffer.extend_from_slice(b"{\"text\":");
+        push_json(FrameSink(buffer), text);
+        buffer.extend_from_slice(b",\"index\":");
+        push_json(FrameSink(buffer), index);
+        buffer.extend_from_slice(b",\"logprobs\":");
+        match logprobs {
+            // The logprobs' `Serialize` lives in another crate, so their write
+            // keeps the fallible path rather than the infallible one.
+            Some(logprobs) => serde_json::to_writer(FrameSink(buffer), logprobs)?,
+            None => buffer.extend_from_slice(b"null"),
+        }
+        buffer.extend_from_slice(b",\"finish_reason\":");
+        match finish_reason {
+            Some(finish_reason) => push_json(FrameSink(buffer), finish_reason),
+            None => buffer.extend_from_slice(b"null"),
+        }
+        buffer.extend_from_slice(b"}");
+        Ok(())
     }
 }
 
@@ -380,7 +589,7 @@ pub(super) fn forces_tool_call(spec: &ChatResponseSpec) -> bool {
 /// A streamed choice carrying whichever of `content`, `reasoning_content` and
 /// `tool_calls` the caller sets; the role is not repeated, the first chunk
 /// ([`opening_choice`]) carried it.
-pub(super) fn assistant_choice(
+pub(crate) fn assistant_choice(
     index: u32,
     content: Option<String>,
     reasoning_content: Option<String>,

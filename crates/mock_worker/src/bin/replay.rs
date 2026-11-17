@@ -20,7 +20,11 @@
 //! of TTFT on an otherwise idle gateway.
 
 // A command-line tool: the summary goes to stdout, progress to stderr.
-#![allow(clippy::print_stdout, clippy::print_stderr)]
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a command-line tool reports on its standard streams"
+)]
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -975,6 +979,10 @@ struct AdminRecord {
     request_id: String,
     worker: String,
     cached_tokens: u32,
+    /// Of `cached_tokens`, those restored from the mock's shared KV tier (0
+    /// without the tier; absent from mock builds older than the tier).
+    #[serde(default)]
+    restored_tokens: u32,
     oracle_tokens: u32,
     queued_ms: f64,
 }
@@ -1234,9 +1242,16 @@ async fn main() -> Result<()> {
             if let Some(d) = decisions.get(&key) {
                 r.branch.clone_from(&d.branch);
                 r.credit_tokens = d.credit_tokens(r.prompt_tokens, args.block_size);
+                // The gateway's index holds the workers' own caches: what an
+                // engine restored from the shared tier is no credit it could
+                // have given.
+                let restored = admin_rows
+                    .get(&r.request_id)
+                    .map_or(0, |a| a.restored_tokens);
+                let own = r.cached_tokens.saturating_sub(restored);
                 r.agree = Some(match r.credit_tokens {
-                    Some(credit) => credit == r.cached_tokens,
-                    None => d.claims_overlap() == (r.cached_tokens > 0),
+                    Some(credit) => credit == own,
+                    None => d.claims_overlap() == (own > 0),
                 });
             }
         }

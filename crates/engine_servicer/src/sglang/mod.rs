@@ -18,7 +18,8 @@
 //! room's residue instead (`bootstrap_room % dp_size`: where SGLang's prefill
 //! side requires it and the decode side looks for the KV), the pin yielding
 //! to it (a warning on the connection's first such request, a debug line on
-//! each later one); the decode side keeps the pin.
+//! each later one); the decode side keeps the pin. A prefill side of plain
+//! data-parallel replicas also names that rank to the engine.
 //!
 //! The language side of encode/prefill disaggregation (`--language-only`)
 //! works as behind the engine's own frontend: a request's media references
@@ -34,6 +35,7 @@ mod embed;
 mod engine;
 mod generate;
 mod info;
+mod lora;
 mod media_identity;
 mod service;
 #[cfg(test)]
@@ -51,7 +53,7 @@ use tonic::service::Routes;
 use crate::{
     engine_link::EngineLink,
     health_probe,
-    kv_events::KvEventRelay,
+    kv_events::{record_with_queue, KvEventRelay, RankLoads},
     metrics::{Identity, ServicerMetrics},
     proto_json,
     servicer::{self, Shared, WireState},
@@ -201,6 +203,21 @@ pub(super) fn places_by_rendezvous_room(model: &SglangModelInfo) -> bool {
         == Some("prefill")
 }
 
+/// Whether the scheduler ranks are plain data-parallel replicas (`--dp-size`
+/// above one without attention DP), read off the launcher's `server_args` in
+/// either release's spelling of attention DP: `attn_dp_size` above one beside
+/// a `dp_size` of 1, or `enable_dp_attention` beside the `dp_size`.
+pub(super) fn ranks_are_replicas(model: &SglangModelInfo) -> bool {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    let width = |name: &str| args.get(name).and_then(serde_json::Value::as_u64);
+    let attention_dp = width("attn_dp_size").is_some_and(|ranks| ranks > 1)
+        || args
+            .get("enable_dp_attention")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    width("dp_size").is_some_and(|replicas| replicas > 1) && !attention_dp
+}
+
 /// SGLang's `CaptureHiddenMode`: how much of the hidden states the scheduler
 /// was launched to return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,16 +299,13 @@ impl std::fmt::Debug for SglangServicerConfig {
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
 /// attaches to every batch it streams.
-impl crate::kv_events::RankLoads for State {
+impl RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         // A connected rank reads its own entry (zero-filled until its first
         // load tail), never another rank's figures; a rank past the
         // connected ones gets no record.
         let load = info::rank_load(self, dp_rank)?;
-        Some(crate::kv_events::record_with_queue(
-            &load,
-            load.num_waiting_uncached_tokens,
-        ))
+        Some(record_with_queue(&load, load.num_waiting_uncached_tokens))
     }
 
     fn engine_link(&self) -> &EngineLink {
@@ -305,6 +319,7 @@ impl crate::kv_events::RankLoads for State {
 
 pub(super) struct State {
     pub(super) model: SglangModelInfo,
+    loras: lora::PreloadedLoras,
     /// What every servicer's state shares: the engine link, the admitted
     /// requests, the KV-event relay, the metrics and the serving switch.
     pub(super) shared: Shared,
@@ -412,6 +427,7 @@ impl SglangServicerServer {
                         .map(str::to_owned)
                 });
         let state = Arc::new(State {
+            loras: lora::PreloadedLoras::from_server_args(&config.model.server_args_json)?,
             media_identity_key,
             media_disaggregation_mode,
             model: config.model,

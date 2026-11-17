@@ -10,7 +10,8 @@
 
 use crate::{
     decision::{Decision, Target},
-    view::{Health, LoadRow, WorkerId},
+    sessions::SessionVerdict,
+    view::{Health, LoadRow, Session, WorkerId},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -48,9 +49,18 @@ pub struct Lease {
     /// side names its own).
     pub target_index: u8,
     pub generation: u64,
-    /// The fingerprint of the session key, so a sticky in-flight cap counts
-    /// per key per worker from leases; `0` when none.
-    pub session_key: u64,
+    /// The request's session ([`crate::RequestFacts::session`]: its key
+    /// within its model and phase), which the host fills for every keyed
+    /// request, whatever rule governed it, so the commit moves that
+    /// session's pins and a sticky in-flight cap counts per session per
+    /// worker from leases; [`Session::NONE`] when the request carried no
+    /// key. The wire carries [`Session::get`], in the field both contracts
+    /// still spell `session_key`: the change that first reads a lease from
+    /// the wire renames it in both.
+    pub session: Session,
+    /// What the decision did with the session key, copied from its pick, so
+    /// the commit moves the key's pins by its own decision alone.
+    pub session_verdict: SessionVerdict,
     /// The host's clock at issue, microseconds since its origin. In-process
     /// only; the wire carries the dispatch deadline as a duration.
     pub issued_micros: u64,
@@ -83,6 +93,7 @@ pub struct Outcome {
     pub ttft_micros: u32,
     pub tokens_in: u32,
     pub tokens_out: u32,
+    /// Microseconds the dispatch took, saturating at `u32::MAX`, never wrapping.
     pub duration_micros: u32,
 }
 
@@ -97,6 +108,10 @@ pub enum ReleaseReason {
     ClientGone,
     /// The commit refused every target (a removed worker, a lost room).
     CommitFailed,
+    /// The stream rule's grace passed without a completion.
+    Expired,
+    /// An immediate deregistration released the worker's leases.
+    WorkerRemoved,
 }
 
 /// A membership change the host reports.

@@ -26,10 +26,10 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use smg::{
     config::PolicyConfig,
-    observability::metrics::{start_prometheus, PrometheusConfig},
+    observability::metrics::{start_prometheus, Metrics, PrometheusConfig},
     policies::PolicyRegistry,
     worker::{
-        monitor::WorkerMonitor, registry::WorkerRegistry, BasicWorkerBuilder, ConnectionMode,
+        load::monitor::WorkerMonitor, registry::WorkerRegistry, BasicWorkerBuilder, ConnectionMode,
         Worker, WorkerType,
     },
 };
@@ -110,8 +110,7 @@ fn worker(url: &str) -> Arc<dyn Worker> {
 }
 
 /// A heartbeat-shaped record: the core figures with the telemetry an engine
-/// reports beside them, so the report carries absolute token counts and the
-/// DP-rank token cache takes it, as it takes a poll.
+/// reports beside them, so the report carries absolute token counts.
 fn record(running: u32, sample: u64) -> EngineLoad {
     EngineLoad {
         running_requests: running,
@@ -128,19 +127,16 @@ fn record(running: u32, sample: u64) -> EngineLoad {
 }
 
 /// A record for a rank already on file, the steady state of every stream
-/// (each record after a rank's first), allocates for one thing: the DP-rank
-/// token cache's map of the report's ranks. Nothing for the report (the
-/// rank's entry is replaced in place; the poll-shaped copy the shared
-/// snapshot takes is built once per publish window) and nothing for the
+/// (each record after a rank's first), allocates nothing. Nothing for the
+/// report (the rank's entry is replaced in place; the poll-shaped copy the
+/// shared snapshot takes is built once per publish window), nothing for the
 /// `smg_engine_*` gauges, which the record sets through handles kept per
 /// worker and rank, for its own rank alone, so a worker's other ranks on
-/// file add nothing to a record's cost. The handles are kept once the
+/// file add nothing to a record's cost, and nothing for the DP-rank token
+/// cache, which a record does not feed. The handles are kept once the
 /// gateway's Prometheus recorder is installed, so the pin installs it.
 #[tokio::test(flavor = "current_thread")]
-async fn a_record_for_a_rank_on_file_allocates_for_the_rank_cache_alone() {
-    /// The DP-rank token cache's map of the report's ranks, per record.
-    const RANK_CACHE: usize = 1;
-
+async fn a_record_for_a_rank_on_file_allocates_nothing() {
     install_recorder();
     let monitor = monitor();
     let t0 = Instant::now();
@@ -167,12 +163,36 @@ async fn a_record_for_a_rank_on_file_allocates_for_the_rank_cache_alone() {
          {both_on_file} with two ranks on file, {second_rank} for a worker's second rank"
     );
     assert_eq!(
-        one_rank, RANK_CACHE,
-        "a record for the one rank of a worker on file: the rank cache's one, nothing for the gauges"
+        one_rank, 0,
+        "a record for the one rank of a worker on file: nothing for the report, the gauges or the rank cache"
     );
     assert_eq!(
-        both_on_file, RANK_CACHE,
+        both_on_file, 0,
         "two ranks on file: the record sets its own rank's gauges through kept handles and touches no other rank's"
+    );
+}
+
+/// The records of a batch the index applied (its blocks, its age, its
+/// disposition, the worker's index-blocks gauge and the apply time) go
+/// through handles kept per worker: after a worker's first batch they build
+/// no key and allocate nothing.
+#[test]
+fn a_batchs_records_for_a_worker_on_file_allocate_nothing() {
+    const WORKER: &str = "grpc://engine-a:9000";
+    install_recorder();
+    let batch = |blocks: usize| {
+        Metrics::record_kv_event_blocks(WORKER, "stored", blocks);
+        Metrics::record_kv_event_lag(WORKER, 0.002);
+        Metrics::record_kv_event_batch(WORKER, "applied");
+        Metrics::set_kv_index_blocks(WORKER, blocks);
+        Metrics::record_kv_event_apply(WORKER, 0.000_05);
+    };
+    batch(1);
+    let ((), calls) = allocations_during(|| batch(2));
+    eprintln!("applied batch: {calls} allocation calls for its five records");
+    assert_eq!(
+        calls, 0,
+        "a batch's records for a worker on file: no key, no label list"
     );
 }
 

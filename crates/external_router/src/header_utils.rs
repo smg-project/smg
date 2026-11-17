@@ -6,6 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderValue},
 };
 use http::header::HeaderName;
+use openai_protocol::messages::MessagesBetas;
 
 use crate::error::HEADER_X_SMG_ERROR_CODE;
 
@@ -64,16 +65,19 @@ pub fn extract_routing_key_hint(headers: Option<&HeaderMap>) -> Option<&str> {
     extract_routing_key_hint_named(headers, &HEADER_ROUTING_KEY)
 }
 
-/// Whether the request's `anthropic-beta` header names the beta `name`
-/// (its dated form, `name-YYYY-MM-DD`): the header may repeat, and each value
-/// may list several betas, comma separated.
+/// Whether the request's `anthropic-beta` header names the beta `name` in
+/// its dated form, `name-YYYY-MM-DD` (the reading of [`MessagesBetas`],
+/// without building the set): the header may repeat, and each value may list
+/// several betas, comma separated. A longer beta name that begins with
+/// `name` is another beta, not this one.
 pub fn anthropic_beta_named(headers: &HeaderMap, name: &str) -> bool {
-    headers
-        .get_all("anthropic-beta")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|beta| beta.trim().starts_with(name))
+    MessagesBetas::values_name(
+        headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+        name,
+    )
 }
 
 /// Declared size of the incoming raw body; pre-sizes reserialization buffers.
@@ -126,15 +130,19 @@ pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
 
 /// Convert headers from reqwest Response to axum HeaderMap.
 ///
-/// Filters out hop-by-hop and SMG-owned headers that must not be forwarded.
+/// Filters out hop-by-hop and SMG-owned headers that must not be forwarded, and
+/// the upstream's `server` header: the upstream's software and version are not the
+/// client's to read, and the gateway's own answers carry no `server` header.
 pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
     for (name, value) in reqwest_headers {
         // Use case-insensitive checks to avoid string allocation.
         if should_forward_header_no_alloc(name.as_str()) {
-            // The original name and value are already valid, so we can just clone them
-            headers.insert(name.clone(), value.clone());
+            // One pair per value: a header the upstream sent more than once
+            // (`set-cookie`, `vary`, `link`, `www-authenticate`) keeps every
+            // value, in order. The name and value are already valid: a clone.
+            headers.append(name.clone(), value.clone());
         }
     }
 
@@ -165,9 +173,15 @@ pub fn is_smg_owned_error_code_header(name: &str) -> bool {
     name.eq_ignore_ascii_case(HEADER_X_SMG_ERROR_CODE)
 }
 
-/// Determine if a header should be forwarded without allocating (case-insensitive)
-fn should_forward_header_no_alloc(name: &str) -> bool {
-    // List of headers that should NOT be forwarded (hop-by-hop or SMG error-code).
+/// Whether an upstream response header crosses the relay (case-insensitive, no allocation).
+///
+/// Every HTTP relay reads this one list: `preserve_response_headers` for the buffered
+/// and the OpenAI-style streamed answers, `anthropic::sse::build_sse_response` for the
+/// Messages streamed ones.
+pub(crate) fn should_forward_header_no_alloc(name: &str) -> bool {
+    // List of headers that should NOT be forwarded: hop-by-hop, the SMG error-code
+    // marker, and the upstream's `server` header, which names the upstream's software
+    // and version to every client while the gateway's own answers carry none.
     !(name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("keep-alive")
         || name.eq_ignore_ascii_case("proxy-authenticate")
@@ -178,6 +192,7 @@ fn should_forward_header_no_alloc(name: &str) -> bool {
         || name.eq_ignore_ascii_case("upgrade")
         || name.eq_ignore_ascii_case("content-encoding")
         || name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("server")
         || is_smg_owned_error_code_header(name))
 }
 
@@ -458,6 +473,54 @@ mod tests {
         assert!(!anthropic_beta_named(&headers, "threads"));
     }
 
+    /// The dated form alone is the beta: a longer beta name sharing the
+    /// prefix, the undated name, a malformed date and a date of the right
+    /// shape but the wrong length are not it.
+    #[test]
+    fn anthropic_beta_named_requires_the_dated_suffix() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("token-counting-2024-11-01, token-efficient-tools-2025-02-19"),
+        );
+        assert!(anthropic_beta_named(&headers, "token-counting"));
+        assert!(anthropic_beta_named(&headers, "token-efficient-tools"));
+        assert!(!anthropic_beta_named(&headers, "token"));
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("message-threads, message-threads-2026-8-12"),
+        );
+        assert!(!anthropic_beta_named(&headers, "message-threads"));
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("message-threads-2026-08-1, message-threads-2026-08-123"),
+        );
+        assert!(!anthropic_beta_named(&headers, "message-threads"));
+    }
+
+    #[test]
+    fn preserve_response_headers_keeps_every_value_of_a_repeated_header() {
+        let mut upstream = HeaderMap::new();
+        upstream.append("set-cookie", HeaderValue::from_static("a=1"));
+        upstream.append("set-cookie", HeaderValue::from_static("b=2"));
+        upstream.append("vary", HeaderValue::from_static("accept"));
+        upstream.append("vary", HeaderValue::from_static("origin"));
+        upstream.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let forwarded = preserve_response_headers(&upstream);
+
+        fn values<'a>(headers: &'a HeaderMap, name: &str) -> Vec<&'a str> {
+            headers
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect()
+        }
+        assert_eq!(values(&forwarded, "set-cookie"), ["a=1", "b=2"]);
+        assert_eq!(values(&forwarded, "vary"), ["accept", "origin"]);
+        assert_eq!(values(&forwarded, "content-type"), ["application/json"]);
+    }
+
     #[test]
     fn preserve_response_headers_drops_smg_owned_error_code() {
         let mut upstream = HeaderMap::new();
@@ -469,6 +532,35 @@ mod tests {
         assert!(forwarded.get(HEADER_X_SMG_ERROR_CODE).is_none());
         assert_eq!(forwarded.get("x-upstream-id").unwrap(), "worker-a");
         assert!(is_smg_owned_error_code_header("X-SMG-Error-Code"));
+    }
+
+    #[test]
+    fn preserve_response_headers_drops_the_upstream_server_header() {
+        let mut upstream = HeaderMap::new();
+        upstream.insert(
+            "Server",
+            HeaderValue::from_static("engine/1.2.3 Python/3.12"),
+        );
+        upstream.insert("connection", HeaderValue::from_static("keep-alive"));
+        upstream.insert("content-type", HeaderValue::from_static("application/json"));
+        upstream.insert("x-request-id", HeaderValue::from_static("req-7"));
+        upstream.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("41"),
+        );
+        upstream.insert("retry-after", HeaderValue::from_static("3"));
+
+        let forwarded = preserve_response_headers(&upstream);
+
+        assert!(forwarded.get("server").is_none());
+        assert!(forwarded.get("connection").is_none());
+        assert_eq!(forwarded.get("content-type").unwrap(), "application/json");
+        assert_eq!(forwarded.get("x-request-id").unwrap(), "req-7");
+        assert_eq!(
+            forwarded.get("x-ratelimit-remaining-requests").unwrap(),
+            "41"
+        );
+        assert_eq!(forwarded.get("retry-after").unwrap(), "3");
     }
 
     /// The tests' HTTP client, the process-level TLS crypto provider

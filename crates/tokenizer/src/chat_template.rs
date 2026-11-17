@@ -5,7 +5,7 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, io, iter,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -21,7 +21,7 @@ use chrono::{
 use minijinja::{
     machinery::{
         ast::{BinOpKind, Call, CallArg, Expr, ForLoop, IfCond, Macro, Set, Stmt, UnaryOpKind},
-        parse, WhitespaceConfig,
+        parse, tokenize, Token, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
     value::{DynObject, Enumerator, Kwargs, Object, ObjectRepr, ValueKind},
@@ -30,7 +30,7 @@ use minijinja::{
 use serde::Serialize;
 use serde_json::{self, ser::Formatter, Value as JsonValue};
 
-use crate::{encoders::marks, native::AddedTokens};
+use crate::{encoders::marks, native::AddedTokens, traits::SpecialTokens};
 
 /// Chat template content format
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -85,6 +85,28 @@ impl ThinkingKeyName {
             ThinkingKeyName::ReasoningEffort => "reasoning_effort",
         }
     }
+
+    /// The kwarg value that switches thinking on or off under this key: a
+    /// boolean, or the key's own words where the template compares strings.
+    fn value(self, thinking: bool) -> serde_json::Value {
+        match self {
+            ThinkingKeyName::EnableThinking | ThinkingKeyName::Thinking => {
+                serde_json::Value::Bool(thinking)
+            }
+            ThinkingKeyName::ReasoningEffort => serde_json::Value::String(
+                if thinking {
+                    REASONING_EFFORT_ON_VALUES[0]
+                } else {
+                    REASONING_EFFORT_OFF_VALUES[0]
+                }
+                .to_string(),
+            ),
+            // The tri-state key compares strings, not booleans.
+            ThinkingKeyName::ThinkingMode => {
+                serde_json::Value::String(if thinking { "enabled" } else { "disabled" }.to_string())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,7 +127,11 @@ pub enum ThinkingToggle {
 }
 
 /// Detect whether the chat template supports a thinking/reasoning toggle
-/// and what its default value is.
+/// and what its default value is. A `thinking` variable counts where the
+/// template's code reads it (`mentions_thinking_variable`), not where its
+/// prose prints the word. The default is read from the template's text: a
+/// state built from the template takes it only where the template's own
+/// renders do not say (`ChatTemplateState::rendered_thinking_default`).
 pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<ThinkingKeyName>) {
     if template.contains("think_begin_token")
         && template.contains("no_think")
@@ -171,8 +197,13 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
 /// thinking ...`, `thinking is ...`, `thinking == ...`, `set thinking ...`).
 /// The word must stand alone: `clear_thinking is defined` (GLM-5.3) or
 /// `thinking_mode`/`thinking_budget` name other variables, and a template
-/// that only reads those has no thinking switch.
+/// that only reads those has no thinking switch. Only the template's code
+/// is read (`jinja_code`): the MiniMax M3.1 template prints the prose
+/// "When thinking is enabled" from a string literal and branches on no
+/// variable, so it has no switch either.
 fn mentions_thinking_variable(template: &str) -> bool {
+    let code = jinja_code(template);
+    let template = code.as_str();
     template.match_indices("thinking").any(|(start, matched)| {
         let before = &template[..start];
         let after = &template[start + matched.len()..];
@@ -187,6 +218,35 @@ fn mentions_thinking_variable(template: &str) -> bool {
             || after.starts_with(" ==")
             || ((before.ends_with("if ") || before.ends_with("set ")) && after.starts_with(' '))
     })
+}
+
+/// The template's code with everything else blanked to spaces: the text the
+/// template prints (the data outside the blocks and inside a `{% raw %}`
+/// block) and the string literals; the comments never reach the lexer's
+/// tokens. Built from minijinja's own tokenizer, so a block ends where the
+/// lexer ends it (a nested dict literal's `}}` does not close a `{{ }}`
+/// block). A word of the result is a variable, a keyword or an operator the
+/// template evaluates; the words a template prints are not in it. A template
+/// the lexer refuses is read whole, as the detector read every template
+/// before this view.
+fn jinja_code(template: &str) -> String {
+    let mut code = vec![b' '; template.len()];
+    for item in tokenize(template, false, SyntaxConfig, WhitespaceConfig::default()) {
+        match item {
+            Ok((Token::TemplateData(_) | Token::Str(_) | Token::String(_), _)) => {}
+            Ok((_, span)) => {
+                let (start, end) = (span.start_offset as usize, span.end_offset as usize);
+                if let (Some(from), Some(to)) = (
+                    template.as_bytes().get(start..end),
+                    code.get_mut(start..end),
+                ) {
+                    to.copy_from_slice(from);
+                }
+            }
+            Err(_) => return template.to_string(),
+        }
+    }
+    String::from_utf8(code).unwrap_or_else(|_| template.to_string())
 }
 
 /// Detect the content format expected by a Jinja2 chat template
@@ -218,13 +278,16 @@ struct NotAName;
 
 /// The nodes of a template the engine's rule reads, in document order: each
 /// loop with the macros it sits in (outermost first), the assignments, the
-/// macros and the calls.
+/// macros and the calls; and every name the template reads.
 #[derive(Default)]
 struct Nodes<'a> {
     loops: Vec<(&'a ForLoop<'a>, Vec<&'a Macro<'a>>)>,
     sets: Vec<&'a Set<'a>>,
     macros: Vec<&'a Macro<'a>>,
     calls: Vec<&'a Call<'a>>,
+    /// Every name the template reads: a bare name anywhere in an expression
+    /// (see [`ChatTemplateState::reads`]).
+    names: HashSet<&'a str>,
 }
 
 impl<'a> Nodes<'a> {
@@ -313,9 +376,13 @@ impl<'a> Nodes<'a> {
                 macros.pop();
             }
             // A `{% call %}` block is a call with a body, not a macro of the
-            // template (jinja2 keeps the two apart).
+            // template (jinja2 keeps the two apart); its parameter defaults
+            // are expressions of the template, as a macro's are.
             Stmt::CallBlock(cb) => {
                 self.call(&cb.call);
+                for default in &cb.macro_decl.defaults {
+                    self.expr(default);
+                }
                 self.stmts(&cb.macro_decl.body, macros);
             }
             Stmt::Do(d) => self.call(&d.call),
@@ -343,7 +410,10 @@ impl<'a> Nodes<'a> {
 
     fn expr(&mut self, expr: &'a Expr<'a>) {
         match expr {
-            Expr::Var(_) | Expr::Const(_) => {}
+            Expr::Var(v) => {
+                self.names.insert(v.id);
+            }
+            Expr::Const(_) => {}
             Expr::Slice(s) => {
                 self.expr(&s.expr);
                 for bound in [&s.start, &s.stop, &s.step].into_iter().flatten() {
@@ -498,8 +568,7 @@ fn message_loop_vars<'a>(
 
 /// Whether the template has a loop over a message's content: the engine's
 /// `_iter_nodes_assign_content_item`, which decides its content format.
-fn iterates_message_content(ast: &Stmt<'_>) -> Result<bool, NotAName> {
-    let nodes = Nodes::of(ast);
+fn iterates_message_content(nodes: &Nodes<'_>) -> Result<bool, NotAName> {
     let messages_names = names_assigned_from(&nodes.sets, "messages")?;
     let message_vars = message_loop_vars(&nodes.loops, &messages_names)?;
     let is_message_content = |expr: &Expr<'_>| {
@@ -509,7 +578,7 @@ fn iterates_message_content(ast: &Stmt<'_>) -> Result<bool, NotAName> {
     };
 
     // The parameters of each macro that a call fills with a message's content.
-    let fed_params: Vec<(&Macro<'_>, std::collections::HashSet<&str>)> = nodes
+    let fed_params: Vec<(&Macro<'_>, HashSet<&str>)> = nodes
         .macros
         .iter()
         .map(|m| {
@@ -517,7 +586,7 @@ fn iterates_message_content(ast: &Stmt<'_>) -> Result<bool, NotAName> {
                 Some(Expr::Var(v)) => Some(v.id),
                 _ => None,
             };
-            let mut fed = std::collections::HashSet::new();
+            let mut fed = HashSet::new();
             for call in nodes
                 .calls
                 .iter()
@@ -794,31 +863,47 @@ impl ThinkDetector {
     }
 }
 
-/// Single-pass detection of content format, think-in-prefill, and thinking toggle.
-fn detect_all(
-    template: &str,
-) -> (
-    ChatTemplateContentFormat,
-    bool,
-    ThinkingToggle,
-    Option<ThinkingKeyName>,
-    bool,
-) {
+/// What a template's text says before it is compiled: the answers a
+/// [`ChatTemplateState`] keeps per template.
+#[derive(Default)]
+struct Detected {
+    content_format: ChatTemplateContentFormat,
+    think_in_prefill: bool,
+    thinking_toggle: ThinkingToggle,
+    thinking_key_name: Option<ThinkingKeyName>,
+    prefill_opens_think_block: bool,
+    /// Every name the template reads (see [`ChatTemplateState::reads`]);
+    /// `None` where the template did not parse, the names being unknown.
+    names_read: Option<HashSet<String>>,
+}
+
+/// Single-pass detection of content format, think-in-prefill, thinking toggle
+/// and the names read.
+fn detect_all(template: &str) -> Detected {
     let (thinking_toggle, thinking_key_name) = detect_thinking_toggle(template);
-    let (content_format, think_in_prefill, prefill_opens_think_block) =
+    let (content_format, think_in_prefill, prefill_opens_think_block, names_read) =
         detect_all_with_ast(template);
-    (
+    Detected {
         content_format,
         think_in_prefill,
         thinking_toggle,
         thinking_key_name,
         prefill_opens_think_block,
-    )
+        names_read,
+    }
 }
 
-/// AST detection of content format, think-in-prefill and whether the
-/// generation prompt leaves a think block open.
-fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool, bool) {
+/// AST detection of content format, think-in-prefill, whether the generation
+/// prompt leaves a think block open, and the names the template reads
+/// (`None` where it did not parse).
+fn detect_all_with_ast(
+    template: &str,
+) -> (
+    ChatTemplateContentFormat,
+    bool,
+    bool,
+    Option<HashSet<String>>,
+) {
     let template = plain_generation_blocks(template);
     let ast = match parse(
         &template,
@@ -827,15 +912,22 @@ fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool, bool
         WhitespaceConfig::default(),
     ) {
         Ok(ast) => ast,
-        Err(_) => return (ChatTemplateContentFormat::String, false, false),
+        Err(_) => return (ChatTemplateContentFormat::String, false, false, None),
     };
 
-    let content_format = match iterates_message_content(&ast) {
+    let nodes = Nodes::of(&ast);
+    let content_format = match iterates_message_content(&nodes) {
         Ok(true) => ChatTemplateContentFormat::OpenAI,
         Ok(false) | Err(NotAName) => ChatTemplateContentFormat::String,
     };
+    let names_read = Some(nodes.names.iter().map(|name| (*name).to_string()).collect());
     let (think_in_prefill, prefill_opens_think_block) = ThinkDetector::run(&ast);
-    (content_format, think_in_prefill, prefill_opens_think_block)
+    (
+        content_format,
+        think_in_prefill,
+        prefill_opens_think_block,
+        names_read,
+    )
 }
 
 /// Parameters for chat template application
@@ -847,7 +939,7 @@ pub struct ChatTemplateParams<'a> {
     pub template_kwargs: Option<&'a HashMap<String, serde_json::Value>>,
     /// Special tokens to inject into the template context.
     /// Many templates reference `{{ bos_token }}`, `{{ eos_token }}`, etc.
-    pub special_tokens: Option<&'a crate::traits::SpecialTokens>,
+    pub special_tokens: Option<&'a SpecialTokens>,
     /// Resolved thinking preference. When `Some`, `apply` sets the template's
     /// own thinking-toggle key (`enable_thinking`/`thinking`, per detection) to
     /// this value as a default. An explicit `template_kwargs` entry for that
@@ -1138,7 +1230,7 @@ const TOJSON_BUFFER_BYTES: usize = 1024;
 /// JSON separator pair passed through HuggingFace's `tojson` filter. The
 /// defaults are the static bytes; only a `separators` argument owns its own.
 #[derive(Debug, Clone)]
-struct JsonSeparators {
+pub(crate) struct JsonSeparators {
     item: Cow<'static, [u8]>,
     key: Cow<'static, [u8]>,
 }
@@ -1147,7 +1239,7 @@ impl JsonSeparators {
     /// Python's defaults: `(', ', ': ')` for compact output and `(',', ': ')`
     /// when an indent was given (`pretty`), whatever the indent is: an empty
     /// one still puts every item on its own line.
-    fn python_default(pretty: bool) -> Self {
+    pub(crate) fn python_default(pretty: bool) -> Self {
         let item: &'static [u8] = if pretty { b"," } else { b", " };
         Self {
             item: Cow::Borrowed(item),
@@ -1179,6 +1271,23 @@ impl<'a> PythonJsonFormatter<'a> {
             separators,
             ensure_ascii,
         }
+    }
+
+    /// One more array item or object key: the item separator before every
+    /// item but the first, then, with an indent, a line break and the
+    /// indentation. Python's `json.dumps` begins the two the same way.
+    fn begin_item<W>(&self, writer: &mut W, first: bool) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        if !first {
+            writer.write_all(&self.separators.item)?;
+        }
+        if let Some(indent) = self.indent {
+            writer.write_all(b"\n")?;
+            write_indent(writer, self.current_indent, indent)?;
+        }
+        Ok(())
     }
 }
 
@@ -1266,19 +1375,7 @@ impl Formatter for PythonJsonFormatter<'_> {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent {
-            if first {
-                writer.write_all(b"\n")?;
-            } else {
-                writer.write_all(&self.separators.item)?;
-                writer.write_all(b"\n")?;
-            }
-            write_indent(writer, self.current_indent, indent)
-        } else if first {
-            Ok(())
-        } else {
-            writer.write_all(&self.separators.item)
-        }
+        self.begin_item(writer, first)
     }
 
     fn end_array_value<W>(&mut self, _writer: &mut W) -> io::Result<()>
@@ -1318,19 +1415,7 @@ impl Formatter for PythonJsonFormatter<'_> {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent {
-            if first {
-                writer.write_all(b"\n")?;
-            } else {
-                writer.write_all(&self.separators.item)?;
-                writer.write_all(b"\n")?;
-            }
-            write_indent(writer, self.current_indent, indent)
-        } else if first {
-            Ok(())
-        } else {
-            writer.write_all(&self.separators.item)
-        }
+        self.begin_item(writer, first)
     }
 
     fn begin_object_value<W>(&mut self, writer: &mut W) -> io::Result<()>
@@ -1423,7 +1508,10 @@ fn parse_separators(
     })
 }
 
-fn serialize_with_python_json<T: Serialize>(
+/// Python's `json.dumps` of `value` through the formatter the `tojson` filter
+/// and the prompt encoders share: `indent`, `separators` and `ensure_ascii` as
+/// the filter reads them.
+pub(crate) fn serialize_with_python_json<T: Serialize>(
     value: &T,
     indent: Option<&[u8]>,
     separators: JsonSeparators,
@@ -1446,12 +1534,6 @@ fn serialize_with_python_json<T: Serialize>(
             format!("Invalid UTF-8 in JSON output: {e}"),
         )
     })
-}
-
-/// Compact JSON spelling shared by the Jinja filter and native renderers.
-pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
-    serialize_with_python_json(value, None, JsonSeparators::python_default(false), false)
-        .map_err(Into::into)
 }
 
 /// Whether a filter call passed no keyword argument at all. `Kwargs::args`
@@ -1555,8 +1637,46 @@ fn sort_json_keys(value: &JsonValue) -> JsonValue {
 /// Hugging Face chat-template helper for surfacing model-authored validation
 /// errors instead of a generic "unknown function" render failure.
 fn raise_exception(message: String) -> std::result::Result<String, MinijinjaError> {
-    Err(MinijinjaError::new(ErrorKind::InvalidOperation, message))
+    Err(MinijinjaError::new(ErrorKind::InvalidOperation, message).with_source(RaisedByTemplate))
 }
+
+/// The source of the error [`raise_exception`] returns. The template engine
+/// reports an operation it could not run under the same kind, so the kind
+/// alone does not say that the template refused its input on purpose; this
+/// source does.
+#[derive(Debug)]
+struct RaisedByTemplate;
+
+impl std::fmt::Display for RaisedByTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("raised by the template")
+    }
+}
+
+impl std::error::Error for RaisedByTemplate {}
+
+/// A render the template itself refused through `raise_exception`: the helper
+/// a template's author calls to reject a conversation the template cannot
+/// format (roles out of order, a field it needs). The caller's input is at
+/// fault; any other render failure may be the template's own. The text is the
+/// render failure's, as every render failure reads.
+#[derive(Debug)]
+pub struct TemplateRefusal(String);
+
+impl TemplateRefusal {
+    /// Whether `error` is this refusal, at any depth of its chain.
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<Self>())
+    }
+}
+
+impl std::fmt::Display for TemplateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TemplateRefusal {}
 
 /// Transformers' `{% generation %}` ... `{% endgeneration %}` block marks the
 /// assistant tokens for a training mask and renders its body unchanged; the
@@ -1731,12 +1851,31 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     env.add_filter("lower", python_lower_filter);
     env.add_filter("capitalize", python_capitalize_filter);
     env.add_filter("title", python_title_filter);
+    // Jinja2's `random` filter draws one element of a sequence or one character
+    // of a string, afresh on every render, as the reference renderer draws it: a
+    // template that draws a nonce after every role renders here too, its bytes
+    // its own on each render by design. minijinja-contrib's filter also seeds
+    // from a `RAND_SEED` integer in the render context, which a request's
+    // `chat_template_kwargs` can supply; Jinja2's has no such seed.
+    env.add_filter("random", python_random_filter);
     env.add_function("raise_exception", raise_exception);
     // Jinja2's dict() also builds a map from key/value pairs; minijinja's takes a mapping only
     env.add_function("dict", dict_function);
     env.add_test("iterable", is_iterable);
 
     Ok(env)
+}
+
+/// Jinja2's `random` filter is `random.choice(seq)`, a draw from any sized
+/// sequence; minijinja-contrib's draws from a sequence or a string, so an
+/// iterable (minijinja's `range()`, capped at 100,000 items) is drawn from as
+/// its items.
+fn python_random_filter(state: &State, value: &Value) -> Result<Value, MinijinjaError> {
+    if value.kind() == ValueKind::Iterable {
+        let items: Vec<Value> = value.try_iter()?.collect();
+        return minijinja_contrib::filters::random(state, &Value::from(items));
+    }
+    minijinja_contrib::filters::random(state, value)
 }
 
 /// `str(value)` as Jinja2's string filters apply it: a string is itself, a
@@ -2574,8 +2713,18 @@ fn render_messages<'a>(
     // Render into a buffer sized by the last render through this template:
     // the text grows past no capacity on the way.
     let mut rendered = Vec::with_capacity(output_len.hint());
-    tmpl.render_captured_to(&ctx, &mut rendered)
-        .map_err(|e| anyhow!("Failed to render template: {e}"))?;
+    tmpl.render_captured_to(&ctx, &mut rendered).map_err(|e| {
+        let message = format!("Failed to render template: {e}");
+        // The template's own refusal keeps its type, at any depth of the
+        // error's sources (a macro or an include wraps it).
+        let raised = iter::successors(std::error::Error::source(&e), |cause| cause.source())
+            .any(|cause| cause.is::<RaisedByTemplate>());
+        if raised {
+            anyhow::Error::new(TemplateRefusal(message))
+        } else {
+            anyhow!(message)
+        }
+    })?;
     let mut rendered = String::from_utf8(rendered)
         .map_err(|e| anyhow!("Failed to render template: the output is not UTF-8: {e}"))?;
     output_len.record(rendered.len());
@@ -2933,7 +3082,9 @@ pub struct ChatTemplateState {
     /// Cached, fully-configured environment. `None` when no template is set.
     env: Option<Environment<'static>>,
     content_format: ChatTemplateContentFormat,
-    /// Thinking toggle support detected from the template.
+    /// The template's thinking switch and its default: what the template
+    /// renders with the switch absent, or the text matcher's answer where
+    /// the renders do not say (see `rendered_thinking_default`).
     thinking_toggle: ThinkingToggle,
     /// The variable name used for the thinking toggle (if any).
     thinking_key_name: Option<ThinkingKeyName>,
@@ -2974,6 +3125,9 @@ pub struct ChatTemplateState {
     /// The templates are compiled with their control spellings marked (see
     /// [`Self::mark_controls`]).
     marked: bool,
+    /// Every name the default template reads (see [`Self::reads`]); `None`
+    /// where the template did not parse, the names being unknown.
+    names_read: Option<HashSet<String>>,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -2991,13 +3145,14 @@ impl std::fmt::Debug for ChatTemplateState {
 
 impl ChatTemplateState {
     pub fn new(template: Option<String>) -> Result<Self> {
-        let (
+        let Detected {
             content_format,
             think_in_prefill,
             thinking_toggle,
             thinking_key_name,
             prefill_opens_think_block,
-        ) = template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
+            names_read,
+        } = template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
         let developer_role_supported = template
             .as_deref()
             .is_none_or(detect_developer_role_support);
@@ -3017,8 +3172,9 @@ impl ChatTemplateState {
             output_len: RenderedLength::default(),
             processor: None,
             marked: false,
+            names_read,
         };
-        state.raw_tool_call_arguments = state.writes_tool_call_arguments_as_text();
+        state.settle_by_behaviour();
         Ok(state)
     }
 
@@ -3153,6 +3309,7 @@ impl ChatTemplateState {
             output_len: RenderedLength::default(),
             processor: None,
             marked: false,
+            names_read: None,
         }
     }
 
@@ -3281,24 +3438,7 @@ impl ChatTemplateState {
                 .is_none_or(|k| !k.contains_key(kwarg_key))
             {
                 let mut kwargs = params.template_kwargs.cloned().unwrap_or_default();
-                let value = match key {
-                    ThinkingKeyName::EnableThinking | ThinkingKeyName::Thinking => {
-                        serde_json::Value::Bool(thinking)
-                    }
-                    ThinkingKeyName::ReasoningEffort => serde_json::Value::String(
-                        if thinking {
-                            REASONING_EFFORT_ON_VALUES[0]
-                        } else {
-                            REASONING_EFFORT_OFF_VALUES[0]
-                        }
-                        .to_string(),
-                    ),
-                    // The tri-state key compares strings, not booleans.
-                    ThinkingKeyName::ThinkingMode => serde_json::Value::String(
-                        if thinking { "enabled" } else { "disabled" }.to_string(),
-                    ),
-                };
-                kwargs.insert(kwarg_key.to_string(), value);
+                kwargs.insert(kwarg_key.to_string(), key.value(thinking));
                 let params = ChatTemplateParams {
                     template_kwargs: Some(&kwargs),
                     thinking: None,
@@ -3363,13 +3503,14 @@ impl ChatTemplateState {
     }
 
     pub fn set(&mut self, template: String) -> Result<()> {
-        let (
+        let Detected {
             content_format,
             think_in_prefill,
             thinking_toggle,
             thinking_key_name,
             prefill_opens_think_block,
-        ) = detect_all(&template);
+            names_read,
+        } = detect_all(&template);
         let developer_role_supported = detect_developer_role_support(&template);
         let root_role_supported = detect_root_role_support(&template);
         let env = build_environment(template)?;
@@ -3380,12 +3521,13 @@ impl ChatTemplateState {
         self.thinking_key_name = thinking_key_name;
         self.think_in_prefill = think_in_prefill;
         self.prefill_opens_think_block = prefill_opens_think_block;
+        self.names_read = names_read;
         self.env = Some(env);
         // A replacement template stands alone, as a template file does.
         self.tool_use = None;
         self.processor = None;
         self.marked = false;
-        self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
+        self.settle_by_behaviour();
         Ok(())
     }
 
@@ -3419,6 +3561,30 @@ impl ChatTemplateState {
 
     pub fn think_in_prefill(&self) -> bool {
         self.think_in_prefill
+    }
+
+    /// Whether a render through this state can read the name `name`: the
+    /// default template reads it, or an alternate a request may render through
+    /// does (the `tool_use` one, the processor's). The gateway hands the
+    /// template a request control (`tool_choice`, `response_format`) under its
+    /// name only when the template reads it: one no template reads cannot
+    /// reach the prompt. Without a template every name reads as read, there
+    /// being nothing to leave it out of; so does a template whose names are
+    /// not known (one the detector could not parse).
+    pub fn reads(&self, name: &str) -> bool {
+        self.env.is_none()
+            || self
+                .names_read
+                .as_ref()
+                .is_none_or(|names| names.contains(name))
+            || self
+                .tool_use
+                .as_ref()
+                .is_some_and(|state| state.reads(name))
+            || self
+                .processor
+                .as_ref()
+                .is_some_and(|state| state.reads(name))
     }
 
     /// Whether the generation prompt opens a `<think>` block it does not
@@ -3472,6 +3638,50 @@ impl ChatTemplateState {
             self.apply(&messages, ChatTemplateParams::default()).is_ok()
         };
         renders(serde_json::json!("{\"probe\": 1}")) && !renders(serde_json::json!({"probe": 1}))
+    }
+
+    /// Decide the thinking switch's default by the template's behaviour, not
+    /// its source: one bare user turn with the generation prompt, rendered
+    /// with the switch absent, on and off, at one instant (a template may
+    /// write the time). The absent render is the default:
+    /// on where it equals the on render alone, off where it equals the off
+    /// render alone. `None` where the renders do not say, and the text
+    /// matcher's answer stands ([`detect_thinking_toggle`]): a template with
+    /// no switch, a bare turn that does not render, a switch that moves
+    /// nothing on a bare turn, an absent render that is a prompt of its own.
+    fn rendered_thinking_default(&self) -> Option<ThinkingToggle> {
+        let key = self.thinking_key_name?;
+        let messages = [serde_json::json!({"role": "user", "content": "probe"})];
+        // One instant for the three renders: a template that writes the time
+        // (`strftime_now`) must not tell them apart by the clock alone.
+        let now = render_instant();
+        let render = |thinking: Option<bool>| {
+            let kwargs = thinking
+                .map(|thinking| HashMap::from([(key.as_kwarg().to_string(), key.value(thinking))]));
+            let params = ChatTemplateParams {
+                add_generation_prompt: true,
+                template_kwargs: kwargs.as_ref(),
+                now: Some(now),
+                ..Default::default()
+            };
+            self.apply(&messages, params).ok()
+        };
+        let (absent, on, off) = (render(None)?, render(Some(true))?, render(Some(false))?);
+        match (absent == on, absent == off) {
+            (true, false) => Some(ThinkingToggle::DefaultOn),
+            (false, true) => Some(ThinkingToggle::DefaultOff),
+            _ => None,
+        }
+    }
+
+    /// The answers read from the template's behaviour once its environment
+    /// is in place: how it writes a history tool call's arguments, and the
+    /// thinking switch's default where its renders say it.
+    fn settle_by_behaviour(&mut self) {
+        self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
+        if let Some(default) = self.rendered_thinking_default() {
+            self.thinking_toggle = default;
+        }
     }
 }
 

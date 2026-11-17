@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use llm_multimodal::Modality;
 use llm_tokenizer::traits::{PromptEncoding, Tokenizer};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     routers::{
@@ -129,6 +129,16 @@ pub(crate) async fn prepare_rendered_prompt(
                 model_id,
                 wire_pools,
             );
+            // The byte bound the pixels must fit before any image is decoded,
+            // where every worker the selection can pick takes them inline in
+            // the gateway's own Generate message; none where any may take
+            // them beside it (an SHM handle, the RDMA lane, a TRT-LLM
+            // worker's file bytes, a ZMQ wire), and the framing itself answers.
+            let image_wire_cap = multimodal::mm_image_wire_cap_over(
+                &ctx.components.worker_registry,
+                model_id,
+                wire_pools,
+            );
             // The frames decode under the destination engine's own
             // transparency rule, resolved over the same pools as the dtype.
             let transparency = multimodal::engine_transparency_policy(
@@ -149,6 +159,7 @@ pub(crate) async fn prepare_rendered_prompt(
                 &tokenizer_id,
                 &tokenizer_source,
                 image_wire_dtype,
+                image_wire_cap,
                 transparency,
                 encoder_budget,
             )
@@ -164,12 +175,27 @@ pub(crate) async fn prepare_rendered_prompt(
                     multimodal_intermediate = Some(output.intermediate);
                 }
                 Err(e) => {
+                    let response = multimodal::processing_failed_response(&e);
+                    // The request's own media, by an explicit verdict, is the
+                    // client's to fix: one WARN with the cause, the answer
+                    // marked reported. Every other failure keeps ERROR and
+                    // stays unmarked: the media host's, this process's, and
+                    // one with no verdict, whose 400 also covers a model
+                    // configuration this host could not load.
+                    if multimodal::is_request_media_fault(&e) {
+                        warn!(
+                            function = stage,
+                            error = %format!("{e:#}"),
+                            "Multimodal processing failed"
+                        );
+                        return Err(utils::reported(response));
+                    }
                     error!(
                         function = stage,
-                        error = %multimodal::processing_failed_message(&e),
+                        error = %format!("{e:#}"),
                         "Multimodal processing failed"
                     );
-                    return Err(multimodal::processing_failed_response(&e));
+                    return Err(response);
                 }
             }
         }
@@ -194,9 +220,12 @@ mod tests {
         TokenizerRegistry,
     };
     use openai_protocol::{chat::ChatCompletionRequest, worker::MmProcessingMode};
+    use tracing::Level;
 
     use super::prepare_rendered_prompt;
     use crate::{
+        middleware::ReportedRefusal,
+        observability::logging::test_support::{test_subscriber, LinesAtWarnOrAbove},
         routers::{
             common::placement::PipelinePin,
             grpc::{
@@ -206,6 +235,7 @@ mod tests {
                     MultimodalConfigRegistry, MultimodalSettings, PlaceholderTokens,
                 },
                 regular::stages::testing::components_over,
+                testing::unreadable_model_dir,
                 utils::MediaContext,
             },
         },
@@ -241,7 +271,7 @@ mod tests {
     fn media(mode: MmProcessingMode, placeholders: PlaceholderTokens) -> MediaContext {
         media_for(
             MediaPlan::new([MediaContentPart::ImageUrl {
-                url: "https://a/1.png".to_string(),
+                url: "https://a/1.png".to_string().into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
@@ -307,6 +337,45 @@ mod tests {
         );
     }
 
+    /// A processing failure with no verdict that the request's media is at
+    /// fault (here, a model whose `config.json` does not parse) keeps the
+    /// stage's ERROR line and stays unmarked, though its answer is a 400.
+    #[tokio::test]
+    async fn a_processing_failure_with_no_client_verdict_keeps_the_error_line() {
+        // The media context names where the model's configuration is looked
+        // for: a local directory, alive to the end of the test, so the load
+        // fails on this host, with no fetch.
+        let model_dir = unreadable_model_dir();
+        let (mut ctx, tokenizer) = context().await;
+        let mut placeholders = PlaceholderTokens::default();
+        placeholders.insert(Modality::Image, "token".to_string());
+        let mut media = media(MmProcessingMode::Router, placeholders);
+        media.tokenizer_source = model_dir.path().to_str().unwrap().to_string();
+        let lines = LinesAtWarnOrAbove::default();
+        let _subscriber = test_subscriber(lines.clone());
+
+        let Err(response) = prepare_rendered_prompt(
+            &mut ctx,
+            &tokenizer,
+            "Hello token",
+            PromptEncoding::FromText,
+            Some(media),
+            &[],
+            "test",
+        )
+        .await
+        else {
+            panic!("media of a model without a media config is refused");
+        };
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.extensions().get::<ReportedRefusal>().is_none());
+        assert_eq!(
+            lines.lines(),
+            [(Level::ERROR, "Multimodal processing failed".to_string())]
+        );
+    }
+
     /// Media a worker processes itself leaves as references: the tokens are
     /// the renderer's, no intermediate is built, and the pipeline pin the
     /// worker selection reads is set from the plan. The plan is an audio
@@ -318,7 +387,7 @@ mod tests {
         let placeholders = PlaceholderTokens::worker_only();
         let media = media_for(
             MediaPlan::new([MediaContentPart::AudioUrl {
-                url: "https://a/1.wav".to_string(),
+                url: "https://a/1.wav".to_string().into(),
                 uuid: None,
             }]),
             MmProcessingMode::Worker,

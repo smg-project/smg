@@ -30,9 +30,9 @@ pub use super::deepseek_v32::ThinkingMode;
 use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
-        has_tools, merge_tool_messages, push_tools_and_response_format, render_v4_tools_template,
-        sort_tool_results_by_call_order, task_sp_token, text, to_json, tool_schemas, DsmlTags,
-        IncomingBlocks, Turn,
+        has_tools, merge_tool_messages, push_tools_and_response_format, render_system_message,
+        render_v4_tools_template, sort_tool_results_by_call_order, task_sp_token, text, to_json,
+        tool_schemas, DsmlTags, IncomingBlocks, Turn,
     },
     truthy, RendererProfile,
 };
@@ -93,7 +93,7 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // `thinking: false` (or the engine's `enable_thinking` alias, see the
     // capabilities) turns it off.
     thinking_toggle: ThinkingToggle::DefaultOn,
-    thinking_key_name: ThinkingKeyName::Thinking,
+    thinking_key_name: Some(ThinkingKeyName::Thinking),
     native_effort_values: NATIVE_EFFORT_VALUES,
     // Switches off on the protocol's `none` / `minimal`: no words of its own.
     native_effort_off_values: &[],
@@ -490,13 +490,7 @@ fn render_system(turn: &Turn<'_>, prompt: &mut String) {
     if turn.index > 0 {
         prompt.push_str(SYSTEM);
     }
-    prompt.push_str(turn.content);
-    push_tools_and_response_format(
-        prompt,
-        turn.tools.as_deref(),
-        turn.response_format,
-        render_tools,
-    );
+    render_system_message(prompt, turn, render_tools);
 }
 
 /// A developer turn renders as a user turn; an empty one is refused.
@@ -765,6 +759,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{super::deepseek_common::object_arguments_render_one_parameter_per_key_through, *};
+    use crate::chat_template::developer_messages_as_system;
 
     fn user(q: &str) -> Value {
         json!({ "role": "user", "content": q })
@@ -1239,7 +1234,7 @@ mod tests {
             // encoder drops the message or writes a user turn: the tests
             // above); the fold stays here so those recordings still describe
             // the system path they took.
-            if let Some(rewritten) = crate::chat_template::developer_messages_as_system(&messages) {
+            if let Some(rewritten) = developer_messages_as_system(&messages) {
                 messages = rewritten;
             }
 

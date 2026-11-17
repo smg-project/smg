@@ -41,6 +41,7 @@ pub(super) async fn generate(
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
+    req.lora_id = state.loras.resolve(&req.lora_id)?;
     if req.return_hidden_states {
         refuse_hidden_states_above_cap(&state.model)?;
     }

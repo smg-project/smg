@@ -26,9 +26,10 @@ pub(crate) fn describe_error(error: &dyn std::error::Error) -> String {
 
 /// Logical column names for the responses table, in canonical SELECT order.
 ///
-/// Shared between Oracle and Postgres backends to build dynamic SELECT queries.
-/// The order here doesn't affect correctness (both backends read by name, not
-/// position), but having a single source prevents accidental divergence.
+/// The one list of the table's columns: the Oracle and Postgres backends build
+/// their SELECT base from it (both read by name, so the order is a convention),
+/// and the schema validation reads it as the core columns an extra column may
+/// not shadow and a skipped column has to be one of.
 pub(super) const RESPONSE_COLUMNS: &[&str] = &[
     "id",
     "conversation_id",
@@ -167,6 +168,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::schema::ColumnDef;
 
     #[test]
     fn describe_error_prints_the_sources_once() {
@@ -280,14 +282,14 @@ mod tests {
         let mut tc = TableConfig::with_table("t");
         tc.extra_columns.insert(
             "TENANT_ID".to_string(),
-            crate::schema::ColumnDef {
+            ColumnDef {
                 sql_type: "VARCHAR(128)".to_string(),
                 default_value: None,
             },
         );
         tc.extra_columns.insert(
             "EXPIRES_AT".to_string(),
-            crate::schema::ColumnDef {
+            ColumnDef {
                 sql_type: "TIMESTAMP".to_string(),
                 default_value: None,
             },
@@ -304,14 +306,14 @@ mod tests {
         let mut tc = TableConfig::with_table("t");
         tc.extra_columns.insert(
             "z_col".to_string(),
-            crate::schema::ColumnDef {
+            ColumnDef {
                 sql_type: "TEXT".to_string(),
                 default_value: None,
             },
         );
         tc.extra_columns.insert(
             "a_col".to_string(),
-            crate::schema::ColumnDef {
+            ColumnDef {
                 sql_type: "TEXT".to_string(),
                 default_value: None,
             },
@@ -324,12 +326,10 @@ mod tests {
 
     #[test]
     fn resolve_extra_values_prefers_hook_over_default() {
-        use crate::hooks::ExtraColumns;
-
         let mut tc = TableConfig::with_table("t");
         tc.extra_columns.insert(
             "TENANT_ID".to_string(),
-            crate::schema::ColumnDef {
+            ColumnDef {
                 sql_type: "VARCHAR(128)".to_string(),
                 default_value: Some(json!("default_tenant")),
             },
@@ -346,12 +346,10 @@ mod tests {
 
     #[test]
     fn resolve_extra_values_falls_back_to_default() {
-        use crate::hooks::ExtraColumns;
-
         let mut tc = TableConfig::with_table("t");
         tc.extra_columns.insert(
             "TENANT_ID".to_string(),
-            crate::schema::ColumnDef {
+            ColumnDef {
                 sql_type: "VARCHAR(128)".to_string(),
                 default_value: Some(json!("default_tenant")),
             },
@@ -364,12 +362,10 @@ mod tests {
 
     #[test]
     fn resolve_extra_values_returns_none_when_no_value() {
-        use crate::hooks::ExtraColumns;
-
         let mut tc = TableConfig::with_table("t");
         tc.extra_columns.insert(
             "TENANT_ID".to_string(),
-            crate::schema::ColumnDef {
+            ColumnDef {
                 sql_type: "VARCHAR(128)".to_string(),
                 default_value: None,
             },
@@ -382,12 +378,10 @@ mod tests {
 
     #[test]
     fn resolve_extra_values_skips_null_hook_values() {
-        use crate::hooks::ExtraColumns;
-
         let mut tc = TableConfig::with_table("t");
         tc.extra_columns.insert(
             "TENANT_ID".to_string(),
-            crate::schema::ColumnDef {
+            ColumnDef {
                 sql_type: "VARCHAR(128)".to_string(),
                 default_value: Some(json!("fallback")),
             },
@@ -422,7 +416,7 @@ mod tests {
         let mut cfg = SchemaConfig::default();
         cfg.responses.extra_columns.insert(
             "tenant_id".to_string(),
-            crate::schema::ColumnDef {
+            ColumnDef {
                 sql_type: "TEXT".to_string(),
                 default_value: None,
             },
@@ -472,7 +466,7 @@ mod tests {
 
         cfg.responses.extra_columns.insert(
             "TENANT_ID".to_string(),
-            crate::schema::ColumnDef {
+            ColumnDef {
                 sql_type: "VARCHAR2(128)".to_string(),
                 default_value: Some(json!("default_tenant")),
             },
@@ -547,8 +541,6 @@ mod tests {
 
     #[test]
     fn skip_columns_and_extra_columns_together() {
-        use crate::{hooks::ExtraColumns, schema::ColumnDef};
-
         let mut cfg = SchemaConfig::default();
         cfg.responses
             .skip_columns
@@ -623,8 +615,6 @@ mod tests {
 
     #[test]
     fn column_remapping_with_skip_and_extra() {
-        use crate::schema::ColumnDef;
-
         let mut cfg = SchemaConfig::default();
         // Rename table
         cfg.responses.table = "my_responses".to_string();
@@ -699,8 +689,6 @@ mod tests {
 
     #[test]
     fn extra_columns_in_insert_column_list() {
-        use crate::{hooks::ExtraColumns, schema::ColumnDef};
-
         let mut cfg = SchemaConfig::default();
         // Remap id → resp_id
         cfg.responses

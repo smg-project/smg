@@ -6,7 +6,10 @@ use std::{
     time::Duration,
 };
 
-use crate::engine::{Calibration, EngineParams, KvCacheGroup, LoadsLike, OutputSeed, TimingModel};
+use crate::{
+    engine::{Calibration, EngineParams, KvCacheGroup, LoadsLike, OutputSeed, TimingModel},
+    kv_zmq::{KvZmqConfig, Wire},
+};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -78,6 +81,14 @@ pub struct Config {
     pub realistic: bool,
     /// Engine-simulator parameters (only used when `realistic`).
     pub engine: EngineParams,
+    /// Per-worker KV pools in tokens, in place of the fleet's
+    /// (`--worker-kv-tokens`), keyed by the worker's name as it registers
+    /// itself (`grpc:<port>`, `http:<port>`, `zmq:<index>`; a data-parallel
+    /// worker's ranks share its entry).
+    pub worker_kv_tokens: BTreeMap<String, u64>,
+    /// Per-worker pass-time scales (`--worker-pass-time-scale`,
+    /// [`EngineParams::pass_time_scale`]), keyed the same way.
+    pub worker_pass_time_scale: BTreeMap<String, f64>,
     /// Extra `server_args` entries the gRPC `GetServerInfo` advertises, as
     /// string values (e.g. `rl.control_url`). Empty leaves `server_args` unset.
     pub server_args: BTreeMap<String, String>,
@@ -110,7 +121,7 @@ pub struct Config {
     /// Batches each publisher keeps for replay.
     pub kv_events_buffer_steps: usize,
     /// Which engine's wire the publishers speak.
-    pub kv_events_wire: crate::kv_zmq::Wire,
+    pub kv_events_wire: Wire,
     /// Which backend's load report the workers imitate (`GetLoads`, `/v1/loads`).
     pub loads_like: LoadsLike,
     /// What the load record says of the mock's wire: `true` imitates an
@@ -118,7 +129,8 @@ pub struct Config {
     /// batches), `false` (the default) a wire that carries token batches
     /// only, whose silence the gateway judges against its prefill bound.
     pub step_reports: bool,
-    /// The HTTP or gRPC workers' role in a disaggregated fleet
+    /// The role of a process's HTTP workers alone, or of its gRPC workers
+    /// and ZMQ ranks together, in a disaggregated fleet
     /// (`--worker-type`): a prefill worker answers every request with the
     /// prompt side's completion alone and binds its bootstrap port, a decode
     /// worker generates as a regular one, an encode worker answers the
@@ -127,15 +139,18 @@ pub struct Config {
     /// the TokenSpeed gRPC wire's encoder service); each advertises the role
     /// in its
     /// server info as the engines do (`disaggregation_mode`, or `kv_role`
-    /// and `ec_role` behind their connectors on the vLLM wire). One process
-    /// gives the role to one wire's workers; the ZMQ workers take none.
-    /// `None` is a regular worker.
+    /// and `ec_role` behind their connectors on the vLLM wire; the ZMQ ranks
+    /// declare it in their handshake). One process gives the role to its HTTP
+    /// workers alone or to its gRPC workers and ZMQ ranks together, the encode
+    /// role to the gRPC wire's alone. `None` is a regular worker.
     pub role: Option<Role>,
     /// First bootstrap port of the prefill or encode workers
-    /// (`--bootstrap-base-port`): worker `i` binds `base + i`, where a
+    /// (`--bootstrap-base-port`): worker `i` binds `base + i` (a ZMQ rank `I`
+    /// binds `base + grpc_count + I`, after the gRPC workers), where a
     /// partner's engine would rendezvous for the handoff, and advertises it
     /// (`disaggregation_bootstrap_port`); the gateway probes it. `None` binds
-    /// and advertises nothing.
+    /// and advertises nothing, and is refused for a ZMQ prefill rank: its
+    /// handshake is the only place the port reaches the gateway.
     pub bootstrap_base_port: Option<u16>,
     /// The pairing protocol the process environment names
     /// (`SMG_PAIRING_PROTOCOL`), advertised in the gRPC workers' server args
@@ -161,7 +176,8 @@ pub struct ReplayConfig {
 }
 
 /// A worker's role in a disaggregated fleet (`--worker-type`, on the HTTP
-/// and the gRPC workers; the gateway's worker API spells it `worker_type`).
+/// workers, the gRPC workers and the ZMQ ranks; the gateway's worker API
+/// spells it `worker_type`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     /// Answers every request with the prompt side's completion alone and
@@ -360,6 +376,8 @@ impl Default for Config {
             output_tokens: 8,
             realistic: false,
             engine: EngineParams::default(),
+            worker_kv_tokens: BTreeMap::new(),
+            worker_pass_time_scale: BTreeMap::new(),
             server_args: BTreeMap::new(),
             weight_version: None,
             admin_port: None,
@@ -370,7 +388,7 @@ impl Default for Config {
             kv_events_replay: true,
             kv_events_topic: String::new(),
             kv_events_buffer_steps: 10_000,
-            kv_events_wire: crate::kv_zmq::Wire::Vllm,
+            kv_events_wire: Wire::Vllm,
             loads_like: LoadsLike::Mock,
             step_reports: false,
             role: None,
@@ -415,11 +433,11 @@ impl Config {
                 "--zmq-count" => cfg.zmq_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-step-ms" => cfg.zmq_step_ms = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-start-index" => {
-                    cfg.zmq_start_index = parse(value(&mut args, &flag)?, &flag)?
+                    cfg.zmq_start_index = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--zmq-lockstep" => cfg.zmq_lockstep = true,
                 "--zmq-add-delay-ms" => {
-                    cfg.zmq_add_delay_ms = parse(value(&mut args, &flag)?, &flag)?
+                    cfg.zmq_add_delay_ms = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--model" => cfg.model_id = value(&mut args, &flag)?,
                 "--tokenizer" => cfg.tokenizer_path = value(&mut args, &flag)?,
@@ -449,7 +467,7 @@ impl Config {
                     timing.decode_poly = Some(parse_poly(value(&mut args, &flag)?, &flag)?);
                 }
                 "--prefill-tps" => {
-                    timing.prefill_tps = Some(parse(value(&mut args, &flag)?, &flag)?)
+                    timing.prefill_tps = Some(parse(value(&mut args, &flag)?, &flag)?);
                 }
                 "--decode-base-ms" => {
                     timing.decode_base_ms = Some(parse(value(&mut args, &flag)?, &flag)?);
@@ -466,6 +484,19 @@ impl Config {
                     kv_tokens_given = true;
                 }
                 "--kv-blocks" => kv_blocks = Some(parse(value(&mut args, &flag)?, &flag)?),
+                "--worker-kv-tokens" => {
+                    parse_per_worker(value(&mut args, &flag)?, &flag, &mut cfg.worker_kv_tokens)?;
+                }
+                "--worker-pass-time-scale" => {
+                    let raw = value(&mut args, &flag)?;
+                    parse_per_worker(raw, &flag, &mut cfg.worker_pass_time_scale)?;
+                }
+                "--global-l3-blocks" => {
+                    cfg.engine.global_l3_blocks = parse(value(&mut args, &flag)?, &flag)?;
+                }
+                "--global-l3-ms-per-token" => {
+                    cfg.engine.global_l3_ms_per_token = parse(value(&mut args, &flag)?, &flag)?;
+                }
                 "--request-overhead-ms" => {
                     cfg.engine.request_overhead_ms = parse(value(&mut args, &flag)?, &flag)?;
                     overhead_given = true;
@@ -525,7 +556,7 @@ impl Config {
                         Duration::try_from_secs_f64(secs).map_err(|e| format!("{flag}: {e}"))?;
                 }
                 "--prefix-cache" => {
-                    cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?
+                    cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("unknown flag: {other}\n\n{}", usage())),
@@ -533,7 +564,7 @@ impl Config {
         }
 
         if cfg.tokenizer_path.is_empty() {
-            cfg.tokenizer_path = cfg.model_id.clone();
+            cfg.tokenizer_path.clone_from(&cfg.model_id);
         }
         cfg.default_sampling_params_json = sampling_defaults_json(Path::new(&cfg.model_id));
         let (model, calibration) = timing.resolve()?;
@@ -575,8 +606,9 @@ impl Config {
         if cfg.grpc_dp_size > 1 && !cfg.realistic {
             return Err("--grpc-dp-size above 1 needs --engine realistic".to_string());
         }
-        if cfg.kv_events_wire == crate::kv_zmq::Wire::Sglang && cfg.engine.kv_cache_groups.len() > 1
-        {
+        cfg.check_worker_overrides()?;
+        cfg.check_global_l3()?;
+        if cfg.kv_events_wire == Wire::Sglang && cfg.engine.kv_cache_groups.len() > 1 {
             return Err(
                 "--kv-cache-groups names several groups, but the SGLang wire (--kv-events-wire \
                  sglang) publishes one cache group"
@@ -612,27 +644,25 @@ impl Config {
                 cfg.grpc_wire.as_str()
             ));
         }
-        if cfg.role.is_some() {
-            if cfg.zmq_count > 0 {
-                return Err(
-                    "--worker-type is the HTTP and gRPC workers' role: the ZMQ workers of this \
-                     mock take none"
-                        .to_string(),
-                );
-            }
-            if cfg.http_count > 0 && cfg.grpc_count > 0 {
-                return Err(
-                    "--worker-type gives one wire's workers the role: pass --http-count or \
-                     --grpc-count, not both (worker i of either wire would bind the same \
-                     bootstrap port)"
-                        .to_string(),
-                );
-            }
+        if cfg.role.is_some() && cfg.http_count > 0 && (cfg.grpc_count > 0 || cfg.zmq_count > 0) {
+            return Err(
+                "--worker-type gives the role to the HTTP workers alone or to the gRPC workers \
+                 and ZMQ ranks together: pass --http-count or --grpc-count/--zmq-count, not \
+                 both (an HTTP worker i and a gRPC worker i would bind the same bootstrap port)"
+                    .to_string(),
+            );
         }
         if cfg.role == Some(Role::Encode) && cfg.http_count > 0 {
             return Err(
                 "--worker-type encode is a gRPC worker's role: the HTTP workers have no encode \
                  role (pass --grpc-count with --grpc-wire vllm or tokenspeed)"
+                    .to_string(),
+            );
+        }
+        if cfg.role == Some(Role::Encode) && cfg.zmq_count > 0 {
+            return Err(
+                "--worker-type encode is the gRPC wire's role: the ZMQ ranks of this mock serve \
+                 prefill and decode, not encode"
                     .to_string(),
             );
         }
@@ -651,11 +681,209 @@ impl Config {
                     .to_string(),
             );
         }
+        if cfg.role == Some(Role::Prefill) && cfg.zmq_count > 0 && cfg.bootstrap_base_port.is_none()
+        {
+            return Err(
+                "--worker-type prefill with --zmq-count needs --bootstrap-base-port: a ZMQ \
+                 prefill rank hands the gateway its bootstrap port in its handshake alone, and \
+                 the gateway refuses a prefill rank that names none"
+                    .to_string(),
+            );
+        }
         Ok(cfg)
     }
 }
 
 impl Config {
+    /// The engine of the worker named `worker` (`grpc:<port>`, `http:<port>`,
+    /// `zmq:<index>`; every rank of a worker of several): the fleet's, with
+    /// the worker's own KV pool (`--worker-kv-tokens`) and pass-time scale
+    /// (`--worker-pass-time-scale`). Its own pool changes how much it holds,
+    /// not how long its steps take: its decode cost keeps the fleet's pool as
+    /// its reference, unless a calibration gave the reference.
+    pub fn engine_for(&self, worker: &str) -> EngineParams {
+        let mut params = self.engine.clone();
+        if let Some(&tokens) = self.worker_kv_tokens.get(worker) {
+            params
+                .decode_reference_tokens
+                .get_or_insert(params.kv_capacity_tokens);
+            params.kv_capacity_tokens = tokens;
+        }
+        if let Some(&scale) = self.worker_pass_time_scale.get(worker) {
+            params.pass_time_scale = scale;
+        }
+        params
+    }
+
+    /// Refuse a per-worker override that would not take: one on a canned
+    /// engine or on a prefill or encode worker (neither runs its engine's
+    /// passes), one naming no worker of this process (a data-parallel rank's
+    /// name included: an override names the whole worker), a pool under one
+    /// block or, where decode reads utilisation, over the largest pool its
+    /// cost is measured against, and a scale outside 0.001 to 1000.
+    fn check_worker_overrides(&self) -> Result<(), String> {
+        let pools = self
+            .worker_kv_tokens
+            .keys()
+            .map(|w| ("--worker-kv-tokens", w));
+        let scales = self
+            .worker_pass_time_scale
+            .keys()
+            .map(|w| ("--worker-pass-time-scale", w));
+        for (flag, worker) in pools.chain(scales) {
+            if !self.realistic {
+                return Err(format!(
+                    "{flag} sets a realistic engine's parameters: it needs --engine realistic"
+                ));
+            }
+            if let Some(role) = self.role.filter(|role| *role != Role::Decode) {
+                return Err(format!(
+                    "{flag} sets an engine's parameters, but --worker-type {} workers answer \
+                     without running their engine's passes",
+                    role.as_str()
+                ));
+            }
+            if let Some(whole) = self.worker_of_rank(worker) {
+                return Err(format!(
+                    "{flag} names {worker}, a rank of {whole}: an override names the whole \
+                     worker and applies to every rank"
+                ));
+            }
+            if !self.serves(worker) {
+                return Err(format!(
+                    "{flag} names {worker}, which is no worker of this process (a worker is \
+                     named grpc:<port>, http:<port> or zmq:<index>, as it registers itself)"
+                ));
+            }
+        }
+        let block = u64::from(self.engine.block_size);
+        // Past the pool a utilisation-based decode cost is measured against,
+        // the cost stops growing; the linear model reads no utilisation.
+        let reads_utilisation = !matches!(self.engine.timing, TimingModel::Linear { .. });
+        let fleet = self.engine.kv_capacity_tokens;
+        let cap = self
+            .engine
+            .decode_reference_tokens
+            .map_or(fleet, |calibrated| calibrated.max(fleet));
+        for (worker, &tokens) in &self.worker_kv_tokens {
+            if tokens < block {
+                return Err(format!(
+                    "--worker-kv-tokens gives {worker} {tokens} tokens, less than one block of \
+                     {block}"
+                ));
+            }
+            if reads_utilisation && tokens > cap {
+                return Err(format!(
+                    "--worker-kv-tokens gives {worker} {tokens} tokens, more than {cap}, the \
+                     largest pool its decode cost is measured against (the fleet's, or a \
+                     calibration's): give the fleet the largest pool and the other workers less"
+                ));
+            }
+        }
+        for (worker, scale) in &self.worker_pass_time_scale {
+            if !(0.001..=1000.0).contains(scale) {
+                return Err(format!(
+                    "--worker-pass-time-scale gives {worker} {scale}: a scale is a number from \
+                     0.001 to 1000"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `worker` is the name of one of this process's workers, as it
+    /// registers it: `grpc:<port>` and `http:<port>` on their wire's ports,
+    /// `zmq:<index>` on the ZMQ ranks' engine indexes.
+    fn serves(&self, worker: &str) -> bool {
+        let Some((wire, id)) = worker.split_once(':') else {
+            return false;
+        };
+        // A decimal id with no sign or leading zero, as the name is written.
+        let Some(id) = id.parse::<u32>().ok().filter(|n| n.to_string() == id) else {
+            return false;
+        };
+        let (first, count) = match wire {
+            "grpc" if id <= u32::from(u16::MAX) => {
+                (u32::from(self.grpc_base_port), self.grpc_count)
+            }
+            "http" if id <= u32::from(u16::MAX) => {
+                (u32::from(self.http_base_port), self.http_count)
+            }
+            "zmq" => (self.zmq_start_index, self.zmq_count),
+            _ => return false,
+        };
+        id.checked_sub(first)
+            .is_some_and(|offset| offset < u32::from(count))
+    }
+
+    /// The worker a data-parallel rank's name (`grpc:<port>:r<k>`, as the
+    /// admin API lists the ranks) belongs to, when it is a rank of one of
+    /// this process's gRPC workers.
+    fn worker_of_rank<'a>(&self, name: &'a str) -> Option<&'a str> {
+        let (whole, rank) = name.rsplit_once(":r")?;
+        let rank: u16 = rank.parse().ok()?;
+        let is_rank = self.grpc_dp_size > 1 && rank < self.grpc_dp_size;
+        (is_rank && whole.starts_with("grpc:") && self.serves(whole)).then_some(whole)
+    }
+
+    /// Refuse the shared KV tier's flags where the tier would not take: on a
+    /// canned engine, on prefill or encode workers (neither runs its engine's
+    /// passes, which write and restore the tier), with prefix caching off (a
+    /// restore continues a prefix hit), on an engine whose cache groups are
+    /// not one main-attention group (the tier holds whole blocks of one
+    /// group), and a restore price with no tier or one that is not a finite
+    /// number of at least 0.
+    fn check_global_l3(&self) -> Result<(), String> {
+        let (blocks, ms) = (
+            self.engine.global_l3_blocks,
+            self.engine.global_l3_ms_per_token,
+        );
+        if blocks > 0 && !self.realistic {
+            return Err(
+                "--global-l3-blocks is a realistic engine's tier: it needs --engine realistic"
+                    .to_string(),
+            );
+        }
+        if let Some(role) = self.role.filter(|role| blocks > 0 && *role != Role::Decode) {
+            return Err(format!(
+                "--global-l3-blocks is a tier the engines' passes write and restore from, but \
+                 --worker-type {} workers answer without running their engine's passes",
+                role.as_str()
+            ));
+        }
+        if blocks > 0 && !self.engine.prefix_cache {
+            return Err(
+                "--global-l3-blocks restores what continues a prefix hit: it needs \
+                 --prefix-cache true"
+                    .to_string(),
+            );
+        }
+        let one_main_group = matches!(
+            self.engine.kv_cache_groups.as_slice(),
+            [group] if KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str())
+        );
+        if blocks > 0 && !one_main_group {
+            return Err(
+                "--global-l3-blocks holds whole blocks of one cache group: it needs one KV cache \
+                 group of a main-attention kind (--kv-cache-groups)"
+                    .to_string(),
+            );
+        }
+        if !(ms.is_finite() && ms >= 0.0) {
+            return Err(format!(
+                "--global-l3-ms-per-token must be a finite number of at least 0, got {ms}"
+            ));
+        }
+        if ms > 0.0 && blocks == 0 {
+            return Err(
+                "--global-l3-ms-per-token prices restores from the shared tier: it needs \
+                 --global-l3-blocks"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// The bootstrap port of worker number `index` (its offset from its
     /// wire's base port, `--grpc-base-port` or `--http-base-port`):
     /// `--bootstrap-base-port` plus the offset for a
@@ -671,17 +899,13 @@ impl Config {
     /// then ZMQ ranks), when publishing is on and the engine is realistic.
     /// `dp_rank` is the rank the publisher stamps on the vLLM wire: 0 for a
     /// gRPC worker, the engine index a ZMQ rank advertises.
-    pub(crate) fn kv_zmq_for(
-        &self,
-        index: u16,
-        dp_rank: i32,
-    ) -> Option<crate::kv_zmq::KvZmqConfig> {
+    pub(crate) fn kv_zmq_for(&self, index: u16, dp_rank: i32) -> Option<KvZmqConfig> {
         if !self.realistic {
             return None;
         }
         let base = self.kv_events_zmq_base_port?;
         let port = base.checked_add(index.checked_mul(2)?)?;
-        Some(crate::kv_zmq::KvZmqConfig {
+        Some(KvZmqConfig {
             host: self.host.clone(),
             port,
             replay: self.kv_events_replay,
@@ -712,6 +936,31 @@ fn parse_ids(raw: String, flag: &str) -> Result<Vec<u32>, String> {
                 .map_err(|_| format!("invalid value for {flag}: {raw}"))
         })
         .collect()
+}
+
+/// `worker=value,...`: a setting per worker, keyed by the worker's name, each
+/// worker named once over every use of the flag.
+fn parse_per_worker<T: std::str::FromStr>(
+    raw: String,
+    flag: &str,
+    into: &mut BTreeMap<String, T>,
+) -> Result<(), String> {
+    for item in raw.split(',') {
+        let Some((worker, v)) = item.split_once('=') else {
+            return Err(format!(
+                "invalid value for {flag}: {item} (want worker=value)"
+            ));
+        };
+        let worker = worker.trim();
+        let v = v
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid value for {flag}: {item}"))?;
+        if into.insert(worker.to_string(), v).is_some() {
+            return Err(format!("{flag} names {worker} twice"));
+        }
+    }
+    Ok(())
 }
 
 /// `kind[:window],...`: the KV cache groups a realistic engine publishes,
@@ -839,6 +1088,18 @@ pub fn usage() -> String {
        --max-running <n>        max sequences per pass (default 256)\n\
        --kv-tokens <n>          KV cache capacity in tokens (default 524288)\n\
        --kv-blocks <n>          KV cache capacity in blocks (overrides --kv-tokens)\n\
+       --worker-kv-tokens <worker=n,..>  the named workers' KV capacity in tokens instead, at\n\
+                                most the fleet's or a calibration's pool (grpc:<port>,\n\
+                                http:<port> or zmq:<index>; a generating worker); their decode\n\
+                                keeps the fleet's step time: a pool's size is room, not speed\n\
+       --worker-pass-time-scale <worker=f,..>  the named workers' passes take f times the\n\
+                                timing model's duration (0.001 to 1000; above 1 a slower engine)\n\
+       --global-l3-blocks <n>   process-wide shared KV tier every engine writes to and restores\n\
+                                prefixes from, in blocks (default 0: off; a generating worker's\n\
+                                realistic engine, --prefix-cache true and one main-attention\n\
+                                cache group only)\n\
+       --global-l3-ms-per-token <f>  pass time per token restored from the shared tier (default 0;\n\
+                                needs --global-l3-blocks)\n\
        --request-overhead-ms <f>  fixed per-request latency added to every event of a stream (default 0)\n\
        --block-size <n>         cache block/page size in tokens (default 16)\n\
        --prefix-cache <bool>    enable prefix caching + KV events (default true)\n\
@@ -867,9 +1128,9 @@ pub fn usage() -> String {
                                 engine's silence against\n\
        --admin-port <port>      process-wide admin API: fleet, request records with the\n\
                                 arrival-time oracle, cache dumps, resets (default off)\n\
-       --worker-type <prefill|decode|encode>  the HTTP or gRPC workers' role in a disaggregated\n\
-                                fleet (default none; one wire per process, the ZMQ workers take\n\
-                                none): a prefill worker answers every request with the\n\
+       --worker-type <prefill|decode|encode>  the role of the HTTP workers alone, or of the gRPC\n\
+                                workers and ZMQ ranks together, in a disaggregated fleet\n\
+                                (default none): a prefill worker answers every request with the\n\
                                 prompt side's completion alone (no output, no script), a decode\n\
                                 worker generates as a regular one, an encode worker answers the\n\
                                 encoder's side of the media handoff (the vllm gRPC wire's encoder\n\
@@ -877,9 +1138,10 @@ pub fn usage() -> String {
                                 role in its server info (disaggregation_mode; kv_role and\n\
                                 ec_role behind their connectors on the vllm wire)\n\
        --bootstrap-base-port <port>  first bootstrap port of the prefill or encode workers: worker\n\
-                                i binds base+i, accepts and closes each connection (the gateway's\n\
+                                i binds base+i (a ZMQ rank I binds base+grpc_count+I, after the\n\
+                                gRPC workers), accepts and closes each connection (the gateway's\n\
                                 probe) and advertises it (disaggregation_bootstrap_port)\n\
-                                (default none)\n\
+                                (default none; a ZMQ prefill rank needs one)\n\
        --drain-timeout-secs <s> on SIGTERM or SIGINT, how long the requests in flight may\n\
                                 finish before the process exits regardless (default 5)\n\
      \n\
@@ -960,6 +1222,330 @@ mod tests {
 
     fn parse(flags: &[&str]) -> Result<Config, String> {
         Config::parse(flags.iter().map(|flag| (*flag).to_string()))
+    }
+
+    /// A per-worker override changes the named worker's engine alone: its
+    /// pool, with the fleet's pool kept as its decode reference (or a
+    /// calibration's, when one gave it), and its pass-time scale.
+    #[test]
+    fn a_worker_override_changes_the_named_workers_engine_alone() {
+        let cfg = parse(&[
+            "--engine",
+            "realistic",
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "3",
+            "--kv-tokens",
+            "131072",
+            "--worker-kv-tokens",
+            "grpc:19001=65536",
+            "--worker-pass-time-scale",
+            "grpc:19001=2,grpc:19002=0.5",
+        ])
+        .expect("overrides on two of three workers");
+        let named = cfg.engine_for("grpc:19001");
+        assert_eq!(named.kv_capacity_tokens, 65_536);
+        assert_eq!(named.decode_reference_tokens, Some(131_072));
+        assert_eq!(named.pass_time_scale, 2.0);
+        let faster = cfg.engine_for("grpc:19002");
+        assert_eq!(faster.kv_capacity_tokens, 131_072);
+        assert_eq!(faster.decode_reference_tokens, None);
+        assert_eq!(faster.pass_time_scale, 0.5);
+        let untouched = cfg.engine_for("grpc:19000");
+        assert_eq!(untouched.kv_capacity_tokens, 131_072);
+        assert_eq!(untouched.pass_time_scale, 1.0);
+        let calibrated = Config {
+            engine: EngineParams {
+                decode_reference_tokens: Some(393_216),
+                ..cfg.engine.clone()
+            },
+            ..cfg
+        };
+        assert_eq!(
+            calibrated.engine_for("grpc:19001").decode_reference_tokens,
+            Some(393_216)
+        );
+    }
+
+    /// A per-worker override that would not take is refused: one on a canned
+    /// engine or a prefill worker, one naming no worker of the process (as
+    /// no worker is named, past the port range, or a data-parallel rank), one
+    /// naming a worker twice, a pool under one block or over the fleet's and
+    /// a calibration's (any size under linear timing), a scale outside 0.001
+    /// to 1000, an item with no `=`.
+    #[test]
+    fn a_worker_override_is_refused_unless_it_takes() {
+        let fleet = [
+            "--engine",
+            "realistic",
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "2",
+            "--http-base-port",
+            "18000",
+            "--http-count",
+            "1",
+        ];
+        let with = |flags: &[&str]| parse(&[&fleet[..], flags].concat());
+        for worker in ["grpc:19000", "grpc:19001", "http:18000"] {
+            let flag = format!("{worker}=2");
+            with(&["--worker-pass-time-scale", &flag])
+                .unwrap_or_else(|e| panic!("{worker} is a worker of the process: {e}"));
+        }
+        let refused = |flags: &[&str], reason: &str| {
+            let err = with(flags).expect_err("refused");
+            assert!(err.contains(reason), "{flags:?}: {err}");
+        };
+        for worker in [
+            "grpc:19002",
+            "grpc:019001",
+            "grpc:+19001",
+            "http:19000",
+            "zmq:0",
+        ] {
+            let flag = format!("{worker}=65536");
+            refused(&["--worker-kv-tokens", &flag], "no worker of this process");
+        }
+        refused(
+            &["--worker-kv-tokens", "grpc:19000=8"],
+            "less than one block",
+        );
+        refused(
+            &["--worker-pass-time-scale", "grpc:19000=1,grpc:19000=2"],
+            "names grpc:19000 twice",
+        );
+        refused(
+            &[
+                "--worker-pass-time-scale",
+                "grpc:19000=1",
+                "--worker-pass-time-scale",
+                "grpc:19000=2",
+            ],
+            "names grpc:19000 twice",
+        );
+        for scale in ["0", "-1", "0.0009", "1001", "inf", "NaN"] {
+            let flag = format!("grpc:19000={scale}");
+            refused(
+                &["--worker-pass-time-scale", &flag],
+                "a number from 0.001 to 1000",
+            );
+        }
+        with(&[
+            "--worker-pass-time-scale",
+            "grpc:19000=0.001,grpc:19001=1000",
+        ])
+        .expect("the scale's ends");
+        refused(
+            &["--worker-pass-time-scale", "grpc:19000"],
+            "want worker=value",
+        );
+        let canned = parse(&[
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "1",
+            "--worker-kv-tokens",
+            "grpc:19000=65536",
+        ])
+        .expect_err("a canned engine has no pool");
+        assert!(canned.contains("needs --engine realistic"), "{canned}");
+        refused(
+            &[
+                "--kv-tokens",
+                "131072",
+                "--worker-kv-tokens",
+                "grpc:19000=262144",
+            ],
+            "more than 131072, the largest pool its decode cost is measured against",
+        );
+        refused(
+            &[
+                "--grpc-dp-size",
+                "2",
+                "--worker-kv-tokens",
+                "grpc:19001:r1=65536",
+            ],
+            "a rank of grpc:19001",
+        );
+        // A rank the worker does not have is no worker either.
+        for (size, rank) in [("1", "grpc:19000:r0"), ("2", "grpc:19001:r2")] {
+            let flag = format!("{rank}=65536");
+            refused(
+                &["--grpc-dp-size", size, "--worker-kv-tokens", &flag],
+                "no worker of this process",
+            );
+        }
+        // The linear model's decode reads no utilisation, so no pool is too large.
+        with(&[
+            "--timing",
+            "linear",
+            "--kv-tokens",
+            "131072",
+            "--worker-kv-tokens",
+            "grpc:19000=262144",
+        ])
+        .expect("a larger pool under linear timing");
+        // A calibration's pool is the reference: a worker may take up to it.
+        let dir = tempfile::tempdir().expect("a directory for the calibration");
+        let fit = dir.path().join("fit.json");
+        std::fs::write(
+            &fit,
+            r#"{"prefill": [16.5, 0.015, 4e-7], "decode": [5.7, 54.0, -25.7], "kv_capacity_tokens": 393216}"#,
+        )
+        .expect("write the calibration");
+        let timing = format!("fit:{}", fit.display());
+        let calibrated = |pool: &str| {
+            with(&[
+                "--timing",
+                &timing,
+                "--kv-blocks",
+                "8192",
+                "--worker-kv-tokens",
+                pool,
+            ])
+        };
+        calibrated("grpc:19000=262144").expect("under the calibration's pool");
+        let over = calibrated("grpc:19000=400000").expect_err("over the calibration's pool");
+        assert!(over.contains("more than 393216"), "{over}");
+        let prefill = parse(&[
+            "--engine",
+            "realistic",
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "1",
+            "--worker-type",
+            "prefill",
+            "--worker-pass-time-scale",
+            "grpc:19000=2",
+        ])
+        .expect_err("a prefill worker runs no passes");
+        assert!(
+            prefill.contains("workers answer without running"),
+            "{prefill}"
+        );
+        let past_the_ports = parse(&[
+            "--engine",
+            "realistic",
+            "--grpc-base-port",
+            "65535",
+            "--grpc-count",
+            "2",
+            "--worker-kv-tokens",
+            "grpc:65536=65536",
+        ])
+        .expect_err("no port is 65536");
+        assert!(
+            past_the_ports.contains("no worker of this process"),
+            "{past_the_ports}"
+        );
+        // ZMQ ranks are named by engine index, from --zmq-start-index on.
+        let zmq = |worker: &str| {
+            let flag = format!("{worker}=65536");
+            parse(&[
+                "--engine",
+                "realistic",
+                "--zmq-handshake",
+                "ipc:///tmp/unused",
+                "--zmq-count",
+                "2",
+                "--zmq-start-index",
+                "4",
+                "--worker-kv-tokens",
+                &flag,
+            ])
+        };
+        for worker in ["zmq:4", "zmq:5"] {
+            zmq(worker).unwrap_or_else(|e| panic!("{worker} is a rank of the process: {e}"));
+        }
+        for worker in ["zmq:3", "zmq:6"] {
+            let err = zmq(worker).expect_err("not a rank of the process");
+            assert!(err.contains("no worker of this process"), "{worker}: {err}");
+        }
+    }
+
+    /// The shared tier's flags set the engines' tier and are refused where
+    /// it would not take: a canned engine, a prefill or encode worker (a
+    /// decode worker takes it), prefix caching off, a hybrid engine's several
+    /// cache groups, a restore price with no tier, a price that is not a
+    /// finite number of at least 0.
+    #[test]
+    fn the_shared_tier_flags_set_the_tier_and_are_refused_where_it_would_not_take() {
+        let realistic = [
+            "--engine",
+            "realistic",
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "1",
+        ];
+        let with = |flags: &[&str]| parse(&[&realistic[..], flags].concat());
+        let cfg = with(&[
+            "--global-l3-blocks",
+            "4096",
+            "--global-l3-ms-per-token",
+            "0.002",
+        ])
+        .expect("a tier");
+        assert_eq!(cfg.engine.global_l3_blocks, 4096);
+        assert_eq!(cfg.engine.global_l3_ms_per_token, 0.002);
+        assert_eq!(with(&[]).expect("no tier").engine.global_l3_blocks, 0);
+        let refused = |flags: &[&str], reason: &str| {
+            let err = with(flags).expect_err("refused");
+            assert!(err.contains(reason), "{flags:?}: {err}");
+        };
+        refused(
+            &["--global-l3-blocks", "4096", "--prefix-cache", "false"],
+            "needs --prefix-cache true",
+        );
+        for role in ["prefill", "encode"] {
+            refused(
+                &["--global-l3-blocks", "4096", "--worker-type", role],
+                "workers answer without running their engine's passes",
+            );
+        }
+        with(&["--global-l3-blocks", "4096", "--worker-type", "decode"])
+            .expect("a decode worker runs its engine's passes");
+        for groups in ["full_attention,sliding_window:128", "sliding_window:128"] {
+            refused(
+                &["--global-l3-blocks", "4096", "--kv-cache-groups", groups],
+                "one KV cache group of a main-attention kind",
+            );
+        }
+        with(&[
+            "--global-l3-blocks",
+            "4096",
+            "--kv-cache-groups",
+            "mla_attention",
+        ])
+        .expect("one main-attention group of another kind");
+        refused(
+            &["--global-l3-ms-per-token", "0.002"],
+            "needs --global-l3-blocks",
+        );
+        for price in ["-1", "inf", "NaN"] {
+            refused(
+                &[
+                    "--global-l3-blocks",
+                    "4096",
+                    "--global-l3-ms-per-token",
+                    price,
+                ],
+                "a finite number of at least 0",
+            );
+        }
+        let canned = parse(&[
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "1",
+            "--global-l3-blocks",
+            "4096",
+        ])
+        .expect_err("a canned engine has no tier");
+        assert!(canned.contains("needs --engine realistic"), "{canned}");
     }
 
     /// `--kv-cache-groups` names each group's kind and window in order, the
@@ -1320,12 +1906,12 @@ mod tests {
         );
     }
 
-    /// The prefill and decode roles are the HTTP and the gRPC workers',
-    /// with the same bootstrap numbering on both wires, one wire per
-    /// process; the ZMQ workers take none and the encode role is a gRPC
-    /// wire's.
+    /// The prefill and decode roles are a process's HTTP workers' alone or
+    /// its gRPC workers' and ZMQ ranks' together, the ranks' bootstrap ports
+    /// numbered after the gRPC workers (a ZMQ prefill rank needs the base
+    /// port); the encode role is the gRPC wire's alone.
     #[test]
-    fn the_prefill_and_decode_roles_are_the_http_and_grpc_workers() {
+    fn the_prefill_and_decode_roles_are_the_http_side_or_the_grpc_and_zmq_side() {
         let grpc = ["--grpc-base-port", "19000", "--grpc-count", "2"];
         let cfg = parse(&grpc).expect("gRPC flags parse");
         assert_eq!((cfg.role, cfg.bootstrap_base_port), (None, None));
@@ -1386,19 +1972,57 @@ mod tests {
             .contains("HTTP workers have no encode role"));
         assert!(
             parse(&[&grpc[..], &["--http-count", "1", "--worker-type", "decode"]].concat())
-                .expect_err("one wire's workers take the role")
+                .expect_err("the HTTP workers alone or the gRPC workers and ZMQ ranks together take the role")
                 .contains("not both")
         );
-        assert!(parse(&[
+        let zmq = [
             "--zmq-handshake",
             "ipc:///tmp/mock-handshake",
             "--zmq-count",
             "1",
-            "--worker-type",
-            "prefill",
-        ])
-        .expect_err("the ZMQ workers take no role")
-        .contains("ZMQ workers"));
+        ];
+        let zmq_prefill = parse(
+            &[
+                &zmq[..],
+                &["--worker-type", "prefill", "--bootstrap-base-port", "8998"],
+            ]
+            .concat(),
+        )
+        .expect("ZMQ prefill ranks");
+        assert_eq!(zmq_prefill.role, Some(Role::Prefill));
+        assert_eq!(
+            zmq_prefill.bootstrap_port_for(zmq_prefill.grpc_count),
+            Some(8998),
+            "the first rank's port, numbered after the gRPC workers"
+        );
+        assert!(parse(&[&zmq[..], &["--worker-type", "prefill"]].concat())
+            .expect_err("a ZMQ prefill rank needs its bootstrap port")
+            .contains("needs --bootstrap-base-port"));
+        let both = parse(
+            &[
+                &grpc[..],
+                &zmq[..],
+                &["--worker-type", "prefill", "--bootstrap-base-port", "8998"],
+            ]
+            .concat(),
+        )
+        .expect("gRPC workers and ZMQ ranks take the role together");
+        assert_eq!(
+            (
+                both.bootstrap_port_for(0),
+                both.bootstrap_port_for(both.grpc_count)
+            ),
+            (Some(8998), Some(9000)),
+            "the gRPC workers take base + i, the first rank the port after them"
+        );
+        assert!(parse(&[&zmq[..], &["--worker-type", "encode"]].concat())
+            .expect_err("the ZMQ ranks have no encode role")
+            .contains("not encode"));
+        assert!(
+            parse(&[&zmq[..], &["--http-count", "1", "--worker-type", "decode"]].concat())
+                .expect_err("the HTTP workers alone or the gRPC workers and ZMQ ranks together take the role")
+                .contains("not both")
+        );
         assert!(parse(
             &[
                 &grpc[..],

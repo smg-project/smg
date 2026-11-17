@@ -12,6 +12,7 @@ matched filters to the shards.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -34,8 +35,17 @@ SPLIT_PACKAGES = {
 INFRA_FILES = (
     "Cargo.toml",
     "Cargo.lock",
+    "rust-toolchain.toml",
     ".cargo/config.toml",
+    ".github/actions/setup-rust/action.yml",
     "scripts/ci_rust_tests.sh",
+    "scripts/ci_install_rust.sh",
+    "scripts/ci_apt_mirror.sh",
+    "scripts/ci_apt_install.sh",
+    "scripts/ci_apt_update.sh",
+    "scripts/ci_retry.sh",
+    "scripts/ci_install_build_deps.sh",
+    "scripts/ci_install_protoc.sh",
     ".github/workflows/pr-test-rust.yml",
 )
 
@@ -194,12 +204,16 @@ class ShardTableTests(unittest.TestCase):
                     )
 
     def test_shard_filters_cover_the_build_infrastructure(self):
+        # The workflow's rust-ci filter is its own copy of this list (it comes
+        # before the rust-infra anchor, so it cannot reuse it) and the only
+        # gate for rust-lint and the aarch64 job, so it is read beside the
+        # shard filters.
         filters = path_filters()
-        for row in shard_table():
+        for name in sorted({row["filter"] for row in shard_table()} | {"rust-ci"}):
             for path in INFRA_FILES:
-                self.assertTrue(
-                    filter_matches(filters[row["filter"]], path), f"{row['filter']} misses {path}"
-                )
+                self.assertTrue(filter_matches(filters[name], path), f"{name} misses {path}")
+        missing = sorted(set(filters["rust-infra"]) - set(filters["rust-ci"]))
+        self.assertEqual(missing, [], f"rust-ci misses rust-infra patterns: {missing}")
 
     def test_shard_filters_exclude_unrelated_crates(self):
         filters = path_filters()
@@ -231,6 +245,189 @@ class ShardTableTests(unittest.TestCase):
             "examples/wasm/README.md",
         ):
             self.assertFalse(filter_matches(filters["rust-gateway"], path), path)
+
+    def test_the_kv_shard_builds_the_example_policy_plugin_and_requires_it(self):
+        # The policy crate's tests load the example plugin as its own build
+        # line wrote it: the shard that runs them builds it first, requires
+        # it, and runs on a change to the example or to the tool's installer.
+        row = next(r for r in shard_table() if r["shard"] == "kv")
+        self.assertEqual(row["needs"], "policy-guest,policy-import")
+        workflow = WORKFLOW.read_text()
+        # The step: the pinned tool, the line a user runs, then, inside the
+        # guest's directory, the repository's formatter (nightly) and the
+        # pinned clippy, which the workspace's own runs do not reach.
+        step = workflow.split("- name: Build the example policy plugin", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        for line in (
+            "bash scripts/ci_install_wasm_tools.sh",
+            "bash examples/wasm/wasm-guest-policy/build.sh",
+            "cd examples/wasm/wasm-guest-policy",
+            "rustup toolchain install nightly --profile minimal --component rustfmt",
+            "cargo +nightly fmt -- --check",
+            "cargo clippy --locked --target wasm32-unknown-unknown --target-dir target -- -D warnings",
+        ):
+            self.assertIn(line, step)
+        self.assertIn(
+            "SMG_REQUIRE_POLICY_GUEST: ${{ contains(matrix.needs, 'policy-guest') && '1' || '' }}",
+            workflow,
+        )
+        filters = path_filters()
+        for path in (
+            "examples/wasm/wasm-guest-policy/src/lib.rs",
+            "examples/wasm/wasm-guest-policy/Cargo.lock",
+            "examples/wasm/wasm-guest-policy/build.sh",
+            "scripts/ci_install_wasm_tools.sh",
+        ):
+            self.assertTrue(filter_matches(filters["rust-kv"], path), path)
+        # The other guests are the agentic shard's: they do not run this one.
+        self.assertFalse(
+            filter_matches(filters["rust-kv"], "examples/wasm/wasm-guest-storage-hook/src/lib.rs")
+        )
+
+    def test_the_kv_shard_turns_on_every_feature_a_policy_test_target_requires(self):
+        # cargo skips a test target whose required features are off, in
+        # silence: the shard's line turns each of them on.
+        manifest = tomllib.loads((REPO / "crates/policy_controller/Cargo.toml").read_text())
+        package = manifest["package"]["name"]
+        line = next(
+            text
+            for text in SCRIPT.read_text().splitlines()
+            if f"-p {package} " in text and "--features" in text
+        )
+        todo = ["default"] + [
+            feature.split("/", 1)[1]
+            for feature in re.search(r"--features ([^\s\"]+)", line).group(1).split(",")
+            if feature.startswith(f"{package}/")
+        ]
+        features = manifest.get("features", {})
+        on = set()
+        while todo:
+            feature = todo.pop()
+            if feature in on:
+                continue
+            on.add(feature)
+            todo.extend(
+                name
+                for name in features.get(feature, [])
+                if not name.startswith("dep:") and "/" not in name
+            )
+        for target in manifest.get("test", []):
+            for need in target.get("required-features", []):
+                self.assertIn(need, on, f"the kv shard would skip tests/{target['name']}.rs")
+
+    def test_the_kv_shard_builds_the_example_controller_outside_the_workspace(self):
+        # The example controller is also built where a user stands: its own
+        # script writes it outside the workspace with the crate named by
+        # git from a snapshot of the checkout, and its cases run there.
+        row = next(r for r in shard_table() if r["shard"] == "kv")
+        self.assertIn("policy-import", row["needs"].split(","))
+        workflow = WORKFLOW.read_text()
+        step = workflow.split("- name: Build the example controller outside the workspace", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        for line in (
+            "if: contains(matrix.needs, 'policy-import')",
+            "bash examples/policy-controller/own-repository.sh "
+            '"${RUNNER_TEMP}/own-controller" --snapshot',
+            'cd "${RUNNER_TEMP}/own-controller"',
+            "cargo test",
+        ):
+            self.assertIn(line, step)
+        filters = path_filters()
+        for path in (
+            "examples/policy-controller/own-repository.sh",
+            "examples/policy-controller/src/main.rs",
+            "crates/policy_controller/build.rs",
+        ):
+            self.assertTrue(filter_matches(filters["rust-kv"], path), path)
+
+    def test_the_example_controllers_script_writes_a_repository_of_its_own(self):
+        example = REPO / "examples" / "policy-controller"
+        own = example / "own-repository.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "own"
+            subprocess.run(
+                ["bash", str(own), str(dest), "file:///a/checkout"], check=True, capture_output=True
+            )
+            text = (dest / "Cargo.toml").read_text()
+            manifest = tomllib.loads(text)
+            # The crate by git from the source it is handed, and no key the
+            # workspace alone resolves.
+            self.assertEqual(
+                manifest["dependencies"]["smg-policy-controller"],
+                {"git": "file:///a/checkout", "features": ["controller"]},
+            )
+            self.assertNotIn("workspace", text)
+            # The test-only dependencies at the versions the workspace names.
+            workspace = tomllib.loads((REPO / "Cargo.toml").read_text())["workspace"][
+                "dependencies"
+            ]
+            dev = manifest["dev-dependencies"]
+            self.assertEqual(dev["serde_yaml"], workspace["serde_yaml"])
+            self.assertEqual(dev["tokio"]["version"], workspace["tokio"]["version"])
+            for name in (
+                "src/main.rs",
+                "tests/serve.rs",
+                "policy.yaml",
+                "Cargo.lock",
+                "rust-toolchain.toml",
+            ):
+                self.assertTrue((dest / name).is_file(), name)
+            # A directory that exists is refused.
+            again = subprocess.run(["bash", str(own), str(dest)], capture_output=True, text=True)
+            self.assertEqual(again.returncode, 2, again.stderr)
+            self.assertIn("exists", again.stderr)
+            # With no source named, the line is the guide's own.
+            plain = Path(tmp) / "plain"
+            subprocess.run(["bash", str(own), str(plain)], check=True, capture_output=True)
+            line = next(
+                entry
+                for entry in (plain / "Cargo.toml").read_text().splitlines()
+                if entry.startswith("smg-policy-controller")
+            )
+            self.assertIn(line, (example / "README.md").read_text())
+            # With --snapshot the source is a repository of one revision
+            # beside the copy, made from this checkout's tracked files. The
+            # revision is the script's own: a host whose configuration signs
+            # every revision (here with a program that fails) signs none.
+            snap = Path(tmp) / "snap"
+            count = int(os.environ.get("GIT_CONFIG_COUNT") or 0)
+            signing = {
+                **os.environ,
+                "GIT_CONFIG_COUNT": str(count + 2),
+                f"GIT_CONFIG_KEY_{count}": "commit.gpgsign",
+                f"GIT_CONFIG_VALUE_{count}": "true",
+                f"GIT_CONFIG_KEY_{count + 1}": "gpg.program",
+                f"GIT_CONFIG_VALUE_{count + 1}": "false",
+            }
+            subprocess.run(
+                ["bash", str(own), str(snap), "--snapshot"],
+                check=True,
+                capture_output=True,
+                env=signing,
+            )
+            source = Path(tmp) / "snap-source"
+            named = tomllib.loads((snap / "Cargo.toml").read_text())["dependencies"]
+            self.assertEqual(named["smg-policy-controller"]["git"], f"file://{source}")
+            for args, expected in (
+                (("rev-list", "--count", "HEAD"), "1"),
+                (("status", "--short"), ""),
+            ):
+                read = subprocess.run(
+                    ["git", "-C", str(source), *args], check=True, capture_output=True, text=True
+                )
+                self.assertEqual(read.stdout.strip(), expected, args)
+            for name in (
+                "crates/policy_controller/Cargo.toml",
+                "crates/grpc_client/proto/common.proto",
+            ):
+                self.assertTrue((source / name).is_file(), name)
+        # A directory inside the checkout is refused and never made: the
+        # workspace would claim the package.
+        inside = example / "own-repository-refused"
+        refused = subprocess.run(["bash", str(own), str(inside)], capture_output=True, text=True)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("inside this checkout", refused.stderr)
+        self.assertFalse(inside.exists())
 
     def test_every_shard_has_a_filter_and_setup_flags_the_workflow_knows(self):
         filters = path_filters()

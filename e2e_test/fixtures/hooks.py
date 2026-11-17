@@ -571,7 +571,10 @@ def _annotation(record: str) -> str:
 
 
 # The run page shows ten warning annotations per step and drops the rest
-# without a word; the reporter is the only annotator of the test step.
+# without a word. The reporter is the test step's only warning annotator on
+# a well-configured run: the memory guard script that opens the step
+# (scripts/ci_killall_sglang.sh) warns once when its wait or poll variable
+# is not a whole number of seconds, and the job sets neither.
 _ANNOTATIONS_PER_STEP = 10
 
 

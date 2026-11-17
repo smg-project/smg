@@ -8,15 +8,20 @@ use tracing::{debug, warn};
 
 use crate::{
     channel::Channel,
+    framed::{call_with_frames, vllm_frames},
     request_fields::{
-        body_format, completion_constraint, logit_bias_by_token_id, plain_constraint, stop_strings,
-        ConstraintKind, OutputConstraint, PlainSampling,
+        body_format, completion_constraint, logit_bias_by_token_id, plain_constraint,
+        seeded_folded_i32, seeded_i32, stop_strings, ConstraintKind, OutputConstraint,
+        PlainSampling,
     },
     BoxedTraceInjector,
 };
 
 // Include the generated protobuf code
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod proto {
     #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
     tonic::include_proto!("vllm.grpc.engine");
@@ -24,13 +29,16 @@ pub mod proto {
 
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
-pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, VllmEngineClient>;
+pub type AbortOnDropStream =
+    crate::AbortOnDropStream<Box<proto::GenerateResponse>, VllmEngineClient>;
 
 /// gRPC client for vLLM scheduler
 #[derive(Clone)]
 pub struct VllmEngineClient {
     client: proto::vllm_engine_client::VllmEngineClient<Channel>,
     trace_injector: BoxedTraceInjector,
+    /// The client's own channel, the one its generated stub rides.
+    channel: Channel,
 }
 
 crate::impl_abort_for_drop_with_reason!(VllmEngineClient);
@@ -39,7 +47,9 @@ impl VllmEngineClient {
     crate::impl_engine_client_basics!(
         proto,
         proto::vllm_engine_client::VllmEngineClient<Channel>,
-        "vLLM"
+        "vLLM",
+        "vllm.grpc.engine.VllmEngine",
+        proto::vllm_engine_server::SERVICE_NAME
     );
 
     /// The request every builder of this client sends: the tokenized input, the
@@ -196,6 +206,7 @@ impl VllmEngineClient {
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
             max_tokens,
+            min_tokens: request.min_tokens.unwrap_or(0),
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens,
@@ -205,13 +216,14 @@ impl VllmEngineClient {
             n: request.n.unwrap_or(1),
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
-            // Proto seed is i32 (line 48 of generated vllm.grpc.engine.rs);
-            // OpenAI request seed is i64. Saturating cast keeps "set" vs
-            // "unset" distinction (None stays None — vLLM will pick a random
-            // seed itself, matching prior behaviour).
+            // The proto seed is a signed 32-bit word. `sampling_seed` (a u64) wins when a request
+            // sets it, with its bits folded; else the OpenAI-compatible `seed` (an int64) is
+            // itself when it fits, else its bits folded. Never -1, which the engine reads as
+            // "no seed"; None stays None and the engine picks its own.
             seed: request
-                .seed
-                .map(|s| s.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
+                .sampling_seed
+                .map(seeded_folded_i32)
+                .or_else(|| request.seed.map(seeded_i32)),
             constraint: Self::build_constraint_for_chat(request, constraint)?,
             ..Default::default()
         })
@@ -447,8 +459,9 @@ impl VllmEngineClient {
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
             seed: request
-                .seed
-                .map(|s| s.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
+                .sampling_seed
+                .map(seeded_folded_i32)
+                .or_else(|| request.seed.map(seeded_i32)),
             constraint,
             ..Default::default()
         })
@@ -489,12 +502,8 @@ impl VllmEngineClient {
             ignore_eos: plain.ignore_eos,
             include_stop_str_in_output: plain.no_stop_trim,
             n: plain.n,
-            // The proto seed is i32; the plain seed is u64. Fold the high half into
-            // the low so distinct seeds stay distinct (a saturating cast would send
-            // every seed >= 2^31 to one value).
-            seed: plain
-                .sampling_seed
-                .map(|seed| ((seed ^ (seed >> 32)) as u32) as i32),
+            // The proto seed is a signed 32-bit word, the plain seed a u64: its bits folded, never -1.
+            seed: plain.sampling_seed.map(seeded_folded_i32),
             constraint: match params {
                 Some(p) => Self::constraint_of(plain_constraint(p)?),
                 None => None,
@@ -510,6 +519,39 @@ impl VllmEngineClient {
 
 // The disaggregation fields stay absent until this wire exposes them.
 crate::impl_rank_load_conversions!(proto);
+
+impl VllmEngineClient {
+    /// `generate` with the request's large inline tensors as body frames of
+    /// their own (the crate's private `framed` module): no encode buffer of
+    /// the message's size, the same message on the wire. A plain fn like
+    /// `generate`, for the same reason: the request becomes its frames before
+    /// the future exists, so the boxed future holds the frame list and the
+    /// request id, not the request; the trace context is injected at the
+    /// first poll, as there.
+    pub fn generate_framed(
+        &self,
+        req: proto::GenerateRequest,
+    ) -> impl std::future::Future<Output = Result<AbortOnDropStream, tonic::Status>> + '_ {
+        let request_id = req.request_id.clone();
+        let frames = vllm_frames(req);
+        async move {
+            let frames = frames?;
+            let mut carrier = Request::new(());
+            if let Err(e) = self.trace_injector.inject(carrier.metadata_mut()) {
+                warn!("Failed to inject trace context: {}", e);
+            }
+            let (metadata, _extensions, ()) = carrier.into_parts();
+            let stream = call_with_frames::<Box<proto::GenerateResponse>>(
+                self.channel(),
+                "/vllm.grpc.engine.VllmEngine/Generate",
+                metadata.into_headers(),
+                frames,
+            )
+            .await?;
+            Ok(AbortOnDropStream::new(stream, request_id, self.clone()))
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -625,7 +667,45 @@ mod tests {
         assert_eq!(seed(seeded(Some(7))), Some(7));
         assert_eq!(seed(seeded(Some(1 << 32))), Some(1));
         assert_eq!(seed(seeded(Some(u64::MAX))), Some(0));
+        // The fold lands this seed on -1, which the engine reads as "no seed": it is carried as the
+        // word's minimum instead.
+        assert_eq!(seed(seeded(Some(u64::from(u32::MAX)))), Some(i32::MIN));
         assert_eq!(seed(seeded(None)), None);
+    }
+
+    /// A chat or completion request's `sampling_seed` reaches the proto seed folded, as on the
+    /// plain route, and wins over `seed` when a request sets both; `seed` alone still arrives.
+    #[test]
+    fn chat_and_completion_sampling_seed_reaches_the_engine_request() {
+        let chat = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a chat request");
+            VllmEngineClient::build_grpc_sampling_params_from_chat(
+                &request,
+                OutputConstraint::default(),
+            )
+            .expect("build sampling params")
+            .seed
+        };
+        let completion = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "prompt": "hi", "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a completion request");
+            VllmEngineClient::build_grpc_sampling_params_from_completion(&request)
+                .expect("build sampling params")
+                .seed
+        };
+        let both =
+            |sampling_seed, seed| (chat(sampling_seed, seed), completion(sampling_seed, seed));
+        assert_eq!(both(Some(7), None), (Some(7), Some(7)));
+        assert_eq!(both(Some(7), Some(42)), (Some(7), Some(7)));
+        assert_eq!(both(Some(1 << 32), None), (Some(1), Some(1)));
+        assert_eq!(both(None, Some(42)), (Some(42), Some(42)));
+        assert_eq!(both(None, None), (None, None));
     }
 
     #[test]
@@ -692,7 +772,9 @@ mod tests {
         .expect("build sampling params");
         assert_eq!(unset_params.seed, None);
 
-        // Saturating cast: request.seed is i64, proto seed is i32.
+        // A seed past the wire's width is folded, not clamped, so two distinct wide
+        // seeds stay distinct on the wire (a clamp sent every seed from 2^31 up to
+        // one value).
         let huge = ChatCompletionRequest {
             seed: Some(i64::MAX),
             ..Default::default()
@@ -702,7 +784,31 @@ mod tests {
             OutputConstraint::default(),
         )
         .expect("build sampling params");
-        assert_eq!(huge_params.seed, Some(i32::MAX));
+        assert_eq!(huge_params.seed, Some(i32::MIN));
+        let next = ChatCompletionRequest {
+            seed: Some(i64::MAX - 1),
+            ..Default::default()
+        };
+        let next_params = VllmEngineClient::build_grpc_sampling_params_from_chat(
+            &next,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(next_params.seed, Some(i32::MIN + 1));
+        // The engine reads -1 as "no seed": a public -1, and a seed that folds to it, are carried
+        // as the word's minimum instead, so the request stays seeded.
+        for seed in [-1, i64::from(u32::MAX)] {
+            let sentinel = ChatCompletionRequest {
+                seed: Some(seed),
+                ..Default::default()
+            };
+            let sentinel_params = VllmEngineClient::build_grpc_sampling_params_from_chat(
+                &sentinel,
+                OutputConstraint::default(),
+            )
+            .expect("build sampling params");
+            assert_eq!(sentinel_params.seed, Some(i32::MIN), "{seed}");
+        }
     }
 
     #[test]
@@ -786,14 +892,32 @@ mod tests {
             .expect("build sampling params");
         assert_eq!(unset_params.seed, None);
 
-        // Saturating cast: request.seed is i64, proto seed is i32.
+        // A seed past the wire's width is folded, not clamped, so two distinct wide
+        // seeds stay distinct on the wire.
         let huge = CompletionRequest {
             seed: Some(i64::MAX),
             ..minimal_completion_request()
         };
         let huge_params = VllmEngineClient::build_grpc_sampling_params_from_completion(&huge)
             .expect("build sampling params");
-        assert_eq!(huge_params.seed, Some(i32::MAX));
+        assert_eq!(huge_params.seed, Some(i32::MIN));
+        let next = CompletionRequest {
+            seed: Some(i64::MAX - 1),
+            ..minimal_completion_request()
+        };
+        let next_params = VllmEngineClient::build_grpc_sampling_params_from_completion(&next)
+            .expect("build sampling params");
+        assert_eq!(next_params.seed, Some(i32::MIN + 1));
+        for seed in [-1, i64::from(u32::MAX)] {
+            let sentinel = CompletionRequest {
+                seed: Some(seed),
+                ..minimal_completion_request()
+            };
+            let sentinel_params =
+                VllmEngineClient::build_grpc_sampling_params_from_completion(&sentinel)
+                    .expect("build sampling params");
+            assert_eq!(sentinel_params.seed, Some(i32::MIN), "{seed}");
+        }
     }
 
     /// A chat or completion request's `logit_bias` reaches the proto keyed by
@@ -824,6 +948,36 @@ mod tests {
         )
         .expect("build sampling params");
         assert!(params.logit_bias.is_empty());
+    }
+
+    /// A chat request's `min_tokens` reaches the proto, as a completion
+    /// request's does; a request without one sends the proto's zero, which the
+    /// engine reads as no minimum.
+    #[test]
+    fn chat_and_completion_sampling_params_carry_min_tokens() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "min_tokens": 30
+        }))
+        .expect("a chat request");
+        let params = VllmEngineClient::build_grpc_sampling_params_from_chat(
+            &chat,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_tokens, 30);
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "min_tokens": 30
+        }))
+        .expect("a completion request");
+        let params = VllmEngineClient::build_grpc_sampling_params_from_completion(&completion)
+            .expect("build sampling params");
+        assert_eq!(params.min_tokens, 30);
+        let params = VllmEngineClient::build_grpc_sampling_params_from_chat(
+            &ChatCompletionRequest::default(),
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_tokens, 0);
     }
 
     #[test]

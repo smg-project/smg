@@ -15,7 +15,7 @@ it. A prompt that fits still goes through; the engine stays the arbiter of
 whether ``input + max_tokens`` fits.
 
 Usage:
-    E2E_RUNTIME=vllm pytest e2e_test/router/test_context_length.py -v
+    E2E_RUNTIME=vllm E2E_ENGINE=vllm pytest e2e_test/router/test_context_length.py -v
 """
 
 from __future__ import annotations

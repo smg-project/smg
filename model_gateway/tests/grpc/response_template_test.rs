@@ -34,7 +34,7 @@ use smg::{
 use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
 use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 use tower::ServiceExt;
-use tracing_subscriber::{layer::SubscriberExt, Layer};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 use super::{events, read, tokens};
 use crate::{common, scripted_tokenizer, scripted_worker};
@@ -358,7 +358,12 @@ fn chat_request(extra: Value) -> openai_protocol::chat::ChatCompletionRequest {
 async fn chat(gateway: &Gateway, extra: Value) -> Chat {
     let stream = extra["stream"] == true;
     let request = chat_request(extra);
-    let body = read(gateway.router.route_chat(None, &tenant(), request, MODEL)).await;
+    let body = read(
+        gateway
+            .router
+            .route_chat(None, &tenant(), Arc::new(request), MODEL),
+    )
+    .await;
     let arguments = |args: &str| match args {
         "" => Value::Null,
         args => serde_json::from_str(args).unwrap(),
@@ -592,6 +597,13 @@ fn json_lines(capture: &Capture) -> Vec<Value> {
 /// none on it.
 #[tokio::test]
 async fn a_streamed_outputs_reading_is_on_the_streams_end_line() {
+    // The process's default subscriber, so tracing reads a callsite's interest from a
+    // subscriber on every thread. It reads the interest once, at the callsite's first
+    // hit, and with this test's capture the one live dispatcher it asks the hitting
+    // thread's subscriber: a line another test's thread reached first was cached as
+    // never interesting, and the capture missed it for good (the access log's head
+    // line in a whole-binary run, while its start and end lines stayed).
+    let _ = tracing_subscriber::registry().try_init();
     for (output, outcome) in [(OUTPUT, None), (UNDECLARED_CALL, Some("unknown_tool"))] {
         let gateway = serve(Setup {
             output,
@@ -1056,7 +1068,9 @@ async fn hf_refuses_what_the_templates_table_cannot_constrain() {
     let (status, error) = refusal(gateway.router.route_chat(
         None,
         &tenant(),
-        chat_request(json!({"tools": tools(), "tool_choice": "required"})),
+        Arc::new(chat_request(
+            json!({"tools": tools(), "tool_choice": "required"}),
+        )),
         MODEL,
     ))
     .await;
@@ -1081,7 +1095,7 @@ async fn hf_refuses_what_the_templates_table_cannot_constrain() {
     let (status, error) = refusal(gateway.router.route_chat(
         None,
         &tenant(),
-        chat_request(json!({})),
+        Arc::new(chat_request(json!({}))),
         MODEL,
     ))
     .await;
@@ -1204,7 +1218,7 @@ async fn turn_sent(
         Duration::from_secs(30),
         gateway
             .router
-            .route_chat(None, &tenant, chat_request(extra), MODEL),
+            .route_chat(None, &tenant, Arc::new(chat_request(extra)), MODEL),
     )
     .await
     .expect("request should finish");

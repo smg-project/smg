@@ -767,6 +767,14 @@ def _setup_pd(
         # The class's workers, for the answers a test states on the mock
         # engine (the fixture picks the decode side's).
         set_class_workers(all_workers)
+        # The launch's readiness wait covers each worker's tokenizer autoload,
+        # so the gateway's timeout takes the floor the regular path applies.
+        gateway_config = {
+            **gateway_config,
+            "timeout": _gateway_readiness_timeout(
+                connection_mode, model_id, gateway_config["timeout"]
+            ),
+        }
         if moriio:
             _start_gateway(gateway, gateway_config, prefill_workers=[], decode_workers=[])
             _register_moriio_workers(gateway, prefill_workers, decode_workers)
@@ -871,6 +879,13 @@ def _setup_epd(
         # engine (the fixture picks the decode side's) and for a test that
         # reads one worker's own admin API.
         set_class_workers(all_workers)
+        # The same floor as the prefill-decode launch above.
+        gateway_config = {
+            **gateway_config,
+            "timeout": _gateway_readiness_timeout(
+                connection_mode, model_id, gateway_config["timeout"]
+            ),
+        }
         _start_gateway(
             gateway,
             gateway_config,

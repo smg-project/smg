@@ -3,17 +3,25 @@
 //!
 //! The connection pool and the client library bound their own steps (waiting
 //! for a pooled connection, connecting, a response), but nothing bounded a
-//! call as a whole on Postgres, and on Redis the client library's own
-//! response timeout was the only bound. A store that accepts bytes and does
-//! not answer (a frozen or partitioned server, a stalled proxy, a half-open
-//! connection) held every request that touched it for as long as the client
-//! waited.
+//! call as a whole on Postgres, on Redis the client library's own response
+//! timeout was the only bound, and on Oracle the driver's blocking call had
+//! none. A store that accepts bytes and does not answer (a frozen or
+//! partitioned server, a stalled proxy, a half-open connection) held every
+//! request that touched it for as long as the client waited.
 //!
 //! These wrappers put one bound around each call of the three storage traits.
-//! A call that exceeds it is dropped (its pooled connection goes back to the
-//! pool; a reply that arrives later is discarded by the client library) and
-//! answered as the error type's `Timeout`, with one WARN naming the backend,
-//! the operation and the bound. Like the hooked wrappers, they forward every
+//! A call that exceeds it is answered as the error type's `Timeout`, with one
+//! WARN naming the backend, the operation and the bound, and its future is
+//! dropped. On the async drivers (Postgres, Redis) that ends the call: the
+//! pooled connection goes back to the pool and a reply that arrives later is
+//! discarded by the client library. On a driver that runs each call on a
+//! blocking thread (Oracle) the bound ends the wait, not the statement: it
+//! runs on, is applied if it completes (the pooled connections autocommit),
+//! and its connection returns to the pool when the driver returns (each of
+//! its round trips ends within the driver's own call timeout of twice the
+//! bound; a statement with several round trips takes longer in total); so
+//! a write answered as a timeout may have been applied. Like the hooked
+//! wrappers, they forward every
 //! method of a trait: a method added to a storage trait is forwarded here too.
 //! The one exception is `get_response_chain`, left to the trait's default so
 //! that a chain walk is bounded per record: a long `previous_response_id`

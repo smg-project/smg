@@ -8,6 +8,8 @@ pub mod router;
 pub(crate) mod stream_failure;
 pub(crate) mod stream_relay;
 pub(crate) mod tenant_rate_limit;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use axum::response::Response;
 use openai_protocol::{chat::ChatCompletionRequest, profile::ProviderProfile};

@@ -40,6 +40,7 @@ use crate::{
             ResponsesContext,
         },
     },
+    tenant::storage_tenant,
 };
 
 /// Main handler for POST /v1/responses
@@ -148,7 +149,7 @@ async fn route_responses_streaming(
     background: Option<BackgroundStream>,
 ) -> Response {
     // 1. Load conversation history, as the caller's tenant may see it
-    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let tenant = storage_tenant(&params.tenant_request_meta);
     let modified_request = match load_history(
         ctx.history_stores(),
         &request,
@@ -191,7 +192,7 @@ async fn route_responses_streaming(
     let chat_request = match conversions::responses_to_chat(&modified_request) {
         Ok(req) => Arc::new(req),
         Err(e) => {
-            return error::bad_request(e.code(), format!("Failed to convert request: {e}"));
+            return error::bad_request(e.code(), e.to_string());
         }
     };
 

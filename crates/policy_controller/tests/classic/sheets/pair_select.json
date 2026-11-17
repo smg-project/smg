@@ -1,0 +1,2062 @@
+{
+  "recorded_from": "4ba2a6431357be5411a2383cdc4916b41471d722",
+  "policy": "pair-select",
+  "rows": [
+    {
+      "name": "pair-every-worker-open",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              2
+            ]
+          },
+          {
+            "pair": [
+              1,
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-the-decode-policy-draws-among-the-chosen-prefills-partners",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "random",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              1,
+              1,
+              2958
+            ],
+            [
+              1,
+              2,
+              3042
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-one-prefill-over-is-passed-by",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              2
+            ]
+          },
+          {
+            "pair": [
+              1,
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-one-prefill-over-under-a-weighing-policy",
+      "prefill_policy": "cache_aware",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              0,
+              2
+            ]
+          },
+          {
+            "pair": [
+              0,
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-one-prefill-over-under-a-weighing-policy-and-shedding",
+      "prefill_policy": "cache_aware",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": true,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              2
+            ]
+          },
+          {
+            "pair": [
+              1,
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-every-prefill-over-pairs-by-load",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "random",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              1,
+              1,
+              6000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-every-prefill-over-under-a-weighing-policy",
+      "prefill_policy": "cache_aware",
+      "decode_policy": "random",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              1,
+              1,
+              3003
+            ],
+            [
+              1,
+              2,
+              2997
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-every-prefill-over-is-shed-under-shedding",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": true,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "overloaded"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "overloaded"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-every-prefill-over-under-a-weighing-policy-and-shedding",
+      "prefill_policy": "cache_aware",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": true,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "overloaded"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "overloaded"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-every-decode-over-takes-the-least-loaded-partner",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "random",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 3,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "over",
+          "transport": "b"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              0,
+              2,
+              6000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-every-decode-over-is-shed-under-shedding",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": true,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 3,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "over",
+          "transport": "b"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "decode",
+              "why": "overloaded"
+            }
+          },
+          {
+            "none": {
+              "role": "decode",
+              "why": "overloaded"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-one-prefills-partners-over-beside-a-free-decode",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-every-decode-over-a-tie-of-two-partners",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "b"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              0,
+              0,
+              2981
+            ],
+            [
+              0,
+              2,
+              3019
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-two-decodes-over-and-one-stalled",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "random",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 3,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled",
+          "transport": "b"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              1,
+              2,
+              6000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-every-prefill-stalled-pairs-by-load",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "random",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "stalled",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              1,
+              1,
+              6000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-every-prefill-stalled-under-a-weighing-policy",
+      "prefill_policy": "cache_aware",
+      "decode_policy": "random",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "stalled",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              1,
+              1,
+              6000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-every-prefill-stalled-under-shedding",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": true,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "stalled",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "stalled",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-every-decode-stalled-pairs-by-load",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "stalled",
+          "transport": "a"
+        },
+        {
+          "in_flight": 4,
+          "state": "stalled",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "stalled",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              2
+            ]
+          },
+          {
+            "pair": [
+              1,
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-one-prefill-over-and-one-stalled",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "random",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 5,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              0,
+              0,
+              6000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-one-prefill-over-and-one-stalled-under-a-weighing-policy",
+      "prefill_policy": "cache_aware",
+      "decode_policy": "random",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 5,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              0,
+              0,
+              2989
+            ],
+            [
+              0,
+              2,
+              3011
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-one-prefill-over-and-one-stalled-under-shedding",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": true,
+      "prefills": [
+        {
+          "in_flight": 5,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "stalled",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-the-default-draws-over-two-tied-prefills",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 9,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              0,
+              0,
+              2998
+            ],
+            [
+              1,
+              1,
+              3002
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-the-default-draws-a-prefill-then-its-tied-partners",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              0,
+              2,
+              2981
+            ],
+            [
+              1,
+              1,
+              1489
+            ],
+            [
+              1,
+              2,
+              1530
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-a-decode-without-a-free-room-is-passed-by",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a",
+          "rooms": {
+            "window": 2,
+            "admitted": 2
+          }
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b",
+          "rooms": {
+            "window": 2,
+            "admitted": 0
+          }
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null,
+          "rooms": {
+            "window": 2,
+            "admitted": 0
+          }
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              0,
+              2
+            ]
+          },
+          {
+            "pair": [
+              0,
+              2
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-no-partner-has-a-free-room",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a",
+          "rooms": {
+            "window": 2,
+            "admitted": 2
+          }
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b",
+          "rooms": {
+            "window": 2,
+            "admitted": 0
+          }
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null,
+          "rooms": {
+            "window": 2,
+            "admitted": 2
+          }
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              0,
+              0
+            ]
+          },
+          {
+            "pair": [
+              0,
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-every-decode-over-takes-a-free-room-first",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "random",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 3,
+          "state": "over",
+          "transport": "a",
+          "rooms": {
+            "window": 2,
+            "admitted": 0
+          }
+        },
+        {
+          "in_flight": 1,
+          "state": "over",
+          "transport": "b",
+          "rooms": {
+            "window": 2,
+            "admitted": 0
+          }
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": null,
+          "rooms": {
+            "window": 2,
+            "admitted": 2
+          }
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              0,
+              0,
+              6000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-the-default-reads-no-room",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "random",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a",
+          "rooms": {
+            "window": 2,
+            "admitted": 0
+          }
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b",
+          "rooms": {
+            "window": 2,
+            "admitted": 2
+          }
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null,
+          "rooms": {
+            "window": 2,
+            "admitted": 0
+          }
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              1,
+              1,
+              6000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-a-prefill-at-capacity-is-passed-by",
+      "prefill_policy": "random",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefill_bound": 4,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              1,
+              2,
+              6000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-every-prefill-at-capacity",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefill_bound": 4,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-the-default-sheds-when-its-prefill-is-at-capacity",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefill_bound": 4,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 6,
+          "state": "over",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "at_capacity"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-every-prefill-down",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "unavailable"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "unavailable"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-every-decode-down",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "decode",
+              "why": "unavailable"
+            }
+          },
+          {
+            "none": {
+              "role": "decode",
+              "why": "unavailable"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-one-prefills-partners-down",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-the-only-ready-prefills-partners-over-beside-a-free-decode",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "decode",
+              "why": "unavailable"
+            }
+          },
+          {
+            "none": {
+              "role": "decode",
+              "why": "unavailable"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-every-prefill-over-passes-by-a-down-partner",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "random",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "b"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              1,
+              2,
+              6000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-the-default-weighs-the-partners-load-between-tied-prefills",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 3,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 9,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 1,
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "pairs": [
+            [
+              1,
+              1,
+              6000
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "pair-one-prefill-over-and-one-stalled-with-more-under-shedding",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": true,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 5,
+          "state": "stalled",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 1,
+          "state": "free",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "b"
+        },
+        {
+          "in_flight": 5,
+          "state": "free",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "pair": [
+              1,
+              1
+            ]
+          },
+          {
+            "pair": [
+              1,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-every-prefill-over-under-a-weighing-policy-and-every-decode-down",
+      "prefill_policy": "cache_aware",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 4,
+          "state": "over",
+          "transport": "a"
+        },
+        {
+          "in_flight": 2,
+          "state": "over",
+          "transport": "b"
+        }
+      ],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "a"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": "b"
+        },
+        {
+          "in_flight": 0,
+          "state": "down",
+          "transport": null
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "unavailable"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "unavailable"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-no-prefill-of-the-model",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [],
+      "decodes": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        }
+      ],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "prefill",
+              "why": "no_candidates"
+            }
+          },
+          {
+            "none": {
+              "role": "prefill",
+              "why": "no_candidates"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "pair-no-decode-of-the-model",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "shed": false,
+      "prefills": [
+        {
+          "in_flight": 0,
+          "state": "free",
+          "transport": "a"
+        }
+      ],
+      "decodes": [],
+      "requests": 2,
+      "outcome": {
+        "sequence": [
+          {
+            "none": {
+              "role": "decode",
+              "why": "no_candidates"
+            }
+          },
+          {
+            "none": {
+              "role": "decode",
+              "why": "no_candidates"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

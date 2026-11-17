@@ -6,7 +6,7 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
 use serde_json::Value;
-use smg_policy_controller::{spec::MAX_HEADERS, PolicySpec};
+use smg_policy_controller::{spec::MAX_HEADERS, Catalog, PolicySpec};
 
 fn schema_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("policyspec.schema.json")
@@ -122,11 +122,22 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
             .map(str::to_string)
             .collect()
     };
+    // Read from the stock catalog, the one the validator resolves a name in.
+    // The catalog's pickers are a table of its own, so a picker in one and
+    // not in the other fails here. Its scorers are the list the schema
+    // reads, so the literals are what pins a published spelling.
+    let stock = Catalog::builtin();
+    let scorers: Vec<&str> = stock
+        .scorers()
+        .filter(|name| *name != "resident-work")
+        .collect();
+    assert_eq!(bare("ScoreSpec"), scorers);
     assert_eq!(
-        bare("ScoreSpec"),
+        scorers,
         [
             "least-load",
             "least-requests",
+            "fewest-sessions",
             "session-affinity",
             "prefix-affinity",
             "kv-pressure",
@@ -135,8 +146,13 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
             "consistent-hash",
         ]
     );
+    let pickers: Vec<&str> = stock
+        .pickers()
+        .filter(|name| *name != "best-with-temperature")
+        .collect();
+    assert_eq!(bare("PickSpec"), pickers);
     assert_eq!(
-        bare("PickSpec"),
+        pickers,
         [
             "best",
             "round-robin",

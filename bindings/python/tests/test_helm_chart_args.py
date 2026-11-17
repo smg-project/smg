@@ -26,6 +26,7 @@ import json
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -140,8 +141,8 @@ def test_oracle_variables_are_read_by_the_launcher(monkeypatch):
     )
 
 
-def helm_template(settings: tuple[str, ...], files: tuple[Path, ...] = ()):
-    command = ["helm", "template", "smg", str(CHART), "--kube-version", KUBE_VERSION]
+def helm_template(settings: tuple[str, ...], files: tuple[Path, ...] = (), chart: Path = CHART):
+    command = ["helm", "template", "smg", str(chart), "--kube-version", KUBE_VERSION]
     # Pinned so the render never follows the kube context (in a cluster, the pod's own namespace).
     command += ["--namespace", "default"]
     for file in files:
@@ -159,9 +160,9 @@ def render(*settings: str, files: tuple[Path, ...] = ()) -> tuple[str, list[dict
     return completed.stdout, documents
 
 
-def render_error(*settings: str) -> str:
+def render_error(*settings: str, files: tuple[Path, ...] = ()) -> str:
     """Renders the chart with ``--set`` pairs that must fail: helm's error."""
-    completed = helm_template(settings)
+    completed = helm_template(settings, files)
     assert completed.returncode != 0, "the chart rendered values it should refuse"
     return completed.stderr
 
@@ -891,6 +892,74 @@ def test_a_prefill_only_policy_is_refused_by_the_schema():
     assert "router.policy must be one of the following" in render_error("router.policy=bucket")
 
 
+# Tags of digits alone, two workers whose tags are filled in as written, and
+# the policy controller's switch.
+DIGIT_TAGS = ("1.16", "1.10", "20261115")
+WORKERS = (
+    "workers:\n"
+    "  - name: one\n    engine: vllm\n    model: m\n    image:\n      tag: {}\n"
+    "  - name: two\n    engine: vllm\n    model: m\n    image:\n      tag: {}\n"
+)
+CONTROLLER_ON = ("policyController.enabled=true",)
+
+
+def images(documents: list[dict]) -> set[str]:
+    """Every image the render's pod templates name."""
+    return {
+        container["image"]
+        for document in documents
+        if document["kind"] in ("Deployment", "StatefulSet")
+        for container in document["spec"]["template"]["spec"]["containers"]
+    }
+
+
+@needs_helm
+def test_an_image_tag_written_as_a_number_is_refused_under_its_name(tmp_path):
+    """A tag is text. YAML reads an unquoted tag of digits as a number, and no
+    template prints a number as written: 1.10 is read as 1.1. The image name
+    was rendered with a formatting error in the tag's place, and helm exited
+    0. The schema refuses such a tag under the value's name: the router's and
+    a worker's, with the policy controller on or off, from a values file or
+    from ``--set``."""
+    values = tmp_path / "values.yaml"
+    for written in DIGIT_TAGS:
+        values.write_text(f"global:\n  image:\n    tag: {written}\n")
+        for switch in ((), CONTROLLER_ON):
+            assert "global.image.tag: Invalid type" in render_error(*switch, files=(values,))
+        # Every worker's tag, not the first alone.
+        for at, tags in enumerate(((written, '"0.31"'), ('"0.31"', written))):
+            values.write_text(WORKERS.format(*tags))
+            assert f"workers.{at}.image.tag: Invalid type" in render_error(files=(values,))
+    assert "global.image.tag: Invalid type" in render_error("global.image.tag=20261115")
+
+
+@needs_helm
+def test_a_tag_of_digits_quoted_names_the_image(tmp_path):
+    """Quoted, a tag of digits alone is the text written: the router's image
+    and the version label carry it, a worker's image carries its own, and a
+    worker that names none takes the router's. A ``null`` tag is the default:
+    the chart's own version."""
+    values = tmp_path / "values.yaml"
+    workers = WORKERS.format('"0.31"', "null")
+    for written in DIGIT_TAGS:
+        values.write_text(f'global:\n  image:\n    tag: "{written}"\n{workers}')
+        for switch in ((), CONTROLLER_ON):
+            _, documents = render(*switch, files=(values,))
+            assert router_container(documents)["image"] == f"docker.io/lightseekorg/smg:{written}"
+            engines = {image for image in images(documents) if image.startswith("ghcr.io/")}
+            assert engines == {"ghcr.io/smg-project/smg:0.31", f"ghcr.io/smg-project/smg:{written}"}
+            labels = [document["metadata"].get("labels", {}) for document in documents]
+            versions = {found.get("app.kubernetes.io/version") for found in labels}
+            assert versions - {None} == {written}
+    values.write_text(f"global:\n  image:\n    tag: null\n{WORKERS.format('null', 'null')}")
+    _, documents = render(files=(values,))
+    version = yaml.safe_load((CHART / "Chart.yaml").read_text())["appVersion"]
+    assert images(documents) == {
+        f"docker.io/lightseekorg/smg:{version}",
+        f"ghcr.io/smg-project/smg:{version}",
+    }
+
+
 @needs_helm
 @pytest.mark.parametrize("value", [-1, 0, 4096])
 def test_the_concurrency_bound_value_reaches_the_launcher_as_given(value):
@@ -1225,19 +1294,35 @@ def services(documents: list[dict]) -> dict[str, dict]:
 
 
 @needs_helm
+def test_an_admin_host_without_an_admin_port_is_refused_at_render():
+    """A host without the port fails at the gateway's start; the chart refuses
+    it where the values are written."""
+    assert "router.adminPort" in render_error("router.adminHost=0.0.0.0")
+
+
+LISTENER_PORT_KEYS = ("router.port", "router.metrics.port", "router.mesh.port")
+
+
+@needs_helm
 @pytest.mark.parametrize(
-    "settings, words",
+    "settings, key",
     [
-        (("router.adminHost=0.0.0.0",), "router.adminPort"),
         (("router.adminPort=30000",), "router.port"),
         (("router.adminPort=29000", "router.metrics.port=29000"), "router.metrics.port"),
         (("router.mesh.enabled=true", "router.adminPort=39527"), "router.mesh.port"),
     ],
 )
-def test_an_admin_listener_the_gateway_would_refuse_is_refused_at_render(settings, words):
-    """A host without the port, or a port another listener holds, fails at the
-    gateway's start; the chart refuses both where the values are written."""
-    assert words in render_error(*settings)
+def test_an_admin_port_another_listener_holds_is_refused_naming_that_listener(settings, key):
+    """A port another listener holds fails at the gateway's start; the chart
+    refuses it where the values are written and names the one key that
+    matched, so the operator reads which listener to move and not a list."""
+    error = render_error(*settings)
+    port = next(s for s in settings if s.startswith("router.adminPort=")).split("=")[1]
+    assert (
+        f"router.adminPort {port} equals {key}: the gateway refuses two listeners on one port"
+        in error
+    ), error
+    assert not any(other in error for other in LISTENER_PORT_KEYS if other != key), error
 
 
 @needs_helm
@@ -1481,3 +1566,244 @@ def test_the_admission_config_example_renders_arguments_the_launcher_parses():
     parsed = parser.parse_args(args)
     assert parsed.tenant_rate_limit_config == "/etc/smg/rate-limit/rate-limit.yaml"
     assert parsed.priority_scheduler_config == "/etc/smg/scheduler/scheduler.yaml"
+
+
+# `helm upgrade --reuse-values` renders the new chart over the old release's
+# values, in place of the chart's own: a value added since that release is
+# absent. These are the values 1.14.0 already held and the chart cannot
+# render its defaults without; a release that old or newer brings them along.
+HELD_SINCE_1_14 = frozenset(
+    """
+    global global.image global.image.registry global.image.repository
+    global.image.pullPolicy
+    router router.replicas router.progressDeadlineSeconds router.policy router.mesh
+    router.serviceDiscovery router.discovery router.cacheThreshold
+    router.balanceAbsThreshold router.balanceRelThreshold router.evictionIntervalSecs
+    router.maxTreeSize router.blockSize router.maxPayloadSize router.requestTimeoutSecs
+    router.maxConcurrentRequests router.queueSize router.queueTimeoutSecs router.retry
+    router.retry.enabled router.retry.maxRetries router.retry.initialBackoffMs
+    router.retry.maxBackoffMs router.retry.backoffMultiplier router.retry.jitterFactor
+    router.circuitBreaker router.circuitBreaker.enabled
+    router.circuitBreaker.failureThreshold router.circuitBreaker.successThreshold
+    router.circuitBreaker.timeoutDurationSecs router.circuitBreaker.windowDurationSecs
+    router.healthCheck router.healthCheck.enabled router.healthCheck.failureThreshold
+    router.healthCheck.successThreshold router.healthCheck.timeoutSecs
+    router.healthCheck.intervalSecs router.healthCheck.endpoint router.port router.service
+    router.service.type router.service.port router.ingress router.metrics
+    router.metrics.port router.metrics.serviceMonitor router.tracing router.logging
+    router.logging.level router.autoscaling router.podDisruptionBudget
+    router.securityContext router.securityContext.readOnlyRootFilesystem
+    router.securityContext.runAsNonRoot router.securityContext.runAsUser
+    router.securityContext.allowPrivilegeEscalation router.securityContext.capabilities
+    router.securityContext.capabilities.drop router.securityContext.seccompProfile
+    router.securityContext.seccompProfile.type router.livenessProbe
+    router.livenessProbe.path router.livenessProbe.initialDelaySeconds
+    router.livenessProbe.periodSeconds router.readinessProbe router.readinessProbe.path
+    router.readinessProbe.initialDelaySeconds router.readinessProbe.periodSeconds
+    router.shutdownGracePeriodSeconds router.terminationGraceMarginSeconds router.wasm
+    router.mcp
+    huggingface
+    auth auth.rateLimitTokensPerSecond
+    history history.backend
+    serviceAccount serviceAccount.create
+    rbac
+    grafana grafana.dashboard
+    prometheusRule
+    """.split()
+)
+
+
+def key_paths(values: dict, prefix: str = "") -> list[str]:
+    """Every key path of a values tree, a mapping before its members."""
+    paths = []
+    for key, value in values.items():
+        paths.append(f"{prefix}{key}")
+        if isinstance(value, dict):
+            paths += key_paths(value, f"{prefix}{key}.")
+    return paths
+
+
+def chart_copy(values: dict, directory: Path) -> Path:
+    """A copy of the chart with ``values`` written as its values file."""
+    chart = directory / "smg"
+    shutil.copytree(CHART, chart)
+    (chart / "values.yaml").write_text(yaml.safe_dump(values))
+    return chart
+
+
+def chart_without(path: str, directory: Path) -> Path:
+    """A copy of the chart whose values file lacks one key path."""
+    values = yaml.safe_load((CHART / "values.yaml").read_text())
+    *parents, last = path.split(".")
+    node = values
+    for parent in parents:
+        node = node[parent]
+    del node[last]
+    return chart_copy(values, directory / path)
+
+
+@needs_helm
+def test_a_value_added_since_1_14_may_be_absent(tmp_path):
+    """Each key path of the values file is removed in turn, and the chart
+    renders what its defaults render, byte for byte, unless 1.14.0 already
+    held that path. A value added to the chart is not on that list: an
+    upgrade with reused values must render the defaults without it."""
+    default = helm_template(())
+    assert default.returncode == 0, default.stderr
+    values = yaml.safe_load((CHART / "values.yaml").read_text())
+    # Each copy below holds a values file the YAML library wrote: one written
+    # back whole must render the same, or every path would read as needed.
+    written_back = helm_template((), chart=chart_copy(values, tmp_path / "whole"))
+    assert written_back.stdout == default.stdout, written_back.stderr
+    paths = key_paths(values)
+
+    def needed(path: str) -> bool:
+        rendered = helm_template((), chart=chart_without(path, tmp_path))
+        return rendered.returncode != 0 or rendered.stdout != default.stdout
+
+    with ThreadPoolExecutor(8) as pool:
+        needs = {path for path, need in zip(paths, pool.map(needed, paths)) if need}
+    added = sorted(needs - HELD_SINCE_1_14)
+    assert not added, (
+        f"an upgrade that reuses older values holds none of {added}: read each "
+        "nil-safely in the templates, and render its default when it is absent"
+    )
+    stale = sorted(HELD_SINCE_1_14 - needs)
+    assert not stale, f"listed as needed, yet the defaults render without {stale}"
+
+
+@needs_helm
+@pytest.mark.parametrize("provider", ["kubernetes", "slurm"])
+def test_a_provider_renders_the_same_without_the_disaggregation_block(provider, tmp_path):
+    """A 1.14.0 release that finds its workers through a provider holds no
+    ``router.disaggregation``: over its reused values the provider's
+    arguments render as they do over the whole values."""
+    whole = helm_template(PROVIDERS[provider])
+    assert whole.returncode == 0, whole.stderr
+    chart = chart_without("router.disaggregation", tmp_path)
+    without = helm_template(PROVIDERS[provider], chart=chart)
+    assert without.returncode == 0, without.stderr
+    assert without.stdout == whole.stdout
+
+
+# A value added since 1.14.0 that holds a default, its block, and what an
+# upgrade gives to turn the feature on: the switch alone, or the switch and
+# one other member of the block. ``router.mmTurbojpeg`` is the sixth such
+# value: it has no block and no switch, and the sweep above removes it.
+ADMIN_PORT = "router.adminPort=9001"
+RATE_LIMIT = ("router.tenantRateLimit.enabled=true", "router.tenantRateLimit.configMap.name=limits")
+SCHEDULER = (
+    "router.priorityScheduler.enabled=true",
+    "router.priorityScheduler.configMap.name=classes",
+)
+TURNED_ON_OVER_REUSED_VALUES = [
+    ("auth.controlPlane.secretKey", "auth.controlPlane", ("auth.controlPlane.apiKeys=k1",)),
+    (
+        "auth.controlPlane.secretKey",
+        "auth.controlPlane",
+        ("auth.controlPlane.existingSecret=keys",),
+    ),
+    ("router.adminService.port", "router.adminService", (ADMIN_PORT,)),
+    (
+        "router.adminService.port",
+        "router.adminService",
+        (ADMIN_PORT, "router.adminService.type=LoadBalancer"),
+    ),
+    (
+        "router.adminService.port",
+        "router.adminService",
+        (ADMIN_PORT, "router.adminService.annotations.team=a"),
+    ),
+    ("router.adminService.type", "router.adminService", (ADMIN_PORT,)),
+    (
+        "router.adminService.type",
+        "router.adminService",
+        (ADMIN_PORT, "router.adminService.port=9100"),
+    ),
+    ("router.tenantRateLimit.configMap.key", "router.tenantRateLimit", RATE_LIMIT),
+    ("router.priorityScheduler.configMap.key", "router.priorityScheduler", SCHEDULER),
+]
+
+
+@needs_helm
+@pytest.mark.parametrize(("leaf", "block", "given"), TURNED_ON_OVER_REUSED_VALUES)
+def test_a_feature_turned_on_over_reused_values_renders_as_a_fresh_install(
+    leaf, block, given, tmp_path
+):
+    """An upgrade that reuses the values of a 1.14.0 release and turns a
+    feature on holds what it gives and none of the block's defaults. Without
+    the value, and without its whole block, the chart renders what it renders
+    over its own values: the default, never an empty field or a printed nil."""
+    whole = helm_template(given)
+    assert whole.returncode == 0, whole.stderr
+    for absent in (leaf, block):
+        without = helm_template(given, chart=chart_without(absent, tmp_path))
+        assert without.returncode == 0, f"without {absent}: {without.stderr}"
+        assert without.stdout == whole.stdout, f"without {absent}"
+
+
+@needs_helm
+def test_the_admission_example_renders_the_same_over_reused_values(tmp_path):
+    """The example names both ConfigMaps and neither key: given in an upgrade
+    that reuses values from before the blocks, each flag names the chart's
+    default file."""
+    whole = helm_template((), files=(ADMISSION_EXAMPLE,))
+    assert whole.returncode == 0, whole.stderr
+    for block in ("router.tenantRateLimit", "router.priorityScheduler"):
+        chart = chart_without(block, tmp_path)
+        without = helm_template((), files=(ADMISSION_EXAMPLE,), chart=chart)
+        assert without.returncode == 0, f"without {block}: {without.stderr}"
+        assert without.stdout == whole.stdout, f"without {block}"
+
+
+@needs_helm
+def test_the_rate_limit_turned_on_alone_over_reused_values_is_refused_in_the_charts_words(
+    tmp_path,
+):
+    """The switch with no ConfigMap is refused by the chart's own sentence
+    over reused values too, not by a nil pointer."""
+    chart = chart_without("router.tenantRateLimit", tmp_path)
+    refused = helm_template(("router.tenantRateLimit.enabled=true",), chart=chart)
+    assert refused.returncode != 0
+    assert "router.tenantRateLimit.enabled needs router.tenantRateLimit.configMap.name" in (
+        refused.stderr
+    )
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    ("given", "directory"), [(RATE_LIMIT, "rate-limit"), (SCHEDULER, "scheduler")]
+)
+def test_an_admission_config_key_that_is_given_names_the_file(given, directory):
+    feature = given[0].split(".")[1]
+    _, documents = render(*given, f"router.{feature}.configMap.key=tables.yaml")
+    assert f"/etc/smg/{directory}/tables.yaml" in router_container(documents)["args"]
+
+
+@needs_helm
+def test_the_admin_service_takes_the_type_port_and_annotations_it_is_given():
+    _, documents = render(
+        ADMIN_PORT,
+        "router.adminService.type=LoadBalancer",
+        "router.adminService.port=9100",
+        "router.adminService.annotations.team=a",
+    )
+    admin = services(documents)["smg-router-admin"]
+    assert admin["metadata"]["annotations"] == {"team": "a"}
+    assert admin["spec"]["type"] == "LoadBalancer"
+    assert admin["spec"]["ports"][0]["port"] == 9100
+
+
+@needs_helm
+@pytest.mark.parametrize(("mode", "role"), [("pd", "prefill"), ("pd", "decode"), ("epd", "encode")])
+def test_one_role_list_alone_gives_the_charts_workers_a_role(mode, role):
+    """Chart workers under a mode are refused when no role addresses them:
+    each role's list alone does."""
+    _, documents = render(
+        *WORKER,
+        f"router.disaggregation.mode={mode}",
+        f"router.disaggregation.{role}[0].url=http://{role}-0:8000",
+    )
+    args = router_container(documents)["args"]
+    assert "--worker-urls" not in args
+    assert f"--{role}" in args

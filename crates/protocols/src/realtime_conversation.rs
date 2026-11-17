@@ -181,7 +181,10 @@ pub struct McpListToolEntry {
 /// Error from an MCP tool call.
 ///
 /// One of: protocol error, tool execution error, or HTTP error.
-#[expect(clippy::enum_variant_names)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "the variants carry the wire's type names, which all end in error"
+)]
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

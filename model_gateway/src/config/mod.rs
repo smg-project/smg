@@ -6,6 +6,7 @@ pub mod secrets;
 pub(crate) mod test_support;
 pub mod types;
 pub(crate) mod validation;
+mod worker_settings;
 
 pub use builder::*;
 pub use types::*;

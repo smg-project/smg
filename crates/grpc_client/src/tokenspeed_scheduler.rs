@@ -17,14 +17,18 @@ use tracing::{debug, warn};
 
 use crate::{
     channel::Channel,
+    framed::{call_with_frames, tokenspeed_frames},
     request_fields::{
-        body_format, completion_constraint, logit_bias_by_token_text, plain_constraint,
+        body_format, completion_constraint, logit_bias_by_token_text, plain_constraint, seed_bits,
         stop_strings, ConstraintKind, OutputConstraint, PlainSampling,
     },
     BoxedTraceInjector,
 };
 
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod tokenspeed_proto {
     #![allow(
         clippy::all,
@@ -38,13 +42,14 @@ pub mod tokenspeed_proto {
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
 pub type AbortOnDropStream =
-    crate::AbortOnDropStream<tokenspeed_proto::GenerateResponse, TokenSpeedSchedulerClient>;
+    crate::AbortOnDropStream<Box<tokenspeed_proto::GenerateResponse>, TokenSpeedSchedulerClient>;
 
 /// gRPC client for the TokenSpeed scheduler.
 #[derive(Clone)]
 pub struct TokenSpeedSchedulerClient {
     client: tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient<Channel>,
     trace_injector: BoxedTraceInjector,
+    channel: Channel,
 }
 
 crate::impl_abort_for_drop_with_reason!(TokenSpeedSchedulerClient);
@@ -53,7 +58,9 @@ impl TokenSpeedSchedulerClient {
     crate::impl_engine_client_basics!(
         tokenspeed_proto,
         tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient<Channel>,
-        "TokenSpeed"
+        "TokenSpeed",
+        "tokenspeed.grpc.scheduler.TokenSpeedScheduler",
+        tokenspeed_proto::token_speed_scheduler_server::SERVICE_NAME
     );
 
     pub async fn abort_request(
@@ -243,13 +250,14 @@ impl TokenSpeedSchedulerClient {
             presence_penalty: Some(request.presence_penalty.unwrap_or(0.0)),
             repetition_penalty: Some(request.repetition_penalty.unwrap_or(1.0)),
             max_new_tokens: request.output_token_cap(),
+            min_new_tokens: request.min_tokens.unwrap_or(0),
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens: true,
             spaces_between_special_tokens: true,
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
-            sampling_seed: Self::chat_sampling_seed(request)?,
+            sampling_seed: Self::chat_sampling_seed(request),
             n: request.n.unwrap_or(1),
             logit_bias: logit_bias_by_token_text(request.logit_bias.as_ref()),
             constraint: Self::build_constraint_for_chat(request, constraint)?,
@@ -333,7 +341,7 @@ impl TokenSpeedSchedulerClient {
             spaces_between_special_tokens: true,
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
-            sampling_seed: Self::completion_sampling_seed(request)?,
+            sampling_seed: Self::completion_sampling_seed(request),
             n: request.n.unwrap_or(1),
             logit_bias: logit_bias_by_token_text(request.logit_bias.as_ref()),
             constraint: Self::constraint_of(completion_constraint(request)?),
@@ -467,34 +475,26 @@ impl TokenSpeedSchedulerClient {
         })
     }
 
-    fn unsigned_sampling_seed(seed: Option<i64>) -> Result<Option<u64>, String> {
-        seed.map(|seed| {
-            u64::try_from(seed).map_err(|_| "sampling seed must be an unsigned integer".to_owned())
-        })
-        .transpose()
+    /// The OpenAI-compatible `seed` on this wire's unsigned word: its bits ([`seed_bits`]).
+    fn unsigned_sampling_seed(seed: Option<i64>) -> Option<u64> {
+        seed.map(seed_bits)
     }
 
     /// Resolve the TokenSpeed sampling seed: the native `sampling_seed` field
     /// wins when set; the OpenAI-compatible `seed` is only the fallback.
-    fn resolve_sampling_seed(
-        sampling_seed: Option<u64>,
-        legacy_seed: Option<i64>,
-    ) -> Result<Option<u64>, String> {
-        match sampling_seed {
-            Some(seed) => Ok(Some(seed)),
-            None => Self::unsigned_sampling_seed(legacy_seed),
-        }
+    fn resolve_sampling_seed(sampling_seed: Option<u64>, legacy_seed: Option<i64>) -> Option<u64> {
+        sampling_seed.or_else(|| Self::unsigned_sampling_seed(legacy_seed))
     }
 
     #[expect(
         deprecated,
         reason = "TokenSpeed preserves the OpenAI-compatible chat seed on its sampling wire"
     )]
-    fn chat_sampling_seed(request: &ChatCompletionRequest) -> Result<Option<u64>, String> {
+    fn chat_sampling_seed(request: &ChatCompletionRequest) -> Option<u64> {
         Self::resolve_sampling_seed(request.sampling_seed, request.seed)
     }
 
-    fn completion_sampling_seed(request: &CompletionRequest) -> Result<Option<u64>, String> {
+    fn completion_sampling_seed(request: &CompletionRequest) -> Option<u64> {
         Self::resolve_sampling_seed(request.sampling_seed, request.seed)
     }
 }
@@ -566,6 +566,39 @@ impl From<tokenspeed_proto::GetLoadsResponse> for openai_protocol::worker::Worke
             loads: resp.loads.into_iter().map(Into::into).collect(),
             aggregate,
             sampled_at: None,
+        }
+    }
+}
+
+impl TokenSpeedSchedulerClient {
+    /// `generate` with the request's large inline tensors as body frames of
+    /// their own (the crate's private `framed` module): no encode buffer of
+    /// the message's size, the same message on the wire. A plain fn like
+    /// `generate`, for the same reason: the request becomes its frames before
+    /// the future exists, so the boxed future holds the frame list and the
+    /// request id, not the request; the trace context is injected at the
+    /// first poll, as there.
+    pub fn generate_framed(
+        &self,
+        req: tokenspeed_proto::GenerateRequest,
+    ) -> impl std::future::Future<Output = Result<AbortOnDropStream, tonic::Status>> + '_ {
+        let request_id = req.request_id.clone();
+        let frames = tokenspeed_frames(req);
+        async move {
+            let frames = frames?;
+            let mut carrier = Request::new(());
+            if let Err(e) = self.trace_injector.inject(carrier.metadata_mut()) {
+                tracing::warn!("Failed to inject trace context: {}", e);
+            }
+            let (metadata, _extensions, ()) = carrier.into_parts();
+            let stream = call_with_frames::<Box<tokenspeed_proto::GenerateResponse>>(
+                self.channel(),
+                "/tokenspeed.grpc.scheduler.TokenSpeedScheduler/Generate",
+                metadata.into_headers(),
+                frames,
+            )
+            .await?;
+            Ok(AbortOnDropStream::new(stream, request_id, self.clone()))
         }
     }
 }
@@ -646,6 +679,47 @@ mod logit_bias_tests {
         let params = TokenSpeedSchedulerClient::build_sampling_params_from_completion(&plain)
             .expect("build sampling params");
         assert!(params.logit_bias.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod min_tokens_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// A chat request's `min_tokens` reaches the proto as `min_new_tokens`, as
+    /// a completion request's does; a request without one sends the proto's
+    /// zero, which the engine reads as no minimum.
+    #[test]
+    fn chat_and_completion_sampling_params_carry_min_tokens() {
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "min_tokens": 30
+        }))
+        .expect("a chat request");
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_chat(
+            &chat,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 30);
+        let completion: CompletionRequest = serde_json::from_value(json!({
+            "model": "m", "prompt": "hi", "min_tokens": 30
+        }))
+        .expect("a completion request");
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_completion(&completion)
+            .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 30);
+        let unset: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        let params = TokenSpeedSchedulerClient::build_sampling_params_from_chat(
+            &unset,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 0);
     }
 }
 
@@ -751,29 +825,31 @@ mod seed_resolution_tests {
 
     #[test]
     fn native_sampling_seed_wins_over_legacy_seed() {
-        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(Some(7), Some(42))
-            .expect("native seed should resolve");
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(Some(7), Some(42));
         assert_eq!(resolved, Some(7));
     }
 
     #[test]
     fn legacy_seed_is_the_fallback() {
-        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(42))
-            .expect("legacy seed should resolve");
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(42));
         assert_eq!(resolved, Some(42));
     }
 
     #[test]
-    fn negative_legacy_seed_is_rejected() {
-        let err = TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(-1))
-            .expect_err("negative legacy seed must be rejected");
-        assert!(err.contains("unsigned integer"), "{err}");
+    fn a_negative_legacy_seed_is_its_bits() {
+        assert_eq!(
+            TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(-1)),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            TokenSpeedSchedulerClient::resolve_sampling_seed(None, Some(i64::MIN)),
+            Some(1 << 63)
+        );
     }
 
     #[test]
     fn no_seed_stays_none() {
-        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, None)
-            .expect("absent seeds should resolve");
+        let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, None);
         assert_eq!(resolved, None);
     }
 }

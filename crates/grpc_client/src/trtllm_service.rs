@@ -10,14 +10,17 @@ use tracing::{debug, warn};
 use crate::{
     channel::Channel,
     request_fields::{
-        body_format, completion_constraint, plain_constraint, stop_strings, ConstraintKind,
-        OutputConstraint, PlainSampling,
+        body_format, completion_constraint, plain_constraint, seed_bits, stop_strings,
+        ConstraintKind, OutputConstraint, PlainSampling,
     },
     AbortOnDropClient, BoxedTraceInjector,
 };
 
 // Include the generated protobuf code
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod proto {
     #![allow(
         clippy::all,
@@ -30,13 +33,16 @@ pub mod proto {
 
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
-pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, TrtllmServiceClient>;
+pub type AbortOnDropStream =
+    crate::AbortOnDropStream<Box<proto::GenerateResponse>, TrtllmServiceClient>;
 
 /// gRPC client for TensorRT-LLM service
 #[derive(Clone)]
 pub struct TrtllmServiceClient {
     client: proto::trtllm_service_client::TrtllmServiceClient<Channel>,
     trace_injector: BoxedTraceInjector,
+    /// The client's own channel, the one its generated stub rides.
+    channel: Channel,
 }
 
 impl AbortOnDropClient for TrtllmServiceClient {
@@ -56,7 +62,9 @@ impl TrtllmServiceClient {
     crate::impl_engine_client_basics!(
         proto,
         proto::trtllm_service_client::TrtllmServiceClient<Channel>,
-        "TensorRT-LLM"
+        "TensorRT-LLM",
+        "trtllm.TrtllmService",
+        proto::trtllm_service_server::SERVICE_NAME
     );
 
     /// Abort a request
@@ -295,6 +303,10 @@ impl TrtllmServiceClient {
     /// - temperature: 1.0 (neutral sampling)
     /// - top_p: 1.0 (no nucleus filtering)
     /// - repetition_penalty: 1.0 (no penalty)
+    #[expect(
+        deprecated,
+        reason = "ChatCompletionRequest.seed is marked Legacy by openai-protocol, but the engine still honors it"
+    )]
     fn build_sampling_config_from_chat(request: &ChatCompletionRequest) -> proto::SamplingConfig {
         proto::SamplingConfig {
             beam_width: 1,
@@ -304,9 +316,11 @@ impl TrtllmServiceClient {
             top_p_min: None,
             top_p_reset_ids: None,
             top_p_decay: None,
-            seed: None,
+            seed: request
+                .sampling_seed
+                .or_else(|| request.seed.map(seed_bits)),
             temperature: Some(request.temperature.unwrap_or(1.0)),
-            min_tokens: None,
+            min_tokens: request.min_tokens,
             beam_search_diversity_rate: None,
             repetition_penalty: Some(request.repetition_penalty.unwrap_or(1.0)),
             presence_penalty: request.presence_penalty,
@@ -575,7 +589,9 @@ impl TrtllmServiceClient {
             top_p_min: None,
             top_p_reset_ids: None,
             top_p_decay: None,
-            seed: request.seed.map(|s| s as u64),
+            seed: request
+                .sampling_seed
+                .or_else(|| request.seed.map(seed_bits)),
             temperature: Some(request.temperature.unwrap_or(1.0)),
             min_tokens: request.min_tokens,
             beam_search_diversity_rate: None,
@@ -661,6 +677,7 @@ crate::impl_rank_load_conversions!(proto);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::{testing::refused_endpoint, DEFAULT_CONNECT_TIMEOUT};
 
     /// A request with a `logit_bias` is refused: the wire has no sparse map.
     /// (The completion builder keeps a receiver, and a lazy channel needs the
@@ -685,15 +702,12 @@ mod tests {
             "model": "m", "prompt": "hi", "logit_bias": {"1": -100}
         }))
         .expect("a completion request");
+        let channel = Channel::unconnected("http://127.0.0.1:1", DEFAULT_CONNECT_TIMEOUT)
+            .expect("a channel to nowhere");
         let client = TrtllmServiceClient {
-            client: proto::trtllm_service_client::TrtllmServiceClient::new(
-                Channel::unconnected(
-                    "http://127.0.0.1:1",
-                    crate::channel::DEFAULT_CONNECT_TIMEOUT,
-                )
-                .expect("a channel to nowhere"),
-            ),
+            client: proto::trtllm_service_client::TrtllmServiceClient::new(channel.clone()),
             trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
+            channel,
         };
         let error = client
             .build_generate_request_from_completion(
@@ -716,7 +730,6 @@ mod tests {
             )
             .is_ok());
     }
-    use crate::channel::testing::refused_endpoint;
 
     /// A poll's answer reaches the worker's report rank for rank, the
     /// measured capacity included where the servicer reports one.
@@ -794,6 +807,72 @@ mod tests {
         );
     }
 
+    /// A chat request's `seed` reaches the sampling config, as a completion
+    /// request's does and with the same bits; a request without one sends none.
+    #[test]
+    fn chat_and_completion_sampling_configs_carry_the_seed() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "seed": 7
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&chat).seed,
+            Some(7)
+        );
+        let negative: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "seed": -1
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&negative).seed,
+            Some(u64::MAX)
+        );
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "seed": 7
+        }))
+        .expect("a completion request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_completion(&completion).seed,
+            Some(7)
+        );
+        let unset: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&unset).seed,
+            None
+        );
+    }
+
+    /// A chat or completion request's `sampling_seed` reaches the sampling config whole, as on the
+    /// plain route, and wins over `seed` when a request sets both; `seed` alone still arrives.
+    #[test]
+    fn chat_and_completion_sampling_seed_reaches_the_engine_request() {
+        let chat = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a chat request");
+            TrtllmServiceClient::build_sampling_config_from_chat(&request).seed
+        };
+        let completion = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "prompt": "hi", "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a completion request");
+            TrtllmServiceClient::build_sampling_config_from_completion(&request).seed
+        };
+        let both =
+            |sampling_seed, seed| (chat(sampling_seed, seed), completion(sampling_seed, seed));
+        assert_eq!(both(Some(7), None), (Some(7), Some(7)));
+        assert_eq!(both(Some(7), Some(42)), (Some(7), Some(7)));
+        assert_eq!(both(Some(u64::MAX), None), (Some(u64::MAX), Some(u64::MAX)));
+        assert_eq!(both(None, Some(42)), (Some(42), Some(42)));
+        assert_eq!(both(None, None), (None, None));
+    }
+
     #[test]
     fn plain_sampling_seed_and_stop_token_ids_reach_the_request() {
         let body: GenerateRequest = serde_json::from_value(serde_json::json!({
@@ -810,6 +889,36 @@ mod tests {
         .unwrap();
         assert_eq!(request.sampling_config.unwrap().seed, Some(7));
         assert_eq!(request.stop_token_ids, vec![1, 2]);
+    }
+
+    /// A chat request's `min_tokens` reaches the sampling config, as a
+    /// completion request's does; a request without one leaves it unset.
+    #[test]
+    fn chat_and_completion_sampling_configs_carry_min_tokens() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "min_tokens": 30
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&chat).min_tokens,
+            Some(30)
+        );
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "min_tokens": 30
+        }))
+        .expect("a completion request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_completion(&completion).min_tokens,
+            Some(30)
+        );
+        let unset: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&unset).min_tokens,
+            None
+        );
     }
 
     /// A `response_format` set aside for the builder reads as absent: the tag
@@ -1013,15 +1122,12 @@ mod tests {
 
         // A client over a lazy channel nothing listens on (made under the
         // runtime a channel needs): the builders dial nothing.
+        let channel = Channel::unconnected("http://127.0.0.1:1", DEFAULT_CONNECT_TIMEOUT)
+            .expect("a channel to nowhere");
         let client = TrtllmServiceClient {
-            client: proto::trtllm_service_client::TrtllmServiceClient::new(
-                Channel::unconnected(
-                    "http://127.0.0.1:1",
-                    crate::channel::DEFAULT_CONNECT_TIMEOUT,
-                )
-                .expect("a channel to nowhere"),
-            ),
+            client: proto::trtllm_service_client::TrtllmServiceClient::new(channel.clone()),
             trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
+            channel,
         };
         let build = |request: &ResponsesRequest| {
             client

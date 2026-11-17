@@ -22,7 +22,9 @@
 
 use std::{fmt, sync::Arc};
 
-use llm_multimodal::{ImageFrame, MediaItemInfo, Modality, VisionPreProcessor};
+use llm_multimodal::{
+    EncoderDtype, ImageFrame, MediaConnectorError, MediaItemInfo, Modality, VisionPreProcessor,
+};
 
 use crate::worker::{Worker, WorkerRegistry};
 
@@ -174,12 +176,62 @@ pub(crate) fn check_image_size_feature_budget(
     Ok(())
 }
 
+/// The longest message the gRPC framing carries: its length prefix is four
+/// bytes, and tonic refuses a longer message on whichever side encodes it
+/// (`Cannot return body with more than 4GB`), the request's own size.
+pub(crate) const WIRE_MESSAGE_CAP: usize = u32::MAX as usize;
+
+/// Hold a batch of images to the wire's own cap before any of the batch is
+/// decoded or any tensor built, where the caller resolved one (`cap`:
+/// [`WIRE_MESSAGE_CAP`] where the pixels ride inline in the gateway's own
+/// gRPC message, `None` where they travel beside it or the caller cannot
+/// tell, and then nothing is refused here: the framing itself answers a
+/// message it cannot carry): the pixel tensors they would put in one
+/// Generate request, planned from the size each header promised through the
+/// processor's own size-to-elements rule (`image_input_elements`) at the
+/// width the wire writes an element in (`wire_dtype`; when the plan does not
+/// know it yet, the processor's own bytes for one that emits pixel bytes and
+/// the narrowest float width the engines take, two bytes, otherwise, so the
+/// bound refuses only what no serialization could carry), must stay within
+/// the cap. The message's other fields are not counted: a
+/// request the pixels alone leave within the cap by a hair is refused by the
+/// framing itself, as the request's own size. An image the processor plans
+/// no element count for is not counted either.
+pub(crate) fn check_image_wire_cap(
+    processor: &dyn VisionPreProcessor,
+    images: &[Arc<ImageFrame>],
+    wire_dtype: Option<EncoderDtype>,
+    cap: Option<usize>,
+) -> Result<(), MediaConnectorError> {
+    let Some(cap) = cap else {
+        return Ok(());
+    };
+    let element_size = wire_dtype.map_or_else(
+        || if processor.emits_pixel_bytes() { 1 } else { 2 },
+        EncoderDtype::element_size,
+    );
+    let bytes = images
+        .iter()
+        .filter_map(|image| {
+            let size = image.size();
+            processor.image_input_elements(size.width, size.height)
+        })
+        .fold(0usize, |total, elements| {
+            total.saturating_add(elements.saturating_mul(element_size))
+        });
+    if bytes > cap {
+        return Err(MediaConnectorError::PixelsOverWireCap { bytes, limit: cap });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use llm_multimodal::{
-        types::ImageSize, ImageSource, PreprocessedEncoderInputs, TransformError, VideoSamplingInfo,
+        types::ImageSize, ImageSource, MediaErrorCode, MediaFault, PreprocessedEncoderInputs,
+        TransformError, VideoSamplingInfo,
     };
 
     use super::*;
@@ -302,6 +354,9 @@ mod tests {
         fn model_name(&self) -> &'static str {
             "pixel-counted"
         }
+        fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+            Some(width as usize * height as usize)
+        }
         fn preprocess(
             &self,
             _: &[&image::DynamicImage],
@@ -352,5 +407,76 @@ mod tests {
         assert!(check_image_size_feature_budget(&PixelCounted, &images, None).is_ok());
         let refused_size = [header_only(0, 64)];
         assert!(check_image_size_feature_budget(&PixelCounted, &refused_size, Some(1)).is_ok());
+    }
+
+    /// A batch whose planned pixel bytes would not ride in one message is
+    /// refused on the header sizes alone, as the request's own size under
+    /// `media_too_large`, one byte over the cap; at the cap it is admitted.
+    /// The width is the wire's: four bytes under float32, one under uint8,
+    /// two when the plan does not know it; the batch is summed.
+    #[test]
+    fn a_batch_whose_pixels_would_not_fit_one_message_is_refused_before_preprocessing() {
+        let one_over = |width: u32, height: u32, dtype: Option<EncoderDtype>| {
+            check_image_wire_cap(
+                &PixelCounted,
+                &[header_only(width, height)],
+                dtype,
+                Some(WIRE_MESSAGE_CAP),
+            )
+            .unwrap_err()
+        };
+        let error = one_over(32_768, 32_768, Some(EncoderDtype::Float32));
+        assert_eq!(
+            error.to_string(),
+            "the request's images would be 4294967296 bytes of pixel tensors on the wire, over \
+             the 4294967295-byte message cap; send fewer or smaller images"
+        );
+        assert_eq!(error.code(), MediaErrorCode::TooLarge);
+        assert_eq!(error.fault(), MediaFault::Client);
+        assert!(matches!(
+            one_over(65_536, 65_536, Some(EncoderDtype::Uint8)),
+            MediaConnectorError::PixelsOverWireCap {
+                bytes: 4_294_967_296,
+                ..
+            }
+        ));
+        assert!(matches!(
+            one_over(46_341, 46_341, None),
+            MediaConnectorError::PixelsOverWireCap {
+                bytes: 4_294_976_562,
+                ..
+            }
+        ));
+        for (width, height, dtype) in [
+            (32_767, 32_768, Some(EncoderDtype::Float32)),
+            (65_535, 65_536, Some(EncoderDtype::Uint8)),
+            (46_340, 46_340, None),
+        ] {
+            assert!(
+                check_image_wire_cap(
+                    &PixelCounted,
+                    &[header_only(width, height)],
+                    dtype,
+                    Some(WIRE_MESSAGE_CAP),
+                )
+                .is_ok(),
+                "{width}x{height} {dtype:?}"
+            );
+        }
+        // The batch is summed: two images within the cap each, over it together.
+        let pair = [header_only(32_767, 32_768), header_only(1, 32_768)];
+        let cap = Some(WIRE_MESSAGE_CAP);
+        assert!(
+            check_image_wire_cap(&PixelCounted, &pair, Some(EncoderDtype::Float32), cap).is_err()
+        );
+        assert!(
+            check_image_wire_cap(&PixelCounted, &pair, Some(EncoderDtype::BFloat16), cap).is_ok()
+        );
+        assert!(check_image_wire_cap(&PixelCounted, &[], Some(EncoderDtype::Float32), cap).is_ok());
+        // No bound where the pixels travel beside the message: nothing is
+        // refused here, the framing of the hop that carries them answers.
+        assert!(
+            check_image_wire_cap(&PixelCounted, &pair, Some(EncoderDtype::Float32), None).is_ok()
+        );
     }
 }

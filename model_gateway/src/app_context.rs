@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use dashmap::DashSet;
 use llm_tokenizer::registry::TokenizerRegistry;
 use openai_protocol::profile::ProviderProfile;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
@@ -21,11 +22,13 @@ use crate::{
     config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
-    policies::{host_stores::HostStores, PolicyRegistry},
+    policies::PolicyRegistry,
     rate_limit::RateLimitManager,
+    rl_adapter,
     routers::{
         common::{
-            openai_bridge::FormatRegistry, overload, pd_admission, realtime::RealtimeRegistry,
+            openai_bridge::FormatRegistry, overload, pd_admission,
+            prefill_admission::PrefillAdmission, realtime::RealtimeRegistry,
         },
         gateway::Gateway,
         grpc::{
@@ -34,11 +37,14 @@ use crate::{
             utils::{Names, ALIASES},
         },
     },
+    server::http_client_builder,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
-        http_client::{build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS},
-        liveness, rl_adapter, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache,
-        WorkerMonitor, WorkerRegistry, WorkerService,
+        connection::http_client::{
+            build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS,
+        },
+        health::liveness,
+        KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService,
     },
     workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
@@ -78,6 +84,17 @@ pub struct AppContext {
     /// operator's request), read where a request finds no tokenizer for its
     /// model.
     pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
+    /// The ids of the tokenizer entries a worker's registration loaded:
+    /// written by the registration workflow's loader under the registry's
+    /// per-name lock, before the entry is published (a reader that sees the
+    /// entry sees the record), read by the removal workflow's release step
+    /// and by the second look of a put-back or a worker's load, which take
+    /// no other entry (the startup entry and an operator's stay however
+    /// their models' workers come and go), and dropped with the entry on
+    /// every removal path, the operator's `DELETE /v1/tokenizers/{id}`
+    /// included: that ends the worker's ownership, and the model's next
+    /// registration loads afresh and records again.
+    pub worker_loaded_tokenizers: Arc<DashSet<String>>,
     pub multimodal_config_registry: Arc<MultimodalConfigRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -427,11 +444,13 @@ impl AppContextBuilder {
             .router_config
             .ok_or(AppContextBuildError::MissingField("router_config"))?;
         // The configuration's liveness budgets (the stall, wedge and stale
-        // thresholds and the warm-up slice, see `worker::liveness`) take
+        // thresholds and the warm-up slice, see `worker::health::liveness`) take
         // effect for every context built from it, the server's and a test's
-        // alike, here and nowhere else. They are process-wide and the first
-        // call wins, so the first context built in a process sets them.
-        liveness::configure_from(&router_config);
+        // alike. They are process-wide and the first call wins, so a
+        // constructor that builds the policy registry itself configures them
+        // before that build (`from_config` and the test harness do).
+        // This call covers a context assembled without such a constructor.
+        liveness::configure_from(router_config.worker_liveness_budgets());
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
 
@@ -499,18 +518,6 @@ impl AppContextBuilder {
         let policy_registry = self
             .policy_registry
             .ok_or(AppContextBuildError::MissingField("policy_registry"))?;
-        // Under `--policy-engine engine` the host's store ingress stands
-        // beside the engine (the registry, the monitors and the admission
-        // counters behind the store traits); nothing reads or writes through
-        // it until the step that moves the ingestion drivers. Under `legacy`
-        // nothing is built.
-        if let Some(decider) = policy_registry.decider() {
-            decider.set_stores(Arc::new(HostStores::new(
-                Arc::clone(&worker_registry),
-                self.worker_monitor.as_ref(),
-                self.kv_event_monitor.as_ref(),
-            )));
-        }
         let worker_job_queue = self
             .worker_job_queue
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;
@@ -540,7 +547,9 @@ impl AppContextBuilder {
             router_config.clone(),
         ));
 
-        let worker_client_cache = Arc::new(WorkerHttpClientCache::new(&router_config));
+        let worker_client_cache = Arc::new(WorkerHttpClientCache::new(
+            router_config.worker_http_client_settings(),
+        ));
         let gateway_auth = AuthConfig::with_tenant_keys(
             router_config.api_key.clone(),
             &router_config.tenant_api_keys,
@@ -561,6 +570,7 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError::MissingField("tokenizer_registry"))?,
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             tokenizer_load_failures: Arc::new(TokenizerLoadFailures::new()),
+            worker_loaded_tokenizers: Arc::new(DashSet::new()),
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
@@ -615,6 +625,10 @@ impl AppContextBuilder {
                 .iter()
                 .map(|(alias, canonical)| (alias.as_str(), canonical.as_str())),
         );
+        // The configuration's liveness budgets take effect before the policy
+        // registry is built below (the first call wins; `build` keeps its
+        // call for a context assembled without this constructor).
+        liveness::configure_from(router_config.worker_liveness_budgets());
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
@@ -693,12 +707,12 @@ impl AppContextBuilder {
         }
 
         let make_builder = || {
-            let mut client_builder = crate::server::http_client_builder()
+            let mut client_builder = http_client_builder()
                 .pool_idle_timeout(pool_idle_timeout)
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))
                 // Below the request timeout, as the worker clients keep it
-                // (`worker::http_client::connect_timeout_secs_below`): a dark
+                // (`worker::connection::http_client::connect_timeout_secs_below`): a dark
                 // external host fails as a connect timeout, not as the
                 // request's own (except under a 1 s request timeout, where the
                 // two timers race).
@@ -805,12 +819,7 @@ impl AppContextBuilder {
                 config.policy.clone(),
                 config.routing_key_override.clone(),
             )
-            .with_pd_pairing_mode(config.pd_pairing_mode)
-            .with_policy_engine(
-                config.policy_engine,
-                config.mode.get_prefill_policy(&config.policy),
-                config.mode.get_decode_policy(&config.policy),
-            ),
+            .with_pd_pairing_mode(config.pd_pairing_mode),
         ));
         self
     }
@@ -938,8 +947,9 @@ impl AppContextBuilder {
     /// cache-aware policy streams its KV events into the model's index, every
     /// other gRPC worker streams its load records alone, so load-aware
     /// routing prices a worker by a record at the engine's cadence rather
-    /// than by the last poll (the `UpdatePoliciesStep` picks the kind per
-    /// worker; HTTP and ZMQ workers are never subscribed). The monitor itself
+    /// than by the last poll (`start_kv_stream` picks the kind per worker,
+    /// for a registration and for an update that rebuilt the worker alike;
+    /// HTTP and ZMQ workers are never subscribed). The monitor itself
     /// is cheap (empty maps) and stays dormant until workers are added; a
     /// model without an events subscription has no index and no index
     /// gauges.
@@ -949,6 +959,11 @@ impl AppContextBuilder {
         // The load records on the streams are polls of the worker.
         if let Some(worker_monitor) = &self.worker_monitor {
             monitor.set_load_sink(worker_monitor);
+        }
+        // The add reads the registry before it stops or starts a stream: a
+        // worker the registry no longer holds under its URL gets none.
+        if let Some(registry) = &self.worker_registry {
+            monitor.set_worker_registry(registry);
         }
         monitor.start_stats_task();
 
@@ -997,14 +1012,16 @@ fn mcp_bootstrap_config(file: Option<&smg_mcp::McpConfig>) -> smg_mcp::McpConfig
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use openai_protocol::worker::WorkerStatus;
+    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::{
         config::types::PolicyConfig,
+        routers::common::prefill_admission::PrefillAdmissionAttempt,
         worker::{
             test_support::{select_worker, worker_of},
-            BasicWorkerBuilder, PrefillAdmissionAttempt, Worker, WorkerType,
+            BasicWorkerBuilder, ConnectionMode, SubscriptionKind, Worker, WorkerType,
         },
     };
 
@@ -1027,11 +1044,11 @@ mod tests {
     }
 
     /// Child-process body of the root-store test below (see
-    /// `worker::http_client::no_root_store`); a no-op unless the case
+    /// `worker::connection::http_client::no_root_store`); a no-op unless the case
     /// variable is set.
     #[test]
     fn child_with_client_without_native_roots() {
-        use crate::worker::http_client::no_root_store;
+        use crate::worker::connection::http_client::no_root_store;
 
         if std::env::var(no_root_store::CASE).is_err() {
             return;
@@ -1047,7 +1064,7 @@ mod tests {
         ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
     )]
     fn the_gateway_client_builds_without_a_native_root_store() {
-        use crate::worker::http_client::no_root_store;
+        use crate::worker::connection::http_client::no_root_store;
 
         no_root_store::run(
             &no_root_store::test_name(module_path!(), "child_with_client_without_native_roots"),
@@ -1278,78 +1295,24 @@ mod tests {
         assert!(cache_aware.kv_event_monitor_is_set_for_test());
     }
 
-    /// The switch reaches the policy registry of a built context: `engine`
-    /// with a carried policy exposes the decider, `legacy` none.
+    /// A dropped context lets its worker monitor go: the monitor holds the
+    /// policy registry, and nothing the context builds holds the monitor
+    /// back.
     #[tokio::test]
-    async fn a_context_under_the_engine_switch_exposes_the_decider_and_legacy_none() {
-        use crate::config::PolicyEngineMode;
-
-        let build = |mode: PolicyEngineMode| {
-            let mut config = RouterConfig::builder()
-                .round_robin_policy()
-                .policy_engine(mode)
-                .build_unchecked();
-            config.health_check.disable_health_check = true;
-            config
-        };
-        let engine = AppContext::from_config(build(PolicyEngineMode::Engine), 30, None, None)
-            .await
-            .expect("a context under engine");
-        assert!(engine.policy_registry.decider().is_some());
-        let legacy = AppContext::from_config(build(PolicyEngineMode::Legacy), 30, None, None)
-            .await
-            .expect("a context under legacy");
-        assert!(legacy.policy_registry.decider().is_none());
-    }
-
-    /// Under `engine` the host's store ingress stands beside the decider;
-    /// under `legacy` there is no decider to hand it to.
-    #[tokio::test]
-    async fn a_context_under_the_engine_switch_hands_the_host_stores_to_the_decider() {
-        use smg_policy_controller::store::WorkersStore;
-
-        use crate::config::PolicyEngineMode;
-
+    async fn a_dropped_context_lets_its_worker_monitor_go() {
         let mut config = RouterConfig::builder()
             .round_robin_policy()
-            .policy_engine(PolicyEngineMode::Engine)
             .build_unchecked();
         config.health_check.disable_health_check = true;
         let context = AppContext::from_config(config, 30, None, None)
             .await
-            .expect("a context under engine");
-        let decider = context.policy_registry.decider().expect("the engine");
-        let stores = decider.stores().expect("the host's stores");
-        assert_eq!(stores.epoch(), 0, "nothing wrote through them");
-    }
-
-    /// The worker monitor holds the policy registry; under `engine` the
-    /// registry's decider holds the host's stores, which must not hold the
-    /// monitor back, or a dropped context leaves its monitor alive.
-    #[tokio::test]
-    async fn a_context_under_the_engine_switch_lets_its_worker_monitor_go_when_dropped() {
-        use crate::config::PolicyEngineMode;
-
-        for (name, mode) in [
-            ("legacy", PolicyEngineMode::Legacy),
-            ("engine", PolicyEngineMode::Engine),
-        ] {
-            let mut config = RouterConfig::builder()
-                .round_robin_policy()
-                .policy_engine(mode)
-                .build_unchecked();
-            config.health_check.disable_health_check = true;
-            let context = AppContext::from_config(config, 30, None, None)
-                .await
-                .expect("a context");
-            let monitor =
-                Arc::downgrade(context.worker_monitor.as_ref().expect("the worker monitor"));
-            drop(context);
-            assert!(
-                monitor.upgrade().is_none(),
-                "the worker monitor outlives its context under {name}"
-            );
-        }
+            .expect("a context");
+        let monitor = Arc::downgrade(context.worker_monitor.as_ref().expect("the worker monitor"));
+        drop(context);
+        assert!(
+            monitor.upgrade().is_none(),
+            "the worker monitor outlives its context"
+        );
     }
 
     #[test]
@@ -1515,6 +1478,55 @@ policy:
         drop(selected);
         drop(occupied);
     }
+
+    /// The app wires its worker registry into the monitor: an add for a
+    /// gRPC worker the registry does not hold starts no stream, and the
+    /// same worker gets one once registered.
+    #[traced_test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_kv_event_monitor_reads_the_apps_worker_registry() {
+        let config = config_with_policy(PolicyConfig::Random);
+        let builder = AppContextBuilder::new()
+            .with_worker_registry()
+            .with_policy_registry(&config)
+            .with_kv_event_monitor();
+        let monitor = builder
+            .kv_event_monitor
+            .as_ref()
+            .expect("the monitor is built");
+        let registry = builder
+            .worker_registry
+            .as_ref()
+            .expect("the worker registry is built");
+        // A port that refuses connections at once: the stream's task loops
+        // on reconnects until `stop`, with no engine involved.
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:1")
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Loads)
+            .await;
+        assert!(logs_contain(
+            "no KV event stream for a worker the registry no longer holds"
+        ));
+        assert!(!logs_contain("Starting KV event subscription"));
+
+        registry
+            .register(Arc::clone(&worker))
+            .expect("the worker registers");
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Loads)
+            .await;
+        assert!(logs_contain("Starting KV event subscription"));
+        monitor.stop().await;
+    }
 }
 
 #[cfg(test)]
@@ -1545,17 +1557,19 @@ pub(crate) mod testing {
         config::RouterConfig,
         middleware::{AuthConfig, TokenBucket},
         observability::inflight_tracker::InFlightRequestTracker,
+        policies::PolicyRegistry,
         routers::{
             common::{openai_bridge, realtime::RealtimeRegistry},
             grpc::multimodal::MultimodalConfigRegistry,
         },
-        worker::{WorkerRegistry, WorkerService},
+        server::http_client,
+        worker::{WorkerHttpClientCache, WorkerRegistry, WorkerService},
     };
 
     /// An `AppContext` over `router_config` and `worker_registry`: in-memory
     /// storage, a generous rate limiter, no gateway, worker monitor or WASM
-    /// manager, the policy registry the configuration's policy and routing-key
-    /// override select, the given tool parsers (a parser override is validated
+    /// manager, the policy registry the configuration's policy, routing-key
+    /// override and pairing mode select, the given tool parsers (a parser override is validated
     /// against them when they are given), and an uninitialized worker job
     /// queue: submitted jobs are accepted and queued but never processed, so a
     /// test observes what a step or a pass submits without spawning workflow
@@ -1569,22 +1583,18 @@ pub(crate) mod testing {
 
         Arc::new(AppContext {
             gateway_auth: AuthConfig::new(None),
-            client: crate::server::http_client(),
+            client: http_client(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
             worker_registry: Arc::clone(&worker_registry),
             prefill_admission: None,
             policy_registry: Arc::new(
-                crate::policies::PolicyRegistry::with_override(
+                PolicyRegistry::with_override(
                     router_config.policy.clone(),
                     router_config.routing_key_override.clone(),
                 )
-                .with_policy_engine(
-                    router_config.policy_engine,
-                    router_config.mode.get_prefill_policy(&router_config.policy),
-                    router_config.mode.get_decode_policy(&router_config.policy),
-                ),
+                .with_pd_pairing_mode(router_config.pd_pairing_mode),
             ),
             reasoning_parser_factory: None,
             tool_parser_factory,
@@ -1604,9 +1614,10 @@ pub(crate) mod testing {
             tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             tokenizer_load_failures: Arc::default(),
+            worker_loaded_tokenizers: Arc::default(),
             wasm_manager: None,
-            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
-                &router_config,
+            worker_client_cache: Arc::new(WorkerHttpClientCache::new(
+                router_config.worker_http_client_settings(),
             )),
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,

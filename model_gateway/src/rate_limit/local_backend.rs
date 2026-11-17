@@ -67,7 +67,7 @@ impl ActiveReservation {
 }
 
 /// What the in-memory backend's `replace_policy` did to the live buckets.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct PolicyReplacement {
     /// Buckets whose scope kept its limits, kept with their fill.
     pub kept: usize,
@@ -162,7 +162,10 @@ impl LocalRateLimitBackend {
     /// of its completion tokens. A reserve that cloned a bucket's `Arc` just
     /// before its replacement debits the old one, which the new one does
     /// not see: one debit at the swap instant, cheaper than a lock on the
-    /// reserve path. One replacement runs at a time.
+    /// reserve path. A reserve that read the policy before the store and
+    /// finds no bucket of its scope after the key snapshot creates none
+    /// (`bucket_for`): it reads the new policy and comes again, so no bucket
+    /// at the old limits escapes the walk. One replacement runs at a time.
     pub fn replace_policy(&self, policy: CompiledPolicySet) -> PolicyReplacement {
         let _turn = self.replacement.lock();
         let policy = Arc::new(policy);
@@ -202,17 +205,38 @@ impl LocalRateLimitBackend {
         report
     }
 
-    fn bucket_for(&self, key: ScopeKey, limits: ScopeLimits) -> Arc<ScopeBucket> {
+    /// The bucket of `key`, created at `limits` when it has none. `limits`
+    /// is the caller's reading of `read`; a creation that finds another
+    /// policy in force, stored by a replacement since that reading, inserts
+    /// nothing and answers `None`, for the caller to read the live policy
+    /// again. The check runs under the shard's write lock, which a
+    /// replacement's key snapshot excludes: a bucket in the map before the
+    /// snapshot is walked to the new limits, and one created after it was
+    /// checked against the policy the walk serves.
+    fn bucket_for(
+        &self,
+        key: ScopeKey,
+        read: &Arc<CompiledPolicySet>,
+        limits: ScopeLimits,
+    ) -> Option<Arc<ScopeBucket>> {
         // A shard read lock first: an existing bucket is the common case,
         // and the sweep's scan holds shard read locks, which never make a
         // reader wait.
         if let Some(bucket) = self.buckets.get(&key) {
-            return Arc::clone(&bucket);
+            return Some(Arc::clone(&bucket));
         }
-        self.buckets
-            .entry(key)
-            .or_insert_with(|| Arc::new(ScopeBucket::new(limits)))
-            .clone()
+        match self.buckets.entry(key) {
+            Entry::Occupied(entry) => Some(Arc::clone(entry.get())),
+            Entry::Vacant(entry) => {
+                let live = self.policy.load();
+                if !Arc::ptr_eq(&live, read) {
+                    return None;
+                }
+                Some(Arc::clone(
+                    &entry.insert(Arc::new(ScopeBucket::new(limits))),
+                ))
+            }
+        }
     }
 
     /// Drop every bucket that no reservation holds, that has gone untouched
@@ -284,21 +308,33 @@ impl LocalRateLimitBackend {
             Entry::Vacant(entry) => entry,
         };
 
-        let policy = self.policy.load();
-        let tenant_policy = policy.policy_for(&request.tenant_key);
-
         // The tenant-global bucket, and the model rule's when one matches:
-        // at most two, held as a pair.
-        let global_key = ScopeKey::TenantGlobal(request.tenant_key.clone());
-        let global = self.bucket_for(global_key, tenant_policy.limits);
-        let rule = request
-            .model_id
-            .and_then(|model_id| tenant_policy.matching_rule(model_id))
-            .map(|rule| {
-                let rule_key =
-                    ScopeKey::ModelRule(request.tenant_key.clone(), Arc::clone(&rule.rule_id));
-                self.bucket_for(rule_key, rule.limits)
-            });
+        // at most two, held as a pair, both resolved under one reading of
+        // the policy. A creation that finds a replacement's policy in force
+        // since that reading sends the reserve back to read it: the
+        // replacement's walk never sees the bucket it would have made. A
+        // pass ends unless a replacement lands inside it, and replacements
+        // run one at a time.
+        let (global, rule) = loop {
+            let policy = self.policy.load();
+            let tenant_policy = policy.policy_for(&request.tenant_key);
+            let global_key = ScopeKey::TenantGlobal(request.tenant_key.clone());
+            let Some(global) = self.bucket_for(global_key, &policy, tenant_policy.limits) else {
+                continue;
+            };
+            let Some(rule) = request
+                .model_id
+                .and_then(|model_id| tenant_policy.matching_rule(model_id))
+            else {
+                break (global, None);
+            };
+            let rule_key =
+                ScopeKey::ModelRule(request.tenant_key.clone(), Arc::clone(&rule.rule_id));
+            match self.bucket_for(rule_key, &policy, rule.limits) {
+                Some(bucket) => break (global, Some(bucket)),
+                None => continue,
+            }
+        };
 
         // Fixed lock order (tenant-global, then model-rule): every
         // reservation for the same tenant locks in this same order, so
@@ -671,6 +707,36 @@ mod tests {
             backend.reserve(reserve_request("auth:team-red", 190)).await,
             ReserveOutcome::Admitted
         );
+    }
+
+    #[test]
+    fn a_creation_that_finds_a_replacement_in_force_sends_the_reserve_back_to_the_policy() {
+        let backend = LocalRateLimitBackend::new(policy_set(100, 5));
+        let tenant = TenantKey::new("auth:team-red");
+        let key = ScopeKey::TenantGlobal(tenant.clone());
+        // A reserve's reading of the policy and the limits it took from it.
+        let read = backend.policy.load_full();
+        let limits = read.policy_for(&tenant).limits;
+        // The replacement lands between that reading and the creation: its
+        // key snapshot holds no bucket of the tenant for the walk.
+        backend.replace_policy(policy_set(10, 1));
+        assert!(
+            backend.bucket_for(key.clone(), &read, limits).is_none(),
+            "a creation from the superseded reading must insert nothing"
+        );
+        assert!(backend.buckets.get(&key).is_none());
+        // The reserve reads again and creates at the limits in force.
+        let live = backend.policy.load_full();
+        let bucket = backend
+            .bucket_for(key, &live, live.policy_for(&tenant).limits)
+            .expect("the live reading creates");
+        assert_eq!(bucket.limits(), live.policy_for(&tenant).limits);
+        assert_ne!(bucket.limits(), limits);
+        // Through the reserve: the budget of 10 tokens a minute refuses 60.
+        assert!(matches!(
+            backend.reserve_now(reserve_request("auth:team-red", 60)),
+            ReserveOutcome::Denied { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1163,8 +1229,10 @@ mod tests {
         let wrong_bucket = AtomicUsize::new(0);
         let bad_sweeps = AtomicUsize::new(0);
         let seed = || {
+            let policy = backend.policy.load_full();
             drop(backend.bucket_for(
                 key.clone(),
+                &policy,
                 ScopeLimits {
                     tokens_per_minute: u32::MAX,
                     requests_per_minute: u32::MAX,

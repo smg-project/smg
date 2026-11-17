@@ -7,9 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context as _;
 use futures::StreamExt as _;
 use mock_worker::{
-    admin,
     config::{Config, Role, SchedulerWire},
     drain,
     grpc::serve_with_listener,
@@ -37,11 +37,11 @@ async fn start(
     role: Role,
     bootstrap_base_port: Option<u16>,
     pairing_protocol: Option<&str>,
-) -> (TokenSpeedSchedulerClient, String) {
+) -> anyhow::Result<(TokenSpeedSchedulerClient, String)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind a free port");
-    let port = listener.local_addr().expect("listener address").port();
+        .context("bind a free port")?;
+    let port = listener.local_addr().context("listener address")?.port();
     let cfg = Config {
         model_id: "roles-test".to_string(),
         grpc_base_port: port,
@@ -59,8 +59,9 @@ async fn start(
     let _server = tokio::spawn(serve_with_listener(Arc::new(cfg), listener));
     let client = TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
         .await
-        .expect("connect to the mock worker");
-    (client, format!("grpc:{port}"))
+        .map_err(anyhow::Error::from_boxed)
+        .context("connect to the mock worker")?;
+    Ok((client, format!("grpc:{port}")))
 }
 
 fn request(id: &str, input_ids: &[u32], stream: bool) -> ts::GenerateRequest {
@@ -94,11 +95,11 @@ fn rendezvous_room(mut req: ts::GenerateRequest, port: i32, room: i64) -> ts::Ge
 
 /// Serve one canned worker of `role` on the SGLang wire, on a free port:
 /// the gateway's client for that wire.
-async fn start_sglang(role: Role) -> SglangSchedulerClient {
+async fn start_sglang(role: Role) -> anyhow::Result<SglangSchedulerClient> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind a free port");
-    let port = listener.local_addr().expect("listener address").port();
+        .context("bind a free port")?;
+    let port = listener.local_addr().context("listener address")?.port();
     let cfg = Config {
         model_id: "roles-test".to_string(),
         grpc_base_port: port,
@@ -113,9 +114,11 @@ async fn start_sglang(role: Role) -> SglangSchedulerClient {
         reason = "the server serves until the test process exits"
     )]
     let _server = tokio::spawn(serve_with_listener(Arc::new(cfg), listener));
-    SglangSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
+    let client = SglangSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
         .await
-        .expect("connect to the mock worker")
+        .map_err(anyhow::Error::from_boxed)
+        .context("connect to the mock worker")?;
+    Ok(client)
 }
 
 /// The SGLang wire's request with a rendezvous naming `room` at the
@@ -149,7 +152,9 @@ fn server_arg(info: &ts::GetServerInfoResponse, key: &str) -> Option<String> {
 
 #[tokio::test]
 async fn a_prefill_worker_answers_the_prompt_side_alone_and_leaves_the_script_to_decode() {
-    let (client, name) = start(Role::Prefill, None, None).await;
+    let (client, name) = start(Role::Prefill, None, None)
+        .await
+        .expect("the worker starts");
     // The answer a test states is the decode side's: a prefill worker given
     // it keeps it where it is.
     let scripted = script::Answer::parse(&json!({"output_ids": [7, 8, 9]})).expect("an answer");
@@ -160,7 +165,8 @@ async fn a_prefill_worker_answers_the_prompt_side_alone_and_leaves_the_script_to
             &client,
             rendezvous(request("pd-1", &[1, 2, 3, 4, 5], stream), 8998),
         )
-        .await;
+        .await
+        .expect("the worker answers");
         assert_eq!(
             frames.len(),
             1,
@@ -195,8 +201,10 @@ async fn a_prefill_worker_answers_the_prompt_side_alone_and_leaves_the_script_to
 
 #[tokio::test]
 async fn a_prefill_worker_binds_its_bootstrap_port_and_advertises_its_role() {
-    let bootstrap_port = free_port();
-    let (client, _) = start(Role::Prefill, Some(bootstrap_port), None).await;
+    let bootstrap_port = free_port().expect("a free port");
+    let (client, _) = start(Role::Prefill, Some(bootstrap_port), None)
+        .await
+        .expect("the worker starts");
 
     // The gateway's probe: a connection the port accepts, then closes.
     let mut probe = TcpStream::connect(("127.0.0.1", bootstrap_port))
@@ -227,9 +235,13 @@ async fn a_prefill_worker_binds_its_bootstrap_port_and_advertises_its_role() {
 
 #[tokio::test]
 async fn a_decode_worker_generates_as_a_regular_worker_and_advertises_its_role() {
-    let (client, _) = start(Role::Decode, None, Some("kv-v2")).await;
+    let (client, _) = start(Role::Decode, None, Some("kv-v2"))
+        .await
+        .expect("the worker starts");
 
-    let frames = generate(&client, rendezvous(request("pd-2", &[1, 2, 3], true), 8998)).await;
+    let frames = generate(&client, rendezvous(request("pd-2", &[1, 2, 3], true), 8998))
+        .await
+        .expect("the worker answers");
     let chunks = frames
         .iter()
         .filter(|frame| matches!(frame.response, Some(GenResp::Chunk(_))))
@@ -259,11 +271,12 @@ async fn a_decode_worker_generates_as_a_regular_worker_and_advertises_its_role()
 
 /// A realistic prefill worker on a free port and the admin API beside it:
 /// the gateway's client and the worker's fault route.
-async fn start_realistic_prefill() -> (TokenSpeedSchedulerClient, reqwest::Client, String) {
+async fn start_realistic_prefill(
+) -> anyhow::Result<(TokenSpeedSchedulerClient, reqwest::Client, String)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind a free port");
-    let port = listener.local_addr().expect("listener address").port();
+        .context("bind a free port")?;
+    let port = listener.local_addr().context("listener address")?.port();
     let cfg = Config {
         model_id: "roles-test".to_string(),
         grpc_base_port: port,
@@ -279,45 +292,32 @@ async fn start_realistic_prefill() -> (TokenSpeedSchedulerClient, reqwest::Clien
     let _server = tokio::spawn(serve_with_listener(Arc::new(cfg), listener));
     let client = TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
         .await
-        .expect("connect to the mock worker");
-    let (http, fault) = fault_route(port).await;
-    (client, http, fault)
+        .map_err(anyhow::Error::from_boxed)
+        .context("connect to the mock worker")?;
+    let (http, fault) = fault_route(port).await?;
+    Ok((client, http, fault))
 }
 
 /// The admin API beside the worker on gRPC `port`: an HTTP client and the
-/// worker's fault route, up.
-async fn fault_route(port: u16) -> (reqwest::Client, String) {
-    let admin_port = free_port();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the admin server serves until the test process exits"
-    )]
-    let _admin = tokio::spawn(admin::serve(
-        Arc::new(Config::default()),
-        "127.0.0.1".to_string(),
-        admin_port,
-    ));
+/// worker's fault route, on a port the server held before it was read.
+async fn fault_route(port: u16) -> anyhow::Result<(reqwest::Client, String)> {
+    let admin_port = common::start_admin(Config::default()).await?;
     let http = common::http_client();
     let fault = format!("http://127.0.0.1:{admin_port}/admin/fault/grpc:{port}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while http.get(&fault).send().await.is_err() {
-        assert!(Instant::now() < deadline, "the admin API did not come up");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    (http, fault)
+    Ok((http, fault))
 }
 
 /// A realistic encode worker on the vLLM wire (the wire with an encode role)
 /// and the admin API beside it: the gateway's client and the fault route.
-async fn start_realistic_encoder() -> (
+async fn start_realistic_encoder() -> anyhow::Result<(
     vllm::vllm_engine_client::VllmEngineClient<Channel>,
     reqwest::Client,
     String,
-) {
+)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind a free port");
-    let port = listener.local_addr().expect("listener address").port();
+        .context("bind a free port")?;
+    let port = listener.local_addr().context("listener address")?.port();
     let cfg = Config {
         model_id: "roles-test".to_string(),
         grpc_base_port: port,
@@ -333,16 +333,16 @@ async fn start_realistic_encoder() -> (
     )]
     let _server = tokio::spawn(serve_with_listener(Arc::new(cfg), listener));
     let channel = Channel::from_shared(format!("http://127.0.0.1:{port}"))
-        .expect("endpoint")
+        .context("endpoint")?
         .connect()
         .await
-        .expect("connect to the mock worker");
-    let (http, fault) = fault_route(port).await;
-    (
+        .context("connect to the mock worker")?;
+    let (http, fault) = fault_route(port).await?;
+    Ok((
         vllm::vllm_engine_client::VllmEngineClient::new(channel),
         http,
         fault,
-    )
+    ))
 }
 
 /// What the gateway sends an encoder: a tokenized prompt with one media
@@ -377,43 +377,45 @@ fn encode_request(id: &str) -> vllm::GenerateRequest {
 async fn encoder_completion(
     client: &mut vllm::vllm_engine_client::VllmEngineClient<Channel>,
     id: &str,
-) -> vllm::GenerateComplete {
+) -> anyhow::Result<vllm::GenerateComplete> {
     let mut stream = client
         .generate(encode_request(id))
         .await
-        .expect("the encoder's stream")
+        .context("the encoder's stream")?
         .into_inner();
     let frame = stream
         .message()
         .await
-        .expect("a frame")
-        .expect("the encoder's completion");
+        .context("a frame")?
+        .context("the encoder's completion")?;
     let Some(vllm::generate_response::Response::Complete(complete)) = frame.response else {
-        panic!("a Complete, not {frame:?}");
+        anyhow::bail!("a Complete, not {frame:?}");
     };
-    complete
+    Ok(complete)
 }
 
 /// The worker's fault counters (`failed_total`, `cut_total`).
-async fn fault_counts(http: &reqwest::Client, fault: &str) -> (u64, u64) {
-    let state: serde_json::Value = http
+async fn fault_counts(http: &reqwest::Client, fault: &str) -> anyhow::Result<(u64, u64)> {
+    let state: Value = http
         .get(fault)
         .send()
         .await
-        .expect("the fault state")
+        .context("the fault state")?
         .json()
         .await
-        .expect("json");
+        .context("json")?;
     let worker = &state["workers"][0];
-    (
-        worker["failed_total"].as_u64().expect("failed_total"),
-        worker["cut_total"].as_u64().expect("cut_total"),
-    )
+    Ok((
+        worker["failed_total"].as_u64().context("failed_total")?,
+        worker["cut_total"].as_u64().context("cut_total")?,
+    ))
 }
 
 #[tokio::test]
 async fn a_realistic_prefill_worker_honors_an_armed_fault_before_it_answers() {
-    let (client, http, fault) = start_realistic_prefill().await;
+    let (client, http, fault) = start_realistic_prefill()
+        .await
+        .expect("the prefill worker starts");
 
     // One 503 armed: the prompt side answers it before admission, as any
     // request of the realistic engine would, and the failure is counted.
@@ -429,14 +431,18 @@ async fn a_realistic_prefill_worker_honors_an_armed_fault_before_it_answers() {
         .err()
         .expect("the armed status, not a stream");
     assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
-    assert_eq!(fault_counts(&http, &fault).await, (1, 0));
+    assert_eq!(
+        fault_counts(&http, &fault).await.expect("the fault counts"),
+        (1, 0)
+    );
 
     // Spent: the next request is the prompt side's completion as before.
     let frames = generate(
         &client,
         rendezvous(request("pd-f2", &[1, 2, 3], false), 8998),
     )
-    .await;
+    .await
+    .expect("the worker answers");
     let Some(GenResp::Complete(complete)) = &frames[0].response else {
         panic!("a Complete, not {:?}", frames[0]);
     };
@@ -446,7 +452,9 @@ async fn a_realistic_prefill_worker_honors_an_armed_fault_before_it_answers() {
 
 #[tokio::test]
 async fn a_realistic_prefill_worker_ends_the_prompt_side_with_error_on_an_armed_cut() {
-    let (client, http, fault) = start_realistic_prefill().await;
+    let (client, http, fault) = start_realistic_prefill()
+        .await
+        .expect("the prefill worker starts");
 
     // `finish=error` wins over the status, as on any worker: the prompt side
     // ends with `error` and the cut is counted, not a failure.
@@ -460,13 +468,17 @@ async fn a_realistic_prefill_worker_ends_the_prompt_side_with_error_on_an_armed_
         &client,
         rendezvous(request("pd-e1", &[1, 2, 3], false), 8998),
     )
-    .await;
+    .await
+    .expect("the worker answers");
     let Some(GenResp::Complete(complete)) = &frames[0].response else {
         panic!("a Complete, not {:?}", frames[0]);
     };
     assert_eq!(complete.finish_reason, "error");
     assert!(complete.output_ids.is_empty(), "no output: {complete:?}");
-    assert_eq!(fault_counts(&http, &fault).await, (0, 1));
+    assert_eq!(
+        fault_counts(&http, &fault).await.expect("the fault counts"),
+        (0, 1)
+    );
 
     // A status cut: with no output to cut after it fires at once, as a cut.
     let armed = http
@@ -481,12 +493,15 @@ async fn a_realistic_prefill_worker_ends_the_prompt_side_with_error_on_an_armed_
         .err()
         .expect("the cut's status, not a stream");
     assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
-    assert_eq!(fault_counts(&http, &fault).await, (0, 2));
+    assert_eq!(
+        fault_counts(&http, &fault).await.expect("the fault counts"),
+        (0, 2)
+    );
 }
 
 #[tokio::test]
 async fn a_realistic_encode_worker_takes_the_fault_hooks_and_counts_in_flight() {
-    let (mut client, http, fault) = start_realistic_encoder().await;
+    let (mut client, http, fault) = start_realistic_encoder().await.expect("the encoder starts");
 
     // One 503 armed: the encoder refuses before it answers, as the prompt
     // side of a prefill worker does, and the failure is counted.
@@ -501,7 +516,10 @@ async fn a_realistic_encode_worker_takes_the_fault_hooks_and_counts_in_flight() 
         .await
         .expect_err("the armed status, not a stream");
     assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
-    assert_eq!(fault_counts(&http, &fault).await, (1, 0));
+    assert_eq!(
+        fault_counts(&http, &fault).await.expect("the fault counts"),
+        (1, 0)
+    );
 
     // An armed cut: the encoder's completion ends with `error` and the cut
     // is counted; the handles still come, the gateway reads the reason.
@@ -511,9 +529,14 @@ async fn a_realistic_encode_worker_takes_the_fault_hooks_and_counts_in_flight() 
         .await
         .expect("arm the fault");
     assert_eq!(armed.status(), 200);
-    let complete = encoder_completion(&mut client, "ec-e1").await;
+    let complete = encoder_completion(&mut client, "ec-e1")
+        .await
+        .expect("the encoder completes");
     assert_eq!(complete.finish_reason, "error");
-    assert_eq!(fault_counts(&http, &fault).await, (1, 1));
+    assert_eq!(
+        fault_counts(&http, &fault).await.expect("the fault counts"),
+        (1, 1)
+    );
 
     // A stall: the request counts in flight while it waits, and no longer
     // once its completion is out. Sampled over the stall, so a request of
@@ -524,17 +547,24 @@ async fn a_realistic_encode_worker_takes_the_fault_hooks_and_counts_in_flight() 
         .await
         .expect("arm the stall");
     assert_eq!(armed.status(), 200);
-    let (complete, during) = tokio::join!(encoder_completion(&mut client, "ec-s1"), async {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let mut during = usize::MAX;
-        for _ in 0..5 {
-            let now = drain::in_flight();
-            assert!(now >= 1, "the stalled request is not counted in flight");
-            during = during.min(now);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    let (complete, during) = tokio::join!(
+        async {
+            encoder_completion(&mut client, "ec-s1")
+                .await
+                .expect("the encoder completes")
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut during = usize::MAX;
+            for _ in 0..5 {
+                let now = drain::in_flight();
+                assert!(now >= 1, "the stalled request is not counted in flight");
+                during = during.min(now);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            during
         }
-        during
-    });
+    );
     assert_eq!(complete.finish_reason, "stop");
     let deadline = Instant::now() + Duration::from_secs(5);
     while drain::in_flight() >= during {
@@ -548,7 +578,7 @@ async fn a_realistic_encode_worker_takes_the_fault_hooks_and_counts_in_flight() 
 
 #[tokio::test]
 async fn a_realistic_encode_worker_checks_the_request_before_it_spends_a_fault() {
-    let (mut client, http, fault) = start_realistic_encoder().await;
+    let (mut client, http, fault) = start_realistic_encoder().await.expect("the encoder starts");
     let armed = http
         .post(format!("{fault}/fail?status=503&count=1"))
         .send()
@@ -565,7 +595,10 @@ async fn a_realistic_encode_worker_checks_the_request_before_it_spends_a_fault()
         .await
         .expect_err("the wrong pool, not a stream");
     assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
-    assert_eq!(fault_counts(&http, &fault).await, (0, 0));
+    assert_eq!(
+        fault_counts(&http, &fault).await.expect("the fault counts"),
+        (0, 0)
+    );
 
     // The fault still waits for the next encode request.
     let refused = client
@@ -573,18 +606,21 @@ async fn a_realistic_encode_worker_checks_the_request_before_it_spends_a_fault()
         .await
         .expect_err("the armed status, not a stream");
     assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
-    assert_eq!(fault_counts(&http, &fault).await, (1, 0));
+    assert_eq!(
+        fault_counts(&http, &fault).await.expect("the fault counts"),
+        (1, 0)
+    );
 }
 
 /// A canned encode worker on the vLLM wire that holds each request for
 /// `gen_delay` before its completion: the gateway's client.
 async fn start_canned_encoder(
     gen_delay: Duration,
-) -> vllm::vllm_engine_client::VllmEngineClient<Channel> {
+) -> anyhow::Result<vllm::vllm_engine_client::VllmEngineClient<Channel>> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind a free port");
-    let port = listener.local_addr().expect("listener address").port();
+        .context("bind a free port")?;
+    let port = listener.local_addr().context("listener address")?.port();
     let cfg = Config {
         model_id: "roles-test".to_string(),
         grpc_base_port: port,
@@ -600,26 +636,29 @@ async fn start_canned_encoder(
     )]
     let _server = tokio::spawn(serve_with_listener(Arc::new(cfg), listener));
     let channel = Channel::from_shared(format!("http://127.0.0.1:{port}"))
-        .expect("endpoint")
+        .context("endpoint")?
         .connect()
         .await
-        .expect("connect to the mock worker");
-    vllm::vllm_engine_client::VllmEngineClient::new(channel)
+        .context("connect to the mock worker")?;
+    Ok(vllm::vllm_engine_client::VllmEngineClient::new(channel))
 }
 
 /// The worker's own running count, as its load report tells the gateway.
-async fn running_reqs(client: &mut vllm::vllm_engine_client::VllmEngineClient<Channel>) -> i32 {
-    client
+async fn running_reqs(
+    client: &mut vllm::vllm_engine_client::VllmEngineClient<Channel>,
+) -> anyhow::Result<i32> {
+    let running = client
         .get_loads(vllm::GetLoadsRequest {
             dp_rank: None,
             ..Default::default()
         })
         .await
-        .expect("the load report")
+        .context("the load report")?
         .into_inner()
         .loads
         .remove(0)
-        .num_running_reqs
+        .num_running_reqs;
+    Ok(running)
 }
 
 // ── The HTTP wire's roles ───────────────────────────────────────────────────
@@ -627,11 +666,11 @@ async fn running_reqs(client: &mut vllm::vllm_engine_client::VllmEngineClient<Ch
 /// Serve one HTTP worker of `cfg`'s role on a free port, as worker 0 of its
 /// process (its port is the base port, so its bootstrap port is the base
 /// bootstrap port): the tests' client, the worker's base URL and its name.
-async fn start_http(cfg: Config) -> (reqwest::Client, String, String) {
+async fn start_http(cfg: Config) -> anyhow::Result<(reqwest::Client, String, String)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind a free port");
-    let port = listener.local_addr().expect("listener address").port();
+        .context("bind a free port")?;
+    let port = listener.local_addr().context("listener address")?.port();
     let cfg = Config {
         model_id: "roles-test".to_string(),
         http_base_port: port,
@@ -651,35 +690,21 @@ async fn start_http(cfg: Config) -> (reqwest::Client, String, String) {
         assert!(Instant::now() < deadline, "the HTTP worker did not come up");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    (client, base, format!("http:{port}"))
+    Ok((client, base, format!("http:{port}")))
 }
 
 /// A realistic HTTP prefill worker on a free port and the admin API beside
 /// it: the tests' client, the worker's base URL and its fault route.
-async fn start_realistic_http_prefill() -> (reqwest::Client, String, String) {
+async fn start_realistic_http_prefill() -> anyhow::Result<(reqwest::Client, String, String)> {
     let (client, base, name) = start_http(Config {
         realistic: true,
         role: Some(Role::Prefill),
         ..Config::default()
     })
-    .await;
-    let admin_port = free_port();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the admin server serves until the test process exits"
-    )]
-    let _admin = tokio::spawn(admin::serve(
-        Arc::new(Config::default()),
-        "127.0.0.1".to_string(),
-        admin_port,
-    ));
+    .await?;
+    let admin_port = common::start_admin(Config::default()).await?;
     let fault = format!("http://127.0.0.1:{admin_port}/admin/fault/{name}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while client.get(&fault).send().await.is_err() {
-        assert!(Instant::now() < deadline, "the admin API did not come up");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    (client, base, fault)
+    Ok((client, base, fault))
 }
 
 /// A chat request as the gateway's disaggregated dispatch sends it to both
@@ -702,50 +727,57 @@ fn disaggregated_chat(room: Option<u64>, port: Option<u16>, stream: bool) -> Val
     body
 }
 
-async fn chat(client: &reqwest::Client, base: &str, body: &Value) -> reqwest::Response {
-    client
+async fn chat(
+    client: &reqwest::Client,
+    base: &str,
+    body: &Value,
+) -> anyhow::Result<reqwest::Response> {
+    let response = client
         .post(format!("{base}/v1/chat/completions"))
         .json(body)
         .send()
         .await
-        .expect("the worker answers")
+        .context("the worker answers")?;
+    Ok(response)
 }
 
-async fn server_info(client: &reqwest::Client, base: &str, route: &str) -> Value {
-    client
+async fn server_info(client: &reqwest::Client, base: &str, route: &str) -> anyhow::Result<Value> {
+    let info = client
         .get(format!("{base}/{route}"))
         .send()
         .await
-        .expect("server info")
+        .context("server info")?
         .json()
         .await
-        .expect("json")
+        .context("json")?;
+    Ok(info)
 }
 
 /// The worker's own running count, as its load report tells the gateway.
-async fn http_running_reqs(client: &reqwest::Client, base: &str) -> u64 {
+async fn http_running_reqs(client: &reqwest::Client, base: &str) -> anyhow::Result<u64> {
     let loads: Value = client
         .get(format!("{base}/v1/loads"))
         .send()
         .await
-        .expect("the load report")
+        .context("the load report")?
         .json()
         .await
-        .expect("json");
+        .context("json")?;
     loads["loads"][0]["num_running_reqs"]
         .as_u64()
-        .expect("num_running_reqs")
+        .context("num_running_reqs")
 }
 
 #[tokio::test]
 async fn an_http_prefill_worker_binds_its_bootstrap_port_and_advertises_its_role() {
-    let bootstrap_port = free_port();
+    let bootstrap_port = free_port().expect("a free port");
     let (client, base, name) = start_http(Config {
         role: Some(Role::Prefill),
         bootstrap_base_port: Some(bootstrap_port),
         ..Config::default()
     })
-    .await;
+    .await
+    .expect("the HTTP worker starts");
 
     // The gateway's probe: a connection the port accepts, then closes.
     let mut probe = TcpStream::connect(("127.0.0.1", bootstrap_port))
@@ -758,11 +790,15 @@ async fn an_http_prefill_worker_binds_its_bootstrap_port_and_advertises_its_role
         "the port says nothing and closes"
     );
 
-    let info = server_info(&client, &base, "server_info").await;
+    let info = server_info(&client, &base, "server_info")
+        .await
+        .expect("the server info");
     assert_eq!(info["disaggregation_mode"], "prefill");
     assert_eq!(info["disaggregation_bootstrap_port"], bootstrap_port);
     assert_eq!(
-        server_info(&client, &base, "get_server_info").await,
+        server_info(&client, &base, "get_server_info")
+            .await
+            .expect("the server info"),
         info,
         "the older spelling answers the same"
     );
@@ -777,7 +813,8 @@ async fn an_http_prefill_worker_binds_its_bootstrap_port_and_advertises_its_role
             &base,
             &disaggregated_chat(Some(7), Some(bootstrap_port), stream),
         )
-        .await;
+        .await
+        .expect("the worker answers");
         assert_eq!(response.status(), 200);
         let text = response.text().await.expect("the body");
         if stream {
@@ -816,14 +853,17 @@ async fn an_http_prefill_worker_binds_its_bootstrap_port_and_advertises_its_role
 
     // A request without the rendezvous went to the wrong pool; one naming
     // another port would send the decode partner elsewhere.
-    let refused = chat(&client, &base, &disaggregated_chat(None, None, false)).await;
+    let refused = chat(&client, &base, &disaggregated_chat(None, None, false))
+        .await
+        .expect("the worker answers");
     assert_eq!(refused.status(), 400);
     let refused = chat(
         &client,
         &base,
         &disaggregated_chat(Some(7), Some(bootstrap_port.wrapping_add(1)), false),
     )
-    .await;
+    .await
+    .expect("the worker answers");
     assert_eq!(refused.status(), 400);
 }
 
@@ -833,9 +873,12 @@ async fn an_http_decode_worker_generates_as_a_regular_worker_and_advertises_its_
         role: Some(Role::Decode),
         ..Config::default()
     })
-    .await;
+    .await
+    .expect("the HTTP worker starts");
 
-    let info = server_info(&client, &base, "server_info").await;
+    let info = server_info(&client, &base, "server_info")
+        .await
+        .expect("the server info");
     assert_eq!(info["disaggregation_mode"], "decode");
     assert!(
         info.get("disaggregation_bootstrap_port").is_none(),
@@ -847,7 +890,8 @@ async fn an_http_decode_worker_generates_as_a_regular_worker_and_advertises_its_
         &base,
         &disaggregated_chat(Some(7), Some(8998), true),
     )
-    .await;
+    .await
+    .expect("the worker answers");
     assert_eq!(response.status(), 200);
     let text = response.text().await.expect("the body");
     assert_eq!(
@@ -859,7 +903,9 @@ async fn an_http_decode_worker_generates_as_a_regular_worker_and_advertises_its_
         text.contains(r#""finish_reason":"stop""#) && text.contains("[DONE]"),
         "{text}"
     );
-    let refused = chat(&client, &base, &disaggregated_chat(None, None, false)).await;
+    let refused = chat(&client, &base, &disaggregated_chat(None, None, false))
+        .await
+        .expect("the worker answers");
     assert_eq!(
         refused.status(),
         400,
@@ -869,7 +915,9 @@ async fn an_http_decode_worker_generates_as_a_regular_worker_and_advertises_its_
 
 #[tokio::test]
 async fn a_realistic_http_prefill_worker_honors_an_armed_fault_before_it_answers() {
-    let (client, base, fault) = start_realistic_http_prefill().await;
+    let (client, base, fault) = start_realistic_http_prefill()
+        .await
+        .expect("the prefill worker starts");
     let armed = client
         .post(format!("{fault}/fail?status=503&count=1"))
         .send()
@@ -879,19 +927,34 @@ async fn a_realistic_http_prefill_worker_honors_an_armed_fault_before_it_answers
 
     // A request without the rendezvous is refused before the hooks: the
     // armed fault and its counters wait for a request this side serves.
-    let refused = chat(&client, &base, &disaggregated_chat(None, None, false)).await;
+    let refused = chat(&client, &base, &disaggregated_chat(None, None, false))
+        .await
+        .expect("the worker answers");
     assert_eq!(refused.status(), 400);
-    assert_eq!(fault_counts(&client, &fault).await, (0, 0));
+    assert_eq!(
+        fault_counts(&client, &fault)
+            .await
+            .expect("the fault counts"),
+        (0, 0)
+    );
 
     // The prompt side answers the armed status before admission, as any
     // request of the realistic engine would, and the failure is counted.
-    let refused = chat(&client, &base, &disaggregated_chat(Some(1), None, false)).await;
+    let refused = chat(&client, &base, &disaggregated_chat(Some(1), None, false))
+        .await
+        .expect("the worker answers");
     assert_eq!(refused.status(), 503);
-    assert_eq!(fault_counts(&client, &fault).await, (1, 0));
+    assert_eq!(
+        fault_counts(&client, &fault)
+            .await
+            .expect("the fault counts"),
+        (1, 0)
+    );
 
     // Spent: the next request is the prompt side's completion as before.
     let body: Value = chat(&client, &base, &disaggregated_chat(Some(2), None, false))
         .await
+        .expect("the worker answers")
         .json()
         .await
         .expect("json");
@@ -907,7 +970,9 @@ async fn a_realistic_http_prefill_worker_honors_an_armed_fault_before_it_answers
 
 #[tokio::test]
 async fn a_realistic_http_prefill_worker_ends_the_prompt_side_with_error_on_an_armed_cut() {
-    let (client, base, fault) = start_realistic_http_prefill().await;
+    let (client, base, fault) = start_realistic_http_prefill()
+        .await
+        .expect("the prefill worker starts");
 
     // `finish=error` wins over the status, as on any worker: the prompt side
     // ends with `error` and the cut is counted, not a failure.
@@ -917,12 +982,19 @@ async fn a_realistic_http_prefill_worker_ends_the_prompt_side_with_error_on_an_a
         .await
         .expect("arm the fault");
     assert_eq!(armed.status(), 200);
-    let response = chat(&client, &base, &disaggregated_chat(Some(1), None, false)).await;
+    let response = chat(&client, &base, &disaggregated_chat(Some(1), None, false))
+        .await
+        .expect("the worker answers");
     assert_eq!(response.status(), 200);
     let body: Value = response.json().await.expect("json");
     assert_eq!(body["choices"][0]["finish_reason"], "error");
     assert_eq!(body["choices"][0]["message"]["content"], "");
-    assert_eq!(fault_counts(&client, &fault).await, (0, 1));
+    assert_eq!(
+        fault_counts(&client, &fault)
+            .await
+            .expect("the fault counts"),
+        (0, 1)
+    );
 
     // A status cut: with no output to cut after it fires at once, as a cut.
     let armed = client
@@ -931,9 +1003,16 @@ async fn a_realistic_http_prefill_worker_ends_the_prompt_side_with_error_on_an_a
         .await
         .expect("arm the fault");
     assert_eq!(armed.status(), 200);
-    let refused = chat(&client, &base, &disaggregated_chat(Some(2), None, false)).await;
+    let refused = chat(&client, &base, &disaggregated_chat(Some(2), None, false))
+        .await
+        .expect("the worker answers");
     assert_eq!(refused.status(), 502);
-    assert_eq!(fault_counts(&client, &fault).await, (0, 2));
+    assert_eq!(
+        fault_counts(&client, &fault)
+            .await
+            .expect("the fault counts"),
+        (0, 2)
+    );
 }
 
 #[tokio::test]
@@ -943,37 +1022,62 @@ async fn a_canned_http_prefill_worker_reports_its_held_request_as_running() {
         gen_delay: Duration::from_millis(1500),
         ..Config::default()
     })
-    .await;
-    assert_eq!(http_running_reqs(&client, &base).await, 0);
+    .await
+    .expect("the HTTP worker starts");
+    assert_eq!(
+        http_running_reqs(&client, &base)
+            .await
+            .expect("the running count"),
+        0
+    );
 
     // Held for the canned delay, the request is the worker's one running
     // request in its own load report, and the report reads idle again once
     // the completion is out.
     let held = disaggregated_chat(Some(1), None, false);
-    let (response, during) = tokio::join!(chat(&client, &base, &held), async {
-        // Sampled once the request is held, not after a fixed wait: a
-        // slow box must not let a sample read the worker before then.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while http_running_reqs(&client, &base).await == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+    let (response, during) = tokio::join!(
+        async {
+            chat(&client, &base, &held)
+                .await
+                .expect("the worker answers")
+        },
+        async {
+            // Sampled once the request is held, not after a fixed wait: a
+            // slow box must not let a sample read the worker before then.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while http_running_reqs(&client, &base)
+                    .await
+                    .expect("the running count")
+                    == 0
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the held request never showed in the worker's load report");
+            let mut seen = Vec::new();
+            for _ in 0..5 {
+                seen.push(
+                    http_running_reqs(&client, &base)
+                        .await
+                        .expect("the running count"),
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-        })
-        .await
-        .expect("the held request never showed in the worker's load report");
-        let mut seen = Vec::new();
-        for _ in 0..5 {
-            seen.push(http_running_reqs(&client, &base).await);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            seen
         }
-        seen
-    });
+    );
     assert_eq!(response.status(), 200);
     assert_eq!(
         during, [1; 5],
         "the held request is not the worker's one running request"
     );
     let deadline = Instant::now() + Duration::from_secs(5);
-    while http_running_reqs(&client, &base).await != 0 {
+    while http_running_reqs(&client, &base)
+        .await
+        .expect("the running count")
+        != 0
+    {
         assert!(
             Instant::now() < deadline,
             "the completion is out but the worker still reports it running"
@@ -984,37 +1088,46 @@ async fn a_canned_http_prefill_worker_reports_its_held_request_as_running() {
 
 #[tokio::test]
 async fn a_canned_encode_worker_reports_its_held_request_as_running() {
-    let mut client = start_canned_encoder(Duration::from_millis(1500)).await;
+    let mut client = start_canned_encoder(Duration::from_millis(1500))
+        .await
+        .expect("the encoder starts");
     let mut poller = client.clone();
-    assert_eq!(running_reqs(&mut poller).await, 0);
+    assert_eq!(running_reqs(&mut poller).await.expect("the load report"), 0);
 
     // Held for the canned delay, the request is the worker's one running
     // request in its own load report (whatever the process's other workers
     // carry), and the report reads idle again once the completion is out.
-    let (complete, during) = tokio::join!(encoder_completion(&mut client, "ec-l1"), async {
-        // Sampled once the request is admitted, not after a fixed wait: a
-        // slow box must not let a sample read the worker before it holds it.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while running_reqs(&mut poller).await == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+    let (complete, during) = tokio::join!(
+        async {
+            encoder_completion(&mut client, "ec-l1")
+                .await
+                .expect("the encoder completes")
+        },
+        async {
+            // Sampled once the request is admitted, not after a fixed wait: a
+            // slow box must not let a sample read the worker before it holds it.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while running_reqs(&mut poller).await.expect("the load report") == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the held request never showed in the worker's load report");
+            let mut seen = Vec::new();
+            for _ in 0..5 {
+                seen.push(running_reqs(&mut poller).await.expect("the load report"));
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-        })
-        .await
-        .expect("the held request never showed in the worker's load report");
-        let mut seen = Vec::new();
-        for _ in 0..5 {
-            seen.push(running_reqs(&mut poller).await);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            seen
         }
-        seen
-    });
+    );
     assert_eq!(complete.finish_reason, "stop");
     assert_eq!(
         during, [1; 5],
         "the held request is not the worker's one running request"
     );
     let deadline = Instant::now() + Duration::from_secs(5);
-    while running_reqs(&mut poller).await != 0 {
+    while running_reqs(&mut poller).await.expect("the load report") != 0 {
         assert!(
             Instant::now() < deadline,
             "the completion is out but the worker still reports it running"
@@ -1026,7 +1139,7 @@ async fn a_canned_encode_worker_reports_its_held_request_as_running() {
 #[tokio::test]
 async fn a_disaggregated_worker_refuses_a_request_without_its_rendezvous() {
     for role in [Role::Prefill, Role::Decode] {
-        let (client, _) = start(role, None, None).await;
+        let (client, _) = start(role, None, None).await.expect("the worker starts");
         // No rendezvous: the request would pair nowhere, as the engines'
         // disaggregated servers answer, and the refusal names the field.
         let refused = client
@@ -1059,7 +1172,8 @@ async fn a_disaggregated_worker_refuses_a_request_without_its_rendezvous() {
             &client,
             rendezvous(request("pd-r3", &[1, 2, 3], false), 8998),
         )
-        .await;
+        .await
+        .expect("the worker answers");
         assert!(
             matches!(
                 frames.last().and_then(|frame| frame.response.as_ref()),
@@ -1072,7 +1186,8 @@ async fn a_disaggregated_worker_refuses_a_request_without_its_rendezvous() {
             &client,
             rendezvous_room(request("pd-r4", &[1, 2, 3], false), 8998, 0),
         )
-        .await;
+        .await
+        .expect("the worker answers");
         assert!(
             matches!(
                 frames.last().and_then(|frame| frame.response.as_ref()),
@@ -1088,7 +1203,7 @@ async fn a_disaggregated_worker_refuses_a_request_without_its_rendezvous() {
 #[tokio::test]
 async fn a_disaggregated_worker_takes_a_room_of_zero_on_the_sglang_wire() {
     for role in [Role::Prefill, Role::Decode] {
-        let client = start_sglang(role).await;
+        let client = start_sglang(role).await.expect("the worker starts");
         let mut stream = client
             .generate(sglang_request("pd-sg-0", 0))
             .await
@@ -1110,8 +1225,10 @@ async fn a_disaggregated_worker_takes_a_room_of_zero_on_the_sglang_wire() {
 
 #[tokio::test]
 async fn a_prefill_worker_refuses_a_rendezvous_naming_another_port() {
-    let bootstrap_port = free_port();
-    let (client, _) = start(Role::Prefill, Some(bootstrap_port), None).await;
+    let bootstrap_port = free_port().expect("a free port");
+    let (client, _) = start(Role::Prefill, Some(bootstrap_port), None)
+        .await
+        .expect("the worker starts");
     // Its decode partner would come to the named port for the handoff: a
     // port other than the one this worker bound is refused with both named.
     let elsewhere = client
@@ -1138,7 +1255,8 @@ async fn a_prefill_worker_refuses_a_rendezvous_naming_another_port() {
             i32::from(bootstrap_port),
         ),
     )
-    .await;
+    .await
+    .expect("the worker answers");
     assert_eq!(
         frames.len(),
         1,
@@ -1151,17 +1269,17 @@ async fn a_prefill_worker_refuses_a_rendezvous_naming_another_port() {
 /// the worker's name.
 async fn start_tokenspeed_encoder(
     realistic: bool,
-) -> (
+) -> anyhow::Result<(
     TokenSpeedSchedulerClient,
     enc::token_speed_encoder_client::TokenSpeedEncoderClient<Channel>,
     reqwest::Client,
     String,
     String,
-) {
+)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind a free port");
-    let port = listener.local_addr().expect("listener address").port();
+        .context("bind a free port")?;
+    let port = listener.local_addr().context("listener address")?.port();
     let cfg = Config {
         model_id: "roles-test".to_string(),
         grpc_base_port: port,
@@ -1169,7 +1287,7 @@ async fn start_tokenspeed_encoder(
         grpc_wire: SchedulerWire::TokenSpeed,
         realistic,
         role: Some(Role::Encode),
-        bootstrap_base_port: Some(free_port()),
+        bootstrap_base_port: Some(free_port()?),
         ..Config::default()
     };
     #[expect(
@@ -1180,85 +1298,126 @@ async fn start_tokenspeed_encoder(
     let endpoint = format!("http://127.0.0.1:{port}");
     let scheduler = TokenSpeedSchedulerClient::connect(&endpoint)
         .await
-        .expect("connect to the mock worker");
+        .map_err(anyhow::Error::from_boxed)
+        .context("connect to the mock worker")?;
     let channel = Channel::from_shared(endpoint)
-        .expect("endpoint")
+        .context("endpoint")?
         .connect()
         .await
-        .expect("connect to the encoder");
-    let (http, fault) = fault_route(port).await;
-    (
+        .context("connect to the encoder")?;
+    let (http, fault) = fault_route(port).await?;
+    Ok((
         scheduler,
         enc::token_speed_encoder_client::TokenSpeedEncoderClient::new(channel),
         http,
         fault,
         format!("grpc:{port}"),
-    )
+    ))
+}
+
+/// A media item as the gateway builds it for the TokenSpeed wire: an image
+/// with a content hash, an inline feature and one placeholder token at
+/// `index` of the prompt (the worker checks the shape before it answers).
+fn tokenspeed_media_item(index: usize) -> anyhow::Result<ts::MultimodalItem> {
+    Ok(ts::MultimodalItem {
+        modality: smg_grpc_client::common_proto::Modality::Image as i32,
+        content_hash: vec![u8::try_from(index).context("a small index")? + 1; 8],
+        encoder_input: Some(ts::TensorData {
+            shape: vec![1, 4],
+            dtype: "float32".to_string(),
+            payload: Some(ts::tensor_data::Payload::Inline(vec![0; 16].into())),
+        }),
+        placeholders: vec![ts::PlaceholderRange {
+            offset: u32::try_from(index).context("a small index")?,
+            length: 1,
+        }],
+        ..Default::default()
+    })
 }
 
 /// What the gateway sends a TokenSpeed encoder: the request's media items
 /// and one rendezvous room per item.
-fn tokenspeed_encode_request(id: &str, items: usize, rooms: &[i64]) -> enc::EncodeRequest {
-    enc::EncodeRequest {
+fn tokenspeed_encode_request(
+    id: &str,
+    items: usize,
+    rooms: &[i64],
+) -> anyhow::Result<enc::EncodeRequest> {
+    Ok(enc::EncodeRequest {
         request_id: id.to_string(),
         mm_inputs: Some(ts::MultimodalInputs {
-            items: vec![ts::MultimodalItem::default(); items],
+            items: (0..items)
+                .map(tokenspeed_media_item)
+                .collect::<anyhow::Result<_>>()?,
         }),
         items: rooms
             .iter()
             .map(|&bootstrap_room| enc::EncodeItemAssignment { bootstrap_room })
             .collect(),
-    }
+    })
 }
 
 /// The worker's `encodes` count off the admin API's ops status, as a bed
 /// reads it.
-async fn encodes_served(http: &reqwest::Client, fault: &str, name: &str) -> u64 {
-    let base = fault.split("/admin/fault/").next().expect("the admin base");
+async fn encodes_served(http: &reqwest::Client, fault: &str, name: &str) -> anyhow::Result<u64> {
+    let base = fault
+        .split("/admin/fault/")
+        .next()
+        .context("the admin base")?;
     let status: Value = http
         .get(format!("{base}/admin/ops/all"))
         .send()
         .await
-        .expect("the ops status")
+        .context("the ops status")?
         .json()
         .await
-        .expect("json");
-    status["workers"]
+        .context("json")?;
+    let served = status["workers"]
         .as_array()
-        .expect("workers")
+        .context("workers")?
         .iter()
         .find(|worker| worker["worker"] == name)
-        .map_or(0, |worker| worker["encodes"].as_u64().unwrap_or(0))
+        .map_or(0, |worker| worker["encodes"].as_u64().unwrap_or(0));
+    Ok(served)
 }
 
-async fn arm(http: &reqwest::Client, fault: &str, query: &str) {
+async fn arm(http: &reqwest::Client, fault: &str, query: &str) -> anyhow::Result<()> {
     let armed = http
         .post(format!("{fault}/fail?{query}"))
         .send()
         .await
-        .expect("arm the fault");
+        .context("arm the fault")?;
     assert_eq!(armed.status(), 200);
+    Ok(())
 }
 
 #[tokio::test]
 async fn a_tokenspeed_encode_worker_accepts_the_media_rooms_counts_them_and_refuses_generate() {
-    let (scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false).await;
+    let (scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false)
+        .await
+        .expect("the encoder starts");
 
     // One media item in one room: accepted and counted.
-    let before = encodes_served(&http, &fault, &name).await;
+    let before = encodes_served(&http, &fault, &name)
+        .await
+        .expect("the encode count");
     let answer = encoder
-        .encode(tokenspeed_encode_request("ts-e1", 1, &[42]))
+        .encode(tokenspeed_encode_request("ts-e1", 1, &[42]).expect("an encode request"))
         .await
         .expect("the encoder's answer")
         .into_inner();
     assert!(answer.accepted);
-    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+    assert_eq!(
+        encodes_served(&http, &fault, &name)
+            .await
+            .expect("the encode count"),
+        before + 1
+    );
 
     // Rooms that do not match the items, no item at all, or a room of 0:
     // refused as malformed and not counted.
     for (items, rooms) in [(2usize, &[7i64][..]), (0, &[][..]), (1, &[0][..])] {
         let refused = encoder
-            .encode(tokenspeed_encode_request("ts-e2", items, rooms))
+            .encode(tokenspeed_encode_request("ts-e2", items, rooms).expect("an encode request"))
             .await
             .expect_err("a malformed encode request");
         assert_eq!(
@@ -1267,7 +1426,34 @@ async fn a_tokenspeed_encode_worker_accepts_the_media_rooms_counts_them_and_refu
             "{items} item(s), rooms {rooms:?}: {refused:?}"
         );
     }
-    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+    assert_eq!(
+        encodes_served(&http, &fault, &name)
+            .await
+            .expect("the encode count"),
+        before + 1
+    );
+
+    // An item without its feature: the encode worker runs the tower on it
+    // and has no room to fall back on, so the request is refused and not
+    // counted.
+    let mut featureless = tokenspeed_encode_request("ts-e3", 1, &[43]).expect("an encode request");
+    featureless.mm_inputs.as_mut().expect("the items").items[0].encoder_input = None;
+    let refused = encoder
+        .encode(featureless)
+        .await
+        .expect_err("an item without its feature");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().contains("media item 0")
+            && refused.message().contains("no encoder input"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        encodes_served(&http, &fault, &name)
+            .await
+            .expect("the encode count"),
+        before + 1
+    );
 
     // A `Generate` went to the wrong pool: this worker takes `Encode`.
     let wrong_pool = scheduler
@@ -1294,53 +1480,258 @@ async fn a_tokenspeed_encode_worker_accepts_the_media_rooms_counts_them_and_refu
     );
 }
 
+/// The encoder servicer reads its feature through the generic tensor reader,
+/// not the scheduler's feature path: an SHM handle in a dtype the scheduler
+/// refuses for its feature is accepted here, with the byte length the
+/// generic reader checks.
+#[tokio::test]
+async fn a_tokenspeed_encode_worker_reads_an_shm_feature_as_the_encoder_servicer_does() {
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false)
+        .await
+        .expect("the encoder starts");
+    let before = encodes_served(&http, &fault, &name)
+        .await
+        .expect("the encode count");
+    let mut shm = tokenspeed_encode_request("ts-shm", 1, &[45]).expect("an encode request");
+    shm.mm_inputs.as_mut().expect("the items").items[0].encoder_input = Some(ts::TensorData {
+        shape: vec![1, 4],
+        dtype: "float64".to_string(),
+        payload: Some(ts::tensor_data::Payload::Shm(
+            smg_grpc_client::common_proto::ShmHandle {
+                name: "smg-mm-enc".to_string(),
+                nbytes: 32,
+                ..Default::default()
+            },
+        )),
+    });
+    let answer = encoder
+        .encode(shm)
+        .await
+        .expect("a float64 SHM feature on the encoder")
+        .into_inner();
+    assert!(answer.accepted);
+    assert_eq!(
+        encodes_served(&http, &fault, &name)
+            .await
+            .expect("the encode count"),
+        before + 1
+    );
+
+    let mut short = tokenspeed_encode_request("ts-shm-short", 1, &[46]).expect("an encode request");
+    short.mm_inputs.as_mut().expect("the items").items[0].encoder_input = Some(ts::TensorData {
+        shape: vec![1, 4],
+        dtype: "float64".to_string(),
+        payload: Some(ts::tensor_data::Payload::Shm(
+            smg_grpc_client::common_proto::ShmHandle {
+                name: "smg-mm-enc".to_string(),
+                nbytes: 16,
+                ..Default::default()
+            },
+        )),
+    });
+    let refused = encoder
+        .encode(short)
+        .await
+        .expect_err("a byte length short of the shape");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(refused.message().contains("byte length 16"), "{refused:?}");
+    assert_eq!(
+        encodes_served(&http, &fault, &name)
+            .await
+            .expect("the encode count"),
+        before + 1
+    );
+}
+
+/// Both servicers pull a remote handle for the item's feature alone: the
+/// encoder accepts a remote feature as the scheduler does, and a remote side
+/// tensor is refused, as the generic reader's `tensor_payload_bytes` refuses
+/// it on either.
+#[tokio::test]
+async fn a_tokenspeed_encode_worker_pulls_a_remote_feature_and_refuses_a_remote_side_tensor() {
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false)
+        .await
+        .expect("the encoder starts");
+    let before = encodes_served(&http, &fault, &name)
+        .await
+        .expect("the encode count");
+    let remote = |nbytes: u64| {
+        Some(ts::tensor_data::Payload::Remote(
+            smg_grpc_client::common_proto::RemoteTensorHandle {
+                transport: "nixl".to_string(),
+                nbytes,
+                ..Default::default()
+            },
+        ))
+    };
+    let mut feature = tokenspeed_encode_request("ts-remote", 1, &[47]).expect("an encode request");
+    feature.mm_inputs.as_mut().expect("the items").items[0].encoder_input = Some(ts::TensorData {
+        shape: vec![1, 4],
+        dtype: "float16".to_string(),
+        payload: remote(8),
+    });
+    let answer = encoder
+        .encode(feature)
+        .await
+        .expect("a remote feature on the encoder")
+        .into_inner();
+    assert!(answer.accepted);
+    assert_eq!(
+        encodes_served(&http, &fault, &name)
+            .await
+            .expect("the encode count"),
+        before + 1
+    );
+
+    let mut side =
+        tokenspeed_encode_request("ts-remote-side", 1, &[48]).expect("an encode request");
+    side.mm_inputs.as_mut().expect("the items").items[0]
+        .model_specific_tensors
+        .insert(
+            "image_grid_thw".to_string(),
+            ts::TensorData {
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+                payload: remote(24),
+            },
+        );
+    let refused = encoder
+        .encode(side)
+        .await
+        .expect_err("a remote side tensor the servicer refuses");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().contains("image_grid_thw")
+            && refused.message().contains("remote payload"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        encodes_served(&http, &fault, &name)
+            .await
+            .expect("the encode count"),
+        before + 1
+    );
+}
+
+/// The engine's encoder takes exactly one media item under one room per
+/// request, named by a request id: the mock refuses the rest as the engine's
+/// adapter does, so a gateway that batched items into one `Encode` or dropped
+/// the id would not pass the mock row.
+#[tokio::test]
+async fn a_tokenspeed_encode_worker_takes_one_item_in_one_room_with_a_request_id() {
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(false)
+        .await
+        .expect("the encoder starts");
+    let before = encodes_served(&http, &fault, &name)
+        .await
+        .expect("the encode count");
+    for (id, items, rooms) in [("ts-one-two", 2usize, &[7i64, 8][..]), ("", 1, &[9][..])] {
+        let refused = encoder
+            .encode(tokenspeed_encode_request(id, items, rooms).expect("an encode request"))
+            .await
+            .expect_err("refused as the engine's adapter refuses it");
+        assert_eq!(
+            refused.code(),
+            tonic::Code::InvalidArgument,
+            "{id:?}, {items} item(s), rooms {rooms:?}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        encodes_served(&http, &fault, &name)
+            .await
+            .expect("the encode count"),
+        before
+    );
+    let answer = encoder
+        .encode(tokenspeed_encode_request("ts-one", 1, &[10]).expect("an encode request"))
+        .await
+        .expect("one item in one room with an id")
+        .into_inner();
+    assert!(answer.accepted);
+    assert_eq!(
+        encodes_served(&http, &fault, &name)
+            .await
+            .expect("the encode count"),
+        before + 1
+    );
+}
+
 #[tokio::test]
 async fn a_realistic_tokenspeed_encode_worker_takes_the_fault_hooks() {
-    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(true).await;
+    let (_scheduler, mut encoder, http, fault, name) = start_tokenspeed_encoder(true)
+        .await
+        .expect("the encoder starts");
 
     // One 503 armed: refused before the answer, as the prompt side of a
     // prefill worker is, and the failure is counted.
-    arm(&http, &fault, "status=503&count=1").await;
+    arm(&http, &fault, "status=503&count=1")
+        .await
+        .expect("the fault arms");
     let refused = encoder
-        .encode(tokenspeed_encode_request("ts-f1", 1, &[1]))
+        .encode(tokenspeed_encode_request("ts-f1", 1, &[1]).expect("an encode request"))
         .await
         .expect_err("the armed status, not an answer");
     assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
-    assert_eq!(fault_counts(&http, &fault).await, (1, 0));
+    assert_eq!(
+        fault_counts(&http, &fault).await.expect("the fault counts"),
+        (1, 0)
+    );
 
     // An armed cut: the request is not accepted, the cut is counted, and the
     // side still ran for the bed that counts it.
-    arm(&http, &fault, "finish=error&status=503&count=1").await;
-    let before = encodes_served(&http, &fault, &name).await;
+    arm(&http, &fault, "finish=error&status=503&count=1")
+        .await
+        .expect("the fault arms");
+    let before = encodes_served(&http, &fault, &name)
+        .await
+        .expect("the encode count");
     let answer = encoder
-        .encode(tokenspeed_encode_request("ts-f2", 1, &[2]))
+        .encode(tokenspeed_encode_request("ts-f2", 1, &[2]).expect("an encode request"))
         .await
         .expect("an answer")
         .into_inner();
     assert!(!answer.accepted, "the armed cut is the engine's refusal");
-    assert_eq!(fault_counts(&http, &fault).await, (1, 1));
-    assert_eq!(encodes_served(&http, &fault, &name).await, before + 1);
+    assert_eq!(
+        fault_counts(&http, &fault).await.expect("the fault counts"),
+        (1, 1)
+    );
+    assert_eq!(
+        encodes_served(&http, &fault, &name)
+            .await
+            .expect("the encode count"),
+        before + 1
+    );
 
     // A malformed request spends no armed fault: the fault waits for the
     // next well-formed one.
-    arm(&http, &fault, "status=503&count=1").await;
+    arm(&http, &fault, "status=503&count=1")
+        .await
+        .expect("the fault arms");
     let malformed = encoder
-        .encode(tokenspeed_encode_request("ts-f3", 2, &[3]))
+        .encode(tokenspeed_encode_request("ts-f3", 2, &[3]).expect("an encode request"))
         .await
         .expect_err("a malformed encode request");
     assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
-    assert_eq!(fault_counts(&http, &fault).await, (1, 1));
+    assert_eq!(
+        fault_counts(&http, &fault).await.expect("the fault counts"),
+        (1, 1)
+    );
     let refused = encoder
-        .encode(tokenspeed_encode_request("ts-f4", 1, &[4]))
+        .encode(tokenspeed_encode_request("ts-f4", 1, &[4]).expect("an encode request"))
         .await
         .expect_err("the armed status, not an answer");
     assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
-    assert_eq!(fault_counts(&http, &fault).await, (2, 1));
+    assert_eq!(
+        fault_counts(&http, &fault).await.expect("the fault counts"),
+        (2, 1)
+    );
 }
 
 #[tokio::test]
 async fn a_tokenspeed_prefill_worker_checks_the_rooms_of_its_media_items() {
-    let (client, _name) = start(Role::Prefill, None, None).await;
+    let (client, _name) = start(Role::Prefill, None, None)
+        .await
+        .expect("the worker starts");
     let room = |item_index: u32, bootstrap_room: i64| ts::EncodeItemBootstrapInfo {
         item_index,
         bootstrap_host: "127.0.0.1".to_string(),
@@ -1353,7 +1744,10 @@ async fn a_tokenspeed_prefill_worker_checks_the_rooms_of_its_media_items() {
     let with_media = |id: &str, rooms: Option<Vec<ts::EncodeItemBootstrapInfo>>| {
         let mut req = rendezvous(request(id, &[1, 2, 3], false), 8998);
         req.mm_inputs = Some(ts::MultimodalInputs {
-            items: vec![ts::MultimodalItem::default(); 2],
+            items: (0..2)
+                .map(tokenspeed_media_item)
+                .collect::<anyhow::Result<_>>()
+                .expect("the media items"),
         });
         req.encode_bootstrap_info = rooms.map(|items| ts::EncodeBootstrapInfo { items });
         req
@@ -1364,7 +1758,8 @@ async fn a_tokenspeed_prefill_worker_checks_the_rooms_of_its_media_items() {
         &client,
         with_media("ts-p1", Some(vec![room(0, 11), room(1, 12)])),
     )
-    .await;
+    .await
+    .expect("the worker answers");
     let Some(GenResp::Complete(complete)) = &frames[0].response else {
         panic!("a Complete, not {:?}", frames[0]);
     };
@@ -1392,8 +1787,25 @@ async fn a_tokenspeed_prefill_worker_checks_the_rooms_of_its_media_items() {
         );
     }
 
+    // Rooms with no media at all: the first entry's index is out of range
+    // (item 0 of 0), refused as a room off the end is.
+    let mut no_media = with_media("ts-p4", Some(vec![room(0, 11)]));
+    no_media.mm_inputs = None;
+    let refused = client
+        .generate(no_media)
+        .await
+        .err()
+        .expect("a refused handoff, not a stream");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().ends_with("names item 0 of 0"),
+        "{refused:?}"
+    );
+
     // No rooms at all: a request without an encoder, served as before.
-    let frames = generate(&client, with_media("ts-p3", None)).await;
+    let frames = generate(&client, with_media("ts-p3", None))
+        .await
+        .expect("the worker answers");
     let Some(GenResp::Complete(complete)) = &frames[0].response else {
         panic!("a Complete, not {:?}", frames[0]);
     };

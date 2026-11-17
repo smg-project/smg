@@ -4,10 +4,12 @@
 //!
 //! - `GET /admin/fleet`: every worker of the process: a realistic engine with
 //!   its cache size and load and, in a canned process, each listener with its
-//!   name and mode.
+//!   name and mode; with the shared KV tier on (`--global-l3-blocks`), the
+//!   blocks it holds and the tokens restored from it.
 //! - `GET /admin/requests?since=<seq>&limit=<n>`: admitted-request records
-//!   (`request_id`, serving worker, prompt/cached/oracle tokens, queue wait),
-//!   oldest first, `seq` strictly greater than `since`.
+//!   (`request_id`, serving worker, prompt/cached/oracle tokens and the
+//!   cached tokens restored from the shared tier, queue wait), oldest first,
+//!   `seq` strictly greater than `since`.
 //! - `GET /admin/cache/{worker}`: the worker's cached block keys.
 //! - `POST /admin/reset/{worker}` and `POST /admin/reset`: clear one or every
 //!   cache and publish `AllBlocksCleared` (an engine restart, to the index).
@@ -21,7 +23,8 @@
 //! - `POST /admin/truth/{worker}` with `{"token_ids": [...]}`: what the
 //!   worker would serve from cache for that prompt right now;
 //!   `GET /admin/truth`: per worker, what it served over every admitted
-//!   request.
+//!   request; with the shared KV tier on, both give the tier's share as
+//!   `restored_tokens`.
 //! - `POST /admin/script/{worker}` with one scripted answer or an array of
 //!   them: what the worker's next requests get, in order (`all`: whichever
 //!   worker gets the request), or, with a `key` or `input_ids`, what every
@@ -59,7 +62,9 @@ use crate::{
     admin_ops::AdminOps,
     config::Config,
     engine::{self, Engine, FaultScope, RequestFault},
+    overrides::for_port,
     script,
+    zmq::rank_output_counts,
 };
 
 struct AdminState {
@@ -105,7 +110,7 @@ fn router(state: Arc<AdminState>) -> Router {
 }
 
 async fn serving_get(Path(port): Path<u16>) -> Json<Value> {
-    Json(json!({ "port": port, "serving": crate::overrides::for_port(port).serving() }))
+    Json(json!({ "port": port, "serving": for_port(port).serving() }))
 }
 
 /// Body `{"serving": true|false}`: whether the worker's gRPC health check
@@ -113,7 +118,7 @@ async fn serving_get(Path(port): Path<u16>) -> Json<Value> {
 async fn serving_set(Path(port): Path<u16>, Json(body): Json<Value>) -> Response {
     match body.get("serving").and_then(Value::as_bool) {
         Some(serving) => {
-            crate::overrides::for_port(port).set_serving(serving);
+            for_port(port).set_serving(serving);
             Json(json!({ "port": port, "serving": serving })).into_response()
         }
         None => (StatusCode::BAD_REQUEST, "body: {\"serving\": true|false}").into_response(),
@@ -121,12 +126,7 @@ async fn serving_set(Path(port): Path<u16>, Json(body): Json<Value>) -> Response
 }
 
 async fn info_get(Path(port): Path<u16>) -> Json<Value> {
-    Json(Value::Object(
-        crate::overrides::for_port(port)
-            .info()
-            .into_iter()
-            .collect(),
-    ))
+    Json(Value::Object(for_port(port).info().into_iter().collect()))
 }
 
 /// Body: a JSON object merged into the info the worker reports (its gRPC
@@ -135,7 +135,7 @@ async fn info_get(Path(port): Path<u16>) -> Json<Value> {
 async fn info_patch(Path(port): Path<u16>, Json(body): Json<Value>) -> Response {
     match body.as_object() {
         Some(patch) => {
-            let overrides = crate::overrides::for_port(port);
+            let overrides = for_port(port);
             overrides.patch_info(patch);
             Json(Value::Object(overrides.info().into_iter().collect())).into_response()
         }
@@ -193,7 +193,8 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
 
 /// Serve the admin API on `port` until `shutdown` resolves (the drain of a
 /// termination signal): the requests in flight are answered, no new one is
-/// accepted.
+/// accepted. A port another listener holds stops the server before it
+/// serves: the bind failure is logged and the future returns.
 pub async fn serve_until(
     cfg: Arc<Config>,
     host: String,
@@ -207,6 +208,22 @@ pub async fn serve_until(
             return;
         }
     };
+    serve_with_listener_until(cfg, listener, shutdown).await;
+}
+
+/// Serve the admin API on an already-bound listener until the process exits.
+/// A test that needs a free port binds port 0 and reads it back instead of
+/// probing one and binding it later: nothing takes the port in between.
+pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
+    serve_with_listener_until(cfg, listener, pending()).await;
+}
+
+/// [`serve_with_listener`] with the shutdown of [`serve_until`].
+pub async fn serve_with_listener_until(
+    cfg: Arc<Config>,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
     let state = Arc::new(AdminState { cfg });
     if let Err(e) = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
@@ -349,7 +366,12 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
 }
 
 async fn fleet(State(state): State<Arc<AdminState>>) -> Json<Value> {
-    Json(json!({ "workers": fleet_rows(&state.cfg) }))
+    let mut fleet = json!({ "workers": fleet_rows(&state.cfg) });
+    if state.cfg.engine.global_l3_blocks > 0 {
+        let (blocks, restored_tokens) = engine::global_l3_stats();
+        fleet["global_l3"] = json!({ "blocks": blocks, "restored_tokens": restored_tokens });
+    }
+    Json(fleet)
 }
 
 /// One row per worker of the process, in name order: a realistic engine with
@@ -423,6 +445,7 @@ async fn requests(Query(q): Query<HashMap<String, String>>) -> Json<Value> {
                 "worker": r.worker,
                 "prompt_tokens": r.prompt_tokens,
                 "cached_tokens": r.cached_tokens,
+                "restored_tokens": r.restored_tokens,
                 "oracle_tokens": r.oracle_tokens,
                 "queued_ms": r.queued_ms,
                 "running_at_admit": r.running_at_admit,
@@ -461,7 +484,7 @@ fn injected_failures() -> Value {
 /// the wave starts it accepted and its current wave, so a test tells a park
 /// from a wake.
 async fn zmq_rank(Path(worker): Path<String>) -> Response {
-    match crate::zmq::rank_output_counts(&worker) {
+    match rank_output_counts(&worker) {
         Some(counts) => {
             let (batch_messages, outputs) = counts.read();
             let (parks, wakes, wave) = counts.waves();
@@ -659,6 +682,7 @@ async fn truth_prompt(Path(worker): Path<String>, Json(body): Json<Value>) -> Re
                         "worker": e.name(),
                         "cached_tokens": truth.cached_tokens,
                         "cached_blocks": truth.cached_blocks,
+                        "restored_tokens": truth.restored_tokens,
                         "block_size": truth.block_size,
                         "prompt_tokens": token_ids.len(),
                     })
@@ -673,13 +697,14 @@ async fn truth_prompt(Path(worker): Path<String>, Json(body): Json<Value>) -> Re
 /// Per worker, what it actually served over every admitted request, and
 /// what its fault hook refused or cut.
 async fn truth_served() -> Json<Value> {
-    let mut totals: BTreeMap<String, (u64, u64, u64, u64)> = BTreeMap::new();
+    let mut totals: BTreeMap<String, (u64, u64, u64, u64, u64)> = BTreeMap::new();
     for r in engine::records_since(0, usize::MAX) {
-        let t = totals.entry(r.worker).or_insert((0, 0, 0, 0));
+        let t = totals.entry(r.worker).or_insert((0, 0, 0, 0, 0));
         t.0 += 1;
         t.1 += u64::from(r.prompt_tokens);
         t.2 += u64::from(r.cached_tokens);
         t.3 += u64::from(r.oracle_tokens);
+        t.4 += u64::from(r.restored_tokens);
     }
     let injected: BTreeMap<String, (u64, u64)> = engine::fleet_engines()
         .iter()
@@ -689,11 +714,11 @@ async fn truth_served() -> Json<Value> {
         })
         .collect();
     for worker in injected.keys() {
-        totals.entry(worker.clone()).or_insert((0, 0, 0, 0));
+        totals.entry(worker.clone()).or_insert((0, 0, 0, 0, 0));
     }
     let workers: Vec<Value> = totals
         .iter()
-        .map(|(worker, (requests, prompt, cached, oracle))| {
+        .map(|(worker, (requests, prompt, cached, oracle, restored))| {
             let (failed, cut) = injected.get(worker).copied().unwrap_or((0, 0));
             json!({
                 "worker": worker,
@@ -701,6 +726,7 @@ async fn truth_served() -> Json<Value> {
                 "prompt_tokens": prompt,
                 "cached_tokens": cached,
                 "oracle_tokens": oracle,
+                "restored_tokens": restored,
                 "injected_failures": failed,
                 "cut_streams": cut,
             })
@@ -711,7 +737,10 @@ async fn truth_served() -> Json<Value> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::oneshot;
+
     use super::*;
+    use crate::{config::Role, grpc::serve_with_listener, tls::install_crypto_provider};
 
     fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -725,7 +754,7 @@ mod tests {
     /// engine once that port is bound.
     #[tokio::test]
     async fn a_listener_that_cannot_bind_its_bootstrap_port_never_joins_the_fleet() {
-        let taken = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let taken = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a port to occupy");
         let taken_port = taken.local_addr().expect("address").port();
@@ -735,7 +764,7 @@ mod tests {
         // registered here. The listener is held through the check, so no
         // other test takes the port meanwhile.
         let (listener, port) = loop {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("the worker's port");
             let port = listener.local_addr().expect("address").port();
@@ -746,19 +775,19 @@ mod tests {
                 break (listener, port);
             }
         };
-        let cfg = std::sync::Arc::new(Config {
+        let cfg = Arc::new(Config {
             host: "127.0.0.1".to_string(),
             grpc_base_port: port,
             grpc_count: 1,
             realistic: true,
-            role: Some(crate::config::Role::Prefill),
+            role: Some(Role::Prefill),
             bootstrap_base_port: Some(taken_port),
             ..Config::default()
         });
         // The worker stops at the bind: serving returns instead of running on.
         tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            crate::grpc::serve_with_listener(std::sync::Arc::clone(&cfg), listener),
+            Duration::from_secs(10),
+            serve_with_listener(Arc::clone(&cfg), listener),
         )
         .await
         .expect("the worker stops at the bootstrap bind");
@@ -776,6 +805,68 @@ mod tests {
             "a worker that never served is listed: {:?}",
             fleet_rows(&cfg)
         );
+        drop(taken);
+    }
+
+    /// The admin API serves a listener its caller bound: the port the caller
+    /// read back answers, and the shutdown ends the server.
+    #[tokio::test]
+    async fn the_admin_api_serves_a_listener_the_caller_bound_until_its_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the admin listener");
+        let port = listener.local_addr().expect("address").port();
+        let (stop, stopped) = oneshot::channel::<()>();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the server task is joined at the end of the test"
+        )]
+        let server = tokio::spawn(serve_with_listener_until(
+            Arc::new(Config::default()),
+            listener,
+            async {
+                let _ = stopped.await;
+            },
+        ));
+        install_crypto_provider();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test's client; the process TLS crypto provider is installed first"
+        )]
+        let http = reqwest::Client::new();
+        let health = http
+            .get(format!("http://127.0.0.1:{port}/admin/health"))
+            .send()
+            .await
+            .expect("the admin API answers on the port read back");
+        assert_eq!(health.text().await.expect("the body"), "ok");
+        stop.send(()).expect("the server waits on its shutdown");
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the server stops at its shutdown")
+            .expect("the server task");
+    }
+
+    /// A port another listener holds stops the server before it serves: the
+    /// bind failure is logged and the future returns, which is why a test
+    /// binds the admin listener itself and reads the port back.
+    #[tokio::test]
+    async fn a_taken_admin_port_stops_the_server_before_it_serves() {
+        let taken = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port to occupy");
+        let port = taken.local_addr().expect("address").port();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            serve_until(
+                Arc::new(Config::default()),
+                "127.0.0.1".to_string(),
+                port,
+                pending(),
+            ),
+        )
+        .await
+        .expect("the server stops at the bind");
         drop(taken);
     }
 
@@ -846,6 +937,32 @@ mod tests {
             (0, 1)
         );
         drop(engines);
+    }
+
+    /// The fleet reports the shared KV tier beside the workers while the tier
+    /// is on, and has no such key while it is off.
+    #[tokio::test]
+    async fn the_fleet_reports_the_shared_tier_while_it_is_on() {
+        let with_tier = |global_l3_blocks| {
+            let engine = engine::EngineParams {
+                global_l3_blocks,
+                ..Default::default()
+            };
+            let cfg = Arc::new(Config {
+                realistic: true,
+                engine,
+                ..Config::default()
+            });
+            State(Arc::new(AdminState { cfg }))
+        };
+        let Json(off) = fleet(with_tier(0)).await;
+        assert!(off.get("global_l3").is_none(), "{off}");
+        let Json(on) = fleet(with_tier(4096)).await;
+        let tier = &on["global_l3"];
+        assert!(
+            tier["blocks"].is_u64() && tier["restored_tokens"].is_u64(),
+            "{on}"
+        );
     }
 
     #[test]

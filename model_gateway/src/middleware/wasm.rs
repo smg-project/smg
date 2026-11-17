@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 use axum::{
     body::{Body, HttpBody},
     extract::{Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, response::Parts, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -26,7 +26,7 @@ use crate::{
         spec::{
             apply_modify_action_to_headers, build_wasm_headers_from_axum_headers,
             smg::gateway::middleware_types::{
-                Action, Request as WasmRequest, Response as WasmResponse,
+                Action, ModifyAction, Request as WasmRequest, Response as WasmResponse,
             },
         },
         types::WasmComponentInput,
@@ -103,6 +103,7 @@ async fn run_request_hook(
     let extensions = parts.extensions;
 
     let max_body_size = wasm_manager.get_max_body_size();
+    let mut body_replaced = false;
     let mut body_bytes = match axum::body::to_bytes(body, max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) if super::body_timeout::crossed_payload_limit(&e) => {
@@ -159,15 +160,13 @@ async fn run_request_hook(
                 );
             }
             Action::Modify(modify) => {
-                apply_modify_action_to_headers(&mut headers, &modify);
-                if let Some(new_body) = modify.body_replace {
-                    body_bytes = new_body;
-                }
+                body_replaced |= apply_modify(&mut headers, &mut body_bytes, modify);
             }
         }
     }
 
     // Reconstruct request with modifications, preserving original extensions
+    frame_body(&mut headers, body_bytes.len(), body_replaced);
     let mut final_request = Request::builder()
         .method(method)
         .uri(uri)
@@ -218,10 +217,14 @@ async fn run_response_hook(wasm_manager: &WasmModuleManager, response: Response)
         return response;
     }
 
-    // Extract response data once before processing modules
-    let mut status = response.status();
-    let mut headers = response.headers().clone();
-    let mut body_bytes = match axum::body::to_bytes(response.into_body(), max_body_size).await {
+    // Take the response apart once before the modules run; the parts carry
+    // the extensions the layers inside handed the edge (the admission permit,
+    // the request span, the keep-alive), which ride on into the rebuilt one.
+    let (mut parts, body) = response.into_parts();
+    let mut status = parts.status;
+    let mut headers = std::mem::take(&mut parts.headers);
+    let mut body_replaced = false;
+    let mut body_bytes = match axum::body::to_bytes(body, max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) if super::body_timeout::crossed_payload_limit(&e) => {
             // A size unknown before the read, over the cap: the body is
@@ -264,22 +267,19 @@ async fn run_response_hook(wasm_manager: &WasmModuleManager, response: Response)
             Action::Continue => {}
             Action::Reject(status_code) => {
                 let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST);
-                return rebuild_response(status, headers, body_bytes);
+                return rebuild_response(parts, status, headers, body_bytes, body_replaced);
             }
             Action::Modify(modify) => {
                 if let Some(new_status) = modify.status {
                     status = StatusCode::from_u16(new_status).unwrap_or(status);
                 }
-                apply_modify_action_to_headers(&mut headers, &modify);
-                if let Some(new_body) = modify.body_replace {
-                    body_bytes = new_body;
-                }
+                body_replaced |= apply_modify(&mut headers, &mut body_bytes, modify);
             }
         }
     }
 
     // Reconstruct final response with all modifications
-    rebuild_response(status, headers, body_bytes)
+    rebuild_response(parts, status, headers, body_bytes, body_replaced)
 }
 
 /// Whether `response` is known to be over `max_body_size` before it is read:
@@ -310,14 +310,53 @@ fn is_streaming(response: &Response) -> bool {
             .is_some_and(|te| te.contains("chunked"))
 }
 
-/// The response the modules left: `status`, `headers` and `body`.
-fn rebuild_response(status: StatusCode, headers: HeaderMap, body: Vec<u8>) -> Response {
-    let mut response = Response::builder()
-        .status(status)
-        .body(Body::from(body))
-        .unwrap_or_else(|_| Response::new(Body::empty()));
-    *response.headers_mut() = headers;
-    response
+/// The response the modules left: `status`, `headers` and `body` on the
+/// original `parts`, so the extensions the layers inside handed the edge
+/// ride on; the headers frame the body as it is now.
+fn rebuild_response(
+    mut parts: Parts,
+    status: StatusCode,
+    mut headers: HeaderMap,
+    body: Vec<u8>,
+    body_replaced: bool,
+) -> Response {
+    frame_body(&mut headers, body.len(), body_replaced);
+    parts.status = status;
+    parts.headers = headers;
+    Response::from_parts(parts, Body::from(body))
+}
+
+/// Apply a module's `Modify` to the headers and body in hand, and say whether
+/// the body was replaced. A replacement first drops the content encoding
+/// declared for the body it replaces, then the module's own header edits
+/// apply, so a module that encodes its replacement and says so keeps its
+/// word; a body left in place keeps its encoding.
+fn apply_modify(headers: &mut HeaderMap, body: &mut Vec<u8>, modify: ModifyAction) -> bool {
+    if modify.body_replace.is_some() {
+        headers.remove(header::CONTENT_ENCODING);
+    }
+    apply_modify_action_to_headers(headers, &modify);
+    match modify.body_replace {
+        Some(new_body) => {
+            *body = new_body;
+            true
+        }
+        None => false,
+    }
+}
+
+/// The framing of a body the hook forwards whole: its length is the body's
+/// (an upstream's declaration described the body it replaced), and a
+/// transfer encoding no longer applies to a body held in memory; the
+/// content encoding is the body's own, settled when a module's `Modify` was
+/// applied. An empty body no module touched keeps the length it came with:
+/// a HEAD answer or a 304 declares the entity it stands for, and a bodiless
+/// request declares nothing.
+fn frame_body(headers: &mut HeaderMap, len: usize, body_replaced: bool) {
+    if body_replaced || len > 0 {
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    }
+    headers.remove(header::TRANSFER_ENCODING);
 }
 
 /// The wall clock in milliseconds since the epoch, as the modules read it.
@@ -335,17 +374,21 @@ mod tests {
     use axum::{
         body::{Body, Bytes},
         extract::Request,
-        http::{header, StatusCode},
+        http::{header, HeaderMap, StatusCode},
         response::Response,
     };
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use uuid::Uuid;
 
-    use super::{is_streaming, run_request_hook, run_response_hook, RequestHook};
+    use super::{
+        apply_modify, frame_body, is_streaming, rebuild_response, run_request_hook,
+        run_response_hook, RequestHook,
+    };
     use crate::wasm::{
         module::{MiddlewareAttachPoint, WasmModule, WasmModuleAttachPoint, WasmModuleMeta},
         module_manager::WasmModuleManager,
+        spec::smg::gateway::middleware_types::{Header, ModifyAction},
         WasmRuntimeConfig,
     };
 
@@ -621,6 +664,173 @@ mod tests {
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(code, "request_body_too_large");
         assert_eq!(body["error"]["code"], "request_body_too_large");
+    }
+
+    /// A body the hook forwards is framed as it is now: the length is the
+    /// body's, not the one the upstream declared for the body a module
+    /// replaced; a transfer encoding no longer applies to a body held whole;
+    /// the content encoding is not the framing's to touch.
+    #[test]
+    fn a_forwarded_body_is_framed_as_it_is_now() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "5".parse().unwrap());
+        headers.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        frame_body(&mut headers, 12, true);
+        assert_eq!(headers[header::CONTENT_LENGTH], "12");
+        assert!(headers.get(header::TRANSFER_ENCODING).is_none());
+
+        let mut kept = HeaderMap::new();
+        kept.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        frame_body(&mut kept, 7, false);
+        assert_eq!(kept[header::CONTENT_LENGTH], "7");
+        assert_eq!(kept[header::CONTENT_ENCODING], "gzip");
+
+        let mut head = HeaderMap::new();
+        head.insert(header::CONTENT_LENGTH, "5".parse().unwrap());
+        frame_body(&mut head, 0, false);
+        assert_eq!(
+            head[header::CONTENT_LENGTH],
+            "5",
+            "a HEAD answer keeps the entity's length"
+        );
+        let mut bodiless = HeaderMap::new();
+        frame_body(&mut bodiless, 0, false);
+        assert!(bodiless.get(header::CONTENT_LENGTH).is_none());
+        let mut emptied = HeaderMap::new();
+        emptied.insert(header::CONTENT_LENGTH, "5".parse().unwrap());
+        frame_body(&mut emptied, 0, true);
+        assert_eq!(
+            emptied[header::CONTENT_LENGTH],
+            "0",
+            "a body a module emptied is framed empty"
+        );
+    }
+
+    fn modify(body: Option<&[u8]>, set: &[(&str, &str)]) -> ModifyAction {
+        ModifyAction {
+            status: None,
+            headers_set: set
+                .iter()
+                .map(|(name, value)| Header {
+                    name: (*name).to_string(),
+                    value: (*value).to_string(),
+                })
+                .collect(),
+            headers_add: vec![],
+            headers_remove: vec![],
+            body_replace: body.map(<[u8]>::to_vec),
+        }
+    }
+
+    /// A module's replacement carries its own encoding: the one declared for
+    /// the body it replaces goes, a declaration the module makes alongside
+    /// its replacement stays, and a body left in place keeps its encoding.
+    #[test]
+    fn a_modules_replacement_carries_its_own_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let mut body = b"gzipped upstream".to_vec();
+        assert!(apply_modify(
+            &mut headers,
+            &mut body,
+            modify(Some(b"plain".as_slice()), &[])
+        ));
+        assert!(headers.get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(body, b"plain");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "br".parse().unwrap());
+        let mut body = b"brotli upstream".to_vec();
+        let encoded = modify(
+            Some(b"\x1f\x8b gzipped by the module".as_slice()),
+            &[("content-encoding", "gzip")],
+        );
+        assert!(apply_modify(&mut headers, &mut body, encoded));
+        assert_eq!(headers[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(body, b"\x1f\x8b gzipped by the module");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let mut body = b"left in place".to_vec();
+        assert!(!apply_modify(
+            &mut headers,
+            &mut body,
+            modify(None, &[("x-seen", "1")])
+        ));
+        assert_eq!(headers[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(headers["x-seen"], "1");
+        assert_eq!(body, b"left in place");
+    }
+
+    /// A rejection is rebuilt from the response's parts too: the status is
+    /// the module's, the body is framed, and the extensions stay.
+    #[test]
+    fn a_rejection_keeps_the_responses_extensions() {
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, "40")
+            .body(Body::empty())
+            .expect("a response");
+        response.extensions_mut().insert(Marker("permit"));
+        let (parts, _) = response.into_parts();
+        let headers = parts.headers.clone();
+        let rejected =
+            rebuild_response(parts, StatusCode::FORBIDDEN, headers, b"no".to_vec(), true);
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        assert_eq!(rejected.headers()[header::CONTENT_LENGTH], "2");
+        assert_eq!(
+            rejected.extensions().get::<Marker>(),
+            Some(&Marker("permit"))
+        );
+    }
+
+    /// The response the hook rebuilds declares the body it carries, whatever
+    /// the upstream declared for the body before the modules ran, and keeps
+    /// the extensions the layers inside handed the edge.
+    #[tokio::test]
+    async fn the_response_hook_frames_the_body_it_forwards_and_keeps_the_extensions() {
+        let manager = manager_with_an_inert_module();
+        let payload = b"twenty bytes of body".to_vec();
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, "3")
+            .body(Body::from(payload.clone()))
+            .expect("a response");
+        response.extensions_mut().insert(Marker("permit"));
+        let response = run_response_hook(&manager, response).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            payload.len().to_string()
+        );
+        assert_eq!(
+            response.extensions().get::<Marker>(),
+            Some(&Marker("permit"))
+        );
+        assert_eq!(body_of(response.into_body()).await, payload);
+    }
+
+    /// The request the hook forwards declares the body it carries, not the
+    /// length the client declared for the body before the modules ran.
+    #[tokio::test]
+    async fn the_request_hook_frames_the_body_it_forwards() {
+        let manager = manager_with_an_inert_module();
+        let payload = b"{\"model\":\"m\"}".to_vec();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_LENGTH, "3")
+            .body(Body::from(payload.clone()))
+            .expect("a request");
+        let RequestHook::Run(request) = run_request_hook(&manager, request, "req").await else {
+            panic!("the hook forwards the request");
+        };
+        assert_eq!(
+            request.headers()[header::CONTENT_LENGTH],
+            payload.len().to_string()
+        );
+        assert_eq!(body_of(request.into_body()).await, payload);
     }
 
     /// A response that declares a length over the cap passes through the hook

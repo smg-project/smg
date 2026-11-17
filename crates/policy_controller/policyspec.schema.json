@@ -57,7 +57,7 @@
       "type": "object",
       "properties": {
         "headers": {
-          "description": "The request headers a stage may read, lowercase, in the order their\npositions take on the wire. A name on the deny-list (`authorization`,\n`proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, the host's\ntenant header) is refused. Every header a binding's `sessions`,\n`canary` or `match.header` names must be listed here. At most 256: a\nview names a header by its position in one byte.",
+          "description": "The request headers a stage may read, lowercase, in the order their\npositions take on the wire. A name on the deny-list (`authorization`,\n`proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `api-key`,\n`x-goog-api-key`, the host's tenant header) is refused. Every header a\nbinding's `sessions`, `canary` or `match.header` names must be listed\nhere. At most 256: a view names a header by its position in one byte.",
           "type": "array",
           "items": {
             "type": "string"
@@ -179,6 +179,7 @@
           "enum": [
             "least-load",
             "least-requests",
+            "fewest-sessions",
             "session-affinity",
             "prefix-affinity",
             "kv-pressure",
@@ -216,6 +217,18 @@
           },
           "required": [
             "least-requests"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "fewest-sessions": {
+              "$ref": "#/$defs/Weight"
+            }
+          },
+          "required": [
+            "fewest-sessions"
           ],
           "additionalProperties": false
         },
@@ -486,7 +499,7 @@
       "additionalProperties": false
     },
     "KvPressureParams": {
-      "description": "The KV-pressure scorer: the fleet's KV-usage spread past which affinity\nyields to load, and the per-candidate ceiling above which the hottest\ncandidate is de-ranked.",
+      "description": "The KV-pressure gate: the fleet's KV-usage spread, or the usage the\nhottest candidate crosses, past which the profile's affinity stages\nyield to load. The stage orders nothing itself.",
       "type": "object",
       "properties": {
         "weight": {
@@ -506,7 +519,7 @@
           "exclusiveMinimum": 0
         },
         "ceiling": {
-          "description": "The usage ceiling above which a candidate is de-ranked; above zero,\n1 and above switches the rule off (default 1).",
+          "description": "The usage the hottest candidate crosses for affinity to yield to\nload; above zero, 1 and above switches the rule off (default 1).",
           "type": [
             "number",
             "null"
@@ -574,6 +587,16 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "miss_share": {
+          "description": "The index overlap share at or under which a hit counts as a miss\nfor the slice; between 0 and 1 (default 0.3, the affinity\nthreshold's).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "minimum": 0.0,
+          "maximum": 1.0
         }
       },
       "additionalProperties": false
@@ -679,7 +702,7 @@
       "additionalProperties": false
     },
     "ResidentWorkParams": {
-      "description": "The resident-work scorer: the tokens resident on a candidate, with the\nrequest's own token count added for the comparison.",
+      "description": "The resident-work scorer: the context tokens resident on a candidate,\nand a price in tokens for every request it holds.",
       "type": "object",
       "properties": {
         "weight": {
@@ -690,10 +713,10 @@
           "exclusiveMinimum": 0
         },
         "request_tokens": {
-          "description": "The request's token count added to each candidate's resident\ntokens; above zero.",
+          "description": "What one request a candidate holds adds to its resident tokens, in\ncontext tokens; zero compares the tokens alone.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 1
+          "minimum": 0
         }
       },
       "additionalProperties": false,
@@ -702,7 +725,7 @@
       ]
     },
     "PickSpec": {
-      "description": "A picker: its bare name, or the name mapped to its parameters.",
+      "description": "A picker: its bare name, or the name mapped to its parameters. `power-of-two` and `power-of-two-count-first` compare two workers drawn from those the filters left, `count-first` the fewest in flight among them: the built-in scorers score the workers compared and no other. Between two workers a normalized score is all or nothing, so several weighted scorers under a two-draw picker vote by weight where over the pool they would blend: name one scorer there, or the `best` picker over the pool.",
       "anyOf": [
         {
           "type": "string",
@@ -1107,26 +1130,26 @@
           }
         },
         "ttl_s": {
-          "description": "How long an idle key stays pinned, in seconds; above zero (default\n14400).",
+          "description": "How long an idle key stays pinned, in seconds; above zero (default\n14400), `4294967295` for ever.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
           "default": 14400
         },
         "sweep_s": {
-          "description": "The sweep cadence of idle keys, in seconds; above zero (default 120).",
+          "description": "The sweep cadence of idle keys, in seconds; above zero (default 120),\n`4294967295` for never, allowed under a `ttl_s` for ever alone.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
           "default": 120
         },
         "assignment": {
-          "description": "How a first-seen key picks its worker (default `delegate`).",
+          "description": "How a first-seen key picks its worker (default `delegate`); under\nthe `manual` picker, a request with no key as well.",
           "$ref": "#/$defs/Assignment",
           "default": "delegate"
         },
         "inflight_cap": {
-          "description": "How many requests of one key a worker carries before the next steps\naside; above zero (default 2).",
+          "description": "How many requests of one key a worker carries before the next steps\naside; above zero (default 2), `65535` for no cap.",
           "type": "integer",
           "format": "uint16",
           "minimum": 1,
@@ -1134,9 +1157,14 @@
           "default": 2
         },
         "issue_session_id": {
-          "description": "Issue a session id to a request that carries none (default false:\nthe host issues none).",
+          "description": "Issue a session id to a request that carries none (default false;\nnot in this build: set, it is refused by name).",
           "type": "boolean",
           "default": false
+        },
+        "recovery": {
+          "description": "Which pin leads once both of a key's pins are routable (default\n`original`).",
+          "$ref": "#/$defs/Recovery",
+          "default": "original"
         }
       },
       "additionalProperties": false,
@@ -1145,7 +1173,7 @@
       ]
     },
     "Assignment": {
-      "description": "How a session key seen for the first time picks its worker.",
+      "description": "How a session key seen for the first time picks its worker. Under the\n`manual` picker the same assignment places a request with no key, which\nis not pinned, and a `manual` profile bound with no sessions rule places\nevery request by `min_load`.",
       "oneOf": [
         {
           "description": "A random worker.",
@@ -1167,6 +1195,14 @@
           "type": "string",
           "const": "delegate"
         }
+      ]
+    },
+    "Recovery": {
+      "description": "Which of a key's two pins leads once both are routable again: the first\nworker the key was placed on (the manual policy's order) or the latest\none it was dispatched to (the sticky override's under `delegate`).",
+      "type": "string",
+      "enum": [
+        "original",
+        "latest"
       ]
     },
     "CanarySpec": {

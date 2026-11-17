@@ -102,11 +102,14 @@ def _last_flag(cmd: list[str], flag: str) -> str:
     return cmd[max(i for i, arg in enumerate(cmd) if arg == flag) + 1]
 
 
-def test_an_encode_worker_takes_the_vllm_wire_and_a_bootstrap_port():
+def test_an_encode_worker_takes_the_vllm_wire_and_a_bootstrap_port(monkeypatch):
+    monkeypatch.delenv(ENV_MOCK_WIRE, raising=False)
     encode = _worker(ConnectionMode.GRPC, worker_type=WorkerType.ENCODE, bootstrap_port=31901)
     cmd = encode._build_cmd()
     assert _flag(cmd, "--worker-type") == "encode"
-    assert _last_flag(cmd, "--grpc-wire") == "vllm", "the encode role's default wire"
+    assert _last_flag(cmd, "--grpc-wire") == "vllm", (
+        "the encode role's wire when the lane names none"
+    )
     assert _flag(cmd, "--bootstrap-base-port") == "31901", "the port the gateway is told of"
     # A class's own wire comes after the role's, as for every pool: the mock
     # takes the last, and refuses the encode role on a wire without one.
@@ -116,6 +119,29 @@ def test_an_encode_worker_takes_the_vllm_wire_and_a_bootstrap_port():
         extra_engine_args=["--grpc-wire", "sglang"],
     )._build_cmd()
     assert _last_flag(stated, "--grpc-wire") == "sglang"
+
+
+@pytest.mark.parametrize("wire", ["vllm", "tokenspeed"])
+def test_an_encode_worker_speaks_the_lanes_wire_when_it_has_an_encoder(monkeypatch, wire):
+    # One runtime per fleet: the encode worker takes the lane's wire, not a
+    # vLLM worker beside TokenSpeed prefill and decode workers.
+    monkeypatch.setenv(ENV_MOCK_WIRE, wire)
+    cmd = _worker(ConnectionMode.GRPC, worker_type=WorkerType.ENCODE)._build_cmd()
+    flags = [cmd[i + 1] for i, flag in enumerate(cmd) if flag == "--grpc-wire"]
+    assert flags == [wire], "the lane's wire once, no override"
+    assert _flag(cmd, "--worker-type") == "encode"
+
+
+def test_an_encode_worker_on_the_sglang_lane_is_refused_unless_the_class_names_a_wire(monkeypatch):
+    monkeypatch.setenv(ENV_MOCK_WIRE, "sglang")
+    with pytest.raises(ValueError, match="E2E_MOCK_WIRE=sglang"):
+        _worker(ConnectionMode.GRPC, worker_type=WorkerType.ENCODE)._build_cmd()
+    stated = _worker(
+        ConnectionMode.GRPC,
+        worker_type=WorkerType.ENCODE,
+        extra_engine_args=["--grpc-wire", "vllm"],
+    )._build_cmd()
+    assert _last_flag(stated, "--grpc-wire") == "vllm", "the class's own wire, after the lane's"
 
 
 def test_the_prefill_and_decode_roles_reach_the_http_command_with_the_bootstrap_port():

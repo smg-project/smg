@@ -1,4 +1,5 @@
 mod hy_v4;
+mod random_filter;
 mod render_context;
 
 use super::*;
@@ -41,6 +42,75 @@ fn a_replacement_template_refreshes_the_tool_call_arguments_answer() {
     assert!(state.raw_tool_call_arguments());
     state.set(SERIALIZING_CALLS.to_string()).unwrap();
     assert!(!state.raw_tool_call_arguments());
+}
+
+/// A state reads the names its templates read: a bare name anywhere in an
+/// expression of the default template, or of an alternate a request may
+/// render through. The gateway hands a request control to the template
+/// under its name only when the template reads it.
+#[test]
+fn a_state_reads_the_names_its_templates_read() {
+    let reading = "{% macro format(f) %}{{ f | tojson }}{% endmacro %}{% for m in messages %}\
+                   {{ m.content }}{% endfor %}{% if response_format is defined %}\
+                   {{ format(response_format) }}{% endif %}";
+    let state = ChatTemplateState::new(Some(reading.to_string())).unwrap();
+    assert!(state.reads("response_format"));
+    assert!(state.reads("messages"));
+    assert!(!state.reads("tool_choice"));
+
+    let plain = "{% for m in messages %}{{ m.content }}{% endfor %}";
+    let state = ChatTemplateState::new(Some(plain.to_string())).unwrap();
+    assert!(!state.reads("response_format"));
+    assert!(!state.reads("tool_choice"));
+
+    // An alternate's reads count: the `tool_use` template a request with
+    // tools renders through.
+    let state = ChatTemplateState::from_config(ConfigChatTemplates {
+        default: Some(plain.to_string()),
+        tool_use: Some(format!("{plain}{{{{ tool_choice }}}}")),
+    })
+    .unwrap();
+    assert!(state.reads("tool_choice"));
+    assert!(!state.reads("response_format"));
+
+    // A name read only as a call block's parameter default counts: the
+    // block's parameters are expressions of the template, as a macro's.
+    let call_block = "{% macro wrap() %}{{ caller() }}{% endmacro %}{% for m in messages %}\
+                      {{ m.content }}{% endfor %}{% call(fmt=response_format) wrap() %}\
+                      {{ fmt | tojson }}{% endcall %}";
+    let state = ChatTemplateState::new(Some(call_block.to_string())).unwrap();
+    assert!(state.reads("response_format"));
+    assert!(!state.reads("tool_choice"));
+
+    // The processor alternate's reads count too: a checkpoint's processor
+    // template, which a request without tools renders through.
+    let state = ChatTemplateState::from_checkpoint(
+        ConfigChatTemplates {
+            default: Some(plain.to_string()),
+            tool_use: None,
+        },
+        Some(format!("processor:{plain}{{{{ response_format }}}}")),
+    )
+    .unwrap();
+    assert!(format!("{state:?}").contains("has_processor: true"));
+    assert!(state.reads("response_format"));
+    assert!(!state.reads("tool_choice"));
+
+    // A replacement template answers for itself.
+    let mut state = ChatTemplateState::new(Some(plain.to_string())).unwrap();
+    state.set(reading.to_string()).unwrap();
+    assert!(state.reads("response_format"));
+
+    // No template: nothing to leave a name out of.
+    assert!(ChatTemplateState::empty().reads("response_format"));
+    assert!(ChatTemplateState::new(None).unwrap().reads("tool_choice"));
+
+    // A template the detector could not parse leaves the names unknown,
+    // and an unknown set reads every name rather than none.
+    assert!(detect_all("{% if %}").names_read.is_none());
+    let mut state = ChatTemplateState::new(Some(plain.to_string())).unwrap();
+    state.names_read = None;
+    assert!(state.reads("response_format"));
 }
 
 /// A template that writes a history call by string concatenation, as the
@@ -1482,6 +1552,68 @@ fn clear_thinking_is_not_a_thinking_switch() {
     }
 }
 
+/// The word `thinking` in what a template prints is not a switch: the
+/// MiniMax M3.1 template's system prose ("When thinking is enabled, wrap your
+/// reasoning in ...") stands in a string literal, and the template branches
+/// on no thinking variable, where the M3 template branched on
+/// `thinking_mode`. A comment or the raw text outside the blocks is not a
+/// switch either; the same words as code are.
+#[test]
+fn thinking_in_prose_or_a_comment_is_not_a_thinking_switch() {
+    let m31_shape = "{{- 'You have a thinking capability that allows you to reason step by step \
+                     before responding. When thinking is enabled, wrap your reasoning in ' ~ \
+                     think_begin_token ~ ' and ' ~ think_end_token }}\
+                     {%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                     {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    for template in [
+        m31_shape,
+        "{{ \"When thinking is enabled, think.\" }}{% for m in messages %}{{ m.content }}{% endfor %}",
+        "{% set note = 'if thinking == true' %}{{ note }}",
+        "{# if thinking is defined #}{{ messages | length }}",
+        "When thinking is enabled, think.{% for m in messages %}{{ m.content }}{% endfor %}",
+        // A raw block prints its text as it is, switch-looking words included.
+        "{% raw %}{% if thinking %}on{% endif %}{% endraw %}{{ messages | length }}",
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::None, None),
+            "{template}"
+        );
+    }
+    let state = ChatTemplateState::new(Some(m31_shape.to_string())).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::None);
+    assert_eq!(state.thinking_key_name(), None);
+    assert!(!state.prefill_opens_think_block());
+
+    // The same words as code are the switch, after a literal and after a
+    // literal with an escaped quote in it.
+    for template in [
+        "{% if thinking is defined and thinking %}<think>{% endif %}",
+        "{{ 'When thinking is enabled' }}{% if thinking %}<think>{% endif %}",
+        "{{ 'it\\'s thinking' }}{% if thinking == true %}<think>{% endif %}",
+        "{{ \"a 'quoted' word\" }}{% set thinking = thinking %}",
+        // A nested dict literal's `}}` does not end the block before the switch.
+        "{{ {'a': {'b': '<think>'}}['a']['b'] if thinking else '' }}",
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::DefaultOn, Some(ThinkingKeyName::Thinking)),
+            "{template}"
+        );
+    }
+    // The M3 shape keeps its tri-state switch.
+    assert_eq!(
+        detect_thinking_toggle(
+            "{{- 'When thinking is enabled, wrap your reasoning.' }}\
+             {%- if thinking_mode is defined and thinking_mode == \"enabled\" -%}<think>{%- endif -%}"
+        ),
+        (
+            ThinkingToggle::DefaultOff,
+            Some(ThinkingKeyName::ThinkingMode)
+        )
+    );
+}
+
 #[test]
 fn test_chat_template_state_invalid_template() {
     let result = ChatTemplateState::new(Some("{% invalid".to_string()));
@@ -1514,13 +1646,50 @@ fn test_raise_exception_surfaces_template_validation_message() {
     assert!(error.contains("reasoning_effort is invalid"), "{error}");
 }
 
+/// A template's own `raise_exception` is typed as the template's refusal, from
+/// inside a macro too, under the text every render failure reads; an operation
+/// the template could not run is a render failure and no refusal.
+#[test]
+fn a_templates_own_refusal_is_typed_and_another_render_failure_is_not() {
+    let failure = |template: &str| {
+        ChatTemplateState::new(Some(template.to_string()))
+            .unwrap()
+            .apply(
+                &[serde_json::json!({"role": "user", "content": []})],
+                ChatTemplateParams::default(),
+            )
+            .unwrap_err()
+    };
+
+    let refused = failure("{{ raise_exception('the roles must alternate') }}");
+    assert!(TemplateRefusal::is(&refused), "{refused:#}");
+    assert!(
+        refused
+            .to_string()
+            .starts_with("Failed to render template: invalid operation: the roles must alternate"),
+        "{refused}"
+    );
+    let in_a_macro =
+        failure("{% macro check() %}{{ raise_exception('no') }}{% endmacro %}{{ check() }}");
+    assert!(TemplateRefusal::is(&in_a_macro), "{in_a_macro:#}");
+
+    let failed = failure("{{ 'user: ' + messages[0]['content'] }}");
+    assert!(!TemplateRefusal::is(&failed), "{failed:#}");
+    assert!(
+        failed
+            .to_string()
+            .starts_with("Failed to render template: invalid operation: "),
+        "{failed}"
+    );
+}
+
 #[test]
 fn test_special_tokens_injected_into_context() {
     let template = "{{ bos_token }}{% for message in messages %}{{ message.content }}{% endfor %}{{ eos_token }}";
     let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
 
     let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-    let special_tokens = crate::traits::SpecialTokens {
+    let special_tokens = SpecialTokens {
         bos_token: Some("<s>".to_string()),
         eos_token: Some("</s>".to_string()),
         ..Default::default()
@@ -1553,7 +1722,7 @@ fn test_special_tokens_partial() {
     let template = "{{ bos_token }}hello{% if eos_token is defined %}{{ eos_token }}{% endif %}";
     let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
 
-    let special_tokens = crate::traits::SpecialTokens {
+    let special_tokens = SpecialTokens {
         bos_token: Some("<s>".to_string()),
         eos_token: None,
         ..Default::default()
@@ -1660,6 +1829,142 @@ fn thinking_filter_on_other_values_does_not_change_the_switch_default() {
         ),
         (ThinkingToggle::DefaultOff, Some(ThinkingKeyName::Thinking))
     );
+}
+
+/// A template's thinking default is what it renders with the switch absent,
+/// whatever its source spells. A template that opens the thought, or asks
+/// for it, only where the switch is true defaults off: an undefined switch
+/// is not true. The text matcher knows two spellings of a default off and
+/// calls each of these three on.
+#[test]
+fn the_thinking_default_is_what_the_template_renders_with_the_switch_absent() {
+    let defined_and_true = "{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                            {%- if add_generation_prompt -%}<|assistant|>\
+                            {%- if enable_thinking is defined and enable_thinking is true -%}\
+                            {{- '<think>\\n' -}}{%- else -%}{{- '<think>\\n\\n</think>\\n\\n' -}}\
+                            {%- endif -%}{%- endif -%}";
+    let truthy = "{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                  {%- if add_generation_prompt -%}<|assistant|>\
+                  {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    let in_the_system_prompt = "{%- if thinking -%}<|system|>Think before you answer.\
+                                {%- else -%}<|system|>Answer.{%- endif -%}\
+                                {%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                                {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    for (template, key) in [
+        (defined_and_true, ThinkingKeyName::EnableThinking),
+        (truthy, ThinkingKeyName::EnableThinking),
+        (in_the_system_prompt, ThinkingKeyName::Thinking),
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::DefaultOn, Some(key)),
+            "the text matcher: {template}"
+        );
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(
+            state.thinking_toggle(),
+            ThinkingToggle::DefaultOff,
+            "{template}"
+        );
+        assert_eq!(state.thinking_key_name(), Some(key));
+    }
+
+    // A template that closes the thought only where the switch is false
+    // defaults on, and one the matcher reads as off renders off: both as
+    // before.
+    let defined_and_false = "{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                             {%- if add_generation_prompt -%}<|assistant|>\
+                             {%- if enable_thinking is defined and enable_thinking is false -%}\
+                             {{- '<think>\\n\\n</think>\\n\\n' -}}{%- else -%}{{- '<think>\\n' -}}\
+                             {%- endif -%}{%- endif -%}";
+    let set_false = "{%- if enable_thinking is not defined -%}\
+                     {%- set enable_thinking = false -%}{%- endif -%}\
+                     {%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                     {%- if add_generation_prompt -%}<|assistant|>\
+                     {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    for (template, default) in [
+        (defined_and_false, ThinkingToggle::DefaultOn),
+        (set_false, ThinkingToggle::DefaultOff),
+    ] {
+        assert_eq!(detect_thinking_toggle(template).0, default, "{template}");
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), default, "{template}");
+    }
+
+    // A replacement template answers for itself.
+    let mut state = ChatTemplateState::new(Some(defined_and_false.to_string())).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOn);
+    state.set(truthy.to_string()).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOff);
+}
+
+/// The three probe renders share one instant. A template that writes the
+/// time would otherwise separate them by the clock alone, and its default
+/// would fall back to the text matcher's answer: here the time is written to
+/// the nanosecond, so three reads of the clock never agree.
+#[test]
+fn the_probe_renders_share_one_instant() {
+    let writes_the_time = "{{- strftime_now('%H:%M:%S.%f') -}}\
+                           {%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                           {%- if add_generation_prompt -%}<|assistant|>\
+                           {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    assert_eq!(
+        detect_thinking_toggle(writes_the_time),
+        (
+            ThinkingToggle::DefaultOn,
+            Some(ThinkingKeyName::EnableThinking)
+        ),
+        "the text matcher"
+    );
+    let state = ChatTemplateState::new(Some(writes_the_time.to_string())).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOff);
+}
+
+/// Where the renders do not say, the text matcher's answer stands: a bare
+/// turn that does not render, a switch that moves nothing on a bare turn,
+/// and an absent render that equals neither the on nor the off render.
+#[test]
+fn the_text_matcher_answers_where_the_renders_do_not_say() {
+    // The template refuses a conversation with no system message.
+    let refuses = "{%- if messages[0].role != 'system' -%}\
+                   {{- raise_exception('a system message is required') -}}{%- endif -%}\
+                   {%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                   {%- if add_generation_prompt -%}<|assistant|>\
+                   {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    // The switch only shapes an assistant message of the history.
+    let history_only = "{%- for m in messages -%}\
+                        {%- if m.role == 'assistant' and enable_thinking -%}\
+                        <think>{{ m.reasoning_content }}</think>{%- endif -%}\
+                        {{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    // No thought marker with the switch absent; true opens the thought and
+    // false closes it.
+    let third = "{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                 {%- if add_generation_prompt -%}<|assistant|>\
+                 {%- if enable_thinking is defined and enable_thinking is true -%}\
+                 {{- '<think>\\n' -}}\
+                 {%- elif enable_thinking is defined and enable_thinking is false -%}\
+                 {{- '<think>\\n\\n</think>\\n\\n' -}}{%- endif -%}{%- endif -%}";
+    for template in [refuses, history_only, third] {
+        let matched = detect_thinking_toggle(template);
+        assert_eq!(
+            matched,
+            (
+                ThinkingToggle::DefaultOn,
+                Some(ThinkingKeyName::EnableThinking)
+            ),
+            "{template}"
+        );
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), matched.0, "{template}");
+    }
+    let bare = [serde_json::json!({"role": "user", "content": "probe"})];
+    let params = || ChatTemplateParams {
+        add_generation_prompt: true,
+        ..Default::default()
+    };
+    let state = ChatTemplateState::new(Some(refuses.to_string())).unwrap();
+    assert!(state.apply(&bare, params()).is_err(), "the bare turn");
 }
 
 #[test]

@@ -34,6 +34,7 @@ use super::{
             encode::EncodeDispatchPlan,
             helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask, ToolConstraintStamp},
             pd_protocol::{EncodeHandoff, PdProtocol},
+            request_execution::EncodeWatch,
             RateLimitCell,
         },
     },
@@ -49,7 +50,7 @@ use super::{
         stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
         symphony::{PromptReplay, Reading},
     },
-    spec::ResponseSpec,
+    spec::{MessagesTools, ResponseSpec},
     utils::{Names, ParserResolver, WorkerDecoding},
 };
 use crate::{
@@ -58,11 +59,14 @@ use crate::{
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
     routers::{
-        common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard, sse::SseSender},
+        common::{
+            attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard,
+            prefill_admission::PrefillLoadGuard, sse::SseSender,
+        },
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
     },
-    worker::{PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
     workflow::TokenizerLoadFailures,
 };
 
@@ -113,7 +117,21 @@ pub(crate) enum RequestType {
     },
 }
 
+fn openai_response_model(model: &str, adapter: Option<&str>) -> String {
+    adapter.map_or_else(|| model.to_string(), |adapter| format!("{model}:{adapter}"))
+}
+
 impl RequestType {
+    /// Adapter selection forwarded by the SGLang gRPC request builders.
+    pub fn lora_adapter(&self) -> Option<&str> {
+        match self {
+            Self::Chat(request) => request.lora_path.as_deref(),
+            Self::Generate(request) => request.lora_path.as_deref().or(request.lora_id.as_deref()),
+            Self::Completion(request) => request.lora_path.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Overwrite the request's own `model` field.
     ///
     /// `Arc::make_mut` copies the request when another handle is still
@@ -255,14 +273,13 @@ pub(crate) struct ProcessingState {
 
     /// The provider profile of the request's model (`ProviderProfile::for_model`), derived once
     /// by the chat and Messages preparations and read by the later stages in place of a
-    /// derivation of their own (the output budget, the constraint's tool-call reading, the
+    /// derivation of their own (the constraint's tool-call reading, request building, the
     /// response spec). `None` on the other endpoints; a read then derives it itself.
     pub provider: Option<ProviderProfile>,
     /// The table's replay of the rendered prompt, as preparation read it for the forced call's
     /// tag (`reading::prepare`): request building's reasoning decision takes it in place of a
-    /// second replay of the same prompt (`reading::reasoning_decision`). `None` when preparation
-    /// did not replay (the request's thinking switch armed the reasoning, or the endpoint's
-    /// preparation reads no prompt); a decision then replays itself.
+    /// second replay of the same prompt (`reading::reasoning_decision`). `None` where the
+    /// endpoint's preparation reads no prompt; a decision then replays itself.
     pub prompt_thought: Option<PromptReplay>,
     /// The table decision for the request's model under its parser (`regular::symphony::reading`:
     /// the table that reads the response, or why the legacy parsers do), as the chat and Messages
@@ -275,6 +292,13 @@ pub(crate) struct ProcessingState {
     /// endpoints whose preparation decides nothing, and when the names refused (the constraint
     /// carries the refusal); the assignment then decides itself.
     pub reading: Option<Reading>,
+
+    /// A Messages request's tools, taken out of the request by the route
+    /// while it still owned it (`MessagesTools::take_from`) and stored by
+    /// `RequestContext::for_messages`: the Messages preparation clones them
+    /// (a flag and an `Arc`) into the response spec. `None` only for a
+    /// context of another request type.
+    pub messages_tools: Option<MessagesTools>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request
@@ -447,7 +471,16 @@ pub(crate) struct DispatchContext {
     /// prefill/decode sides against the already-running encode jobs (a push plan
     /// carrying media is not retried).
     pub encode_outputs: Option<EncodeOutputs>,
+    /// The watch on a rendezvous plan's encode dispatch, made when the first
+    /// attempt launched the encode jobs beside its pair (see
+    /// `request_execution::launch_encode_dispatch`); a replay's prefill side
+    /// waits at the same rooms on the same jobs, so it races the same watch
+    /// and a failed send ends its wait too. `None` for a push plan, a
+    /// text-only request, or a plan with nothing to encode.
+    pub encode_watch: Option<EncodeWatch>,
     pub multimodal_inflight: Option<InflightPermit>,
+    /// Set for each attempt before it dispatches. Response processing is
+    /// its last reader and takes it.
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
     /// Prefill admission slot for the next PD/EPD dispatch; a retry's
@@ -490,6 +523,30 @@ impl StageOutput for ClientSelection {
     );
 }
 
+impl StageOutput for ExecutionResult {
+    const NOT_COMPLETED: (&'static str, &'static str) =
+        ("no_execution_result", "No execution result");
+}
+
+impl StageOutput for DispatchMetadata {
+    const NOT_COMPLETED: (&'static str, &'static str) =
+        ("dispatch_metadata_not_set", "Dispatch metadata not set");
+}
+
+impl StageOutput for Arc<dyn Tokenizer> {
+    const NOT_COMPLETED: (&'static str, &'static str) = (
+        "tokenizer_not_cached",
+        "Tokenizer not cached in context - preparation stage may have been skipped",
+    );
+}
+
+impl StageOutput for StopSequenceDecoder {
+    const NOT_COMPLETED: (&'static str, &'static str) = (
+        "stop_decoder_not_initialized",
+        "Stop decoder not initialized",
+    );
+}
+
 impl<T: StageOutput> StageOutput for &T {
     const NOT_COMPLETED: (&'static str, &'static str) = T::NOT_COMPLETED;
 }
@@ -510,6 +567,14 @@ pub(crate) fn stage_output<T: StageOutput>(
         error!(function = function, "{message}");
         internal_error(code, message)
     })
+}
+
+/// The failure a response-processing stage `function` reports when the
+/// dispatch handed it another request kind's [`ResponseSpec`]: logged once
+/// under the stage that noticed, one code for every stage.
+pub(crate) fn wrong_response_spec(function: &'static str) -> axum::response::Response {
+    error!(function = function, "Wrong response spec");
+    internal_error("wrong_response_spec", "Wrong response spec")
 }
 
 /// Everything request building hands the dispatch phase.
@@ -578,6 +643,13 @@ pub(crate) enum ExecutionPlan {
         shared_request_id: String,
         requests: Vec<ProtoGenerateRequest>,
     },
+    /// Batched embedding fan-out: one backend request per input, in the
+    /// request's order, answered as one list. Sub-request ids are
+    /// `{shared_request_id}-p{i}`.
+    EmbedBatch {
+        shared_request_id: String,
+        requests: Vec<ProtoEmbedRequest>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -585,6 +657,28 @@ pub(crate) enum ExecutionPlanKind {
     Single,
     PrefillDecode,
     EncodePrefillDecode,
+}
+
+/// The mode's settings for the request a stage builds: which execution plan
+/// it becomes, and whether the prefill-decode metadata is injected into it.
+/// Read once off the mode by the pipeline and held by every request-building
+/// stage as one value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlanSettings {
+    pub inject_pd_metadata: bool,
+    pub plan_kind: ExecutionPlanKind,
+}
+
+impl PlanSettings {
+    /// The mode-bearing part of a stage's descriptor in the pipeline parity
+    /// test: one form for every stage that holds the settings.
+    #[cfg(test)]
+    pub(crate) fn signature(self) -> String {
+        format!(
+            "inject_pd_metadata={}, {:?}",
+            self.inject_pd_metadata, self.plan_kind
+        )
+    }
 }
 
 impl ExecutionPlan {
@@ -633,6 +727,9 @@ impl ExecutionPlan {
             }
             Self::Batch {
                 shared_request_id, ..
+            }
+            | Self::EmbedBatch {
+                shared_request_id, ..
             } => shared_request_id,
         }
     }
@@ -643,13 +740,13 @@ impl ExecutionPlan {
             | Self::PrefillDecode(_)
             | Self::EncodePrefillDecode { .. }
             | Self::Batch { .. } => "generate",
-            Self::Single(ProtoRequest::Embed(_)) => "embed",
+            Self::Single(ProtoRequest::Embed(_)) | Self::EmbedBatch { .. } => "embed",
         }
     }
 
     pub(crate) fn mode_label(&self) -> &'static str {
         match self {
-            Self::Single(_) => "single",
+            Self::Single(_) | Self::EmbedBatch { .. } => "single",
             Self::PrefillDecode(_) => "prefill_decode",
             Self::EncodePrefillDecode { .. } => "encode_prefill_decode",
             Self::Batch { kind, .. } => match kind {
@@ -669,6 +766,9 @@ impl ExecutionPlan {
             }
             Self::Batch { requests, .. } => {
                 requests.iter().map(ProtoGenerateRequest::wire_len).sum()
+            }
+            Self::EmbedBatch { requests, .. } => {
+                requests.iter().map(ProtoEmbedRequest::wire_len).sum()
             }
         }
     }
@@ -691,7 +791,7 @@ impl ExecutionPlan {
                 request.set_request_id(request_id);
                 Ok(())
             }
-            Self::Batch { .. } => {
+            Self::Batch { .. } | Self::EmbedBatch { .. } => {
                 error!(
                     function = "ExecutionPlan::set_request_id",
                     "Single id stamp on a batch plan"
@@ -714,6 +814,7 @@ impl ExecutionPlan {
                 request.token_ids()
             }
             Self::Batch { requests, .. } => requests.first().map_or(&[], |r| r.token_ids()),
+            Self::EmbedBatch { requests, .. } => requests.first().map_or(&[], |r| r.token_ids()),
         }
     }
 
@@ -725,7 +826,7 @@ impl ExecutionPlan {
             Self::Single(ProtoRequest::Generate(request))
             | Self::PrefillDecode(request)
             | Self::EncodePrefillDecode { request } => std::slice::from_mut(request).iter_mut(),
-            Self::Single(ProtoRequest::Embed(_)) => [].iter_mut(),
+            Self::Single(ProtoRequest::Embed(_)) | Self::EmbedBatch { .. } => [].iter_mut(),
             Self::Batch { requests, .. } => requests.iter_mut(),
         }
     }
@@ -779,10 +880,9 @@ pub(crate) enum PreparationOutput {
         original_text: Option<String>,
         token_ids: Vec<u32>,
     },
-    Embedding {
-        original_text: String,
-        token_ids: Vec<u32>,
-    },
+    /// The inputs of an embedding or classification request, one per input
+    /// of the batch, in the request's order.
+    Embedding { inputs: Vec<EmbeddingInput> },
     Harmony {
         token_ids: Vec<u32>,
         selection_text: String,
@@ -799,6 +899,14 @@ pub(crate) struct CompletionItem {
     pub token_ids: Vec<u32>,
 }
 
+/// One input of an embedding or classification request: a text the gateway
+/// tokenized, or the token ids the client sent (no text beside them; the
+/// engine embeds from the ids).
+pub(crate) struct EmbeddingInput {
+    pub text: Option<String>,
+    pub token_ids: Vec<u32>,
+}
+
 impl PreparationOutput {
     /// Token IDs (common to all variants). Batched completions expose the
     /// first prompt's tokens as the routing-affinity proxy.
@@ -811,11 +919,13 @@ impl PreparationOutput {
             | Self::Messages { token_ids, .. }
             | Self::Transcription { token_ids, .. }
             | Self::Generate { token_ids, .. }
-            | Self::Embedding { token_ids, .. }
             | Self::Harmony { token_ids, .. } => token_ids,
             Self::Completion { items, .. } => {
                 items.first().map_or(&[], |item| item.token_ids.as_slice())
             }
+            Self::Embedding { inputs } => inputs
+                .first()
+                .map_or(&[], |input| input.token_ids.as_slice()),
         }
     }
 
@@ -827,13 +937,15 @@ impl PreparationOutput {
         match self {
             Self::Decisions { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
             Self::Completion { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
+            Self::Embedding { inputs } => inputs.iter().map(|input| input.token_ids.len()).sum(),
             other => other.token_ids().len(),
         }
     }
 
     /// Longest single input in tokens -- what the engine's context window
-    /// bounds. Every prompt of a batched `Completion` is dispatched as its own
-    /// engine request, so the window applies per item, not to their sum.
+    /// bounds. Every prompt of a batched `Completion` and every input of an
+    /// `Embedding` batch is dispatched as its own engine request, so the
+    /// window applies per item, not to their sum and not to the first alone.
     pub fn max_input_token_count(&self) -> usize {
         match self {
             Self::Decisions { items, .. } => items
@@ -844,6 +956,11 @@ impl PreparationOutput {
             Self::Completion { items, .. } => items
                 .iter()
                 .map(|item| item.token_ids.len())
+                .max()
+                .unwrap_or(0),
+            Self::Embedding { inputs } => inputs
+                .iter()
+                .map(|input| input.token_ids.len())
                 .max()
                 .unwrap_or(0),
             other => other.token_ids().len(),
@@ -870,7 +987,7 @@ impl PreparationOutput {
             } => joined_routing_text
                 .as_deref()
                 .or_else(|| items.first().map(|item| item.text.as_str())),
-            Self::Embedding { original_text, .. } => Some(original_text),
+            Self::Embedding { inputs } => inputs.first().and_then(|input| input.text.as_deref()),
             Self::Generate { original_text, .. } => original_text.as_deref(),
             Self::Harmony { selection_text, .. } => Some(selection_text),
         }
@@ -1133,8 +1250,10 @@ impl RequestContext {
         // name. Native `/generate` callers may leave the field empty, so
         // prefer the resolved id there.
         let dispatch_model = match &request_type {
-            RequestType::Chat(req) => req.model.clone(),
-            RequestType::Completion(req) => req.model.clone(),
+            RequestType::Chat(req) => openai_response_model(&req.model, req.lora_path.as_deref()),
+            RequestType::Completion(req) => {
+                openai_response_model(&req.model, req.lora_path.as_deref())
+            }
             RequestType::Generate(_) => model_id.clone(),
             RequestType::Responses(req) => req.model.clone(),
             RequestType::Embedding(req) => req.model.clone(),
@@ -1196,6 +1315,7 @@ impl RequestContext {
             sticky_key: state.sticky_key,
             clients: state.clients,
             encode_outputs: state.encode_outputs,
+            encode_watch: None,
             multimodal_inflight: state.multimodal_inflight,
             dispatch: None,
             load_guards: None,
@@ -1320,19 +1440,38 @@ impl RequestContext {
         )
     }
 
-    /// Create context for messages request
+    /// A Messages context: it carries the request's tools beside the request
+    /// (`tools`, taken out of the request by the route while it still owned
+    /// it), and the preparation builds the response spec from them.
     pub fn for_messages(
+        request: Arc<CreateMessageRequest>,
+        tools: MessagesTools,
+        headers: Option<HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        let mut ctx = Self::new(
+            RequestType::Messages(request),
+            headers,
+            model_id,
+            components,
+        );
+        ctx.state.messages_tools = Some(tools);
+        ctx
+    }
+
+    /// A Messages context over a request that still carries its tools, as the
+    /// tests build theirs: the tools are converted from the request by
+    /// reference.
+    #[cfg(test)]
+    pub fn for_messages_carrying_its_tools(
         request: Arc<CreateMessageRequest>,
         headers: Option<HeaderMap>,
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self::new(
-            RequestType::Messages(request),
-            headers,
-            model_id,
-            components,
-        )
+        let tools = MessagesTools::from(&*request);
+        Self::for_messages(request, tools, headers, model_id, components)
     }
 
     /// Get Arc clone of chat request (panics if not chat)
@@ -1653,8 +1792,9 @@ pub(crate) enum ExecutionResult {
         /// leaves this `None` and the streaming layer drains the stream itself.
         prefill_input_logprobs: Option<ProtoInputLogProbs>,
     },
-    /// Embedding requests return a single response, not a stream
-    Embedding { response: ProtoEmbedComplete },
+    /// An embedding request's answers, one per input in the request's
+    /// order: each a response in hand, not a stream.
+    Embedding { responses: Vec<ProtoEmbedComplete> },
     /// Batched completion fan-out: one result per prompt, in prompt order.
     Batch { results: Vec<ExecutionResult> },
 }
@@ -1991,6 +2131,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_dispatch_phase_outputs_keep_their_codes() {
+        assert_eq!(
+            <ExecutionResult as StageOutput>::NOT_COMPLETED.0,
+            "no_execution_result"
+        );
+        assert_eq!(
+            <DispatchMetadata as StageOutput>::NOT_COMPLETED.0,
+            "dispatch_metadata_not_set"
+        );
+        assert_eq!(
+            <Arc<dyn Tokenizer> as StageOutput>::NOT_COMPLETED.0,
+            "tokenizer_not_cached"
+        );
+        assert_eq!(
+            <StopSequenceDecoder as StageOutput>::NOT_COMPLETED.0,
+            "stop_decoder_not_initialized"
+        );
+    }
+
     fn completion_prep(texts: &[&str], joined: Option<&str>) -> PreparationOutput {
         PreparationOutput::Completion {
             items: texts
@@ -2030,7 +2190,7 @@ mod tests {
         );
 
         let prefill_guard = PrefillLoadGuard::Unbounded {
-            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
         };
         assert_eq!(prefill.load(), 1);
         drop(prefill_guard);
@@ -2044,7 +2204,10 @@ mod tests {
 
     #[tokio::test]
     async fn batch_prompts_preserve_phase_load_semantics() {
-        use crate::worker::{BasicWorkerBuilder, PrefillAdmission, WorkerType};
+        use crate::{
+            routers::common::prefill_admission::PrefillAdmission,
+            worker::{BasicWorkerBuilder, WorkerType},
+        };
 
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://prefill:30000")
@@ -2204,6 +2367,29 @@ mod tests {
         assert_eq!(empty.max_input_token_count(), 0);
     }
 
+    /// An embedding batch goes to the engine one input per call, so the
+    /// window applies to its longest input: neither the first alone (which
+    /// would let a long later input through) nor their sum.
+    #[test]
+    fn max_input_token_count_is_the_longest_embedding_input() {
+        let batch = PreparationOutput::Embedding {
+            inputs: vec![
+                EmbeddingInput {
+                    text: Some("short".to_string()),
+                    token_ids: vec![1],
+                },
+                EmbeddingInput {
+                    text: None,
+                    token_ids: vec![2, 3, 4, 5, 6],
+                },
+            ],
+        };
+
+        assert_eq!(batch.max_input_token_count(), 5);
+        assert_eq!(batch.token_ids().len(), 1);
+        assert_eq!(batch.total_input_token_count(), 6);
+    }
+
     #[test]
     fn batch_execution_plan_reports_shared_id_and_kind_label() {
         let plan = ExecutionPlan::Batch {
@@ -2329,7 +2515,7 @@ mod tests {
         // the prefill side with its own guard when the prefill phase ends.
         let guards = LoadGuards::new(&pd_selection(&prefill, &decode), None);
         let prefill_guard = PrefillLoadGuard::Unbounded {
-            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
         };
         drop(prefill_guard);
         assert_eq!(

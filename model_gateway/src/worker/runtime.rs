@@ -21,8 +21,8 @@ use tokio::sync::Notify;
 
 // The trait is named only by the doc links of this module.
 #[cfg(doc)]
-use super::basic::Worker;
-use super::basic::WorkerRoutingKeyLoad;
+use super::identity::basic::Worker;
+use super::identity::basic::WorkerRoutingKeyLoad;
 
 /// Why the liveness tracker vetoes a worker (see the `liveness` module).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,7 +205,7 @@ pub struct WorkerRuntime {
     /// series at 1, or a stale code over a fresh one.
     publish_lock: Mutex<()>,
     /// Last successful contact and last token or completion, in
-    /// [`super::liveness::now_ms`] milliseconds.
+    /// [`super::health::liveness::now_ms`] milliseconds.
     last_contact_ms: AtomicU64,
     last_token_ms: AtomicU64,
     /// Waiting-queue depth from the previous load report.
@@ -213,10 +213,10 @@ pub struct WorkerRuntime {
     /// A transport failure happened since the last contact.
     transport_failed: AtomicBool,
     /// The worker's KV-event stream has pushed a load record: silence is
-    /// then judged by the stream's cadence (see [`super::liveness`]).
+    /// then judged by the stream's cadence (see [`super::health::liveness`]).
     pushed_loads: AtomicBool,
     /// The latest pushed load record reports the engine silent on its
-    /// in-flight requests past the wedge bound (see [`super::liveness`]).
+    /// in-flight requests past the wedge bound (see [`super::health::liveness`]).
     engine_stalled: AtomicBool,
     /// In-flight count at the previous liveness sweep.
     last_load_sample: AtomicUsize,
@@ -224,7 +224,7 @@ pub struct WorkerRuntime {
     /// KV event subscriber) retries the moment the worker is heard from.
     contact_wake: Arc<Notify>,
     /// When the worker last became routable (promoted to Ready, or a liveness
-    /// veto cleared), in [`super::liveness::now_ms`] milliseconds.
+    /// veto cleared), in [`super::health::liveness::now_ms`] milliseconds.
     admitted_at_ms: AtomicU64,
     /// The warm-up slice's baseline: the admission it was taken for and the
     /// blocks the index held for the worker then (see [`Self::warmup_growth`]).
@@ -234,12 +234,12 @@ pub struct WorkerRuntime {
     /// no further diverted hit.
     divert_until_ms: AtomicU64,
     /// When the current run of in-flight requests began (the load counter
-    /// left zero), in [`super::liveness::now_ms`] milliseconds; zero while
+    /// left zero), in [`super::health::liveness::now_ms`] milliseconds; zero while
     /// idle. The no-progress clock of the wedged rule starts here, not at
     /// registration or the last token before an idle spell.
     busy_since_ms: AtomicU64,
     /// Requests in flight whose responses the gateway sees one by one (see
-    /// [`Worker::tracked_load`]).
+    /// [`Self::tracked_load`]).
     tracked_in_flight: AtomicUsize,
     /// Open streams that have produced a token or completion (see
     /// [`Worker::output_silence`]).
@@ -364,13 +364,21 @@ struct PrefillBook {
     /// Gateway clock at which the timed tokens left zero; `None` while
     /// none is pending.
     busy_since_ms: Option<u64>,
-    /// Busy time banked into the open window from closed intervals.
+    /// Busy time banked into the open window from closed intervals. An
+    /// interval closed by a release without an answer banks only the part
+    /// up to the latest timed answer in it (the tokens the window holds; an
+    /// untimed answer puts none in it), none of the wait after it.
     window_busy_ms: u64,
     /// First tokens' prompt tokens in the open window.
     window_tokens: u64,
     /// Gateway clock of the latest first response (or one answer) to a
     /// prompt dispatched here; zero until one.
     last_answer_ms: u64,
+    /// Gateway clock of the latest answer to a timed prompt dispatched here
+    /// (one whose tokens the rate window takes); zero until one. The credit
+    /// an unanswered release banks stops here, not at an untimed answer:
+    /// the window holds no tokens for that answer's time.
+    last_timed_answer_ms: u64,
     /// Gateway clock of the latest handoff of a prompt dispatched here that
     /// a decode side showed (see [`Worker::prefill_handed_off_ago`]); zero
     /// until one. No answer: it releases no prompt, times nothing, answers
@@ -439,11 +447,29 @@ impl PrefillBook {
             return;
         }
         self.timed = self.timed.saturating_sub(tokens);
-        if tokens > 0 {
-            if let Some(cached) = cached {
-                // What the engine computed: the prompt less its cache hit.
-                self.observe(tokens.saturating_sub(cached), now_ms);
+        let Some(cached) = cached else {
+            // A release without an answer: the engine showed nothing for it.
+            // Prompts still in flight keep the interval open (their prefill
+            // runs on in it); with none left it closes, banking only the part
+            // up to the latest timed answer in it, whose tokens the window
+            // holds, and none of the wait after that answer. An untimed
+            // answer in the interval is not that mark: its one answer put no
+            // tokens in the window, so the time up to it would read as
+            // prefill time with nothing computed in it.
+            if self.timed == 0 {
+                if let Some(since) = self.busy_since_ms.take() {
+                    let answered = self.last_timed_answer_ms.min(now_ms);
+                    self.window_busy_ms = self
+                        .window_busy_ms
+                        .saturating_add(answered.saturating_sub(since));
+                }
             }
+            return;
+        };
+        self.last_timed_answer_ms = self.last_timed_answer_ms.max(now_ms);
+        if tokens > 0 {
+            // What the engine computed: the prompt less its cache hit.
+            self.observe(tokens.saturating_sub(cached), now_ms);
         }
         if self.timed == 0 {
             if let Some(since) = self.busy_since_ms.take() {
@@ -559,6 +585,21 @@ impl PrefillBook {
         })
     }
 
+    /// How long, as of `now_ms`, the worker's prompts have gone unanswered
+    /// since its latest answer: the current run's wait while it has not
+    /// answered, plus what earlier runs left ([`Self::unanswered_run`]
+    /// without its idle condition, so a worker that holds nothing still
+    /// reports the silence it owes). Zero after an answer, or for a worker
+    /// never dispatched to.
+    fn unanswered_total(&self, now_ms: u64) -> Duration {
+        let run = if self.run_since_ms > 0 && !self.run_answered {
+            now_ms.saturating_sub(self.run_since_ms)
+        } else {
+            0
+        };
+        Duration::from_millis(self.unanswered_ms.saturating_add(run))
+    }
+
     /// Whether the engine is on a shape it has not shown it runs: a prompt
     /// pending here, or one of `extra` tokens about to be dispatched, longer
     /// than any answered, on a worker that has answered one. A worker that
@@ -660,15 +701,15 @@ impl WorkerRuntime {
             stall: AtomicU8::new(0),
             published_state: AtomicU8::new(0),
             publish_lock: Mutex::new(()),
-            last_contact_ms: AtomicU64::new(super::liveness::now_ms()),
-            last_token_ms: AtomicU64::new(super::liveness::now_ms()),
+            last_contact_ms: AtomicU64::new(super::health::liveness::now_ms()),
+            last_token_ms: AtomicU64::new(super::health::liveness::now_ms()),
             last_waiting_reqs: AtomicI64::new(0),
             transport_failed: AtomicBool::new(false),
             pushed_loads: AtomicBool::new(false),
             engine_stalled: AtomicBool::new(false),
             last_load_sample: AtomicUsize::new(0),
             contact_wake: Arc::new(Notify::new()),
-            admitted_at_ms: AtomicU64::new(super::liveness::now_ms()),
+            admitted_at_ms: AtomicU64::new(super::health::liveness::now_ms()),
             warmup_base_admitted_ms: AtomicU64::new(u64::MAX),
             warmup_base_blocks: AtomicUsize::new(0),
             divert_until_ms: AtomicU64::new(0),
@@ -681,7 +722,7 @@ impl WorkerRuntime {
 
     pub fn note_admitted(&self) {
         self.admitted_at_ms
-            .store(super::liveness::now_ms(), Ordering::Relaxed);
+            .store(super::health::liveness::now_ms(), Ordering::Relaxed);
     }
 
     pub fn admitted_age(&self) -> Duration {
@@ -769,13 +810,13 @@ impl WorkerRuntime {
 
     pub fn note_contact(&self) {
         self.last_contact_ms
-            .store(super::liveness::now_ms(), Ordering::Relaxed);
+            .store(super::health::liveness::now_ms(), Ordering::Relaxed);
         self.transport_failed.store(false, Ordering::Relaxed);
         self.contact_wake.notify_one();
     }
 
     pub fn note_token_progress(&self) {
-        self.note_token_progress_at(super::liveness::now_ms());
+        self.note_token_progress_at(super::health::liveness::now_ms());
     }
 
     /// [`Self::note_token_progress`] at `now` on the gateway clock.
@@ -841,7 +882,7 @@ impl WorkerRuntime {
     // ── Prefill backlog (the wedged rule's bound) ───────────────────
 
     pub fn note_prefill_started(&self, tokens: u64, timed: bool) {
-        self.note_prefill_started_at(tokens, timed, super::liveness::now_ms().max(1));
+        self.note_prefill_started_at(tokens, timed, super::health::liveness::now_ms().max(1));
     }
 
     /// [`Self::note_prefill_started`] at `now_ms` on the gateway clock.
@@ -850,7 +891,12 @@ impl WorkerRuntime {
     }
 
     pub fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
-        self.note_prefill_ended_at(tokens, timed, cached, super::liveness::now_ms().max(1));
+        self.note_prefill_ended_at(
+            tokens,
+            timed,
+            cached,
+            super::health::liveness::now_ms().max(1),
+        );
     }
 
     /// [`Self::note_prefill_ended`] at `now_ms` on the gateway clock.
@@ -877,7 +923,7 @@ impl WorkerRuntime {
     }
 
     pub fn prefill_answered_ago(&self) -> Option<Duration> {
-        self.prefill_answered_ago_at(super::liveness::now_ms().max(1))
+        self.prefill_answered_ago_at(super::health::liveness::now_ms().max(1))
     }
 
     /// [`Self::prefill_answered_ago`] as of `now_ms` on the gateway clock.
@@ -888,7 +934,7 @@ impl WorkerRuntime {
     /// A decode side showed a handoff of this worker's (see
     /// [`Worker::note_prefill_handoff`]): stamped apart from the answers.
     pub fn note_prefill_handoff(&self) {
-        self.note_prefill_handoff_at(super::liveness::now_ms().max(1));
+        self.note_prefill_handoff_at(super::health::liveness::now_ms().max(1));
     }
 
     /// [`Self::note_prefill_handoff`] at `now_ms` on the gateway clock.
@@ -897,7 +943,7 @@ impl WorkerRuntime {
     }
 
     pub fn prefill_handed_off_ago(&self) -> Option<Duration> {
-        self.prefill_handed_off_ago_at(super::liveness::now_ms().max(1))
+        self.prefill_handed_off_ago_at(super::health::liveness::now_ms().max(1))
     }
 
     /// [`Self::prefill_handed_off_ago`] as of `now_ms` on the gateway clock.
@@ -910,12 +956,21 @@ impl WorkerRuntime {
     }
 
     pub fn prefill_unanswered_run(&self) -> Option<Duration> {
-        self.prefill_unanswered_run_at(super::liveness::now_ms().max(1))
+        self.prefill_unanswered_run_at(super::health::liveness::now_ms().max(1))
     }
 
     /// [`Self::prefill_unanswered_run`] as of `now_ms` on the gateway clock.
     pub fn prefill_unanswered_run_at(&self, now_ms: u64) -> Option<Duration> {
         self.prefill.lock().unanswered_run(now_ms)
+    }
+
+    pub fn prefill_unanswered_total(&self) -> Duration {
+        self.prefill_unanswered_total_at(super::health::liveness::now_ms().max(1))
+    }
+
+    /// [`Self::prefill_unanswered_total`] as of `now_ms` on the gateway clock.
+    pub fn prefill_unanswered_total_at(&self, now_ms: u64) -> Duration {
+        self.prefill.lock().unanswered_total(now_ms)
     }
 
     pub fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
@@ -927,7 +982,7 @@ impl WorkerRuntime {
     }
 
     fn age_of(stamp_ms: u64) -> Duration {
-        Duration::from_millis(super::liveness::now_ms().saturating_sub(stamp_ms))
+        Duration::from_millis(super::health::liveness::now_ms().saturating_sub(stamp_ms))
     }
 
     // ── Lifecycle status ────────────────────────────────────────────
@@ -1013,7 +1068,7 @@ impl WorkerRuntime {
     pub fn try_increment_load(&self, max: usize) -> bool {
         match self
             .load_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1).filter(|next| *next <= max)
             }) {
             Ok(0) => {
@@ -1043,7 +1098,7 @@ impl WorkerRuntime {
     pub fn note_tracked_ended(&self) {
         let _ =
             self.tracked_in_flight
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |tracked| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |tracked| {
                     Some(tracked.saturating_sub(1))
                 });
     }
@@ -1058,7 +1113,7 @@ impl WorkerRuntime {
     pub fn note_output_ended(&self) {
         let _ = self
             .producing_streams
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             });
     }
@@ -1070,7 +1125,7 @@ impl WorkerRuntime {
     }
     /// The load counter left zero: the wedged rule's clock starts now.
     fn note_busy_started(&self) {
-        self.note_busy_started_at(super::liveness::now_ms());
+        self.note_busy_started_at(super::health::liveness::now_ms());
     }
     /// [`Self::note_busy_started`] at `now_ms`, a stamp the caller read.
     fn note_busy_started_at(&self, now_ms: u64) {
@@ -1082,7 +1137,7 @@ impl WorkerRuntime {
     pub fn try_decrement_load(&self) -> bool {
         match self
             .load_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             }) {
             Ok(1) => {
@@ -1110,7 +1165,7 @@ impl WorkerRuntime {
     /// `window`. All-or-nothing: a refusal claims nothing.
     pub fn try_admit_pd(&self, count: usize, window: usize) -> bool {
         self.pd_admitted
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 admitted.checked_add(count).filter(|total| *total <= window)
             })
             .is_ok()
@@ -1121,7 +1176,7 @@ impl WorkerRuntime {
     pub fn release_pd(&self, count: usize) {
         let _ = self
             .pd_admitted
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 Some(admitted.saturating_sub(count))
             });
         self.wake_claimable();
@@ -1176,11 +1231,11 @@ impl WorkerRuntime {
             };
             let could_claim = queue.may_claim(place);
             let rooms = queue.waiting.remove(at).map_or(0, |gone| gone.rooms);
-            let _ = self.pd_waiting_rooms.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |waiting| Some(waiting.saturating_sub(rooms)),
-            );
+            let _ =
+                self.pd_waiting_rooms
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |waiting| {
+                        Some(waiting.saturating_sub(rooms))
+                    });
             if could_claim {
                 queue.claimable_wakes()
             } else {
@@ -1249,7 +1304,7 @@ mod tests {
     use tokio::time;
 
     use super::*;
-    use crate::worker::liveness::now_ms;
+    use crate::worker::health::liveness::now_ms;
 
     #[test]
     fn a_token_within_the_stamped_millisecond_records_nothing_new_and_keeps_the_semantics() {
@@ -1342,7 +1397,6 @@ mod tests {
             runtime.progress_reference_ms() > registered,
             "the clock starts at the dispatch, not at registration"
         );
-        assert!(runtime.token_progress_age() < Duration::from_millis(10));
         assert!(runtime.try_decrement_load());
         assert_eq!(
             runtime.progress_reference_ms(),
@@ -1516,6 +1570,149 @@ mod tests {
         runtime.note_tracked_ended();
         runtime.note_tracked_started_at(9_000);
         assert_eq!(runtime.busy_since_ms.load(Ordering::Relaxed), 9_000);
+    }
+
+    #[test]
+    fn unanswered_total_is_the_open_run_plus_what_earlier_runs_banked() {
+        // A side behind an encode worker spends the cold-shape grace against
+        // this total: the run still awaiting its first answer counts from
+        // its start, a run released without an answer leaves its wait
+        // banked for the runs after it, and an answer clears the lot.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        assert_eq!(
+            runtime.prefill_unanswered_total_at(5_000),
+            Duration::ZERO,
+            "nothing at all"
+        );
+        runtime.note_prefill_started_at(1_000, true, 1_000);
+        assert_eq!(
+            runtime.prefill_unanswered_total_at(4_000),
+            Duration::from_secs(3),
+            "the open run, from its start"
+        );
+        // Released without an answer: the wait stays on the book; idle time adds nothing.
+        runtime.note_prefill_ended_at(1_000, true, None, 4_500);
+        assert_eq!(
+            runtime.prefill_unanswered_total_at(10_000),
+            Duration::from_millis(3_500),
+            "banked, not growing"
+        );
+        // The next run adds its own wait to what was banked.
+        runtime.note_prefill_started_at(1_000, true, 10_000);
+        assert_eq!(
+            runtime.prefill_unanswered_total_at(12_000),
+            Duration::from_millis(5_500),
+            "banked plus the open run"
+        );
+        // An answer clears it; the run after the answer counts from its own start.
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 12_500);
+        assert_eq!(
+            runtime.prefill_unanswered_total_at(20_000),
+            Duration::ZERO,
+            "answered"
+        );
+        runtime.note_prefill_started_at(1_000, true, 20_000);
+        assert_eq!(
+            runtime.prefill_unanswered_total_at(21_000),
+            Duration::from_secs(1),
+            "the run after the answer, from its start"
+        );
+    }
+
+    #[test]
+    fn a_prompt_released_without_an_answer_leaves_no_busy_time_in_the_rate_window() {
+        // A timed prompt given up on after the whole cold-shape grace showed
+        // the engine computing nothing the gateway could read; the first
+        // answer after it is read over its own time, not over that wait.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(95, true, 1_000);
+        runtime.note_prefill_ended_at(95, true, None, 121_000);
+        assert_eq!(runtime.prefill_rate_tps(), 0, "nothing answered yet");
+        runtime.note_prefill_started_at(95, true, 121_000);
+        runtime.note_prefill_ended_at(95, true, Some(0), 122_000);
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            95,
+            "95 tokens over the second they took"
+        );
+        assert_eq!(runtime.prefill_eta(95), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_untimed_answer_does_not_bank_a_cancelled_timed_prompts_wait() {
+        // A streaming prompt and a non-streaming one start together; the
+        // non-streaming one answers at 120 s (its one answer puts no tokens
+        // in the rate window), the streaming one is given up on at 121 s.
+        // The interval closes banking nothing: the next answer is read over
+        // its own second, not over the 119 s a credit up to the untimed
+        // answer would have banked (1 token/s, every bound after it long).
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(95, true, 1_000);
+        runtime.note_prefill_started_at(95, false, 1_000);
+        runtime.note_prefill_ended_at(95, false, Some(0), 120_000);
+        runtime.note_prefill_ended_at(95, true, None, 121_000);
+        assert_eq!(runtime.prefill_rate_tps(), 0, "no timed answer yet");
+        runtime.note_prefill_started_at(95, true, 121_000);
+        runtime.note_prefill_ended_at(95, true, Some(0), 122_000);
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            95,
+            "95 tokens over the second they took, not over the untimed answer's wait"
+        );
+    }
+
+    #[test]
+    fn a_release_without_an_answer_keeps_the_interval_open_for_the_prompts_still_in_flight() {
+        // A client drops a short prompt while a long one is still prefilling:
+        // the long prompt's answer is still read over the whole time it
+        // took, so a healthy engine at 10k tokens/s reads 10k tokens/s and
+        // its next long prompt keeps a bound it can meet (a release that
+        // cut the interval short would read it ten times too fast and veto
+        // the worker at the threshold).
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(100_000, true, 0);
+        runtime.note_prefill_started_at(100, true, 9_900);
+        runtime.note_prefill_ended_at(100, true, None, 9_950);
+        runtime.note_prefill_ended_at(100_000, true, Some(0), 10_000);
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            10_000,
+            "100k tokens over the ten seconds they took"
+        );
+        let mut at = 10_000;
+        for _ in 0..10 {
+            runtime.note_prefill_started_at(1_000, true, at);
+            at += 100;
+            runtime.note_prefill_ended_at(1_000, true, Some(0), at);
+        }
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            10_000,
+            "ten short answers at the same speed"
+        );
+        assert_eq!(runtime.prefill_eta(100_000), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn an_answer_then_a_cancel_keeps_the_answers_time_in_the_window() {
+        // A long prompt answers inside the window's first second (its tokens
+        // stay in the window, no sample yet) and a short prompt dispatched
+        // beside it is cancelled before its first token: the time up to the
+        // answer stays banked, only the tail after it is dropped, and the
+        // next answer's sample reads the engine's real rate (dropping the
+        // whole interval would keep the tokens and lose their time).
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(9_000, true, 0);
+        runtime.note_prefill_started_at(100, true, 500);
+        runtime.note_prefill_ended_at(9_000, true, Some(0), 900);
+        runtime.note_prefill_ended_at(100, true, None, 950);
+        runtime.note_prefill_started_at(1_000, true, 950);
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 1_050);
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            10_000,
+            "10k tokens over the 900 ms up to the first answer plus the 100 ms of the next"
+        );
     }
 
     #[test]

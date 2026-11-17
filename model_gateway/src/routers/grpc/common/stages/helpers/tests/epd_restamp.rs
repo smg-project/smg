@@ -73,6 +73,13 @@ fn epd_restamp_remints_pd_room_and_keeps_encode_rooms() {
     let retry_pair = tokenspeed_pd_pair("grpc://retry-prefill:30000", "grpc://decode:30000");
     restamp_plan_for_attempt(&mut plan, &stamp, &retry_pair, &ToolParserFactory::new()).unwrap();
 
+    let ExecutionPlan::EncodePrefillDecode { request } = &plan else {
+        panic!("expected an EPD plan")
+    };
+    assert!(
+        request.awaits_encode(),
+        "the retried prefill side still waits on the encoder's rooms, so its bound is the encode-aware one"
+    );
     let (encode, kv) = tokenspeed_rendezvous(&plan);
     assert_eq!(
         (

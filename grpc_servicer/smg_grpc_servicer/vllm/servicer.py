@@ -1326,7 +1326,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             n=params.n if params.n > 0 else 1,
             logprobs=params.logprobs if params.HasField("logprobs") else None,
             prompt_logprobs=params.prompt_logprobs if params.HasField("prompt_logprobs") else None,
-            seed=params.seed if params.HasField("seed") else None,
+            # The seed word in its unsigned form: the engine reads a seed of -1 as
+            # "no seed" and derives each of n > 1 choices' seeds by an offset, so a
+            # word that is never negative keeps every choice seeded; the form is
+            # one-to-one, so distinct words stay distinct.
+            seed=(params.seed & 0xFFFFFFFF) if params.HasField("seed") else None,
             include_stop_str_in_output=params.include_stop_str_in_output,
             logit_bias=dict(params.logit_bias) if params.logit_bias else None,
             structured_outputs=structured_outputs,

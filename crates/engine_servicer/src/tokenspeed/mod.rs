@@ -31,7 +31,7 @@ use tonic::service::Routes;
 use crate::{
     engine_link::{EngineLink, TokenizerSlot},
     health_probe,
-    kv_events::KvEventRelay,
+    kv_events::{record_with_queue, KvEventRelay, RankLoads, TOKENSPEED_DISABLED_MESSAGE},
     metrics::{Identity, ServicerMetrics},
     servicer::{self, Shared, WireState},
     ServicerConfig, ServicerError,
@@ -233,6 +233,19 @@ fn is_unspecified_address(host: &str) -> bool {
         .is_ok_and(|address| address.is_unspecified())
 }
 
+/// What `SubscribeKvEvents` is refused with when no publisher is relayed:
+/// the launcher's line for a publisher it left off for the model's sake
+/// (`kv_events_left_off` in the server args), else the wire's standing text.
+pub(super) fn kv_events_refusal(model: &TokenSpeedModelInfo) -> String {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    args.get("kv_events_left_off")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|left_off| !left_off.is_empty())
+        .unwrap_or(TOKENSPEED_DISABLED_MESSAGE)
+        .to_string()
+}
+
 /// The role this servicer was launched for against what the engines'
 /// handshakes list: the encode role needs every engine to list the encode
 /// request (an engine before the wire carried it lists none and cannot take
@@ -288,16 +301,13 @@ pub struct TokenSpeedServicerConfig {
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
 /// attaches to every batch it streams.
-impl crate::kv_events::RankLoads for State {
+impl RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         // A connected rank reads its own entry (zero-filled until its first
         // load tail), never another rank's figures; a rank past the
         // connected ones gets no record, an encode worker none at all.
         let load = info::rank_load(self, dp_rank)?;
-        Some(crate::kv_events::record_with_queue(
-            &load,
-            load.num_waiting_uncached_tokens,
-        ))
+        Some(record_with_queue(&load, load.num_waiting_uncached_tokens))
     }
 
     fn engine_link(&self) -> &EngineLink {
@@ -325,6 +335,9 @@ pub(super) struct State {
     /// How long `HealthCheck`'s probe waits for the scheduler
     /// ([`HEALTH_CHECK_TIMEOUT_ENV`]).
     pub(super) health_probe_timeout: Duration,
+    /// What `SubscribeKvEvents` is refused with when no publisher is relayed
+    /// ([`kv_events_refusal`]).
+    pub(super) kv_events_disabled: String,
 }
 
 impl WireState for State {
@@ -393,6 +406,7 @@ impl TokenSpeedServicerServer {
             config.servicer.metrics_bind_address.is_some(),
         )?;
         let encode_role = encode_role(&config.model)?;
+        let kv_events_disabled = kv_events_refusal(&config.model);
         let state = Arc::new(State {
             model: config.model,
             shared: Shared::new(
@@ -404,6 +418,7 @@ impl TokenSpeedServicerServer {
             tokenizer: TokenizerSlot::new(),
             encode_role,
             health_probe_timeout: health_probe::timeout_from_env(HEALTH_CHECK_TIMEOUT_ENV),
+            kv_events_disabled,
         });
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));

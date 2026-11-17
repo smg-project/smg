@@ -12,6 +12,7 @@ use crate::{
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
+        rgb_runs::RgbSplitter,
         transforms::{
             pil_to_filter, resize_bicubic_torch_aa_rgb, resize_rgb_bytes, rgb_bytes,
             round_half_to_even, TransformError,
@@ -26,10 +27,6 @@ const MIN_IMAGE_TOKENS: usize = 16;
 const MAX_IMAGE_TOKENS: usize = 8000;
 /// The checkpoint's own video budget, in tokens.
 const MAX_VIDEO_TOKENS: usize = 240_000;
-/// The serving engine caps a clip at this many vision tokens (the
-/// checkpoint's own budget would starve its KV cache at startup profiling);
-/// images keep the checkpoint's budget.
-const VIDEO_TOKEN_CAP: usize = 30_000;
 
 #[derive(Clone, Copy)]
 struct Params {
@@ -49,10 +46,9 @@ struct Geometry {
     content: (usize, usize),
 }
 
-/// The image's own bytes in the patch layout, with the normalization a
-/// float destination applies.
+/// What [`encode`] appended: the normalization a float destination applies
+/// to the bytes, and their grid.
 struct Patches {
-    values: Vec<u8>,
     norm: PixelNorm,
     grid: (usize, usize, usize),
     count: usize,
@@ -128,10 +124,9 @@ impl Params {
                 Ok,
             )
         };
-        // Video budgets read video-named token keys first; without them a
-        // video processor config is budgeted the way the engine's own server
-        // budgets it, and an image config (the gateway's fallback for a video
-        // when there is none) keeps the checkpoint default: its image-scale
+        // Video budgets read video-named token keys first, then the video
+        // processor config's `max_image_tokens`. An image config used as a
+        // fallback keeps the checkpoint video default: its image-scale
         // `max_image_tokens` must not silently become a clip's volume cap.
         let (min_key, max_key, max_fallback) = if video {
             (
@@ -271,11 +266,8 @@ impl Params {
     }
 }
 
-/// The clip budget the serving engine's own server applies to a video
-/// processor config (one naming its `video_processor_type`): the config's
-/// `max_image_tokens` under the serving cap, the checkpoint default when the
-/// key is absent. Any other config is not a video processor's and keeps the
-/// checkpoint default.
+/// A video processor config's `max_image_tokens`, or the checkpoint video
+/// default when the key is absent or an image config is used as a fallback.
 fn video_token_budget(config: &PreProcessorConfig) -> Result<usize, TransformError> {
     if !config.extra.contains_key("video_processor_type") {
         return Ok(MAX_VIDEO_TOKENS);
@@ -283,7 +275,7 @@ fn video_token_budget(config: &PreProcessorConfig) -> Result<usize, TransformErr
     if !config.extra.contains_key("max_image_tokens") {
         return Ok(MAX_VIDEO_TOKENS);
     }
-    Ok(extra_usize(config, "max_image_tokens", MAX_VIDEO_TOKENS)?.min(VIDEO_TOKEN_CAP))
+    extra_usize(config, "max_image_tokens", MAX_VIDEO_TOKENS)
 }
 
 /// The reference's fused rescale and normalize for these settings
@@ -345,8 +337,8 @@ impl Pixels {
     }
 }
 
-/// One frame's bytes as the reference lays them out: resized to the content
-/// size, then zero-padded to the target canvas. The reference image and video
+/// One frame's content as the reference lays it out before its zero padding:
+/// the frame resized to the content size. The reference image and video
 /// processors resize with the torchvision antialiased kernel on the bytes
 /// (a bicubic `resample` takes that kernel's uint8 form, which parts from
 /// Pillow's quantization by up to two levels at the scale extremes: tiny
@@ -359,55 +351,39 @@ fn prepare<'a, F: RgbSource>(
 ) -> Result<Cow<'a, [u8]>, TransformError> {
     let (source_w, source_h) = frame.dimensions();
     let raw = frame.rgb()?;
-    let ((target_h, target_w), (content_h, content_w)) = (geometry.target, geometry.content);
-    if !do_resize
-        || (source_w as usize == target_w
-            && source_h as usize == target_h
-            && geometry.content == geometry.target)
-    {
+    let (content_h, content_w) = geometry.content;
+    if !do_resize || (source_w as usize, source_h as usize) == (content_w, content_h) {
         return Ok(raw);
     }
-    let content = if (source_w as usize, source_h as usize) == (content_w, content_h) {
-        raw.into_owned()
+    let resized = if filter == FilterType::CatmullRom {
+        resize_bicubic_torch_aa_rgb(
+            raw.as_ref(),
+            source_w,
+            source_h,
+            content_w as u32,
+            content_h as u32,
+        )?
     } else {
-        let resized = if filter == FilterType::CatmullRom {
-            resize_bicubic_torch_aa_rgb(
-                raw.as_ref(),
-                source_w,
-                source_h,
-                content_w as u32,
-                content_h as u32,
-            )?
-        } else {
-            resize_rgb_bytes(
-                raw.as_ref(),
-                source_w,
-                source_h,
-                content_w as u32,
-                content_h as u32,
-                filter,
-            )?
-        };
-        resized.into_raw()
+        resize_rgb_bytes(
+            raw.as_ref(),
+            source_w,
+            source_h,
+            content_w as u32,
+            content_h as u32,
+            filter,
+        )?
     };
-    if geometry.content == geometry.target {
-        return Ok(Cow::Owned(content));
-    }
-    let mut canvas = vec![0; rgb_len(target_w, target_h)?];
-    let (content_row, target_row) = (content_w * 3, target_w * 3);
-    for row in 0..content_h {
-        canvas[row * target_row..row * target_row + content_row]
-            .copy_from_slice(&content[row * content_row..(row + 1) * content_row]);
-    }
-    Ok(Cow::Owned(canvas))
+    Ok(Cow::Owned(resized.into_raw()))
 }
 
-/// Pack resized RGB frames into merged patch rows with temporal padding.
+/// Append resized RGB frames to `values` as merged patch rows with temporal
+/// padding. After an error `values` holds a partial append.
 fn encode<F: RgbSource>(
     frames: &[F],
     budget_frames: usize,
     params: Params,
     pixels: &Pixels,
+    values: &mut Vec<u8>,
 ) -> Result<Patches, TransformError> {
     let first = frames.first().ok_or(TransformError::EmptyBatch)?;
     let source_size = first.dimensions();
@@ -422,6 +398,7 @@ fn encode<F: RgbSource>(
         source_size.0 as usize,
     )?;
     let (height, width) = geometry.target;
+    let (content_h, content_w) = geometry.content;
     let (grid_h, grid_w) = (height / params.patch, width / params.patch);
     let grid_t = frames.len().div_ceil(params.temporal);
     let count = product(&[grid_t, grid_h, grid_w], "GLM patch count")?;
@@ -430,17 +407,20 @@ fn encode<F: RgbSource>(
         "GLM features",
     )?;
     let expected = product(&[count, features], "GLM patch output size")?;
-    let mut values = Vec::new();
     values
         .try_reserve_exact(expected)
         .map_err(|error| shape(format!("cannot reserve GLM patch output: {error}")))?;
     // Write bounded row slices rather than growing the Vec for each pixel.
-    // This also lets the gather loop check the RGB row's bounds once.
-    values.resize(expected, 0);
-    let mut remaining = values.as_mut_slice();
+    let written = values.len();
+    values.resize(written + expected, 0);
+    let mut remaining = &mut values[written..];
     let norm = pixels.norm;
     let filter = pixels.filter;
     let merged_patch = params.merge * params.patch;
+    let splitter = RgbSplitter::detect();
+    // One channel of a patch holds its plane once per frame of the temporal patch.
+    let plane = params.patch * params.patch;
+    let channel = params.temporal * plane;
 
     for temporal_index in 0..grid_t {
         let start = temporal_index * params.temporal;
@@ -449,28 +429,43 @@ fn encode<F: RgbSource>(
             .iter()
             .map(|frame| prepare(frame, geometry, filter, do_resize))
             .collect::<Result<Vec<_>, _>>()?;
-        let last = prepared.last().ok_or(TransformError::EmptyBatch)?;
+        if prepared.is_empty() {
+            return Err(TransformError::EmptyBatch);
+        }
         for patch_row in 0..grid_h / params.merge {
             for patch_col in 0..grid_w / params.merge {
                 let (y0, x0) = (patch_row * merged_patch, patch_col * merged_patch);
                 for merge_h in 0..params.merge {
                     for merge_w in 0..params.merge {
-                        for channel in 0..3 {
-                            for temporal in 0..params.temporal {
-                                let raw = prepared.get(temporal).unwrap_or(last).as_ref();
-                                for patch_y in 0..params.patch {
-                                    let row = (y0 + merge_h * params.patch + patch_y) * width
-                                        + x0
-                                        + merge_w * params.patch;
-                                    let rgb = &raw[row * 3..(row + params.patch) * 3];
-                                    let (output, rest) = remaining.split_at_mut(params.patch);
-                                    remaining = rest;
-                                    for (output, pixel) in
-                                        output.iter_mut().zip(rgb.as_chunks::<3>().0)
-                                    {
-                                        *output = pixel[channel];
-                                    }
-                                }
+                        let (patch, rest) = remaining.split_at_mut(3 * channel);
+                        remaining = rest;
+                        let (red, rest) = patch.split_at_mut(channel);
+                        let (green, blue) = rest.split_at_mut(channel);
+                        // The canvas past the content is zero bytes, which
+                        // `values` holds there already.
+                        let top = y0 + merge_h * params.patch;
+                        let left = (x0 + merge_w * params.patch).min(content_w);
+                        let run = (content_w - left).min(params.patch);
+                        let rows = content_h.saturating_sub(top).min(params.patch);
+                        for (temporal, raw) in prepared.iter().enumerate() {
+                            for patch_y in 0..rows {
+                                let row = ((top + patch_y) * content_w + left) * 3;
+                                let at = temporal * plane + patch_y * params.patch;
+                                splitter.split(
+                                    &raw[row..row + run * 3],
+                                    &mut red[at..at + run],
+                                    &mut green[at..at + run],
+                                    &mut blue[at..at + run],
+                                );
+                            }
+                        }
+                        // A frame past the clip's end repeats the last one.
+                        for temporal in prepared.len()..params.temporal {
+                            for copies in [&mut *red, &mut *green, &mut *blue] {
+                                copies.copy_within(
+                                    (temporal - 1) * plane..temporal * plane,
+                                    temporal * plane,
+                                );
                             }
                         }
                     }
@@ -480,7 +475,6 @@ fn encode<F: RgbSource>(
     }
     debug_assert!(remaining.is_empty());
     Ok(Patches {
-        values,
         norm,
         grid: (grid_t, grid_h, grid_w),
         count,
@@ -498,14 +492,15 @@ fn preprocess_video_frames<F: RgbSource>(
         .first()
         .ok_or(TransformError::EmptyBatch)?
         .dimensions();
-    let patches = encode(frames, frames.len(), params, pixels)?;
+    let mut values = Vec::new();
+    let patches = encode(frames, frames.len(), params, pixels, &mut values)?;
     let fps = clip.sample_fps;
     if !fps.is_finite() || fps <= 0.0 {
         return Err(shape(format!("GLM video fps must be positive, got {fps}")));
     }
     let (grid_t, grid_h, grid_w) = patches.grid;
     let features = 3 * params.temporal * params.patch * params.patch;
-    let tensor = Array2::from_shape_vec((patches.count, features), patches.values)
+    let tensor = Array2::from_shape_vec((patches.count, features), values)
         .map_err(|error| shape(format!("failed to build GLM video patches: {error}")))?;
     Ok(PreprocessedEncoderInputs::new(
         EncoderInput::bytes(tensor, patches.norm),
@@ -700,6 +695,7 @@ impl VisionPreProcessor for Glm53FlashProcessor {
                 params.temporal,
                 params,
                 &self.pixels,
+                &mut values,
             )?;
             grids.extend([
                 patches.grid.0 as i64,
@@ -708,7 +704,6 @@ impl VisionPreProcessor for Glm53FlashProcessor {
             ]);
             counts.push(patches.count as i64);
             tokens.push(patches.tokens);
-            values.extend(patches.values);
         }
         let features = 3 * params.temporal * params.patch * params.patch;
         let total = values.len() / features;
@@ -970,20 +965,29 @@ mod tests {
         .unwrap()
     }
 
-    /// A clip is budgeted the way the engine's own server budgets it: the
-    /// checkpoint's 240,000-token video budget under the 30,000-token serving
-    /// cap, which fits 32 frames of 3416x2060 on a 952x1540 canvas (68x110
-    /// patches, 16 x 34 x 55 = 29,920 tokens), the engine's own numbers for
-    /// such a clip. An image config in the video's place keeps the checkpoint
-    /// default rather than its image-scale budget, and an explicit
-    /// `max_video_tokens` stands.
+    /// A video config keeps its checkpoint's token budget. An image config
+    /// used for video keeps the video default, and explicit video token
+    /// budgets take precedence.
     #[test]
-    fn video_budget_follows_the_engines_serving_cap() {
+    fn video_budget_respects_the_checkpoint_token_budget() {
         let ppt = 2 * 28 * 28;
         let params = Params::from_config(&video_config(), true).unwrap();
-        assert_eq!(params.max_pixels, VIDEO_TOKEN_CAP * ppt);
+        assert_eq!(params.max_pixels, MAX_VIDEO_TOKENS * ppt);
         assert_eq!(params.min_pixels, 16 * ppt);
-        assert_eq!(params.geometry(32, 2060, 3416).unwrap().target, (952, 1540));
+        assert_eq!(
+            params.geometry(32, 2060, 3416).unwrap().target,
+            (2072, 3416)
+        );
+
+        for (tokens, side) in [(14_400, 3360), (40_000, 5600)] {
+            let mut config = video_config();
+            config
+                .extra
+                .insert("max_image_tokens".into(), serde_json::json!(tokens));
+            let params = Params::from_config(&config, true).unwrap();
+            assert_eq!(params.max_pixels, tokens * ppt);
+            assert_eq!(params.geometry(2, 5600, 5600).unwrap().target, (side, side));
+        }
 
         let image_fallback = Params::from_config(&config(MAX_IMAGE_TOKENS), true).unwrap();
         assert_eq!(image_fallback.max_pixels, MAX_VIDEO_TOKENS * ppt);
@@ -1057,6 +1061,15 @@ mod tests {
         let borrowed = resize.preprocess_video_rgb(&borrowed, &clip).unwrap();
         assert_eq!(dynamic.encoder_input, borrowed.encoder_input);
         assert_eq!(grid(&dynamic, "video_grid_thw"), vec![2, 2, 4]);
+        // The entry's video layout slices the clip by `patches_per_image`, the
+        // legacy map's one sizes key, so the video output carries that count
+        // beside `patches_per_video`: the grid's product, the encoder rows the
+        // assembler checks the item sizes against.
+        assert_eq!(grid(&dynamic, "patches_per_image"), vec![2 * 2 * 4]);
+        assert_eq!(
+            grid(&dynamic, "patches_per_image"),
+            grid(&dynamic, "patches_per_video")
+        );
         assert!(matches!(
             dynamic.model_specific.get("video_second_per_grid"),
             Some(ModelSpecificValue::Tensor { data, .. }) if data == &[1.0]
@@ -1077,6 +1090,80 @@ mod tests {
         let patch = &flat[..1176];
         for (offset, value) in [10.0, 40.0, 20.0, 50.0, 30.0, 60.0].into_iter().enumerate() {
             assert!((patch[offset * 196] - value / 255.0).abs() < 1e-6);
+        }
+    }
+
+    /// `encode` writes what the plain per-byte gather over the padded canvas
+    /// writes: the merged blocks in row-major order, each sub-patch channel
+    /// by channel, each channel once per frame of the temporal patch, a frame
+    /// past the clip's end repeating the last one, zero bytes where the
+    /// canvas extends past the frame; and it appends to what the buffer holds.
+    #[test]
+    fn encode_writes_gradient_frames_as_the_per_byte_gather_does() {
+        // A frame that is its own canvas, and one whose 196x168 canvas has a
+        // patch column and a patch row it only partly covers and one of each
+        // it does not reach.
+        for (width, height, do_resize) in [(56_usize, 84_usize, false), (173, 149, true)] {
+            let frames: Vec<Vec<u8>> = (0..4)
+                .map(|seed| lcg_bytes(width * height * 3, seed))
+                .collect();
+            // Clips that end inside a temporal patch, by one frame and by two
+            // and with two frames in it, and a single frame.
+            for (temporal_patch, count) in [(2, 3), (3, 4), (3, 2), (2, 1)] {
+                let mut config = config(MAX_VIDEO_TOKENS);
+                config.do_resize = Some(do_resize);
+                config.temporal_patch_size = Some(temporal_patch);
+                let params = Params::from_config(&config, true).unwrap();
+                let pixels = Pixels::from_config(&config, params).unwrap();
+                let geometry = params
+                    .input_geometry(do_resize, count, height, width)
+                    .unwrap();
+                assert_eq!(geometry.content, (height, width));
+                let (canvas_h, canvas_w) = geometry.target;
+                let clip: Vec<RgbFrameRef<'_>> = frames[..count]
+                    .iter()
+                    .map(|data| RgbFrameRef {
+                        width: width as u32,
+                        height: height as u32,
+                        data,
+                    })
+                    .collect();
+                let mut values = vec![0xAA];
+                encode(&clip, count, params, &pixels, &mut values).unwrap();
+
+                let (patch, merged) = (params.patch, params.merge * params.patch);
+                let mut expected = vec![0xAA];
+                for group in clip.chunks(params.temporal) {
+                    for block_row in 0..canvas_h / merged {
+                        for block_col in 0..canvas_w / merged {
+                            for merge_h in 0..params.merge {
+                                for merge_w in 0..params.merge {
+                                    let top = block_row * merged + merge_h * patch;
+                                    let left = block_col * merged + merge_w * patch;
+                                    for channel in 0..3 {
+                                        for temporal in 0..params.temporal {
+                                            let frame = group[temporal.min(group.len() - 1)].data;
+                                            for y in top..top + patch {
+                                                for x in left..left + patch {
+                                                    expected.push(if y < height && x < width {
+                                                        frame[(y * width + x) * 3 + channel]
+                                                    } else {
+                                                        0
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    values, expected,
+                    "{width}x{height}, temporal patch {temporal_patch}, {count} frames"
+                );
+            }
         }
     }
 

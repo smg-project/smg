@@ -6,7 +6,9 @@
 //! `\n<think></think>` into the prompt only when the request turns thinking off. Recorded as
 //! `glm-4.6` (zai-org/GLM-4.6). GLM 4.7 and later write the tags with nothing between them and
 //! open the thought in the prompt ([`glm()`](super::glm())); Ling writes the newline before the
-//! close instead of after each pair, under its own turn opener ([`ling()`](super::ling())).
+//! close instead of after each pair, under its own turn opener ([`ling()`](super::ling()));
+//! LongCat writes these newlines under `longcat_`-prefixed markers, each call bare after the
+//! content ([`longcat()`](super::longcat())).
 //!
 //! The table carries the one part of its chat template's layout the tags write: after the
 //! thought's close the template writes a newline before the content or the first call

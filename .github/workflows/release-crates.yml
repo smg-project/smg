@@ -13,11 +13,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Tier 1: Crates with no internal dependencies
-  tier1:
+  # Tier 0: The crate the protocol crate of tier 1 depends on
+  tier0:
     # A candidate never reaches crates.io: its dispatch is a no-op (every tier needs this one), and the first step says
     # why when the job is reached anyway.
     if: ${{ !contains(github.ref_name, '-rc.') }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: smg-worker
+            path: crates/worker
+    steps:
+      - name: Refuse a release candidate
+        shell: bash
+        run: |
+          # A release candidate never reaches crates.io (scripts/release/README.md): the job's if makes an -rc. dispatch
+          # a no-op, and this step holds the rule, with the reason, when the job is reached anyway.
+          case "${GITHUB_REF_NAME:-}" in
+            *-rc.*)
+              echo "${GITHUB_REF_NAME} is a release candidate: candidates are never published to crates.io (the images, the chart and the GitHub pre-release carry a candidate); dispatch this workflow against a final's tag" >&2
+              exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/publish-crate
+        with:
+          crate: ${{ matrix.crate }}
+          path: ${{ matrix.path }}
+          token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Tier 1: Crates with no internal dependencies but tier 0
+  tier1:
+    needs: tier0
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -44,17 +73,6 @@ jobs:
           - crate: smg-radix-tree
             path: crates/radix_tree
     steps:
-      - name: Refuse a release candidate
-        shell: bash
-        run: |
-          # A release candidate never reaches crates.io (scripts/release/README.md): the job's if makes an -rc. dispatch
-          # a no-op, and this step holds the rule, with the reason, when the job is reached anyway.
-          case "${GITHUB_REF_NAME:-}" in
-            *-rc.*)
-              echo "${GITHUB_REF_NAME} is a release candidate: candidates are never published to crates.io (the images, the chart and the GitHub pre-release carry a candidate); dispatch this workflow against a final's tag" >&2
-              exit 1 ;;
-          esac
-
       - uses: actions/checkout@v7
       - uses: ./.github/actions/publish-crate
         with:

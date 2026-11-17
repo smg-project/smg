@@ -248,19 +248,6 @@ def _entries_from_environment(sources: _SecretSources) -> list[str]:
     return entries
 
 
-def _read_entries_file(path: str, sources: _SecretSources) -> list[str]:
-    """The entries of a list-valued secret's file, one per line; blank lines
-    and lines starting with '#' are skipped. A file without an entry is
-    refused."""
-    entries = _entries_of(_read_text(path, sources.file_flag), r"\n")
-    if not entries:
-        raise ValueError(
-            f"{sources.file_flag} {path!r}: the file holds no entry; one {sources.entry} per line,"
-            " blank and # lines skipped"
-        )
-    return entries
-
-
 _ACCESS_LOG_FIELD_NAMES = (
     "client_addr",
     "forwarded_for",
@@ -320,8 +307,8 @@ class RouterArgs:
     admin_max_connections: int = 0
     admin_port: int | None = None
     api_key: str | None = None
-    # The file the shared API key was read from, when a file was its source:
-    # a target of the key reload, beside the key (a path alone is refused)
+    # The file the shared API key comes from, when a file is its source: the
+    # binding reads it and the key reload watches it (a key beside it is refused)
     api_key_file: str | None = None
     # Routing-key assignment; defaults: random (manual policy), delegate (override)
     assignment_mode: str | None = None
@@ -365,8 +352,8 @@ class RouterArgs:
     consul_service: str | None = None
     # API keys for control plane auth (list of tuples: id, name, key, role)
     control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
-    # The file the control-plane keys were read from, when a file was their source,
-    # beside the keys (a path alone is refused)
+    # The file the control-plane keys come from, when a file is their source: the
+    # binding reads it (keys beside it are refused)
     control_plane_api_keys_file: str | None = None
     control_plane_audit_enabled: bool = False
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
@@ -419,6 +406,9 @@ class RouterArgs:
     engine_metrics: bool = False
     epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
     eviction_interval_secs: int = 120
+    # Pin a routing key's requests to one engine of a grouped data-parallel
+    # worker: off (the default) or hash
+    grouped_dp_sticky: str = "off"
     # Seconds a request to a gRPC worker may take from its dispatch to its last
     # message; 0 (the default) arms no deadline
     grpc_request_timeout_secs: int = 0
@@ -527,6 +517,9 @@ class RouterArgs:
     multimodal_tensor_transport: str | None = None
     oracle_connect_descriptor: str | None = None
     oracle_external_auth: bool = False
+    # The bound on one Oracle history-store call (pool wait, connect and the
+    # operation included), the same key as the Postgres and Redis ones
+    oracle_op_timeout_secs: int = 5
     oracle_password: str | None = None
     oracle_pool_max: int = 16
     oracle_pool_min: int = 1
@@ -550,9 +543,6 @@ class RouterArgs:
     # protocol: off, lenient or strict
     pd_pairing_mode: str = "lenient"
     policy: str = "cache_aware"
-    # Which implementation decides worker selection: legacy (the policies over
-    # worker handles) or engine (the policy engine over its bounded view)
-    policy_engine: str = "legacy"
     postgres_db_url: str | None = None
     # The bound on one Postgres history-store call (pool wait, connect and the
     # operation included)
@@ -670,8 +660,8 @@ class RouterArgs:
     stream_body_stall_timeout_secs: int = 300
     # Per-tenant data-plane keys as (tenant_id, key) pairs (--tenant-api-key)
     tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
-    # The file the tenant keys were read from, when a file was their source,
-    # beside the keys (a path alone is refused)
+    # The file the tenant keys come from, when a file is their source: the
+    # binding reads it (keys beside it are refused)
     tenant_api_keys_file: str | None = None
     # The tenant header trust_tenant_header reads
     tenant_header_name: str = "x-smg-tenant-id"
@@ -964,19 +954,6 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
-            f"--{prefix}policy-engine",
-            type=str,
-            choices=["legacy", "engine"],
-            default=RouterArgs.policy_engine,
-            help=(
-                "Which implementation decides worker selection: legacy, the policies over"
-                " worker handles, or engine, the policy engine over its bounded view. Under"
-                " engine the policy must be one the engine carries: random, round_robin,"
-                " passthrough, power_of_two (expected_wait, requests, least_requests) or"
-                " least_load"
-            ),
-        )
-        routing_group.add_argument(
             f"--{prefix}encode-policy",
             type=str,
             default=None,
@@ -1090,7 +1067,9 @@ class RouterArgs:
                 " transfer protocol. lenient refuses only a known difference in runtime,"
                 " transport or KV layout (unknown components and engine versions pair"
                 " with anything); strict also refuses unknown components and version"
-                " differences; off pairs on nothing"
+                " differences; off compares nothing of it. On the gRPC wire two known"
+                " runtimes never pair, in any mode: its requests are in the runtime's"
+                " own message type"
             ),
         )
         routing_group.add_argument(
@@ -1547,6 +1526,21 @@ class RouterArgs:
             help=(
                 "Ordered header names checked for the routing key; the first"
                 " header present with a valid value wins"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}grouped-dp-sticky",
+            type=str,
+            choices=["off", "hash"],
+            default=RouterArgs.grouped_dp_sticky,
+            help=(
+                "Whether, and how, a request that carries a routing key is pinned to one"
+                " engine of a grouped data-parallel worker (a ZMQ worker several engines"
+                " dial, as many as --zmq-engine-count says or its engines declare), so a"
+                " conversation keeps one engine's prefix cache. The key is the first valid"
+                " --routing-key-headers header, or the body rid under --routing-key-override."
+                " hash sends a key's requests to the engine its hash picks; off leaves each"
+                " request to the least-loaded engine"
             ),
         )
         routing_group.add_argument(
@@ -2769,8 +2763,9 @@ class RouterArgs:
             default=RouterArgs.history_memory_max_responses,
             help=(
                 "Most stored responses the memory history backend keeps; the oldest go"
-                " first, on every write (memory backend only; a stored response takes"
-                " about 12 KB)."
+                " first, on every write (a stored response takes about 12 KB). The"
+                " Messages thread store keeps that many turns under every history"
+                " backend, the oldest evicted first."
             ),
         )
         backend_group.add_argument(
@@ -2792,7 +2787,8 @@ class RouterArgs:
                 " on every write; 0 keeps a record until a count bound drops it. A"
                 " conversation is kept that long after its last use (created, read or"
                 " updated); a background response still running is not dropped by a"
-                " count bound."
+                " count bound. The Messages thread store keeps a turn that long after it"
+                " was written, under every history backend."
             ),
         )
 
@@ -2852,6 +2848,13 @@ class RouterArgs:
             type=int,
             default=int(os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)),
             help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
+        )
+        oracle_group.add_argument(
+            f"--{prefix}oracle-op-timeout-secs",
+            type=int,
+            default=int(os.getenv("ATP_OP_TIMEOUT_SECS", RouterArgs.oracle_op_timeout_secs)),
+            help="Bound in seconds on each call to the Oracle store (pool wait, connect and the statement); "
+            "a call past it is answered 503 storage_unavailable (default: 5, env: ATP_OP_TIMEOUT_SECS)",
         )
 
         # Postgres configuration
@@ -3346,11 +3349,12 @@ class RouterArgs:
 
         if args_dict.get("api_key") is None:
             _value_from_environment(args_dict, "api_key", _API_KEY_SOURCES.env, strip=True)
+        # A key file is the binding's to read: its path goes alone, and a key
+        # given beside it is refused here, by the flags' names.
         api_key_file = file_option(_API_KEY_SOURCES)
         if api_key_file is not None:
             if args_dict.get("api_key") is not None:
                 raise _given_twice(_API_KEY_SOURCES)
-            args_dict["api_key"] = _read_secret_file(api_key_file, _API_KEY_SOURCES.file_flag)
             args_dict["api_key_file"] = api_key_file
 
         backend = args_dict.get("history_backend", cls.history_backend)
@@ -3368,7 +3372,8 @@ class RouterArgs:
             args_dict[name] = _read_secret_file(url_file, sources.file_flag)
 
         # Parse per-tenant data-plane API keys: the flag's entries, else the
-        # environment's (split at ',' and at line ends), else the file's.
+        # environment's (split at ',' and at line ends); a file's path goes
+        # alone, for the binding to read.
         tenant_entries = list(cli_args_dict.get(f"{prefix}tenant_api_key") or [])
         if not tenant_entries:
             tenant_entries = _entries_from_environment(_TENANT_API_KEYS_SOURCES)
@@ -3376,12 +3381,11 @@ class RouterArgs:
         if tenant_file is not None:
             if tenant_entries:
                 raise _given_twice(_TENANT_API_KEYS_SOURCES)
-            tenant_entries = _read_entries_file(tenant_file, _TENANT_API_KEYS_SOURCES)
             args_dict["tenant_api_keys_file"] = tenant_file
         args_dict["tenant_api_keys"] = cls._parse_tenant_api_keys(tenant_entries)
 
         # The control-plane keys under the same rule: the flag's entries, else
-        # the environment's, else the file's.
+        # the environment's; a file's path goes alone.
         control_plane_entries = list(cli_args_dict.get(f"{prefix}control_plane_api_keys") or [])
         if not control_plane_entries:
             control_plane_entries = _entries_from_environment(_CONTROL_PLANE_API_KEYS_SOURCES)
@@ -3389,9 +3393,6 @@ class RouterArgs:
         if control_plane_file is not None:
             if control_plane_entries:
                 raise _given_twice(_CONTROL_PLANE_API_KEYS_SOURCES)
-            control_plane_entries = _read_entries_file(
-                control_plane_file, _CONTROL_PLANE_API_KEYS_SOURCES
-            )
             args_dict["control_plane_api_keys_file"] = control_plane_file
         args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(
             control_plane_entries

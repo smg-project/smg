@@ -41,7 +41,7 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    worker::{registry::WorkerId, Worker},
+    worker::{registry::WorkerId, ConnectionMode, Worker},
 };
 
 // ============================================================================
@@ -140,7 +140,7 @@ pub struct WorkerWorkflowData {
     /// Determined by ClassifyWorkerTypeStep (Local or External).
     pub worker_kind: Option<WorkerKind>,
     // -- Local-only fields --
-    pub connection_mode: Option<crate::worker::ConnectionMode>,
+    pub connection_mode: Option<ConnectionMode>,
     /// HTTP workers: whether the router speaks HTTP/2 prior knowledge,
     /// resolved by DetectConnectionModeStep.
     #[serde(default)]
@@ -260,6 +260,23 @@ pub struct WorkerRemovalWorkflowData {
     /// (transient, not serialized)
     #[serde(skip, default)]
     pub removed_workers: Vec<Arc<dyn Worker>>,
+}
+
+impl WorkerRemovalWorkflowData {
+    /// Narrows the job to `kept`, the workers it still holds: the selection's
+    /// result, or what a step left after it found some of them standing on
+    /// their own (a pin that moved, a registration under the URL since the
+    /// selection). The worker list, the URLs and the affected models move
+    /// together, so the steps after it touch nothing of the others.
+    pub fn keep_only(&mut self, kept: Vec<Arc<dyn Worker>>) {
+        self.worker_urls = kept.iter().map(|worker| worker.url().to_string()).collect();
+        self.affected_models = kept
+            .iter()
+            .map(|worker| worker.model_id().to_string())
+            .collect();
+        self.workers_to_remove = Some(WorkerList::from_workers(&kept));
+        self.actual_workers_to_remove = Some(kept);
+    }
 }
 
 impl WorkflowData for WorkerRemovalWorkflowData {

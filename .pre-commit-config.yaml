@@ -41,7 +41,7 @@ repos:
     hooks:
       - id: codespell
         additional_dependencies: ['tomli']
-        args: ['-L', 'cann,thi,makro,wil,rouge,PRIS,hel,te,ans,ser,wit,WIT,implementors,caf,nin,Nin,doubleclick,allocatedp,notin,NotIn,ure,preformed']
+        args: ['-L', 'cann,thi,makro,wil,rouge,PRIS,hel,te,ans,ser,wit,WIT,implementors,caf,nin,Nin,doubleclick,allocatedp,notin,NotIn,ure,preformed,Nd']
         exclude: |
           (?x)^(
             Cargo\.lock|

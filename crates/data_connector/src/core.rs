@@ -13,6 +13,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 
+use crate::common::describe_error;
+
 // ============================================================================
 // Shared helpers
 // ============================================================================
@@ -741,7 +743,7 @@ impl Failure {
     pub fn pool(error: &dyn std::error::Error) -> Self {
         Self::Unavailable(format!(
             "no connection from the pool: {}",
-            crate::common::describe_error(error)
+            describe_error(error)
         ))
     }
 
@@ -773,7 +775,7 @@ impl Failure {
     /// read-only standby after a failover (`25006`). Any other server answer
     /// (a constraint, a refused statement) is the store's own.
     pub fn postgres(error: &tokio_postgres::Error) -> Self {
-        let text = crate::common::describe_error(error);
+        let text = describe_error(error);
         let Some(db) = error.as_db_error() else {
             return Self::Unavailable(text);
         };
@@ -1046,18 +1048,14 @@ pub fn is_unstored(response: &StoredResponse) -> bool {
 }
 
 /// Whether `response` is [unstored](is_unstored) and reached a terminal
-/// status (the statuses a response does not leave: completed, incomplete,
-/// failed, cancelled) before `cutoff`: at its object's `completed_at` when it
-/// carries one, at the record's creation otherwise.
+/// status ([`TERMINAL_RESPONSE_STATUSES`]) before `cutoff`: at its object's
+/// `completed_at` when it carries one, at the record's creation otherwise.
 pub fn unstored_terminal_before(response: &StoredResponse, cutoff: DateTime<Utc>) -> bool {
     let raw = &response.raw_response;
     if !is_unstored(response) {
         return false;
     }
-    if !matches!(
-        raw.get("status").and_then(Value::as_str),
-        Some("completed" | "incomplete" | "failed" | "cancelled")
-    ) {
+    if !response.is_closed() {
         return false;
     }
     let ended = raw

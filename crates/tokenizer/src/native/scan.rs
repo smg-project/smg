@@ -6,17 +6,24 @@
 //! role's test for one character in one read: a table of role bits per
 //! ASCII byte (a byte beyond ASCII reads as no role there), one per code
 //! point of the Basic Multilingual Plane built from the classes when the
-//! scanner is recognized, and the classes themselves above the plane. The
-//! plane table is kept by 256-code-point blocks, blocks with the same bits
-//! sharing one row: the ideographs, the kana, a Cyrillic or Thai block each
-//! read from one 512-byte row, so the table a text touches stays in the
-//! first-level cache (a flat table of the plane is 128 KiB and missed the
-//! cache on every character of such a run: measured, a seventh of the
-//! encode's instructions on a corpus with such scripts in it). A run of one
-//! class is then a loop over bytes with one load per ASCII byte; a character
-//! beyond ASCII is decoded from its bytes in place (the text is valid UTF-8
-//! and the scanners stand on character boundaries, so the lead byte gives
-//! the length and no validation is repeated).
+//! scanner is recognized, and above the plane the runs of code points the
+//! classes read alike: one binary search per character, where asking the
+//! classes is a search per category table per class (measured: two thirds
+//! of an encode's cycles on a text with one emoji per 134 bytes). The plane
+//! table is kept by 64-code-point blocks, blocks with the same bits
+//! sharing one row: the ideographs read from one 128-byte row, the kana, a
+//! Cyrillic or Thai block from a few, so the table a text touches stays in
+//! the first-level cache (a flat table of the plane is 128 KiB and missed
+//! the cache on every character of such a run: measured, a seventh of the
+//! encode's instructions on a corpus with such scripts in it). Such a block
+//! is the characters whose bytes differ in the last one alone: the bytes
+//! before it name the block and its six bits the place in the row, so a
+//! character of the plane is read from its bytes as they stand and no code
+//! point is put together. A run of one class is then a loop over bytes with
+//! one load per ASCII byte; a character beyond ASCII is read from its bytes
+//! in place (the text is valid UTF-8 and the scanners stand on character
+//! boundaries, so the lead byte gives the length and no validation is
+//! repeated).
 
 use std::collections::HashMap;
 
@@ -29,8 +36,14 @@ pub(super) type Bits = u16;
 /// Code points of the plane table.
 const PLANE: u32 = 0x1_0000;
 
-/// Code points per block of the plane table.
-const BLOCK: usize = 256;
+/// Code points per block of the plane table: the characters whose UTF-8
+/// bytes differ in the last one alone.
+const BLOCK: usize = 64;
+
+/// Blocks of the plane table. There are at most as many rows as blocks, so
+/// the start of a row fits sixteen bits whatever the classes are.
+const BLOCKS: usize = PLANE as usize / BLOCK;
+const _: () = assert!(BLOCKS * BLOCK - BLOCK <= u16::MAX as usize);
 
 /// The code point of the character beyond ASCII whose lead byte `lead`
 /// stands at `pos` of `bytes`, and its length. The text is valid UTF-8 and
@@ -70,6 +83,13 @@ const EACH_BYTE: u64 = 0x0101_0101_0101_0101;
 pub(super) struct WordScan;
 
 impl WordScan {
+    /// Every ASCII character of any of the four sets (the letters and the
+    /// white space), as a bit per code: a scanner whose runs stop at other
+    /// classes checks those classes against it (see `chain`).
+    pub(super) const MEMBERS: u128 = ascii_range(b'A', b'Z')
+        | ascii_range(b'a', b'z')
+        | ascii_range(b'\t', b'\r')
+        | ascii_range(b' ', b' ');
     /// No word scan: the mark of a role whose members are no scan's set,
     /// which runs byte by byte under any name a caller passes. Not a scan a
     /// caller may name ([`Roles::run_end_as`] refuses it at compile time).
@@ -105,14 +125,29 @@ impl WordScan {
     /// function is instantiated.
     #[inline(always)]
     fn outside<const SCAN: u8>(word: u64) -> u64 {
+        (Self::inside::<SCAN>(word & !HIGH_BITS) & !word & HIGH_BITS) ^ HIGH_BITS
+    }
+
+    /// [`Self::outside`] for a word of an all-ASCII text: no byte has its
+    /// high bit set, so the set's test is the whole of it, three operations
+    /// and one constant fewer per word.
+    #[inline(always)]
+    fn outside_ascii<const SCAN: u8>(word: u64) -> u64 {
+        debug_assert_eq!(word & HIGH_BITS, 0, "a word of an all-ASCII text");
+        !Self::inside::<SCAN>(word) & HIGH_BITS
+    }
+
+    /// Bit 7 of each byte of `low` (every high bit clear) that is in the set
+    /// of `SCAN`; the other bits of the result are not defined.
+    #[inline(always)]
+    fn inside<const SCAN: u8>(low: u64) -> u64 {
         const {
             assert!(
                 SCAN >= Self::LETTERS && SCAN <= Self::SPACES,
                 "one of the four word scans"
             );
         };
-        let low = word & !HIGH_BITS;
-        let inside = if SCAN == Self::LETTERS {
+        if SCAN == Self::LETTERS {
             between(low | (EACH_BYTE * 0x20), b'a', b'z')
         } else if SCAN == Self::LOWER {
             between(low, b'a', b'z')
@@ -121,8 +156,7 @@ impl WordScan {
         } else {
             // `SPACES`, the one scan left.
             between(low, b'\t', b'\r') | between(low, b' ', b' ')
-        };
-        (inside & !word & HIGH_BITS) ^ HIGH_BITS
+        }
     }
 }
 
@@ -156,19 +190,21 @@ pub(super) struct Roles {
     /// Per role, the word scan its ASCII members are the set of
     /// ([`WordScan`]), `WordScan::NONE` for most.
     scans: [u8; Bits::BITS as usize],
-    /// Per block of the plane, the row of `rows` that holds its bits.
-    block_rows: [u16; 256],
+    /// Per block of the plane, where the row that holds its bits starts in
+    /// `rows`.
+    block_rows: [u16; BLOCKS],
     /// The distinct rows of the plane table, `BLOCK` bits each.
     rows: Box<[Bits]>,
-    /// The class of each role, read above the plane.
-    classes: Vec<Class>,
+    /// The role bits above the plane as runs in code point order: the first
+    /// code point of each run and its bits; a run ends where the next starts.
+    above: Box<[(u32, Bits)]>,
 }
 
 impl std::fmt::Debug for Roles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Roles")
-            .field("roles", &self.classes.len())
             .field("rows", &(self.rows.len() / BLOCK))
+            .field("runs_above", &self.above.len())
             .finish()
     }
 }
@@ -199,7 +235,7 @@ impl Roles {
                 .fold(0u128, |members, (code, _)| members | (1 << code));
             *scan = WordScan::of(members);
         }
-        let mut block_rows = [0u16; 256];
+        let mut block_rows = [0u16; BLOCKS];
         let mut rows: Vec<Bits> = Vec::new();
         let mut seen: HashMap<[Bits; BLOCK], u16> = HashMap::new();
         for (block, row) in block_rows.iter_mut().enumerate() {
@@ -210,16 +246,42 @@ impl Roles {
             }
             *row = *seen.entry(block_bits).or_insert_with(|| {
                 rows.extend_from_slice(&block_bits);
-                (rows.len() / BLOCK - 1) as u16
+                (rows.len() - BLOCK) as u16
             });
+        }
+        // Above the plane the bits change only where a class's membership
+        // does: one run from each such point to the next, equal neighbours
+        // as one.
+        let mut changes = vec![PLANE, u32::from(char::MAX) + 1];
+        for class in classes {
+            class.changes_from(PLANE, &mut changes);
+        }
+        changes.sort_unstable();
+        changes.dedup();
+        let mut above: Vec<(u32, Bits)> = Vec::new();
+        for code in changes {
+            let bits = char::from_u32(code).map_or(0, bits_of);
+            if above.last().is_none_or(|&(_, last)| last != bits) {
+                above.push((code, bits));
+            }
         }
         Self {
             bytes,
             scans,
             block_rows,
             rows: rows.into_boxed_slice(),
-            classes: classes.iter().map(|class| (*class).clone()).collect(),
+            above: above.into_boxed_slice(),
         }
+    }
+
+    /// The ASCII characters holding any of `bits`, as a bit per code.
+    pub(super) fn ascii_members(&self, bits: Bits) -> u128 {
+        self.bytes
+            .iter()
+            .take(128)
+            .enumerate()
+            .filter(|(_, role_bits)| **role_bits & bits != 0)
+            .fold(0u128, |members, (code, _)| members | (1 << code))
     }
 
     /// The role bits of the character at `pos`, a character boundary, and
@@ -236,31 +298,40 @@ impl Roles {
     }
 
     /// The role bits of the character beyond ASCII whose lead byte `lead`
-    /// stands at `pos`, and its length.
+    /// stands at `pos`, and its length. A character of two or three bytes
+    /// is one of the plane, and the bytes before its last name its block;
+    /// one of four bytes stands above the plane. The text is valid UTF-8
+    /// and `pos` a character boundary, so the bytes the lead announces
+    /// follow; the reads stay checked all the same.
     #[inline(always)]
     fn beyond(&self, bytes: &[u8], pos: usize, lead: u8) -> (Bits, usize) {
-        let (code, len) = char_beyond_ascii(bytes, pos, lead);
-        let bits = if code < PLANE {
-            let row = usize::from(self.block_rows[(code >> 8) as usize]);
-            self.rows[(row << 8) | (code & 0xFF) as usize]
+        let tail = |i: usize| bytes.get(pos + i).copied().unwrap_or(0);
+        if lead < 0xE0 {
+            (self.in_block(usize::from(lead & 0x1F), tail(1)), 2)
+        } else if lead < 0xF0 {
+            let block = (usize::from(lead & 0x0F) << 6) | usize::from(tail(1) & 0x3F);
+            (self.in_block(block, tail(2)), 3)
         } else {
-            self.above(code)
-        };
-        (bits, len)
+            self.above(bytes, pos, lead)
+        }
     }
 
-    /// The role bits of a code point above the plane, from the classes.
+    /// The role bits of the character of `block` whose last byte is `last`.
+    #[inline(always)]
+    fn in_block(&self, block: usize, last: u8) -> Bits {
+        let row = usize::from(self.block_rows[block]);
+        self.rows[row | usize::from(last & 0x3F)]
+    }
+
+    /// The role bits of the character of four bytes whose lead byte `lead`
+    /// stands at `pos`, and its length: one above the plane, which reads
+    /// the bits of its run.
     #[cold]
     #[inline(never)]
-    fn above(&self, code: u32) -> Bits {
-        let Some(c) = char::from_u32(code) else {
-            return 0;
-        };
-        self.classes
-            .iter()
-            .enumerate()
-            .filter(|(_, class)| class.contains(c))
-            .fold(0, |bits, (slot, _)| bits | (1 << slot))
+    fn above(&self, bytes: &[u8], pos: usize, lead: u8) -> (Bits, usize) {
+        let (code, len) = char_beyond_ascii(bytes, pos, lead);
+        let next = self.above.partition_point(|&(start, _)| start <= code);
+        (next.checked_sub(1).map_or(0, |run| self.above[run].1), len)
     }
 
     /// [`Self::run_end`] for a role whose run the caller expects to be the
@@ -278,19 +349,58 @@ impl Roles {
     pub(super) fn run_end_as<const SCAN: u8, const WORDS: bool>(
         &self,
         text: &str,
-        mut pos: usize,
+        pos: usize,
         bit: Bits,
     ) -> usize {
         const {
             assert!(
                 SCAN >= WordScan::LETTERS && SCAN <= WordScan::SPACES,
-                "one of the four word scans; a role with no scan runs through run_end"
+                "one of the four word scans; a role with no scan runs through the byte loop"
             );
         };
         debug_assert_eq!(bit.count_ones(), 1, "one role's bit");
         if !WORDS || self.scans[bit.trailing_zeros() as usize % Bits::BITS as usize] != SCAN {
             return self.run_end(text, pos, bit);
         }
+        self.words_end::<SCAN>(text, pos, bit, 0)
+    }
+
+    /// [`Self::run_end_as`] for the chain scanner, whose runs also end at a
+    /// character holding one of the `stop` bits (its stage classes): the
+    /// same words, [`Self::run_end_in`] as the byte loop. The caller has read
+    /// that no stop class holds an ASCII member of the set.
+    #[inline(always)]
+    pub(super) fn run_end_as_in<const SCAN: u8>(
+        &self,
+        text: &str,
+        pos: usize,
+        bit: Bits,
+        stop: Bits,
+    ) -> usize {
+        const {
+            assert!(
+                SCAN >= WordScan::LETTERS && SCAN <= WordScan::SPACES,
+                "one of the four word scans; a role with no scan runs through the byte loop"
+            );
+        };
+        debug_assert_eq!(bit.count_ones(), 1, "one role's bit");
+        if self.scans[bit.trailing_zeros() as usize % Bits::BITS as usize] != SCAN {
+            return self.run_end_in(text, pos, bit, stop);
+        }
+        self.words_end::<SCAN>(text, pos, bit, stop)
+    }
+
+    /// The word scan itself: the first byte through the table, then whole
+    /// words of the set's members, a byte outside the set ending the run when
+    /// it is ASCII; a `stop` bit ends it as the byte loops do.
+    #[inline(always)]
+    fn words_end<const SCAN: u8>(
+        &self,
+        text: &str,
+        mut pos: usize,
+        bit: Bits,
+        stop: Bits,
+    ) -> usize {
         let bytes = text.as_bytes();
         loop {
             let Some(&lead) = bytes.get(pos) else {
@@ -298,13 +408,14 @@ impl Roles {
             };
             if lead >= 0x80 {
                 let (bits, len) = self.beyond(bytes, pos, lead);
-                if bits & bit == 0 {
+                if bits & bit == 0 || bits & stop != 0 {
                     return pos;
                 }
                 pos += len;
                 continue;
             }
-            if self.bytes[usize::from(lead)] & bit == 0 {
+            let bits = self.bytes[usize::from(lead)];
+            if bits & bit == 0 || bits & stop != 0 {
                 return pos;
             }
             pos += 1;
@@ -321,6 +432,122 @@ impl Roles {
                 }
                 pos += 8;
             }
+        }
+    }
+
+    /// [`Self::run_end_as`] for a text that is all ASCII (the encoder reads
+    /// that once per unit): there is no character beyond ASCII to decode
+    /// and none for a run to end at, so the word test is the whole scan and
+    /// a run costs the same few operations whatever its length up to a
+    /// word. The letters' run goes straight to the word test: its caller
+    /// has read the run's first letter, and a second mostly follows.
+    /// Another role's run often ends at once and reads its first byte
+    /// through the table, as the byte loop does, before the word. The first
+    /// word is tested in line and ends nine runs in ten of English prose; a
+    /// longer run, and the tail under eight bytes, go out of line
+    /// ([`Self::run_end_ascii_rest`]): as a loop in here the scan cost every
+    /// run the loop's setup, as many operations as the test itself
+    /// (counted). A role whose ASCII members are not the set of `SCAN` runs
+    /// byte by byte.
+    #[inline(always)]
+    pub(super) fn run_end_ascii<const SCAN: u8>(
+        &self,
+        text: &str,
+        mut pos: usize,
+        bit: Bits,
+    ) -> usize {
+        const {
+            assert!(
+                SCAN >= WordScan::LETTERS && SCAN <= WordScan::SPACES,
+                "one of the four word scans; a role with no scan runs through the byte loop"
+            );
+        };
+        debug_assert_eq!(bit.count_ones(), 1, "one role's bit");
+        let bytes = text.as_bytes();
+        if self.scans[bit.trailing_zeros() as usize % Bits::BITS as usize] != SCAN {
+            return self.run_end_bytes(bytes, pos, bit);
+        }
+        if SCAN != WordScan::LETTERS {
+            match bytes.get(pos) {
+                Some(&lead) if self.bytes[usize::from(lead)] & bit != 0 => pos += 1,
+                _ => return pos,
+            }
+        }
+        let Some(word) = bytes.get(pos..).and_then(<[u8]>::first_chunk::<8>) else {
+            return self.run_end_ascii_rest::<SCAN>(bytes, pos, bit);
+        };
+        let outside = WordScan::outside_ascii::<SCAN>(u64::from_le_bytes(*word));
+        if outside != 0 {
+            return pos + (outside.trailing_zeros() / 8) as usize;
+        }
+        self.run_end_ascii_rest::<SCAN>(bytes, pos + 8, bit)
+    }
+
+    /// The rest of a lean run ([`Self::run_end_ascii`]) from `pos`: whole
+    /// words while every byte is in the set, then the tail under eight bytes
+    /// byte by byte.
+    #[cold]
+    #[inline(never)]
+    fn run_end_ascii_rest<const SCAN: u8>(&self, bytes: &[u8], mut pos: usize, bit: Bits) -> usize {
+        while let Some(word) = bytes.get(pos..).and_then(<[u8]>::first_chunk::<8>) {
+            let outside = WordScan::outside_ascii::<SCAN>(u64::from_le_bytes(*word));
+            if outside != 0 {
+                return pos + (outside.trailing_zeros() / 8) as usize;
+            }
+            pos += 8;
+        }
+        self.run_end_bytes(bytes, pos, bit)
+    }
+
+    /// [`Self::run_end`] on a text that is all ASCII: a character is its
+    /// byte, and the byte table is the whole test.
+    #[inline(always)]
+    fn run_end_bytes(&self, bytes: &[u8], mut pos: usize, bit: Bits) -> usize {
+        while let Some(&byte) = bytes.get(pos) {
+            if self.bytes[usize::from(byte)] & bit == 0 {
+                break;
+            }
+            pos += 1;
+        }
+        pos
+    }
+
+    /// [`Self::at`] by the walk's text: on a text that is all ASCII
+    /// (`ASCII`) a character is its byte, and the byte table is the read.
+    #[inline(always)]
+    pub(super) fn at_by<const ASCII: bool>(&self, text: &str, pos: usize) -> Option<(Bits, usize)> {
+        if ASCII {
+            let byte = *text.as_bytes().get(pos)?;
+            Some((self.bytes[usize::from(byte)], 1))
+        } else {
+            self.at(text, pos)
+        }
+    }
+
+    /// [`Self::run_end`] by the walk's text: on a text that is all ASCII the
+    /// byte table is the whole test.
+    #[inline(always)]
+    pub(super) fn run_end_of<const ASCII: bool>(&self, text: &str, pos: usize, bit: Bits) -> usize {
+        if ASCII {
+            self.run_end_bytes(text.as_bytes(), pos, bit)
+        } else {
+            self.run_end(text, pos, bit)
+        }
+    }
+
+    /// A run's end by the scans a walk takes: [`Self::run_end_ascii`] when
+    /// its text is all ASCII (`ASCII`), else [`Self::run_end_as`].
+    #[inline(always)]
+    pub(super) fn run_end_by<const SCAN: u8, const WORDS: bool, const ASCII: bool>(
+        &self,
+        text: &str,
+        pos: usize,
+        bit: Bits,
+    ) -> usize {
+        if ASCII {
+            self.run_end_ascii::<SCAN>(text, pos, bit)
+        } else {
+            self.run_end_as::<SCAN, WORDS>(text, pos, bit)
         }
     }
 
@@ -349,6 +576,23 @@ impl Roles {
                 }
                 pos += len;
             }
+        }
+        pos
+    }
+
+    /// [`Self::run_end`] with `stop` bits: a character holding one of them
+    /// ends the run as the end of the text would (the chain scanner's
+    /// stretches end at the next character of a stage class). The stop test
+    /// comes first: with the role's bit tested first the compiler emits one
+    /// instruction more per character (measured on the chain shape's short
+    /// inputs), and this loop is the chain's byte loop for every run.
+    #[inline(always)]
+    pub(super) fn run_end_in(&self, text: &str, mut pos: usize, bit: Bits, stop: Bits) -> usize {
+        while let Some((bits, len)) = self.at(text, pos).filter(|(bits, _)| bits & stop == 0) {
+            if bits & bit == 0 {
+                break;
+            }
+            pos += len;
         }
         pos
     }
@@ -388,13 +632,30 @@ mod tests {
     #[test]
     fn the_tables_read_every_code_point_as_the_classes_do() {
         // Classes of every kind: a category, a negated set with a category,
-        // a range set, whitespace, a single character.
-        let pattern =
-            Pattern::parse(r"\p{L}|[^\r\n\p{L}\p{N}]|[一-龥぀-ゟ゠-ヿ]|\s|\p{N}|'").expect("parses");
+        // a range set, whitespace, a single character, a category with an
+        // exclusion.
+        let pattern = Pattern::parse(concat!(
+            r"\p{L}|[^\r\n\p{L}\p{N}]|[一-龥぀-ゟ゠-ヿ]|\s|\p{N}|'",
+            r"|[\p{L}&&[^\p{Lu}]]",
+        ))
+        .expect("parses");
         let classes: Vec<&Class> = pattern.classes().iter().collect();
         let roles = Roles::build(&classes);
         let mut text = String::new();
-        for code in (0..0x11_0000u32).filter(|code| code % 7 == 0 || *code < 0x3000) {
+        // Above the plane the table is runs: both ends of every run are read
+        // beside the sample, and every code point of the block at U+10400,
+        // where only the exclusion cuts a run of the last class (capitals
+        // out, small letters in).
+        let mut changes = vec![PLANE];
+        for class in &classes {
+            class.changes_from(PLANE, &mut changes);
+        }
+        let ends = changes.iter().flat_map(|&code| code - 1..=code);
+        let cuts = 0x1_0400..=0x1_044F;
+        // The plane whole, where a character's bytes name its block, and a
+        // sample above it.
+        let sample = (0..0x11_0000u32).filter(|code| *code < PLANE || code % 7 == 0);
+        for code in sample.chain(ends).chain(cuts) {
             let Some(c) = char::from_u32(code) else {
                 continue;
             };
@@ -587,6 +848,86 @@ mod tests {
         assert!(
             reached.iter().all(|&times| times >= 100),
             "a word, two words, a tail after a word, beyond ASCII after a word: {reached:?}"
+        );
+    }
+
+    /// The lean scan of an all-ASCII text ends every run where the byte loop
+    /// ends it: every role at every offset of texts made of ASCII pieces of
+    /// every kind, so a run that ends at once, one inside a word, one over
+    /// two words and one into the tail under eight bytes after a word are
+    /// each reached hundreds of times (counted from the byte loop's answer);
+    /// and a scan named for a role whose members are another set is the
+    /// byte loop.
+    #[test]
+    fn the_lean_scan_of_an_ascii_text_ends_runs_as_the_byte_loop_does() {
+        let pattern = Pattern::parse(r"\p{L}|\s|\p{Ll}|[\r\n]").expect("parses");
+        let classes: Vec<&Class> = pattern.classes().iter().collect();
+        let roles = Roles::build(&classes);
+        let pieces = [
+            "a",
+            "Z",
+            " ",
+            "\n",
+            "\r",
+            "1",
+            ".",
+            "abcdefgh",
+            "ABCDEFGHIJK",
+            "lowercase",
+            "        ",
+            "\t\t\t\t\t",
+        ];
+        let mut reached = [0usize; 4];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut text = String::new();
+        for _ in 0..3_000 {
+            text.clear();
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let len = (seed % 40) as usize;
+            let mut pick = seed;
+            for _ in 0..len {
+                pick = pick.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(1);
+                text.push_str(pieces[((pick >> 33) % pieces.len() as u64) as usize]);
+            }
+            for pos in 0..=text.len() {
+                let by_bytes = |bit: Bits| roles.run_end(&text, pos, bit);
+                for bit in [1, 2, 4] {
+                    let run = by_bytes(bit) - pos;
+                    reached[0] += usize::from(run == 0);
+                    reached[1] += usize::from((1..8).contains(&run));
+                    reached[2] += usize::from(run >= 17);
+                    reached[3] += usize::from(
+                        run >= 9 && pos + run == text.len() && !(run - 1).is_multiple_of(8),
+                    );
+                }
+                assert_eq!(
+                    roles.run_end_ascii::<{ WordScan::LETTERS }>(&text, pos, 1),
+                    by_bytes(1),
+                    "{text:?} at {pos} letters"
+                );
+                assert_eq!(
+                    roles.run_end_ascii::<{ WordScan::SPACES }>(&text, pos, 2),
+                    by_bytes(2),
+                    "{text:?} at {pos} spaces"
+                );
+                assert_eq!(
+                    roles.run_end_ascii::<{ WordScan::LOWER }>(&text, pos, 4),
+                    by_bytes(4),
+                    "{text:?} at {pos} lower"
+                );
+                // The line breaks are no scan's set: the byte loop under any name.
+                assert_eq!(
+                    roles.run_end_ascii::<{ WordScan::SPACES }>(&text, pos, 8),
+                    by_bytes(8),
+                    "{text:?} at {pos} breaks"
+                );
+            }
+        }
+        assert!(
+            reached.iter().all(|&times| times >= 100),
+            "a run at once, one inside a word, one over two words, a tail after a word: {reached:?}"
         );
     }
 }

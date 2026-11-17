@@ -174,7 +174,7 @@ def model_info_from_config(
         # notice there, whatever connector the projection above reports.
         "runs_mooncake": runs_mooncake(vllm_config),
         # Encoder-cache disaggregation, off `ec_transfer_config` as the Python
-        # servicer reads it; the Rust servicer refuses a leg that names a
+        # servicer reads it; the Rust servicer refuses a request that names a
         # connector when none runs.
         **ec_transfer_facts(vllm_config),
         "log_stats": log_stats,

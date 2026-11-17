@@ -44,7 +44,7 @@ use crate::{
     kv_events,
     testing::{
         assert_bucket_edges, assert_golden, captured_logs, handshake_address, http_get, next_batch,
-        servicer_config, Bounded,
+        reported_alive, servicer_config, Bounded,
     },
     ServicerError,
 };
@@ -234,6 +234,16 @@ async fn recv_abort(engine: &mut MockEngineInput) -> Vec<String> {
     decode_msgpack(frames[1].as_ref()).unwrap()
 }
 
+/// Nothing reaches the scheduler within a grace period.
+async fn assert_engine_idle(engine: &mut MockEngineInput) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), engine.recv_frames())
+            .await
+            .is_err(),
+        "nothing should have reached the scheduler"
+    );
+}
+
 /// The mock scheduler's step for the health probe the servicer sends: its
 /// one token, finished, so nothing lingers.
 async fn answer_probe(engine: &mut MockEngine) {
@@ -303,17 +313,17 @@ async fn a_slow_scheduler_stays_linked_while_the_launcher_reports_it_alive() {
     let silence = Duration::from_millis(300);
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
-    let server = TokenSpeedServicerServer::start(config).unwrap();
+    let server = Arc::new(TokenSpeedServicerServer::start(config).unwrap());
+    // The launcher reports through the whole start, as it polls the process
+    // it launched: the silence bound then meets the scheduler's quiet load
+    // alone, not the time this host takes over the dial-in or over READY.
+    let _alive = reported_alive(server.clone(), TokenSpeedServicerServer::note_engine_alive);
     // The scheduler dials in at once, then "loads" for four silences.
     let loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
         .expect("HELLO answered with INIT");
-    let load_time = Instant::now() + 4 * silence;
-    while Instant::now() < load_time {
-        server.note_engine_alive();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    tokio::time::sleep(4 * silence).await;
     assert_eq!(
         server.last_error().unwrap(),
         None,
@@ -341,13 +351,18 @@ async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound()
     let silence = Duration::from_millis(300);
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
-    let server = TokenSpeedServicerServer::start(config).unwrap();
+    let server = Arc::new(TokenSpeedServicerServer::start(config).unwrap());
+    // Reported alive until HELLO is answered: the silence under test starts
+    // there, whatever time this host takes over the dial-in, and counts
+    // from a sign of life no earlier than `before_hello`.
+    let alive = reported_alive(server.clone(), TokenSpeedServicerServer::note_engine_alive);
+    let before_hello = Instant::now();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
         .expect("HELLO answered with INIT");
-    let since_hello = Instant::now();
-    let deadline = since_hello + Duration::from_secs(10);
+    drop(alive);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let error = loop {
         if let Some(error) = server.last_error().unwrap() {
             break error;
@@ -355,7 +370,7 @@ async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound()
         assert!(Instant::now() < deadline, "no link failure reported");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert!(since_hello.elapsed() >= silence);
+    assert!(before_hello.elapsed() >= silence);
     assert!(
         error.contains("timed out while waiting for READY"),
         "{error}"
@@ -379,15 +394,14 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
     config.servicer.engine_startup_ceiling = Some(ceiling);
-    let server = TokenSpeedServicerServer::start(config).unwrap();
+    // Read before the start, which the ceiling counts from.
     let started = Instant::now();
-    let _loading = hello(&handshake, EngineId::from_engine_index(0))
-        .bounded()
-        .await
-        .expect("HELLO answered with INIT");
+    let server = Arc::new(TokenSpeedServicerServer::start(config).unwrap());
+    // The scheduler does not dial in: a dial-in would race the ceiling at this
+    // host's pace, and the ceiling bounds every wait of the handshake alike.
+    let _alive = reported_alive(server.clone(), TokenSpeedServicerServer::note_engine_alive);
     let deadline = started + Duration::from_secs(10);
     let error = loop {
-        server.note_engine_alive();
         if let Some(error) = server.last_error().unwrap() {
             break error;
         }
@@ -972,6 +986,76 @@ async fn string_stops_are_matched_by_the_servicer() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The servicer's own matched-stop terminal for a fan-out's second choice
+/// carries that choice's index, as the engine's completes do: the stop string
+/// matches on choice 1 while choice 0 is still open, and choice 0 then ends on
+/// the engine's own complete with index 0.
+#[tokio::test]
+async fn a_matched_stop_ends_the_second_choice_with_its_own_index() {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+    let mut h = harness(model_info(), Some(tokenizer)).await;
+    let mut request = generate_request("r8", true, vec!["Hello world".to_string()]);
+    request.sampling_params.as_mut().unwrap().n = 2;
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r8-1", vec![1], 1, None, None)).await;
+    send(&mut h.engine_out, &batch("r8-1", vec![2], 2, None, None)).await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![1]
+    );
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![2]
+    );
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (
+            done.index,
+            done.finish_reason.as_str(),
+            done.output_ids.clone()
+        ),
+        (1, "stop", vec![1, 2])
+    );
+    assert_eq!(
+        done.matched_stop,
+        Some(ts::generate_complete::MatchedStop::MatchedStopStr(
+            "Hello world".to_string()
+        ))
+    );
+
+    send(
+        &mut h.engine_out,
+        &batch("r8-0", vec![30], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![30]
+    );
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (
+            done.index,
+            done.finish_reason.as_str(),
+            done.output_ids.clone()
+        ),
+        (0, "length", vec![30])
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    // The scheduler gets the abort for the choice the servicer ended, and
+    // only that one: nothing follows it.
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r8-1".to_string()]);
+    assert_engine_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// A stop string that is one token (`world` is mock token 2) also reaches
 /// the scheduler as a stop id, so it finishes on the tick the string
 /// matches; the choice ends with the scheduler's own `Complete`.
@@ -1128,6 +1212,70 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
         })
         .await
         .expect("abort of an unknown id");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A fan-out's open choices end on an `Abort` RPC with their own indexes: the
+/// terminal the servicer builds for the second choice carries index 1, as the
+/// engine's own completes do.
+#[tokio::test]
+async fn an_abort_ends_each_choice_of_a_fan_out_with_its_own_index() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("r7", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().n = 2;
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r7-1", vec![21], 1, None, None)).await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![21]
+    );
+
+    let response = h
+        .client
+        .abort(ts::AbortRequest {
+            request_id: "r7".to_string(),
+            reason: "test".to_string(),
+        })
+        .await
+        .expect("abort")
+        .into_inner();
+    assert!(response.success);
+    let mut terminals = [
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+        complete(stream.message().bounded().await.unwrap().unwrap()),
+    ];
+    terminals.sort_by_key(|done| done.index);
+    let seen: Vec<_> = terminals
+        .iter()
+        .map(|done| {
+            (
+                done.index,
+                done.finish_reason.clone(),
+                done.output_ids.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (0, "abort".to_string(), vec![]),
+            (1, "abort".to_string(), vec![21])
+        ]
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    let mut aborted = recv_abort(&mut h.engine_in).await;
+    while aborted.len() < 2 {
+        aborted.extend(recv_abort(&mut h.engine_in).await);
+    }
+    aborted.sort();
+    assert_eq!(aborted, vec!["r7-0".to_string(), "r7-1".to_string()]);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -1608,7 +1756,7 @@ async fn control_rpcs_report_what_the_wire_cannot_carry() {
         .await
         .expect_err("no publisher");
     assert_eq!(events.code(), Code::Unimplemented);
-    assert_eq!(events.message(), kv_events::TOKENSPEED_DISABLED_MESSAGE);
+    assert_eq!(events.message(), TOKENSPEED_DISABLED_MESSAGE);
     let bundle = h
         .client
         .get_tokenizer(common::GetTokenizerRequest::default())
@@ -1616,6 +1764,63 @@ async fn control_rpcs_report_what_the_wire_cannot_carry() {
         .expect_err("no tokenizer dir");
     assert_eq!(bundle.code(), Code::FailedPrecondition);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A launcher that left the publisher off for the model's sake wrote why
+/// into the server args (`kv_events_left_off`), and `SubscribeKvEvents` is
+/// refused in those words.
+#[tokio::test]
+async fn a_publisher_the_launcher_left_off_is_refused_in_the_launchers_words() {
+    let left_off = "KV event publishing left off: org/model keeps recurrent state in 3 of its \
+                    4 layers; pass --kv-events-config to turn the publisher on anyway";
+    let mut model = model_info();
+    let mut server_args: serde_json::Value =
+        serde_json::from_str(&model.server_args_json).expect("the fixture's server args");
+    server_args["kv_events_left_off"] = left_off.into();
+    model.server_args_json = server_args.to_string();
+    let mut h = harness(model, None).await;
+    let events = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await
+        .expect_err("no publisher");
+    assert_eq!(events.code(), Code::Unimplemented);
+    assert_eq!(events.message(), left_off);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Only a line the launcher wrote replaces the standing text: an entry that
+/// is absent, empty, blank or not a string leaves it, and so do server args
+/// that do not parse.
+#[test]
+fn the_kv_events_refusal_falls_back_to_the_standing_text() {
+    let refusal = |server_args_json: &str| {
+        kv_events_refusal(&TokenSpeedModelInfo {
+            server_args_json: server_args_json.to_string(),
+            ..model_info()
+        })
+    };
+    assert_eq!(
+        refusal(r#"{"kv_events_left_off":" left off: a reason "}"#),
+        "left off: a reason"
+    );
+    assert_eq!(
+        refusal(r#"{"model":"org/model"}"#),
+        TOKENSPEED_DISABLED_MESSAGE
+    );
+    assert_eq!(
+        refusal(r#"{"kv_events_left_off":""}"#),
+        TOKENSPEED_DISABLED_MESSAGE
+    );
+    assert_eq!(
+        refusal(r#"{"kv_events_left_off":"  "}"#),
+        TOKENSPEED_DISABLED_MESSAGE
+    );
+    assert_eq!(
+        refusal(r#"{"kv_events_left_off":7}"#),
+        TOKENSPEED_DISABLED_MESSAGE
+    );
+    assert_eq!(refusal(""), TOKENSPEED_DISABLED_MESSAGE);
 }
 
 /// The relay follows the publisher from the servicer's start, before any
@@ -1722,6 +1927,61 @@ async fn a_scheduler_that_never_dials_in_fails_the_link_at_the_startup_bound() {
 
     server.stop(Duration::from_secs(5)).unwrap();
     assert_handshake_released(&handshake).await;
+}
+
+/// A stop while the link is still waiting for its engine releases the
+/// handshake endpoint too: the connect that was waiting ends with the server,
+/// and its endpoint file does not outlive `stop`.
+#[tokio::test]
+async fn a_stop_during_the_handshake_wait_releases_the_handshake_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = TokenSpeedServicerServer::start(config).unwrap();
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    wait_until(|| std::fs::metadata(&endpoint).is_ok()).await;
+    assert!(
+        server.last_error().unwrap().is_none(),
+        "the link is still waiting for the engine"
+    );
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        std::fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
+    assert_handshake_released(&handshake).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_leftover_handshake_endpoint_does_not_fail_the_link() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    // A bound-then-dropped listener leaves its socket file behind, as a
+    // process that died without cleanup does.
+    drop(UnixListener::bind(&endpoint).unwrap());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = TokenSpeedServicerServer::start(config).unwrap();
+
+    // Only the link's own bind answers a connect: the leftover refuses it.
+    wait_until(|| {
+        assert_eq!(
+            server.last_error().unwrap(),
+            None,
+            "the link failed on the leftover"
+        );
+        UnixStream::connect(&endpoint).is_ok()
+    })
+    .await;
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        std::fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
 }
 
 /// A shutdown with a stream still open is the engine side going away under
@@ -3599,8 +3859,6 @@ async fn link_error(server: &TokenSpeedServicerServer, rank: &str) -> String {
 /// tick.
 #[tokio::test]
 async fn an_encode_worker_reports_no_scheduler_load() {
-    use crate::kv_events::RankLoads;
-
     let mut generate = harness(model_info(), None).await;
     assert!(
         generate.server.state.rank_load(Some(0)).is_some(),
@@ -4080,8 +4338,6 @@ async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch()
 /// connected ones has no record.
 #[tokio::test]
 async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
-    use crate::kv_events::RankLoads;
-
     let record_of = |load: &ts::SchedulerLoad| {
         let mut record = common::EngineLoad::from(load);
         record.waiting_uncached_tokens =

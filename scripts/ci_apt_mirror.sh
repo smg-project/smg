@@ -104,11 +104,55 @@ reachable() {
 pattern='https?://([a-z0-9-]+\.)*(archive|security)\.ubuntu\.com/ubuntu/?'
 source_files=("${APT_ROOT}/sources.list" "${APT_ROOT}"/sources.list.d/*.list "${APT_ROOT}"/sources.list.d/*.sources)
 
-# A host already on a Canonical mirror (GitHub-hosted runners use the Azure
-# one) keeps it while it answers; only a dead mirror is replaced. The rewrite
-# below still runs for it, so any line left on another host joins it.
-current="$(cat "${source_files[@]}" 2>/dev/null | grep -Eo "${pattern}" | grep -vE '://(archive|security)\.ubuntu\.com/' | head -n 1 || true)"
-current="${current%/}"
+# Recognize only whole source URL tokens: Canonical origins or an exact URL
+# explicitly configured in MIRRORS. Compare custom URLs literally, so regexp
+# and replacement characters in a URL cannot match/rewrite unrelated sources.
+managed_sources() {
+    local mode="$1"
+    shift
+    CI_APT_MANAGED_URLS="$(printf '%s\n' "${MIRRORS[@]}")" \
+        CI_APT_CANONICAL_PATTERN="${pattern}" CI_APT_CHOSEN="${chosen:-}" \
+        awk -v mode="${mode}" '
+        BEGIN {
+            count = split(ENVIRON["CI_APT_MANAGED_URLS"], urls, "\n")
+            for (i = 1; i <= count; i++) {
+                sub(/\/$/, "", urls[i])
+                configured[urls[i]] = 1
+            }
+            canonical = "^(" ENVIRON["CI_APT_CANONICAL_PATTERN"] ")$"
+        }
+        {
+            rest = $0
+            output = ""
+            while (match(rest, /[^[:space:]]+/)) {
+                prefix = substr(rest, 1, RSTART - 1)
+                token = substr(rest, RSTART, RLENGTH)
+                rest = substr(rest, RSTART + RLENGTH)
+                origin = token
+                sub(/\/$/, "", origin)
+                managed = (token ~ canonical || origin in configured)
+                # x86 mirrors must never rewrite arm64 Ubuntu ports sources.
+                if (origin ~ /^https?:\/\/ports\.ubuntu\.com\//) managed = 0
+                if (managed && mode == "origins") print origin
+                if (managed && mode == "rewrite") token = ENVIRON["CI_APT_CHOSEN"] "/"
+                output = output prefix token
+            }
+            if (mode == "rewrite") print output rest
+        }' "$@"
+}
+
+# Ordinary calls retain the first existing non-main/security mirror, just
+# as before. Reprobe instead skips the first actual package origin, including
+# main; filtering main before ordinary selection must not hide a later cloud.
+origins="$(cat "${source_files[@]}" 2>/dev/null | managed_sources origins || true)"
+ordinary_current="$(printf '%s\n' "${origins}" \
+    | grep -vE '://(archive|security)\.ubuntu\.com/' | head -n 1 || true)"
+active_current="$(printf '%s\n' "${origins}" \
+    | grep -vE '://security\.ubuntu\.com/' | head -n 1 || true)"
+current="${ordinary_current}"
+if [ "${1:-}" = "--reprobe" ]; then
+    current="${active_current}"
+fi
 
 # The rewrite folds the security lines into the chosen host, so it has to
 # serve the security pocket as well as the release.
@@ -156,7 +200,9 @@ fi
 # Sources already on the main archive stay as they are, provided the
 # separate security origin answers too; if it does not, the rewrite below
 # moves the security lines onto the main archive, which serves that pocket.
-if [ "${chosen}" = "${MAIN_ARCHIVE}" ] && [ -z "${current}" ] \
+other_origins="$(printf '%s\n' "${origins}" \
+    | grep -vE '^https?://(archive|security)\.ubuntu\.com/ubuntu$' || true)"
+if [ "${chosen}" = "${MAIN_ARCHIVE}" ] && [ -z "${other_origins}" ] \
     && reachable "${SECURITY_ARCHIVE}" "${codename}-security"; then
     write_conf "${chosen}"
     log "main archive answers; leaving apt sources alone"
@@ -170,7 +216,7 @@ rewritten=0
 failed=0
 for file in "${source_files[@]}"; do
     [ -f "${file}" ] || continue
-    grep -Eq "${pattern}" "${file}" || continue
+    [ -n "$(managed_sources origins "${file}")" ] || continue
     matched=$((matched + 1))
     # Stage the copy next to the file so the final rename is atomic: apt
     # never sees a partial file, whatever fails along the way.
@@ -179,7 +225,7 @@ for file in "${source_files[@]}"; do
         failed=$((failed + 1))
         continue
     fi
-    if ! sed -E "s#${pattern}#${chosen}/#g" "${file}" | ${SUDO} tee "${staged}" >/dev/null; then
+    if ! managed_sources rewrite "${file}" | ${SUDO} tee "${staged}" >/dev/null; then
         log "could not rewrite ${file}; leaving it alone"
         ${SUDO} rm -f "${staged}"
         failed=$((failed + 1))

@@ -13,7 +13,6 @@ use super::{
     error::{set_error_message, SglErrorCode},
     grpc_converter::GrpcResponseConverterHandle,
     proto_parse::{is_terminal_response, parse_proto_response},
-    runtime::RUNTIME,
 };
 
 /// Postprocess a gRPC stream chunk to OpenAI format
@@ -193,14 +192,11 @@ pub unsafe extern "C" fn sgl_postprocess_stream_chunks_batch(
         };
 
         // Convert proto chunk to OpenAI format
-        let result = RUNTIME.block_on(async {
-            super::grpc_converter::convert_proto_chunk_to_openai(
-                proto_response,
-                handle_ref,
-                &tokenizer,
-            )
-            .await
-        });
+        let result = super::grpc_converter::convert_proto_chunk_to_openai(
+            proto_response,
+            handle_ref,
+            &tokenizer,
+        );
 
         match result {
             Ok(Some(openai_response)) => {
