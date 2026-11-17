@@ -1478,6 +1478,9 @@ def test_the_image_job_starts_on_what_these_cases_read():
         # stock one: its package and what the package compiles.
         REPO / "examples" / "policy-controller" / "Cargo.toml",
         REPO / "examples" / "policy-controller" / "src" / "main.rs",
+        # The cargo configuration the build reads: the allocator of an arm64
+        # binary takes its page size from it.
+        REPO / ".cargo" / "config.toml",
     ] + [
         path
         for path in sorted(CHART.rglob("*"))
@@ -2031,3 +2034,30 @@ def test_a_lease_deleted_under_running_pods_leaves_them_ready_and_nobody_leading
         for pod in pods:
             pod.end()
         stand_in.close()
+
+
+def test_the_image_job_builds_the_example_for_both_platforms_and_pushes_nothing():
+    """The example controller's image is built by the image's file with the
+    package argument naming the example: once for the runner's platform and
+    once for arm64 by the file's own cross build, behind an emulation step,
+    since the final stage runs the binary. No step of the job pushes an image
+    or logs in to a registry."""
+    document = yaml.safe_load(IMAGE_WORKFLOW.read_text())
+    steps = document["jobs"]["image"]["steps"]
+    package = "--build-arg PACKAGE=policy-controller-example"
+    builds = [at for at, step in enumerate(steps) if package in step.get("run", "")]
+    assert len(builds) == 2, f"{len(builds)} step(s) build the example's image"
+    for at in builds:
+        assert "--file docker/policy-controller.Dockerfile" in steps[at]["run"]
+    (cross,) = [at for at in builds if "--platform" in steps[at]["run"]]
+    assert "--platform linux/arm64" in steps[cross]["run"]
+    emulated = [
+        at
+        for at, step in enumerate(steps)
+        if step.get("uses", "").startswith("docker/setup-qemu-action@")
+    ]
+    assert emulated and emulated[0] < cross, "the arm64 build's final stage runs the binary"
+    for step in steps:
+        told = step.get("run", "") + " " + step.get("uses", "")
+        for word in ("docker push", "--push", "docker login", "login-action"):
+            assert word not in told, f"the step {step.get('name')!r} holds {word!r}"

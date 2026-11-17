@@ -31,8 +31,10 @@ instead ([`wasm-guest-policy`](../wasm/wasm-guest-policy)).
   passed over, and the idle one opens. The catalog a controller is bound
   with validates the document, and the stock controller's refuses it by the
   scorer's name. The built binary's start-up line names `pack` among its
-  scorers.
-- `Cargo.toml`: one dependency, the crate with its `controller` feature.
+  scorers. It runs on the allocator it registers, with the settings it
+  exports.
+- `Cargo.toml`: the crate with its `controller` feature, and the allocator
+  the binary registers.
 
 ## Write, register, run
 
@@ -128,6 +130,23 @@ at `warn` and above unless `RUST_LOG` says otherwise. `controller::run`
 installs the process's log subscriber and panics when one is already set, so
 `main` installs none.
 
+## The allocator
+
+The library registers no allocator: a controller built on it chooses its own.
+This example registers the one the stock controller's binary runs on, with
+the same settings: `src/main.rs` declares both, and `Cargo.toml` names one
+dependency under a target rule. The rule leaves an Apple target out: the
+allocator compiles no background thread there, which the settings ask for,
+and the example runs on the system allocator. The choice shows under
+registrations. Each one builds the store's world again, and the system
+allocator keeps resident what those builds free. In a one-thread probe of the
+store, 4,096 registrations of one model leave hundreds of megabytes resident
+under the system allocator and about a dozen under this one. A controller
+that registers none runs on the system allocator and pays that. On Linux
+aarch64 the allocator is built for 64 KiB pages, so one binary runs on every
+page size: the workspace's cargo configuration sets it, and a repository of
+your own needs the same line.
+
 ## In a repository of your own
 
 ```toml
@@ -144,11 +163,12 @@ and `protoc` with the well-known types on its include path: the crate and the
 gRPC client it links compile their contracts in their build scripts.
 
 `own-repository.sh <directory>` writes this example as such a repository: its
-source, document and tests, a manifest with the line above, and this
-checkout's toolchain pin and lock file. `cargo test` passes there. With
-`--snapshot` the git source is a snapshot of this checkout, written beside
-the copy. CI builds and tests the example that way, against the change under
-test.
+source, document and tests, a manifest with the line above and the
+allocator's dependency, the allocator's page setting (`.cargo/config.toml`),
+and this checkout's toolchain pin and lock file. `cargo test` passes there.
+With `--snapshot` the git source is a snapshot of this checkout, written
+beside the copy. CI builds and tests the example that way, against the change
+under test.
 
 ## The image
 
@@ -161,12 +181,14 @@ docker build --file docker/policy-controller.Dockerfile \
 ```
 
 CI builds this image beside the stock controller's, starts it and reads
-`pack` in its start-up line. It pushes neither.
+`pack` in its start-up line. It builds it again for arm64 by the file's
+cross build, where the final stage runs the binary. It pushes none of them.
 
 `PACKAGE` names a package of the workspace the file builds in. A repository
 of your own copies the file: it reads `rust-toolchain.toml` and `Cargo.lock`
-at the root of its build context, and it builds a package that depends on
-the crate.
+at the root of its build context, where cargo also reads
+`.cargo/config.toml`, and it builds a package that depends on the crate. No
+job builds an image from such a copy: CI's images are this workspace's.
 
 The Helm chart runs `registry/repository:tag` from
 `policyController.image.registry`, `policyController.image.repository` and
