@@ -1,11 +1,10 @@
 // Protocol definitions and validation for various LLM APIs
 // This module provides a structured approach to handling different API protocols
 
-/// Default model identifier used when no model is specified.
-///
-/// This constant should be used instead of hardcoded "unknown" strings
-/// throughout the codebase for consistency.
-pub const UNKNOWN_MODEL_ID: &str = "unknown";
+// The worker's wire types, the model card and the default model identifier
+// live in the worker crate; the paths they had here are kept.
+#[doc(inline)]
+pub use smg_worker::{model_card, model_type, worker, UNKNOWN_MODEL_ID};
 
 pub mod builders;
 pub mod chat;
@@ -20,8 +19,6 @@ pub mod generate;
 pub mod interactions;
 pub mod messages;
 mod messages_validation;
-pub mod model_card;
-pub mod model_type;
 pub mod models;
 pub mod multipart;
 pub mod parser;
@@ -39,4 +36,3 @@ pub mod systemone;
 pub mod tokenize;
 pub mod transcription;
 pub mod validated;
-pub mod worker;

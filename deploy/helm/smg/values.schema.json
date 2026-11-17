@@ -422,6 +422,12 @@
             "admin": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 }
           }
         },
+        "identityAsTold": {
+          "description": "Nothing is verified on a listener named here: whoever reaches its port acts as any principal of its scopes.",
+          "type": ["array", "null"],
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["gateway", "control", "replication"] }
+        },
         "service": {
           "type": ["object", "null"],
           "additionalProperties": false,

@@ -22,7 +22,8 @@ pub fn generate_room_id() -> u64 {
 /// modulo `dp_size`: SGLang's prefill side, under its default
 /// `follow_bootstrap_room` placement, fails a request whose
 /// `bootstrap_room % dp_size` is not the rank it runs on. The caller passes
-/// `dp_size > 1` and `rank < dp_size`.
+/// `rank < dp_size` and a `dp_size` above 1 and below `i64::MAX`: the draw's
+/// range, `0..i64::MAX - dp_size`, is then not empty.
 pub fn generate_room_id_for_rank(rank: usize, dp_size: usize) -> u64 {
     let dp_size = dp_size as u64;
     let base = rand::random_range(0..i64::MAX as u64 - dp_size);

@@ -101,14 +101,22 @@ impl Readiness {
             if self.state() == wanted {
                 return Some(wanted);
             }
-            tokio::select! {
-                moved = self.phase.changed() => moved.ok()?,
-                stepped = self.steps.changed() => {
-                    if stepped.is_err() {
-                        // The election is gone: the run loop alone moves.
-                        self.phase.changed().await.ok()?;
-                    }
+            self.moved().await?;
+        }
+    }
+
+    /// Resolves at the next move of the run loop or step of the election,
+    /// when a follower of the state reads it again; `None` when the
+    /// controller is gone.
+    pub(crate) async fn moved(&mut self) -> Option<()> {
+        tokio::select! {
+            moved = self.phase.changed() => moved.ok(),
+            stepped = self.steps.changed() => {
+                if stepped.is_err() {
+                    // The election is gone: the run loop alone moves.
+                    self.phase.changed().await.ok()?;
                 }
+                Some(())
             }
         }
     }
@@ -132,7 +140,10 @@ pub(crate) fn channel(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
 
     use tokio::sync::watch;
 
@@ -142,20 +153,29 @@ pub(crate) mod tests {
         elector::{ElectionSettings, Elector, MemoryLease, Tick},
     };
 
-    /// A candidate over a lease of its own and a readiness that reads its
-    /// fence: the run loop's writer, the election's writer, the reader.
+    /// A candidate alone over a lease of its own and a readiness that reads
+    /// its fence: the run loop's writer, the election's writer, the reader.
     pub(crate) fn fenced() -> (
         Elector,
         watch::Sender<Phase>,
         watch::Sender<Standing>,
         Readiness,
     ) {
-        let elector = Elector::new(
-            Box::new(MemoryLease::new()),
-            "controller-0@127.0.0.1:1",
-            ElectionSettings::default(),
+        over(
+            Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+                .expect("the default settings are in order"),
         )
-        .expect("the default settings are in order");
+    }
+
+    /// The same over the candidate that is handed in.
+    fn over(
+        elector: Elector,
+    ) -> (
+        Elector,
+        watch::Sender<Phase>,
+        watch::Sender<Standing>,
+        Readiness,
+    ) {
         let (steps, stepped) = watch::channel(Standing::default());
         let (phase, readiness) = channel(elector.fence(), stepped);
         (elector, phase, steps, readiness)
@@ -175,18 +195,46 @@ pub(crate) mod tests {
 
     #[test]
     fn the_role_is_the_fences_at_the_instant_of_the_read() {
-        let (mut elector, phase, _steps, readiness) = fenced();
+        // A lease that is handed in may have a holder this candidate never
+        // saw, so its take waits to lead.
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(100),
+            renew_deadline: Duration::from_millis(400),
+        };
+        let (mut elector, phase, _steps, readiness) = over(
+            Elector::new(
+                Box::new(MemoryLease::new()),
+                "controller-0@127.0.0.1:1",
+                settings,
+            )
+            .expect("the settings are in order"),
+        );
         assert_eq!(readiness.state(), State::Starting);
 
         // Serving with no lease held: a follower.
         phase.send_replace(Phase::Serving);
         assert_eq!(readiness.state(), State::Follower);
 
-        // The take opens the fence: the leader, with no message sent.
+        // The take of a lease that held no record opens no fence: still a
+        // follower, through a renewal inside the wait. The lead opens one
+        // renew deadline after the take's write, between two steps: the
+        // leader from that instant, with no step taken and no message sent.
+        // The renewal's instant is ahead of the clock and just short of the
+        // opening, so the fence stays open most of a renew deadline past it.
+        let taken = Instant::now();
         assert_eq!(
-            elector.tick(Instant::now()).expect("the take"),
+            elector.tick(taken).expect("the take"),
             Tick::Acquired { term: 1 }
         );
+        assert_eq!(readiness.state(), State::Follower);
+        let renewed = taken + settings.renew_deadline - Duration::from_millis(10);
+        assert_eq!(
+            elector.tick(renewed).expect("the renewal"),
+            Tick::Renewed { term: 1 }
+        );
+        assert_eq!(readiness.state(), State::Follower);
+        thread::sleep(settings.renew_deadline);
         assert_eq!(readiness.state(), State::Leader);
 
         // Draining says so whatever the fence says.
@@ -199,15 +247,12 @@ pub(crate) mod tests {
         let (mut elector, phase, _steps, readiness) = fenced();
         phase.send_replace(Phase::Serving);
 
-        // A take dated a second past the renew deadline: the holder still
-        // holds the record, and its fence is closed at the read.
+        // A last renewal dated a second past the renew deadline: the holder
+        // still holds the record, and its fence is closed at the read.
         let stale = Instant::now()
             .checked_sub(ElectionSettings::default().renew_deadline + Duration::from_secs(1))
             .expect("an instant three seconds back");
-        assert_eq!(
-            elector.tick(stale).expect("the take"),
-            Tick::Acquired { term: 1 }
-        );
+        elector.lead_at(stale);
         assert!(elector.is_holder());
         assert_eq!(readiness.state(), State::Follower);
 
@@ -244,7 +289,7 @@ pub(crate) mod tests {
         let mut waiter = reader.clone();
         let (waited, ()) = tokio::join!(within(&mut waiter, State::Leader), async {
             tokio::task::yield_now().await;
-            elector.tick(Instant::now()).expect("the take");
+            elector.lead_at(Instant::now());
             steps.send_replace(Standing::default());
         });
         assert_eq!(waited, Some(State::Leader));

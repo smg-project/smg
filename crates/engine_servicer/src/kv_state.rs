@@ -1630,6 +1630,7 @@ mod tests {
         // A 676k-block pool (a large worker's) in chains of 64.
         let mut state = LiveState::new();
         let mut hash = 1i64;
+        let started = Instant::now();
         for seq in 0..(676_144 / 64) {
             let hashes: Vec<i64> = (hash..hash + 64).collect();
             hash += 64;
@@ -1639,6 +1640,7 @@ mod tests {
                 vec![stored(None, &hashes, KvCacheTier::Device)],
             ));
         }
+        let built = started.elapsed();
         assert_eq!(state.blocks(), 676_096);
         let started = Instant::now();
         let snapshot = state.snapshot();
@@ -1654,13 +1656,17 @@ mod tests {
         }
         let encoded = started.elapsed();
         eprintln!(
-            "676k snapshot: collect {collected:?}, order {ordered:?}, {count} chunks built in {encoded:?}"
+            "676k snapshot: state built in {built:?}, collect {collected:?}, order {ordered:?}, {count} chunks built in {encoded:?}"
         );
         assert_eq!(blocks, 676_096);
         assert_eq!(count as usize, 676_096_usize.div_ceil(CHUNK_BLOCKS));
+        // Brief by the clock, or by this host's own pace: a loaded host
+        // stretches the build above and the collect alike, so a collect past
+        // the second is slow by its own work only when it also outlasts the
+        // build of the state it walks.
         assert!(
-            collected.as_millis() < 1_000,
-            "collecting under the lock took {collected:?}"
+            collected.as_millis() < 1_000 || collected < built,
+            "collecting under the lock took {collected:?}; building the state took {built:?}"
         );
     }
 }

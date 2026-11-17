@@ -30,6 +30,7 @@ use crate::{
             utils::{self, Names},
         },
     },
+    worker::{ModelLabels, Worker},
 };
 
 /// What preparation found for the response.
@@ -54,11 +55,11 @@ pub(crate) struct Prepared {
     /// stores them (`ProcessingState::parser_names`) and request building reads them in
     /// place of a second resolution.
     pub names: Names,
-    /// The table's replay of the rendered prompt, when preparation replayed it for the forced
-    /// call's tag: the stage stores it (`ProcessingState::prompt_thought`) and request building's
-    /// reasoning decision reads it in place of a second replay of the same prompt. `None` when
-    /// the request's thinking switch armed the reasoning and no replay was needed.
-    pub prompt_thought: Option<PromptReplay>,
+    /// The table's replay of the rendered prompt, asked for the forced call's tag whatever the
+    /// request's thinking switch says: the stage stores it (`ProcessingState::prompt_thought`)
+    /// and request building's reasoning decision reads it in place of a second replay of the
+    /// same prompt.
+    pub prompt_thought: PromptReplay,
     /// The table decision for the request (`regular::symphony::reading`: which table reads the
     /// response under the parser, or why the legacy parsers do), read here once for the replay,
     /// the constraint and the decoder's special tokens: the stage stores it
@@ -81,10 +82,13 @@ pub(crate) struct Prepared {
 /// prompt a parser with a reasoning prefix gets its tag wrapped so a forced
 /// call follows the reasoning instead of preempting it: `switch` is the API's
 /// tokenizer-driven answer, and where a table reads the response its replay
-/// of the rendered prompt decides beside it (a turn the prompt leaves
-/// unopened starts inside the thought whatever the switch says:
-/// `regular::symphony::reasoning_open`), so the tag reads the prompt as the
-/// engine will. The table's refusal waits for request building, which decides
+/// of the rendered prompt decides by the rule request building asks
+/// (`PromptThought::or_switch` over `regular::symphony::reasoning_open`): a
+/// turn the prompt leaves unopened starts inside the thought whatever the
+/// switch says, a prompt that closed the thought is past it whatever the
+/// switch says, and where the family's rule sets the switch aside the replay
+/// decides alone; so the tag reads the prompt as the engine will. The
+/// table's refusal waits for request building, which decides
 /// on the selected worker; the registry's refuses the request here (a 400,
 /// logged under `stage`). A table whose markers the decoder would drop as
 /// special tokens needs them kept whatever the request asks of the channels:
@@ -109,32 +113,37 @@ pub(crate) fn prepare(
     // legacy parsers here and at the two sites below, whatever the enum's
     // default.
     let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
-    // The model's workers, fetched once for the request: the cards' parser
-    // names are read among them here, and a forced call's tag takes the
-    // start they name together; a JSON answer's tag and the `auto` tag take
-    // the selected worker's own start at request building.
-    let workers = ctx
-        .components
-        .worker_registry
-        .get_by_model(&ctx.input.model_id);
-    let names = ctx.components.parser_resolver.names_among(&workers, model);
+    // What the model's workers say together, as the registry's membership
+    // snapshot keeps it (`together`): the cards' parser names, and for a
+    // forced call's tag the start and the vocabulary they name together; a
+    // JSON answer's tag and the `auto` tag take the selected worker's own
+    // start at request building.
+    let labels = together(ctx, model, ModelLabels::clone);
+    let names = ctx.components.parser_resolver.names_of(Names {
+        tool: labels.tool_parser,
+        reasoning: labels.reasoning_parser,
+    });
     // Which table reads the response under the parser, decided once for the
     // request: the replay, the constraint and the decoder's special tokens
     // read it here, the assignment at request building after them. A refusal
     // (the names ask for a response template the model cannot compile) is the
     // constraint's to carry, as before.
     let reading = symphony::reading(parser, &names, model, &ctx.components.templates);
-    let prompt_thought = (!switch).then(|| {
-        reading
-            .as_ref()
-            .ok()
-            .and_then(|read| symphony::reasoning_open_for(read, processed_text))
-    });
-    let replay = prompt_thought.flatten();
-    let reasoning = switch || replay.is_some_and(|thought| thought.open);
+    // The replay is asked whatever the thinking switch says: a template may
+    // close the thought for a request that names no switch while the switch's
+    // default says thinking, and a prompt that closed the thought is past it.
+    let prompt_thought = reading
+        .as_ref()
+        .ok()
+        .and_then(|read| symphony::reasoning_open_for(read, processed_text));
     // The prompt closed the thought itself and wrote the template's text
-    // after it (thinking switched off): the calls' tag owes none of it.
-    let thought_closed = replay.is_some_and(|thought| thought.closed);
+    // after it (thinking switched off): the calls' tag owes none of it, and
+    // no thought stands in front of the calls.
+    let thought_closed = prompt_thought.is_some_and(|thought| thought.closed);
+    // The one rule request building asks (`reasoning_decision`): the replay's
+    // answer, with the switch only where the replay does not decide alone; the
+    // switch itself where no table replays the prompt.
+    let reasoning = prompt_thought.map_or(switch, |thought| thought.or_switch(|| switch));
     let from_the_table = reading.as_ref().map_err(Clone::clone).and_then(|read| {
         symphony::constraint_for(
             read,
@@ -142,8 +151,8 @@ pub(crate) fn prepare(
             tools,
             reasoning,
             thought_closed,
-            symphony::grammar_start_of(&workers),
-            symphony::vocabulary_of(&workers),
+            labels.grammar_start,
+            labels.vocabulary,
         )
     });
     let choice = asks.choice();
@@ -214,6 +223,42 @@ pub(crate) fn prepare(
     })
 }
 
+/// What the model's workers say together to a request, before one of them is
+/// selected: the parser names their cards set
+/// (`utils::ParserResolver::card_names_among`), where their engines start a
+/// grammar (`regular::symphony::grammar_start_of`) and the tag vocabulary
+/// they take (`regular::symphony::vocabulary_of`). A worker's cards and
+/// labels stay as they are while it is a member, so the registry's
+/// membership snapshot keeps the three answers
+/// (`ModelWorkerSnapshot::labels`): the first request after a membership
+/// change walks the workers, and every request after it reads the kept
+/// answers, whatever the size of the fleet. A request that spells the model
+/// otherwise than the kept answers do, or names a model no worker serves,
+/// walks the workers itself. `take` reads what its caller needs of the
+/// answers.
+fn together<T>(ctx: &RequestContext, model: &str, take: impl FnOnce(&ModelLabels) -> T) -> T {
+    let read = |workers: &[Arc<dyn Worker>]| {
+        let Names { tool, reasoning } = utils::ParserResolver::card_names_among(workers, model);
+        ModelLabels {
+            tool_parser: tool,
+            reasoning_parser: reasoning,
+            grammar_start: symphony::grammar_start_of(workers),
+            vocabulary: symphony::vocabulary_of(workers),
+        }
+    };
+    let snapshot = ctx
+        .components
+        .worker_registry
+        .model_routing_snapshot(&ctx.input.model_id);
+    match snapshot.as_deref() {
+        Some(snapshot) => match snapshot.labels(model, read) {
+            Some(kept) => take(kept),
+            None => take(&read(snapshot)),
+        },
+        None => take(&read(&[])),
+    }
+}
+
 /// Whether the rendered prompt leaves the model inside its thought, as the
 /// request's grammar, the plan's reasoning state and the response spec all
 /// read it: where a Symphony table reads the response, the table's own replay
@@ -222,8 +267,9 @@ pub(crate) fn prepare(
 /// (the API's: `utils::chat_reasoning_starts_in_rendered_prefill`,
 /// `utils::messages_reasoning_starts_in_prefill`, over `model`'s tokenizer),
 /// or alone where the family's rule sets the switch aside (Gemma 4 prefills
-/// an open channel only after a tool response), and no legacy parser is built
-/// to be asked; otherwise native Gemma4 channels follow the rendered prompt
+/// an open channel only after a tool response) or the prompt closed the
+/// thought itself, and no legacy parser is built to be asked; otherwise
+/// native Gemma4 channels follow the rendered prompt
 /// when that parser decides, and other parsers keep their tokenizer-driven
 /// preference for the engine's reasoning gate. With it, whether the prompt
 /// closed the thought itself and wrote the template's text after it
@@ -397,14 +443,10 @@ pub(crate) fn decide(
             .map_err(|why| error::bad_request("invalid_parser_configuration", why))?,
     };
     // A forced call's reader starts where the model's workers start a grammar together, the
-    // start preparation built the constraint for, read among the same workers; the assignment
-    // asks under a forced call's JSON schema alone, so no other request walks the registry here.
+    // start preparation built the constraint for, kept with it (`together`); the assignment
+    // asks under a forced call's JSON schema alone, so no other request reads it here.
     let assignment = symphony::assign_for(read, asks, registry, processed_text, provider, || {
-        symphony::grammar_start_of(
-            &ctx.components
-                .worker_registry
-                .get_by_model(&ctx.input.model_id),
-        )
+        together(ctx, model, |labels| labels.grammar_start)
     });
     ctx.state.parser = Some(match assignment {
         Some(_) => ParserChoice::Symphony,
@@ -713,6 +755,12 @@ mod tests {
             reasoning_decision(&ctx, MODEL, PROMPT, |_| false),
             (false, true)
         );
+        // A prompt that closed the thought overrules a switch that says the model thinks.
+        ctx.state.tokenizer = Some(hiding(&["<think>", "</think>"]));
+        assert_eq!(
+            reasoning_decision(&ctx, MODEL, PROMPT, |_| true),
+            (false, true)
+        );
         // Under a legacy assignment the kept replay is not read: no closed thought is reported.
         ctx.state.parser = Some(ParserChoice::Legacy);
         ctx.state.prompt_thought = Some(symphony::reasoning_open(
@@ -974,6 +1022,128 @@ mod tests {
         }
     }
 
+    /// Preparation reads the thought by the rule request building asks. On the table whose
+    /// replay decides alone, a new turn the prompt leaves outside the thought is not reasoning
+    /// whatever the thinking switch says: the forced call's tag is the same with the switch on
+    /// and off, wherever the model's workers start a grammar, and request building says the
+    /// same of the turn from the replay preparation stored. A channel the prompt opened is
+    /// still read as open with the switch off.
+    #[test]
+    fn preparation_reads_the_thought_by_request_buildings_rule() {
+        const NEW_TURN: &str = "<|turn>user\nhi<turn|>\n<|turn>model\n";
+        const OPENED: &str = "<|turn>user\nhi<turn|>\n<|turn>model\n<|channel>thought\n";
+        let tokenizer = hiding(&["<|channel>", "<channel|>"]);
+        for start in [Some("first_token"), Some("after_reasoning"), None] {
+            let chat = forced(true);
+            let mut ctx = RequestContext::for_chat(
+                Arc::clone(&chat),
+                None,
+                SERVED.into(),
+                pool("gemma4", start),
+            );
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            ctx.state.tokenizer = Some(Arc::clone(&tokenizer));
+            let tools = chat.tools.clone().unwrap_or_default();
+            let prepared_for = |ctx: &RequestContext, prompt: &str, switch: bool| {
+                prepare(
+                    ctx,
+                    Asks::Chat(&chat),
+                    &tools,
+                    prompt,
+                    switch,
+                    &tokenizer,
+                    "test",
+                )
+                .map_err(|response| response.status())
+                .expect("nothing refused")
+            };
+            let tag = |prompt: &str, switch: bool| {
+                format!("{:?}", prepared_for(&ctx, prompt, switch).constraint)
+            };
+            let new_turn = tag(NEW_TURN, false);
+            assert!(
+                new_turn.contains("lookup"),
+                "a tag over the forced tool: {new_turn}"
+            );
+            assert_eq!(
+                tag(NEW_TURN, true),
+                new_turn,
+                "a new turn, workers that start at {start:?}"
+            );
+            let opened = tag(OPENED, false);
+            assert_eq!(
+                tag(OPENED, true),
+                opened,
+                "an opened channel, workers that start at {start:?}"
+            );
+            if start == Some("first_token") {
+                assert_ne!(
+                    opened, new_turn,
+                    "the open channel's close stands before the call"
+                );
+            }
+            // Request building reads what preparation stored for the request, as the chat and
+            // Messages stages store it: the table's replay of the prompt, not one built again.
+            for (prompt, open) in [(NEW_TURN, false), (OPENED, true)] {
+                for switch in [true, false] {
+                    let prepared = prepared_for(&ctx, prompt, switch);
+                    let table = match &prepared.reading {
+                        Some(Reading::Table(format, _)) => Some(format.name()),
+                        _ => None,
+                    };
+                    assert_eq!(table, Some("gemma4"), "the table the card names reads");
+                    ctx.state.parser_names = Some(prepared.names);
+                    ctx.state.prompt_thought = Some(prepared.prompt_thought);
+                    assert_eq!(
+                        reasoning_decision(&ctx, SERVED, prompt, |_| switch),
+                        (open, false),
+                        "request building over {prompt:?}, the switch {switch}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A prompt that closed the thought itself overrules a thinking switch that says the model
+    /// thinks: a template may write the closed thought for a request that names no switch while
+    /// the switch's default says thinking. The forced call's tag is then the one the same prompt
+    /// gets with the switch off, the call with no thought in front of it, wherever the model's
+    /// workers start a grammar.
+    #[test]
+    fn a_prompt_that_closed_the_thought_overrules_the_thinking_switch() {
+        const CLOSED: &str =
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        let tokenizer = hiding(&["<think>", "</think>"]);
+        for start in [Some("first_token"), Some("after_reasoning"), None] {
+            let chat = forced(true);
+            let mut ctx = RequestContext::for_chat(
+                Arc::clone(&chat),
+                None,
+                SERVED.into(),
+                pool("qwen3", start),
+            );
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            let tools = chat.tools.clone().unwrap_or_default();
+            let tag = |switch: bool| {
+                let prepared = prepare(
+                    &ctx,
+                    Asks::Chat(&chat),
+                    &tools,
+                    CLOSED,
+                    switch,
+                    &tokenizer,
+                    "test",
+                )
+                .map_err(|response| response.status())
+                .expect("nothing refused");
+                format!("{:?}", prepared.constraint)
+            };
+            let off = tag(false);
+            assert!(off.contains("lookup"), "a tag over the forced tool: {off}");
+            assert_eq!(tag(true), off, "workers that start at {start:?}");
+        }
+    }
+
     /// The assignment of a forced call under the schema starts the reader where the model's
     /// workers start a grammar together: in the call, with nothing of the prompt replayed, on
     /// workers that start at the first token, where the schema holds the output before the model
@@ -1019,5 +1189,93 @@ mod tests {
             assert_eq!(assignment.prompt, replayed, "{case}");
             assert_eq!(assignment.opener, opener, "{case}");
         }
+    }
+
+    /// Preparation reads what the model's workers say together where the registry's membership
+    /// snapshot keeps it: the first request after a membership change walks the workers and
+    /// leaves its answers on the snapshot, the next request reads them there, and a worker that
+    /// joins the model is read by the request after it, its card and its label beside the
+    /// first worker's.
+    #[test]
+    fn preparation_keeps_what_the_models_workers_say_until_the_membership_changes() {
+        let components = pool("inkling", Some("first_token"));
+        let tokenizer = hiding(&["<|content_thinking|>", "<|end_message|>"]);
+        let chat = forced(true);
+        let tools = chat.tools.clone().unwrap_or_default();
+        let names = || {
+            let mut ctx = RequestContext::for_chat(
+                Arc::clone(&chat),
+                None,
+                SERVED.into(),
+                Arc::clone(&components),
+            );
+            ctx.state.parser = Some(ParserChoice::Symphony);
+            prepare(
+                &ctx,
+                Asks::Chat(&chat),
+                &tools,
+                THINKING,
+                false,
+                &tokenizer,
+                "test",
+            )
+            .map_err(|response| response.status())
+            .expect("nothing refused")
+            .names
+        };
+        // What the snapshot a request draws now holds, read by nobody here: a reader that ran
+        // would mean preparation kept nothing.
+        let kept = || {
+            components
+                .worker_registry
+                .model_routing_snapshot(SERVED)
+                .expect("a served model")
+                .labels(SERVED, |_| {
+                    panic!("preparation kept nothing on the snapshot")
+                })
+                .cloned()
+                .expect("kept under the request's spelling")
+        };
+        let inkling = Names {
+            tool: None,
+            reasoning: Some("inkling".to_string()),
+        };
+        assert_eq!(names(), inkling);
+        assert_eq!(
+            kept(),
+            ModelLabels {
+                tool_parser: None,
+                reasoning_parser: Some("inkling".to_string()),
+                grammar_start: ::symphony::grammar::GrammarStart::FirstToken,
+                vocabulary: utils::TagVocabulary::Current,
+            }
+        );
+        assert_eq!(names(), inkling, "the next request reads the kept answers");
+
+        let joining = BasicWorkerBuilder::new("grpc://engine-2:50051")
+            .model(
+                ModelCard::new(SERVED)
+                    .with_reasoning_parser("inkling")
+                    .with_tool_parser("json"),
+            )
+            .worker_type(WorkerType::Regular)
+            .label(tool_parser::GrammarStart::LABEL, "after_reasoning");
+        components
+            .worker_registry
+            .register(Arc::new(joining.build()));
+        let joined = Names {
+            tool: Some("json".to_string()),
+            ..inkling
+        };
+        assert_eq!(names(), joined);
+        assert_eq!(
+            kept(),
+            ModelLabels {
+                tool_parser: joined.tool,
+                reasoning_parser: joined.reasoning,
+                grammar_start: ::symphony::grammar::GrammarStart::Either,
+                vocabulary: utils::TagVocabulary::Current,
+            }
+        );
     }
 }

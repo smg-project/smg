@@ -205,15 +205,17 @@ mod tests {
         assert!(inflight.reserve(2000).await.is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_request_above_the_whole_budget_is_refused_at_once() {
         let inflight = quick(4096);
-        let started = std::time::Instant::now();
+        // Virtual time: a wait in the gate would advance it, a held test
+        // thread cannot.
+        let started = tokio::time::Instant::now();
         assert_eq!(
             inflight.reserve(5000).await.unwrap_err(),
             InflightRefusal::TooLarge
         );
-        assert!(started.elapsed() < Duration::from_millis(15));
+        assert_eq!(started.elapsed(), Duration::ZERO);
         assert!(inflight.reserve(0).await.is_ok());
     }
 
@@ -240,7 +242,7 @@ mod tests {
     /// Queued requests still hold their media, so the gateway turns arrivals
     /// away once the queue is as heavy as the budget rather than letting the
     /// two of them add up without limit.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn arrivals_past_a_budget_of_waiting_are_refused_without_waiting() {
         let inflight = Arc::new(MultimodalInflight::new(4096).with_wait(Duration::from_secs(5)));
         let held = inflight.reserve(4096).await.unwrap();
@@ -253,15 +255,16 @@ mod tests {
             let inflight = Arc::clone(&inflight);
             async move { inflight.reserve(4096).await }
         });
-        // Give the queued request time to register before the next arrives.
+        // The paused clock passes this sleep only once the queued request
+        // has registered and waits.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         assert_eq!(
             inflight.reserve(1024).await.unwrap_err(),
             InflightRefusal::Busy
         );
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(started.elapsed(), Duration::ZERO);
 
         drop(held);
         assert!(queued.await.unwrap().is_ok());

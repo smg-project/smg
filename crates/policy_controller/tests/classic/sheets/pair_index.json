@@ -1,0 +1,3842 @@
+{
+  "recorded_from": "64ff5a437b5007af5079f0492b46f4e5a712b66f",
+  "policy": "pair-index",
+  "rows": [
+    {
+      "name": "pair-one-descriptor-lists-every-decode",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                null
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                null
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                null
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                null
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-two-transports-list-apart",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                "transport",
+                null
+              ],
+              [
+                "transport",
+                null,
+                "transport"
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                2
+              ],
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                "transport",
+                null
+              ],
+              [
+                "transport",
+                null,
+                "transport"
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                2
+              ],
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null,
+                null
+              ],
+              [
+                null,
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1,
+                2
+              ],
+              [
+                0,
+                1,
+                2
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                "transport",
+                null
+              ],
+              [
+                "transport",
+                null,
+                "transport"
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                2
+              ],
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                "transport",
+                null
+              ],
+              [
+                "transport",
+                null,
+                "transport"
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                2
+              ],
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null,
+                null
+              ],
+              [
+                null,
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1,
+                2
+              ],
+              [
+                0,
+                1,
+                2
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-a-prefill-that-names-no-transport",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/?/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                "transport"
+              ],
+              [
+                "transport",
+                null
+              ],
+              [
+                "unknown transport",
+                "unknown transport"
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              []
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                "transport"
+              ],
+              [
+                "transport",
+                null
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ],
+              [
+                null,
+                null
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                "transport"
+              ],
+              [
+                "transport",
+                null
+              ],
+              [
+                "unknown transport",
+                "unknown transport"
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              []
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                "transport"
+              ],
+              [
+                "transport",
+                null
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ],
+              [
+                null,
+                null
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-a-decode-that-names-no-transport-is-on-two-lists",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/?/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "unknown transport",
+                null,
+                "transport"
+              ],
+              [
+                "unknown transport",
+                "transport",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                1
+              ],
+              [
+                2
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                null,
+                "transport"
+              ],
+              [
+                null,
+                "transport",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                2
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null,
+                null
+              ],
+              [
+                null,
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1,
+                2
+              ],
+              [
+                0,
+                1,
+                2
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "unknown transport",
+                null,
+                "transport"
+              ],
+              [
+                "unknown transport",
+                "transport",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                1
+              ],
+              [
+                2
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                null,
+                "transport"
+              ],
+              [
+                null,
+                "transport",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                2
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null,
+                null
+              ],
+              [
+                null,
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1,
+                2
+              ],
+              [
+                0,
+                1,
+                2
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-nobody-names-a-transport",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/?/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/?/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "unknown transport"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/?/?"
+              ],
+              "decode": [
+                "vllm/?/?"
+              ],
+              "mismatches": [
+                "unknown transport"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "unknown transport"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/?/?"
+              ],
+              "decode": [
+                "vllm/?/?"
+              ],
+              "mismatches": [
+                "unknown transport"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-no-shared-transport-is-refused",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "transport"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "vllm/mooncake/?"
+              ],
+              "mismatches": [
+                "transport"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "transport"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "vllm/mooncake/?"
+              ],
+              "mismatches": [
+                "transport"
+              ]
+            }
+          },
+          "off": {
+            "verdicts": [
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "transport"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "vllm/mooncake/?"
+              ],
+              "mismatches": [
+                "transport"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "transport"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "vllm/mooncake/?"
+              ],
+              "mismatches": [
+                "transport"
+              ]
+            }
+          },
+          "off": {
+            "verdicts": [
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-a-store-transport-pairs-with-its-own-kind-alone",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake-store",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake-store/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake-store",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake-store/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "transport",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "transport",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "transport",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "transport",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-two-runtimes-each-list-their-own",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "sglang/nixl/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "sglang/nixl/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                "runtime"
+              ],
+              [
+                "runtime",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                "runtime"
+              ],
+              [
+                "runtime",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                "runtime"
+              ],
+              [
+                "runtime",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                "runtime"
+              ],
+              [
+                "runtime",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                "runtime"
+              ],
+              [
+                "runtime",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-two-runtimes-and-no-pair-on-one-runtime",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "sglang/nixl/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "runtime"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "sglang/nixl/?"
+              ],
+              "mismatches": [
+                "runtime"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "runtime"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "sglang/nixl/?"
+              ],
+              "mismatches": [
+                "runtime"
+              ]
+            }
+          },
+          "off": {
+            "verdicts": [
+              [
+                "runtime"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "sglang/nixl/?"
+              ],
+              "mismatches": [
+                "runtime"
+              ]
+            }
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "runtime"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "sglang/nixl/?"
+              ],
+              "mismatches": [
+                "runtime"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "runtime"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "sglang/nixl/?"
+              ],
+              "mismatches": [
+                "runtime"
+              ]
+            }
+          },
+          "off": {
+            "verdicts": [
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-an-undetected-runtime-on-one-side",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/?/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": null,
+          "protocol": null,
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "unspecified/?/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/?/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "unknown runtime",
+                "unknown transport"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/?/?"
+              ],
+              "decode": [
+                "unspecified/?/?",
+                "vllm/?/?"
+              ],
+              "mismatches": [
+                "unknown runtime",
+                "unknown transport"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "unknown runtime",
+                "unknown transport"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "vllm/?/?"
+              ],
+              "decode": [
+                "unspecified/?/?",
+                "vllm/?/?"
+              ],
+              "mismatches": [
+                "unknown runtime",
+                "unknown transport"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-an-undetected-runtime-on-both-sides",
+      "prefills": [
+        {
+          "runtime": null,
+          "protocol": null,
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "unspecified/?/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": null,
+          "protocol": null,
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "unspecified/?/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "unknown runtime"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "unspecified/?/?"
+              ],
+              "decode": [
+                "unspecified/?/?"
+              ],
+              "mismatches": [
+                "unknown runtime"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "unknown runtime"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "unspecified/?/?"
+              ],
+              "decode": [
+                "unspecified/?/?"
+              ],
+              "mismatches": [
+                "unknown runtime"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-equal-protocols-settle-the-pair-over-the-transport",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": "blue",
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "blue"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": "blue",
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "blue"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": "red",
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "red"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                "pairing_protocol"
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                "pairing_protocol"
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                "pairing_protocol"
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                "pairing_protocol"
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-a-protocol-on-one-side-alone",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": "blue",
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "blue"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "unknown pairing_protocol",
+                "unknown pairing_protocol"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "blue"
+              ],
+              "decode": [
+                "vllm/mooncake/?",
+                "vllm/nixl/?"
+              ],
+              "mismatches": [
+                "unknown pairing_protocol"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                "transport"
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "unknown pairing_protocol",
+                "unknown pairing_protocol"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "blue"
+              ],
+              "decode": [
+                "vllm/mooncake/?",
+                "vllm/nixl/?"
+              ],
+              "mismatches": [
+                "unknown pairing_protocol"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                "transport"
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-equal-protocols-do-not-cross-runtimes",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": "blue",
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "blue"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "sglang",
+          "protocol": "blue",
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "blue"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "runtime"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "blue"
+              ],
+              "decode": [
+                "blue"
+              ],
+              "mismatches": [
+                "runtime"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "runtime"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "blue"
+              ],
+              "decode": [
+                "blue"
+              ],
+              "mismatches": [
+                "runtime"
+              ]
+            }
+          },
+          "off": {
+            "verdicts": [
+              [
+                "runtime"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "blue"
+              ],
+              "decode": [
+                "blue"
+              ],
+              "mismatches": [
+                "runtime"
+              ]
+            }
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "runtime"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "blue"
+              ],
+              "decode": [
+                "blue"
+              ],
+              "mismatches": [
+                "runtime"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "runtime"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "blue"
+              ],
+              "decode": [
+                "blue"
+              ],
+              "mismatches": [
+                "runtime"
+              ]
+            }
+          },
+          "off": {
+            "verdicts": [
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-one-layout-fact",
+      "prefills": [
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [
+            [
+              "kv_cache_dtype",
+              "auto"
+            ]
+          ],
+          "key": "sglang/nixl/dtype=auto"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [
+            [
+              "kv_cache_dtype",
+              "auto"
+            ]
+          ],
+          "key": "sglang/nixl/dtype=auto"
+        },
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [
+            [
+              "kv_cache_dtype",
+              "fp8_e5m2"
+            ]
+          ],
+          "key": "sglang/nixl/dtype=fp8_e5m2"
+        },
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "sglang/nixl/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                "kv_cache_dtype",
+                "unknown kv_cache_dtype"
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                "kv_cache_dtype",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                2
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1,
+                2
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                "kv_cache_dtype",
+                "unknown kv_cache_dtype"
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                "kv_cache_dtype",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                2
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1,
+                2
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-a-layout-fact-one-side-reports",
+      "prefills": [
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [
+            [
+              "kv_cache_dtype",
+              "auto"
+            ],
+            [
+              "attention_backend",
+              "flash_attn"
+            ]
+          ],
+          "key": "sglang/nixl/dtype=auto,attn=flash_attn"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [
+            [
+              "kv_cache_dtype",
+              "auto"
+            ]
+          ],
+          "key": "sglang/nixl/dtype=auto"
+        },
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [
+            [
+              "kv_cache_dtype",
+              "auto"
+            ],
+            [
+              "attention_backend",
+              "flash_attn"
+            ]
+          ],
+          "key": "sglang/nixl/dtype=auto,attn=flash_attn"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "unknown attention_backend",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "unknown attention_backend",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-two-layout-facts-differ-and-one-is-named",
+      "prefills": [
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [
+            [
+              "kv_cache_dtype",
+              "auto"
+            ],
+            [
+              "page_size",
+              "16"
+            ],
+            [
+              "attention_backend",
+              "flash_attn"
+            ],
+            [
+              "model_dtype",
+              "bfloat16"
+            ]
+          ],
+          "key": "sglang/nixl/dtype=auto,page=16,attn=flash_attn,model=bfloat16"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [
+            [
+              "kv_cache_dtype",
+              "fp8_e5m2"
+            ],
+            [
+              "page_size",
+              "16"
+            ],
+            [
+              "attention_backend",
+              "xformers"
+            ],
+            [
+              "model_dtype",
+              "bfloat16"
+            ]
+          ],
+          "key": "sglang/nixl/dtype=fp8_e5m2,page=16,attn=xformers,model=bfloat16"
+        },
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [
+            [
+              "kv_cache_dtype",
+              "auto"
+            ],
+            [
+              "page_size",
+              "64"
+            ],
+            [
+              "attention_backend",
+              "flash_attn"
+            ],
+            [
+              "model_dtype",
+              "float16"
+            ]
+          ],
+          "key": "sglang/nixl/dtype=auto,page=64,attn=flash_attn,model=float16"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "kv_cache_dtype",
+                "page_size"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "sglang/nixl/dtype=auto,page=16,attn=flash_attn,model=bfloat16"
+              ],
+              "decode": [
+                "sglang/nixl/dtype=auto,page=64,attn=flash_attn,model=float16",
+                "sglang/nixl/dtype=fp8_e5m2,page=16,attn=xformers,model=bfloat16"
+              ],
+              "mismatches": [
+                "kv_cache_dtype",
+                "page_size"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "kv_cache_dtype",
+                "page_size"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "sglang/nixl/dtype=auto,page=16,attn=flash_attn,model=bfloat16"
+              ],
+              "decode": [
+                "sglang/nixl/dtype=auto,page=64,attn=flash_attn,model=float16",
+                "sglang/nixl/dtype=fp8_e5m2,page=16,attn=xformers,model=bfloat16"
+              ],
+              "mismatches": [
+                "kv_cache_dtype",
+                "page_size"
+              ]
+            }
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "kv_cache_dtype",
+                "page_size"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "sglang/nixl/dtype=auto,page=16,attn=flash_attn,model=bfloat16"
+              ],
+              "decode": [
+                "sglang/nixl/dtype=auto,page=64,attn=flash_attn,model=float16",
+                "sglang/nixl/dtype=fp8_e5m2,page=16,attn=xformers,model=bfloat16"
+              ],
+              "mismatches": [
+                "kv_cache_dtype",
+                "page_size"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "kv_cache_dtype",
+                "page_size"
+              ]
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "sglang/nixl/dtype=auto,page=16,attn=flash_attn,model=bfloat16"
+              ],
+              "decode": [
+                "sglang/nixl/dtype=auto,page=64,attn=flash_attn,model=float16",
+                "sglang/nixl/dtype=fp8_e5m2,page=16,attn=xformers,model=bfloat16"
+              ],
+              "mismatches": [
+                "kv_cache_dtype",
+                "page_size"
+              ]
+            }
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-a-version-counts-strictly-where-both-report-one",
+      "prefills": [
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": "1",
+          "kv_layout": [],
+          "key": "sglang/nixl/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": "1",
+          "kv_layout": [],
+          "key": "sglang/nixl/?"
+        },
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": "0",
+          "kv_layout": [],
+          "key": "sglang/nixl/?"
+        },
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "sglang/nixl/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                "version",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                2
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1,
+                2
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1,
+                2
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                null,
+                "version",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                2
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null,
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1,
+                2
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1,
+                2
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-two-versions-of-prefill-list-the-same-decodes",
+      "prefills": [
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": "1",
+          "kv_layout": [],
+          "key": "sglang/nixl/?"
+        },
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": "2",
+          "kv_layout": [],
+          "key": "sglang/nixl/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "sglang/nixl/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                null
+              ],
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null
+              ],
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null
+              ],
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                null
+              ],
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                null
+              ],
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null
+              ],
+              [
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              [
+                0
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-a-refusal-names-each-component-once",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "sglang",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "sglang/nixl/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        },
+        {
+          "runtime": "tokenspeed",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "tokenspeed/mooncake/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "transport",
+                "runtime"
+              ],
+              [
+                "runtime",
+                "runtime"
+              ]
+            ],
+            "partners": [
+              [],
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "sglang/nixl/?",
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "tokenspeed/mooncake/?",
+                "vllm/mooncake/?"
+              ],
+              "mismatches": [
+                "runtime",
+                "transport"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "transport",
+                "runtime"
+              ],
+              [
+                "runtime",
+                "runtime"
+              ]
+            ],
+            "partners": [
+              [],
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "sglang/nixl/?",
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "tokenspeed/mooncake/?",
+                "vllm/mooncake/?"
+              ],
+              "mismatches": [
+                "runtime",
+                "transport"
+              ]
+            }
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                "runtime"
+              ],
+              [
+                "runtime",
+                "runtime"
+              ]
+            ],
+            "partners": [
+              [
+                0
+              ],
+              []
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "transport",
+                "runtime"
+              ],
+              [
+                "runtime",
+                "runtime"
+              ]
+            ],
+            "partners": [
+              [],
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "sglang/nixl/?",
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "tokenspeed/mooncake/?",
+                "vllm/mooncake/?"
+              ],
+              "mismatches": [
+                "runtime",
+                "transport"
+              ]
+            }
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "transport",
+                "runtime"
+              ],
+              [
+                "runtime",
+                "runtime"
+              ]
+            ],
+            "partners": [
+              [],
+              []
+            ],
+            "refusal": {
+              "prefill": [
+                "sglang/nixl/?",
+                "vllm/nixl/?"
+              ],
+              "decode": [
+                "tokenspeed/mooncake/?",
+                "vllm/mooncake/?"
+              ],
+              "mismatches": [
+                "runtime",
+                "transport"
+              ]
+            }
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null
+              ],
+              [
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1
+              ],
+              [
+                0,
+                1
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-prefills-and-no-decode",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        }
+      ],
+      "decodes": [],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              []
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              []
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              []
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              []
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              []
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              []
+            ],
+            "partners": [
+              []
+            ],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-decodes-and-no-prefill",
+      "prefills": [],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [],
+            "partners": [],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [],
+            "partners": [],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [],
+            "partners": [],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [],
+            "partners": [],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [],
+            "partners": [],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [],
+            "partners": [],
+            "refusal": null
+          }
+        }
+      }
+    },
+    {
+      "name": "pair-the-lists-keep-the-pools-order",
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake-store",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake-store/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/?/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": null,
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/?/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "nixl",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/nixl/?"
+        },
+        {
+          "runtime": "vllm",
+          "protocol": null,
+          "transport": "mooncake",
+          "version": null,
+          "kv_layout": [],
+          "key": "vllm/mooncake/?"
+        }
+      ],
+      "outcome": {
+        "grpc": {
+          "strict": {
+            "verdicts": [
+              [
+                "transport",
+                null,
+                "unknown transport",
+                "transport",
+                null
+              ],
+              [
+                "transport",
+                "transport",
+                "unknown transport",
+                "transport",
+                "transport"
+              ],
+              [
+                null,
+                "transport",
+                "unknown transport",
+                null,
+                "transport"
+              ],
+              [
+                "unknown transport",
+                "unknown transport",
+                "unknown transport",
+                "unknown transport",
+                "unknown transport"
+              ],
+              [
+                "transport",
+                null,
+                "unknown transport",
+                "transport",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                1,
+                4
+              ],
+              [],
+              [
+                0,
+                3
+              ],
+              [],
+              [
+                1,
+                4
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "transport",
+                null,
+                null,
+                "transport",
+                null
+              ],
+              [
+                "transport",
+                "transport",
+                null,
+                "transport",
+                "transport"
+              ],
+              [
+                null,
+                "transport",
+                null,
+                null,
+                "transport"
+              ],
+              [
+                null,
+                null,
+                null,
+                null,
+                null
+              ],
+              [
+                "transport",
+                null,
+                null,
+                "transport",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                1,
+                2,
+                4
+              ],
+              [
+                2
+              ],
+              [
+                0,
+                2,
+                3
+              ],
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ],
+              [
+                1,
+                2,
+                4
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null,
+                null,
+                null,
+                null
+              ],
+              [
+                null,
+                null,
+                null,
+                null,
+                null
+              ],
+              [
+                null,
+                null,
+                null,
+                null,
+                null
+              ],
+              [
+                null,
+                null,
+                null,
+                null,
+                null
+              ],
+              [
+                null,
+                null,
+                null,
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ],
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ],
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ],
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ],
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ]
+            ],
+            "refusal": null
+          }
+        },
+        "http": {
+          "strict": {
+            "verdicts": [
+              [
+                "transport",
+                null,
+                "unknown transport",
+                "transport",
+                null
+              ],
+              [
+                "transport",
+                "transport",
+                "unknown transport",
+                "transport",
+                "transport"
+              ],
+              [
+                null,
+                "transport",
+                "unknown transport",
+                null,
+                "transport"
+              ],
+              [
+                "unknown transport",
+                "unknown transport",
+                "unknown transport",
+                "unknown transport",
+                "unknown transport"
+              ],
+              [
+                "transport",
+                null,
+                "unknown transport",
+                "transport",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                1,
+                4
+              ],
+              [],
+              [
+                0,
+                3
+              ],
+              [],
+              [
+                1,
+                4
+              ]
+            ],
+            "refusal": null
+          },
+          "lenient": {
+            "verdicts": [
+              [
+                "transport",
+                null,
+                null,
+                "transport",
+                null
+              ],
+              [
+                "transport",
+                "transport",
+                null,
+                "transport",
+                "transport"
+              ],
+              [
+                null,
+                "transport",
+                null,
+                null,
+                "transport"
+              ],
+              [
+                null,
+                null,
+                null,
+                null,
+                null
+              ],
+              [
+                "transport",
+                null,
+                null,
+                "transport",
+                null
+              ]
+            ],
+            "partners": [
+              [
+                1,
+                2,
+                4
+              ],
+              [
+                2
+              ],
+              [
+                0,
+                2,
+                3
+              ],
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ],
+              [
+                1,
+                2,
+                4
+              ]
+            ],
+            "refusal": null
+          },
+          "off": {
+            "verdicts": [
+              [
+                null,
+                null,
+                null,
+                null,
+                null
+              ],
+              [
+                null,
+                null,
+                null,
+                null,
+                null
+              ],
+              [
+                null,
+                null,
+                null,
+                null,
+                null
+              ],
+              [
+                null,
+                null,
+                null,
+                null,
+                null
+              ],
+              [
+                null,
+                null,
+                null,
+                null,
+                null
+              ]
+            ],
+            "partners": [
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ],
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ],
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ],
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ],
+              [
+                0,
+                1,
+                2,
+                3,
+                4
+              ]
+            ],
+            "refusal": null
+          }
+        }
+      }
+    }
+  ]
+}

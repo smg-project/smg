@@ -6,6 +6,7 @@ pub mod identity;
 pub mod kv;
 pub mod load;
 pub mod pd;
+pub(crate) mod periodic_task;
 pub mod registry;
 pub mod runtime;
 #[cfg(any(test, feature = "test-util"))]
@@ -19,7 +20,7 @@ pub use health::liveness::configure_from as configure_liveness;
 pub use health::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     liveness::{budgets as liveness_budgets, Budgets as LivenessBudgets},
-    manager::WorkerManager,
+    manager::{WorkerJobs, WorkerManager},
     overload::OverloadThresholds,
     resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES},
 };
@@ -44,7 +45,7 @@ pub use kv::{
 };
 pub use load::{
     capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity},
-    monitor::{WorkerLoadManager, WorkerMonitor},
+    monitor::{LoadConsumer, WorkerLoadManager, WorkerMonitor},
 };
 // Re-export UNKNOWN_MODEL_ID from protocols
 pub use openai_protocol::UNKNOWN_MODEL_ID;
@@ -56,4 +57,4 @@ pub use openai_protocol::{
 pub(crate) use pd::pair_index::{PdPairIndex, PdWire};
 pub use pd::pairing::{PairingMismatch, PdPairing, PdPairingMode};
 pub use registry::{service::WorkerService, WorkerOrigin, WorkerRegistry};
-pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool, WindowFloor};
+pub(crate) use registry::{ModelLabels, ModelWorkerSnapshot, RoutingPool, WindowFloor};

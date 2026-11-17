@@ -569,6 +569,19 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // a thought, so the model is never told a call syntax: content alone (bellwether's reference
     // refused every call and reasoning probe, leaving three common cases and two turn shapes).
     ("midashenglm-spatial", GenerationPrompt::Plain),
+    // Checkpoints whose template writes neither a call nor a thought: every reference bellwether
+    // recorded for them is content alone, and the plain table reads it as it stands.
+    ("audio-flamingo-3-hf", GenerationPrompt::Plain),
+    ("bar-2x7b-base", GenerationPrompt::Plain),
+    ("bitcpm-cann-3b-unquantized", GenerationPrompt::Plain),
+    ("caprl-internvl3.5-8b", GenerationPrompt::Plain),
+    ("cogalign-llava-ov-0-5b", GenerationPrompt::Plain),
+    (
+        "deep-ignorance-unfiltered-instruct-test",
+        GenerationPrompt::Plain,
+    ),
+    ("dogr", GenerationPrompt::Plain),
+    ("dots.mocr", GenerationPrompt::Plain),
     // Python calls: Olmo 3 has no thought; LFM2.5's template adds nothing to the turn opener in
     // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", GenerationPrompt::Plain),

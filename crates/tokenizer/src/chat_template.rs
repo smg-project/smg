@@ -85,6 +85,28 @@ impl ThinkingKeyName {
             ThinkingKeyName::ReasoningEffort => "reasoning_effort",
         }
     }
+
+    /// The kwarg value that switches thinking on or off under this key: a
+    /// boolean, or the key's own words where the template compares strings.
+    fn value(self, thinking: bool) -> serde_json::Value {
+        match self {
+            ThinkingKeyName::EnableThinking | ThinkingKeyName::Thinking => {
+                serde_json::Value::Bool(thinking)
+            }
+            ThinkingKeyName::ReasoningEffort => serde_json::Value::String(
+                if thinking {
+                    REASONING_EFFORT_ON_VALUES[0]
+                } else {
+                    REASONING_EFFORT_OFF_VALUES[0]
+                }
+                .to_string(),
+            ),
+            // The tri-state key compares strings, not booleans.
+            ThinkingKeyName::ThinkingMode => {
+                serde_json::Value::String(if thinking { "enabled" } else { "disabled" }.to_string())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -107,7 +129,9 @@ pub enum ThinkingToggle {
 /// Detect whether the chat template supports a thinking/reasoning toggle
 /// and what its default value is. A `thinking` variable counts where the
 /// template's code reads it (`mentions_thinking_variable`), not where its
-/// prose prints the word.
+/// prose prints the word. The default is read from the template's text: a
+/// state built from the template takes it only where the template's own
+/// renders do not say (`ChatTemplateState::rendered_thinking_default`).
 pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<ThinkingKeyName>) {
     if template.contains("think_begin_token")
         && template.contains("no_think")
@@ -1613,8 +1637,46 @@ fn sort_json_keys(value: &JsonValue) -> JsonValue {
 /// Hugging Face chat-template helper for surfacing model-authored validation
 /// errors instead of a generic "unknown function" render failure.
 fn raise_exception(message: String) -> std::result::Result<String, MinijinjaError> {
-    Err(MinijinjaError::new(ErrorKind::InvalidOperation, message))
+    Err(MinijinjaError::new(ErrorKind::InvalidOperation, message).with_source(RaisedByTemplate))
 }
+
+/// The source of the error [`raise_exception`] returns. The template engine
+/// reports an operation it could not run under the same kind, so the kind
+/// alone does not say that the template refused its input on purpose; this
+/// source does.
+#[derive(Debug)]
+struct RaisedByTemplate;
+
+impl std::fmt::Display for RaisedByTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("raised by the template")
+    }
+}
+
+impl std::error::Error for RaisedByTemplate {}
+
+/// A render the template itself refused through `raise_exception`: the helper
+/// a template's author calls to reject a conversation the template cannot
+/// format (roles out of order, a field it needs). The caller's input is at
+/// fault; any other render failure may be the template's own. The text is the
+/// render failure's, as every render failure reads.
+#[derive(Debug)]
+pub struct TemplateRefusal(String);
+
+impl TemplateRefusal {
+    /// Whether `error` is this refusal, at any depth of its chain.
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<Self>())
+    }
+}
+
+impl std::fmt::Display for TemplateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TemplateRefusal {}
 
 /// Transformers' `{% generation %}` ... `{% endgeneration %}` block marks the
 /// assistant tokens for a training mask and renders its body unchanged; the
@@ -2651,8 +2713,18 @@ fn render_messages<'a>(
     // Render into a buffer sized by the last render through this template:
     // the text grows past no capacity on the way.
     let mut rendered = Vec::with_capacity(output_len.hint());
-    tmpl.render_captured_to(&ctx, &mut rendered)
-        .map_err(|e| anyhow!("Failed to render template: {e}"))?;
+    tmpl.render_captured_to(&ctx, &mut rendered).map_err(|e| {
+        let message = format!("Failed to render template: {e}");
+        // The template's own refusal keeps its type, at any depth of the
+        // error's sources (a macro or an include wraps it).
+        let raised = iter::successors(std::error::Error::source(&e), |cause| cause.source())
+            .any(|cause| cause.is::<RaisedByTemplate>());
+        if raised {
+            anyhow::Error::new(TemplateRefusal(message))
+        } else {
+            anyhow!(message)
+        }
+    })?;
     let mut rendered = String::from_utf8(rendered)
         .map_err(|e| anyhow!("Failed to render template: the output is not UTF-8: {e}"))?;
     output_len.record(rendered.len());
@@ -3010,7 +3082,9 @@ pub struct ChatTemplateState {
     /// Cached, fully-configured environment. `None` when no template is set.
     env: Option<Environment<'static>>,
     content_format: ChatTemplateContentFormat,
-    /// Thinking toggle support detected from the template.
+    /// The template's thinking switch and its default: what the template
+    /// renders with the switch absent, or the text matcher's answer where
+    /// the renders do not say (see `rendered_thinking_default`).
     thinking_toggle: ThinkingToggle,
     /// The variable name used for the thinking toggle (if any).
     thinking_key_name: Option<ThinkingKeyName>,
@@ -3100,7 +3174,7 @@ impl ChatTemplateState {
             marked: false,
             names_read,
         };
-        state.raw_tool_call_arguments = state.writes_tool_call_arguments_as_text();
+        state.settle_by_behaviour();
         Ok(state)
     }
 
@@ -3364,24 +3438,7 @@ impl ChatTemplateState {
                 .is_none_or(|k| !k.contains_key(kwarg_key))
             {
                 let mut kwargs = params.template_kwargs.cloned().unwrap_or_default();
-                let value = match key {
-                    ThinkingKeyName::EnableThinking | ThinkingKeyName::Thinking => {
-                        serde_json::Value::Bool(thinking)
-                    }
-                    ThinkingKeyName::ReasoningEffort => serde_json::Value::String(
-                        if thinking {
-                            REASONING_EFFORT_ON_VALUES[0]
-                        } else {
-                            REASONING_EFFORT_OFF_VALUES[0]
-                        }
-                        .to_string(),
-                    ),
-                    // The tri-state key compares strings, not booleans.
-                    ThinkingKeyName::ThinkingMode => serde_json::Value::String(
-                        if thinking { "enabled" } else { "disabled" }.to_string(),
-                    ),
-                };
-                kwargs.insert(kwarg_key.to_string(), value);
+                kwargs.insert(kwarg_key.to_string(), key.value(thinking));
                 let params = ChatTemplateParams {
                     template_kwargs: Some(&kwargs),
                     thinking: None,
@@ -3470,7 +3527,7 @@ impl ChatTemplateState {
         self.tool_use = None;
         self.processor = None;
         self.marked = false;
-        self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
+        self.settle_by_behaviour();
         Ok(())
     }
 
@@ -3581,6 +3638,50 @@ impl ChatTemplateState {
             self.apply(&messages, ChatTemplateParams::default()).is_ok()
         };
         renders(serde_json::json!("{\"probe\": 1}")) && !renders(serde_json::json!({"probe": 1}))
+    }
+
+    /// Decide the thinking switch's default by the template's behaviour, not
+    /// its source: one bare user turn with the generation prompt, rendered
+    /// with the switch absent, on and off, at one instant (a template may
+    /// write the time). The absent render is the default:
+    /// on where it equals the on render alone, off where it equals the off
+    /// render alone. `None` where the renders do not say, and the text
+    /// matcher's answer stands ([`detect_thinking_toggle`]): a template with
+    /// no switch, a bare turn that does not render, a switch that moves
+    /// nothing on a bare turn, an absent render that is a prompt of its own.
+    fn rendered_thinking_default(&self) -> Option<ThinkingToggle> {
+        let key = self.thinking_key_name?;
+        let messages = [serde_json::json!({"role": "user", "content": "probe"})];
+        // One instant for the three renders: a template that writes the time
+        // (`strftime_now`) must not tell them apart by the clock alone.
+        let now = render_instant();
+        let render = |thinking: Option<bool>| {
+            let kwargs = thinking
+                .map(|thinking| HashMap::from([(key.as_kwarg().to_string(), key.value(thinking))]));
+            let params = ChatTemplateParams {
+                add_generation_prompt: true,
+                template_kwargs: kwargs.as_ref(),
+                now: Some(now),
+                ..Default::default()
+            };
+            self.apply(&messages, params).ok()
+        };
+        let (absent, on, off) = (render(None)?, render(Some(true))?, render(Some(false))?);
+        match (absent == on, absent == off) {
+            (true, false) => Some(ThinkingToggle::DefaultOn),
+            (false, true) => Some(ThinkingToggle::DefaultOff),
+            _ => None,
+        }
+    }
+
+    /// The answers read from the template's behaviour once its environment
+    /// is in place: how it writes a history tool call's arguments, and the
+    /// thinking switch's default where its renders say it.
+    fn settle_by_behaviour(&mut self) {
+        self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
+        if let Some(default) = self.rendered_thinking_default() {
+            self.thinking_toggle = default;
+        }
     }
 }
 

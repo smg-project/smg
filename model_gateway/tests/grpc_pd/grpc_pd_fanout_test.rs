@@ -274,7 +274,9 @@ async fn chat_continuous_usage_is_opt_in_for_single_and_multiple_choices() {
                 "stream_options": options,
             }))
             .unwrap();
-            let response = router.route_chat(None, &tenant(), request, MODEL).await;
+            let response = router
+                .route_chat(None, &tenant(), Arc::new(request), MODEL)
+                .await;
             let status = response.status();
             let body = read_body(response).await;
             assert_eq!(status, http::StatusCode::OK, "{body}");

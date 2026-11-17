@@ -26,9 +26,10 @@ pub(crate) fn describe_error(error: &dyn std::error::Error) -> String {
 
 /// Logical column names for the responses table, in canonical SELECT order.
 ///
-/// Shared between Oracle and Postgres backends to build dynamic SELECT queries.
-/// The order here doesn't affect correctness (both backends read by name, not
-/// position), but having a single source prevents accidental divergence.
+/// The one list of the table's columns: the Oracle and Postgres backends build
+/// their SELECT base from it (both read by name, so the order is a convention),
+/// and the schema validation reads it as the core columns an extra column may
+/// not shadow and a skipped column has to be one of.
 pub(super) const RESPONSE_COLUMNS: &[&str] = &[
     "id",
     "conversation_id",
