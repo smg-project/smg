@@ -314,9 +314,7 @@ impl VisionPreProcessor for DeepseekV41Processor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
         let plans: Vec<GridPlan> = images
             .iter()
