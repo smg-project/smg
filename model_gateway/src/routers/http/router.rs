@@ -4137,39 +4137,11 @@ mod tests {
         );
     }
 
-    /// Loopback engine stub on `/body` whose head and first chunk leave at
-    /// once and whose body then never ends, as an engine that stalls
-    /// mid-answer does: the client's own timeout is what ends the read.
-    async fn spawn_stalled_body_stub() -> String {
-        let app = axum::Router::new().route(
-            "/body",
-            axum::routing::post(|| async {
-                let head = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
-                    b"{\"partial\":",
-                ))]);
-                (
-                    [(CONTENT_TYPE, "application/json")],
-                    Body::from_stream(head.chain(stream::pending())),
-                )
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test stub server lives for the duration of the test process"
-        )]
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("http://{addr}")
-    }
-
     /// The request's own timeout running out while the body is read is the
     /// request's end: the same 504 as before the head, and as final.
     #[tokio::test]
     async fn read_worker_body_capped_ends_the_request_at_its_timeout() {
-        let url = spawn_stalled_body_stub().await;
+        let url = spawn_stalled_stream_stub("/body", "application/json", &["{\"partial\":"]).await;
         let client = client_with_timeout(Duration::from_millis(200));
 
         let response = Router::read_worker_body_capped(worker_body(&client, &url).await, 1 << 20)
@@ -6221,6 +6193,82 @@ mod tests {
         let error: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap())
             .expect("the error event is a frame of its own");
         assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(events[3], "data: [DONE]");
+    }
+
+    /// An engine's server on `path` whose head and chunks leave at once as
+    /// `content_type` and whose body then never ends, as an engine that
+    /// stalls mid-answer does: the client's own timeout is what ends the
+    /// read.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_stalled_stream_stub(
+        path: &'static str,
+        content_type: &'static str,
+        chunks: &'static [&'static str],
+    ) -> String {
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::post(move || async move {
+                let sent =
+                    stream::iter(chunks.iter().map(|chunk| {
+                        Ok::<_, std::io::Error>(Bytes::from_static(chunk.as_bytes()))
+                    }));
+                (
+                    [(CONTENT_TYPE, content_type)],
+                    Body::from_stream(sent.chain(stream::pending())),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// A stream the gateway's request timeout cuts ends with the event that
+    /// names the timeout, the code of the 504 the same request gets unary,
+    /// and with `[DONE]`.
+    #[tokio::test]
+    async fn a_stream_the_request_timeout_cuts_ends_with_the_timeouts_code() {
+        let url =
+            spawn_stalled_stream_stub("/v1/chat/completions", "text/event-stream", CHAT_SSE_CHUNKS)
+                .await;
+        let worker = BasicWorkerBuilder::new(&url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .http_client(client_with_timeout(Duration::from_millis(300)))
+            .build();
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 4, "{body}");
+        let error: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(
+            error["error"]["code"], "call_upstream_timeout",
+            "the event names the timeout as the 504 does: {body}"
+        );
         assert_eq!(events[3], "data: [DONE]");
     }
 
