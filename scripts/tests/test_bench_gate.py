@@ -1620,6 +1620,42 @@ def test_a_level_count_is_two_counts_of_each_executable_that_agree(mod, tmp_path
     assert "it is not steady on one executable alone" in said and "level" not in said
 
 
+def test_two_counts_that_differ_are_decided_at_a_batch_all_four_counts_ran(mod, tmp_path):
+    # A second count that ended one batch early: the row is decided one batch earlier, where
+    # every count ran, and its line names that batch.
+    short = counted_twice(400_000, 400_024)
+    short["pr"]["again"] = doubling(400_024, 2)[:2]
+    verdict, said = whole_row(mod, tmp_path, short)
+    assert verdict == "placement"
+    assert (
+        "200,000 instructions on the base and 200,012 on the pull request over a batch of 2 "
+        "iterations (+0.006%, 6.0 instructions an iteration more), the same in two counts of each"
+    ) in said
+    # The base's second count one batch short bounds the row the same way.
+    mirror = counted_twice(400_000, 400_024)
+    mirror["base"]["again"] = doubling(400_000, 2)[:2]
+    verdict, said = whole_row(mod, tmp_path, mirror)
+    assert verdict == "placement" and "over a batch of 2 iterations" in said
+    # What one count alone read past that batch decides nothing: here it is 1 % apart, and the
+    # batch all four ran reads level.
+    last = counted_twice(400_000, 400_024)
+    last["pr"]["batches"] = [*doubling(400_024, 2)[:2], 404_000]
+    last["pr"]["again"] = doubling(400_024, 2)[:2]
+    assert whole_row(mod, tmp_path, last)[0] == "placement"
+    # A second count the same batch through keeps that reading: 1 % is beyond the level.
+    assert whole_row(mod, tmp_path, counted_twice(400_000, 404_000))[0] == "regression"
+    # A second count of its first batch alone leaves no batch all four ran: the time decides.
+    alone = counted_twice(400_000, 400_024)
+    for side in ("base", "pr"):
+        alone[side]["again"] = alone[side]["again"][:1]
+    verdict, said = whole_row(mod, tmp_path, alone)
+    assert verdict == "regression"
+    assert said == (
+        " The count was not read (a second count ended before the batches that differ): the "
+        "time alone decides."
+    )
+
+
 def test_a_whole_pass_id_on_the_same_count_asks_no_moved_function(mod, tmp_path):
     same = {"base": {"batches": [9, 20, 40]}, "pr": {"batches": [7, 20, 40]}}
     verdict, said = whole_row(mod, tmp_path, same)
@@ -1689,7 +1725,14 @@ def test_the_repository_gate_files_mark_the_rows_that_time_a_whole_decision(mod)
         "policy-engine.toml": {
             "policy_engine/decide/cache_aware/8": True,
             "policy_engine/decide/least_load_credited/8": True,
-            "policy_engine/decide/manual_keyed_hit/64": True,
+            "policy_engine/decide/cache_aware/512": True,
+            "policy_engine/decide/passthrough/8": True,
+            "policy_engine/decide/manual_keyed_miss/8": True,
+            "policy_engine/decide/manual_keyed_hit/8": False,
+            "policy_engine/decide/passthrough/64": False,
+            "policy_engine/decide/power_of_two/512": False,
+            "policy_engine/decide/random/64": False,
+            "policy_engine/decide/round_robin/512": False,
             "policy_engine/view_build/64": False,
             "policy_engine/spec/parse_validate": False,
         },
@@ -1707,5 +1750,6 @@ def test_the_repository_gate_files_mark_the_rows_that_time_a_whole_decision(mod)
     engine = mod.load_gates(root / "policy-engine.toml")
     assert engine.threshold_for("policy_engine/decide/least_load_credited/8").threshold == 0.15
     assert engine.threshold_for("policy_engine/decide/cache_aware/8").threshold == 0.10
+    assert engine.threshold_for("policy_engine/decide/random/64").threshold == 0.10
     for name in ("policy-engine-power-of-two.toml", "policy-store.toml"):
         assert not any(gate.whole_pass for gate in mod.load_gates(root / name).gates), name
