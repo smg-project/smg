@@ -52,7 +52,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     decide,
-    floor::{unbelieved, Told, FLOORS_SPENT_MAX},
+    floor::{unbelieved, Told, FLOORS_SPENT_MAX, FLOOR_REACH},
     gateways::{over_kinds, Refused, Seat, Vetoed, KINDS_MAX, VETOES_MAX},
     lifecycle,
     principal::Principal,
@@ -442,7 +442,8 @@ async fn fenced(shared: &Shared, term: u64, now: Instant, answers: &mut Answers)
 /// next take is above the floor. A floor that is not believed
 /// ([`unbelieved`]) is refused by its field's name and says nothing. Past
 /// the budget of terms one process moves on such floors the frame is
-/// refused in the same words and nothing is said.
+/// refused in the same words and nothing is said, and so is a floor whose
+/// take would land past the reach of every process's floors.
 fn floor(shared: &Shared, subject: &str, floor: u64, term: u64) -> Option<Status> {
     if floor <= term {
         return None;
@@ -464,7 +465,14 @@ fn floor(shared: &Shared, subject: &str, floor: u64, term: u64) -> Option<Status
             budget = FLOORS_SPENT_MAX,
             "this process has too few terms left for a gateway's floor; a floor past what is left is refused and moves nothing until the process starts again"
         ),
-        Told::Kept | Told::Spent { first: false } => {}
+        Told::Past { first: true } => warn!(
+            gateway = %subject,
+            floor,
+            term,
+            reach = FLOOR_REACH,
+            "a gateway's term floor is past the terms a floor may move the lease to; it is refused and moves nothing, also after a restart"
+        ),
+        Told::Kept | Told::Spent { first: false } | Told::Past { first: false } => {}
     }
     Some(Status::failed_precondition(format!(
         "the gateway's term floor {floor} is above this controller's term {term}"
@@ -628,7 +636,7 @@ mod tests {
         controller::{
             config::Scope,
             election::{LeasePlace, Said, Standing},
-            floor::{FLOORS_SPENT_MAX, FLOOR_BELIEVED},
+            floor::{FLOORS_SPENT_MAX, FLOOR_BELIEVED, FLOOR_REACH},
             gateways::{
                 tests::{lease, PATIENT},
                 Gateways, Refused, KINDS_MAX, VETOES_MAX,
@@ -1181,6 +1189,45 @@ mod tests {
 
         let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
         let line = "this process has too few terms left for a gateway's floor";
+        assert_eq!(logged.matches(line).count(), 1, "{logged}");
+    }
+
+    /// The floors of every process move the lease to the reach and no
+    /// further: a floor whose take would land past it is refused in the
+    /// same words, it says nothing, and the log says so once.
+    #[tokio::test]
+    async fn a_floor_past_the_reach_is_refused_as_before_and_says_nothing() {
+        // The subscriber of the Welcome's log case, for the same reason.
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+
+        let bed = bed(PATIENT).await;
+        let (door, said) = Said::door();
+        bed.shared.floors.open(door);
+        // The last floor a word moves the lease for: its take is the reach.
+        let term = FLOOR_REACH - 2;
+        let status = floor(&bed.shared, GATEWAY, FLOOR_REACH - 1, term).expect("refused");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(said.terms(), [FLOOR_REACH - 1]);
+        let term = FLOOR_REACH;
+        for high in [term + 1, term + 2] {
+            let status = floor(&bed.shared, GATEWAY, high, term).expect("refused");
+            assert_eq!(status.code(), Code::FailedPrecondition);
+            assert_eq!(
+                status.message(),
+                format!("the gateway's term floor {high} is above this controller's term {term}")
+            );
+        }
+        assert!(said.terms().is_empty());
+
+        let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+        let line = "a gateway's term floor is past the terms a floor may move the lease to";
         assert_eq!(logged.matches(line).count(), 1, "{logged}");
     }
 

@@ -39,9 +39,10 @@
 // floor more than 65,536 above the term, or one that leaves no term to
 // take, is not believed: INVALID_ARGUMENT by the field's name, and the
 // lease stands; one controller process moves the lease 1,048,576 terms on
-// such floors at most, and past them a floor above the term is refused the
-// same and moves nothing); a leader past its renew deadline sends
-// NotLeader with an empty address and releases nothing.
+// such floors at most and no floor moves it past term 8,388,608, and past
+// either a floor above the term is refused the same and moves nothing); a
+// leader past its renew deadline sends NotLeader with an empty address and
+// releases nothing.
 // Flow: design 5.2. Budgets are relative to receipt, never absolute; credits
 // ride the Decide stream as deltas (Credit) and are never taken back; with
 // no credit the gateway decides locally, and a DecideRequest sent with none

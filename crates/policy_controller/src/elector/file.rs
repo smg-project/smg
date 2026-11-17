@@ -10,8 +10,10 @@
 //! record's duration, and taken above the highest term that replica saw. A
 //! take of a file that holds no record leads one renew deadline later: a
 //! holder still alive has fenced itself by then. A replica started after the
-//! loss takes it at term one; the gateways' term floors then refuse the
-//! controller until they restart: keep the file.
+//! loss takes it at term one. A gateway's term floor above that term then
+//! moves the lease above it, one hand-over a rising floor, while the floor
+//! is believed (up to 65,536 above the term); past that the floors refuse
+//! the controller until the gateways restart: keep the file.
 //! Local filesystems only: the lock is the standard library's advisory lock,
 //! which a network filesystem need not honour between hosts.
 

@@ -15,14 +15,17 @@
 //! ([`crate::elector::TERM_CEILING`]). So the floors one process says
 //! move the lease up a budget of terms and no more
 //! ([`FLOORS_SPENT_MAX`]): past it a floor above the term is refused as
-//! before and says nothing.
+//! before and says nothing. A budget is one process's and the lease
+//! outlives every process, so no floor moves the lease past a mark either
+//! ([`FLOOR_REACH`]): the terms above it are kept for hand-overs, whatever
+//! any process said before.
 
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 
 use super::election::Door;
-use crate::elector::term_said;
+use crate::elector::{term_said, TERM_CEILING};
 
 /// How far above the term a gateway's floor is believed. A floor counts the
 /// hand-overs a fleet lived through and stays far under it. One further
@@ -53,17 +56,32 @@ pub(crate) fn unbelieved(floor: u64, term: u64) -> Option<String> {
 /// that lost.
 pub(crate) const FLOORS_SPENT_MAX: u64 = 16 * FLOOR_BELIEVED;
 
+/// The highest term a floor's word moves the lease to, in every process:
+/// half the terms an election can take. A budget renews when its process
+/// starts again and the lease keeps the term, so the budgets of sixteen
+/// process lifetimes would spend every term, and no replica could take the
+/// lease after that. The terms above the reach are kept for hand-overs. A
+/// floor whose take would land past it is refused as before and moves
+/// nothing.
+pub(crate) const FLOOR_REACH: u64 = TERM_CEILING / 2;
+
+// A floor under the reach leaves a term to take: the election's door
+// refuses no word the floors say.
+const _: () = assert!(FLOOR_REACH < TERM_CEILING - 1);
+
 /// What became of a believed floor above the term ([`Floors::say`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Told {
     /// Said to the election.
     Said,
-    /// Not said: one as high was said, the election does not run yet, or
-    /// the election refuses its term.
+    /// Not said: one as high was said, or the election does not run yet.
     Kept,
     /// Not said: the budget has too few terms left for it. `first` at the
     /// first floor it could not hold.
     Spent { first: bool },
+    /// Not said: its take would land past the reach. `first` at the first
+    /// such floor.
+    Past { first: bool },
 }
 
 /// What the floors said so far come to.
@@ -75,6 +93,8 @@ struct Words {
     spent: u64,
     /// Whether a floor was refused its word for the budget.
     out: bool,
+    /// Whether a floor was refused its word for the reach.
+    past: bool,
 }
 
 /// The floors said to the election. The election keeps a term it was told,
@@ -98,7 +118,8 @@ impl Floors {
     }
 
     /// Says `floor`, a believed floor above `term`, unless one as high was
-    /// said, the election does not run yet or the budget cannot hold it.
+    /// said, the election does not run yet, its take would land past the
+    /// reach or the budget cannot hold it.
     /// The lease moves up from the higher of the term and the floor last
     /// said to the next take's term, one above the floor: that many terms
     /// are spent.
@@ -110,19 +131,22 @@ impl Floors {
         if words.said >= floor {
             return Told::Kept;
         }
+        // The take after a floor's word is one above the floor.
+        if floor >= FLOOR_REACH {
+            let first = !words.past;
+            words.past = true;
+            return Told::Past { first };
+        }
         let moved = floor - words.said.max(term) + 1;
         if words.spent + moved > FLOORS_SPENT_MAX {
             let first = !words.out;
             words.out = true;
             return Told::Spent { first };
         }
-        // The election refuses a term that leaves none to take, as the
-        // floor's judge did before it came here: nothing is said or spent.
-        if door.saw(floor).is_err() {
-            return Told::Kept;
-        }
         words.spent += moved;
         words.said = floor;
+        // Under the reach the door refuses no term.
+        let _ = door.saw(floor);
         Told::Said
     }
 
@@ -135,7 +159,7 @@ impl Floors {
 
 #[cfg(test)]
 mod tests {
-    use super::{unbelieved, Floors, Told, FLOORS_SPENT_MAX, FLOOR_BELIEVED};
+    use super::{unbelieved, Floors, Told, FLOORS_SPENT_MAX, FLOOR_BELIEVED, FLOOR_REACH};
     use crate::{controller::election::Said, elector::TERM_CEILING};
 
     #[test]
@@ -206,18 +230,63 @@ mod tests {
     }
 
     #[test]
-    fn a_floor_the_election_refuses_is_neither_said_nor_spent() {
+    fn a_floor_whose_take_would_pass_the_reach_is_refused_its_word() {
         let floors = Floors::default();
         let (door, said) = Said::door();
         floors.open(door);
-        // The session's judge refuses this floor before it comes here; the
-        // election's own refusal counts nothing.
-        assert_eq!(floors.say(TERM_CEILING - 1, TERM_CEILING - 3), Told::Kept);
+        // The contract says the reach by its number.
+        assert_eq!(FLOOR_REACH, 8_388_608);
+        // The take after a floor is one above it: the floor under the reach
+        // is the last a word moves the lease for.
+        let term = FLOOR_REACH - 2;
+        assert_eq!(floors.say(FLOOR_REACH, term), Told::Past { first: true });
+        assert_eq!(
+            floors.say(FLOOR_REACH + 1, term),
+            Told::Past { first: false }
+        );
         assert_eq!(floors.spent(), 0);
         assert!(said.terms().is_empty());
-        // The floor under it is said: the refused one was not remembered.
-        assert_eq!(floors.say(TERM_CEILING - 2, TERM_CEILING - 3), Told::Said);
-        assert_eq!(said.terms(), [TERM_CEILING - 2]);
+        assert_eq!(floors.say(FLOOR_REACH - 1, term), Told::Said);
+        assert_eq!(floors.spent(), 2);
+        assert_eq!(said.terms(), [FLOOR_REACH - 1]);
+        // A leader that hand-overs brought past the reach: no floor moves
+        // it, however little was spent.
+        assert_eq!(
+            floors.say(FLOOR_REACH + 9, FLOOR_REACH + 8),
+            Told::Past { first: false }
+        );
+        assert!(said.terms().is_empty());
+    }
+
+    #[test]
+    fn the_floors_of_every_process_lifetime_stop_at_the_reach() {
+        // The lease keeps the term a process's floors moved it to, and the
+        // next process starts with a whole budget.
+        let mut term = 1;
+        let mut lifetimes = 0;
+        loop {
+            let floors = Floors::default();
+            let (door, _said) = Said::door();
+            floors.open(door);
+            let started = term;
+            // A floor at the top of the believed range a word.
+            while floors.say(term + FLOOR_BELIEVED, term) == Told::Said {
+                term += FLOOR_BELIEVED + 1;
+            }
+            if term == started {
+                break;
+            }
+            lifetimes += 1;
+            // Sixteen budgets are every term: a mark that held none of
+            // these floors back ends the case here.
+            assert!(
+                lifetimes < TERM_CEILING / FLOORS_SPENT_MAX,
+                "the floors of {lifetimes} lifetimes moved the lease to {term}"
+            );
+        }
+        // Never past the reach, and within one word of it.
+        assert!(term <= FLOOR_REACH, "{term}");
+        assert!(term + FLOOR_BELIEVED >= FLOOR_REACH, "{term}");
     }
 
     #[test]
