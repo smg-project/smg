@@ -3,10 +3,11 @@
 The policy controller's replay runs the rows of a sheet it has a module for and reads no row of
 the others, so the table in the sheets' README is the only statement of what each sheet is. This
 holds the table to the files: every sheet has a row and every row a sheet and a recorder, and a
-row's commit, row counts and sha256 are the file's. A sheet of picks states its sequence rows and
-its drawn rows; the pair sheet picks nothing and states its pair rows, each an outcome on both
-pair wires; the overload sheet picks nothing either and states its verdict rows, each a verdict
-after every step.
+row's commit, row counts and sha256 are the file's. The recording table's test filter for a sheet
+is a tail of the module path the layout places its recorder at: a filter that names no test runs
+none and writes no sheet. A sheet of picks states its sequence rows and its drawn rows; the pair
+sheet picks nothing and states its pair rows, each an outcome on both pair wires; the overload
+sheet picks nothing either and states its verdict rows, each a verdict after every step.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ ROW = re.compile(
 )
 # A line of the README's layout: a recorder's path under the gateway's sources, then its sheet.
 PLACED = re.compile(r"^  (?P<path>[a-z_/]+\.rs) +(?P<sheet>[a-z_]+\.json)$")
+# A row of the README's recording table: a sheet, then the test filter that runs its recorder.
+TESTED = re.compile(r"^\| `(?P<sheet>[a-z_]+\.json)` \| `(?P<test>[a-z_:]+)` \|$")
 
 
 def readme() -> list[str]:
@@ -43,17 +46,35 @@ def table() -> dict[str, dict[str, str]]:
     return {row["sheet"]: row for row in rows}
 
 
+def layout() -> dict[str, str]:
+    lines = [at.groupdict() for line in readme() if (at := PLACED.match(line))]
+    once([at["sheet"] for at in lines], "the layout")
+    return {at["sheet"]: at["path"] for at in lines}
+
+
 def test_every_sheet_has_a_row_and_every_row_a_sheet_and_a_recorder():
     rows = table()
     assert sorted(rows) == sorted(path.name for path in SHEETS.glob("*.json"))
-    layout = [at.groupdict() for line in readme() if (at := PLACED.match(line))]
-    once([at["sheet"] for at in layout], "the layout")
-    placed = {at["sheet"]: at["path"] for at in layout}
+    placed = layout()
     assert sorted(placed) == sorted(rows), "the layout and the table name different sheets"
     for name, row in rows.items():
         recorder = GATEWAY / placed[name]
         assert recorder.name == row["recorder"], f"{name}: the layout says {placed[name]}"
         assert recorder.is_file(), f"{name}: no recorder {placed[name]}"
+
+
+def test_the_recording_table_runs_the_recorder_the_layout_places():
+    placed = layout()
+    tested = [at.groupdict() for line in readme() if (at := TESTED.match(line))]
+    once([at["sheet"] for at in tested], "the recording table")
+    assert sorted(at["sheet"] for at in tested) == sorted(placed), (
+        "the recording table and the layout name different sheets"
+    )
+    for at in tested:
+        module = "::" + placed[at["sheet"]].removesuffix(".rs").replace("/", "::")
+        assert module.endswith("::" + at["test"]), (
+            f"{at['sheet']}: the recording table runs {at['test']}, the layout says {module}"
+        )
 
 
 def test_a_row_states_its_sheets_commit_row_counts_and_sha256():
