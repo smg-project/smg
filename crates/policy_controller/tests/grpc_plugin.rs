@@ -2961,6 +2961,55 @@ fn a_dropped_plugin_ends_its_streams() {
 
 // --- the lifecycle and the exposure -------------------------------------------
 
+/// A scorer whose state the lifecycle's calls keep.
+#[derive(Debug)]
+struct Kept;
+
+impl Lifecycle for Kept {
+    fn needs_lifecycle(&self) -> bool {
+        true
+    }
+}
+
+impl Scorer for Kept {
+    fn name(&self) -> &'static str {
+        "kept"
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(1.0);
+        TieBand::NORMALIZED
+    }
+}
+
+/// A plugin declares no need of the lifecycle's calls: an adapter needs
+/// them where its fallback does, and an engine built in code says so.
+#[test]
+fn an_adapter_needs_the_lifecycle_where_its_fallback_does() {
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "kept");
+    let binder = plugin.binder();
+    let adapter = |fallback: Option<Box<dyn Scorer>>| GrpcScorer::new(binder.bind(), fallback);
+    assert!(adapter(Some(Box::new(Kept))).needs_lifecycle());
+    assert!(!adapter(Some(Box::new(LeastRequests))).needs_lifecycle());
+    assert!(!adapter(None).needs_lifecycle());
+
+    let engine_of = |fallback: Option<Box<dyn Scorer>>| {
+        single_engine(Profile {
+            name: "adapted".into(),
+            filters: vec![],
+            scorers: vec![Weighted {
+                scorer: Box::new(adapter(fallback)),
+                weight: 1.0,
+            }],
+            picker: Box::new(Best),
+        })
+    };
+    assert!(engine_of(Some(Box::new(Kept))).needs_lifecycle());
+    assert!(!engine_of(None).needs_lifecycle());
+}
+
 #[test]
 fn the_lifecycle_reaches_the_plugin_once_in_order() {
     let served = TestPlugin::serve();

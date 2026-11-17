@@ -2571,6 +2571,13 @@ impl Lifecycle for Engine {
             profile.picker.on_signal(signal);
         }
     }
+
+    fn needs_lifecycle(&self) -> bool {
+        self.profiles.iter().any(|profile| {
+            profile.picker.needs_lifecycle()
+                || profile.scorers.iter().any(|w| w.scorer.needs_lifecycle())
+        })
+    }
 }
 
 #[cfg(test)]
