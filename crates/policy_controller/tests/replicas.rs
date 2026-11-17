@@ -287,6 +287,17 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
         assert_eq!(refused.code(), snapshot, "GetSnapshot on {listener}");
     }
 
+    // The first leader took a lease no record stood for: its fence opened
+    // between two steps, and its line of leading comes at the step after.
+    // The kill waits for that line, so the logs hold one take a term.
+    assert!(
+        replicas[first]
+            .logs(|leader| leader.takes().last() == Some(&term))
+            .await,
+        "the first leader logged no take of term {term}:\n{}",
+        replicas[first].log()
+    );
+
     // THE KILL. The lease is not released: a follower takes it once the
     // record stood still for its duration by that follower's own clock.
     let mut killed = replicas.remove(first);

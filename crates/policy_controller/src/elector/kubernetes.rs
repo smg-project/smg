@@ -717,14 +717,18 @@ pub(in crate::elector) mod tests {
             "the take landed"
         );
         assert_eq!(a.tick(t0 + S).expect("own"), Tick::Acquired { term: 1 });
-        // No Lease record stood at the attempt: the fence opens one renew
-        // deadline after it, at the renewal that lands then.
-        assert_eq!(a.fence().leader_term(t0 + S), None);
+        // No Lease record stood at the attempt, and an attempt in doubt
+        // dates nothing: the fence opens one renew deadline after the write
+        // that made the take this run's own. The take alone carries it
+        // nowhere, and with one renewal behind it the fence opens by
+        // itself, at no step.
+        assert_eq!(a.fence().leader_term(t0 + 3 * S), None);
         assert_eq!(
             a.tick(t0 + 2 * S).expect("renew"),
             Tick::Renewed { term: 1 }
         );
-        assert_eq!(a.fence().leader_term(t0 + 2 * S), Some(1));
+        assert_eq!(a.fence().leader_term(t0 + 2 * S), None);
+        assert_eq!(a.fence().leader_term(t0 + 3 * S), Some(1));
     }
 
     #[test]
