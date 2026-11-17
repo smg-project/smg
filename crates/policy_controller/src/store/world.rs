@@ -1275,11 +1275,12 @@ pub(super) struct Writer {
     unlisted: Vec<Arc<[Candidate]>>,
     /// How many times a publication allocated a pool's rows.
     allocations: u64,
-    /// Every world still out: the standing one, and each earlier one until
-    /// a publication finds no reader holding it and lets it go. The writer
-    /// is never the first to let go of a world, so a decision that drops
-    /// the last reader's hold frees nothing: not the world, its list of
-    /// pools, its vetoes, its derived tables nor its generation.
+    /// Every replaced world a reader still held when the cell let it go
+    /// ([`Self::replaced`]), until a publication finds no reader holding it
+    /// and lets it go. The cell holds the standing world and the writer
+    /// each of these, so a decision that drops the last reader's hold
+    /// frees nothing: not the world, its list of pools, its vetoes, its
+    /// derived tables nor its generation.
     worlds: Vec<Arc<World>>,
     /// Every member's rows, sorted by worker id: a worker serving several
     /// models has a row in each model's pool.
@@ -1369,19 +1370,28 @@ impl Writer {
     }
 
     /// A world of everything published so far: one small object, a pointer
-    /// per pool. Nothing derived is built here. The writer keeps a hold of
-    /// its own on the world it hands out, among its `worlds`.
-    pub(super) fn world(&mut self) -> Arc<World> {
-        let world = Arc::new(World {
+    /// per pool. Nothing derived is built here.
+    pub(super) fn world(&self) -> Arc<World> {
+        Arc::new(World {
             epoch: self.epoch,
             origin: self.origin,
             derived: Arc::clone(&self.derived),
             rows: self.published.clone().into_boxed_slice(),
             vetoes: Arc::clone(&self.pool_vetoes),
             spec: Arc::clone(&self.spec),
-        });
-        self.worlds.push(Arc::clone(&world));
-        world
+        })
+    }
+
+    /// Take back the world the cell let go as its successor was shown. One
+    /// no reader holds is freed here, by the write, as a world always was;
+    /// one a reader holds is kept among `worlds`, so that reader's hold is
+    /// not the last. The cell's swap pays each reader's borrow of the
+    /// outgoing world into its count before it returns, so the count read
+    /// here is every reader's.
+    pub(super) fn replaced(&mut self, world: Arc<World>) {
+        if let Err(held) = Arc::try_unwrap(world) {
+            self.worlds.push(held);
+        }
     }
 
     /// Publish every world from here on under `spec`, the first at once:

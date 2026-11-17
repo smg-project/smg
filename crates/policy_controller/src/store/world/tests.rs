@@ -2329,16 +2329,18 @@ fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
         .expect("above the unbound start");
     assert!(before.is_none(), "nothing was kept before the first apply");
     // A reader still holds a world of generation 1 when the next is
-    // applied; the unbound start, kept since the first apply, is handed
-    // back.
+    // applied and the cell lets that world go; the unbound start, kept
+    // since the first apply, is handed back.
+    let reader = Arc::clone(&world);
     let (_, before) = writer
         .apply(Arc::new(generation(2)), std::iter::empty(), |_, _| None)
         .expect("above the standing one");
     assert_eq!(before.map(|spec| spec.generation()), Some(0));
+    writer.replaced(world);
     // The reader lets its world go: the writer keeps the generation, and
     // the world too until a publication lets it go, so the reader frees
     // no engine. Both holds are the writer's.
-    drop(world);
+    drop(reader);
     assert_eq!(held.strong_count(), 2, "kept by the writer alone");
     // The next apply lets the world go and hands the generation back, and
     // the caller's drop is its end.
@@ -2359,19 +2361,20 @@ fn a_world_held_across_two_applies_takes_its_generation_to_a_publication() {
     let (world, _) = writer
         .apply(first, std::iter::empty(), |_, _| None)
         .expect("above the unbound start");
-    for number in [2, 3] {
-        let applied = writer.apply(Arc::new(generation(number)), std::iter::empty(), |_, _| {
-            None
-        });
-        drop(applied.expect("above the standing one"));
-    }
+    // A reader holds the world the cell lets go at the next apply.
+    let reader = Arc::clone(&world);
+    let applied = writer.apply(Arc::new(generation(2)), std::iter::empty(), |_, _| None);
+    drop(applied.expect("above the standing one"));
+    writer.replaced(world);
+    let applied = writer.apply(Arc::new(generation(3)), std::iter::empty(), |_, _| None);
+    drop(applied.expect("above the standing one"));
     // The second apply handed the generation back and its caller let it
     // go: the reader's world alone holds it now.
     assert_eq!(held.strong_count(), 1);
     // The reader frees no engine all the same: the writer lists its world,
     // and the engine goes with it at the publication that finds no reader
     // holding it, here the next apply's.
-    drop(world);
+    drop(reader);
     assert_eq!(held.strong_count(), 1);
     let applied = writer.apply(Arc::new(generation(4)), std::iter::empty(), |_, _| None);
     drop(applied.expect("above the standing one"));

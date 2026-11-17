@@ -137,7 +137,7 @@ impl MemoryStore {
         // that far: a sample older than the store keeps an instant of its
         // own.
         let origin = now.checked_sub(Duration::from_secs(3_600)).unwrap_or(now);
-        let mut writer = Writer::new(window, origin);
+        let writer = Writer::new(window, origin);
         let world = ArcSwap::new(writer.world());
         Self {
             workers: Mutex::default(),
@@ -257,7 +257,7 @@ impl MemoryStore {
                 workers.rows.values().map(|row| &row.row),
                 |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
             )?;
-            self.world.store(world);
+            writer.replaced(self.world.swap(world));
             before
         };
         drop(before);
@@ -362,15 +362,15 @@ impl MemoryStore {
             |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
             classes,
         );
-        self.world.store(world);
+        writer.replaced(self.world.swap(world));
     }
 
     /// Show the deciders the world a write made, when it made one. Called
     /// with the load lock held: the worlds reach the cell in the order the
-    /// writer made them.
-    fn show(&self, world: Option<Arc<World>>) {
+    /// writer made them, and the writer takes back the one each replaces.
+    fn show(&self, writer: &mut Writer, world: Option<Arc<World>>) {
         if let Some(world) = world {
-            self.world.store(world);
+            writer.replaced(self.world.swap(world));
         }
     }
 
@@ -379,7 +379,7 @@ impl MemoryStore {
     fn show_status(&self, id: WorkerId, status: WorkerStatus) {
         let mut loads = self.loads.lock();
         let world = loads.writer.fold_status(id, status);
-        self.show(world);
+        self.show(&mut loads.writer, world);
     }
 
     /// Publish `gateway`'s veto on `id`, or its clearing, at once. Called
@@ -388,7 +388,7 @@ impl MemoryStore {
     fn show_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {
         let mut loads = self.loads.lock();
         let world = loads.writer.veto(gateway, id, until);
-        self.show(world);
+        self.show(&mut loads.writer, world);
     }
 
     /// How many entries the health tables hold, over every gateway. A
@@ -1067,7 +1067,7 @@ impl LoadSink for MemoryStore {
         if let Some(place) = writer.fold_load(id, rank, Some(&sample)) {
             writer.recorded(place, received_at);
             let world = writer.folded_at(received_at);
-            self.show(world);
+            self.show(writer, world);
         }
     }
 
@@ -1160,7 +1160,7 @@ impl LoadSink for MemoryStore {
         }
         if changed {
             let world = writer.folded_at(polled_at);
-            self.show(world);
+            self.show(writer, world);
         }
     }
 
@@ -1171,7 +1171,7 @@ impl LoadSink for MemoryStore {
             // Every engine was judged again under the period: shown as
             // a load write with no instant of its own is.
             let world = loads.writer.folded();
-            self.show(world);
+            self.show(&mut loads.writer, world);
         }
         stands
     }
@@ -1235,7 +1235,7 @@ impl LoadSink for MemoryStore {
                     writer.judged(engine, false);
                 }
                 let world = writer.folded();
-                self.show(world);
+                self.show(writer, world);
             }
         }
     }
@@ -1247,7 +1247,7 @@ impl LoadSink for MemoryStore {
     fn publish(&self, now: Instant) {
         let mut loads = self.loads.lock();
         let world = loads.writer.publish_if_due(now);
-        self.show(world);
+        self.show(&mut loads.writer, world);
     }
 }
 
