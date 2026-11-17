@@ -38,6 +38,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use parking_lot::RwLock;
 use rmcp::{
     model::{CallToolRequestParams, CallToolResult},
     service::{RunningService, ServiceError},
@@ -547,6 +548,11 @@ pub struct McpOrchestrator {
     /// handler, which must see a server's current client after a recovery
     /// re-inserts it.
     static_servers: Arc<DashMap<String, ServerEntry>>,
+    /// The connected server that answers each builtin tool type, with the tool it names: what
+    /// a walk of `static_servers` would find, kept by type so a lookup takes no walk (a walk
+    /// allocates once per shard). Written where an entry goes into `static_servers`, emptied
+    /// where that map is; the first server registered for a type keeps it.
+    builtin_servers: RwLock<Vec<(BuiltinToolType, String, String)>>,
     /// Tool inventory with qualified names.
     tool_inventory: Arc<ToolInventory>,
     /// Approval manager for interactive and policy-only modes.
@@ -608,6 +614,7 @@ impl McpOrchestrator {
 
         let orchestrator = Self {
             static_servers: Arc::new(DashMap::new()),
+            builtin_servers: RwLock::new(Vec::new()),
             tool_inventory,
             approval_manager,
             connection_pool,
@@ -662,6 +669,7 @@ impl McpOrchestrator {
 
         Self {
             static_servers: Arc::new(DashMap::new()),
+            builtin_servers: RwLock::new(Vec::new()),
             tool_inventory: Arc::new(ToolInventory::new()),
             approval_manager,
             connection_pool: Arc::new(McpConnectionPool::new()),
@@ -759,6 +767,7 @@ impl McpOrchestrator {
         });
 
         self.metrics.record_connection_opened();
+        self.index_builtin_server(config);
         info!("Connected to static server '{}'", config.name);
         Ok(())
     }
@@ -931,12 +940,16 @@ impl McpOrchestrator {
             None
         };
 
-        // First, search connected static servers (dynamically registered via connect_static_server).
-        // This handles servers registered after orchestrator initialization.
-        for entry in self.static_servers.iter() {
-            if let Some(result) = extract_builtin(&entry.config) {
-                return Some(result);
-            }
+        // A connected server first, one registered after start-up included: read by type from
+        // the index its registration wrote, with no walk of the server map.
+        let connected = self
+            .builtin_servers
+            .read()
+            .iter()
+            .find(|(held, ..)| *held == builtin_type)
+            .map(|(_, server, tool)| (server.clone(), tool.clone()));
+        if connected.is_some() {
+            return connected;
         }
 
         // Fallback to initial config servers (handles edge cases where servers
@@ -948,6 +961,20 @@ impl McpOrchestrator {
         }
 
         None
+    }
+
+    /// Record a connected server as the answer for its builtin type, unless an earlier server
+    /// holds the type. A recovery puts a server's own settings back, so it changes nothing here.
+    fn index_builtin_server(&self, config: &McpServerConfig) {
+        let (Some(builtin_type), Some(tool_name)) =
+            (config.builtin_type, &config.builtin_tool_name)
+        else {
+            return;
+        };
+        let mut index = self.builtin_servers.write();
+        if !index.iter().any(|(held, ..)| *held == builtin_type) {
+            index.push((builtin_type, config.name.clone(), tool_name.clone()));
+        }
     }
 
     /// Returns the set of server names that have `builtin_type` configured.
@@ -2002,6 +2029,7 @@ impl McpOrchestrator {
             self.metrics.record_connection_closed();
         }
         self.static_servers.clear();
+        self.builtin_servers.write().clear();
         self.connection_pool.clear();
 
         self.tool_inventory.clear_all();
@@ -2972,6 +3000,37 @@ mod tests {
 
         // Should find 0 matches
         assert_eq!(matching.len(), 0);
+    }
+
+    /// The index of connected builtin servers: the first server registered for a type keeps it,
+    /// the same settings put back (what a recovery does) change nothing, a connected server
+    /// answers before a configured one, and a shutdown leaves the configured one.
+    #[tokio::test]
+    async fn the_first_connected_server_of_a_builtin_type_answers_until_shutdown() {
+        let search = |name: &str, tool: &str| McpServerConfig {
+            builtin_type: Some(BuiltinToolType::WebSearchPreview),
+            builtin_tool_name: Some(tool.to_string()),
+            ..sse_server(name, "http://localhost:1/sse")
+        };
+        let orchestrator = McpOrchestrator::new_test_with_config(McpConfig {
+            servers: vec![search("configured", "configured_search")],
+            ..Default::default()
+        });
+        let found = || orchestrator.find_builtin_server(BuiltinToolType::WebSearchPreview);
+        let answer = |server: &str, tool: &str| Some((server.to_string(), tool.to_string()));
+        assert_eq!(found(), answer("configured", "configured_search"));
+
+        orchestrator.index_builtin_server(&search("first", "search"));
+        orchestrator.index_builtin_server(&search("second", "other_search"));
+        orchestrator.index_builtin_server(&search("first", "search"));
+        assert_eq!(found(), answer("first", "search"));
+        assert_eq!(
+            orchestrator.find_builtin_server(BuiltinToolType::CodeInterpreter),
+            None
+        );
+
+        orchestrator.shutdown().await;
+        assert_eq!(found(), answer("configured", "configured_search"));
     }
 
     #[test]
