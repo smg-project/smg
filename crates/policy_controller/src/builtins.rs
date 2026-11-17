@@ -4262,6 +4262,8 @@ mod tests {
         };
         assert!(pinned.pins(1) && !pinned.pins(0) && !pinned.pins(2));
         assert!(!unpinned.pins(0) && !unpinned.pins(u32::MAX - 1));
+        // No position reads as pinned under no pin, the last one neither.
+        assert!(!unpinned.pins(u32::MAX));
         let mut scores = [0.0f32; 3];
         SessionAffinity.score(&unpinned, &pool, &kept(3), &mut scores);
         assert_eq!(scores, [0.0, 0.0, 0.0]);

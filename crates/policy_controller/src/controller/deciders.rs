@@ -93,7 +93,10 @@ use crate::{
     framework::{release, Plan, Scratch},
     proto::{self, busy::Reason},
     store::{Ask, GatewayId, MemoryStore, ViewBuffers, World},
-    view::{fingerprint, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, WireModes},
+    view::{
+        fingerprint, AffinityFacts, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role,
+        WireModes,
+    },
 };
 
 /// What the deciders and the streams count on the controller's own side,
@@ -628,15 +631,30 @@ fn shed(reason: ShedReason, emptied_by: &'static str, seed: u64, generation: u64
     })
 }
 
+/// What [`hand`] reads of a pool for one request: the pool's facts, the
+/// decision's instant in the rows' clock, the rows, the mask of the asking
+/// gateway's vetoes beside lent rows, and the affinity column.
+type Read<'a> = (
+    PoolFacts<'a>,
+    u64,
+    &'a [Candidate],
+    &'a [u32],
+    &'a [AffinityFacts],
+);
+
 /// Hands `decide` what the engine reads for one request: the request with
 /// what is left of its budget, the pool's facts under the generation its
 /// rows were published under, and those rows as the asking gateway reaches
-/// them at the decision's instant, less what the gateway states of itself
-/// takes ([`narrow`]), with the affinity column where the request's
-/// profile declares it. The rows its wires take are counted in `undialed`,
-/// the decider's own part, and the list they leave takes a name of its own
-/// ([`cut_reach`]). The request's block hashes are cut at what that
-/// generation reads of them.
+/// them at the decision's instant, with the affinity column where the
+/// request's profile declares it. A request that states no wires and no
+/// hint of 0 reads the rows where their publication left them
+/// ([`World::view`]), its gateway's standing vetoes beside them. One that
+/// states wires or a hint of 0, and one whose profile shows its rows to a
+/// plugin, is handed rows written for it ([`World::build`]), less what the
+/// gateway states of itself takes ([`narrow`]). The rows its wires take are
+/// counted in `undialed`, the decider's own part, and the list they leave
+/// takes a name of its own ([`cut_reach`]). The request's block hashes are
+/// cut at what that generation reads of them.
 fn hand<R>(
     world: &World,
     taken: &Taken<'_>,
@@ -658,11 +676,14 @@ fn hand<R>(
     } = *taken;
     let spec = world.spec();
     let (model, phase) = (request.model(), request.phase());
+    // What the decision's profile reads, and whether it shows its rows to
+    // a plugin.
+    let (needs, shown) = spec.engine().reads_for(model, phase);
     let ask = Ask {
         gateway,
         now,
         pinned: None,
-        affinity: spec.engine().needs_for(model, phase).affinity,
+        affinity: needs.affinity,
     };
     let role = match phase {
         Phase::Single => Role::Single,
@@ -675,40 +696,56 @@ fn hand<R>(
         scratch,
         lists,
     } = buffers;
-    let (pool, now_micros) = match world.build(model, role, &ask, view) {
-        Some(built) => {
-            // The pool's facts are of the rows before the request's own
-            // narrowing, all but the list's name: the rows the wires left
-            // are another list of the pool.
-            let mut pool = built.pool_facts();
-            let wires = request.wires();
-            let took = narrow(view, wires, request.subset());
-            if took > 0 {
-                undialed.fetch_add(took, Ordering::Relaxed);
-                if let Some(wires) = wires {
-                    pool.reach = cut_reach(pool.reach, wires);
-                }
-            }
-            (pool, built.now_micros)
+    let wires = request.wires();
+    // No member serves the model in the role: the engine answers over no
+    // candidate, as it answers any host that hands it none.
+    let none = || PoolFacts {
+        generation: spec.generation(),
+        ..PoolFacts::default()
+    };
+    // Nothing of the request's own is cut out of lent rows, and a plugin is
+    // shown a row's bits and ages as the row's own fields.
+    let lent = wires.is_none() && request.subset() != Some(0) && !shown;
+    let (pool, now_micros, candidates, stalled, affinity): Read<'_> = if lent {
+        match world.view(model, role, &ask, false, view) {
+            Some(read) => (
+                read.built.pool_facts(),
+                read.built.now_micros,
+                read.candidates,
+                read.stalled,
+                read.affinity,
+            ),
+            None => (none(), world.micros(now), &[], &[], &[]),
         }
-        // No member serves the model in the role: the engine answers over
-        // no candidate, as it answers any host that hands it none.
-        None => (
-            PoolFacts {
-                generation: spec.generation(),
-                ..PoolFacts::default()
-            },
-            world.micros(now),
-        ),
+    } else {
+        let (pool, now_micros) = match world.build(model, role, &ask, view) {
+            Some(built) => {
+                // The pool's facts are of the rows before the request's own
+                // narrowing, all but the list's name: the rows the wires
+                // left are another list of the pool.
+                let mut pool = built.pool_facts();
+                let took = narrow(view, wires, request.subset());
+                if took > 0 {
+                    undialed.fetch_add(took, Ordering::Relaxed);
+                    if let Some(wires) = wires {
+                        pool.reach = cut_reach(pool.reach, wires);
+                    }
+                }
+                (pool, built.now_micros)
+            }
+            None => (none(), world.micros(now)),
+        };
+        (pool, now_micros, &view.candidates, &[], &view.affinity)
     };
     let viewed = Viewed {
         now_micros,
         budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
-        affinity: &view.affinity,
+        affinity,
+        stalled,
         max_block_hashes: request.hashes_read(spec),
     };
     request.read(lists, viewed, |facts, constraints| {
-        decide(facts, &pool, &view.candidates, constraints, scratch)
+        decide(facts, &pool, candidates, constraints, scratch)
     })
 }
 
@@ -1428,6 +1465,50 @@ pub(crate) mod tests {
         );
     }
 
+    /// A request that states nothing of its gateway reads the rows where
+    /// their publication left them, and the decider's buffers take no row.
+    /// One that states wires, or a hint of 0, is handed rows written into
+    /// those buffers, which its narrowing cuts. No decider's facts pin a
+    /// row.
+    #[test]
+    fn a_request_that_states_nothing_of_its_gateway_reads_the_published_rows() {
+        const SPOKEN: &str = "model-http";
+        let store = MemoryStore::new();
+        ready(&store, "h0", SPOKEN, Role::Single, WireModes::HTTP);
+        ready(&store, "g0", SPOKEN, Role::Single, WireModes::GRPC);
+        // The rows the engine is handed, and the rows written into the
+        // decider's buffers for them.
+        let read = |frame: proto::DecideRequest| {
+            let request = checked(frame);
+            let now = Instant::now();
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let mut buffers = Buffers::default();
+            let handed = store.deciding(|world| {
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &AtomicU64::new(0),
+                    |facts, _, rows, _, _| {
+                        assert_eq!(facts.pinned_at, 0);
+                        rows.len()
+                    },
+                )
+            });
+            (handed, buffers.view.candidates.len())
+        };
+        let plain = frame_for(SPOKEN, 1, 1);
+        assert_eq!(read(plain), (2, 0), "no constraints: lent");
+        let hinted = constrained(frame_for(SPOKEN, 2, 2), 0, Some(7));
+        assert_eq!(read(hinted), (2, 0), "a positive hint: lent");
+        let wired = constrained(frame_for(SPOKEN, 3, 3), 0b001, None);
+        assert_eq!(read(wired), (1, 1), "wires: written and cut");
+        let both = constrained(frame_for(SPOKEN, 4, 4), 0b011, None);
+        assert_eq!(read(both), (2, 2), "wires that cut none: written");
+        let none = constrained(frame_for(SPOKEN, 5, 5), 0, Some(0));
+        assert_eq!(read(none), (0, 0), "a hint of 0");
+    }
+
     /// What the engine is handed for one request, copied out of the
     /// hand-over.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1462,15 +1543,18 @@ pub(crate) mod tests {
                 &taken,
                 &mut buffers,
                 &AtomicU64::new(0),
-                |facts, pool, rows, _, _| Handed {
+                |facts, pool, rows, cx, _| Handed {
                     now_micros: facts.now_micros,
                     budget_micros: facts.budget_micros,
                     column: facts.affinity.len(),
                     candidates: rows.iter().map(|row| row.id).collect(),
+                    // By the row's own bit where the rows were written, and
+                    // by the mask beside them where they were lent.
                     stalled: rows
                         .iter()
-                        .filter(|row| row.health.stalled)
-                        .map(|row| row.id)
+                        .zip(0..)
+                        .filter(|(row, at)| row.health.stalled || cx.masks(*at))
+                        .map(|(row, _)| row.id)
                         .collect(),
                     pool: (pool.pool_size, pool.generation),
                 },
@@ -1772,6 +1856,9 @@ pub(crate) mod tests {
                 decider.answer(checked(frame(id, 1)), GATEWAY, bed.script.taken)
             };
             for id in 1..=3 {
+                // The buffers hold something when the fault comes: a lent
+                // view writes nothing into them.
+                decider.buffers.view.candidates.reserve(1);
                 assert_eq!(busy(&ask(&mut decider, id)), Reason::Unspecified);
                 assert_eq!(
                     decider.buffers.view.candidates.capacity(),
@@ -1782,6 +1869,7 @@ pub(crate) mod tests {
             assert_eq!(written(), 1, "one line for the streak");
             // A decision that does not fault ends the streak and keeps its
             // buffers.
+            decider.buffers.view.candidates.reserve(1);
             let answer = ask(&mut decider, 4);
             assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
             assert!(decider.buffers.view.candidates.capacity() > 0);

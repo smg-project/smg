@@ -1808,6 +1808,8 @@ impl<'a> PairPools<'a> {
                 seed,
                 affinity,
                 named: None,
+                // A pin is a position in one pool: neither side takes it.
+                pinned_at: 0,
                 ..*facts
             };
             (pool, facts)
@@ -1818,6 +1820,10 @@ impl<'a> PairPools<'a> {
 /// The stage a decision names when it is refused for its affinity column:
 /// what a host counts its sheds under.
 const AFFINITY_COLUMN: &str = "affinity-column";
+
+/// The stage a decision names when a profile that shows its rows to a
+/// plugin was handed rows that carry a mask or a pin beside them.
+const WRITTEN_ROWS: &str = "written-rows";
 
 /// Whether an affinity column stands for `pool`: empty, or one entry a
 /// candidate, in the candidates' order. Asked once where a decision takes
@@ -1986,13 +1992,29 @@ impl Engine {
     /// decode answer carries that profile's needs too. The host reads it per
     /// worker, at registration, to choose the worker's stream.
     pub fn needs_for(&self, model: &str, phase: Phase) -> Needs {
-        let own = self
+        self.reads_for(model, phase).0
+    }
+
+    /// [`Self::needs_for`], and whether the profile that decision resolves
+    /// to shows its rows to a plugin ([`Profile::scoped`]), by one lookup.
+    /// A host hands such a decision rows written for it: a plugin's view
+    /// carries each row's bits and ages as the row's own fields, and
+    /// [`Self::decide`] declines such a profile over rows that carry a mask
+    /// or a pin beside them ([`Constraints::stalled`],
+    /// [`RequestFacts::pinned_at`]).
+    pub fn reads_for(&self, model: &str, phase: Phase) -> (Needs, bool) {
+        let (own, shown) = self
             .resolve(model, phase)
-            .map(|(entry, _, profile)| profile.needs().or(session_needs(&entry.binding)))
+            .map(|(entry, index, profile)| {
+                (
+                    profile.needs().or(session_needs(&entry.binding)),
+                    self.marks[usize::from(index)].scoped(),
+                )
+            })
             .unwrap_or_default();
         match phase {
-            Phase::Decode => own.or(self.pair_decode_needs(model)),
-            _ => own,
+            Phase::Decode => (own.or(self.pair_decode_needs(model)), shown),
+            _ => (own, shown),
         }
     }
 
@@ -2175,11 +2197,12 @@ impl Engine {
             None
         } else {
             // A plugin is shown each row as a record of the row's own
-            // fields: its host hands rows written for the decision.
-            debug_assert!(
-                !marks.scoped() || (cx.stalled.is_empty() && facts.pinned_at == 0),
-                "a profile that shows its rows to a plugin is handed rows written for the decision"
-            );
+            // fields: its host hands rows written for the decision
+            // ([`Self::reads_for`]). A mask or a pin beside the rows says
+            // they are not, and the decision is declined.
+            if marks.scoped() && (!cx.stalled.is_empty() || facts.pinned_at != 0) {
+                return shed(ShedReason::PolicyDeclined, WRITTEN_ROWS, bare);
+            }
             let opened = marks
                 .scoped()
                 .then(|| profile.open(facts, candidates, pool));
@@ -3468,6 +3491,8 @@ mod tests {
                 holders: &holders,
                 ..NamedAffinity::default()
             }),
+            // A pin is a position in one pool: no side takes it either.
+            pinned_at: 2,
             ..RequestFacts::default()
         };
         let pools = PairPools {
@@ -3478,6 +3503,7 @@ mod tests {
         for (side, name) in [(PairSide::Prefill, "prefill"), (PairSide::Decode, "decode")] {
             let (_, read) = pools.side(side, &facts).expect("an empty column fits");
             assert!(read.named.is_none(), "the {name} side");
+            assert_eq!(read.pinned_at, 0, "the {name} side");
         }
     }
 
@@ -3537,6 +3563,85 @@ mod tests {
             &mut Scratch::new(),
         );
         assert_eq!(lead(&decision), Some(3));
+    }
+
+    /// A profile that shows its rows to a plugin says so by the engine's one
+    /// lookup, and its decision over rows that carry a mask or a pin beside
+    /// them is declined under a name of its own, in every build.
+    #[test]
+    fn a_profile_that_shows_its_rows_is_told_and_declines_rows_not_written_for_it() {
+        #[derive(Debug)]
+        struct Shown;
+
+        impl Lifecycle for Shown {}
+
+        impl DecisionScope for Shown {
+            fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+            fn close(&self) {}
+        }
+
+        impl Filter for Shown {
+            fn name(&self) -> &'static str {
+                "shown"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn scope(&self) -> Option<&dyn DecisionScope> {
+                Some(self)
+            }
+        }
+
+        let engine_of =
+            |profile| Engine::new(vec![profile], vec![single_binding()], 1, Needs::default());
+        let plain = engine_of(least_requests_profile());
+        let needs = plain.needs_for("m", Phase::Single);
+        assert_eq!(plain.reads_for("m", Phase::Single), (needs, false));
+        let engine = engine_of(Profile {
+            filters: vec![Box::new(Shown)],
+            ..least_requests_profile()
+        });
+        assert!(engine.reads_for("m", Phase::Single).1);
+        let pool = [candidate(0, 0), candidate(1, 0)];
+        let facts = RequestFacts {
+            model: "m",
+            ..RequestFacts::default()
+        };
+        let pinned = RequestFacts {
+            pinned_at: 1,
+            ..facts
+        };
+        let masked = Constraints {
+            stalled: &[0],
+            ..Constraints::default()
+        };
+        let written = Constraints::default();
+        let decide = |facts: &RequestFacts<'_>, cx: &Constraints<'_>| {
+            engine.decide(facts, &PoolFacts::default(), &pool, cx, &mut Scratch::new())
+        };
+        assert!(lead(&decide(&facts, &written)).is_some());
+        for (facts, cx, beside) in [(&facts, &masked, "a mask"), (&pinned, &written, "a pin")] {
+            let Decision::Shed(shed) = decide(facts, cx) else {
+                panic!("{beside} beside the rows is declined");
+            };
+            assert_eq!(
+                (shed.reason, shed.emptied_by),
+                (ShedReason::PolicyDeclined, WRITTEN_ROWS),
+                "{beside}"
+            );
+        }
+        // A profile that shows nothing reads both.
+        assert!(lead(&plain.decide(
+            &facts,
+            &PoolFacts::default(),
+            &pool,
+            &masked,
+            &mut Scratch::new()
+        ))
+        .is_some());
     }
 
     /// A stage that reads the affinity column as a filter alone, or as the
