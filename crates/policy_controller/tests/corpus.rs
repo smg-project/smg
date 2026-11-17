@@ -1,14 +1,19 @@
 //! The step-2 acceptance corpus through the parser and the validator. The
-//! corpus lives outside this repository; `SMG_POLICY_SPEC_CORPUS` names a
-//! directory of its items (Markdown, each with an `## Expected spec` section
-//! holding one fenced YAML document), and the test is skipped when it is
-//! unset. Every expected document must parse (the schema covers every field
-//! the corpus writes) and validate, or be refused only because this build
-//! lacks a stage, a plan, a matcher or a binding rule; any other refusal is
-//! a corpus or a validator defect. The per-item verdicts are printed as the
-//! corpus report.
+//! corpus is the directory `tests/corpus`: one Markdown item a routing
+//! configuration of the gateway, as its title, the dialect it is written
+//! in, its input, and under `## Expected spec` one fenced YAML document that
+//! says the same as a spec. The directory holds the corpus's items that
+//! state a spec document, under their numbers in the corpus, so the numbers
+//! have gaps. Every expected document must parse (the schema covers every
+//! field the corpus writes) and validate, or be refused only because this
+//! build lacks a stage, a plan, a matcher or a binding rule; any other
+//! refusal, and an item with no document, is a corpus or a validator
+//! defect. The per-item verdicts are printed as the corpus report.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use smg_policy_controller::{PolicySpec, SpecError};
 
@@ -52,19 +57,13 @@ fn verdict(item: &str) -> Verdict {
     }
 }
 
-/// Ignored by default because the corpus lives in the test-data repository,
-/// not here: `cargo test --test corpus -- --ignored` with
-/// `SMG_POLICY_SPEC_CORPUS` naming its directory runs it, and it fails rather
-/// than passes when the variable is unset.
 #[test]
-#[ignore = "needs SMG_POLICY_SPEC_CORPUS, the corpus directory of the test-data repository"]
 #[expect(
     clippy::print_stdout,
     reason = "the per-item verdicts are the corpus report"
 )]
 fn the_step_2_corpus_parses_and_every_item_names_its_verdict() {
-    let dir = std::env::var_os("SMG_POLICY_SPEC_CORPUS")
-        .expect("SMG_POLICY_SPEC_CORPUS names the corpus directory");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
     let mut items: Vec<PathBuf> = fs::read_dir(&dir)
         .expect("the corpus directory is readable")
         .filter_map(Result::ok)
@@ -72,11 +71,7 @@ fn the_step_2_corpus_parses_and_every_item_names_its_verdict() {
         .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
         .collect();
     items.sort();
-    assert!(
-        !items.is_empty(),
-        "no items under {}",
-        dir.to_string_lossy()
-    );
+    assert!(!items.is_empty(), "no items under {}", dir.display());
 
     let (mut documents, mut accepted, mut not_in_build) = (0usize, 0usize, 0usize);
     let mut defects = Vec::new();
@@ -90,7 +85,8 @@ fn the_step_2_corpus_parses_and_every_item_names_its_verdict() {
         let text = fs::read_to_string(path).expect("an item is readable");
         let line = match verdict(&text) {
             Verdict::NoDocument => {
-                "no expected document (a rule, report or values item)".to_string()
+                defects.push(format!("{name}: no expected document"));
+                "NO EXPECTED DOCUMENT".to_string()
             }
             Verdict::Accepted(summary) => {
                 documents += 1;
@@ -112,9 +108,9 @@ fn the_step_2_corpus_parses_and_every_item_names_its_verdict() {
     }
     println!();
     println!(
-        "items {}, with a document {documents}, accepted {accepted}, well-formed but not in this build {not_in_build}, refused {}",
+        "items {}, with a document {documents}, accepted {accepted}, well-formed but not in this build {not_in_build}, defects {}",
         items.len(),
         defects.len()
     );
-    assert!(defects.is_empty(), "corpus items refused: {defects:#?}");
+    assert!(defects.is_empty(), "corpus defects: {defects:#?}");
 }
