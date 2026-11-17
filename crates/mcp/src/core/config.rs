@@ -154,8 +154,10 @@ pub struct McpServerConfig {
     #[serde(flatten)]
     pub transport: McpTransport,
 
-    /// Per-server proxy override (overrides global proxy)
-    /// Set to `null` in YAML to force direct connection (no proxy)
+    /// Per-server proxy: a mapping here replaces the global proxy for this
+    /// server. A missing field and `null` both inherit the global proxy; to
+    /// keep a server's host off the global proxy, name the host in the
+    /// global proxy's `no_proxy` list.
     #[serde(default)]
     pub proxy: Option<McpProxyConfig>,
 
@@ -895,24 +897,29 @@ servers:
         assert!(config.warmup.is_empty()); // New field defaults to empty
     }
 
-    #[tokio::test]
-    async fn test_yaml_null_proxy_override() {
-        // Test that explicit null in YAML sets proxy to None
+    /// A server's `proxy: null` is the missing field: the server inherits
+    /// the global proxy, it is not forced direct.
+    #[test]
+    fn a_null_server_proxy_inherits_the_global_proxy() {
+        use crate::core::proxy::resolve_proxy_config;
+
         let yaml = r#"
 proxy:
   http: "http://global-proxy:8080"
 
 servers:
-  - name: "direct-connection"
+  - name: "inherits-the-global-proxy"
     protocol: sse
     url: "http://localhost:3000/sse"
     proxy: null
 "#;
 
         let config: McpConfig = serde_yaml::from_str(yaml).expect("Failed to parse YAML");
-        assert!(config.proxy.is_some()); // Global proxy set
         assert_eq!(config.servers.len(), 1);
-        assert!(config.servers[0].proxy.is_none()); // Explicitly set to null
+        assert!(config.servers[0].proxy.is_none());
+        let resolved = resolve_proxy_config(&config.servers[0], config.proxy.as_ref())
+            .expect("the global proxy");
+        assert_eq!(resolved.http.as_deref(), Some("http://global-proxy:8080"));
     }
 
     #[test]

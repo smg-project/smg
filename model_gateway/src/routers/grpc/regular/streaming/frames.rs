@@ -63,6 +63,24 @@ pub(super) const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 /// not by doubling).
 pub(super) const FRAME_ROOM: usize = 2 * CHUNK_FLUSH_BYTES;
 
+/// The unsent bytes at which a chat burst's frame takes [`CHAT_BURST_ROOM`]
+/// (`ChatStream::read_engine`): an eighth of a frame, half the stream's first
+/// room, so a paced engine's frames, one event each, stay under it and keep
+/// the room they have.
+pub(super) const CHAT_BURST_MARK: usize = CHUNK_FLUSH_BYTES / 8;
+
+/// The room the chat loop's frame buffer takes once a burst's unsent bytes
+/// reach [`CHAT_BURST_MARK`] (`ChatStream::read_engine`): one frame and two
+/// such marks. The frame leaves at the flush bound plus the event that
+/// crossed it, and what it leaves behind still holds the next burst up to
+/// its own mark, so each frame of a burst costs one reservation: taken back
+/// in place when the connection has dropped the sent frame, a fresh
+/// allocation while it is in flight. One frame's room and not [`FRAME_ROOM`]:
+/// the chat loop reserves at every frame's mark, before it knows the frame
+/// will fill, so a second frame's room would never be written, and a frame
+/// in flight pins its whole allocation.
+pub(super) const CHAT_BURST_ROOM: usize = CHUNK_FLUSH_BYTES + 2 * CHAT_BURST_MARK;
+
 /// The SSE frame of the per-token chat chunks of one stream.
 ///
 /// Every chunk of a stream repeats the same `id`, `object`, `created`,
@@ -70,13 +88,14 @@ pub(super) const FRAME_ROOM: usize = 2 * CHUNK_FLUSH_BYTES;
 /// head up to and including `"choices":[` is serialized once per stream and
 /// copied in front of each chunk, so a chunk costs the serialization of its
 /// choice and usage only. The bytes are exactly those of a serialized
-/// [`super::ChatChunkWithUsage`] (the chunk-level `usage: null` placeholder included).
-pub(super) struct ChatChunkFrame {
+/// `ChatCompletionStreamResponse`, plus the chunk-level `usage: null`
+/// placeholder where the wire asks for one.
+pub(crate) struct ChatChunkFrame {
     head: Vec<u8>,
 }
 
 impl ChatChunkFrame {
-    pub(super) fn new(
+    pub(crate) fn new(
         request_id: &str,
         model: &str,
         created: u64,
@@ -99,7 +118,7 @@ impl ChatChunkFrame {
 
     /// Append `data: {...}\n\n` for `choice` (and `usage`, or the `null`
     /// placeholder when `emit_usage_null`) to `buffer`.
-    pub(super) fn write_chunk<C: Serialize>(
+    pub(crate) fn write_chunk<C: Serialize>(
         &self,
         buffer: &mut BytesMut,
         choice: &C,
@@ -179,6 +198,13 @@ impl ChatChunkFrame {
         push_logprobs_view(buffer, view, requested, &decode);
         buffer.extend_from_slice(b",\"finish_reason\":null}");
         Self::close_chunk(buffer, start, Ok(()), usage, emit_usage_null);
+    }
+
+    /// Append the chunk that closes a stream with its usage and no choice.
+    pub(crate) fn write_usage_chunk(&self, buffer: &mut BytesMut, usage: &Usage) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head);
+        Self::close_chunk(buffer, start, Ok(()), Some(usage), false);
     }
 
     /// The chunk's end after its choice: `]`, the usage or its `null`
@@ -563,7 +589,7 @@ pub(super) fn forces_tool_call(spec: &ChatResponseSpec) -> bool {
 /// A streamed choice carrying whichever of `content`, `reasoning_content` and
 /// `tool_calls` the caller sets; the role is not repeated, the first chunk
 /// ([`opening_choice`]) carried it.
-pub(super) fn assistant_choice(
+pub(crate) fn assistant_choice(
     index: u32,
     content: Option<String>,
     reasoning_content: Option<String>,

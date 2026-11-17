@@ -19,11 +19,16 @@ use openai_protocol::{
         InputMessage, SystemContent, ToolResultContent,
     },
     profile::ProviderProfile,
+    worker::MmProcessingMode,
 };
 use serde_json::{json, Value};
-use tracing::error;
+use tracing::{error, warn};
 
-use super::{chat_utils, prepared_tools::prepare_tools};
+use super::{
+    chat_utils::{self, PromptError},
+    prepared_tools::prepare_tools,
+    reported,
+};
 use crate::{
     observability::metrics::Metrics,
     routers::{
@@ -111,7 +116,7 @@ pub fn process_messages(
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
     provider: ProviderProfile,
-) -> Result<(ProcessedMessages, PromptEncoding), String> {
+) -> Result<(ProcessedMessages, PromptEncoding), PromptError> {
     process_messages_prompt(
         MessagesPrompt::for_request(request, provider),
         tokenizer,
@@ -137,6 +142,7 @@ pub fn process_messages_with_encoding(
         MediaPartOrder::MediaFirst,
         ProviderProfile::for_model(&request.model),
     )
+    .map_err(String::from)
 }
 
 /// [`process_messages`] over the prompt parts alone.
@@ -146,7 +152,7 @@ fn process_messages_prompt(
     chat_tools: Option<&[ChatTool]>,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
-) -> Result<(ProcessedMessages, PromptEncoding), String> {
+) -> Result<(ProcessedMessages, PromptEncoding), PromptError> {
     let content_format = tokenizer.chat_template_content_format_for_request(chat_tools.is_some());
 
     // Step 1: Convert InputMessages to chat template JSON values
@@ -258,7 +264,7 @@ fn process_messages_prompt(
             params,
             assistant_prefix.as_deref(),
         )
-        .map_err(|e| format!("Failed to apply chat template: {e}"))?;
+        .map_err(|e| PromptError::of_render(&e))?;
 
     // Step 7: Build ProcessedMessages
     let text = anchor_rendered_markers(placeholder_tokens, &rendered.encoding, rendered.text);
@@ -410,7 +416,16 @@ pub(crate) async fn resolve_media(
     // such a request and never schedules it), and no modality to a pool whose engines take none of
     // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,
     // on the declared parts, before any byte of media is fetched, decoded or sent.
-    multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
+    let router_processes = components
+        .multimodal
+        .as_ref()
+        .is_some_and(|mm_components| mm_components.processing == MmProcessingMode::Router);
+    multimodal::ensure_model_accepts_media(
+        &components.worker_registry,
+        model_id,
+        &plan,
+        router_processes,
+    )?;
     if plan.is_empty() {
         // A request without media renders the same under either order (its text parts in
         // their own order): the registries are not asked for a model with nothing to place.
@@ -470,9 +485,22 @@ pub(crate) async fn resolve_media(
         .await
     }
     .map_err(|e| {
-        // The chain, not the outermost context alone: a hub failure's cause
-        // (the file, the hub's answer, its address) is answered generically
-        // below and lives here.
+        // Only a refusal the plan types as the request's own is the client's
+        // to fix: one WARN with the cause, the answer marked reported.
+        if multimodal::RequestRefusal::is(&e) {
+            warn!(
+                function = stage,
+                model = %model_id,
+                error = %format!("{e:#}"),
+                "Failed to prepare the multimodal prompt plan"
+            );
+            return reported(invalid_multimodal_request(e));
+        }
+        // Every other failure is the deployment's (the hub, the model's
+        // files, its vocabulary): the line stays ERROR and the answer
+        // unmarked. The chain, not the outermost context alone: a hub
+        // failure's cause (the file, the hub's answer, its address) is
+        // answered generically below and lives here.
         error!(
             function = stage,
             model = %model_id,
@@ -562,7 +590,7 @@ pub(crate) async fn count_input_tokens(
         placeholders,
         media_order,
     )
-    .map_err(CountError::Render)?;
+    .map_err(|error| CountError::Render(error.into()))?;
     let encoded = chat_utils::encode_prompt_blocking(tokenizer, &processed.text, encoding)
         .await
         .map_err(CountError::Encode)?;
@@ -590,7 +618,7 @@ fn process_message_content_format(
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
-) -> Result<Vec<Value>, String> {
+) -> Result<Vec<Value>, PromptError> {
     messages
         .iter()
         .enumerate()
@@ -633,7 +661,7 @@ fn process_message_content_format(
 /// are concatenated. A server tool's result or a container upload is refused
 /// by name, as in a user or assistant turn (`server_tool_block_refusal`); the
 /// other non-text blocks are dropped, as before.
-fn convert_system_message(index: usize, content: &InputContent) -> Result<Value, String> {
+fn convert_system_message(index: usize, content: &InputContent) -> Result<Value, PromptError> {
     let text = match content {
         InputContent::String(text) => text.clone(),
         InputContent::Blocks(blocks) => {
@@ -692,7 +720,7 @@ fn convert_user_message(
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
     result: &mut Vec<Value>,
-) -> Result<(), String> {
+) -> Result<(), PromptError> {
     match content {
         InputContent::String(text) => {
             result.push(json!({"role": "user", "content": text}));
@@ -774,37 +802,43 @@ fn convert_user_message(
 /// A document block as prompt text, so that any template reads it: the
 /// title and context the request gave, then the document's text, in the
 /// tagged layout the public API documents for documents in a prompt. Only
-/// text renders: a text source, or a content source made of text blocks. A
-/// PDF or URL source needs a document reader this gateway has no path for
-/// and is refused naming the block (`at`), not handed to the template.
-fn render_document(document: &messages::DocumentBlock, at: &str) -> Result<String, String> {
+/// text renders: a text source, or a content source given as a string or
+/// made of text blocks. A PDF or URL source needs a document reader this
+/// gateway has no path for and is refused naming the block (`at`), not
+/// handed to the template: the request's own, as every refusal here is.
+fn render_document(document: &messages::DocumentBlock, at: &str) -> Result<String, PromptError> {
     let text = match &document.source {
-        messages::DocumentSource::Text { data } => data.as_str(),
-        messages::DocumentSource::Content { content } => {
+        messages::DocumentSource::Text { data }
+        | messages::DocumentSource::Content {
+            content: messages::DocumentContent::String(data),
+        } => data.as_str(),
+        messages::DocumentSource::Content {
+            content: messages::DocumentContent::Blocks(content),
+        } => {
             let mut texts = Vec::with_capacity(content.len());
             for block in content {
                 match block {
                     InputContentBlock::Text(t) => texts.push(t.text.as_str()),
                     _ => {
-                        return Err(format!(
+                        return Err(PromptError::Refused(format!(
                             "{at}: a document content source may hold text blocks only"
-                        ))
+                        )))
                     }
                 }
             }
             return Ok(document_text(document, &texts.join("\n")));
         }
         messages::DocumentSource::Base64 { media_type, .. } => {
-            return Err(format!(
+            return Err(PromptError::Refused(format!(
                 "{at}: document source type 'base64' ({media_type}) is not supported; \
                  send the document as a text or content source"
-            ))
+            )))
         }
         messages::DocumentSource::Url { .. } => {
-            return Err(format!(
+            return Err(PromptError::Refused(format!(
                 "{at}: document source type 'url' is not supported; send the document \
                  as a text or content source"
-            ))
+            )))
         }
     };
     Ok(document_text(document, text))
@@ -861,15 +895,15 @@ fn extract_tool_result_text(tool_result: &messages::ToolResultBlock) -> String {
 /// on an engine route, naming the block and its place. The exchange belongs
 /// to the MCP loop, which no engine route runs: the prompt cannot carry it
 /// faithfully, and dropping it in silence would answer without the call.
-fn mcp_block_refusal(block: &InputContentBlock, index: usize, position: usize) -> String {
+fn mcp_block_refusal(block: &InputContentBlock, index: usize, position: usize) -> PromptError {
     let kind = match block {
         InputContentBlock::McpToolResult(_) => "mcp_tool_result",
         _ => "mcp_tool_use",
     };
-    format!(
+    PromptError::Refused(format!(
         "messages.{index}.content.{position}: block type '{kind}' is not supported on an engine \
          route, which runs no MCP loop; send the turn to a provider route or drop the exchange"
-    )
+    ))
 }
 
 /// The refusal of a block of the public API's server tools (a web fetch, code
@@ -881,7 +915,11 @@ fn mcp_block_refusal(block: &InputContentBlock, index: usize, position: usize) -
 /// before these (`server_tool_use`, `web_search_tool_result`,
 /// `tool_search_tool_result`) are still dropped, as they were: refusing them
 /// is a separate choice, which would turn requests answered today into 400s.
-fn server_tool_block_refusal(block: &InputContentBlock, index: usize, position: usize) -> String {
+fn server_tool_block_refusal(
+    block: &InputContentBlock,
+    index: usize,
+    position: usize,
+) -> PromptError {
     let kind = match block {
         InputContentBlock::WebFetchToolResult(_) => "web_fetch_tool_result",
         InputContentBlock::CodeExecutionToolResult(_) => "code_execution_tool_result",
@@ -891,10 +929,10 @@ fn server_tool_block_refusal(block: &InputContentBlock, index: usize, position: 
         }
         _ => "container_upload",
     };
-    format!(
+    PromptError::Refused(format!(
         "messages.{index}.content.{position}: block type '{kind}' is not supported on an engine \
          route, which runs no server tools; send the turn to a provider route or drop the block"
-    )
+    ))
 }
 
 /// Convert an assistant message content to a single JSON value.
@@ -906,7 +944,7 @@ fn convert_assistant_message(
     index: usize,
     content: &InputContent,
     content_format: ChatTemplateContentFormat,
-) -> Result<Value, String> {
+) -> Result<Value, PromptError> {
     let blocks = match content {
         InputContent::String(text) => return Ok(json!({"role": "assistant", "content": text})),
         InputContent::Blocks(blocks) => blocks,
@@ -983,16 +1021,16 @@ fn format_content_parts(
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
-) -> Result<Value, String> {
+) -> Result<Value, PromptError> {
     match content_format {
         ChatTemplateContentFormat::String => {
             let ordered = order_media_parts(parts, media_order);
             // Text parts as they are, an image part as its placeholder. An
             // image the placeholders hold no token for is refused, as the
-            // chat renderer refuses it: left out, the prompt would carry no
-            // anchor for media that still travels with the request. A caller
-            // without model metadata passes no placeholders and its media
-            // parts are left out.
+            // chat renderer refuses it, and as the request's own: left out,
+            // the prompt would carry no anchor for media that still travels
+            // with the request. A caller without model metadata passes no
+            // placeholders and its media parts are left out.
             let text: String = ordered
                 .iter()
                 .filter_map(|p| {
@@ -1005,14 +1043,16 @@ fn format_content_parts(
                                 .get(Modality::Image)
                                 .map(String::from)
                                 .ok_or_else(|| {
-                                    "missing image placeholder for string-format chat template"
-                                        .to_owned()
+                                    PromptError::Refused(
+                                        "missing image placeholder for string-format chat template"
+                                            .to_owned(),
+                                    )
                                 })
                         }),
                         _ => None,
                     }
                 })
-                .collect::<Result<Vec<_>, String>>()?
+                .collect::<Result<Vec<_>, PromptError>>()?
                 .join("\n");
             Ok(Value::String(text))
         }
@@ -1755,6 +1795,30 @@ mod tests {
         );
     }
 
+    /// A content source given as a string renders as the document's text, as
+    /// a text source does.
+    #[test]
+    fn a_content_document_given_as_a_string_renders_its_text() {
+        let messages = document(
+            messages::DocumentSource::Content {
+                content: messages::DocumentContent::String("The whole text.".to_string()),
+            },
+            None,
+            None,
+        );
+        let parts = process_message_content_format(
+            &messages,
+            ChatTemplateContentFormat::OpenAI,
+            None,
+            MediaPartOrder::Authored,
+        )
+        .unwrap();
+        assert_eq!(
+            parts[0]["content"][0]["text"],
+            "<document>\n<document_content>\nThe whole text.\n</document_content>\n</document>"
+        );
+    }
+
     /// A content-source document joins its text blocks; one holding anything
     /// else is refused naming the block.
     #[test]
@@ -1768,7 +1832,10 @@ mod tests {
         };
         let messages = document(
             messages::DocumentSource::Content {
-                content: vec![text("First paragraph."), text("Second paragraph.")],
+                content: messages::DocumentContent::Blocks(vec![
+                    text("First paragraph."),
+                    text("Second paragraph."),
+                ]),
             },
             None,
             None,
@@ -1787,13 +1854,15 @@ mod tests {
 
         let messages = document(
             messages::DocumentSource::Content {
-                content: vec![InputContentBlock::Image(messages::ImageBlock {
-                    source: messages::ImageSource::Base64 {
-                        media_type: "image/png".to_string(),
-                        data: "AAAA".to_string().into(),
+                content: messages::DocumentContent::Blocks(vec![InputContentBlock::Image(
+                    messages::ImageBlock {
+                        source: messages::ImageSource::Base64 {
+                            media_type: "image/png".to_string(),
+                            data: "AAAA".to_string().into(),
+                        },
+                        cache_control: None,
                     },
-                    cache_control: None,
-                })],
+                )]),
             },
             None,
             None,
@@ -1805,6 +1874,8 @@ mod tests {
             MediaPartOrder::Authored,
         )
         .unwrap_err();
+        assert!(err.is_refusal(), "{err:?}");
+        let err = err.to_string();
         assert!(
             err.starts_with(
                 "messages.0.content.0: a document content source may hold text blocks only"
@@ -1839,7 +1910,8 @@ mod tests {
                 MediaPartOrder::Authored,
             )
             .unwrap_err();
-            assert!(err.starts_with(needle), "{err}");
+            assert!(err.is_refusal(), "{err:?}");
+            assert!(err.to_string().starts_with(needle), "{err}");
         }
     }
 
@@ -2138,8 +2210,10 @@ mod tests {
             )
         };
 
+        let refused = render(Some(&PlaceholderTokens::worker_only())).unwrap_err();
+        assert!(refused.is_refusal(), "{refused:?}");
         assert_eq!(
-            render(Some(&PlaceholderTokens::worker_only())).unwrap_err(),
+            refused.to_string(),
             "missing image placeholder for string-format chat template"
         );
         assert_eq!(render(None).unwrap()[0]["content"], "question");
@@ -2726,13 +2800,15 @@ mod tests {
     #[test]
     fn a_server_tool_block_is_refused_naming_the_block() {
         let convert = |messages: &[InputMessage]| {
-            process_message_content_format(
+            let err = process_message_content_format(
                 messages,
                 ChatTemplateContentFormat::String,
                 None,
                 MediaPartOrder::MediaFirst,
             )
-            .unwrap_err()
+            .unwrap_err();
+            assert!(err.is_refusal(), "{err:?}");
+            err.to_string()
         };
         let assistant: Vec<InputMessage> = serde_json::from_value(json!([
             {"role": "user", "content": "run it"},
@@ -2789,13 +2865,15 @@ mod tests {
     #[test]
     fn a_replayed_mcp_exchange_is_refused_naming_the_block() {
         let convert = |messages: &[InputMessage]| {
-            process_message_content_format(
+            let err = process_message_content_format(
                 messages,
                 ChatTemplateContentFormat::String,
                 None,
                 MediaPartOrder::MediaFirst,
             )
-            .unwrap_err()
+            .unwrap_err();
+            assert!(err.is_refusal(), "{err:?}");
+            err.to_string()
         };
         let assistant: Vec<InputMessage> = serde_json::from_value(json!([
             {"role": "user", "content": "look it up"},

@@ -26,17 +26,33 @@ use std::{hint::black_box, sync::mpsc, thread, time::Instant};
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    elector::{ElectionSettings, Elector, FileLease, LeaseBackend, MemoryLease, Tick},
+    elector::{
+        ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord, MemoryLease, Tick, Written,
+    },
     Constraints, PoolFacts, RequestFacts, Scratch,
 };
 
-fn holder(backend: Box<dyn LeaseBackend>, identity: &str) -> Elector {
+/// A holder whose fence is open, as a leader's is. It takes a lease that a
+/// leader released, which a candidate takes and leads at once: a take of a
+/// lease that no record held leads one renew deadline later by the clock.
+fn holder(mut backend: Box<dyn LeaseBackend>, identity: &str) -> Elector {
+    let released = LeaseRecord {
+        holder: String::new(),
+        term: 1,
+        acquired_at_micros: 1,
+        renewed_at_micros: 1,
+        duration_ms: 0,
+    };
+    assert_eq!(
+        backend.write(None, &released).expect("the release"),
+        Written::Done
+    );
     let mut elector =
         Elector::new(backend, identity, ElectionSettings::default()).expect("valid settings");
-    assert_eq!(
-        elector.tick(Instant::now()).expect("the take"),
-        Tick::Acquired { term: 1 }
-    );
+    let now = Instant::now();
+    let take = elector.tick(now).expect("the take");
+    assert!(matches!(take, Tick::Acquired { .. }), "{take:?}");
+    assert!(elector.fence().leader_term(now).is_some());
     elector
 }
 

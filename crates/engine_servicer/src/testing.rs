@@ -7,7 +7,8 @@ use std::{
     net::{SocketAddr, TcpStream},
     panic::Location,
     path::Path,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{mpsc, Arc, Mutex, OnceLock, PoisonError},
+    thread,
     time::Duration,
 };
 
@@ -60,6 +61,30 @@ pub(crate) trait Bounded: Future + Sized {
 }
 
 impl<F: Future> Bounded for F {}
+
+/// The lifecycle owner's reports that the engine process is alive (`report`
+/// on `server`): one at once, then one each 50 ms until the returned sender
+/// drops. The later ones come from a thread of their own, as a launcher's
+/// do: the pace of the test's own thread on a loaded host then leaves no
+/// gap in them for a short silence bound to expire in.
+#[must_use = "the reports stop when this drops"]
+pub(crate) fn reported_alive<S: Send + Sync + 'static>(
+    server: Arc<S>,
+    report: fn(&S),
+) -> mpsc::Sender<()> {
+    // One report before the thread's first turn, which a loaded host can
+    // itself delay past a short silence bound.
+    report(&server);
+    let (until_dropped, dropped) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        while dropped.recv_timeout(Duration::from_millis(50))
+            == Err(mpsc::RecvTimeoutError::Timeout)
+        {
+            report(&server);
+        }
+    });
+    until_dropped
+}
 
 /// `count` publishers bound on consecutive ports from the returned base, as
 /// a data-parallel engine lays its ranks' publishers out (rank `r` on the

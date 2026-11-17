@@ -43,8 +43,6 @@ use parking_lot::Mutex;
 use tokio::sync::{watch, Notify};
 
 #[cfg(any(test, feature = "test-util"))]
-use crate::policies::LoadBalancingPolicy;
-#[cfg(any(test, feature = "test-util"))]
 use crate::worker::BasicWorker;
 use crate::worker::{registry::WorkerRegistry, Worker};
 
@@ -129,16 +127,17 @@ impl LoadSnapshot {
     }
 }
 
-/// Publisher standing in for the monitor in tests and benchmarks: hands a
-/// policy the feed and publishes each map of reports as the whole snapshot.
+/// Publisher standing in for the monitor in tests and benchmarks: hands the
+/// feed to a reader through `attach` and publishes each map of reports as the
+/// whole snapshot.
 #[cfg(any(test, feature = "test-util"))]
 pub struct TestFeed(watch::Sender<Arc<LoadSnapshot>>);
 
 #[cfg(any(test, feature = "test-util"))]
 impl TestFeed {
-    pub fn attached_to(policy: &dyn LoadBalancingPolicy) -> Self {
+    pub fn attached_to(attach: impl FnOnce(Option<LoadReceiver>)) -> Self {
         let (tx, rx) = watch::channel(Arc::new(LoadSnapshot::default()));
-        policy.set_load_receiver(Some(rx));
+        attach(Some(rx));
         Self(tx)
     }
 

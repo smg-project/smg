@@ -90,6 +90,7 @@ mod scan;
 mod sentencepiece;
 mod short_pieces;
 mod unicode;
+mod wide_pieces;
 
 use long_entries::LongEntryFilter;
 use merge::{ByteTokens, MergeTable};
@@ -97,6 +98,7 @@ use nfc::NfcQuick;
 use pattern::Pattern;
 use sentencepiece::{CharSymbols, Marker, WORD_MARKER};
 use short_pieces::{ShortPieceKey, ShortPieceTable, Vacancy, SHORT_PIECE_MAX_BYTES};
+use wide_pieces::{WideKey, WidePieceTable};
 
 use crate::{
     encode_path::{Declined, Fallback},
@@ -140,7 +142,8 @@ fn class_pattern(ranges: &[(char, char)], runs: bool) -> String {
 
 /// Pieces up to this many bytes are cached per thread by their count (see
 /// `PIECE_CACHE_CAPACITY`): those of up to `SHORT_PIECE_MAX_BYTES` in a
-/// packed table, the longer ones in a map; longer pieces still, up to
+/// packed table, those of up to 32 bytes with up to seven ids in a second
+/// one (`wide_pieces`), the rest in a map; longer pieces still, up to
 /// `LONG_PIECE_MAX_BYTES`, by the bytes they take (see
 /// `LONG_PIECE_BYTES_CAPACITY`).
 const CACHED_PIECE_MAX_BYTES: usize = 64;
@@ -166,8 +169,12 @@ const LONG_PIECE_MAX_BYTES: usize = 16 << 10;
 /// instructions with the scans; 256 B and 2 KB texts +2..+7 % instructions
 /// with the scans compiled into their loop, whether or not a run takes
 /// them). The threshold is the pool path's unit size, so a long input keeps
-/// the scans on every unit it is cut into.
+/// the scans on every unit it is cut into. The chain scanner takes them on
+/// a shorter unit too when it opens as ASCII text
+/// (`NativeEncoder::opens_as_ascii`).
 const WORD_SCAN_MIN_BYTES: usize = PARALLEL_CHUNK_BYTES;
+/// Bytes at the head of a unit that `NativeEncoder::opens_as_ascii` reads.
+const ASCII_HEAD_BYTES: usize = 256;
 /// Entries a thread's piece cache holds for one encoder before it is cleared,
 /// at most; see `PIECE_CACHE_TOTAL_CAPACITY`. This is also the cliff of a
 /// repeated document: one with fewer distinct pieces is encoded again at the
@@ -191,13 +198,20 @@ const WORD_SCAN_MIN_BYTES: usize = PARALLEL_CHUNK_BYTES;
 /// the ids as two boxes, about 140 bytes for a typical entry (a 20-byte
 /// piece with four ids) and about 430 at most (a 64-byte piece whose ids
 /// are its bytes), so a thread whose entries were all such pieces holds
-/// about 35 MiB, 108 MiB in that worst case. A clear at the bound keeps
-/// both tiers' arrays (the packed table's slots and its spill's capacity,
-/// and the map's buckets, unless the share fell below what they were grown
+/// about 35 MiB, 108 MiB in that worst case. A piece of 16 to 32 bytes
+/// with up to seven ids takes a slot of the wide table instead
+/// (`PieceCache::wide`: 65 bytes a slot, the table between three eighths
+/// and three quarters full past 4,096 slots, so 87 to 173 bytes an
+/// entry and 32.5 MiB at the full bound, inside the map's figures), and
+/// allocates nothing per entry. A clear at the bound keeps
+/// the tiers' arrays (the packed table's slots and its spill's capacity,
+/// the wide table's slots and the map's buckets, unless the share fell
+/// below what they were grown
 /// for) and drops their entries, so a thread that filled its packed table
 /// on one kind of text and then meets such pieces holds both, about 51 MiB
 /// with typical map entries and 140 MiB at the worst case the count bound
-/// allows.
+/// allows; a thread that filled its wide table between the two keeps those
+/// slots as well, 32.5 MiB more (about 84 MiB and 172 MiB).
 /// Measured on one thread after a corpus of 7,015 prompts: the peak RSS
 /// grew by 8 MB on a 128k-token vocabulary and did not move on three
 /// larger ones, whose peak is the file load.
@@ -216,12 +230,16 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// back inside its reservation keeps the pages it touched, 528 KiB at most,
 /// while the later threads hold their share's slots: about 440 MiB in all at
 /// 1,024 threads). The maps of the pieces of 16 to 64 bytes share the count at
-/// about 140 bytes a typical entry (430 at most, see `PIECE_CACHE_CAPACITY`),
+/// about 140 bytes a typical entry (430 at most, a wide table's entry within
+/// that; see `PIECE_CACHE_CAPACITY`),
 /// and a clear keeps the packed slots and the map's buckets (the map made anew,
 /// the packed table cut back, for a smaller share), so the count-bounded tiers
 /// of one tokenizer hold at most the sum of the two: about 820 MiB at sixteen
 /// threads with typical map entries (about 2.2 GiB, sixteen times the 140 MiB
-/// of a thread, were every map entry the worst case), toward 352 + 560 MiB with
+/// of a thread, were every map entry the worst case), and the slots of wide
+/// tables that grew to the bound as well, kept through a clear like the packed
+/// slots (65 bytes a slot: 520 MiB more at sixteen threads, 693 MiB at the most
+/// however many threads share the total), toward 352 + 560 MiB with
 /// the rounding of more threads (the packed part toward twice its 352 MiB past
 /// some 680 threads, as above); the long pieces add `LONG_PIECE_BYTES_TOTAL` at
 /// most (a thread's long tier keeps its map's slots through an eviction's
@@ -232,7 +250,7 @@ const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// it for that call's misses (a call that was running when threads joined keeps
 /// its earlier share until it ends; the long tier reads the live share at every
 /// miss), so after threads join it is within the smaller share from its next
-/// call on, entries, packed slots and map buckets alike (the packed table's
+/// call on, entries, packed slots, wide slots and map buckets alike (the packed table's
 /// pages already touched inside its reservation stay resident,
 /// `THREAD_BACKING_SLOTS` slots at most, 33 bytes each, about 528 KiB per
 /// thread: more than the share's slots only once those fall under the
@@ -375,11 +393,16 @@ struct PieceCache {
     /// the fewest slots when the cache is, grown with the pieces the thread
     /// meets, up to its share, and held plain (not in an `Option`): the hit
     /// path reads it at an offset of the cache, with no test of its
-    /// presence per piece. Bounded by count together with `short`.
+    /// presence per piece. Bounded by count together with `wide` and
+    /// `short`.
     packed: ShortPieceTable,
-    /// Pieces of more than `SHORT_PIECE_MAX_BYTES`, up to
+    /// Pieces of 16 to 32 bytes whose ids fit an entry, packed, a line a
+    /// piece (`wide_pieces`): nothing is allocated per entry. Bounded by
+    /// their count together with `packed` and `short`.
+    wide: WidePieceTable,
+    /// The other pieces of more than `SHORT_PIECE_MAX_BYTES`, up to
     /// `CACHED_PIECE_MAX_BYTES`, bounded by their count together with
-    /// `packed`.
+    /// `packed` and `wide`.
     short: PieceIds,
     /// Longer pieces, up to `LONG_PIECE_MAX_BYTES`, bounded by their bytes.
     long: PieceIds,
@@ -400,10 +423,12 @@ struct PieceCache {
 
 impl PieceCache {
     /// The empty cache of a thread whose share of the count-bounded tiers
-    /// is `share`: the packed table with the fewest slots, the maps empty.
+    /// is `share`: the packed table with the fewest slots, the wide table
+    /// with none, the maps empty.
     fn with_share(share: usize) -> Self {
         Self {
             packed: ShortPieceTable::new(),
+            wide: WidePieceTable::new(),
             short: PieceIds::default(),
             long: PieceIds::default(),
             long_bytes: 0,
@@ -443,9 +468,13 @@ impl PieceCache {
         self.long_bytes = 0;
     }
 
-    /// Entries of the tiers bounded by count, `packed` and `short`.
+    /// Entries of the tiers bounded by count: `packed`, `wide` and `short`.
     fn short_entries(&self) -> usize {
-        self.packed.len() + self.short.len()
+        self.packed.len() + self.wide.len() + self.short.len()
+    }
+
+    fn wide_slots(&self) -> usize {
+        self.wide.slots()
     }
 
     /// Slots of the packed tier.
@@ -467,9 +496,11 @@ impl PieceCache {
     /// that had moved past the reservation is made anew), the map is made
     /// anew when its capacity is above twice the share (a map that grew under
     /// the share stays under that, so the check never fires at a steady share
-    /// and a clear at the bound keeps the buckets).
+    /// and a clear at the bound keeps the buckets); the wide table keeps its
+    /// slots, or gives them back when it has more than the share takes.
     fn clear_short(&mut self, share: usize) {
         self.packed.clear(share);
+        self.wide.clear(share);
         if self.short.capacity() > 2 * share {
             self.short = PieceIds::default();
         } else {
@@ -791,8 +822,10 @@ pub(crate) struct AddedTokens {
 /// The distinct prefixes of a set's tokens as a packed searcher: the longest
 /// length up to [`Self::MAX_LEN`] bytes at which there are at most
 /// [`Self::MAX_COUNT`] of them (a token shorter than the length stands
-/// whole), so a hit is as close to a token as the set allows. A set whose
-/// prefixes would be shorter than [`Self::MIN_LEN`] bytes keeps the
+/// whole), so a hit is as close to a token as the set allows; a set that
+/// comes to at most [`Self::NARROW_COUNT`] with [`Self::NARROW_MIN_LEN`]
+/// bytes or more is cut to that length, for the library's narrow form. A
+/// set whose prefixes would be shorter than [`Self::MIN_LEN`] bytes keeps the
 /// automaton's own search. When the library declines the prefixes that fit
 /// (its SIMD searcher takes a one-byte pattern among at most sixteen, and a
 /// set with newline or tab runs among its tokens has such prefixes), the
@@ -809,6 +842,14 @@ impl Prefixes {
     const MAX_LEN: usize = 16;
     const MIN_LEN: usize = 3;
     const MAX_COUNT: usize = 64;
+    /// The most patterns the library's packed searcher takes in its narrow
+    /// form (as of its version 1.1), which reads up to twice the bytes a
+    /// step that its wide form reads.
+    const NARROW_COUNT: usize = 32;
+    /// The shortest prefixes the narrow form is preferred with: a prefix of
+    /// this many bytes is nearly as rare in text as its token, where a
+    /// shorter one would stop the pass at places no token stands.
+    const NARROW_MIN_LEN: usize = 8;
     const MAX_FIRST_BYTES: usize = 16;
 
     /// Whether the automaton's start-byte scan declines `tokens`: a first
@@ -823,34 +864,48 @@ impl Prefixes {
         firsts.len() > 3 || firsts.iter().any(|first| !first.is_ascii())
     }
 
-    /// The searcher over the prefixes of `tokens`; none when the prefixes
-    /// that fit are shorter than [`Self::MIN_LEN`] bytes for a token longer
-    /// than them (a set of added words: the pass would stop at nearly every
-    /// byte of ordinary text, where the automaton's own walk is cheaper),
-    /// when even the one-byte prefixes exceed [`Self::MAX_COUNT`], or when
-    /// the library declines the set.
-    fn of(tokens: &[Added]) -> Option<Self> {
-        let distinct = |len: usize| {
-            let mut prefixes: Vec<&[u8]> = tokens
-                .iter()
-                .map(|token| &token.content.as_bytes()[..token.content.len().min(len)])
-                .collect();
-            prefixes.sort_unstable();
-            prefixes.dedup();
-            prefixes
+    /// The distinct prefixes of `tokens` of up to `len` bytes.
+    fn distinct(tokens: &[Added], len: usize) -> Vec<&[u8]> {
+        let mut prefixes: Vec<&[u8]> = tokens
+            .iter()
+            .map(|token| &token.content.as_bytes()[..token.content.len().min(len)])
+            .collect();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        prefixes
+    }
+
+    /// The prefixes of `tokens` a searcher is made of: the longest of at
+    /// most [`Self::NARROW_COUNT`] when their length is
+    /// [`Self::NARROW_MIN_LEN`] bytes or more, so that the library takes its
+    /// narrow form; else the longest of at most [`Self::MAX_COUNT`]. None
+    /// when the prefixes that fit are shorter than [`Self::MIN_LEN`] bytes
+    /// for a token longer than them (a set of added words: the pass would
+    /// stop at nearly every byte of ordinary text, where the automaton's own
+    /// walk is cheaper), or when even the one-byte prefixes exceed
+    /// [`Self::MAX_COUNT`].
+    fn chosen(tokens: &[Added]) -> Option<Vec<&[u8]>> {
+        // The longest length from `shortest` up with at most `most` distinct
+        // prefixes. Their count never grows as the length shrinks, so the
+        // first length that fits, read from the longest down, is the one.
+        let longest = |shortest: usize, most: usize| {
+            (shortest..=Self::MAX_LEN)
+                .rev()
+                .map(|len| (len, Self::distinct(tokens, len)))
+                .find(|(_, prefixes)| prefixes.len() <= most)
         };
-        let mut len = Self::MAX_LEN;
-        let mut prefixes = distinct(len);
-        while prefixes.len() > Self::MAX_COUNT && len > 1 {
-            len -= 1;
-            prefixes = distinct(len);
-        }
+        let (len, prefixes) = longest(Self::NARROW_MIN_LEN, Self::NARROW_COUNT)
+            .or_else(|| longest(1, Self::MAX_COUNT))?;
         let cut_short = tokens.iter().any(|token| token.content.len() > len);
-        if prefixes.len() > Self::MAX_COUNT || (cut_short && len < Self::MIN_LEN) {
-            return None;
-        }
+        (!cut_short || len >= Self::MIN_LEN).then_some(prefixes)
+    }
+
+    /// The searcher over the prefixes of `tokens` ([`Self::chosen`]); none
+    /// when there are none to take or the library declines the set.
+    fn of(tokens: &[Added]) -> Option<Self> {
+        let prefixes = Self::chosen(tokens)?;
         let searcher = Self::searcher(&prefixes).or_else(|| {
-            let firsts = distinct(1);
+            let firsts = Self::distinct(tokens, 1);
             (firsts.len() <= Self::MAX_FIRST_BYTES)
                 .then(|| Self::searcher(&firsts))
                 .flatten()
@@ -1110,6 +1165,14 @@ pub(crate) struct NativeEncoder {
     /// raw text. Such a text is never cut into units for the thread pool
     /// either (see [`Self::stable_cut`]).
     mapped_from: Option<usize>,
+    /// For the stages over the image: whether the image of each byte is a
+    /// character one of their matches can begin with. A piece that holds no
+    /// such byte holds no match of any of them and goes through every one
+    /// whole, so it is final as it stands, with no image built and no search
+    /// started (see [`Self::pieces_mapping`]). `None` when no stage runs
+    /// over the image, or one of them names no opening class or drops the
+    /// text outside its matches.
+    image_opens: Option<Box<[bool; 256]>>,
     /// Added tokens matched on the raw text (`normalized: false`).
     raw_added: Option<AddedTokens>,
     /// Added tokens matched after normalization (`normalized: true`).
@@ -1260,9 +1323,12 @@ impl NativeEncoder {
             None => chain::Scanner::recognize(&stages),
             Some(_) => None,
         };
+        // One alphabet for the walk's map and for the table read through it.
+        let alphabet = bytes_char();
         Ok(Self {
             end_anchored: stages.iter().any(|stage| stage.pattern.end_anchored()),
             mapped_from,
+            image_opens: Self::image_opening_bytes(&stages, mapped_from, &alphabet),
             nfc_quick: (normalizer == Normalizer::Nfc).then(NfcQuick::read),
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
@@ -1273,7 +1339,7 @@ impl NativeEncoder {
             stages,
             chain,
             frame,
-            alphabet: bytes_char(),
+            alphabet,
             seed: ShortPieceTable::for_entries(0),
             seed_covers_short_entries: false,
             long_entries: None,
@@ -1345,6 +1411,7 @@ impl NativeEncoder {
         Ok(Self {
             end_anchored: false,
             mapped_from: None,
+            image_opens: None,
             normalizer: Normalizer::None,
             nfc_quick: None,
             raw_added: AddedTokens::build(&raw)?,
@@ -1968,6 +2035,7 @@ impl NativeEncoder {
             nfc_quick: None,
             end_anchored: false,
             mapped_from: None,
+            image_opens: None,
             space_inside: stages
                 .iter()
                 .any(|stage| stage.pattern.reads_space_inside()),
@@ -2089,6 +2157,29 @@ impl NativeEncoder {
             }
         }
         Ok((stages, mapped_from))
+    }
+
+    /// The bytes whose image a match of a stage over the image can begin
+    /// with (the `image_opens` field), read through `alphabet`, the map the
+    /// walk builds each image with: every stage from `mapped_from` on must
+    /// name the class its matches begin with and keep the text outside its
+    /// matches, or there is no table.
+    fn image_opening_bytes(
+        stages: &[Stage],
+        mapped_from: Option<usize>,
+        alphabet: &[char; 256],
+    ) -> Option<Box<[bool; 256]>> {
+        let mut opens = Box::new([false; 256]);
+        for stage in &stages[mapped_from?..] {
+            if !matches!(stage.pieces.walk(), Walk::Apart { gaps: true, .. }) {
+                return None;
+            }
+            let class = stage.pattern.opening_class()?;
+            for (open, &c) in opens.iter_mut().zip(alphabet) {
+                *open |= class.contains(c);
+            }
+        }
+        Some(opens)
     }
 
     /// A stage anchored to its text (`\A`, `\z` or `\G`) reads the bounds of
@@ -2316,7 +2407,8 @@ impl NativeEncoder {
     ) -> Result<Vec<u32>, Fallback> {
         // The scanners' word scans, chosen once per call on the input's
         // length (`WORD_SCAN_MIN_BYTES`): every unit of a long input takes
-        // them, a short input walks its runs byte by byte.
+        // them; a short input walks its runs byte by byte, the chain
+        // scanner's units that open as ASCII text apart (`encode_unit`).
         let words = text.len() >= WORD_SCAN_MIN_BYTES;
         // Text not in the normalizer's form (by the library's tables, as
         // every normalization read here) is normalized gap by gap first;
@@ -2831,6 +2923,30 @@ impl NativeEncoder {
                 .is_some_and(char::is_whitespace)
     }
 
+    /// Whether `text` opens as ASCII text: at most one byte in eight of its
+    /// first `ASCII_HEAD_BYTES` is beyond ASCII. The chain scanner takes the
+    /// word scans on such a unit whatever its length: on a text the branch
+    /// predictor has not seen its byte loops' exits mispredict about once
+    /// per run, and on a text it has seen its scanned walk costs no more
+    /// than the byte loops (the single-stage scanners' scanned loops do, so
+    /// they keep `WORD_SCAN_MIN_BYTES`). A unit in another script has few
+    /// runs the scans can pass over and keeps the byte loops. The bytes are
+    /// counted a word at a time: 32 steps for a full head.
+    fn opens_as_ascii(text: &str) -> bool {
+        /// The low bit of every byte of a word.
+        const EACH_BYTE: u64 = 0x0101_0101_0101_0101;
+        let head = &text.as_bytes()[..text.len().min(ASCII_HEAD_BYTES)];
+        let (words, tail) = head.as_chunks::<8>();
+        let mut beyond = tail.iter().filter(|byte| !byte.is_ascii()).count() as u64;
+        for word in words {
+            // Each byte's top bit, moved to its low bit; the multiply sums
+            // the eight into the word's top byte.
+            let tops = (u64::from_le_bytes(*word) >> 7) & EACH_BYTE;
+            beyond += tops.wrapping_mul(EACH_BYTE) >> 56;
+        }
+        beyond <= (head.len() / 8) as u64
+    }
+
     /// Appends the ids of one unit: an added token's id, or a text's pieces
     /// through the stages and the model (the text has no added token left in
     /// it, see [`Self::units`]); the reason when the model declines a piece
@@ -2893,6 +3009,12 @@ impl NativeEncoder {
                 self.pieces_mapping(0, from, text, &mut image, &mut per_piece);
             }
             (Some(chain), _, None) => {
+                // The chain's scanned walk costs a repeated text no more
+                // than its byte loops, so a short unit that opens as ASCII
+                // text takes it too. An all-ASCII unit does by definition:
+                // the head is counted only for a unit with a byte beyond
+                // ASCII.
+                let words = words || cache.unit_ascii || Self::opens_as_ascii(text);
                 chain.pieces(text, words, &mut |start, end| {
                     if let Err(declined) =
                         self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
@@ -2904,9 +3026,14 @@ impl NativeEncoder {
             (None, [stage], None)
                 if matches!(stage.pieces.walk(), Walk::Apart { matches: true, .. }) =>
             {
-                if let Err(declined) =
-                    self.encode_single_stage(model, stage, text, words, mapped, ids, cache)
-                {
+                // An all-ASCII unit has a copy of the stage's loop compiled
+                // for it (see `encode_single_stage`).
+                let encoded = if cache.unit_ascii {
+                    self.encode_single_stage::<true>(model, stage, text, words, mapped, ids, cache)
+                } else {
+                    self.encode_single_stage::<false>(model, stage, text, words, mapped, ids, cache)
+                };
+                if let Err(declined) = encoded {
                     fallback = Some(declined);
                 }
             }
@@ -2988,6 +3115,14 @@ impl NativeEncoder {
             return;
         }
         if depth >= from {
+            // No match of a stage over the image begins in a piece that
+            // holds none of their opening bytes: the piece is final.
+            if let Some(opens) = &self.image_opens {
+                if !text.bytes().any(|byte| opens[usize::from(byte)]) {
+                    f(text.as_bytes());
+                    return;
+                }
+            }
             image.clear();
             image.extend(text.bytes().map(|b| self.alphabet[usize::from(b)]));
             self.pieces_in_alphabet(depth, image, text.as_bytes(), f);
@@ -3116,6 +3251,7 @@ impl NativeEncoder {
         let vacancy = match ShortPieceKey::of(piece) {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return Ok(()),
+                Some(vacancy) if self.seeded(vacancy, ids, cache) => return Ok(()),
                 vacancy => vacancy,
             },
             None => None,
@@ -3131,9 +3267,20 @@ impl NativeEncoder {
     /// loop inlined there cost that path 3 % of its instructions per token
     /// (measured); one call per unit here is nothing against a unit's
     /// pieces.
+    ///
+    /// Compiled twice. `ASCII` is the copy an all-ASCII unit takes (the
+    /// flag [`Self::encode_unit`] reads once per unit): in it the template
+    /// scanner ends every run by the lean scan (`Roles::run_end_ascii`),
+    /// which has no character beyond ASCII to care for, whatever the
+    /// input's length. It is a copy and no third loop of the one function:
+    /// compiled in here, the lean loop moved the code of the other loops,
+    /// and the byte loops and the cased scanner cost 1 to 2 % more
+    /// operations per token on text the lean scan never reads (counted). A
+    /// pattern with no lean scan goes on to the other copy, which is the
+    /// function as it was.
     #[inline(never)]
     #[expect(clippy::too_many_arguments)]
-    fn encode_single_stage(
+    fn encode_single_stage<const ASCII: bool>(
         &self,
         model: Option<&ModelWrapper>,
         stage: &Stage,
@@ -3143,6 +3290,10 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
+        if ASCII && !stage.pattern.has_lean_scan() {
+            return self
+                .encode_single_stage::<false>(model, stage, text, words, mapped, ids, cache);
+        }
         let gaps = matches!(stage.pieces.walk(), Walk::Apart { gaps: true, .. });
         let mut cursor = 0;
         let mut fallback = None;
@@ -3152,7 +3303,7 @@ impl NativeEncoder {
         // instructions for a hit of which the probe is about 50 (counted on
         // the long warm cells). The gap piece stays out of line: a scanner's
         // alternatives tile the text, so a gap is the rare case there.
-        stage.pattern.for_each_match(
+        stage.pattern.for_each_match::<ASCII, _>(
             text,
             words,
             #[inline(always)]
@@ -3198,6 +3349,7 @@ impl NativeEncoder {
         let vacancy = match ShortPieceKey::at(text.as_bytes(), piece.start, piece.end) {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return Ok(()),
+                Some(vacancy) if self.seeded(vacancy, ids, cache) => return Ok(()),
                 vacancy => vacancy,
             },
             None => None,
@@ -3223,8 +3375,45 @@ impl NativeEncoder {
         self.tokenize_piece_at(model, text, piece, mapped, ids, cache)
     }
 
-    /// The rest of [`Self::tokenize_piece`], out of line: the longer pieces'
-    /// cache, the seed, the merge or the model, and the cache insert.
+    /// A short piece the thread's table missed (`vacancy`), answered when
+    /// the encoder's seed holds it, as it holds every short vocabulary word:
+    /// the ids appended, and the seed's entry kept in the thread's table at
+    /// the vacancy as a copy ([`ShortPieceTable::keep`]), so a first-sight
+    /// vocabulary word pays neither the slow path's frame nor a second walk
+    /// and an insert from its ids (70 to 75 instructions fewer a word,
+    /// counted on three vocabularies). False when the seed does not hold
+    /// the piece: the slow path merges it. Out of line and cold: inlined at
+    /// the probe's miss it cost every hit up to ten instructions, as a plain
+    /// call up to twenty-three on one vocabulary; cold, a hit costs what it
+    /// did or less (counted).
+    #[cold]
+    #[inline(never)]
+    fn seeded(&self, vacancy: Vacancy, ids: &mut Vec<u32>, cache: &mut PieceCache) -> bool {
+        let Ok(entry) = self.seed.probe(vacancy.key()) else {
+            return false;
+        };
+        let kept = cache.short_entries() < cache.share && cache.packed.keep(vacancy, entry);
+        let start = ids.len();
+        self.seed.append(entry, ids);
+        if !kept {
+            self.remember_seeded(vacancy, start, ids, cache);
+        }
+        true
+    }
+
+    /// [`Self::remember_piece`] for a seeded piece the thread's table did
+    /// not keep as a copy: its ids are in the seed's spill, or the table is
+    /// at its fill bound or the thread at its share. The rare case, out of
+    /// line so that [`Self::seeded`] keeps no frame for it.
+    #[cold]
+    #[inline(never)]
+    fn remember_seeded(&self, vacancy: Vacancy, start: usize, ids: &[u32], cache: &mut PieceCache) {
+        self.remember_piece(&[], Some(vacancy), start, ids, cache);
+    }
+
+    /// The rest of [`Self::tokenize_piece`], out of line, for a piece the
+    /// thread's packed table and the seed do not hold: the longer pieces'
+    /// cache, the merge or the model, and the cache insert.
     #[inline(never)]
     fn tokenize_piece_slow(
         &self,
@@ -3236,58 +3425,65 @@ impl NativeEncoder {
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
-        if vacancy.is_none() && cacheable {
+        // A piece of 16 to 32 bytes is the wide table's when its ids fit an
+        // entry; one the table does not hold may still be the map's.
+        let wide = match vacancy {
+            None => WideKey::of(bytes),
+            Some(_) => None,
+        };
+        if wide.is_some_and(|key| cache.wide.ids_into(key, ids)) {
+            return Ok(());
+        }
+        if vacancy.is_none() && cacheable && (wide.is_none() || !cache.short.is_empty()) {
             if let Some(found) = cache.get(bytes) {
                 ids.extend_from_slice(found);
                 return Ok(());
             }
         }
         let start = ids.len();
-        // A piece this thread has not met: the encoder's seed has it when it
-        // is a vocabulary word, else it is merged, by the table or by the
-        // model for a table that declined. A raw piece of the sentencepiece
-        // path never comes here: it has its own slow path.
+        // A piece this thread has not met and the seed does not hold (the
+        // probe's miss asked it, see `Self::seeded`): merged, by the table
+        // or by the model for a table that declined. A raw piece of the
+        // sentencepiece path never comes here: it has its own slow path.
         debug_assert!(
             self.chars.is_none(),
             "a sentencepiece piece takes tokenize_raw_piece_slow"
         );
-        if !vacancy.is_some_and(|vacancy| self.seed.ids_into(vacancy.key(), ids)) {
-            // A piece holding a byte the table has no token for is the
-            // model's (see `MergeTable::lacks_a_token_for`).
-            if let Some(table) = self
-                .merges
-                .as_ref()
-                .filter(|table| !table.lacks_a_token_for(bytes))
+        // A piece holding a byte the table has no token for is the
+        // model's (see `MergeTable::lacks_a_token_for`).
+        if let Some(table) = self
+            .merges
+            .as_ref()
+            .filter(|table| !table.lacks_a_token_for(bytes))
+        {
+            // Under `ignore_merges` a piece that is an entry is that entry:
+            // the model's map is asked when the piece can be one (the
+            // lookup is the piece mapped to the alphabet as a string, its
+            // hash, a probe of the map and a compare: a memory latency and
+            // more on a cold piece, measured).
+            let whole = if table.ignore_merges
+                && self.may_be_entry(vacancy.map(|vacancy| vacancy.key()), bytes)
             {
-                // Under `ignore_merges` a piece that is an entry is that entry:
-                // the model's map is asked when the piece can be one (the
-                // lookup is the piece mapped to the alphabet as a string, its
-                // hash, a probe of the map and a compare: a memory latency and
-                // more on a cold piece, measured).
-                let whole = if table.ignore_merges
-                    && self.may_be_entry(vacancy.map(|vacancy| vacancy.key()), bytes)
-                {
-                    model.and_then(|model| model.token_to_id(self.mapped(bytes, mapped)))
-                } else {
-                    None
-                };
-                match whole {
-                    Some(id) => ids.push(id),
-                    // A cold piece of a unit with a non-ASCII byte merges
-                    // from its pre-formed characters when it has them (the
-                    // pre-formed path reads the piece's bytes itself); a
-                    // piece of an ASCII unit never reads that analysis.
-                    None => {
-                        if cache.unit_ascii || !table.merge_preformed(bytes, ids) {
-                            table.merge(bytes, ids);
-                        }
+                model.and_then(|model| model.token_to_id(self.mapped(bytes, mapped)))
+            } else {
+                None
+            };
+            match whole {
+                Some(id) => ids.push(id),
+                // A cold piece of a unit with a non-ASCII byte merges
+                // from its pre-formed characters when it has them (the
+                // pre-formed path reads the piece's bytes itself); a
+                // piece of an ASCII unit never reads that analysis.
+                None => {
+                    if cache.unit_ascii || !table.merge_preformed(bytes, ids) {
+                        table.merge(bytes, ids);
                     }
                 }
-            } else {
-                match model.map(|model| model.tokenize(self.mapped(bytes, mapped))) {
-                    Some(Ok(tokens)) => ids.extend(tokens.iter().map(|token| token.id)),
-                    Some(Err(_)) | None => return Err(Fallback::PieceDeclined),
-                }
+            }
+        } else {
+            match model.map(|model| model.tokenize(self.mapped(bytes, mapped))) {
+                Some(Ok(tokens)) => ids.extend(tokens.iter().map(|token| token.id)),
+                Some(Err(_)) | None => return Err(Fallback::PieceDeclined),
             }
         }
         self.remember_piece(bytes, vacancy, start, ids, cache);
@@ -3295,8 +3491,9 @@ impl NativeEncoder {
     }
 
     /// Remembers `ids[start..]` as the encoding of `piece` in the thread's
-    /// cache: the packed table for a piece with a key, the map for one of up
-    /// to `CACHED_PIECE_MAX_BYTES`, the long tier, by bytes, for one of up
+    /// cache: the packed table for a piece with a key, the wide table or the
+    /// map for one of up to `CACHED_PIECE_MAX_BYTES` (the table when it is
+    /// of at most 32 bytes and seven ids), the long tier, by bytes, for one of up
     /// to `LONG_PIECE_MAX_BYTES`; each within the thread's share. Inlined
     /// into both slow paths: out of line it is a call frame per cache miss
     /// on every vocabulary (four to eight instructions per token on a cold
@@ -3325,7 +3522,11 @@ impl NativeEncoder {
             if cache.short_entries() >= share {
                 cache.clear_short(share);
             }
-            cache.short.insert(piece.into(), ids[start..].into());
+            let kept =
+                WideKey::of(piece).is_some_and(|key| cache.wide.insert(key, &ids[start..], share));
+            if !kept {
+                cache.short.insert(piece.into(), ids[start..].into());
+            }
         } else if piece.len() <= LONG_PIECE_MAX_BYTES {
             let entry = LONG_PIECE_ENTRY_BYTES + piece.len() + size_of_val(&ids[start..]);
             let share = self.long_piece_bytes_share();
@@ -3396,6 +3597,7 @@ impl NativeEncoder {
         let vacancy = match ShortPieceKey::at(text.as_bytes(), piece.start, piece.end) {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return,
+                Some(vacancy) if self.seeded(vacancy, ids, cache) => return,
                 vacancy => vacancy,
             },
             None => None,
@@ -3420,6 +3622,7 @@ impl NativeEncoder {
         let vacancy = match ShortPieceKey::of(spaced.as_bytes()) {
             Some(key) => match cache.packed.lookup(key, ids) {
                 None => return,
+                Some(vacancy) if self.seeded(vacancy, ids, cache) => return,
                 vacancy => vacancy,
             },
             None => None,
@@ -3427,10 +3630,10 @@ impl NativeEncoder {
         self.tokenize_raw_piece_slow(chars, &spaced, vacancy, mapped, ids, cache);
     }
 
-    /// The rest of [`Self::tokenize_raw_piece`], out of line: the longer
-    /// pieces' cache (by the raw bytes), the seed, the merge from the
-    /// piece's character symbols in the vocabulary's form, and the cache
-    /// insert.
+    /// The rest of [`Self::tokenize_raw_piece`], out of line, for a piece
+    /// the thread's packed table and the seed do not hold: the longer
+    /// pieces' cache (by the raw bytes), the merge from the piece's
+    /// character symbols in the vocabulary's form, and the cache insert.
     #[inline(never)]
     fn tokenize_raw_piece_slow(
         &self,
@@ -3442,6 +3645,10 @@ impl NativeEncoder {
         cache: &mut PieceCache,
     ) {
         let bytes = raw.as_bytes();
+        if vacancy.is_none() && WideKey::of(bytes).is_some_and(|key| cache.wide.ids_into(key, ids))
+        {
+            return;
+        }
         if vacancy.is_none() && bytes.len() <= LONG_PIECE_MAX_BYTES {
             if let Some(found) = cache.get(bytes) {
                 ids.extend_from_slice(found);
@@ -3449,13 +3656,11 @@ impl NativeEncoder {
             }
         }
         let start = ids.len();
-        if !vacancy.is_some_and(|vacancy| self.seed.ids_into(vacancy.key(), ids)) {
-            chars.merge(
-                CharSymbols::normalized(raw, mapped),
-                &mut cache.symbols,
-                ids,
-            );
-        }
+        chars.merge(
+            CharSymbols::normalized(raw, mapped),
+            &mut cache.symbols,
+            ids,
+        );
         self.remember_piece(bytes, vacancy, start, ids, cache);
     }
 
@@ -3478,8 +3683,8 @@ impl NativeEncoder {
     /// The calling thread's piece cache, borrowed for one encode call and
     /// within the thread's share at the start of it: a thread whose share
     /// fell since it last read it (threads joined) clears its count-bounded
-    /// tiers here, by their entries, by the slots of its packed table or by
-    /// the capacity of its map (arrays grown for the earlier share keep
+    /// tiers here, by their entries, by the slots of its packed or of its
+    /// wide table or by the capacity of its map (arrays grown for the earlier share keep
     /// their size through a clear at the bound; here the map is made anew for
     /// the share and the packed table is cut back to the share's slots inside
     /// its reservation, see `ShortPieceTable::clear`), and makes its long
@@ -3490,7 +3695,7 @@ impl NativeEncoder {
     /// cache for the call's misses, so a call that was running when threads
     /// joined keeps the share it started with until it ends; a thread that
     /// never encodes again holds what it had until it exits). Two relaxed
-    /// loads, one store and four compares per call.
+    /// loads, one store and five compares per call.
     fn piece_cache_for_call(&self) -> RefMut<'_, PieceCache> {
         let mut cache = self.thread_piece_cache().borrow_mut();
         let share = self.piece_cache_share();
@@ -3498,6 +3703,7 @@ impl NativeEncoder {
         let slots = ShortPieceTable::slots_for(share);
         if cache.short_entries() > share
             || cache.packed_slots() > slots
+            || cache.wide_slots() > WidePieceTable::slots_for(share)
             || cache.map_capacity() > 2 * share
         {
             cache.clear_short(share);

@@ -94,7 +94,7 @@ impl Drop for PeriodicTask {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::{atomic::AtomicUsize, mpsc};
 
     use super::*;
 
@@ -114,23 +114,32 @@ mod tests {
         // Task will be stopped on drop
     }
 
+    /// Drops `task` on a helper thread and waits for the drop under a bound
+    /// far above any host pause: only a wait the shutdown did not wake
+    /// reaches it, and that fails the case by name instead of hanging it.
+    fn assert_the_drop_returns(task: PeriodicTask) {
+        let (dropped, done) = mpsc::channel();
+        thread::spawn(move || {
+            drop(task);
+            let _ = dropped.send(());
+        });
+        done.recv_timeout(Duration::from_secs(30))
+            .expect("the drop woke the task's wait");
+    }
+
+    /// The drop ends a timed wait instead of waiting it out. The interval is
+    /// a day, which no test run reaches, so the drop returning is the proof.
     #[test]
     fn test_periodic_task_responds_to_shutdown() {
-        let task = PeriodicTask::spawn(60, "test", || {
-            // Long interval task
-        });
-
-        let start = Instant::now();
-        drop(task);
-        let elapsed = start.elapsed();
-
-        // The unpark ends the wait at once: well under 60 seconds, and under the
-        // old slice form's 100 ms.
-        assert!(elapsed < Duration::from_millis(500));
+        let task = PeriodicTask::spawn(24 * 60 * 60, "test", || {});
+        // Let the task thread reach its timed wait, so the drop has to wake it.
+        thread::sleep(Duration::from_millis(100));
+        assert_the_drop_returns(task);
     }
 
     /// An interval the clock cannot reach never fires and never panics: the task
-    /// thread parks until shutdown, and the drop still returns at once.
+    /// thread parks until shutdown, and the drop wakes it. The thread has no
+    /// deadline, so the drop returning is the proof.
     #[test]
     fn test_periodic_task_with_an_unreachable_interval_parks_until_shutdown() {
         let counter = Arc::new(AtomicUsize::new(0));
@@ -142,9 +151,7 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
         assert_eq!(counter.load(Ordering::SeqCst), 0);
 
-        let start = Instant::now();
-        drop(task);
-        assert!(start.elapsed() < Duration::from_millis(500));
+        assert_the_drop_returns(task);
         assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 

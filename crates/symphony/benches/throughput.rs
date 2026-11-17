@@ -480,6 +480,25 @@ fn setup(c: &mut Criterion) {
         });
     }
     group.bench_function("declared", |b| b.iter(|| black_box(declared())));
+    // The anchors of DeepSeek V3.2 stand at the end of a generation prompt, and before the open
+    // message of a continued one: the setup must not read the turns before them.
+    let open = format!("<｜Assistant｜></think>{}", &prose()[..256]);
+    for kilobytes in [8_usize, 32, 128] {
+        let mut turns = String::from("<｜begin▁of▁sentence｜><｜User｜>");
+        while turns.len() < kilobytes << 10 {
+            turns.push_str(&prose());
+        }
+        for (shape, end) in [
+            ("first_turn", "<｜Assistant｜><think>"),
+            ("continued", open.as_str()),
+        ] {
+            let prompt = format!("{turns}{end}");
+            let name = format!("deepseek_v3.2_{shape}_{kilobytes}k");
+            group.bench_with_input(BenchmarkId::new("engine", name), &prompt, |b, prompt| {
+                b.iter(|| black_box(engine(Table::DeepSeekV3_2, prompt, &tools)));
+            });
+        }
+    }
     group.finish();
 }
 

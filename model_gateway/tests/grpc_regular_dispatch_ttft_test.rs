@@ -203,7 +203,9 @@ async fn request(router: &dyn RouterTrait, route: Route, streaming: bool) -> Opt
         Route::Chat => {
             let request =
                 serde_json::from_value(chat_request(model, streaming)).expect("chat request");
-            router.route_chat(None, &tenant, request, model).await
+            router
+                .route_chat(None, &tenant, Arc::new(request), model)
+                .await
         }
         Route::Transcriptions => {
             let request = TranscriptionRequest {
@@ -486,7 +488,7 @@ fn harmony_collected_chat_includes_the_held_header_delay() {
         let request =
             serde_json::from_value(chat_request(HARMONY_MODEL, false)).expect("chat request");
         let response = router
-            .route_chat(None, &tenant(), request, HARMONY_MODEL)
+            .route_chat(None, &tenant(), Arc::new(request), HARMONY_MODEL)
             .await;
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
@@ -583,7 +585,9 @@ fn a_client_leaving_after_the_first_chunk_records_no_stream_metrics() {
     let rendered = render_after(|| async {
         let router = regular_router().await;
         let request = serde_json::from_value(chat_request(MODEL, true)).expect("chat request");
-        let response = router.route_chat(None, &tenant(), request, MODEL).await;
+        let response = router
+            .route_chat(None, &tenant(), Arc::new(request), MODEL)
+            .await;
         assert_eq!(response.status(), http::StatusCode::OK);
         let mut body = response.into_body();
         let first = body

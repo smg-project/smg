@@ -3,15 +3,29 @@
 All times are UTC. The shared machines are `amd-mi300x-1` and `amd-mi300x-2`.
 Router retains daily 05:00-06:30. SMG PD retains Monday-Saturday 09:45;
 on Sunday non-AMD rows remain at 09:45 and AMD rows are dispatched at 22:35.
-The Sunday AMD dispatch queues behind any benchmark that still owns the lease.
+The Sunday AMD dispatch retains its agreed 22:35 time even though the benchmark
+moves to Monday. It queues behind any work that still owns the lease; changing
+the PD schedule is a separate decision.
 A delayed schedule is classified by its triggering cron, not the current weekday.
 Manual engine selection remains unchanged.
 
-The AMD benchmark remains Sunday 07:00. Its two GPU jobs retain all eight matrix
-rows and all models/iterations, with a six-hour job timeout. The previous 24-hour
-limit could not fit into any daily 22.5-hour interval outside the Router window.
-The longest retained job in three Sunday runs was 4h09m11s; the new limit is not
-a guarantee that the whole eight-job round finishes at 22:30.
+The AMD benchmark runs Monday 07:00 in four ordered waves: single-worker vLLM,
+single-worker SGLang, multi-worker vLLM, then multi-worker SGLang. Each wave has
+two model rows, retaining the original eight GPU jobs, models, iterations and
+HTTP/gRPC tests with a six-hour job timeout. A manual runtime selection excludes
+unselected engine waves before runner allocation; per-model filters still run
+inside each selected job.
+
+Monday 07:17 AMD BFCL (when `SMG_RUN_AMD_BFCL` and automatic AMD selection are
+enabled), Monday 09:45 AMD PD and ordinary AMD jobs share the same machines and
+lease with the benchmark. BFCL currently declares five AMD model rows with
+360-minute job caps; it can add substantial queue contention. Deferred Sunday
+AMD work can also reach Monday. These waves do
+not reserve hosts or guarantee queue ordering, a new 24-hour queue allowance,
+or completion on Monday. Work can continue in later legal windows after actual
+Router cleanup and lease admission. The longest retained job in three Sunday
+runs was 4h09m11s; that observation does not bound future runtimes or guarantee
+that the whole eight-job round finishes at 22:30.
 
 ## Host enforcement is a separate deployment gate
 
@@ -21,12 +35,19 @@ Admission must be checked before claiming work, after waiting for the shared
 lease and immediately before starting. A denial keeps work queued. Checking
 only the first job step or sleeping in JOB_STARTED starts the timeout too early.
 
-The proposed complete bounds are PR/chat 90 minutes, PD 200 minutes and benchmark
-390 minutes, including preparation, cleanup and margin. Corresponding latest
+The proposed classified bounds are PR/chat 90 minutes, PD 200 minutes and
+benchmark 390 minutes, including preparation, cleanup and margin. Their latest
 starts before 05:00 are 03:30, 01:40 and 22:30 the previous day. These require
 protected workflow/profile binding and actual bound enforcement; they are not
 made effective by this document or the cron patch. Unknown eligible work must
-remain queued. Do not substitute one global benchmark cutoff for all profiles.
+remain queued.
+
+A conservative mixed-label entry instead reserves the largest eligible bound
+for every claim: a 360-minute job and 390-minute complete lifetime, including
+enabled BFCL work. Its latest start is 22:30. The proposed 90/200-minute profiles
+cannot be substituted for that mixed entry without classifying its consumers.
+Monday benchmark waves work with this entry and the existing runner labels;
+separate runner-label management is not a prerequisite for this schedule.
 
 Every enabled AMD PR/manual job follows the same Router reservation. The hosted
 configuration check prints effective boolean gate values and runs the holder

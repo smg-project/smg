@@ -113,6 +113,20 @@ pub(super) fn structured_outputs_support(model: &TrtllmModelInfo) -> StructuredO
     }
 }
 
+/// Where the engine starts a request's grammar on a prompt that ends inside
+/// the model's thinking block (the `constrained_decoding_start` label the
+/// router shapes a forced tool call's grammar by): `first_token` under the
+/// backends that compile one, since the engine's guided decoder builds a
+/// request's matcher before the first generated token and no reasoning
+/// parser gates it. Empty under `none`, where no grammar ever starts, and
+/// under a backend the launcher could not name.
+pub(super) fn constrained_decoding_start(model: &TrtllmModelInfo) -> &'static str {
+    match model.guided_decoding_backend.trim() {
+        "xgrammar" | "llguidance" => "first_token",
+        _ => "",
+    }
+}
+
 /// How to bind, where the engines dial in, and what to advertise.
 #[derive(Debug, Clone)]
 pub struct TrtllmServicerConfig {
