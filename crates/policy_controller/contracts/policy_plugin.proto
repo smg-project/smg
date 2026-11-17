@@ -276,9 +276,12 @@ message RequestFacts {
   bool streaming = 5;
   uint32 max_output_tokens = 6;
   uint32 prompt_tokens = 7;  // the host's count or estimate
-  // Prefix block hashes, capped by `view.max_block_hashes`: a controller
-  // reads the first of a longer list, as many as the stages of its
-  // generation read and that many at most, and refuses none.
+  // Prefix block hashes, capped by `view.max_block_hashes` (1 to 8,190): a
+  // controller reads the first of a longer list, as many as the stages of
+  // its generation read and that many at most, and refuses no list for its
+  // length under the frame's bound. A DecideRequest over that bound, 64 KiB
+  // as encoded, is refused whole: a sender cuts its list at the tail until
+  // the frame fits, and counts the cut on its own side.
   repeated fixed64 block_hashes = 8 [packed = true];
   HashKind hash_kind = 9;
   // The routing key as the host derives it; its `hash` form is the
@@ -299,7 +302,9 @@ message RequestFacts {
   // controller hashes it into `block_hashes` before any stage sees the view,
   // bounded by `view.max_prompt_text_bytes`, a field of the spec still to
   // come with the step that hashes text: a text over the cap is read to the
-  // cap and its tail is not read, and a cap of 0 takes no text. A
+  // cap and its tail is not read, and a cap of 0 takes no text. The
+  // frame's bound comes first: a text that carries its DecideRequest over
+  // 64 KiB is refused with the frame. A
   // controller that does not hash it yet keeps none of it: it answers the
   // request `Busy` with no reason and never decides it as a request with no
   // prefix.

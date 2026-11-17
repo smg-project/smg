@@ -85,10 +85,11 @@
           "default": []
         },
         "max_block_hashes": {
-          "description": "How many prefix block hashes a request carries into the view.",
+          "description": "How many prefix block hashes a request carries into the view, 8,190\nat most: one frame of the Decide call carries no more.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
+          "maximum": 8190,
           "default": 256
         }
       },

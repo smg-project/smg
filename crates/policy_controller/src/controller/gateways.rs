@@ -166,6 +166,12 @@ impl Drop for Seat {
 pub(crate) struct Presence(watch::Receiver<()>);
 
 impl Presence {
+    /// Whether the presence ended: one load, where a poll of
+    /// [`Presence::ended`] takes the watch's lock.
+    pub(crate) fn is_ended(&self) -> bool {
+        self.0.is_closed()
+    }
+
     /// Resolves when the presence ended.
     pub(crate) async fn ended(&mut self) {
         // No value is ever sent: the row holds the sender and goes with
