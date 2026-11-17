@@ -30,8 +30,8 @@ fn expected_document(item: &str) -> Option<&str> {
 
 /// The items whose document names a form this build lacks, each with the
 /// validator's words for it. The test fails when a listed item validates,
-/// so an entry leaves with the change that builds its form, and when any
-/// other item is refused in those words.
+/// so an entry leaves with the change that builds its form, and when an
+/// item is refused as not in this build in words this list does not give it.
 const NOT_IN_BUILD: &[(&str, &str)] = &[
     (
         "27-cli-prefix-hash-boundaries.md",
