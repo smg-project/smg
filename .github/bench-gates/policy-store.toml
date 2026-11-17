@@ -84,10 +84,24 @@
 # confirmed by the re-measure round; the floor, write and publish rows, which the mutant does not touch, passed
 # at -0.8 to +0.5 %. The four build rows added since call the same build.
 #
+# Count: `count = true`, as policy-engine.toml records it. A pull request's job failed `policy_store/floor/8`
+# by time on a change that does not touch the cell: 26.2 against 29.0 ns, +10.6 % against 10 %, re-measured
+# +43.5 %. Its two binaries, built again, run the cell in the same count in every batch after the first, 290.0
+# instructions an iteration, with the cell's measured function at 0x180 of its page in the base's binary and at
+# 0xc40 in the pull request's: by that job's own timings the gate passes with the one placement, in four reads
+# of four. Read on this file's 28 ids, two copies of one binary of main: 21 count the same in every batch after
+# the first, four do not count steadily (`publish/8`, `publish/64`, `view_build/8`,
+# `member_write_spread/512`) and three were not read, the bench having stopped under the counter. A row that
+# does not count steadily, or whose count is not read, keeps the time's verdict.
+#
 # Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted runner's
 # own spread can be read from those and the thresholds tightened once it is known.
 
 repeats = 3
+count = true
+# The count ends 3,180 s into the run: the gate step's bound is 55 minutes, and the report is written
+# in the two minutes behind the count. No count starts in the budget's last 30 s.
+run_budget = 3180
 filter = "^policy_store/"
 
 # The files that feed this binary beyond the measured crate: the base side is built with them as the

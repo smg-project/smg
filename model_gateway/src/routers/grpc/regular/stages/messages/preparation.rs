@@ -99,6 +99,7 @@ impl MessagePreparationStage {
             &*tokenizer,
             &request.messages,
             true,
+            tools_for_template.is_some(),
         )
         .await?;
         let media_order = media.media_order;
@@ -180,7 +181,7 @@ impl MessagePreparationStage {
             "MessagePreparationStage::execute",
         )?;
         ctx.state.parser_names = Some(parser_names);
-        ctx.state.prompt_thought = prompt_thought;
+        ctx.state.prompt_thought = Some(prompt_thought);
         ctx.state.reading = reading;
 
         // Derive skip_special_tokens from parser and constraint type:
@@ -509,6 +510,87 @@ mod tests {
                 constrained.then(|| ("json_schema".to_string(), schema.to_string())),
                 "{extra}"
             );
+        }
+    }
+
+    /// Media of a model without a media spec is judged by the template the
+    /// request renders through, the one for requests with tools when the
+    /// request declares tools and the default one otherwise: refused where
+    /// that template takes one string per message, served where it takes
+    /// content parts.
+    #[tokio::test]
+    async fn media_without_a_spec_is_judged_by_the_template_the_request_renders_through() {
+        use std::sync::Arc;
+
+        use llm_tokenizer::{chat_template::ChatTemplateContentFormat, mock::MockTokenizer};
+        use openai_protocol::messages::CreateMessageRequest;
+        use serde_json::json;
+
+        use crate::routers::grpc::{
+            common::stages::PipelineStage,
+            context::RequestContext,
+            regular::stages::{
+                messages::MessagePreparationStage, testing::components_forwarding_media_of,
+            },
+        };
+
+        for (default, with_tools) in [
+            (
+                ChatTemplateContentFormat::String,
+                ChatTemplateContentFormat::OpenAI,
+            ),
+            (
+                ChatTemplateContentFormat::OpenAI,
+                ChatTemplateContentFormat::String,
+            ),
+        ] {
+            let tokenizer = MockTokenizer::new()
+                .with_deferred_chat_ids(vec![1, 2, 3])
+                .with_content_format(default)
+                .with_tool_content_format(with_tools);
+            let (_dir, components) = components_forwarding_media_of("m", Arc::new(tokenizer)).await;
+            for (declares_tools, format) in [(true, with_tools), (false, default)] {
+                let mut body = json!({
+                    "model": "m", "max_tokens": 8,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "What is this?"},
+                        {"type": "image", "source": {
+                            "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="
+                        }}
+                    ]}]
+                });
+                if declares_tools {
+                    body["tools"] = json!([{
+                        "name": "lookup", "description": "Look a thing up",
+                        "input_schema": {"type": "object", "properties": {}}
+                    }]);
+                }
+                let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
+                let mut ctx = RequestContext::for_messages_carrying_its_tools(
+                    Arc::new(request),
+                    None,
+                    "m".into(),
+                    components.clone(),
+                );
+                let refused_with = MessagePreparationStage::new(&[])
+                    .execute(&mut ctx)
+                    .await
+                    .err()
+                    .map(|response| {
+                        response
+                            .headers()
+                            .get("x-smg-error-code")
+                            .and_then(|code| code.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned()
+                    });
+                assert_eq!(
+                    refused_with.as_deref(),
+                    (format == ChatTemplateContentFormat::String)
+                        .then_some("multimodal_not_supported"),
+                    "declares tools: {declares_tools}"
+                );
+            }
         }
     }
 }

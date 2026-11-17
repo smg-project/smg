@@ -27,6 +27,7 @@ use std::{
 use metrics_exporter_prometheus::PrometheusHandle;
 use smg::{
     observability::metrics::{start_prometheus, Metrics, PrometheusConfig},
+    routers::common::header_utils::extract_routing_key,
     worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard, WorkerType},
 };
 
@@ -98,14 +99,14 @@ fn keyed_request(worker: &Arc<dyn Worker>) {
 /// bumps it in place, the decrement moves it in place too, so neither
 /// builds a key of its own; the key's first request adds the map's copy,
 /// and nothing more. The keyed-load gauge is set on both, through the
-/// gateway's recorder; what one set costs is read beside the requests and
-/// taken out, so the pin reads the bookkeeping alone.
+/// handle this thread keeps for the worker: a set builds no key and
+/// allocates nothing, so the pin reads the whole request.
 #[tokio::test(flavor = "current_thread")]
 async fn a_keyed_request_with_its_key_in_flight_allocates_the_guards_copy_alone() {
     install_recorder();
     let worker = worker();
-    // The first request of all: the gauge's label is interned and its
-    // series registered, the key's shard holds its table.
+    // The first request of all: the gauge's label is interned, its series
+    // registered and its handle kept, the key's shard holds its table.
     keyed_request(&worker);
     let ((), gauge_set) =
         allocations_during(|| Metrics::set_worker_routing_keys_active(WORKER_URL, 1));
@@ -115,37 +116,36 @@ async fn a_keyed_request_with_its_key_in_flight_allocates_the_guards_copy_alone(
     let mut headers = http::HeaderMap::new();
     headers.insert("x-smg-routing-key", KEY.parse().expect("an ASCII key"));
     let ((), from_header) = allocations_during(|| {
-        drop(WorkerLoadGuard::new(Arc::clone(&worker), Some(&headers)));
+        drop(WorkerLoadGuard::with_key(
+            Arc::clone(&worker),
+            extract_routing_key(Some(&headers)),
+        ));
     });
     drop(held);
     // The key's first request, on a shard whose table has room.
     let ((), first_of_key) = allocations_during(|| keyed_request(&worker));
     let ((), unkeyed) =
-        allocations_during(|| drop(WorkerLoadGuard::new(Arc::clone(&worker), None)));
+        allocations_during(|| drop(WorkerLoadGuard::with_key(Arc::clone(&worker), None)));
 
     eprintln!(
         "routing-key load: {in_flight} allocation calls per keyed request with its key in flight \
          ({gauge_set} per gauge set, two sets per request), {from_header} with the key read from \
          the header, {first_of_key} for a key's first request, {unkeyed} for an unkeyed request"
     );
-    let bookkeeping = |calls: usize| {
-        calls
-            .checked_sub(2 * gauge_set)
-            .expect("a keyed request sets the gauge twice")
-    };
     assert_eq!(
-        bookkeeping(in_flight),
-        1,
+        gauge_set, 0,
+        "a gauge set goes through the kept handle: no key, no label list"
+    );
+    assert_eq!(
+        in_flight, 1,
         "a keyed request with its key in flight: the guard's copy of the key, no key built for the increment or the decrement"
     );
     assert_eq!(
-        bookkeeping(from_header),
-        1,
+        from_header, 1,
         "a key read from the header is copied once, into the guard"
     );
     assert_eq!(
-        bookkeeping(first_of_key),
-        2,
+        first_of_key, 2,
         "a key's first request: the guard's copy and the map's"
     );
     assert_eq!(unkeyed, 0, "an unkeyed request touches no map and no gauge");

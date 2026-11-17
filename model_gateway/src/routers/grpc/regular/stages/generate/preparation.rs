@@ -25,6 +25,8 @@ use crate::{
 /// This is a direct extraction without architectural changes.
 pub(crate) struct GeneratePreparationStage;
 
+const FUNCTION: &str = "GeneratePreparationStage::prepare_generate";
+
 impl GeneratePreparationStage {
     /// The stage's work. The chat+generate dispatcher calls this directly, so
     /// the stage's future lives inline in the dispatcher's: one box per stage
@@ -61,8 +63,7 @@ impl GeneratePreparationStage {
         }
 
         // Resolve tokenizer from registry (cached for reuse in response processing)
-        let tokenizer = utils::resolve_tokenizer(ctx, "GeneratePreparationStage::prepare_generate")
-            .map_err(|e| *e)?;
+        let tokenizer = utils::resolve_tokenizer(ctx, FUNCTION).map_err(|e| *e)?;
 
         let (original_text, token_ids) = match self
             .resolve_generate_input(
@@ -75,7 +76,7 @@ impl GeneratePreparationStage {
         {
             Ok(res) => res,
             Err(msg) => {
-                error!(function = "GeneratePreparationStage::execute", error = %msg, "Failed to resolve generate input");
+                error!(function = FUNCTION, error = %msg, "Failed to resolve generate input");
                 return Err(error::bad_request("resolve_input_failed", msg));
             }
         };

@@ -1,6 +1,6 @@
 //! The parts of a plugin's row that are not about its kind: what of the
-//! request it may read, what a stage does when it cannot answer, and when
-//! the breaker bypasses it.
+//! request it may read, what a stage does when it cannot answer, when the
+//! breaker bypasses it, and the frame budget of one call.
 
 /// How a tenant or a session key reaches the plugin: withheld, as its
 /// fingerprint (the default), or in the clear when the host holds it so.
@@ -82,6 +82,38 @@ impl Default for BreakerSpec {
             window_micros: 10_000_000,
             cooldown_micros: 30_000_000,
         }
+    }
+}
+
+/// A plugin's frame budget per stage call (`0` takes the request's) and the
+/// fuel per microsecond it is metered at: the one place the frame is clamped
+/// to the request's and turned into fuel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameBudget {
+    pub micros: u32,
+    pub fuel_per_micro: u64,
+}
+
+impl FrameBudget {
+    /// The frame of one call under `request_budget_micros` left: the
+    /// plugin's own, clamped to the request's.
+    pub fn frame_micros(self, request_budget_micros: u32) -> u32 {
+        if self.micros == 0 {
+            request_budget_micros
+        } else {
+            self.micros.min(request_budget_micros)
+        }
+    }
+
+    /// The fuel of one call's frame under `request_budget_micros` left; `0`
+    /// means no call.
+    pub fn fuel_for(self, request_budget_micros: u32) -> u64 {
+        self.fuel_of(self.frame_micros(request_budget_micros))
+    }
+
+    /// The fuel of `micros` of wall time at this calibration.
+    pub fn fuel_of(self, micros: u32) -> u64 {
+        u64::from(micros).saturating_mul(self.fuel_per_micro)
     }
 }
 

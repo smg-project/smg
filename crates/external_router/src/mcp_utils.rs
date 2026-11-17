@@ -377,10 +377,10 @@ pub async fn ensure_request_mcp_client(
     ensure_mcp_servers(mcp_orchestrator, format_registry, &inputs, &builtin_types).await
 }
 
-/// The Responses routes' MCP routing, under the rule the gRPC router applies:
-/// a request that names an `mcp` tool and binds no server is refused on the
-/// missing connection (424 `connect_mcp_server_failed`) before anything goes
-/// upstream; built-in tools without MCP routing pass through to the model
+/// The Responses routes' MCP routing, one rule for the HTTP and the gRPC
+/// routers: a request that names an `mcp` tool and binds no server is refused
+/// on the missing connection (424 `connect_mcp_server_failed`) before anything
+/// goes upstream; built-in tools without MCP routing pass through to the model
 /// (`Ok(None)`).
 pub async fn ensure_request_mcp_routing(
     mcp_orchestrator: &Arc<McpOrchestrator>,
@@ -396,7 +396,8 @@ pub async fn ensure_request_mcp_routing(
             warn!("Failed to connect to MCP servers: the request names an mcp tool and none bound");
             Err(error::failed_dependency(
                 "connect_mcp_server_failed",
-                "Failed to connect to MCP servers. Check server_url and authorization.",
+                "Failed to connect to MCP servers. Check server_url and authorization, or that \
+                 a server_label without server_url names a configured server.",
             ))
         }
         None => Ok(None),
@@ -507,7 +508,7 @@ mod tests {
     };
     use serde_json::json;
     use smg_mcp::{McpConfig, McpToolSession, ResponseFormatConfig, ToolConfig};
-    use tokio::sync::Notify;
+    use tokio::sync::{oneshot, Notify};
 
     use super::*;
 
@@ -580,7 +581,9 @@ mod tests {
     /// request carries the `refused_bearer` token, or while `refusing` is
     /// set. `arrived` is signalled when a `tools/list` arrives, after its
     /// refusal is decided; a listing arriving while `hold` is holding waits
-    /// for its release; the answer comes after `list_delay`.
+    /// for its release; the answer comes after `list_delay`. With `changed`
+    /// the server opens a session, and its notification stream sends
+    /// `notifications/tools/list_changed` at each signal.
     #[derive(Clone, Default)]
     struct LocalServer {
         tools: Option<&'static [&'static str]>,
@@ -589,6 +592,7 @@ mod tests {
         list_delay: Duration,
         arrived: Option<Arc<Notify>>,
         hold: Option<Arc<Hold>>,
+        changed: Option<Arc<Notify>>,
     }
 
     /// A gate the local server's `tools/list` waits at while `holding` is
@@ -604,7 +608,7 @@ mod tests {
     async fn serve_local_mcp_server(server: LocalServer) -> String {
         use axum::{
             extract::State,
-            http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+            http::{header::AUTHORIZATION, HeaderMap, HeaderValue, StatusCode},
             routing::post,
             Json, Router,
         };
@@ -616,7 +620,7 @@ mod tests {
         ) -> Response {
             use axum::response::IntoResponse;
             let id = message.get("id").cloned().unwrap_or(Value::Null);
-            match message.get("method").and_then(Value::as_str) {
+            let mut response = match message.get("method").and_then(Value::as_str) {
                 Some("initialize") => Json(json!({
                     "jsonrpc": "2.0", "id": id,
                     "result": {
@@ -675,7 +679,32 @@ mod tests {
                     "error": {"code": -32601, "message": "method not found"}
                 }))
                 .into_response(),
+            };
+            // A session makes the client open the notification stream.
+            if server.changed.is_some() {
+                response
+                    .headers_mut()
+                    .insert("mcp-session-id", HeaderValue::from_static("local"));
             }
+            response
+        }
+
+        /// The notification stream: a `tools/list_changed` at each signal.
+        async fn changes(State(server): State<LocalServer>) -> Response {
+            use axum::response::{
+                sse::{Event, Sse},
+                IntoResponse,
+            };
+            let Some(changed) = server.changed else {
+                return StatusCode::METHOD_NOT_ALLOWED.into_response();
+            };
+            Sse::new(futures::stream::unfold(changed, |changed| async move {
+                changed.notified().await;
+                let notice =
+                    json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
+                Some((Event::default().json_data(notice), changed))
+            }))
+            .into_response()
         }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -689,7 +718,9 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/mcp", post(mcp)).with_state(server),
+                Router::new()
+                    .route("/mcp", post(mcp).get(changes))
+                    .with_state(server),
             )
             .await
             .expect("the local MCP server serves");
@@ -975,7 +1006,11 @@ mod tests {
                 // key's connect pools a second whose listing the server
                 // refuses at once; the held listing is released after that
                 // and completes last.
-                arrived.notified().await;
+                // Bounded: a first connection that never lists fails here and
+                // says so, not at the job's timeout.
+                tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+                    .await
+                    .expect("the first connection's tools/list reaches the server");
                 hold.holding.store(false, Ordering::SeqCst);
                 refusing.store(true, Ordering::SeqCst);
                 connect_mcp_servers(&orchestrator, &format_registry, &evicting_input).await;
@@ -1075,6 +1110,74 @@ mod tests {
         );
     }
 
+    /// A refresh publishes its tools before its success. The server refuses
+    /// the first listing, then says its tools changed. A reader on its own
+    /// thread takes the tools at the first moment it finds no listing error,
+    /// as a request that binds the server does, and finds them all. Two
+    /// thousand tools make the write-back long enough to be read half done.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refreshed_listing_is_published_before_its_success_is() {
+        let names: &'static [&'static str] = (0..2000)
+            .map(|n| &*format!("tool-{n}").leak())
+            .collect::<Vec<_>>()
+            .leak();
+        let refusing = Arc::new(AtomicBool::new(true));
+        let changed = Arc::new(Notify::new());
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(names),
+            refusing: Some(Arc::clone(&refusing)),
+            changed: Some(Arc::clone(&changed)),
+            ..Default::default()
+        })
+        .await;
+        let orchestrator = Arc::new(McpOrchestrator::new(McpConfig::default()).await.unwrap());
+        orchestrator
+            .connect_static_server(&McpServerConfig {
+                name: "conf".to_string(),
+                transport: McpTransport::Streamable {
+                    url,
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: None,
+                builtin_type: None,
+                builtin_tool_name: None,
+                internal: false,
+            })
+            .await
+            .expect("the server connects");
+        assert!(
+            orchestrator.list_error_for_server("conf").is_some(),
+            "the first listing was refused"
+        );
+
+        let (spinning, spins) = oneshot::channel();
+        let reader = tokio::task::spawn_blocking({
+            let orchestrator = Arc::clone(&orchestrator);
+            move || {
+                let _ = spinning.send(());
+                let end = std::time::Instant::now() + Duration::from_secs(10);
+                while std::time::Instant::now() < end {
+                    if orchestrator.list_error_for_server("conf").is_none() {
+                        let conf = ["conf".to_string()];
+                        return Some(orchestrator.list_tools_for_servers(&conf).len());
+                    }
+                }
+                None
+            }
+        });
+        spins.await.expect("the reader runs");
+        refusing.store(false, Ordering::SeqCst);
+        changed.notify_one();
+        assert_eq!(
+            reader.await.expect("the reader ends"),
+            Some(names.len()),
+            "what a reader finds once the listing error is gone (None: no refresh in ten seconds)"
+        );
+    }
+
     /// An orchestrator holding one configured server, `conf-static`, a
     /// local MCP server with one tool; and a registry.
     async fn orchestrator_holding_conf_static() -> (Arc<McpOrchestrator>, FormatRegistry) {
@@ -1164,6 +1267,16 @@ mod tests {
             ensure_request_mcp_routing(&orchestrator, &format_registry, &[mcp("conf")]).await;
         let response = refused.expect_err("a lone unknown label is refused");
         assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the refusal's body");
+        let body: Value = serde_json::from_slice(&body).expect("a JSON error");
+        assert_eq!(body["error"]["code"], "connect_mcp_server_failed");
+        assert_eq!(
+            body["error"]["message"],
+            "Failed to connect to MCP servers. Check server_url and authorization, or that a \
+             server_label without server_url names a configured server."
+        );
 
         let routed = ensure_request_mcp_routing(
             &orchestrator,

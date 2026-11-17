@@ -26,7 +26,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use smg::{
     config::PolicyConfig,
-    observability::metrics::{start_prometheus, PrometheusConfig},
+    observability::metrics::{start_prometheus, Metrics, PrometheusConfig},
     policies::PolicyRegistry,
     worker::{
         load::monitor::WorkerMonitor, registry::WorkerRegistry, BasicWorkerBuilder, ConnectionMode,
@@ -169,6 +169,30 @@ async fn a_record_for_a_rank_on_file_allocates_nothing() {
     assert_eq!(
         both_on_file, 0,
         "two ranks on file: the record sets its own rank's gauges through kept handles and touches no other rank's"
+    );
+}
+
+/// The records of a batch the index applied (its blocks, its age, its
+/// disposition, the worker's index-blocks gauge and the apply time) go
+/// through handles kept per worker: after a worker's first batch they build
+/// no key and allocate nothing.
+#[test]
+fn a_batchs_records_for_a_worker_on_file_allocate_nothing() {
+    const WORKER: &str = "grpc://engine-a:9000";
+    install_recorder();
+    let batch = |blocks: usize| {
+        Metrics::record_kv_event_blocks(WORKER, "stored", blocks);
+        Metrics::record_kv_event_lag(WORKER, 0.002);
+        Metrics::record_kv_event_batch(WORKER, "applied");
+        Metrics::set_kv_index_blocks(WORKER, blocks);
+        Metrics::record_kv_event_apply(WORKER, 0.000_05);
+    };
+    batch(1);
+    let ((), calls) = allocations_during(|| batch(2));
+    eprintln!("applied batch: {calls} allocation calls for its five records");
+    assert_eq!(
+        calls, 0,
+        "a batch's records for a worker on file: no key, no label list"
     );
 }
 

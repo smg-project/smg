@@ -10,7 +10,7 @@ use wfaas::{
 
 use crate::{
     app_context::AppContext,
-    worker::{ConnectionMode, SubscriptionKind, Worker},
+    worker::{ConnectionMode, RuntimeType, SubscriptionKind, Worker},
     workflow::data::WorkerRegistrationData,
 };
 
@@ -118,10 +118,24 @@ impl UpdatePoliciesStep {
             let pl = &pw.metadata().spec.labels;
             let dl = &dw.metadata().spec.labels;
 
+            // SGLang's prefill side follows the room under the engine's default
+            // method (`auto`) as under `follow_bootstrap_room`. The decode side
+            // is then free in its width and in its method: each request's room
+            // names the prefill rank that takes it, and the decode side places
+            // the request by itself.
+            let method = pl.get("load_balance_method").map(String::as_str);
+            let sglang = pw.metadata().spec.runtime_type == RuntimeType::Sglang;
+            let follows_room =
+                method == Some("follow_bootstrap_room") || (sglang && method == Some("auto"));
+            let decode_side_is_free = sglang && follows_room;
+
             // Define keys to check for equality
             let keys_to_check = ["tp_size", "dp_size", "load_balance_method"];
 
             for key in keys_to_check {
+                if decode_side_is_free && matches!(key, "dp_size" | "load_balance_method") {
+                    continue;
+                }
                 let p_val = pl.get(key);
                 let d_val = dl.get(key);
                 if p_val != d_val {
@@ -133,16 +147,12 @@ impl UpdatePoliciesStep {
             }
 
             // Specific check for Data-Parallel consistency
-            if let Some(dp_size) = pl.get("dp_size").and_then(|s| s.parse::<usize>().ok()) {
-                if dp_size > 1 {
-                    let plb = pl.get("load_balance_method").map(|s| s.as_str());
-                    if plb != Some("follow_bootstrap_room") {
-                        warn!(
-                            "Model {} has dp_size > 1 but load_balance_method is not 'follow_bootstrap_room' on prefill workers. This may cause rank mismatch in disaggregated mode.",
-                            model_id
-                        );
-                    }
-                }
+            let prefill_ranks = pl.get("dp_size").and_then(|s| s.parse::<usize>().ok());
+            if prefill_ranks.is_some_and(|ranks| ranks > 1) && !follows_room {
+                warn!(
+                    "Model {} has dp_size > 1 but load_balance_method is not 'follow_bootstrap_room' on prefill workers. This may cause rank mismatch in disaggregated mode.",
+                    model_id
+                );
             }
         }
     }
@@ -448,5 +458,96 @@ mod tests {
         );
 
         assert!(!logs_contain("has no KV-event stream"));
+    }
+
+    /// One value per side of a pair: the prefill side's, then the decode
+    /// side's.
+    type Sides = (&'static str, &'static str);
+
+    /// The pair check over one prefill and one decode worker of `runtime`,
+    /// at the two sides' widths and methods; its lines name `model`.
+    fn check_a_pair(model: &str, runtime: RuntimeType, widths: Sides, methods: Sides) {
+        let side = |role: &str, width: &str, method: &str| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("grpc://{role}:30000"))
+                    .runtime_type(runtime)
+                    .label("disaggregation_mode", role)
+                    .label("dp_size", width)
+                    .label("load_balance_method", method)
+                    .build(),
+            )
+        };
+        UpdatePoliciesStep::check_worker_conflicts(
+            model,
+            &[
+                side("prefill", widths.0, methods.0),
+                side("decode", widths.1, methods.1),
+            ],
+        );
+    }
+
+    /// The pairs the check is quiet about: an SGLang prefill side that
+    /// follows the room, by the engine's default method or by name, beside a
+    /// decode side of another width (the prefill side's replicas, or the
+    /// decode side's) or of another method (the default, where the prefill
+    /// side alone names one).
+    const SERVED: [(&str, Sides, Sides); 3] = [
+        ("replicas-by-default", ("2", "1"), ("auto", "auto")),
+        (
+            "replicas-by-name",
+            ("2", "1"),
+            ("follow_bootstrap_room", "auto"),
+        ),
+        ("decode-replicas", ("1", "2"), ("auto", "auto")),
+    ];
+
+    /// The pairs that keep every warning, two prefill ranks beside one decode
+    /// rank of another method: a prefill side off the room, and an engine
+    /// that is not known to follow the room under `auto`.
+    const WARNED: [(&str, RuntimeType, Sides); 2] = [
+        ("off-the-room", RuntimeType::Sglang, ("round_robin", "auto")),
+        (
+            "another-engine",
+            RuntimeType::TokenSpeed,
+            ("auto", "round_robin"),
+        ),
+    ];
+
+    /// Runs the check over every pair and reads `line` (the words after the
+    /// model's name) through the test's own `logged`: no served pair logs
+    /// it, each warned pair does.
+    fn only_the_warned_pairs_log(line: &str, logged: impl Fn(&str) -> bool) {
+        for (model, widths, methods) in SERVED {
+            check_a_pair(model, RuntimeType::Sglang, widths, methods);
+            assert!(
+                !logged(&format!("Model {model} {line}")),
+                "the served pair {model} logs `{line}`"
+            );
+        }
+        for (model, runtime, methods) in WARNED {
+            check_a_pair(model, runtime, ("2", "1"), methods);
+            assert!(
+                logged(&format!("Model {model} {line}")),
+                "the pair {model} does not log `{line}`"
+            );
+        }
+    }
+
+    #[traced_test]
+    #[test]
+    fn a_width_of_its_own_is_a_conflict_only_off_the_room() {
+        only_the_warned_pairs_log("has conflicting dp_size", logs_contain);
+    }
+
+    #[traced_test]
+    #[test]
+    fn a_method_of_its_own_is_a_conflict_only_off_the_room() {
+        only_the_warned_pairs_log("has conflicting load_balance_method", logs_contain);
+    }
+
+    #[traced_test]
+    #[test]
+    fn several_prefill_ranks_are_warned_about_only_off_the_room() {
+        only_the_warned_pairs_log("has dp_size > 1", logs_contain);
     }
 }

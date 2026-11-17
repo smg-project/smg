@@ -3,6 +3,10 @@
 //! present ([`Gateways`](super::gateways::Gateways)) and stays so for the
 //! grace period after the stream's end.
 //!
+//! A stream says `Hello` within [`HELLO_DEADLINE`] of its open or is ended,
+//! and while it waits it reads the election's steps: a replica that stops
+//! leading ends a stream that said nothing as it ends a `Hello`.
+//!
 //! The fence judges the `Hello` and every frame after it. One read of the
 //! fence gives the verdict and the term together, and a frame out carries
 //! the term that read showed: an answer made under one term never leaves
@@ -20,9 +24,10 @@
 //! the `Welcome` and after it: only the gateway's own close ends a stream
 //! with none.
 //!
-//! One arm a kind of frame. `Hello` is served here. The other kinds are
-//! refused by name until the step that serves each adds its arm, as the
-//! service refuses an unserved call.
+//! One arm a kind of frame. `Hello` is served here, and the lifecycle's
+//! three frames in [`lifecycle`]. The other kinds are refused by name
+//! until the step that serves each adds its arm, as the service refuses an
+//! unserved call.
 //!
 //! The session's loop is polled with the stream it answers on, so no task
 //! outlives its stream: a gateway that stops reading its stream stops its
@@ -40,8 +45,17 @@ use tokio::sync::mpsc;
 use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
 use tracing::{debug, info};
 
-use super::{gateways::Refused, principal::Principal, service::Shared, PROTOCOL_VERSION};
-use crate::proto::{self, controller_frame, gateway_frame::Frame};
+use super::{
+    gateways::{Refused, Seat},
+    lifecycle,
+    principal::Principal,
+    service::Shared,
+    PROTOCOL_VERSION,
+};
+use crate::{
+    proto::{self, controller_frame, gateway_frame::Frame},
+    store::GatewayId,
+};
 
 /// The stream rule's grace period (design 4.3): how long a gateway stays
 /// present after its session ended with no new `Hello`.
@@ -53,6 +67,10 @@ pub(crate) const PRESENT_MAX: usize = 4_096;
 
 /// The longest release string of a peer that the log reads.
 const RELEASE_MAX: usize = 64;
+
+/// How long a stream may stand with no `Hello`: one that says none is
+/// ended, so a silent stream holds no listener past it.
+pub(crate) const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The refusal of a `Hello` on a replica that does not lead.
 const NOT_LEADING: &str = "this controller does not lead: find the leader through Leader";
@@ -222,17 +240,50 @@ fn millis(duration: Duration) -> u32 {
 }
 
 /// One session, from its first frame to its end. `Some` is the status the
-/// stream ends with; `None` is a stream the gateway closed or lost.
+/// stream ends with; `None` is a stream the gateway closed.
 async fn session(
     shared: &Shared,
     principal: &Principal,
     mut inbound: Streaming<proto::GatewayFrame>,
     answers: &mut Answers,
 ) -> Option<Status> {
-    let first = match inbound.message().await {
-        Ok(Some(first)) => first,
-        Ok(None) => return None,
-        Err(status) => return Some(unread(status)),
+    // The election's steps from the stream's open on: the receiver is
+    // marked seen here, so the wait for the Hello hears the steps after
+    // the open and the loop after the Welcome hears on. Every mark of it
+    // is made before the session's read of the fence, so no step after
+    // that read is missed.
+    let mut steps = shared.standing.clone();
+    steps.mark_unchanged();
+    let mut election = true;
+    let first = {
+        // The deadline's timer lives as long as the wait: the block's end
+        // drops it at the Hello.
+        let deadline = tokio::time::sleep(shared.hello_deadline);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                first = inbound.message() => match first {
+                    Ok(Some(first)) => break first,
+                    Ok(None) => return None,
+                    Err(status) => return Some(unread(status)),
+                },
+                () = &mut deadline => {
+                    return Some(Status::deadline_exceeded(format!(
+                        "no Hello came within {:?} of the stream's open",
+                        shared.hello_deadline
+                    )));
+                }
+                stepped = steps.changed(), if election => {
+                    if stepped.is_err() {
+                        // The election is gone with the run loop: the deadline
+                        // bounds the wait.
+                        election = false;
+                    } else if shared.fence.leader_term(Instant::now()).is_none() {
+                        return Some(not_leading(shared, answers).await);
+                    }
+                }
+            }
+        }
     };
     let now = Instant::now();
     let hello = match first.frame {
@@ -255,10 +306,6 @@ async fn session(
             hello.protocol_min, hello.protocol_max
         )));
     }
-    // The election's steps, from a receiver nobody marked seen: the loop's
-    // first turn finds the steps published so far and reads the fence once
-    // more, so no session stands on a read the election has overtaken.
-    let mut steps = shared.standing.clone();
     // One read: the verdict and the term the Welcome carries.
     let Some(term) = shared.fence.leader_term(now) else {
         return Some(not_leading(shared, answers).await);
@@ -266,9 +313,10 @@ async fn session(
     if let Some(status) = floor(first.term_floor, term) {
         return Some(status);
     }
+    let gateway = principal.gateway();
     let seat = match shared
         .gateways
-        .welcome(principal.gateway(), &principal.subject, term, now)
+        .welcome(gateway, &principal.subject, term, now)
     {
         Ok(seat) => seat,
         // The fence closed between this session's read and the table's.
@@ -311,7 +359,6 @@ async fn session(
         "a gateway is welcomed"
     );
 
-    let mut election = true;
     let status = loop {
         tokio::select! {
             frame = inbound.message() => {
@@ -320,7 +367,7 @@ async fn session(
                     Ok(None) => break None,
                     Err(status) => break Some(unread(status)),
                 };
-                if let Some(status) = judge(shared, term, &frame, answers).await {
+                if let Some(status) = judge(shared, gateway, term, &seat, &frame, answers).await {
                     break Some(status);
                 }
             }
@@ -329,15 +376,11 @@ async fn session(
                     // The election is gone with the run loop: the drain
                     // closes the stream.
                     election = false;
-                } else if let Some(status) = fenced(shared, term, answers).await {
+                } else if let Some(status) = fenced(shared, term, Instant::now(), answers).await {
                     break Some(status);
                 }
             }
-            () = seat.superseded() => {
-                break Some(Status::aborted(
-                    "a newer session of this gateway took this one's place",
-                ));
-            }
+            () = seat.superseded() => break Some(replaced()),
         }
     };
     debug!(gateway = %principal.subject, term, ended = ?status.as_ref().map(Status::code), "a gateway's session ended");
@@ -346,10 +389,10 @@ async fn session(
     status
 }
 
-/// The fence's verdict on a session welcomed under `term`, at this
-/// instant: `None` while the fence shows that term.
-async fn fenced(shared: &Shared, term: u64, answers: &mut Answers) -> Option<Status> {
-    match shared.fence.leader_term(Instant::now()) {
+/// The fence's verdict at `now` on a session welcomed under `term`:
+/// `None` while the fence shows that term.
+async fn fenced(shared: &Shared, term: u64, now: Instant, answers: &mut Answers) -> Option<Status> {
+    match shared.fence.leader_term(now) {
         Some(shown) if shown == term => None,
         Some(later) => Some(Status::aborted(format!(
             "this controller leads under term {later} now and welcomed the session under term {term}: say Hello again"
@@ -373,15 +416,30 @@ fn floor(floor: u64, term: u64) -> Option<Status> {
     })
 }
 
-/// One frame after the `Welcome`: the fence, the floor, then its kind's
-/// arm. `Some` ends the session; the frame is then not applied.
+/// The end of a session a newer one of its gateway replaced.
+fn replaced() -> Status {
+    Status::aborted("a newer session of this gateway took this one's place")
+}
+
+/// One frame after the `Welcome`: the seat, the fence, the floor, then its
+/// kind's arm. `Some` ends the session; the frame is then not applied.
 async fn judge(
     shared: &Shared,
+    gateway: GatewayId,
     term: u64,
+    seat: &Seat,
     frame: &proto::GatewayFrame,
     answers: &mut Answers,
 ) -> Option<Status> {
-    if let Some(status) = fenced(shared, term, answers).await {
+    // A session that was replaced applies no frame: the gateway's frames
+    // are the newer session's from the instant this one is told.
+    if seat.replaced() {
+        return Some(replaced());
+    }
+    // One read of the clock a frame: the fence's verdict and the instant
+    // an arm writes under are the same.
+    let now = Instant::now();
+    if let Some(status) = fenced(shared, term, now, answers).await {
         return Some(status);
     }
     if let Some(status) = floor(frame.term_floor, term) {
@@ -393,17 +451,18 @@ async fn judge(
         Some(Frame::Hello(_)) => Some(Status::failed_precondition(
             "a session stands on this stream: a second Hello needs a new stream",
         )),
-        Some(
-            unserved @ (Frame::HelloPage(_)
-            | Frame::Dispatched(_)
-            | Frame::Completed(_)
-            | Frame::Released(_)
-            | Frame::Veto(_)
-            | Frame::SpecAck(_)),
-        ) => Some(Status::unimplemented(format!(
-            "{} is not served by this build",
-            kind(unserved)
-        ))),
+        Some(Frame::Dispatched(dispatched)) => {
+            lifecycle::dispatched(&shared.store, gateway, dispatched, now).err()
+        }
+        Some(Frame::Completed(completed)) => {
+            lifecycle::completed(&shared.store, gateway, completed, now).err()
+        }
+        Some(Frame::Released(released)) => {
+            lifecycle::released(&shared.store, gateway, released).err()
+        }
+        Some(unserved @ (Frame::HelloPage(_) | Frame::Veto(_) | Frame::SpecAck(_))) => Some(
+            Status::unimplemented(format!("{} is not served by this build", kind(unserved))),
+        ),
     }
 }
 
@@ -431,22 +490,30 @@ mod tests {
     };
     use tonic_prost::ProstCodec;
 
-    use super::{refusal, release, GRACE_PERIOD, LEADER_POLL, PRESENT_MAX, RELEASE_MAX};
+    use super::{
+        judge, refusal, release, Answers, GRACE_PERIOD, HELLO_DEADLINE, LEADER_POLL, OUT_QUEUE,
+        PRESENT_MAX, RELEASE_MAX,
+    };
     use crate::{
         controller::{
             config::Scope,
             election::Standing,
-            gateways::{tests::PATIENT, Gateways, Refused},
+            gateways::{
+                tests::{lease, PATIENT},
+                Gateways, Refused,
+            },
+            lifecycle::tests::{a_completed, a_dispatched, a_released, worker},
             principal::{tests::told, Layer, ENTRY},
             service::{Service, Shared},
             PROTOCOL_VERSION,
         },
-        elector::{ElectionSettings, Elector, MemoryLease, Tick},
+        elector::{ElectionSettings, Elector, Tick},
+        lease::LeaseId,
         proto::{
             self, controller_frame, gateway_frame::Frame,
             policy_controller_client::PolicyControllerClient,
         },
-        store::MemoryStore,
+        store::{HealthSink, LeaseState, LeasesStore, MemoryStore},
     };
 
     const ID: &str = "controller-0";
@@ -466,14 +533,17 @@ mod tests {
     }
 
     async fn bed(settings: ElectionSettings) -> Bed {
-        bed_with(settings, None).await
+        bed_with(settings, None, None).await
     }
 
     /// The same; with a ceiling, the presence table holds that many rows
     /// in place of the shared state's stock number.
-    async fn bed_with(settings: ElectionSettings, ceiling: Option<usize>) -> Bed {
-        let elector = Elector::new(Box::new(MemoryLease::new()), IDENTITY, settings)
-            .expect("the settings are in order");
+    async fn bed_with(
+        settings: ElectionSettings,
+        ceiling: Option<usize>,
+        hello_deadline: Option<Duration>,
+    ) -> Bed {
+        let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
         let mut shared = Shared::new(
             ID.to_owned(),
@@ -481,7 +551,10 @@ mod tests {
             &elector,
             stood,
             Arc::new(MemoryStore::new()),
-        );
+            Arc::new(crate::Catalog::builtin()),
+            2,
+        )
+        .expect("the deciders start");
         if let Some(ceiling) = ceiling {
             shared.gateways = Arc::new(Gateways::new(
                 GRACE_PERIOD,
@@ -489,6 +562,9 @@ mod tests {
                 elector.fence(),
                 Arc::clone(&shared.store),
             ));
+        }
+        if let Some(hello_deadline) = hello_deadline {
+            shared.hello_deadline = hello_deadline;
         }
         let shared = Arc::new(shared);
         let service = Service::new(vec![Scope::Gateway], Arc::clone(&shared));
@@ -512,14 +588,21 @@ mod tests {
     }
 
     impl Bed {
-        /// The candidate takes or renews its lease now, under `term`, and
-        /// the election publishes the look.
+        /// The candidate leads now under `term`, by a take or a renewal, and
+        /// the election publishes the look. The bed's candidate is alone
+        /// over its own lease: its first take leads at once.
         fn leads(&mut self, term: u64) {
-            let tick = self.elector.tick(Instant::now()).expect("a step");
-            assert!(
-                tick == Tick::Acquired { term } || tick == Tick::Renewed { term },
-                "{tick:?}"
-            );
+            let now = Instant::now();
+            if self.elector.is_holder() || self.elector.observed().is_some() {
+                let tick = self.elector.tick(now).expect("a step");
+                assert!(
+                    tick == Tick::Acquired { term } || tick == Tick::Renewed { term },
+                    "{tick:?}"
+                );
+            } else {
+                self.elector.lead_at(now);
+                assert_eq!(self.elector.fence().leader_term(now), Some(term));
+            }
             self.step(IDENTITY, term);
         }
 
@@ -833,21 +916,6 @@ mod tests {
                 "HelloPage is not served by this build",
             ),
             (
-                Frame::Dispatched(proto::Dispatched::default()),
-                Code::Unimplemented,
-                "Dispatched is not served by this build",
-            ),
-            (
-                Frame::Completed(proto::Completed::default()),
-                Code::Unimplemented,
-                "Completed is not served by this build",
-            ),
-            (
-                Frame::Released(proto::Released::default()),
-                Code::Unimplemented,
-                "Released is not served by this build",
-            ),
-            (
                 Frame::Veto(proto::GatewayVeto::default()),
                 Code::Unimplemented,
                 "GatewayVeto is not served by this build",
@@ -894,14 +962,16 @@ mod tests {
             let mut session = open(bed.addr).await;
             bed.leads(1);
             session.send(hello(GATEWAY)).await;
-            let answer = session.frame().await;
-            if matches!(answer.frame, Some(controller_frame::Frame::Welcome(_))) {
-                break session;
+            match session.frame().await.frame {
+                Some(controller_frame::Frame::Welcome(_)) => break session,
+                // The host held the case past the deadline: again.
+                Some(controller_frame::Frame::NotLeader(_)) => {}
+                other => panic!("a Welcome or a NotLeader answers the Hello: {other:?}"),
             }
             tries += 1;
             assert!(
                 tries < 20,
-                "the host held the case past its deadline twenty times: {answer:?}"
+                "the host held the case past its deadline twenty times"
             );
         };
 
@@ -991,8 +1061,9 @@ mod tests {
         // The shared state builds its own table under the stock ceiling.
         let stock = bed(PATIENT).await;
         assert_eq!(stock.shared.gateways.ceiling(), PRESENT_MAX);
+        assert_eq!(stock.shared.hello_deadline, HELLO_DEADLINE);
 
-        let mut bed = bed_with(PATIENT, Some(1)).await;
+        let mut bed = bed_with(PATIENT, Some(1), None).await;
         bed.leads(1);
         let mut first = open(bed.addr).await;
         first.welcomed(1).await;
@@ -1011,6 +1082,228 @@ mod tests {
         // The gateway that is present says Hello again and is welcomed.
         let mut again = open(bed.addr).await;
         again.welcomed(1).await;
+    }
+
+    /// A stream that says no Hello is ended at its deadline.
+    #[tokio::test]
+    async fn a_stream_that_says_no_hello_is_ended_at_its_deadline() {
+        let mut bed = bed_with(PATIENT, None, Some(Duration::from_millis(50))).await;
+        bed.leads(1);
+        let mut session = open(bed.addr).await;
+        assert_eq!(
+            session.status().await,
+            (
+                Code::DeadlineExceeded,
+                "no Hello came within 50ms of the stream's open".to_owned()
+            )
+        );
+        assert!(!bed.present(Instant::now()));
+        assert_eq!(HELLO_DEADLINE, Duration::from_secs(5));
+    }
+
+    /// A stream that said no Hello yet ends at the step that finds the
+    /// fence closed, as a Hello under a closed fence does: the drain's
+    /// give-up is such a step.
+    #[tokio::test]
+    async fn a_silent_stream_ends_at_the_step_that_finds_the_fence_closed() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let mut session = open(bed.addr).await;
+        // A step that finds the fence open changes nothing.
+        bed.leads(1);
+        // The lease is given up and the election publishes its look.
+        assert!(bed.elector.release().expect("the release"));
+        bed.step("", 1);
+        assert_eq!(session.frame().await, not_leader(1, 1, ""));
+        assert_eq!(
+            session.status().await,
+            (
+                Code::FailedPrecondition,
+                "this controller does not lead: find the leader through Leader".to_owned()
+            )
+        );
+    }
+
+    /// One frame of each kind of the lifecycle, applied in order by the
+    /// session to its own gateway's leases.
+    #[tokio::test]
+    async fn the_lifecycles_three_frames_are_applied_by_the_session() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let gateway = told(GATEWAY).gateway();
+        let store = Arc::clone(&bed.shared.store);
+        let t0 = Instant::now();
+        let served = worker(&store, "http://a:8000");
+        for id in 1..=3 {
+            store.issue(lease(gateway, id, t0)).expect("a lease");
+        }
+
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+        session
+            .send(frame(1, Some(Frame::Dispatched(a_dispatched(1)))))
+            .await;
+        session
+            .send(frame(1, Some(Frame::Completed(a_completed(2, served)))))
+            .await;
+        session
+            .send(frame(1, Some(Frame::Released(a_released(3)))))
+            .await;
+        // A second Hello is refused by name: the three before it were read
+        // in order and none ended the session.
+        session.send(hello(GATEWAY)).await;
+        assert_eq!(
+            session.status().await,
+            (
+                Code::FailedPrecondition,
+                "a session stands on this stream: a second Hello needs a new stream".to_owned()
+            )
+        );
+        let state =
+            |id: u64| LeasesStore::get(&*store, gateway, LeaseId(id)).map(|record| record.state);
+        assert!(matches!(state(1), Some(LeaseState::Dispatched { .. })));
+        assert_eq!(state(2), None);
+        assert_eq!(state(3), None);
+        assert!(store.completed_ok_since(gateway, served, t0));
+    }
+
+    /// The session's rule holds for the lifecycle: a frame under a closed
+    /// fence is not applied.
+    #[tokio::test]
+    async fn a_lifecycle_frame_under_a_closed_fence_is_not_applied() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let gateway = told(GATEWAY).gateway();
+        let store = Arc::clone(&bed.shared.store);
+        store
+            .issue(lease(gateway, 1, Instant::now()))
+            .expect("a lease");
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+
+        assert!(bed.elector.release().expect("the release"));
+        session
+            .send(frame(1, Some(Frame::Released(a_released(1)))))
+            .await;
+        assert_eq!(session.frame().await, not_leader(2, 1, ""));
+        assert_eq!(session.status().await, (Code::Aborted, ENDED.to_owned()));
+        assert_eq!(
+            LeasesStore::get(&*store, gateway, LeaseId(1)).map(|record| record.state),
+            Some(LeaseState::Issued),
+            "a fenced replica releases nothing"
+        );
+    }
+
+    /// A session that was replaced applies no frame, whichever arm the
+    /// loop's turn took.
+    #[tokio::test]
+    async fn a_replaced_sessions_frame_is_not_applied() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let gateway = told(GATEWAY).gateway();
+        let store = Arc::clone(&bed.shared.store);
+        let (first, second) = (
+            worker(&store, "http://a:8000"),
+            worker(&store, "http://b:8000"),
+        );
+        let now = Instant::now();
+        let seat = bed
+            .shared
+            .gateways
+            .welcome(gateway, GATEWAY, 1, now)
+            .expect("a seat");
+        let (sender, _out) = mpsc::channel(OUT_QUEUE);
+        let mut answers = Answers { sender, seq: 0 };
+
+        // While its seat stands the session's frame is applied.
+        let report = frame(1, Some(Frame::Completed(a_completed(1, first))));
+        assert!(judge(&bed.shared, gateway, 1, &seat, &report, &mut answers)
+            .await
+            .is_none());
+        assert!(store.completed_ok_since(gateway, first, now));
+
+        let newer = bed
+            .shared
+            .gateways
+            .welcome(gateway, GATEWAY, 1, now)
+            .expect("a seat");
+        let late = frame(1, Some(Frame::Completed(a_completed(1, second))));
+        let status = judge(&bed.shared, gateway, 1, &seat, &late, &mut answers)
+            .await
+            .expect("the replaced session ends");
+        assert_eq!(
+            (status.code(), status.message()),
+            (
+                Code::Aborted,
+                "a newer session of this gateway took this one's place"
+            )
+        );
+        assert!(
+            !store.completed_ok_since(gateway, second, now),
+            "a replaced session writes nothing"
+        );
+
+        // The session that replaced it was never told: its frame is applied.
+        let third = worker(&store, "http://c:8000");
+        let report = frame(1, Some(Frame::Completed(a_completed(1, third))));
+        assert!(
+            judge(&bed.shared, gateway, 1, &newer, &report, &mut answers)
+                .await
+                .is_none()
+        );
+        assert!(store.completed_ok_since(gateway, third, now));
+    }
+
+    /// And for the floor: a lifecycle frame whose floor is above the term
+    /// is refused before its arm.
+    #[tokio::test]
+    async fn a_lifecycle_frame_under_a_floor_above_the_term_is_not_applied() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let gateway = told(GATEWAY).gateway();
+        let store = Arc::clone(&bed.shared.store);
+        store
+            .issue(lease(gateway, 1, Instant::now()))
+            .expect("a lease");
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+
+        session
+            .send(frame(2, Some(Frame::Released(a_released(1)))))
+            .await;
+        assert_eq!(
+            session.status().await,
+            (
+                Code::FailedPrecondition,
+                "the gateway's term floor 2 is above this controller's term 1".to_owned()
+            )
+        );
+        assert_eq!(
+            LeasesStore::get(&*store, gateway, LeaseId(1)).map(|record| record.state),
+            Some(LeaseState::Issued),
+            "a frame the floor refuses is not applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lifecycle_frame_that_reads_wrong_ends_the_session_by_its_fields_name() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+        session
+            .send(frame(
+                1,
+                Some(Frame::Dispatched(proto::Dispatched::default())),
+            ))
+            .await;
+        assert_eq!(
+            session.status().await,
+            (
+                Code::InvalidArgument,
+                "Dispatched.side is 0, which names none this version knows".to_owned()
+            )
+        );
     }
 
     #[test]

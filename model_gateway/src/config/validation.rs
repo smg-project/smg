@@ -214,6 +214,17 @@ pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
     Ok(())
 }
 
+/// Refuse a zero or a negative for a setting that must be positive.
+fn require_positive<T: Default + Ord + std::fmt::Display>(
+    field: &str,
+    value: T,
+) -> ConfigResult<()> {
+    if value <= T::default() {
+        return Err(ConfigError::invalid_value(field, value, "Must be > 0"));
+    }
+    Ok(())
+}
+
 /// Validate a single worker URL: non-empty, an allowed scheme, a parseable
 /// host, and one address to both of its readers (`read_two_ways`: the URL
 /// library a client dials by and the gateway's own type every line names
@@ -1134,32 +1145,24 @@ impl ConfigValidator {
             ));
         }
 
-        if oracle.pool_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "oracle.pool_timeout_secs",
-                oracle.pool_timeout_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive("oracle.pool_timeout_secs", oracle.pool_timeout_secs)?;
 
-        if oracle.op_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "oracle.op_timeout_secs",
-                oracle.op_timeout_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive("oracle.op_timeout_secs", oracle.op_timeout_secs)?;
 
         Ok(())
     }
 
     fn validate_mode(mode: &RoutingMode) -> ConfigResult<()> {
         match mode {
-            RoutingMode::Regular { worker_urls } => {
+            // Allow empty URLs to support dynamic worker addition
+            // URLs will be validated if provided
+            RoutingMode::Regular { worker_urls }
+            | RoutingMode::OpenAI { worker_urls }
+            | RoutingMode::Anthropic { worker_urls }
+            | RoutingMode::Gemini { worker_urls } => {
                 if !worker_urls.is_empty() {
                     Self::validate_urls(worker_urls)?;
                 }
-                // Allow empty URLs without service discovery to match legacy behavior
             }
             RoutingMode::PrefillDecode {
                 prefill_urls,
@@ -1169,26 +1172,11 @@ impl ConfigValidator {
             } => {
                 // Allow empty URLs even without service discovery to support dynamic worker addition
                 // URLs will be validated if provided
-                if !prefill_urls.is_empty() {
-                    let prefill_url_strings: Vec<String> =
-                        prefill_urls.iter().map(|(url, _)| url.clone()).collect();
-                    Self::validate_urls(&prefill_url_strings)?;
-                }
+                Self::validate_url_port_urls(prefill_urls)?;
                 if !decode_urls.is_empty() {
                     Self::validate_urls(decode_urls)?;
                 }
-
-                for (_url, port) in prefill_urls {
-                    if let Some(port) = port {
-                        if *port == 0 {
-                            return Err(ConfigError::invalid_value(
-                                "bootstrap_port",
-                                port,
-                                "Port must be between 1 and 65535",
-                            ));
-                        }
-                    }
-                }
+                Self::validate_bootstrap_ports(prefill_urls)?;
 
                 if let Some(p_policy) = prefill_policy {
                     Self::validate_policy(p_policy)?;
@@ -1206,22 +1194,8 @@ impl ConfigValidator {
                 decode_policy,
             } => {
                 for urls in [encode_urls, prefill_urls] {
-                    if !urls.is_empty() {
-                        let url_strings: Vec<String> =
-                            urls.iter().map(|(url, _)| url.clone()).collect();
-                        Self::validate_urls(&url_strings)?;
-                    }
-                    for (_url, port) in urls {
-                        if let Some(port) = port {
-                            if *port == 0 {
-                                return Err(ConfigError::invalid_value(
-                                    "bootstrap_port",
-                                    port,
-                                    "Port must be between 1 and 65535",
-                                ));
-                            }
-                        }
-                    }
+                    Self::validate_url_port_urls(urls)?;
+                    Self::validate_bootstrap_ports(urls)?;
                 }
                 if !decode_urls.is_empty() {
                     Self::validate_urls(decode_urls)?;
@@ -1237,24 +1211,24 @@ impl ConfigValidator {
                     Self::validate_policy(policy)?;
                 }
             }
-            RoutingMode::OpenAI { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                // URLs will be validated if provided
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
-                }
-            }
-            RoutingMode::Anthropic { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                // URLs will be validated if provided
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
-                }
-            }
-            RoutingMode::Gemini { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
+        }
+        Ok(())
+    }
+
+    fn validate_url_port_urls(urls: &[(String, Option<u16>)]) -> ConfigResult<()> {
+        urls.iter()
+            .try_for_each(|(url, _)| validate_worker_url(url))
+    }
+
+    fn validate_bootstrap_ports(urls: &[(String, Option<u16>)]) -> ConfigResult<()> {
+        for (_url, port) in urls {
+            if let Some(port) = port {
+                if *port == 0 {
+                    return Err(ConfigError::invalid_value(
+                        "bootstrap_port",
+                        port,
+                        "Port must be between 1 and 65535",
+                    ));
                 }
             }
         }
@@ -1304,13 +1278,7 @@ impl ConfigValidator {
                     ));
                 }
 
-                if *cache_ttl_secs == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "cache_ttl_secs",
-                        cache_ttl_secs,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("cache_ttl_secs", *cache_ttl_secs)?;
 
                 if *cache_index == CacheIndexKind::Hash && cache_boundaries.is_empty() {
                     return Err(ConfigError::invalid_value(
@@ -1336,13 +1304,7 @@ impl ConfigValidator {
                     ));
                 }
 
-                if *block_size == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "block_size",
-                        block_size,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("block_size", *block_size)?;
 
                 // NaN passes every comparison and an infinite threshold is a typo
                 // for "disabled": both are refused with the sign errors.
@@ -1382,21 +1344,9 @@ impl ConfigValidator {
                     ));
                 }
 
-                if *eviction_interval_secs == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "eviction_interval_secs",
-                        eviction_interval_secs,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("eviction_interval_secs", *eviction_interval_secs)?;
 
-                if *max_tree_size == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "max_tree_size",
-                        max_tree_size,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("max_tree_size", *max_tree_size)?;
             }
             PolicyConfig::PowerOfTwo { .. } => {}
             PolicyConfig::LeastLoad {
@@ -1412,13 +1362,7 @@ impl ConfigValidator {
                     ));
                 }
 
-                if *mean_prefill_tokens == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "mean_prefill_tokens",
-                        mean_prefill_tokens,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("mean_prefill_tokens", *mean_prefill_tokens)?;
 
                 if !default_throughput.is_finite() || *default_throughput <= 0.0 {
                     return Err(ConfigError::invalid_value(
@@ -1462,13 +1406,7 @@ impl ConfigValidator {
                 balance_abs_threshold: _,
                 cache_boundaries,
             } => {
-                if *prefix_token_count == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "prefix_token_count",
-                        prefix_token_count,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("prefix_token_count", *prefix_token_count)?;
 
                 if !load_factor.is_finite() || *load_factor < 1.0 {
                     return Err(ConfigError::invalid_value(
@@ -1610,13 +1548,7 @@ impl ConfigValidator {
         let listeners: Vec<_> = listeners.into_iter().flatten().collect();
         validate_distinct_listener_ports(&listeners)?;
 
-        if config.max_payload_size == 0 {
-            return Err(ConfigError::invalid_value(
-                "max_payload_size",
-                config.max_payload_size,
-                "Must be > 0",
-            ));
-        }
+        require_positive("max_payload_size", config.max_payload_size)?;
 
         if config.mm_per_request_image_limit == Some(0) {
             return Err(ConfigError::invalid_value(
@@ -1699,13 +1631,7 @@ impl ConfigValidator {
             }
         }
 
-        if config.request_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "request_timeout_secs",
-                config.request_timeout_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive("request_timeout_secs", config.request_timeout_secs)?;
 
         // The connection limit is a semaphore's permit count, and the
         // runtime refuses more than its maximum at construction (a panic):
@@ -1745,37 +1671,19 @@ impl ConfigValidator {
             }
         }
 
-        if config.worker_startup_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "worker_startup_timeout_secs",
-                config.worker_startup_timeout_secs,
-                "Must be > 0",
-            ));
-        }
-
-        if config.worker_startup_check_interval_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "worker_startup_check_interval_secs",
-                config.worker_startup_check_interval_secs,
-                "Must be > 0",
-            ));
-        }
-
-        if config.zmq_startup_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "zmq_startup_timeout_secs",
-                config.zmq_startup_timeout_secs,
-                "Must be > 0",
-            ));
-        }
-
-        if config.load_monitor_interval_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "load_monitor_interval_secs",
-                config.load_monitor_interval_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive(
+            "worker_startup_timeout_secs",
+            config.worker_startup_timeout_secs,
+        )?;
+        require_positive(
+            "worker_startup_check_interval_secs",
+            config.worker_startup_check_interval_secs,
+        )?;
+        require_positive("zmq_startup_timeout_secs", config.zmq_startup_timeout_secs)?;
+        require_positive(
+            "load_monitor_interval_secs",
+            config.load_monitor_interval_secs,
+        )?;
 
         Ok(())
     }
@@ -2008,13 +1916,10 @@ impl ConfigValidator {
                 "Port must be > 0",
             ));
         }
-        if discovery.check_interval_secs == 0 {
-            return Err(invalid(
-                "discovery.check_interval_secs",
-                "0".to_string(),
-                "Must be > 0",
-            ));
-        }
+        require_positive(
+            "discovery.check_interval_secs",
+            discovery.check_interval_secs,
+        )?;
 
         let roles = [
             ("discovery.job_names", "regular", &discovery.job_names),
@@ -2170,13 +2075,7 @@ impl ConfigValidator {
     /// What the file and Consul providers share: their records name their own
     /// worker types, so any mode with worker pools can use them.
     fn validate_record_discovery(check_interval_secs: u64, mode: &RoutingMode) -> ConfigResult<()> {
-        if check_interval_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "discovery.check_interval_secs",
-                check_interval_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive("discovery.check_interval_secs", check_interval_secs)?;
 
         let unsupported = match mode {
             RoutingMode::Regular { .. }
@@ -2203,13 +2102,10 @@ impl ConfigValidator {
             ));
         }
 
-        if discovery.check_interval_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "discovery.check_interval_secs",
-                discovery.check_interval_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive(
+            "discovery.check_interval_secs",
+            discovery.check_interval_secs,
+        )?;
 
         for (field, value) in [
             (
@@ -2375,13 +2271,7 @@ impl ConfigValidator {
                 "Must be >= 1 (set to 1 to effectively disable retries)",
             ));
         }
-        if retry.initial_backoff_ms == 0 {
-            return Err(ConfigError::invalid_value(
-                "retry.initial_backoff_ms",
-                retry.initial_backoff_ms,
-                "Must be > 0",
-            ));
-        }
+        require_positive("retry.initial_backoff_ms", retry.initial_backoff_ms)?;
         if retry.max_backoff_ms < retry.initial_backoff_ms {
             return Err(ConfigError::invalid_value(
                 "retry.max_backoff_ms",
@@ -2421,20 +2311,14 @@ impl ConfigValidator {
                 "Must be >= 1",
             ));
         }
-        if cb.timeout_duration_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "circuit_breaker.timeout_duration_secs",
-                cb.timeout_duration_secs,
-                "Must be > 0",
-            ));
-        }
-        if cb.window_duration_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "circuit_breaker.window_duration_secs",
-                cb.window_duration_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive(
+            "circuit_breaker.timeout_duration_secs",
+            cb.timeout_duration_secs,
+        )?;
+        require_positive(
+            "circuit_breaker.window_duration_secs",
+            cb.window_duration_secs,
+        )?;
         Ok(())
     }
 
@@ -2690,6 +2574,18 @@ impl ConfigValidator {
 mod tests {
 
     use super::*;
+
+    /// The reason reads "Must be > 0", so a signed zero and a negative are refused alike.
+    #[test]
+    fn require_positive_refuses_zero_and_negative() {
+        assert!(require_positive("field", 1_i64).is_ok());
+        for value in [0_i64, -1] {
+            assert!(matches!(
+                require_positive("field", value),
+                Err(ConfigError::InvalidValue { reason, .. }) if reason == "Must be > 0"
+            ));
+        }
+    }
 
     /// Serialized thresholds survive round trips and reject invalid values for either role.
     #[test]

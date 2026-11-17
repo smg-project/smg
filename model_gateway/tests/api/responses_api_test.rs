@@ -4,9 +4,10 @@ use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode};
 use openai_protocol::{
     common::{GenerationRequest, UsageInfo},
     responses::{
-        CodeInterpreterTool, McpTool, ReasoningEffort, RequireApproval, RequireApprovalMode,
-        ResponseContentPart, ResponseInput, ResponseReasoningParam, ResponseTool, ResponsesRequest,
-        ResponsesToolChoice, ServiceTier, ToolChoiceOptions, Truncation, WebSearchPreviewTool,
+        CodeInterpreterTool, McpAllowedTools, McpTool, ReasoningEffort, RequireApproval,
+        RequireApprovalMode, ResponseContentPart, ResponseInput, ResponseReasoningParam,
+        ResponseTool, ResponsesRequest, ResponsesToolChoice, ServiceTier, ToolChoiceOptions,
+        Truncation, WebSearchPreviewTool,
     },
 };
 use smg::{
@@ -513,6 +514,84 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
             .all(|entry| entry.get("type") != Some(&serde_json::Value::String("mcp_call".into()))),
         "response should interrupt before emitting mcp_call"
     );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+/// One server under two labels: each tool is attributed to one of them, and
+/// the approval the other label asks for still holds the call.
+#[tokio::test]
+async fn test_non_streaming_mcp_approval_holds_for_a_tool_listed_under_another_label() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let url = mcp.url();
+    let mcp_yaml = format!("servers:\n  - name: mock\n    protocol: streamable\n    url: {url}\n");
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+    let router_cfg = worker_router_config(worker_url);
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let label = |server_label: &str, narrow: bool, asks: bool| {
+        ResponseTool::Mcp(McpTool {
+            server_url: Some(url.clone()),
+            authorization: None,
+            headers: None,
+            server_label: server_label.to_string(),
+            server_description: None,
+            require_approval: asks.then_some(RequireApproval::Mode(RequireApprovalMode::Always)),
+            allowed_tools: narrow
+                .then(|| McpAllowedTools::List(vec!["brave_web_search".to_string()])),
+            connector_id: None,
+            defer_loading: None,
+        })
+    };
+    let mut seen = Vec::new();
+    for tools in [
+        vec![label("conf", false, false), label("conf-b", true, true)],
+        vec![label("conf-b", true, false), label("conf", false, true)],
+    ] {
+        let req = ResponsesRequest {
+            input: ResponseInput::Text("search something".to_string()),
+            model: "mock-model".to_string(),
+            store: Some(true),
+            stream: Some(false),
+            tools: Some(tools),
+            ..Default::default()
+        };
+        let resp = router
+            .route_responses(None, &test_tenant_meta(), req.clone(), req.model.as_str())
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("the response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+        let types: Vec<String> = body["output"]
+            .as_array()
+            .expect("the output items")
+            .iter()
+            .filter_map(|item| item["type"].as_str().map(str::to_string))
+            .collect();
+        seen.push(types);
+    }
+    for types in &seen {
+        assert!(
+            types.iter().any(|t| t == "mcp_approval_request")
+                && !types.iter().any(|t| t == "mcp_call"),
+            "each order waits for the approval before the call: {seen:?}"
+        );
+    }
 
     worker.stop().await;
     mcp.stop().await;
@@ -3656,6 +3735,48 @@ async fn an_unstreamed_turn_the_allowance_cuts_renders_each_call_once() {
     mcp.stop().await;
 }
 
+/// A streamed request holds a call under `require_approval: always` as a
+/// non-streamed request does: the tool does not run, and the call the stream
+/// announced closes as failed.
+#[tokio::test]
+async fn a_streamed_call_that_waits_for_approval_does_not_run() {
+    let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
+    let mut req = streaming_mcp_request(&mcp.url(), None);
+    if let Some(ResponseTool::Mcp(tool)) = req.tools.as_mut().and_then(|tools| tools.first_mut()) {
+        tool.require_approval = Some(RequireApproval::Mode(RequireApprovalMode::Always));
+    }
+
+    let body = stream_body(router.as_ref(), req).await;
+
+    assert_eq!(mcp.call_count(), 0, "the tool ran without its approval");
+    let events = frame_events(&body);
+    let closed_calls: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["type"] == "mcp_call"
+        })
+        .collect();
+    assert_eq!(
+        closed_calls.len(),
+        1,
+        "one call announced and closed: {body}"
+    );
+    assert_eq!(closed_calls[0]["item"]["status"], "failed");
+    assert!(
+        closed_calls[0]["item"]["error"]
+            .to_string()
+            .contains("requires approval"),
+        "the call failed for its approval: {body}"
+    );
+    assert_eq!(
+        events.last().and_then(|event| event["type"].as_str()),
+        Some("response.completed")
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
 /// An upstream nothing listens on: the stream is the one typed error event
 /// with the request's failure, at sequence number 0.
 #[tokio::test]
@@ -3785,6 +3906,59 @@ mod conversation_body_refusals {
                 assert_eq!(answer["error"]["code"], code, "{case}: {answer}");
             }
         }
+        ctx.shutdown().await;
+    }
+
+    /// Create, update and create-items refuse a body with a repeated key at
+    /// the door, before a conversation is looked up: 400 `json_parse_error`
+    /// with serde's `duplicate field` words and the place as `param`. The
+    /// keys of `metadata` keep the last value.
+    #[tokio::test]
+    async fn the_posting_routes_refuse_a_repeated_key_outside_metadata() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+        let json = Some("application/json");
+        let twice = r#"{"metadata":{"a":"1"},"metadata":{"a":"2"}}"#;
+        let cases = [
+            ("/v1/conversations", twice, serde_json::Value::Null),
+            (
+                "/v1/conversations/conv_missing",
+                twice,
+                serde_json::Value::Null,
+            ),
+            (
+                "/v1/conversations/conv_missing/items",
+                r#"{"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}]}"#,
+                serde_json::json!("items[0].content[0]"),
+            ),
+        ];
+        for (path, body, param) in cases {
+            let (status, _, answer) = post(&app, path, json, body.as_bytes())
+                .await
+                .expect("an answer from the route");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}: {answer}");
+            assert_eq!(
+                answer["error"]["code"], "json_parse_error",
+                "{path} {body}: {answer}"
+            );
+            assert_eq!(answer["error"]["param"], param, "{path} {body}: {answer}");
+            assert!(
+                answer["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("duplicate field `")),
+                "{path} {body}: {answer}"
+            );
+        }
+        let (status, _, created) = post(
+            &app,
+            "/v1/conversations",
+            json,
+            br#"{"metadata":{"a":"1","a":"2"}}"#,
+        )
+        .await
+        .expect("an answer from the route");
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["metadata"]["a"], "2", "{created}");
         ctx.shutdown().await;
     }
 }

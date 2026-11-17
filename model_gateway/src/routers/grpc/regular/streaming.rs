@@ -45,11 +45,7 @@ use crate::{
     observability::metrics::{metrics_labels, LocalStopAbort, Metrics, StreamingMetricsParams},
     rate_limit::{SharedReservationHandle, UsageSettlement},
     routers::{
-        common::{
-            prefill_admission::PrefillLoadGuard,
-            sse::{SseEncoder, SseSender},
-            sse_rechunk,
-        },
+        common::{prefill_admission::PrefillLoadGuard, sse::SseSender, sse_rechunk},
         grpc::{
             common::{
                 response_collection::drain_prefill,
@@ -85,7 +81,8 @@ use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
     frames::{
         assistant_choice, forces_tool_call, opening_choice, push_json, text_delta, ChatChunkFrame,
-        CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHUNK_FLUSH_BYTES, FRAME_ROOM,
+        CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHAT_BURST_MARK, CHAT_BURST_ROOM,
+        CHUNK_FLUSH_BYTES, FRAME_ROOM,
     },
 };
 #[cfg(test)]
@@ -513,7 +510,6 @@ impl StreamingProcessor {
                 dispatch_start,
             } => {
                 let processor = self.clone();
-                let dispatch_clone = dispatch.clone();
                 let tokenizer_clone = tokenizer.clone();
                 let table = chat_request.symphony.as_ref().map(Assignment::table);
                 // The request's span, for the line a failure writes: the
@@ -526,7 +522,7 @@ impl StreamingProcessor {
                     let result = isolated(processor.process_streaming_chunks_inner(
                         dispatch_start,
                         stream,
-                        dispatch_clone,
+                        dispatch,
                         tokenizer_clone,
                         stop_params,
                         chat_request,
@@ -695,7 +691,11 @@ impl StreamingProcessor {
                 stream
                     .send_finish_chunks(final_usage.as_ref(), usage.as_ref())
                     .await?;
-                stream.send_usage_chunk(final_usage).await
+                stream.write_usage_chunk(final_usage.as_ref());
+                // The closing chunks leave here, as one frame.
+                StreamingProcessor::flush_chunks(stream.tx, &mut stream.sse_buffer)
+                    .await
+                    .map_err(utils::StreamFailure::from)
             }
             .await
         };
@@ -1729,7 +1729,8 @@ impl StreamingProcessor {
     /// to the channel as one frame, without a copy, by [`Self::flush_chunks`]
     /// once the engine has nothing more ready (the chat loop's
     /// `read_engine`: the messages ready at one poll share a frame, after the
-    /// first token's), or here once it holds [`CHUNK_FLUSH_BYTES`].
+    /// first token's) and after the chunks that close the stream, or here
+    /// once it holds [`CHUNK_FLUSH_BYTES`].
     async fn push_chunk<C: Serialize>(
         tx: &SseSender,
         buffer: &mut BytesMut,
@@ -2166,10 +2167,8 @@ impl StreamingProcessor {
     /// keeps the thinking block, its start, its signature and its stop, and no text); the stop
     /// reason when a `Finish` was among the events. The machine writes into the stream's `blocks`
     /// buffer, emptied here before the step: one buffer serves every step, as `buffer` does.
-    /// A step that is one text delta into the open text block, the steady state of a streamed
-    /// answer, goes straight from the borrowed text into the buffer ([`Self::write_text_delta`])
-    /// when the machine says it would send exactly that
-    /// ([`adapt::messages::Stream::direct_text_index`]): no owned event and no `String` per delta.
+    /// The step that is one text delta into the open text block does not come here:
+    /// `MessagesStream::read_chunk` writes it from the borrowed text.
     /// A `tool_use` block's `input_json_delta`s leave under the stream's object rule (`input`,
     /// [`ToolInput`]): the machine hands a call's fragments over as written, as the fold hands the
     /// buffered answer the whole value, and the gateway keeps the block an object on both,
@@ -2184,12 +2183,6 @@ impl StreamingProcessor {
         ),
         events: &[Event<'_>],
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
-        if let [Event::Content(text)] = events {
-            if let Some(index) = machine.direct_text_index(&text.text) {
-                Self::write_text_delta(tx, buffer, index, &text.text).await?;
-                return Ok(None);
-            }
-        }
         let mut stop = None;
         blocks.clear();
         for event in events {
@@ -2260,7 +2253,7 @@ impl StreamingProcessor {
 
     /// Write the `text_delta` event of `text` for the open block `index` into
     /// `buffer`, from the borrowed text: the common delta of a Symphony Messages
-    /// stream ([`Self::send_symphony_blocks`]), the same bytes as the event's
+    /// stream (`MessagesStream::read_chunk`), the same bytes as the event's
     /// frame; it leaves as [`Self::write_messages_event`]'s writes do.
     async fn write_text_delta(
         tx: &SseSender,
@@ -2430,7 +2423,6 @@ impl StreamingProcessor {
                 dispatch_start,
             } => {
                 let processor = self.clone();
-                let dispatch_clone = dispatch.clone();
                 let tokenizer_clone = tokenizer.clone();
                 let table = messages_request.symphony.as_ref().map(Assignment::table);
                 // The request's span, for the line a failure writes: the
@@ -2443,7 +2435,7 @@ impl StreamingProcessor {
                     let result = isolated(processor.process_messages_streaming_chunks_inner(
                         dispatch_start,
                         stream,
-                        dispatch_clone,
+                        dispatch,
                         tokenizer_clone,
                         stop_params,
                         messages_request,
@@ -3395,9 +3387,6 @@ struct ChatStream<'a> {
     /// one per pass of the loop.
     final_indices: Option<Vec<(u32, bool)>>,
 
-    /// Reusable SSE encoder for the post-loop flush / tool / finish / usage
-    /// chunks.
-    sse_encoder: SseEncoder,
     /// The per-chunk SSE frames: the invariant head of every chunk of this
     /// stream is serialized once; per chunk only its choice (and usage) is
     /// serialized into `sse_buffer`, whose written bytes are split off for
@@ -3537,7 +3526,6 @@ impl<'a> ChatStream<'a> {
             delta: Delta::default(),
             spare: Events::new(),
             final_indices: None,
-            sse_encoder: SseEncoder::new(),
             chunk_frame,
             sse_buffer: BytesMut::with_capacity(4096),
             first_token_out: false,
@@ -3615,11 +3603,6 @@ impl<'a> ChatStream<'a> {
         )
         .await
         .map_err(|()| "Failed to send logprobs chunk".to_string())
-    }
-
-    /// The logprobs of an engine chunk, in the public API's shape.
-    fn logprobs_of(&self, chunk: &ProtoGenerateStreamChunk) -> Option<ChatLogProbs> {
-        self.logprobs_from(chunk.output_logprobs())
     }
 
     /// A chunk's logprobs view converted to the public API's shape, for the
@@ -3702,7 +3685,21 @@ impl<'a> ChatStream<'a> {
                         })
                         .await?;
                         match polled {
-                            Some(item) => item,
+                            Some(item) => {
+                                // A message ready with this much unsent
+                                // (`CHAT_BURST_MARK`) is a burst's, and its
+                                // frame is on the way to the flush bound: the
+                                // buffer takes that frame's room in one step
+                                // (`CHAT_BURST_ROOM`). Doubled up from the
+                                // stream's first room, it was copied at every
+                                // step.
+                                let unsent = self.sse_buffer.len();
+                                if unsent >= CHAT_BURST_MARK {
+                                    self.sse_buffer
+                                        .reserve(CHAT_BURST_ROOM.saturating_sub(unsent));
+                                }
+                                item
+                            }
                             None => {
                                 if let Some(frame) = waiting {
                                     self.tx
@@ -3941,7 +3938,7 @@ impl<'a> ChatStream<'a> {
             // The chunk's logprobs still reach the client, on a chunk with
             // an empty delta, as the engine's own server sends a step whose
             // text made no delta: every generated token's entry goes out once.
-            let logprobs = self.logprobs_of(chunk);
+            let logprobs = self.logprobs_from(chunk.output_logprobs());
             if utils::has_entries(logprobs.as_ref()) {
                 let usage = self.usage_snapshot();
                 self.push_bare_logprobs(index, logprobs, usage.as_ref())
@@ -4536,11 +4533,6 @@ impl<'a> ChatStream<'a> {
     /// produced fully-empty streams), then any parsed-but-unstreamed tool
     /// arguments.
     async fn flush_parsers(&mut self, usage: Option<&Usage>) -> Result<(), utils::StreamFailure> {
-        let request_id = &self.dispatch.request_id;
-        let model = &self.dispatch.model;
-        let created = self.dispatch.created;
-        let system_fingerprint = self.dispatch.weight_version.as_deref();
-
         for (index, choice) in self.choices.iter_mut().enumerate() {
             let Some(parser_guard) = &mut choice.tool_parser else {
                 continue;
@@ -4548,24 +4540,16 @@ impl<'a> ChatStream<'a> {
             let index = index as u32;
             let leftover_text = parser_guard.take_unstreamed_normal_text();
             if !leftover_text.is_empty() {
-                let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                    .created(created)
-                    .add_choice_content_with_logprobs(index, leftover_text, None)
-                    .maybe_system_fingerprint(system_fingerprint)
-                    .maybe_usage(usage.cloned())
-                    .build();
-
-                let sse_chunk = self
-                    .sse_encoder
-                    .encode_data(&ChatChunkWithUsage::new(
-                        &content_chunk,
-                        self.emit_usage_null,
-                    ))
-                    .map_err(|e| format!("Failed to serialize content chunk: {e}"))?;
-                self.tx
-                    .send(Ok(sse_chunk))
-                    .await
-                    .map_err(|_| "Failed to send flushed content chunk".to_string())?;
+                StreamingProcessor::push_chunk(
+                    self.tx,
+                    &mut self.sse_buffer,
+                    &self.chunk_frame,
+                    &assistant_choice(index, Some(leftover_text), None, None),
+                    usage,
+                    self.emit_usage_null,
+                )
+                .await
+                .map_err(|()| "Failed to send flushed content chunk".to_string())?;
             }
 
             if let Some(mut unstreamed_items) = parser_guard.get_unstreamed_tool_args() {
@@ -4587,21 +4571,16 @@ impl<'a> ChatStream<'a> {
                         }),
                     };
 
-                    let tool_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                        .created(created)
-                        .add_choice_tool_call_delta(index, tool_call_delta)
-                        .maybe_system_fingerprint(system_fingerprint)
-                        .maybe_usage(usage.cloned())
-                        .build();
-
-                    let sse_chunk = self
-                        .sse_encoder
-                        .encode_data(&ChatChunkWithUsage::new(&tool_chunk, self.emit_usage_null))
-                        .map_err(|e| format!("Failed to serialize tool chunk: {e}"))?;
-                    self.tx
-                        .send(Ok(sse_chunk))
-                        .await
-                        .map_err(|_| "Failed to send unstreamed tool args".to_string())?;
+                    StreamingProcessor::push_chunk(
+                        self.tx,
+                        &mut self.sse_buffer,
+                        &self.chunk_frame,
+                        &assistant_choice(index, None, None, Some(vec![tool_call_delta])),
+                        usage,
+                        self.emit_usage_null,
+                    )
+                    .await
+                    .map_err(|()| "Failed to send unstreamed tool args".to_string())?;
                 }
             }
         }
@@ -4671,11 +4650,6 @@ impl<'a> ChatStream<'a> {
         final_usage: Option<&Usage>,
         usage: Option<&Usage>,
     ) -> Result<(), utils::StreamFailure> {
-        let request_id = &self.dispatch.request_id;
-        let model = &self.dispatch.model;
-        let created = self.dispatch.created;
-        let system_fingerprint = self.dispatch.weight_version.as_deref();
-
         let complete_usage = self.closed_choices() >= self.spec.expected_choices;
         // One finish chunk per finished choice, in index order.
         let finished = self
@@ -4702,58 +4676,37 @@ impl<'a> ChatStream<'a> {
             // (DeepSeek's last one).
             let finish_usage =
                 if complete_usage && self.shape.final_usage_on.carries(position, finished) {
-                    final_usage.cloned()
+                    final_usage
                 } else {
-                    usage.cloned()
+                    usage
                 };
-            let finish_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                .created(created)
-                .add_choice_finish_reason(index, final_finish_reason, matched_stop_value)
-                .maybe_system_fingerprint(system_fingerprint)
-                .maybe_usage(finish_usage)
-                .build();
-
-            let sse_chunk = self
-                .sse_encoder
-                .encode_data(&ChatChunkWithUsage::new(
-                    &finish_chunk,
-                    self.emit_usage_null,
-                ))
-                .map_err(|e| format!("Failed to serialize finish chunk: {e}"))?;
-            self.tx
-                .send(Ok(sse_chunk))
-                .await
-                .map_err(|_| "Failed to send finish chunk".to_string())?;
+            let finish_choice = ChatStreamChoice {
+                finish_reason: Some(final_finish_reason),
+                matched_stop: matched_stop_value,
+                ..assistant_choice(index, None, None, None)
+            };
+            StreamingProcessor::push_chunk(
+                self.tx,
+                &mut self.sse_buffer,
+                &self.chunk_frame,
+                &finish_choice,
+                finish_usage,
+                self.emit_usage_null,
+            )
+            .await
+            .map_err(|()| "Failed to send finish chunk".to_string())?;
         }
         Ok(())
     }
 
     /// Phase 5: the usage-only chunk of the wires that close with one.
-    async fn send_usage_chunk(
-        &mut self,
-        final_usage: Option<Usage>,
-    ) -> Result<(), utils::StreamFailure> {
+    fn write_usage_chunk(&mut self, final_usage: Option<&Usage>) {
         if self.shape.final_usage_on.sends_usage_chunk() {
             if let Some(final_usage) = final_usage {
-                let usage_chunk = ChatCompletionStreamResponse::builder(
-                    &self.dispatch.request_id,
-                    &self.dispatch.model,
-                )
-                .created(self.dispatch.created)
-                .usage(final_usage)
-                .maybe_system_fingerprint(self.dispatch.weight_version.as_deref())
-                .build();
-                let sse_chunk = self
-                    .sse_encoder
-                    .encode_data(&usage_chunk)
-                    .map_err(|e| format!("Failed to serialize usage chunk: {e}"))?;
-                self.tx
-                    .send(Ok(sse_chunk))
-                    .await
-                    .map_err(|_| "Failed to send usage chunk".to_string())?;
+                self.chunk_frame
+                    .write_usage_chunk(&mut self.sse_buffer, final_usage);
             }
         }
-        Ok(())
     }
 
     /// The end: the reservation settled with what the stream used
@@ -5543,25 +5496,37 @@ impl<'a> MessagesStream<'a> {
         let mut chunk_tokens = chunk.token_ids().len() as u32;
 
         if let Some((reader, machine)) = self.symphony.as_mut() {
-            let mut delta = std::mem::take(&mut self.delta);
             let mut events: Events<'_> = std::mem::take(&mut self.spare);
             let should_stop = reader.read(
                 &mut self.stop_decoder,
                 chunk.token_ids(),
-                &mut delta,
+                &mut self.delta,
                 &mut events,
             )?;
-            self.parsed_thinking_tokens += reasoning_text_tokens(events.as_slice());
-            self.symphony_stop = StreamingProcessor::send_symphony_blocks(
-                self.tx,
-                &mut self.sse_buffer,
-                (machine, &mut self.machine_blocks, &mut self.machine_input),
-                events.as_slice(),
-            )
-            .await?
-            .or_else(|| self.symphony_stop.take());
+            // One text delta into the open text block is the steady state of a streamed answer:
+            // it goes from the borrowed text into the buffer, with no owned event, no `String`
+            // and no pass through the machine, when the machine would send exactly that.
+            let direct = match events.as_slice() {
+                [Event::Content(text)] => machine
+                    .direct_text_index(&text.text)
+                    .map(|index| (index, &*text.text)),
+                _ => None,
+            };
+            if let Some((index, text)) = direct {
+                StreamingProcessor::write_text_delta(self.tx, &mut self.sse_buffer, index, text)
+                    .await?;
+            } else {
+                self.parsed_thinking_tokens += reasoning_text_tokens(events.as_slice());
+                self.symphony_stop = StreamingProcessor::send_symphony_blocks(
+                    self.tx,
+                    &mut self.sse_buffer,
+                    (machine, &mut self.machine_blocks, &mut self.machine_input),
+                    events.as_slice(),
+                )
+                .await?
+                .or_else(|| self.symphony_stop.take());
+            }
             self.spare = events.recycle();
-            self.delta = delta;
             if should_stop {
                 self.note_local_stop();
                 self.close_on_local_stop(chunk);

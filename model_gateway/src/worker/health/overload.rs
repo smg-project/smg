@@ -11,8 +11,6 @@
 
 use openai_protocol::worker::{OverloadUpdate, WorkerLoadResponse};
 
-use crate::config::types::RouterConfig;
-
 /// Default KV token-usage ceiling (mean across DP ranks). On the replay
 /// harness this is the setting that keeps `cache_aware`'s hit rate while
 /// cutting its tail; the hardware fleet sits near 0.9 under load, so a
@@ -81,21 +79,6 @@ impl OverloadThresholds {
     /// requirement and every write to the flag.
     pub const fn is_enabled(&self) -> bool {
         self.waiting_requests.is_some() || self.token_usage.is_some()
-    }
-
-    /// Gateway-level thresholds: the `--worker-overload-*` values, which
-    /// default to [`DEFAULT_WAITING_REQUESTS`] and
-    /// [`DEFAULT_TOKEN_USAGE_CEILING`]. `--disable-worker-overload-protection`
-    /// (`worker_overload_protection: false`) switches both off whatever the
-    /// thresholds say; per-worker `overload` blocks still apply on top.
-    pub fn from_gateway_config(config: &RouterConfig) -> Self {
-        if !config.worker_overload_protection {
-            return Self::default();
-        }
-        Self {
-            waiting_requests: config.worker_overload_waiting_requests,
-            token_usage: config.worker_overload_token_usage,
-        }
     }
 
     /// Per-worker effective thresholds: each signal takes the worker's spec
@@ -183,58 +166,6 @@ mod tests {
         assert!(!thresholds.is_overloaded(&response(3, 0.7)));
         assert!(thresholds.is_overloaded(&response(4, 0.1)));
         assert!(thresholds.is_overloaded(&response(0, 0.8)));
-    }
-
-    fn gateway_config(
-        protection: bool,
-        waiting: Option<usize>,
-        token: Option<f64>,
-    ) -> RouterConfig {
-        RouterConfig {
-            worker_overload_protection: protection,
-            worker_overload_waiting_requests: waiting,
-            worker_overload_token_usage: token,
-            ..RouterConfig::default()
-        }
-    }
-
-    /// The gateway defaults enable protection on both signals.
-    #[test]
-    fn protection_is_on_by_default_on_both_signals() {
-        let thresholds = OverloadThresholds::from_gateway_config(&RouterConfig::default());
-        assert_eq!(
-            thresholds,
-            OverloadThresholds {
-                waiting_requests: Some(DEFAULT_WAITING_REQUESTS),
-                token_usage: Some(DEFAULT_TOKEN_USAGE_CEILING),
-            }
-        );
-        assert!(thresholds.is_enabled());
-        assert!(!RouterConfig::default().worker_overload_shed);
-    }
-
-    /// Explicit thresholds replace the defaults; disabling protection switches
-    /// both signals off whatever the thresholds say.
-    #[test]
-    fn explicit_thresholds_replace_the_defaults_and_disabling_wins() {
-        let explicit =
-            OverloadThresholds::from_gateway_config(&gateway_config(true, Some(64), Some(0.5)));
-        assert_eq!(explicit.token_usage, Some(0.5));
-        assert_eq!(explicit.waiting_requests, Some(64));
-
-        let one_signal =
-            OverloadThresholds::from_gateway_config(&gateway_config(true, None, Some(0.5)));
-        assert_eq!(
-            one_signal,
-            OverloadThresholds {
-                waiting_requests: None,
-                token_usage: Some(0.5),
-            }
-        );
-
-        let off =
-            OverloadThresholds::from_gateway_config(&gateway_config(false, Some(8), Some(0.8)));
-        assert!(!off.is_enabled());
     }
 
     /// Per-signal resolution: a worker override beats the gateway default for

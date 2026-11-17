@@ -74,6 +74,7 @@ fn config() -> Config {
         shutdown_settle: Duration::from_millis(100),
         shutdown_grace: Duration::from_secs(5),
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
+        decide_shards: 2,
         election: Election::default(),
     }
 }
@@ -213,11 +214,13 @@ async fn the_listeners_serve_health_and_the_admin_endpoints_on_ephemeral_ports()
 
 /// `message` as a call that states `name`, or states none.
 fn stating<T>(name: Option<&'static str>, message: T) -> Request<T> {
+    use smg_policy_controller::controller::PRINCIPAL_ENTRY;
+
     let mut request = Request::new(message);
     if let Some(name) = name {
         request
             .metadata_mut()
-            .insert("x-smg-principal", AsciiMetadataValue::from_static(name));
+            .insert(PRINCIPAL_ENTRY, AsciiMetadataValue::from_static(name));
     }
     request
 }
@@ -263,6 +266,12 @@ async fn a_listener_named_as_told_takes_the_stated_name_and_the_others_take_none
             .await
             .expect_err("no name is stated");
         assert_eq!(silent.code(), Code::Unauthenticated, "{silent:?}");
+        // Two names a hop joined into one value: no name.
+        let joined = control
+            .get_policy_spec(read(Some("operator-a,operator-b")))
+            .await
+            .expect_err("a comma is two names");
+        assert_eq!(joined.code(), Code::Unauthenticated, "{joined:?}");
 
         let watch = stating(Some("gateway-a"), WatchWorkersRequest::default());
         let unread = gateway
@@ -692,6 +701,13 @@ async fn mutual_tls_admits_the_authoritys_clients_and_refuses_the_rest() {
         controller.identity_as_told("gateway"),
         Err(ConfigError::AsToldBesideClientCa("gateway".to_owned()))
     );
+    // The rule is that listener's own: the ones beside it verify no caller
+    // and are named.
+    for beside in ["control", "replication"] {
+        controller
+            .identity_as_told(beside)
+            .expect("a listener with no client CA");
+    }
     let addresses = controller.addresses();
     let mut readiness = controller.readiness();
     assert_eq!(

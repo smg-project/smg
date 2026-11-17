@@ -115,7 +115,12 @@ async fn probe_models_endpoint(
 
     let models: ModelsResponse = match response.json().await {
         Ok(models) => models,
-        Err(e) => return ModelsProbe::Failed(format!("failed to parse {shown} response: {e}")),
+        Err(e) => {
+            return ModelsProbe::Failed(format!(
+                "failed to parse {shown} response: {}",
+                e.without_url()
+            ))
+        }
     };
 
     let Some(first_model) = models.data.first() else {
@@ -395,7 +400,11 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
 
 #[cfg(test)]
 mod tests {
-    use axum::{routing::get, Json, Router};
+    use axum::{
+        http::{StatusCode, Uri},
+        routing::get,
+        Json, Router,
+    };
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -557,6 +566,31 @@ mod tests {
             .await
             .unwrap_err();
 
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    /// An address registered with a query whose `/v1/models` answers a body
+    /// that is no JSON: the failure does not repeat the query. The HTTP
+    /// client's text of a failed body read ends with the request URL too.
+    #[tokio::test]
+    async fn an_unparsed_models_answer_goes_without_the_clients_url() {
+        // The query takes in the path each probe appends, so the stub tells
+        // the probes apart by the request's tail.
+        let (url, server) = serve_router(Router::new().fallback(|uri: Uri| async move {
+            if uri.to_string().ends_with("/v1/models") {
+                (StatusCode::OK, "not json")
+            } else {
+                (StatusCode::NOT_FOUND, "")
+            }
+        }))
+        .await;
+
+        let result =
+            detect_http_backend(&format!("{url}?token=s3cret"), 1, &http_client(), None).await;
+        server.abort();
+
+        let err = result.unwrap_err();
+        assert!(err.contains("failed to parse"), "{err}");
         assert!(!err.contains("s3cret"), "{err}");
     }
 

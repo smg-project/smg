@@ -5,7 +5,7 @@
 //! shutdown bounds, validated as a whole before anything binds so a refusal
 //! names the field it refuses.
 
-use std::{collections::BTreeMap, fmt, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, fmt, net::SocketAddr, path::PathBuf, thread, time::Duration};
 
 use super::election::Election;
 
@@ -107,12 +107,17 @@ pub struct Config {
     /// The bound on a shutdown, the settle window included: when it runs
     /// out the listeners are closed with their streams. The controller's
     /// streams reconnect on a drain, so the default is far below the
-    /// gateway's, which waits for generations to finish.
+    /// gateway's, which waits for generations to finish. A period the clock
+    /// cannot add to the present is no bound.
     pub shutdown_grace: Duration,
     /// How often the load driver polls an engine whose stream is not
     /// serving it, and the freshness bound a pushed record must meet to
     /// stand in for the poll: the gateway's `--load-monitor-interval`.
     pub load_poll_interval: Duration,
+    /// How many threads decide (design 5.5): a model's decisions all run on
+    /// one of them, behind one bounded queue. From 1 to
+    /// [`Config::MAX_DECIDE_SHARDS`].
+    pub decide_shards: usize,
     /// The election (design 5.3): where the lease lives, its timing and
     /// this replica's dialable address. The default is one replica that
     /// leads itself over a lease in its own process.
@@ -126,6 +131,15 @@ impl Config {
     pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
     /// The default load poll interval, the gateway's.
     pub const DEFAULT_LOAD_POLL_INTERVAL: Duration = Duration::from_secs(10);
+    /// The most deciding threads a controller starts.
+    pub const MAX_DECIDE_SHARDS: usize = 256;
+
+    /// The deciding threads a controller starts when its operator names no
+    /// count: one a CPU available to the process, eight at most, the
+    /// design's count for its busiest fleet.
+    pub fn default_decide_shards() -> usize {
+        thread::available_parallelism().map_or(1, |cpus| cpus.get().min(8))
+    }
 
     /// Refuses the configuration by the first field that is wrong.
     ///
@@ -146,6 +160,15 @@ impl Config {
         }
         if self.listeners.is_empty() {
             return Err(ConfigError::NoListeners);
+        }
+        // A listener is told apart by its name: in a refusal, in a log
+        // line and by a setting that names it.
+        let mut names: Vec<&str> = Vec::with_capacity(self.listeners.len());
+        for listener in &self.listeners {
+            if names.contains(&listener.name.as_str()) {
+                return Err(ConfigError::ListenerNameShared(listener.name.clone()));
+            }
+            names.push(&listener.name);
         }
         let mut mounted: BTreeMap<Scope, &str> = BTreeMap::new();
         for listener in &self.listeners {
@@ -195,6 +218,9 @@ impl Config {
         if self.load_poll_interval.is_zero() {
             return Err(ConfigError::ZeroLoadPollInterval);
         }
+        if !(1..=Self::MAX_DECIDE_SHARDS).contains(&self.decide_shards) {
+            return Err(ConfigError::DecideShards(self.decide_shards));
+        }
         // The holder identity names the gateway listener: every scope is
         // mounted by now, so the listener is there.
         if let Some(gateway) = self
@@ -226,6 +252,10 @@ pub enum ConfigError {
     /// A listener with an empty scope list.
     #[error("listener {0} mounts no scope")]
     ListenerWithoutScope(String),
+    /// Two listeners with one name: a listener is told apart by its name,
+    /// in a refusal, in a log line and by a setting that names it.
+    #[error("two listeners are named {0}: a listener's name is its own")]
+    ListenerNameShared(String),
     /// One scope on two listeners.
     #[error("scope {scope} is mounted on listeners {first} and {second}")]
     ScopeMountedTwice {
@@ -264,6 +294,9 @@ pub enum ConfigError {
     /// The load poll interval is zero.
     #[error("the load poll interval is zero")]
     ZeroLoadPollInterval,
+    /// A count of deciding threads outside its range.
+    #[error("{0} deciding threads: the count is from 1 to {max}", max = Config::MAX_DECIDE_SHARDS)]
+    DecideShards(usize),
     /// A settle window the grace period cannot hold twice.
     #[error("the shutdown settle window of {settle:?} is over half the grace period of {grace:?}")]
     SettleOverHalfTheGrace {
@@ -382,8 +415,44 @@ pub(crate) mod tests {
             shutdown_settle: Duration::from_millis(100),
             shutdown_grace: Duration::from_secs(2),
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
+            decide_shards: 2,
             election: Election::default(),
         }
+    }
+
+    /// A setting names a listener by its name, so no two share one.
+    #[test]
+    fn two_listeners_of_one_name_are_refused() {
+        let mut config = valid();
+        if let Some(second) = config.listeners.get_mut(1) {
+            second.name = "gateway".to_owned();
+        }
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::ListenerNameShared("gateway".to_owned()))
+        );
+    }
+
+    #[test]
+    fn the_deciding_threads_are_counted_from_one_to_their_ceiling() {
+        let mut config = valid();
+        for count in [1, Config::MAX_DECIDE_SHARDS] {
+            config.decide_shards = count;
+            assert_eq!(config.validate(), Ok(()), "{count}");
+        }
+        for count in [0, Config::MAX_DECIDE_SHARDS + 1] {
+            config.decide_shards = count;
+            assert_eq!(
+                config.validate(),
+                Err(ConfigError::DecideShards(count)),
+                "{count}"
+            );
+        }
+        assert_eq!(
+            ConfigError::DecideShards(0).to_string(),
+            "0 deciding threads: the count is from 1 to 256"
+        );
+        assert!((1..=8).contains(&Config::default_decide_shards()));
     }
 
     #[test]

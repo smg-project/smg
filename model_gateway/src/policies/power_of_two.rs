@@ -305,7 +305,7 @@ mod tests {
         // requests. b is scored as drain time (5 · p̄ / throughput ≈ 2.56s),
         // comparable to a's KV barrier (0.15 · 0.9/0.1 = 1.35s) -> pick a.
         let policy = PowerOfTwoPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let a = make_worker("http://a:8000");
         let b = make_worker("http://b:8000");
         for _ in 0..5 {
@@ -420,11 +420,11 @@ mod tests {
         let info = SelectWorkerInfo::default();
 
         let expected_wait = PowerOfTwoPolicy::new();
-        TestFeed::attached_to(&expected_wait).publish(&loads);
+        TestFeed::attached_to(|rx| expected_wait.set_load_receiver(rx)).publish(&loads);
         assert_eq!(expected_wait.select_worker(&workers, &info), Some(0));
 
         let requests = PowerOfTwoPolicy::with_load_metric(PowerOfTwoLoadMetric::Requests);
-        TestFeed::attached_to(&requests).publish(&loads);
+        TestFeed::attached_to(|rx| requests.set_load_receiver(rx)).publish(&loads);
         for _ in 0..20 {
             assert_eq!(requests.select_worker(&workers, &info), Some(1));
         }
@@ -464,11 +464,11 @@ mod tests {
         let info = SelectWorkerInfo::default();
 
         let tokens_only = resident_tokens(0);
-        TestFeed::attached_to(&tokens_only).publish(&loads);
+        TestFeed::attached_to(|rx| tokens_only.set_load_receiver(rx)).publish(&loads);
         assert_eq!(tokens_only.select_worker(&workers, &info), Some(1));
 
         let with_requests = resident_tokens(100_000);
-        TestFeed::attached_to(&with_requests).publish(&loads);
+        TestFeed::attached_to(|rx| with_requests.set_load_receiver(rx)).publish(&loads);
         assert_eq!(with_requests.select_worker(&workers, &info), Some(3));
     }
 
@@ -477,7 +477,7 @@ mod tests {
         // w1's report predates resident tokens: it scores as the best peer
         // plus its live requests, never as idle.
         let policy = resident_tokens(0);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers = holding(&[2, 2]);
         let mut loads = HashMap::new();
         loads.insert("http://w0:8000".to_string(), resident(2, 500_000));
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn least_requests_takes_the_fewest_in_flight_over_every_worker() {
         let policy = PowerOfTwoPolicy::with_load_metric(PowerOfTwoLoadMetric::LeastRequests);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers = holding(&[4, 5, 1, 3]);
         let mut loads = HashMap::new();
         loads.insert("http://w0:8000".to_string(), one_rank_load(0, 0.1, 100.0));
