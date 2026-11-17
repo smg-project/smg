@@ -248,7 +248,7 @@ impl MemoryStore {
         }
     }
 
-    /// The tables replaced by `cut`, a leader's complete snapshot: what a
+    /// The tables replaced by `cut`, a leader's snapshot whole: what a
     /// standby starts from, and starts from again when the leader's log no
     /// longer holds its place. Every row and load row the store held leaves
     /// with what lives as long as a row (the prober's counts, the gateways'

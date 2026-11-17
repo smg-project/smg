@@ -75,7 +75,7 @@ const PAGE: usize = 128;
 
 /// The bytes of one snapshot page's rows on the wire: half a frame of 4 MiB.
 /// A page of [`PAGE`] rows at the door's bound of a row is cut here.
-const PAGE_BYTES: usize = 2 * 1024 * 1024;
+pub(super) const PAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// The log entries a stream takes at one read: what it holds of the log
 /// until its watcher took them.
@@ -576,7 +576,7 @@ impl Asked {
                 }
             }
         }
-        let page = fill(&rows);
+        let page = fill(rows.iter().copied(), worker_wire::row);
         let last = page.len() == rows.len();
         let next = match page.len().checked_sub(1).and_then(|at| after.get(at)) {
             Some(next) if !last => *next,
@@ -586,16 +586,21 @@ impl Asked {
     }
 }
 
-/// The page that starts `rows`: at most [`PAGE`] of them while they take
-/// at most [`PAGE_BYTES`] on the wire. A page takes its first row whatever
-/// it weighs: a row past a page's bytes goes alone.
-fn fill(rows: &[&WorkerRow]) -> Vec<proto::WorkerRow> {
+/// The page that starts `rows`, each as `told` tells it: at most [`PAGE`]
+/// of them while they take at most [`PAGE_BYTES`] on the wire. A page takes
+/// its first row whatever it weighs: a row past a page's bytes goes alone.
+/// A watch's snapshot and a standby's are paged here alike.
+pub(super) fn fill<'a>(
+    rows: impl IntoIterator<Item = &'a WorkerRow>,
+    told: impl Fn(&WorkerRow) -> proto::WorkerRow,
+) -> Vec<proto::WorkerRow> {
     let mut page = Vec::new();
     let mut bytes = 0;
-    for row in rows.iter().take(PAGE) {
-        let told = worker_wire::row(row);
+    for row in rows.into_iter().take(PAGE) {
+        let told = told(row);
         // A row in a page: its bytes under the page's tag and a length
-        // (`WorkerSnapshot.workers`).
+        // (`WorkerSnapshot.workers`, `ReplicationSnapshot.workers`: a tag
+        // of one byte each).
         let framed = message::encoded_len(1, &told);
         if !page.is_empty() && bytes + framed > PAGE_BYTES {
             break;
@@ -1011,7 +1016,7 @@ pub(crate) mod tests {
             let rows: Vec<&WorkerRow> = fleet.iter().collect();
             let (mut told, mut pages) = (0, Vec::new());
             loop {
-                let page = fill(&rows[told..]);
+                let page = fill(rows[told..].iter().copied(), worker_wire::row);
                 assert!(told == rows.len() || !page.is_empty(), "a page takes a row");
                 told += page.len();
                 pages.push(page.len());

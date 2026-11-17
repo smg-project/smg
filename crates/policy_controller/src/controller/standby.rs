@@ -1,7 +1,7 @@
 //! A replica that does not lead follows (design 5.4): the standby's half of
-//! the replication scope. It is restored from its leader's complete
-//! snapshot, applies the batches of `Replicate`, and starts again from a
-//! snapshot where the leader's log no longer continues its own.
+//! the replication scope. It applies the batches of `Replicate` and, where
+//! the leader's log does not continue its own, is restored from the
+//! leader's snapshot, which arrives in parts on the same stream.
 //!
 //! One invariant: a standby's tables and log are its leader's at the place
 //! its log stands at. Each event lands by one write of the store under the
@@ -42,8 +42,8 @@ use crate::{
         replication_event::Event as Sent,
     },
     replication::{Log, Lost},
-    store::{Kinds, LeasesStore, LoadSink, MemoryStore, Position},
-    view::fingerprint,
+    store::{Cut, Kinds, LeasesStore, LoadSample, LoadSink, MemoryStore, Position, WorkerRow},
+    view::{fingerprint, WorkerId},
 };
 
 /// Why a standby stopped applying its leader's stream.
@@ -82,22 +82,24 @@ impl Follower {
         }
     }
 
-    /// The store restored from the leader's complete snapshot, read at
-    /// `now`: the place the standby stands at after it. [`Halt::Lost`]
-    /// where the log refuses the snapshot's place (a history that is not
-    /// ahead of its own), the store as it was.
-    pub(crate) fn restore(
-        &self,
-        snapshot: &proto::Snapshot,
-        now: Instant,
-    ) -> Result<Position, Halt> {
-        let cut = worker_wire::told_cut(snapshot, now).map_err(Halt::Unread)?;
-        let at = cut.at;
-        if self.store.restore_from(cut) {
-            Ok(at)
-        } else {
-            Err(Halt::Lost(at))
+    /// The place a standby that must be restored names in its hello: its
+    /// head's number under no term. No log holds a position that names no
+    /// term, so its leader answers the snapshot, whatever the leader's log
+    /// holds at that number. The number is past zero: zero under no term
+    /// is the place of a standby that applied nothing.
+    pub(crate) fn asking(&self) -> Position {
+        Position {
+            seq: self.log.head(Kinds::All).seq.max(1),
+            term: 0,
         }
+    }
+
+    /// The store restored from the leader's snapshot, its parts staged
+    /// whole ([`Staged`]): the standby stands at the cut's place after it.
+    /// `false` where the log refuses that place (a history that is not
+    /// ahead of its own), the store as it was.
+    pub(crate) fn restore(&self, cut: Cut) -> bool {
+        self.store.restore_from(cut)
     }
 
     /// One batch applied at `now`: each event at its position under the
@@ -106,8 +108,18 @@ impl Follower {
     /// land stops the batch; the events before it stand, each at its place.
     /// A standby that applied nothing takes its leader's first position, a
     /// term's start, wherever the leader's run drew it ([`Log::join`]); no
-    /// other event lands on it.
+    /// other event lands on it. A batch that carries a part of a snapshot
+    /// is refused by its path: a part is read inside the snapshot its
+    /// leader announced alone ([`Staged::take`]).
     pub(crate) fn apply(&self, batch: &proto::ReplicationBatch, now: Instant) -> Result<(), Halt> {
+        // No leader of this build sends a part with no word before it: the
+        // wire's guard alone.
+        if batch.snapshot.is_some() {
+            return Err(Halt::Unread(Refused {
+                path: "batch.snapshot",
+                why: "a part of a snapshot the leader did not announce",
+            }));
+        }
         for (event, seq) in batch.events.iter().zip(batch.first_seq..) {
             let at = Position {
                 seq,
@@ -155,6 +167,71 @@ impl Follower {
     }
 }
 
+/// A leader's snapshot as its parts arrive: the rows and the load rows,
+/// held apart from the store until the last part. The store is restored
+/// from all of them or from none: a stream that ends inside a snapshot
+/// leaves it as it was.
+#[derive(Debug, Default)]
+pub(crate) struct Staged {
+    /// The snapshot's place and membership epoch, as its first part said
+    /// them: every part says the same.
+    at: Option<(Position, u64)>,
+    /// The next part's number.
+    part: u32,
+    rows: Vec<WorkerRow>,
+    loads: Vec<(WorkerId, u16, LoadSample)>,
+}
+
+impl Staged {
+    /// One batch of the stream inside a snapshot, read at `now`: the
+    /// snapshot's next part, staged, and at the last part the cut the
+    /// store is restored from. A part is its snapshot's next where its
+    /// batch carries no event and says the place and the epoch the first
+    /// part said, under the next number. Anything else is refused by its
+    /// path, and the stream is left with nothing restored.
+    pub(crate) fn take(
+        &mut self,
+        batch: &proto::ReplicationBatch,
+        now: Instant,
+    ) -> Result<Option<Cut>, Refused> {
+        let refused = |path, why| Err(Refused { path, why });
+        let Some(part) = &batch.snapshot else {
+            return refused(
+                "batch.snapshot",
+                "no part of the snapshot the leader announced",
+            );
+        };
+        if !batch.events.is_empty() {
+            return refused("batch.events", "events in a part of a snapshot");
+        }
+        // A part says its snapshot's place as a heartbeat says the head.
+        let Some(seq) = batch.first_seq.checked_sub(1) else {
+            return refused("batch.first_seq", "a snapshot at no place");
+        };
+        let at = Position {
+            seq,
+            term: batch.term,
+        };
+        if *self.at.get_or_insert((at, part.membership_epoch)) != (at, part.membership_epoch) {
+            return refused(
+                "batch.first_seq",
+                "a part at another place than its snapshot's",
+            );
+        }
+        if part.part != self.part {
+            return refused("batch.snapshot.part", "a part out of its snapshot's order");
+        }
+        self.part += 1;
+        worker_wire::told_part(part, now, &mut self.rows, &mut self.loads)?;
+        Ok(part.last.then(|| Cut {
+            at,
+            epoch: part.membership_epoch,
+            rows: std::mem::take(&mut self.rows),
+            loads: std::mem::take(&mut self.loads),
+        }))
+    }
+}
+
 /// How far behind its leader a standby is, as its last applied frame says
 /// it: the loop writes it, and `Leader` and the readiness read it.
 #[derive(Debug)]
@@ -167,6 +244,8 @@ pub(crate) struct Lag {
     frame: AtomicU64,
     /// Whether the serve runs a standby that writes this lag.
     follows: AtomicBool,
+    /// How many times the standby asked its leader to be restored.
+    asked: AtomicU64,
     /// The turns a reader may have missed, which looks again at each: a
     /// frame written after no frame, or when the frame before was as old
     /// as the bound by the clock of the write, and a frame forgotten.
@@ -180,6 +259,7 @@ impl Lag {
             within,
             frame: AtomicU64::new(0),
             follows: AtomicBool::new(false),
+            asked: AtomicU64::new(0),
             turns: watch::Sender::new(0),
         }
     }
@@ -258,6 +338,17 @@ impl Lag {
         self.within
     }
 
+    /// The standby asks its leader to be restored: an event of the
+    /// leader's did not land on it.
+    pub(crate) fn asked(&self) {
+        self.asked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many times this replica asked to be restored since its start.
+    pub(crate) fn asks(&self) -> u64 {
+        self.asked.load(Ordering::Relaxed)
+    }
+
     /// The serve runs a standby from here: this replica is ready as a
     /// follower only while it is synced.
     pub(crate) fn follow(&self) {
@@ -301,13 +392,9 @@ const MOST: Duration = Duration::from_secs(5);
 /// end of its connection, sends nothing and ends nothing.
 const QUIET_BEATS: u32 = 3;
 
-/// How many times a stream's quiet bound the leader's snapshot may take to
-/// arrive whole.
-const SNAPSHOT_QUIETS: u32 = 10;
-
-/// How often a standby asks its leader for a snapshot at most. A cut holds
-/// the leader's writers for its length and nothing else paces the call: a
-/// standby that keeps losing its place asks one a beat.
+/// How often a standby asks its leader to be restored at most. A cut holds
+/// the leader's writers for its length and nothing else paces the ask: a
+/// standby on which its leader's events keep not landing asks one a beat.
 const RESYNC: Duration = BEAT;
 
 /// The pace of a standby's snapshots: when the next may be asked.
@@ -403,7 +490,8 @@ async fn pause(steps: &mut watch::Receiver<Standing>, lease: bool, wait: Duratio
 /// What the loop does after a stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Next {
-    /// The standby was restored: it joins again at once, at its new place.
+    /// An event did not land: the next stream opens at once, and asks to
+    /// be restored.
     Join,
     /// The lease no longer names the stream's leader: the loop reads it
     /// again at once.
@@ -437,8 +525,13 @@ pub(crate) struct Standby {
     /// How long a stream may bring no frame: [`QUIET_BEATS`] of the
     /// leader's heartbeats.
     quiet: Duration,
-    /// When this replica may ask its next snapshot ([`RESYNC`]).
+    /// When this replica may next ask to be restored ([`RESYNC`]).
     pace: Pace,
+    /// Whether the next hello asks to be restored: an event of the leader's
+    /// did not land, and no snapshot was restored since.
+    asks: AtomicBool,
+    /// Whether no event landed since the last restore.
+    fresh: AtomicBool,
 }
 
 impl Standby {
@@ -450,6 +543,8 @@ impl Standby {
             port,
             quiet: QUIET_BEATS * BEAT,
             pace: Pace::new(RESYNC),
+            asks: AtomicBool::new(false),
+            fresh: AtomicBool::new(false),
         }
     }
 
@@ -463,7 +558,6 @@ impl Standby {
     /// frame of the leader it follows next ([`Lag::forget`]).
     pub(crate) async fn run(self, mut stop: watch::Receiver<bool>) {
         let mut steps = self.shared.standing.clone();
-        let mut joined = false;
         let mut streak = Streak::default();
         let mut led = self.shared.fence.term();
         loop {
@@ -481,7 +575,7 @@ impl Standby {
             } else {
                 let applied = AtomicBool::new(false);
                 let ended = tokio::select! {
-                    ended = self.stream(&leader, joined, &applied) => ended,
+                    ended = self.stream(&leader, &applied) => ended,
                     next = self.turned(&mut steps, &leader) => Ended {
                         next,
                         applied: applied.load(Ordering::Relaxed),
@@ -500,7 +594,6 @@ impl Standby {
                 }
                 ended.next
             };
-            joined = next == Next::Join;
             let wait = match next {
                 Next::Join | Next::Turn => continue,
                 Next::Lease => MOST,
@@ -596,19 +689,43 @@ impl Ended {
             why: None,
         }
     }
+
+    /// A stream whose snapshot this replica's log refused, at `at`: the
+    /// lease is read again.
+    fn unfollowed(at: Position, applied: bool) -> Self {
+        Self {
+            next: Next::Lease,
+            applied,
+            why: Some(format!(
+                "the leader's snapshot stands at {} under term {}, which this replica's log does not follow",
+                at.seq, at.term
+            )),
+        }
+    }
 }
 
 impl Standby {
     /// One stream's life against `leader`: the dial, the hello at the log's
     /// head, then every batch applied and acknowledged until the stream
-    /// ends. Where the leader's log does not continue this one (a
-    /// `resync_required` batch, an event that does not land) the standby is
-    /// restored from the leader's complete snapshot and joins again;
-    /// `joined` says this stream is such a join, and `applied` is set once
-    /// a frame of it landed: the loop reads it where it leaves the stream
-    /// itself. A leader that opens no stream, or sends no frame, within
-    /// the quiet bound is left and asked again.
-    async fn stream(&self, leader: &Leader, joined: bool, applied: &AtomicBool) -> Ended {
+    /// ends. Where the leader's log does not continue this one the leader
+    /// says so (`resync_required`) and sends its snapshot on the same
+    /// stream, in parts: they are staged, the store is restored at the last
+    /// one, whole, and the stream goes on from the snapshot's place. A
+    /// stream that ends inside a snapshot leaves the store as it was.
+    ///
+    /// An event that does not land ends the stream, and the next one asks
+    /// to be restored ([`Standby::lost`]). `applied` is set once a frame of
+    /// the stream landed: the loop reads it where it leaves the stream
+    /// itself. A leader that opens no stream, or sends no frame, within the
+    /// quiet bound is left and asked again.
+    async fn stream(&self, leader: &Leader, applied: &AtomicBool) -> Ended {
+        let asks = self.asks.load(Ordering::Relaxed);
+        if asks {
+            self.pace.wait().await;
+            if self.shared.fence.leader_term(Instant::now()).is_some() {
+                return Ended::leads(false);
+            }
+        }
         let dialed = match Channel::from_shared(self.target(&leader.address)) {
             Ok(endpoint) => endpoint
                 .connect_timeout(DIAL)
@@ -622,11 +739,19 @@ impl Standby {
             Ok(channel) => PolicyControllerClient::new(channel),
             Err(error) => return Ended::waits(false, format!("the dial failed: {error}")),
         };
-        let place = self.follower.place();
+        let place = if asks {
+            self.follower.asking()
+        } else {
+            self.follower.place()
+        };
         let hello = proto::ReplicaHello {
             replica_id: self.shared.controller_id.clone(),
             last_applied_seq: place.seq,
-            term_seen: leader.term,
+            // The floor: the lease's term as this replica reads it, never
+            // under the term its store stands under. A hello that asks to
+            // be restored names its place under no term, and states the
+            // floor all the same.
+            term_seen: leader.term.max(self.shared.store.term()),
             max_backlog: 0,
             last_applied_term: place.term,
         };
@@ -639,6 +764,8 @@ impl Standby {
             Ok(Err(status)) => return Ended::refused(&status, false),
             Err(_quiet) => return Ended::waits(false, self.silent("opened no stream")),
         };
+        // The leader's snapshot while its parts arrive.
+        let mut staged: Option<Staged> = None;
         loop {
             let landed = applied.load(Ordering::Relaxed);
             let batch = match timeout(self.quiet, batches.message()).await {
@@ -650,93 +777,87 @@ impl Standby {
                 Err(_quiet) => return Ended::waits(landed, self.silent("sent no frame")),
             };
             let now = Instant::now();
-            let lost = batch.resync_required
-                || match self.follower.apply(&batch, now) {
-                    Ok(()) => false,
-                    Err(Halt::Lost(_)) => true,
-                    Err(Halt::Unread(refused)) => return Ended::waits(landed, unread(refused)),
-                };
-            if lost {
-                return self.restored(&mut client, landed, joined).await;
+            if batch.resync_required {
+                // The leader's snapshot follows: a second word starts its
+                // staging over.
+                staged = Some(Staged::default());
+                continue;
             }
-            if !landed {
-                let place = self.follower.place();
+            if let Some(staging) = staged.as_mut() {
+                let cut = match staging.take(&batch, now) {
+                    Ok(Some(cut)) => cut,
+                    Ok(None) => continue,
+                    Err(refused) => return Ended::waits(landed, unread(refused)),
+                };
+                staged = None;
+                let (at, rows) = (cut.at, cut.rows.len());
+                if !self.follower.restore(cut) {
+                    return Ended::unfollowed(at, landed);
+                }
                 info!(
                     controller_id = %self.shared.controller_id,
-                    leader = %leader.controller_id,
-                    seq = place.seq,
-                    term = place.term,
-                    "following the leader's log"
+                    seq = at.seq,
+                    term = at.term,
+                    rows,
+                    "restored from the leader's snapshot"
                 );
+                self.asks.store(false, Ordering::Relaxed);
+                self.fresh.store(true, Ordering::Relaxed);
+            } else {
+                match self.follower.apply(&batch, now) {
+                    Ok(()) => {}
+                    Err(Halt::Lost(at)) => return self.lost(leader, at, landed),
+                    Err(Halt::Unread(refused)) => return Ended::waits(landed, unread(refused)),
+                }
+                if !landed {
+                    let place = self.follower.place();
+                    info!(
+                        controller_id = %self.shared.controller_id,
+                        leader = %leader.controller_id,
+                        seq = place.seq,
+                        term = place.term,
+                        "following the leader's log"
+                    );
+                }
+                if !batch.events.is_empty() {
+                    self.fresh.store(false, Ordering::Relaxed);
+                    // An acknowledgement names the place reached: one the
+                    // channel has no room for is covered by the next.
+                    let seq = self.follower.place().seq;
+                    let _ = frames.try_send(frame(Frame::Ack(proto::ReplicationAck { seq })));
+                }
             }
             applied.store(true, Ordering::Relaxed);
             self.shared.lag.applied(now);
-            if !batch.events.is_empty() {
-                // An acknowledgement names the place reached: one the
-                // channel has no room for is covered by the next.
-                let seq = self.follower.place().seq;
-                let _ = frames.try_send(frame(Frame::Ack(proto::ReplicationAck { seq })));
-            }
         }
     }
 
-    /// The standby restored from its leader's complete snapshot, after
-    /// which it joins again at the snapshot's place. A join that needs a
-    /// second snapshot before it applied a frame waits like a stream that
-    /// applied nothing. A snapshot is asked a beat after the last at the
-    /// soonest ([`RESYNC`]), the stream left standing meanwhile. No snapshot
-    /// is taken by a replica that leads by now, and the log refuses one that
-    /// is not ahead of its own history.
-    async fn restored(
-        &self,
-        client: &mut PolicyControllerClient<Channel>,
-        applied: bool,
-        joined: bool,
-    ) -> Ended {
-        self.pace.wait().await;
-        if self.shared.fence.leader_term(Instant::now()).is_some() {
-            return Ended::leads(applied);
+    /// An event of `leader`'s did not land at `at`: the standby's tables or
+    /// its log refused it, though the leader's log may hold its place. The
+    /// next stream asks to be restored ([`Follower::asking`]), and the ask
+    /// is counted and said here: the leader cannot tell it from a head
+    /// under no term. The next stream opens at once, unless this event
+    /// follows a restore with no event landed between: two in a row are
+    /// two restores a streak's wait apart, never a loop at the stream's
+    /// speed.
+    fn lost(&self, leader: &Leader, at: Position, landed: bool) -> Ended {
+        self.asks.store(true, Ordering::Relaxed);
+        self.shared.lag.asked();
+        warn!(
+            controller_id = %self.shared.controller_id,
+            leader = %leader.controller_id,
+            seq = at.seq,
+            term = at.term,
+            "an event of the leader's did not land on this standby; it asks to be restored from a snapshot"
+        );
+        if self.fresh.load(Ordering::Relaxed) {
+            let why = "restored twice with no event landed between".to_owned();
+            return Ended::waits(false, why);
         }
-        let request = self.stated(proto::SnapshotRequest::default());
-        let bound = self.quiet.saturating_mul(SNAPSHOT_QUIETS);
-        let snapshot = match timeout(bound, client.get_snapshot(request)).await {
-            Ok(Ok(snapshot)) => snapshot.into_inner(),
-            Ok(Err(status)) => return Ended::refused(&status, applied),
-            Err(_quiet) => {
-                let why = format!("the leader's snapshot did not arrive in {bound:?}");
-                return Ended::waits(applied, why);
-            }
-        };
-        let now = Instant::now();
-        match self.follower.restore(&snapshot, now) {
-            Ok(place) => {
-                self.shared.lag.applied(now);
-                info!(
-                    controller_id = %self.shared.controller_id,
-                    seq = place.seq,
-                    term = place.term,
-                    rows = snapshot.workers.len(),
-                    "restored from the leader's snapshot"
-                );
-                if joined && !applied {
-                    let why = "restored twice with no frame between".to_owned();
-                    return Ended::waits(false, why);
-                }
-                Ended {
-                    next: Next::Join,
-                    applied: true,
-                    why: None,
-                }
-            }
-            Err(Halt::Lost(at)) => Ended {
-                next: Next::Lease,
-                applied,
-                why: Some(format!(
-                    "the leader's snapshot stands at {} under term {}, which this replica's log does not follow",
-                    at.seq, at.term
-                )),
-            },
-            Err(Halt::Unread(refused)) => Ended::waits(applied, unread(refused)),
+        Ended {
+            next: Next::Join,
+            applied: landed,
+            why: None,
         }
     }
 }
@@ -755,7 +876,7 @@ mod tests {
     use std::{future::pending, io, net::SocketAddr};
 
     use parking_lot::Mutex;
-    use tokio::{net::TcpListener, sync::oneshot, task::JoinSet};
+    use tokio::{net::TcpListener, task::JoinSet};
     use tonic::{
         transport::{server::TcpIncoming, Error as Transport, Server},
         Response, Streaming,
@@ -765,7 +886,7 @@ mod tests {
     use crate::{
         controller::{
             election::LeasePlace,
-            replication::{journaled, Replication},
+            replication::{journaled, journaled_from, parts, Replication},
         },
         elector::{ElectionSettings, Elector, Tick},
         proto::policy_controller_server::{PolicyController, PolicyControllerServer},
@@ -839,6 +960,7 @@ mod tests {
             term: entry.at.term,
             events: vec![worker_wire::replication(entry, now)],
             resync_required: false,
+            snapshot: None,
         }
     }
 
@@ -950,18 +1072,31 @@ mod tests {
         assert!(told(&led).len() > 10, "{:?}", told(&led));
     }
 
-    /// The leader's complete snapshot at `at`, as its replication scope
-    /// serves it under the term its store wrote.
-    fn snapshot((store, log): &Replica, at: Instant) -> proto::Snapshot {
+    /// The parts of the leader's snapshot at `at`, as its replication scope
+    /// sends them under the term its store wrote.
+    fn snapshot((store, log): &Replica, at: Instant) -> Vec<proto::ReplicationBatch> {
         let mut elector =
             Elector::alone("controller-0@10.0.0.7:30100", ElectionSettings::default())
                 .expect("the default settings are in order");
         let Ok(Tick::Acquired { term }) = elector.tick(at) else {
             panic!("a free lease is taken at the first tick");
         };
-        Replication::new(Arc::clone(store), Arc::clone(log), elector.fence())
-            .snapshot(term, "controller-0", at)
-            .expect("a snapshot")
+        let cut = Replication::new(Arc::clone(store), Arc::clone(log), elector.fence())
+            .cut(term)
+            .expect("a cut");
+        parts(cut, at)
+    }
+
+    /// The cut a standby stages from the `parts` of a snapshot, read at
+    /// `at`.
+    fn staged(parts: &[proto::ReplicationBatch], at: Instant) -> Cut {
+        let mut staged = Staged::default();
+        let mut cut = None;
+        for part in parts {
+            assert!(cut.is_none(), "a part after the last");
+            cut = staged.take(part, at).expect("the snapshot's next part");
+        }
+        cut.expect("the last part")
     }
 
     #[test]
@@ -972,20 +1107,118 @@ mod tests {
         // The standby held a row of its own, under no term.
         standby.upsert(facts("http://stale:8000", 1));
         let first = snapshot(&leader, at);
-        let place = follower.restore(&first, at);
-        assert_eq!(place, Ok(leader.1.head(Kinds::All)));
+        assert!(follower.restore(staged(&first, at)));
+        assert_eq!(follower.place(), leader.1.head(Kinds::All));
         assert_eq!(held(&standby), held(&leader.0));
         rest(&leader.0, at);
         follow(&follower, &leader.1, at);
         assert_eq!(held(&standby), held(&leader.0));
         // A snapshot of the term it followed before is a history it left:
         // refused, the store as it was.
-        let left = Position {
-            seq: first.replication_seq,
-            term: first.replication_term,
-        };
-        assert_eq!(follower.restore(&first, at), Err(Halt::Lost(left)));
+        let place = follower.place();
+        assert!(!follower.restore(staged(&first, at)));
+        assert_eq!(follower.place(), place);
         assert_eq!(held(&standby), held(&leader.0));
+    }
+
+    #[test]
+    fn a_batch_that_is_not_its_snapshots_next_part_is_refused_by_its_path() {
+        let (leader, ..) = pair();
+        let at = Instant::now();
+        first(&leader.0, at);
+        let parts = snapshot(&leader, at);
+        assert_eq!(parts.len(), 2, "the rows' part and the load rows'");
+        let events = batch(&entries(&leader.1, start(&leader.1)).remove(0), at);
+        let next = parts[1].clone();
+        let part = next.snapshot.clone().expect("a part");
+        // Each after the snapshot's first part, which is staged.
+        let refused = |batch: proto::ReplicationBatch| {
+            let mut staged = Staged::default();
+            assert!(matches!(staged.take(&parts[0], at), Ok(None)));
+            let refused = staged.take(&batch, at).expect_err("not the next part");
+            (refused.path, refused.why)
+        };
+        let none = (
+            "batch.snapshot",
+            "no part of the snapshot the leader announced",
+        );
+        assert_eq!(refused(events.clone()), none);
+        assert_eq!(refused(proto::ReplicationBatch::default()), none);
+        let carried = proto::ReplicationBatch {
+            events: events.events,
+            ..next.clone()
+        };
+        let why = "events in a part of a snapshot";
+        assert_eq!(refused(carried), ("batch.events", why));
+        let why = "a part out of its snapshot's order";
+        assert_eq!(refused(parts[0].clone()), ("batch.snapshot.part", why));
+        let elsewhere = [
+            proto::ReplicationBatch {
+                first_seq: next.first_seq + 1,
+                ..next.clone()
+            },
+            proto::ReplicationBatch {
+                term: next.term + 1,
+                ..next.clone()
+            },
+            proto::ReplicationBatch {
+                snapshot: Some(proto::ReplicationSnapshot {
+                    membership_epoch: part.membership_epoch + 1,
+                    ..part
+                }),
+                ..next.clone()
+            },
+        ];
+        let why = "a part at another place than its snapshot's";
+        for batch in elsewhere {
+            assert_eq!(refused(batch), ("batch.first_seq", why));
+        }
+        // A first part that says position zero stands at no place.
+        let nowhere = proto::ReplicationBatch {
+            first_seq: 0,
+            ..parts[0].clone()
+        };
+        let refused = Staged::default().take(&nowhere, at).expect_err("no place");
+        assert_eq!(
+            (refused.path, refused.why),
+            ("batch.first_seq", "a snapshot at no place")
+        );
+    }
+
+    /// A part the leader did not announce is no heartbeat and no batch of
+    /// events: the applier refuses it by its path with nothing applied,
+    /// the place and the tables as they were.
+    #[test]
+    fn a_part_the_leader_did_not_announce_is_refused_by_its_path() {
+        let (leader, follower, (standby, _followed)) = pair();
+        let at = Instant::now();
+        first(&leader.0, at);
+        let parts = snapshot(&leader, at);
+        let (place, before) = (follower.place(), held(&standby));
+        let why = "a part of a snapshot the leader did not announce";
+        for part in &parts {
+            let Err(Halt::Unread(refused)) = follower.apply(part, at) else {
+                panic!("a part with no word before it was applied");
+            };
+            assert_eq!((refused.path, refused.why), ("batch.snapshot", why));
+        }
+        assert_eq!((follower.place(), held(&standby)), (place, before));
+    }
+
+    #[test]
+    fn a_standby_that_asks_names_its_heads_number_past_zero_under_no_term() {
+        // A log whose places start at the start: its head is zero under no
+        // term, the place of a standby that applied nothing and no ask.
+        let (store, feed) = journaled_from(&LeasePlace::File("shared".into()), 0);
+        let follower = Follower::new(store, Arc::clone(&feed.log));
+        assert_eq!(follower.place(), Position::default());
+        assert_eq!(follower.asking(), Position { seq: 1, term: 0 });
+        // Past it, the head's own number.
+        let leader = led();
+        follow(&follower, &leader.1, Instant::now());
+        let head = follower.place();
+        assert!(head.seq > 1 && head.term == 1, "{head:?}");
+        assert_eq!(follower.asking(), Position { term: 0, ..head });
     }
 
     #[test]
@@ -1217,7 +1450,7 @@ mod tests {
                 Status::unavailable("not yet written under term 4"),
                 Next::Wait,
             ),
-            (Status::resource_exhausted("above one message"), Next::Wait),
+            (Status::resource_exhausted("over its budget"), Next::Wait),
             (Status::unauthenticated("no principal"), Next::Wait),
             (Status::failed_precondition("not the leader"), Next::Lease),
             (Status::aborted("the fence closed"), Next::Lease),
@@ -1264,7 +1497,7 @@ mod tests {
     /// A measurement, run by name with `--ignored --nocapture` in the
     /// release profile: what the applier costs an event (a load row, a
     /// status change) in batches of 256 as the leader sends them, and what a
-    /// restore from the complete snapshot costs at 512 and 4,096 workers of
+    /// restore from the snapshot's parts costs at 512 and 4,096 workers of
     /// eight load rows each. The wire's own decode is the transport's and
     /// is not in it.
     #[test]
@@ -1285,20 +1518,22 @@ mod tests {
                         .record(*id, rank, running(3), at, LoadSource::Stream);
                 }
             }
-            let snapshot = snapshot(&leader, at);
+            let parts = snapshot(&leader, at);
             let mut micros: Vec<u128> = (0..21)
                 .map(|_| {
                     let began = Instant::now();
-                    follower.restore(&snapshot, at).expect("a restore");
+                    assert!(follower.restore(staged(&parts, at)), "a restore");
                     began.elapsed().as_micros()
                 })
                 .collect();
             micros.sort_unstable();
+            let told = parts.iter().filter_map(|part| part.snapshot.as_ref());
+            let load_rows: usize = told.map(|part| part.loads.len()).sum();
+            let bytes: usize = parts.iter().map(prost::Message::encoded_len).sum();
             writeln!(
                 out,
-                "RESTORE workers={workers} load_rows={} bytes={} median_us={}",
-                snapshot.loads.len(),
-                prost::Message::encoded_len(&snapshot),
+                "RESTORE workers={workers} load_rows={load_rows} parts={} bytes={bytes} median_us={}",
+                parts.len(),
                 micros[10]
             )
             .expect("stdout");
@@ -1335,6 +1570,7 @@ mod tests {
                             .map(|entry| worker_wire::replication(entry, at))
                             .collect(),
                         resync_required: false,
+                        snapshot: None,
                     })
                     .collect();
                 let began = Instant::now();
@@ -1381,19 +1617,15 @@ mod tests {
         }
     }
 
-    /// A snapshot call, for the case to answer or to leave waiting.
-    type Asked = oneshot::Sender<Result<proto::Snapshot, Status>>;
-
     /// The stream of a call the scripted leader does not serve.
     type Unscripted<T> = ReceiverStream<Result<T, Status>>;
 
     /// A leader that says what the case tells it: each stream a standby
-    /// opens and each snapshot it asks for is handed to the case, with the
-    /// name the call stated. While `mute`, it opens no stream.
+    /// opens is handed to the case, with the name the call stated. While
+    /// `mute`, it opens no stream.
     #[derive(Clone)]
     struct Scripted {
         streams: mpsc::UnboundedSender<Opened>,
-        snapshots: mpsc::UnboundedSender<Asked>,
         names: Arc<Mutex<Vec<String>>>,
         mute: Arc<AtomicBool>,
     }
@@ -1436,19 +1668,6 @@ mod tests {
                     let _ = self.streams.send(Opened { frames, batches });
                     Ok(Response::new(ReceiverStream::new(sent)))
                 }
-
-                async fn get_snapshot(
-                    &self,
-                    request: Request<proto::SnapshotRequest>,
-                ) -> Result<Response<proto::Snapshot>, Status> {
-                    self.named(&request);
-                    let (answer, asked) = oneshot::channel();
-                    let _ = self.snapshots.send(answer);
-                    let answered = asked.await;
-                    answered
-                        .unwrap_or_else(|_| Err(Status::unavailable("the case ended")))
-                        .map(Response::new)
-                }
             }
         };
     }
@@ -1462,6 +1681,7 @@ mod tests {
         register_worker(proto::RegisterWorkerRequest) -> proto::WorkerEvent;
         patch_worker(proto::PatchWorkerRequest) -> proto::WorkerEvent;
         deregister_worker(proto::DeregisterWorkerRequest) -> proto::WorkerEvent;
+        get_snapshot(proto::SnapshotRequest) -> proto::Snapshot;
         explain(proto::ExplainRequest) -> proto::DecisionRecord;
         apply_policy_spec(proto::ApplyRequest) -> proto::ApplyResult;
         get_policy_spec(proto::GetPolicySpecRequest) -> proto::PolicySpecDocument;
@@ -1474,7 +1694,6 @@ mod tests {
     /// The scripted leader on a loopback port, and what it hands the case.
     struct Bed {
         streams: mpsc::UnboundedReceiver<Opened>,
-        snapshots: mpsc::UnboundedReceiver<Asked>,
         names: Arc<Mutex<Vec<String>>>,
         mute: Arc<AtomicBool>,
         addr: SocketAddr,
@@ -1487,12 +1706,10 @@ mod tests {
             let listener = listener.expect("a loopback port");
             let addr = listener.local_addr().expect("the bound address");
             let (streams, opened) = mpsc::unbounded_channel();
-            let (snapshots, asked) = mpsc::unbounded_channel();
             let names = Arc::new(Mutex::new(Vec::new()));
             let mute = Arc::new(AtomicBool::new(false));
             let leader = Scripted {
                 streams,
-                snapshots,
                 names: Arc::clone(&names),
                 mute: Arc::clone(&mute),
             };
@@ -1504,7 +1721,6 @@ mod tests {
             );
             Self {
                 streams: opened,
-                snapshots: asked,
                 names,
                 mute,
                 addr,
@@ -1517,14 +1733,6 @@ mod tests {
             let opened = timeout(FIVE, self.streams.recv()).await;
             opened
                 .expect("a stream in five seconds")
-                .expect("the leader stands")
-        }
-
-        /// The next snapshot the standby asks for.
-        async fn asked(&mut self) -> Asked {
-            let asked = timeout(FIVE, self.snapshots.recv()).await;
-            asked
-                .expect("a snapshot call in five seconds")
                 .expect("the leader stands")
         }
 
@@ -1613,7 +1821,7 @@ mod tests {
             }
             opened.refuses(Status::aborted("deposed")).await;
         };
-        let (ended, ()) = tokio::join!(standby.stream(&named, false, &applied), script);
+        let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
         assert_eq!((ended.next, ended.applied), (Next::Lease, true));
         assert_eq!(ended.why.as_deref(), Some("Aborted: deposed"));
         assert_eq!(standby.follower.place(), leader.1.head(Kinds::All));
@@ -1650,74 +1858,356 @@ mod tests {
             }
             opened.refuses(Status::aborted("deposed")).await;
         };
-        let (ended, ()) = tokio::join!(standby.stream(&named, false, &applied), script);
+        let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
         assert_eq!((ended.next, ended.applied), (Next::Lease, true));
         assert_eq!(standby.follower.place(), leader.1.head(Kinds::All));
         assert_eq!(start(&standby.shared.feed.log), start(&leader.1));
     }
 
     #[tokio::test]
-    async fn a_resync_is_one_snapshot_and_a_second_with_no_frame_between_waits() {
+    async fn a_resync_is_the_leaders_snapshot_in_parts_on_the_stream_it_holds() {
         let mut bed = Bed::new().await;
         let (_elector, standing, standby) = standing_by(&bed, FIVE);
         let leader = led();
         let now = Instant::now();
-        let cut = snapshot(&leader, now);
-        // Two ways a join is lost: an event that does not land (the
-        // leader's last, past a gap for a standby at the start) and the
-        // leader's word.
-        let last = entries(&leader.1, start(&leader.1)).pop();
-        let gap = batch(&last.expect("the leader wrote"), now);
-        standing.send_replace(bed.holds("leader-1", 1));
-        let named = standby.shared.leader(None);
-        let mut asked = Vec::new();
-        for (joined, lost) in [(false, gap), (true, resync())] {
-            let applied = AtomicBool::new(false);
-            let script = async {
-                let opened = bed.opened().await;
-                opened.says(lost).await;
-                let _ = bed.asked().await.send(Ok(cut.clone()));
-                // The stream stands until the standby leaves it.
-                opened
-            };
-            let (ended, _opened) = tokio::join!(standby.stream(&named, joined, &applied), script);
-            assert_eq!(standby.follower.place(), leader.1.head(Kinds::All));
-            asked.push(standby.pace.due.lock().expect("a snapshot was asked"));
-            if joined {
-                assert_eq!((ended.next, ended.applied), (Next::Wait, false));
-                let why = "restored twice with no frame between";
-                assert_eq!(ended.why.as_deref(), Some(why));
-            } else {
-                assert_eq!((ended.next, ended.applied), (Next::Join, true));
-                let lag = standby.shared.lag.age(Instant::now());
-                assert!(lag.is_some(), "a restore is a frame applied");
-            }
-        }
-        // The second snapshot waited out the beat since the first was asked.
-        assert!(asked[1] >= asked[0] + RESYNC, "{asked:?}");
-        // Every call stated the replica's name: two streams, two snapshots.
-        assert_eq!(*bed.names.lock(), ["standby-0"; 4]);
-    }
-
-    #[tokio::test]
-    async fn a_replica_that_leads_by_now_takes_no_snapshot() {
-        let mut bed = Bed::new().await;
-        let (mut elector, standing, standby) = standing_by(&bed, FIVE);
+        let b = leader.0.upsert(facts("http://b:8000", 1)).id();
+        leader.0.record(b, 0, running(1), now, LoadSource::Stream);
+        let parts = snapshot(&leader, now);
+        assert_eq!(parts.len(), 2, "the rows' part and the load rows'");
+        let place = leader.1.head(Kinds::All);
         standing.send_replace(bed.holds("leader-1", 1));
         let named = standby.shared.leader(None);
         let applied = AtomicBool::new(false);
         let script = async {
-            let opened = bed.opened().await;
-            // The replica takes its own lease while the stream stands.
-            let took = elector.tick(Instant::now());
-            assert!(matches!(took, Ok(Tick::Acquired { .. })), "{took:?}");
+            let mut opened = bed.opened().await;
+            assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+            // The leader's word, then its snapshot, a part a batch.
             opened.says(resync()).await;
+            for part in &parts {
+                opened.says(part.clone()).await;
+            }
+            // The log from the snapshot's place, on the same stream: the
+            // standby applies it there and acknowledges it.
+            leader.0.upsert(facts("http://c:8000", 1));
+            for entry in entries(&leader.1, place) {
+                opened.says(batch(&entry, now)).await;
+                let seq = entry.at.seq;
+                let ack = Frame::Ack(proto::ReplicationAck { seq });
+                assert_eq!(opened.frame().await, Some(ack));
+            }
+            opened.refuses(Status::aborted("deposed")).await;
+        };
+        let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Lease, true));
+        assert_eq!(standby.follower.place(), leader.1.head(Kinds::All));
+        assert_eq!(held(&standby.shared.store), held(&leader.0));
+        let lag = standby.shared.lag.age(Instant::now());
+        assert!(lag.is_some(), "a restore is a frame applied");
+        // One stream and no other call: the snapshot rode it. The leader's
+        // word is no ask of the standby's.
+        assert_eq!(*bed.names.lock(), ["standby-0"]);
+        assert_eq!(standby.shared.lag.asks(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_inside_a_snapshot_leaves_the_store_as_it_was() {
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        // The standby follows a leader's first writes.
+        let leader = led();
+        let now = Instant::now();
+        follow(&standby.follower, &leader.1, now);
+        let place = standby.follower.place();
+        let before = held(&standby.shared.store);
+        // The leader moves on, and its snapshot is two parts.
+        let b = leader.0.upsert(facts("http://b:8000", 1)).id();
+        leader.0.record(b, 0, running(1), now, LoadSource::Stream);
+        let parts = snapshot(&leader, now);
+        assert_eq!(parts.len(), 2);
+        let elsewhere = proto::ReplicationBatch {
+            first_seq: parts[1].first_seq + 1,
+            ..parts[1].clone()
+        };
+        let event = entries(&leader.1, place).remove(0);
+        // After the first part: the stream's end, the same part again, a
+        // part at another place, a batch of events.
+        let cut_short = [
+            ("the stream ends", Err(Status::unavailable("gone"))),
+            ("a part out of its order", Ok(parts[0].clone())),
+            ("a part at another place", Ok(elsewhere)),
+            ("a batch of events", Ok(batch(&event, now))),
+        ];
+        standing.send_replace(bed.holds("leader-1", 1));
+        let named = standby.shared.leader(None);
+        for (what, next) in cut_short {
+            let applied = AtomicBool::new(false);
+            let script = async {
+                let opened = bed.opened().await;
+                opened.says(resync()).await;
+                opened.says(parts[0].clone()).await;
+                let sent = opened.batches.send(next).await;
+                assert!(sent.is_ok(), "the stream stands");
+                opened
+            };
+            let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
+            assert_eq!((ended.next, ended.applied), (Next::Wait, false), "{what}");
+            assert_eq!(standby.follower.place(), place, "{what}");
+            assert_eq!(held(&standby.shared.store), before, "{what}");
+        }
+        // The whole snapshot on the next stream restores it. The word said
+        // again starts the staging over: the parts after it are a
+        // snapshot's from its first.
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let opened = bed.opened().await;
+            opened.says(resync()).await;
+            opened.says(parts[0].clone()).await;
+            opened.says(resync()).await;
+            for part in &parts {
+                opened.says(part.clone()).await;
+            }
+            opened.refuses(Status::aborted("deposed")).await;
+        };
+        let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Lease, true));
+        assert_eq!(held(&standby.shared.store), held(&leader.0));
+    }
+
+    #[tokio::test]
+    async fn an_event_that_does_not_land_asks_a_restore_and_two_in_a_row_wait_a_streak_apart() {
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        let leader = led();
+        let now = Instant::now();
+        follow(&standby.follower, &leader.1, now);
+        let place = standby.follower.place();
+        // The leader's event after the next: past a gap, it does not land.
+        let gap = |leader: &Replica, after: Position| {
+            leader
+                .0
+                .upsert(facts(&format!("http://g{}:8000", after.seq), 1));
+            leader
+                .0
+                .upsert(facts(&format!("http://h{}:8000", after.seq), 1));
+            let past = entries(&leader.1, after).pop().expect("the leader wrote");
+            batch(&past, now)
+        };
+        standing.send_replace(bed.holds("leader-1", 7));
+        let named = standby.shared.leader(None);
+        let hello = |seq, term| {
+            Some(Frame::Hello(proto::ReplicaHello {
+                replica_id: "standby-0".to_owned(),
+                last_applied_seq: seq,
+                term_seen: 7,
+                max_backlog: 0,
+                last_applied_term: term,
+            }))
+        };
+
+        // The first: the stream is left, the ask is counted, and the next
+        // stream opens at once.
+        let lost = gap(&leader, place);
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert_eq!(opened.frame().await, hello(place.seq, place.term));
+            opened.says(lost).await;
             opened
         };
-        let (ended, _opened) = tokio::join!(standby.stream(&named, false, &applied), script);
+        let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Join, false));
+        assert!(ended.why.is_none());
+        assert_eq!(standby.shared.lag.asks(), 1);
+
+        // The next hello asks: its head's number under no term, the term
+        // it saw as it is. The leader answers its snapshot, and the event
+        // after it again does not land: a streak's wait, not a stream.
+        let parts = snapshot(&leader, now);
+        let restored = leader.1.head(Kinds::All);
+        let lost = gap(&leader, restored);
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert_eq!(opened.frame().await, hello(place.seq, 0));
+            opened.says(resync()).await;
+            for part in &parts {
+                opened.says(part.clone()).await;
+            }
+            opened.says(lost).await;
+            opened
+        };
+        let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Wait, false));
+        let why = "restored twice with no event landed between";
+        assert_eq!(ended.why.as_deref(), Some(why));
+        assert_eq!(standby.follower.place(), restored);
+        assert_eq!(standby.shared.lag.asks(), 2);
+        let first = standby.pace.due.lock().expect("a restore was asked");
+
+        // It asks again, a beat after its last ask at the soonest.
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert_eq!(opened.frame().await, hello(restored.seq, 0));
+            opened.refuses(Status::aborted("deposed")).await;
+        };
+        let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Lease, false));
+        let second = standby.pace.due.lock().expect("a restore was asked");
+        assert!(second >= first + RESYNC, "{first:?} then {second:?}");
+        // A restore, an event that lands, then one that does not: the pair
+        // is over, and the next stream opens at once.
+        let parts = snapshot(&leader, now);
+        let restored = leader.1.head(Kinds::All);
+        leader.0.upsert(facts("http://landed:8000", 1));
+        let lands = entries(&leader.1, restored).remove(0);
+        let lost = gap(&leader, lands.at);
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+            opened.says(resync()).await;
+            for part in &parts {
+                opened.says(part.clone()).await;
+            }
+            opened.says(batch(&lands, now)).await;
+            opened.says(lost).await;
+            opened
+        };
+        let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Join, true));
+        assert_eq!(standby.follower.place(), lands.at);
+        assert_eq!(standby.shared.lag.asks(), 3);
+        assert_eq!(*bed.names.lock(), ["standby-0"; 4]);
+    }
+
+    #[tokio::test]
+    async fn an_ask_states_the_floor_its_place_no_longer_names() {
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        // The standby followed a leader into term 9, and the lease it reads
+        // names a leader of term 7.
+        let leader = led();
+        leader.0.set_term(9);
+        follow(&standby.follower, &leader.1, Instant::now());
+        let place = standby.follower.place();
+        assert_eq!(place.term, 9);
+        standing.send_replace(bed.holds("leader-1", 7));
+        let named = standby.shared.leader(None);
+        standby.asks.store(true, Ordering::Relaxed);
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            let hello = proto::ReplicaHello {
+                replica_id: "standby-0".to_owned(),
+                last_applied_seq: place.seq,
+                term_seen: 9,
+                max_backlog: 0,
+                last_applied_term: 0,
+            };
+            assert_eq!(opened.frame().await, Some(Frame::Hello(hello)));
+            opened.refuses(Status::failed_precondition("deposed")).await;
+        };
+        let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Lease, false));
+    }
+
+    #[tokio::test]
+    async fn a_restore_ends_the_ask_and_the_next_hello_names_the_place_restored() {
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        let leader = led();
+        let now = Instant::now();
+        let parts = snapshot(&leader, now);
+        let restored = leader.1.head(Kinds::All);
+        standing.send_replace(bed.holds("leader-1", 1));
+        let named = standby.shared.leader(None);
+        let hello = |place: Position| {
+            Some(Frame::Hello(proto::ReplicaHello {
+                replica_id: "standby-0".to_owned(),
+                last_applied_seq: place.seq,
+                term_seen: 1,
+                max_backlog: 0,
+                last_applied_term: place.term,
+            }))
+        };
+        // An event did not land: the hello asks, and the snapshot answers.
+        standby.asks.store(true, Ordering::Relaxed);
+        let asking = standby.follower.asking();
+        assert!(asking.seq > 0 && asking.term == 0, "{asking:?}");
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert_eq!(opened.frame().await, hello(asking));
+            opened.says(resync()).await;
+            for part in &parts {
+                opened.says(part.clone()).await;
+            }
+            opened.refuses(Status::unavailable("gone")).await;
+        };
+        let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Wait, true));
+        // Restored, it names its place under its term again.
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert_eq!(opened.frame().await, hello(restored));
+            opened.refuses(Status::aborted("deposed")).await;
+        };
+        let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Lease, false));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_the_log_does_not_follow_is_left_and_the_lease_read_again() {
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        // The standby followed a leader into term 9.
+        let leader = led();
+        leader.0.set_term(9);
+        let now = Instant::now();
+        follow(&standby.follower, &leader.1, now);
+        let place = standby.follower.place();
+        let before = held(&standby.shared.store);
+        // A replica that still believes it leads term 1 restores it.
+        let parts = snapshot(&led(), now);
+        standing.send_replace(bed.holds("leader-1", 9));
+        let named = standby.shared.leader(None);
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let opened = bed.opened().await;
+            opened.says(resync()).await;
+            for part in &parts {
+                opened.says(part.clone()).await;
+            }
+            opened
+        };
+        let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Lease, false));
+        let why = ended.why.expect("a reason");
+        assert!(
+            why.ends_with("which this replica's log does not follow"),
+            "{why}"
+        );
+        assert_eq!(standby.follower.place(), place);
+        assert_eq!(held(&standby.shared.store), before);
+    }
+
+    #[tokio::test]
+    async fn a_replica_that_leads_by_now_asks_no_restore() {
+        let mut bed = Bed::new().await;
+        let (mut elector, standing, standby) = standing_by(&bed, FIVE);
+        standing.send_replace(bed.holds("leader-1", 1));
+        let named = standby.shared.leader(None);
+        // An event did not land, and the replica took its own lease since.
+        standby.asks.store(true, Ordering::Relaxed);
+        let took = elector.tick(Instant::now());
+        assert!(matches!(took, Ok(Tick::Acquired { .. })), "{took:?}");
+        let applied = AtomicBool::new(false);
+        let ended = standby.stream(&named, &applied).await;
         assert_eq!((ended.next, ended.applied), (Next::Lease, false));
         assert!(ended.why.is_none());
-        assert!(bed.snapshots.try_recv().is_err(), "no snapshot was asked");
+        assert!(bed.streams.try_recv().is_err(), "no stream was opened");
     }
 
     #[tokio::test]
@@ -1841,29 +2331,29 @@ mod tests {
             opened.says(proto::ReplicationBatch::default()).await;
             opened
         };
-        let left = async { tokio::join!(standby.stream(&named, false, &applied), script) };
+        let left = async { tokio::join!(standby.stream(&named, &applied), script) };
         let (ended, opened) = timeout(FIVE, left).await.expect("the stream is left");
         assert_eq!((ended.next, ended.applied), (Next::Wait, true));
         let why = "the leader sent no frame for 100ms";
         assert_eq!(ended.why.as_deref(), Some(why));
         drop(opened);
-        // A snapshot that does not arrive: ten quiet bounds.
+        // A snapshot whose next part does not arrive: the same bound.
         let applied = AtomicBool::new(false);
         let script = async {
             let opened = bed.opened().await;
             opened.says(resync()).await;
-            (opened, bed.asked().await)
+            opened
         };
-        let left = async { tokio::join!(standby.stream(&named, false, &applied), script) };
+        let left = async { tokio::join!(standby.stream(&named, &applied), script) };
         let (ended, held) = timeout(FIVE, left).await.expect("the stream is left");
         assert_eq!((ended.next, ended.applied), (Next::Wait, false));
-        let why = "the leader's snapshot did not arrive in 1s";
+        let why = "the leader sent no frame for 100ms";
         assert_eq!(ended.why.as_deref(), Some(why));
         drop(held);
         // A leader that opens no stream.
         bed.mute.store(true, Ordering::Relaxed);
         let applied = AtomicBool::new(false);
-        let left = standby.stream(&named, false, &applied);
+        let left = standby.stream(&named, &applied);
         let ended = timeout(FIVE, left).await.expect("the stream is left");
         assert_eq!((ended.next, ended.applied), (Next::Wait, false));
         let why = "the leader opened no stream for 100ms";

@@ -269,7 +269,7 @@ async fn three_replicas_elect_one_leader_and_hand_over_at_its_kill_and_at_its_st
         (
             follower.replication,
             Code::PermissionDenied,
-            Code::Unauthenticated,
+            Code::PermissionDenied,
         ),
     ] {
         let mut client = PolicyControllerClient::connect(format!("http://{listener}"))
