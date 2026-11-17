@@ -331,6 +331,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `null` metadata reads as the empty map (`deserialize_null_as_empty_map`, a map twin of
   `deserialize_null_as_empty_vec`), and `IncompleteReason`, `#[non_exhaustive]`, gains
   `MaxMessages` and `Steered`.
+- A Messages search result's text items are written with their `type`, which the public API
+  requires of them, in a message and in a tool result alike. They were read into untagged text
+  blocks, so a forwarded search result lost the `type` of each item. An item read without one
+  still reads, as text, and an item of another type is refused. Breaking:
+  `SearchResultBlock.content` holds the new `SearchResultTextBlock`, whose type is
+  `SearchResultTextType`.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
