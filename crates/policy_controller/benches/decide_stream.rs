@@ -22,7 +22,10 @@
 //!   this one reads a latency at a rate, and the share that went local.
 //! - `policy_decide_stream/rate/<members>/<deciders>`: decisions a second
 //!   over 8, 64 and 512 members with four streams of 32 in flight each: on
-//!   one decider (one model) and on eight (64 models).
+//!   one decider (one model) and on eight (64 models). The rate is the
+//!   streams' measured answers together over the one interval they share,
+//!   from the first of them to the last: a stream that ends early idles
+//!   in it, so the row reads no higher than the streams did together.
 //! - `policy_decide_stream/count/<mode>/<members>`, one cell a run, named by
 //!   `DECIDE_STREAM_COUNT=<mode>:<members>:<decisions>`: the whole process's
 //!   allocator calls a decision, `in_process` (the store's deciding door, a
@@ -31,13 +34,23 @@
 //!   wakes the same threads whatever its fleet, the client's own calls
 //!   included). A run's instructions are read from outside it
 //!   (`perf stat -e instructions:u`): two runs of different length give a
-//!   decision's by their difference.
+//!   decision's by their difference. A counted run keeps no round trip and
+//!   sorts none: a sort grows faster than its length, and the difference
+//!   of two runs would keep part of it.
 //!
 //! Every wire row prints the `Busy` answers it met (none is expected: the
-//! rows stay inside a stream's window and a decider's queue), the process's
-//! CPU seconds per million decisions, client and controller together, and
-//! its resident size. `DECIDE_STREAM_ROWS=round_trip`, `offered` or `rate`
-//! runs one kind alone, and `--test` runs every row for a moment.
+//! rows stay inside a stream's window and a decider's queue) and the
+//! process's resident size. A closed-loop row also prints its CPU seconds
+//! per million decisions, client and controller together; an open-loop
+//! client spins between instants, so its row prints none. Every decision
+//! of a row is a pick over its fleet, or the bench stops: a setup that
+//! drifted to another outcome would print another path's numbers.
+//! `DECIDE_STREAM_ROWS=round_trip`, `offered` or `rate` runs one kind
+//! alone, and `--test` runs every row for a moment.
+//!
+//! The process installs a tracing subscriber that takes nothing, as the
+//! binary installs one of its own: with none, each span of the transport
+//! takes the tracing crate's log path, a cost no served controller pays.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a controller that fails to serve is a bug the tests catch"
@@ -64,8 +77,8 @@ use std::{
 use smg_policy_controller::{
     controller::{Config, Controller, Election, Listener, Scope, State},
     proto::{
-        controller_frame, decide_answer::Answer, gateway_frame::Frame,
-        policy_controller_client::PolicyControllerClient, ControllerFrame, DecideRequest,
+        controller_frame, decide_answer::Answer, decision::Outcome, gateway_frame::Frame,
+        policy_controller_client::PolicyControllerClient, ControllerFrame, DecideRequest, Decision,
         GatewayFrame, Hello, RequestFacts as WireFacts,
     },
     store::{
@@ -361,11 +374,15 @@ async fn hello(addr: SocketAddr) -> (mpsc::Sender<GatewayFrame>, Streaming<Contr
 
 /// What one stream measured.
 struct Tally {
-    /// Each measured decision's round trip, in nanoseconds.
+    /// Each measured decision's round trip, in nanoseconds; none of a
+    /// counted run's.
     nanos: Vec<u64>,
+    /// The measured answers, whether their round trips were kept.
+    answered: u64,
     busy: u64,
-    /// From the first measured answer to the last.
-    window: Duration,
+    /// The first measured answer's receipt, and the last one's.
+    opened: Instant,
+    closed: Instant,
     /// The allocator's calls over the measured decisions, where it counted.
     calls: u64,
     /// The measured requests an open loop handed over late.
@@ -373,6 +390,15 @@ struct Tally {
     /// The measured requests an open loop decided itself: due with no
     /// credit.
     local: u64,
+}
+
+/// Every decision of a row is a pick over its fleet. Another outcome means
+/// the setup drifted, and the row would print another path's numbers.
+fn picked(decision: &Decision) {
+    assert!(
+        matches!(decision.outcome, Some(Outcome::Pick(_))),
+        "a pick over the fleet: {decision:?}"
+    );
 }
 
 fn slot(id: u64) -> usize {
@@ -430,8 +456,10 @@ async fn ask(addr: SocketAddr, shape: Shape) -> Tally {
     let mut next = 0;
     let mut tally = Tally {
         nanos: Vec::with_capacity(usize::try_from(shape.measured).expect("a count that fits")),
+        answered: 0,
         busy: 0,
-        window: Duration::ZERO,
+        opened: Instant::now(),
+        closed: Instant::now(),
         calls: 0,
         late: 0,
         local: 0,
@@ -440,7 +468,6 @@ async fn ask(addr: SocketAddr, shape: Shape) -> Tally {
         hand(&requests, &mut sent_at, &mut next, &models).await;
     }
     let mut done = 0;
-    let mut opened = Instant::now();
     while done < shape.warm + shape.measured {
         let answer = answers
             .message()
@@ -448,19 +475,24 @@ async fn ask(addr: SocketAddr, shape: Shape) -> Tally {
             .expect("an answer, not a status")
             .expect("an answer, not the stream's end");
         let received = Instant::now();
-        match answer.answer {
-            Some(Answer::Decision(_)) => {}
+        match &answer.answer {
+            Some(Answer::Decision(decision)) => picked(decision),
             Some(Answer::Busy(_)) => tally.busy += 1,
             Some(Answer::Credit(_)) | None => continue,
         }
         if done == shape.warm {
-            opened = received;
+            tally.opened = received;
             if shape.counted {
                 CALLS.store(0, Ordering::Relaxed);
                 COUNTING.store(true, Ordering::Relaxed);
             }
         }
         if done >= shape.warm {
+            tally.answered += 1;
+        }
+        // A counted run keeps no round trip: a sort of them would stay in
+        // the difference of two runs.
+        if done >= shape.warm && !shape.counted {
             let id: [u8; 8] = answer
                 .request_id
                 .as_slice()
@@ -481,7 +513,7 @@ async fn ask(addr: SocketAddr, shape: Shape) -> Tally {
         COUNTING.store(false, Ordering::Relaxed);
         tally.calls = CALLS.load(Ordering::Relaxed);
     }
-    tally.window = opened.elapsed();
+    tally.closed = Instant::now();
     tally
 }
 
@@ -506,8 +538,10 @@ async fn offer(addr: SocketAddr, shape: Shape) -> Tally {
     let gap = Duration::from_nanos(1_000_000_000 / shape.offered.max(1));
     let mut tally = Tally {
         nanos: Vec::with_capacity(usize::try_from(shape.measured).expect("a count that fits")),
+        answered: 0,
         busy: 0,
-        window: Duration::ZERO,
+        opened: Instant::now(),
+        closed: Instant::now(),
         calls: 0,
         late: 0,
         local: 0,
@@ -515,7 +549,6 @@ async fn offer(addr: SocketAddr, shape: Shape) -> Tally {
     let start = Instant::now();
     let due = |id: u64| start + gap.saturating_mul(u32::try_from(id).unwrap_or(u32::MAX));
     let (mut next, mut done, mut credit) = (0, 0, WINDOW);
-    let mut opened = start;
     while done < total {
         let now = Instant::now();
         while next < total && due(next) <= now {
@@ -547,8 +580,8 @@ async fn offer(addr: SocketAddr, shape: Shape) -> Tally {
             .expect("an answer, not a status")
             .expect("an answer, not the stream's end");
         let received = Instant::now();
-        match answer.answer {
-            Some(Answer::Decision(_)) => {}
+        match &answer.answer {
+            Some(Answer::Decision(decision)) => picked(decision),
             Some(Answer::Busy(_)) => tally.busy += 1,
             Some(Answer::Credit(grant)) => {
                 credit += u64::from(grant.window);
@@ -563,9 +596,10 @@ async fn offer(addr: SocketAddr, shape: Shape) -> Tally {
             .expect("the request's eight bytes");
         let id = u64::from_be_bytes(id);
         if id >= shape.warm {
-            if tally.nanos.is_empty() {
-                opened = received;
+            if tally.answered == 0 {
+                tally.opened = received;
             }
+            tally.answered += 1;
             let took = received.saturating_duration_since(due(id));
             tally
                 .nanos
@@ -573,7 +607,7 @@ async fn offer(addr: SocketAddr, shape: Shape) -> Tally {
         }
         done += 1;
     }
-    tally.window = opened.elapsed();
+    tally.closed = Instant::now();
     tally
 }
 
@@ -670,10 +704,20 @@ fn wire(shape: Shape) -> Row {
         late: 0,
         local: 0,
     };
+    // The streams' answers together over the one interval they share, from
+    // the first measured answer of any to the last of all: a sum of each
+    // stream's own rate would read high by the stagger of their ends.
+    let opened = tallies.iter().map(|tally| tally.opened).min();
+    let closed = tallies.iter().map(|tally| tally.closed).max();
+    let shared = opened
+        .zip(closed)
+        .map_or(Duration::ZERO, |(opened, closed)| {
+            closed.saturating_duration_since(opened)
+        });
+    let shared = u64::try_from(shared.as_nanos()).expect("an interval under centuries");
+    let answered: u64 = tallies.iter().map(|tally| tally.answered).sum();
+    row.per_second = (answered * 1_000_000_000).checked_div(shared).unwrap_or(0);
     for tally in tallies {
-        let window = u64::try_from(tally.window.as_nanos()).expect("a window under centuries");
-        let answered = u64::try_from(tally.nanos.len()).expect("a count that fits");
-        row.per_second += (answered * 1_000_000_000).checked_div(window).unwrap_or(0);
         row.busy += tally.busy;
         row.calls += tally.calls;
         row.late += tally.late;
@@ -792,6 +836,10 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    // As the binary's own subscriber does, this one keeps the transport's
+    // spans off the tracing crate's log path.
+    tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::default())
+        .expect("no subscriber stands before the bench's");
     let quick = env::args().any(|arg| arg == "--test");
     let mut out = io::stdout().lock();
     if let Ok(cell) = env::var("DECIDE_STREAM_COUNT") {
