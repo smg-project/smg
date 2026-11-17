@@ -150,6 +150,22 @@ pub struct WorkerFacts {
     pub overload: Overload,
 }
 
+impl WorkerFacts {
+    /// Whether these facts name the models `other` names, in any order and
+    /// however often. The order is a fact of its own (a row's events are
+    /// indexed under its first model), and a reorder alone is no other
+    /// worker.
+    pub(crate) fn same_models(&self, other: &Self) -> bool {
+        fn named(models: &[String]) -> Vec<&str> {
+            let mut ids: Vec<&str> = models.iter().map(String::as_str).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        }
+        self.models == other.models || named(&self.models) == named(&other.models)
+    }
+}
+
 /// One worker as the store holds it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkerRow {

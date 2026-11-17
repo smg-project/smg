@@ -190,9 +190,10 @@ impl Door {
                 }));
             }
         };
-        let standing = self.store.by_key(&spec.url);
-        let mut facts =
-            worker_wire::facts(spec, standing.as_ref().map(|row| &row.facts)).map_err(invalid)?;
+        // The conversion reads the standing row once the URL holds its own
+        // rules: a URL past its bound is never looked up.
+        let (mut facts, standing) =
+            worker_wire::registration(spec, |url| self.store.by_key(url)).map_err(invalid)?;
         if request.wait_ready && facts.health.probes {
             return Err(invalid(Refused {
                 path: "wait_ready",
@@ -221,10 +222,11 @@ impl Door {
                 }
                 // The store carries a status across incarnations only where
                 // these three stand: a change of one is a new worker under
-                // the URL.
+                // the URL. The models stand as a set: a reorder alone is
+                // made in place.
                 let another = facts.role != row.facts.role
                     || facts.wire_modes != row.facts.wire_modes
-                    || facts.models != row.facts.models;
+                    || !facts.same_models(&row.facts);
                 if mode == Mode::Replace || another {
                     facts.incarnation = life(term, self.base, self.store.epoch());
                 }
@@ -712,6 +714,54 @@ mod tests {
             assert_eq!(replaced.old.map(|old| old.id), Some(stood.id.0), "{what}");
             assert_eq!(store.get(stood.id), None, "{what}");
         }
+    }
+
+    #[test]
+    fn an_upsert_of_the_same_models_in_another_order_is_made_in_place() {
+        let (store, door) = door();
+        let listing = |models: &[&str]| proto::WorkerSpec {
+            models: models.iter().map(|&model| model.to_owned()).collect(),
+            ..unchecked(URL)
+        };
+        let two = listing(&["model-a", "model-b"]);
+        let told = door
+            .register(&operator(), under(TERM), &ask(two.clone(), Mode::Add))
+            .expect("registered");
+        let first = row_of(&told);
+        // Unchecked, the row is ready by its connect signal: a state to
+        // carry.
+        assert_eq!(
+            store.by_key(URL).map(|row| row.status),
+            Some(WorkerStatus::Ready)
+        );
+        // The same two in the other order, then one of them named twice:
+        // the same worker each time, and the row tells the stated list.
+        for stated in [
+            &["model-b", "model-a"][..],
+            &["model-a", "model-b", "model-a"][..],
+        ] {
+            let told = door
+                .register(
+                    &operator(),
+                    under(TERM),
+                    &ask(listing(stated), Mode::Upsert),
+                )
+                .expect("reordered");
+            let Some(Event::Relabelled(row)) = told.event else {
+                panic!("a reorder is made in place: {told:?}");
+            };
+            assert_eq!((row.id, row.incarnation), (first.id, first.incarnation));
+            assert_eq!(row.models, stated);
+            assert_eq!(row.status, proto::WorkerStatus::Ready as i32);
+        }
+        // A replacement that names the same set carries the status too.
+        let told = door
+            .register(&operator(), under(TERM), &ask(two, Mode::Replace))
+            .expect("replaced");
+        let Some(Event::Replaced(replaced)) = told.event else {
+            panic!("a replacement: {told:?}");
+        };
+        assert!(replaced.state_carried);
     }
 
     #[test]
@@ -1272,6 +1322,75 @@ mod tests {
         }
         // No line holds the URL: it may carry a credential.
         assert!(!logged.contains(URL), "{logged}");
+    }
+
+    #[test]
+    fn a_registration_states_its_bootstrap_port_and_a_change_of_it_is_made_in_place() {
+        let (store, door) = door();
+        let with = |bootstrap_port| proto::WorkerSpec {
+            pairing: Some(proto::PairingDescriptor {
+                bootstrap_port,
+                ..Default::default()
+            }),
+            ..spec(URL)
+        };
+        let port =
+            |told: &proto::WorkerEvent| row_of(told).pairing.map(|pairing| pairing.bootstrap_port);
+        let told = door
+            .register(&operator(), under(TERM), &ask(with(8_998), Mode::Add))
+            .expect("registered");
+        let first = row_of(&told);
+        assert_eq!(port(&told), Some(8_998));
+        assert_eq!(
+            store.by_key(URL).and_then(|row| row.facts.bootstrap_port),
+            Some(8_998)
+        );
+
+        // Another port: the same worker, its facts moved.
+        let told = door
+            .register(&operator(), under(TERM), &ask(with(9_001), Mode::Upsert))
+            .expect("relabelled");
+        assert!(matches!(told.event, Some(Event::Relabelled(_))));
+        let moved = row_of(&told);
+        assert_eq!((moved.id, moved.revision), (first.id, first.revision + 1));
+        assert_eq!(port(&told), Some(9_001));
+
+        // A registration that states no descriptor leaves the port: equal
+        // facts, nothing written.
+        let told = door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Upsert))
+            .expect("answered");
+        assert_eq!(port(&told), Some(9_001));
+        assert_eq!((told.membership_epoch, store.epoch()), (2, 2));
+
+        // A REPLACE that states no descriptor is the worker's next
+        // incarnation and keeps the port that stands.
+        let told = door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Replace))
+            .expect("replaced");
+        let next = row_of(&told);
+        assert_ne!(next.id, first.id, "a life of its own");
+        assert_eq!(port(&told), Some(9_001));
+
+        // Removed and registered again, the worker tells no port.
+        let removal = proto::DeregisterWorkerRequest {
+            worker_id: next.id,
+            revision: next.revision,
+            drain: false,
+        };
+        door.deregister(&operator(), under(TERM), &removal)
+            .expect("removed");
+        let told = door
+            .register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
+            .expect("registered again");
+        assert_eq!(row_of(&told).pairing, None);
+
+        // A worker registered with no port tells no descriptor.
+        let other = "grpc://10.0.0.6:8000";
+        let told = door
+            .register(&operator(), under(TERM), &ask(spec(other), Mode::Add))
+            .expect("registered");
+        assert_eq!(row_of(&told).pairing, None);
     }
 
     #[test]

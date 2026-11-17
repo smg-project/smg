@@ -266,6 +266,67 @@ fn probe_outcomes_follow_the_rows_thresholds_and_a_stale_outcome_is_dropped() {
 }
 
 #[test]
+fn a_threshold_past_the_counters_range_is_never_met_early() {
+    // The first threshold whose tenfold passes 32 bits, and the last one.
+    for threshold in [429_496_730, u32::MAX] {
+        let store = MemoryStore::new();
+        let health: &dyn HealthSink = &store;
+        let mut stated = facts("http://w:8000", 1);
+        stated.health.failure_threshold = threshold;
+        let id = store.upsert(stated).id();
+        let revision = || WorkersStore::get(&store, id).expect("the row").revision;
+        // A pending worker's cap is ten thresholds: five failed probes are
+        // far under it.
+        for _ in 0..5 {
+            assert_eq!(
+                health.probe_outcome(id, false, revision()),
+                None,
+                "pending under {threshold}"
+            );
+        }
+        assert_eq!(health.probe_outcome(id, true, revision()), None);
+        assert_eq!(
+            health.probe_outcome(id, true, revision()),
+            Some((WorkerStatus::Pending, WorkerStatus::Ready))
+        );
+        // And a ready one stays ready through failures under the threshold.
+        for _ in 0..5 {
+            assert_eq!(
+                health.probe_outcome(id, false, revision()),
+                None,
+                "ready under {threshold}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_counter_at_its_ranges_end_stays_there() {
+    let store = MemoryStore::new();
+    let health: &dyn HealthSink = &store;
+    let mut stated = facts("http://w:8000", 1);
+    stated.health.failure_threshold = u32::MAX;
+    let id = store.upsert(stated).id();
+    let revision = || WorkersStore::get(&store, id).expect("the row").revision;
+    // A pending worker's cap is held at the counter's end: met there, and
+    // one probe short of it not yet.
+    store.probed(id, 0, 0, u32::MAX - 2);
+    assert_eq!(health.probe_outcome(id, false, revision()), None);
+    assert_eq!(
+        health.probe_outcome(id, false, revision()),
+        Some((WorkerStatus::Pending, WorkerStatus::Failed))
+    );
+    // Each counter at its end takes one probe more and stays there.
+    store.probed(id, u32::MAX, u32::MAX, u32::MAX);
+    assert_eq!(health.probe_outcome(id, false, revision()), None);
+    store.probed(id, 0, u32::MAX, u32::MAX);
+    assert_eq!(
+        health.probe_outcome(id, true, revision()),
+        Some((WorkerStatus::Failed, WorkerStatus::Ready))
+    );
+}
+
+#[test]
 fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
     let store = MemoryStore::new();
     let health: &dyn HealthSink = &store;
@@ -742,6 +803,39 @@ fn one_block(sequence: u64) -> [KvEvent; 1] {
             content_hash: ContentHash(2_000 + sequence),
         }],
     }]
+}
+
+#[test]
+fn a_reorder_that_moves_the_first_model_moves_the_rows_lane_with_it() {
+    let store = MemoryStore::new();
+    let sink: &dyn KvEventSink<Batch = [KvEvent]> = &store;
+    let mut stated = WorkerFacts {
+        models: vec!["m".to_owned(), "n".to_owned()],
+        signals: Signals {
+            events: true,
+            ..Signals::default()
+        },
+        ..facts("w", 1)
+    };
+    let id = store.upsert(stated.clone()).id();
+    for seq in 1..=3 {
+        sink.admit(id, 0, batch(seq), &one_block(seq));
+    }
+    let held = || (store.kv().held_blocks("m"), store.kv().held_blocks("n"));
+    assert_eq!(held(), (3, 0));
+    // The same two the other way round, written in place. A row's events
+    // are keyed by its first model, and the lane moves with it in the same
+    // write: no block stays under the old key, and the lane made anew is
+    // unheard, which tells a collector to feed it from a snapshot.
+    stated.models.reverse();
+    assert_eq!(store.upsert(stated).id(), id);
+    assert_eq!(held(), (0, 0));
+    assert_eq!(sink.cursor(id, 0), None);
+    assert_eq!(
+        sink.admit(id, 0, batch(1), &one_block(1)),
+        BatchOutcome::Applied
+    );
+    assert_eq!(held(), (0, 1));
 }
 
 #[test]
