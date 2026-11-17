@@ -203,8 +203,7 @@ fails once the reason no longer holds.
   has no preset of either name yet, so it cannot build the rows. The other 38 rows replay. Nine of them, the eight
   ring rows and the keyed round robin row, replay with the crate's rule for a routing key under the ring.
   Until its module lands the replay owes this sheet (`OWED_SHEETS` in `tests/classic_rows.rs`).
-- `pair_index.json`: none is recorded yet. The module that replays it arrives with the crate's pair classes;
-  until then the replay owes this sheet.
+- `pair_index.json`: none. All 23 rows replay.
 - `encode_pair.json`: none is recorded yet. The module that replays it arrives with the crate's encoder lists
   and its rule for encode items; until then the replay owes this sheet.
 - `pair_select.json`: none is recorded yet. The module that replays it arrives with the crate's pair

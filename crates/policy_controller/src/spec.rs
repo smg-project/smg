@@ -3018,6 +3018,9 @@ impl io::Write for HashWriter<'_> {
 /// It carries the document's digest beside the number ([`Digest`]): the
 /// number says which generation a replica runs, the digest which document,
 /// and one load reads the pair.
+///
+/// It also holds what a store derives under, beside the engine: the
+/// document's pairing mode ([`AppliedSpec::pairing`]).
 #[derive(Debug)]
 pub struct AppliedSpec {
     engine: Engine,
@@ -3026,6 +3029,7 @@ pub struct AppliedSpec {
     digest: Option<Digest>,
     /// The document's `view.max_block_hashes`.
     max_block_hashes: u32,
+    pairing: Pairing,
 }
 
 impl AppliedSpec {
@@ -3045,6 +3049,7 @@ impl AppliedSpec {
             engine,
             digest: Some(document.digest()?),
             max_block_hashes: document.view.max_block_hashes,
+            pairing: document.plans.pd_pair.pairing,
         })
     }
 
@@ -3063,18 +3068,21 @@ impl AppliedSpec {
             engine,
             digest: Some(digest),
             max_block_hashes: document.view.max_block_hashes,
+            pairing: document.plans.pd_pair.pairing,
         })
     }
 
     /// The generation a store holds before any document is applied: number
     /// 0, an engine with no profile and no binding, which declines every
-    /// decision by name as an engine declines a model no binding covers.
+    /// decision by name as an engine declines a model no binding covers,
+    /// and the pairing mode a document that names none has.
     #[must_use]
     pub fn unbound() -> Self {
         Self {
             engine: Engine::new(Vec::new(), Vec::new(), 0, Needs::default()),
             digest: None,
             max_block_hashes: ViewSpec::default().max_block_hashes,
+            pairing: Pairing::default(),
         }
     }
 
@@ -3111,6 +3119,13 @@ impl AppliedSpec {
     #[must_use]
     pub fn needs(&self) -> Needs {
         self.engine.needs()
+    }
+
+    /// The mode a store derives its pair classes under while this
+    /// generation stands: the document's `plans.pd-pair.pairing`.
+    #[must_use]
+    pub fn pairing(&self) -> Pairing {
+        self.pairing
     }
 }
 
@@ -5133,5 +5148,21 @@ mod tests {
         let applied = AppliedSpec::validate_digested(&document, handed, &Catalog::builtin())
             .expect("a preset validates");
         assert_eq!(applied.digest(), Some(handed));
+    }
+
+    /// A digest handed on moves nothing else of the generation: its pairing
+    /// mode is the document's, as where the generation digests the document
+    /// itself.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_generation_under_a_handed_digest_takes_its_documents_pairing_mode() {
+        let mut document = PolicySpec::preset("least_load").expect("a preset");
+        document.plans.pd_pair.pairing = Pairing::Strict;
+        let digest = document.digest().expect("a digest");
+        let handed = AppliedSpec::validate_digested(&document, digest, &Catalog::builtin())
+            .expect("a preset validates");
+        assert_eq!(handed.pairing(), Pairing::Strict);
+        let own = AppliedSpec::validate(&document).expect("a preset validates");
+        assert_eq!(own.pairing(), Pairing::Strict);
     }
 }

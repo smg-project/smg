@@ -13,9 +13,21 @@
 //! What a membership write derives (where each pool stands, each pool's
 //! shape) is built once and shared by every world until the next membership
 //! write. A world's epoch is the membership's and is the one thing to
-//! compare: a world's identity moves with every publication. Between two
-//! membership writes a publication derives nothing: it is one small object,
-//! a pointer per pool, and new rows for each pool a write was folded into.
+//! compare between two worlds' pools: a world's identity moves with every
+//! publication. The pair classes are derived with the shapes where a write
+//! moves a member or an offer, and once more where a generation moves the
+//! pairing mode: a new world of the same epoch. Between two membership
+//! writes a publication derives nothing: it is one small object, a pointer
+//! per pool, and new rows for each pool a write was folded into.
+//!
+//! **A pair class is a fact of the rows.** A membership write derives each
+//! model's pair classes from what its prefills and decodes report
+//! ([`PairClasses`]) before any row is built: a worker's row carries its one
+//! class, and the model's table says which classes pair. The table names
+//! classes, never rows, so a pool with another gateway's host-local rows
+//! left out reads the same table. A write that moves no member and no
+//! member's offer carries the last write's classes and reads no member's
+//! facts for them.
 //!
 //! A row in a pool is the candidate row itself. Its fixed fields are
 //! written when the membership's first world is built. Its moving facts
@@ -73,11 +85,12 @@ use std::{
 use rustc_hash::FxHashMap;
 
 use crate::{
-    framework::OverloadThresholds,
-    spec::AppliedSpec,
+    framework::{OverloadThresholds, PairPools, PairTable},
+    spec::{AppliedSpec, Pairing},
     store::{
         loads::LoadSample,
-        workers::{Overload, Reachability, WorkerRow, WorkerStatus},
+        pairing::{known, Member, PairClasses},
+        workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
         GatewayId,
     },
     view::{
@@ -135,6 +148,49 @@ pub struct ViewBuffers {
     pub affinity: Vec<AffinityFacts>,
 }
 
+/// The buffers a host keeps across pair decisions: both sides' views and
+/// the table that says which of their classes pair, all of one publication.
+/// A pair build clears and fills them ([`World::build_pair`]).
+///
+/// What the store numbers for a table leaves it only with that table: the
+/// rows' classes are numbered for the table built beside them, and by the
+/// numbers alone they would pair wrongly. So nothing here is read apart:
+/// [`PairBuffers::pools`] hands the engine's pair entry all of it.
+#[derive(Debug, Default)]
+pub struct PairBuffers {
+    /// The prefill pool's view.
+    prefill: ViewBuffers,
+    /// The decode pool's view.
+    decode: ViewBuffers,
+    /// Where each prefill class's list ends in `listed`.
+    ends: Vec<u32>,
+    /// The decode classes each prefill class pairs with, list after list.
+    listed: Vec<u32>,
+}
+
+impl PairBuffers {
+    /// What the engine's pair entry reads: the two pools, their columns and
+    /// the table of the publication the rows were built from.
+    pub fn pools(&self) -> PairPools<'_> {
+        PairPools {
+            prefills: &self.prefill.candidates,
+            decodes: &self.decode.candidates,
+            prefill_affinity: &self.prefill.affinity,
+            decode_affinity: &self.decode.affinity,
+            table: PairTable::new(&self.ends, &self.listed),
+        }
+    }
+
+    fn clear(&mut self) {
+        for side in [&mut self.prefill, &mut self.decode] {
+            side.candidates.clear();
+            side.affinity.clear();
+        }
+        self.ends.clear();
+        self.listed.clear();
+    }
+}
+
 /// What a build read beside the rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Built {
@@ -181,6 +237,11 @@ struct PoolShape {
     /// The host-local rows, by index, each with the gateway that holds its
     /// socket; empty for a pool every gateway dials whole.
     locals: Box<[(u32, GatewayId)]>,
+    /// The pair classes of the pool's model, on its prefill pool where the
+    /// model has a decode too: a pair build reads them by the one lookup
+    /// that finds its two pools. Counted: a membership write that moves no
+    /// offer hands them to the shape it derives ([`Classes::Carry`]).
+    pairs: Option<Arc<PairClasses>>,
 }
 
 /// The roles a model's pools are derived for: one slot each.
@@ -210,8 +271,9 @@ const fn phase_of(role: Role) -> Phase {
 }
 
 /// What one membership write derives: where each pool stands in a world's
-/// rows, and each pool's shape. Built once per membership write and shared
-/// by every world published until the next.
+/// rows, and each pool's shape. Built once per membership write, and once
+/// more where a generation moves the pairing mode, and shared by every
+/// world published until the next.
 #[derive(Default)]
 struct Derived {
     /// The pools by model, then by role: each an index into a world's rows.
@@ -219,6 +281,14 @@ struct Derived {
     /// status (a status change is a health signal and moves no position).
     by_model: FxHashMap<Box<str>, [Option<u32>; ROLES]>,
     pools: Box<[PoolShape]>,
+}
+
+impl Derived {
+    /// The pair classes of `model`, where it has a prefill and a decode.
+    fn pairs(&self, model: &str) -> Option<&Arc<PairClasses>> {
+        let prefill = self.by_model.get(model)?[role_slot(Role::Prefill)]?;
+        self.pools.get(prefill as usize)?.pairs.as_ref()
+    }
 }
 
 /// One standing veto as its gateway's run in a pool carries it: the row it
@@ -510,9 +580,11 @@ impl std::fmt::Debug for World {
 
 impl World {
     /// The store's epoch at the membership write this world's pools were
-    /// derived by: the one thing to compare between two worlds. A status
-    /// change moves the store's epoch and no world's, and a publication
-    /// between two membership writes is a new world of the same epoch.
+    /// derived by: the one thing to compare between two worlds' pools. A
+    /// status change moves the store's epoch and no world's, and a
+    /// publication between two membership writes is a new world of the same
+    /// epoch. The pair classes move once more, at a generation of another
+    /// pairing mode ([`World::pairs`]).
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -541,6 +613,16 @@ impl World {
     /// gateway's host-local rows counted; `None` when none does.
     pub fn members(&self, model: &str, role: Role) -> Option<usize> {
         self.pool(model, role).map(|(rows, _)| rows.len())
+    }
+
+    /// The pair classes of `model` as this world's pools were derived, with
+    /// the table a pair decision reads beside the two pools
+    /// ([`PairClasses::table`]); `None` when the model has no prefill or no
+    /// decode. A membership write derives them, and so does a generation of
+    /// another pairing mode at the same epoch: the epoch alone does not key
+    /// the classes a reader keeps across worlds.
+    pub fn pairs(&self, model: &str) -> Option<&PairClasses> {
+        self.derived.pairs(model).map(|classes| &**classes)
     }
 
     fn pool(&self, model: &str, role: Role) -> Option<(&[Candidate], &PoolShape)> {
@@ -588,9 +670,22 @@ impl World {
         ask: &Ask,
         out: &mut ViewBuffers,
     ) -> Option<Built> {
+        let Some(index) = self.index(model, role) else {
+            out.candidates.clear();
+            out.affinity.clear();
+            return None;
+        };
+        self.build_at(index, ask, out)
+    }
+
+    /// [`World::build`] past the model's lookup: the view of the pool at
+    /// `index` of this world's rows, into buffers cleared first. Inlined
+    /// into both doors: a single build stays one call, and a pair build
+    /// runs its two sides under its one lookup with no call between them.
+    #[inline(always)]
+    fn build_at(&self, index: usize, ask: &Ask, out: &mut ViewBuffers) -> Option<Built> {
         out.candidates.clear();
         out.affinity.clear();
-        let index = self.index(model, role)?;
         let (rows, shape) = (self.rows.get(index)?, self.derived.pools.get(index)?);
         let now_micros = micros(self.origin, ask.now);
         for (from, to) in Segments::of(&shape.locals, ask.gateway, rows.len()) {
@@ -640,6 +735,36 @@ impl World {
                 ask.gateway.0
             },
         })
+    }
+
+    /// Build both sides of one pair decision into `out`: the model's
+    /// prefill pool, its decode pool ([`World::build`] for each) and the
+    /// table of their classes, all as this publication holds them. `None`,
+    /// with every buffer cleared, when either pool has no member: one side
+    /// alone is no pair, and nothing of it is built. The model's name is
+    /// looked up once for both sides and the table.
+    pub fn build_pair(
+        &self,
+        model: &str,
+        ask: &Ask,
+        out: &mut PairBuffers,
+    ) -> Option<(Built, Built)> {
+        // One lookup of the model finds both pools. The classes stand on
+        // the prefill pool's shape where both pools hold a member, so
+        // neither side is built for a model that has one side alone.
+        let built = self.derived.by_model.get(model).and_then(|pools| {
+            let prefill = pools[role_slot(Role::Prefill)]? as usize;
+            let decode = pools[role_slot(Role::Decode)]? as usize;
+            let classes = self.derived.pools.get(prefill)?.pairs.as_deref()?;
+            let prefill = self.build_at(prefill, ask, &mut out.prefill)?;
+            let decode = self.build_at(decode, ask, &mut out.decode)?;
+            classes.table_into(&mut out.ends, &mut out.listed);
+            Some((prefill, decode))
+        });
+        if built.is_none() {
+            out.clear();
+        }
+        built
     }
 }
 
@@ -724,7 +849,8 @@ impl Iterator for Segments<'_> {
 }
 
 /// The candidate row of one member: its fixed fields from its registration,
-/// its status bits, and its load record when one is on file.
+/// its status bits, and its load record when one is on file. Its pair class
+/// is the membership's to derive ([`pair_up`]).
 fn row_of(member: &WorkerRow, sample: Option<&LoadSample>, origin: Instant) -> Candidate {
     let facts = &member.facts;
     Candidate {
@@ -736,7 +862,6 @@ fn row_of(member: &WorkerRow, sample: Option<&LoadSample>, origin: Instant) -> C
         wire_modes: facts.wire_modes,
         load: sample.map(|sample| sample.row),
         load_sampled_at_micros: sample.map_or(0, |sample| micros(origin, sample.sampled_at)),
-        pair_class: facts.pair_class,
         host_local: facts.reachable_from != Reachability::Any,
         // The low 32 bits of the registration key's fingerprint.
         key: fingerprint(facts.key.as_bytes()) as u32,
@@ -752,6 +877,95 @@ fn health_of(status: WorkerStatus) -> Health {
         draining: status == WorkerStatus::Draining,
         ..Health::default()
     }
+}
+
+/// One member on its way into a pool: its row, what it registered with, and
+/// the two facts of its place.
+#[derive(Clone, Copy)]
+struct Entry<'a> {
+    row: Candidate,
+    facts: &'a WorkerFacts,
+    admitted_micros: u64,
+    local: Option<GatewayId>,
+    /// The thresholds its registration names.
+    own: Overload,
+}
+
+/// What the pairing rule reads of some entries: each worker's id, wires,
+/// runtime and descriptor.
+fn members<'a>(entries: &[Entry<'a>]) -> Vec<Member<'a>> {
+    entries
+        .iter()
+        .map(|entry| {
+            let facts = entry.facts;
+            Member::new(
+                entry.row.id,
+                facts.wire_modes,
+                &facts.engine_kind,
+                facts.pairing.as_ref(),
+            )
+        })
+        .collect()
+}
+
+/// What a membership write asks of the pair classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Classes {
+    /// A member joined or left, or a member's offer may have moved: every
+    /// model's classes are derived.
+    Derive,
+    /// No member joined or left and no member's offer moved
+    /// ([`same_offer`]): the classes are the last write's, carried. A
+    /// derivation reads every member's facts, so a write that moves none
+    /// of them pays for none.
+    Carry,
+}
+
+/// Whether two versions of one worker's facts stand in the same pools with
+/// the same offer: the role and the models place a worker in its pools, and
+/// the wires, the runtime and the descriptor are what [`members`] reads of
+/// it, the runtime as an offer holds it ([`known`]). A write from one such
+/// version to the other moves no pair class.
+pub(super) fn same_offer(old: &WorkerFacts, new: &WorkerFacts) -> bool {
+    old.role == new.role
+        && old.models == new.models
+        && old.wire_modes == new.wire_modes
+        && known(&old.engine_kind) == known(&new.engine_kind)
+        && old.pairing == new.pairing
+}
+
+/// One model's pair classes under `mode`, each prefill's and each decode's
+/// class written on its row: `carried`, the last write's, where this write
+/// moved no member and no offer, else derived. `None` when a side has no
+/// member: one side alone is no pair, and its rows keep class 0.
+fn pair_up(
+    sides: &mut [Vec<Entry<'_>>; ROLES],
+    mode: Pairing,
+    carried: Option<&Arc<PairClasses>>,
+) -> Option<Arc<PairClasses>> {
+    let (prefill, decode) = (role_slot(Role::Prefill), role_slot(Role::Decode));
+    if sides[prefill].is_empty() || sides[decode].is_empty() {
+        return None;
+    }
+    let classes = match carried {
+        Some(carried) => Arc::clone(carried),
+        None => Arc::new(PairClasses::derive(
+            &members(&sides[prefill]),
+            &members(&sides[decode]),
+            mode,
+        )),
+    };
+    for (side, classed) in [(prefill, classes.prefills()), (decode, classes.decodes())] {
+        let ids = sides[side].iter().map(|entry| entry.row.id);
+        debug_assert!(
+            classed.iter().map(|&(id, _)| id).eq(ids),
+            "the classes are these members'"
+        );
+        for (entry, &(_, class)) in sides[side].iter_mut().zip(classed) {
+            entry.row.pair_class = class;
+        }
+    }
+    Some(classes)
 }
 
 /// One member's row in one pool of the writer's working copy.
@@ -927,21 +1141,31 @@ impl Writer {
     }
 
     /// Publish every world from here on under `spec`, the first at once:
-    /// the standing membership, its rows as they are, under the new
-    /// generation. A number at or under the standing one is refused by
-    /// naming the standing one, and nothing is published: the number only
-    /// rises, so no reader sees a generation and then a lower one. Each
-    /// pool takes the thresholds of the new generation's binding, and every
-    /// engine is judged again under them from what is on file.
+    /// the standing membership under the new generation. A number at or
+    /// under the standing one is refused by naming the standing one, and
+    /// nothing is published: the number only rises, so no reader sees a
+    /// generation and then a lower one. Each pool takes the thresholds of
+    /// the new generation's binding, and every engine is judged again
+    /// under them from what is on file.
+    ///
+    /// The pair classes are derived under the generation's pairing mode.
+    /// A generation of the standing mode keeps the rows' classes; one
+    /// of another mode derives `members`, the standing membership, again by
+    /// the membership write's own door ([`Writer::rebuild`]) and publishes
+    /// once, under the new generation at the standing epoch: the epoch is
+    /// the membership's and the generation the document's, and what is
+    /// derived from both is published under both.
     ///
     /// The generation this one replaces is kept until the next apply, and
     /// the one kept until now is handed back for the caller to let go
     /// outside the store's lock: an engine is freed by the thread that
     /// applies, never by a decider dropping the last world of an old
     /// generation, unless a decider holds a world across two applies.
-    pub(super) fn apply(
+    pub(super) fn apply<'a>(
         &mut self,
         spec: Arc<AppliedSpec>,
+        members: impl Iterator<Item = &'a WorkerRow>,
+        sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
     ) -> Result<(Arc<World>, Option<Arc<AppliedSpec>>), StaleGeneration> {
         let standing = self.spec.generation();
         if spec.generation() <= standing {
@@ -950,10 +1174,16 @@ impl Writer {
                 offered: spec.generation(),
             });
         }
+        let derive = spec.pairing() != self.spec.pairing();
         let before = self.retired.replace(mem::replace(&mut self.spec, spec));
-        self.bind();
-        self.judge_every();
-        Ok((self.publish(), before))
+        let world = if derive {
+            self.rebuild(self.epoch, members, sample_of, Classes::Derive)
+        } else {
+            self.bind();
+            self.judge_every();
+            self.publish()
+        };
+        Ok((world, before))
     }
 
     /// Each pool's thresholds under the standing generation: those of the
@@ -1171,21 +1401,19 @@ impl Writer {
     /// each row with its load record on file, make them the working copy
     /// and publish them through the one door: every pool is new, so the
     /// door copies none, every earlier fold is in the world this returns
-    /// and nothing waits.
+    /// and nothing waits. The pair classes are derived too, or carried
+    /// from the last write where the caller says this one moved no member
+    /// and no offer (`classes`).
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
         members: impl Iterator<Item = &'a WorkerRow>,
         sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
+        classes: Classes,
     ) -> Arc<World> {
-        #[derive(Clone, Copy)]
-        struct Entry {
-            row: Candidate,
-            admitted_micros: u64,
-            local: Option<GatewayId>,
-            own: Overload,
-        }
         let origin = self.origin;
+        // The last write's classes, for a write that moved no offer.
+        let last = (classes == Classes::Carry).then(|| Arc::clone(&self.derived));
         // An engine whose last poll brought no report stays silent across
         // the write: its verdict is not raised again from what is still on
         // file. The word is carried by its members' ids, which the outgoing
@@ -1209,7 +1437,7 @@ impl Writer {
         let mut ranked: Vec<(WorkerId, u32)> = Vec::new();
         // A member names a threshold of its own.
         let mut owned = false;
-        let mut groups: FxHashMap<Box<str>, [Vec<Entry>; ROLES]> = FxHashMap::default();
+        let mut groups: FxHashMap<Box<str>, [Vec<Entry<'a>>; ROLES]> = FxHashMap::default();
         // The members' ids are read by the vetoes alone: a membership write
         // with no veto standing neither collects nor sorts them.
         let standing = !self.vetoes.by_gateway.is_empty();
@@ -1231,6 +1459,7 @@ impl Writer {
             owned |= facts.overload != Overload::default();
             let entry = Entry {
                 row: row_of(member, sample.as_ref(), origin),
+                facts,
                 admitted_micros: micros(origin, member.admitted_at),
                 local: match facts.reachable_from {
                     Reachability::Any => None,
@@ -1247,7 +1476,7 @@ impl Writer {
                 match groups.get_mut(model.as_str()) {
                     Some(sides) => sides[side].push(entry),
                     None => {
-                        let mut sides: [Vec<Entry>; ROLES] = Default::default();
+                        let mut sides: [Vec<Entry<'a>>; ROLES] = Default::default();
                         sides[side].push(entry);
                         groups.insert(model.as_str().into(), sides);
                     }
@@ -1264,13 +1493,21 @@ impl Writer {
         self.places.clear();
         let mut by_model = FxHashMap::default();
         let mut pools = Vec::new();
-        for (model, sides) in groups {
+        for (model, mut sides) in groups {
+            // Every side in id order before a class is derived: the classes
+            // are numbered in it, and each row is built with its class.
+            for entries in &mut sides {
+                entries.sort_unstable_by_key(|entry| (entry.row.id, entry.row.dp_rank));
+            }
+            // The model's classes go on its prefill pool's shape: a model
+            // that has classes has that pool.
+            let carried = last.as_deref().and_then(|last| last.pairs(&model));
+            let mut pairs = pair_up(&mut sides, self.spec.pairing(), carried);
             let mut indexes = [None; ROLES];
-            for (side, mut entries) in sides.into_iter().enumerate() {
+            for (side, entries) in sides.into_iter().enumerate() {
                 if entries.is_empty() {
                     continue;
                 }
-                entries.sort_unstable_by_key(|entry| (entry.row.id, entry.row.dp_rank));
                 let rows: Vec<Candidate> = entries.iter().map(|entry| entry.row).collect();
                 let index = self.working.len() as u32;
                 self.places
@@ -1286,6 +1523,11 @@ impl Writer {
                         .enumerate()
                         .filter_map(|(row, entry)| entry.local.map(|gateway| (row as u32, gateway)))
                         .collect(),
+                    pairs: if side == role_slot(Role::Prefill) {
+                        pairs.take()
+                    } else {
+                        None
+                    },
                 });
                 self.spares.push(None);
                 self.working.push(Working {

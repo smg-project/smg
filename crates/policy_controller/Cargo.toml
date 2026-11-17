@@ -321,5 +321,9 @@ harness = false
 name = "draw"
 harness = false
 
+[[bench]]
+name = "pair_classes"
+harness = false
+
 [lints]
 workspace = true
