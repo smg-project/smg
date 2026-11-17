@@ -13,7 +13,7 @@ use axum::{
 use bytes::Bytes;
 use futures::StreamExt;
 use openai_protocol::messages::{
-    ContentBlock, MessageDeltaUsage, StopReason, ToolUseBlock, ToolUseCaller,
+    ContentBlock, MessageDeltaUsage, ServerToolUsage, StopReason, ToolUseBlock, ToolUseCaller,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -200,19 +200,22 @@ pub(crate) async fn emit_mcp_tool_result(
     true
 }
 
-/// Emit the final `message_delta` and `message_stop` events.
+/// Emit the final `message_delta` and `message_stop` events. The usage is
+/// the loop's: the tokens of every round, and the server tool counts the
+/// rounds reported, left out when none did.
 pub(crate) async fn emit_final(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     enc: &mut SseEncoder,
     stop_reason: Option<&StopReason>,
     total_input_tokens: u32,
     total_output_tokens: u32,
+    server_tool_use: Option<&ServerToolUsage>,
 ) {
     let stop_reason_val = stop_reason
         .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
         .unwrap_or(Value::Null);
 
-    let message_delta = serde_json::json!({
+    let mut message_delta = serde_json::json!({
         "type": "message_delta",
         "delta": {
             "stop_reason": stop_reason_val,
@@ -223,6 +226,10 @@ pub(crate) async fn emit_final(
             "output_tokens": total_output_tokens
         }
     });
+    if let Some(server_tool_use) = server_tool_use {
+        message_delta["usage"]["server_tool_use"] =
+            serde_json::to_value(server_tool_use).unwrap_or(Value::Null);
+    }
 
     if !send_event(tx, enc, "message_delta", &message_delta).await {
         debug!("Failed to send final message_delta — channel closed");
@@ -840,6 +847,55 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The loop's final `message_delta` carries the server tool counts its
+    /// rounds reported beside the token totals, and no `server_tool_use`
+    /// when no round reported one.
+    #[tokio::test]
+    async fn the_final_message_delta_carries_the_loops_server_tool_counts() {
+        async fn final_usage(server_tool_use: Option<&ServerToolUsage>) -> Value {
+            let (tx, mut rx) = mpsc::channel(8);
+            let mut enc = SseEncoder::new();
+            emit_final(
+                &tx,
+                &mut enc,
+                Some(&StopReason::EndTurn),
+                7,
+                3,
+                server_tool_use,
+            )
+            .await;
+            drop(tx);
+            let mut bytes = Vec::new();
+            while let Some(frame) = rx.recv().await {
+                bytes.extend_from_slice(&frame.expect("a frame"));
+            }
+            let events = decode_events(&bytes);
+            let (_, data) = events
+                .iter()
+                .find(|(event, _)| event == "message_delta")
+                .expect("a message_delta");
+            let delta: Value = serde_json::from_str(data).expect("the event's JSON");
+            delta["usage"].clone()
+        }
+
+        let counted = ServerToolUsage {
+            web_search_requests: 1,
+            web_fetch_requests: 2,
+        };
+        assert_eq!(
+            final_usage(Some(&counted)).await,
+            serde_json::json!({
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 2}
+            })
+        );
+        assert_eq!(
+            final_usage(None).await,
+            serde_json::json!({"input_tokens": 7, "output_tokens": 3})
+        );
     }
 
     #[test]

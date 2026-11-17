@@ -11,7 +11,7 @@ use axum::{
     response::Response,
 };
 use bytes::Bytes;
-use openai_protocol::messages::{InputContent, InputMessage, Role};
+use openai_protocol::messages::{InputContent, InputMessage, Role, ServerToolUsage};
 use smg_mcp::McpToolSession;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
@@ -192,6 +192,7 @@ async fn run_tool_loop(
     let mut global_index: u32 = 0;
     let mut total_input_tokens: u32 = 0;
     let mut total_output_tokens: u32 = 0;
+    let mut total_server_tool_use: Option<ServerToolUsage> = None;
     let mut is_first_iteration = true;
     // Reusable SSE encoder shared across every event emitted for this stream.
     let mut encoder = SseEncoder::new();
@@ -223,6 +224,7 @@ async fn run_tool_loop(
             if let Some(input) = usage.input_tokens {
                 total_input_tokens += input;
             }
+            add_server_tool_use(&mut total_server_tool_use, usage.server_tool_use.as_ref());
         }
 
         // Check if we should continue the tool loop
@@ -234,6 +236,7 @@ async fn run_tool_loop(
                     consumed.iteration.stop_reason.as_ref(),
                     total_input_tokens,
                     total_output_tokens,
+                    total_server_tool_use.as_ref(),
                 )
                 .await;
                 return Ok(());
@@ -275,6 +278,23 @@ async fn run_tool_loop(
 
 /// Send a streaming request to the pre-selected worker; `start_time` is the
 /// iteration's start, the duration a failed send is counted with.
+/// A round's server tool counts added to the loop's total, as its tokens
+/// are. The total stays `None` until a round reports its counts, so a loop
+/// whose upstream ran no server tool writes no `server_tool_use`, as the
+/// upstream writes none.
+fn add_server_tool_use(total: &mut Option<ServerToolUsage>, round: Option<&ServerToolUsage>) {
+    let Some(round) = round else {
+        return;
+    };
+    let total = total.get_or_insert_with(ServerToolUsage::default);
+    total.web_search_requests = total
+        .web_search_requests
+        .saturating_add(round.web_search_requests);
+    total.web_fetch_requests = total
+        .web_fetch_requests
+        .saturating_add(round.web_fetch_requests);
+}
+
 async fn send_streaming_request(
     router: &RouterContext,
     req_ctx: &RequestContext,
@@ -361,6 +381,32 @@ mod tests {
         anthropic::worker::probe::{counted_failure, series_line},
         test_support::upstream,
     };
+
+    /// The loop's server tool counts are the sum of the rounds that reported
+    /// theirs: a fetch of a first round is kept when a later round reports
+    /// none, and a loop no round reported for has no total to write.
+    #[test]
+    fn a_rounds_server_tool_counts_add_to_the_loops_total() {
+        let mut total = None;
+        add_server_tool_use(&mut total, None);
+        assert!(total.is_none(), "{total:?}");
+        let fetches = ServerToolUsage {
+            web_search_requests: 0,
+            web_fetch_requests: 2,
+        };
+        let search = ServerToolUsage {
+            web_search_requests: 1,
+            web_fetch_requests: 0,
+        };
+        add_server_tool_use(&mut total, Some(&fetches));
+        add_server_tool_use(&mut total, Some(&search));
+        add_server_tool_use(&mut total, None);
+        let total = total.expect("the rounds' total");
+        assert_eq!(
+            (total.web_search_requests, total.web_fetch_requests),
+            (1, 2)
+        );
+    }
 
     /// An upstream error status ends the iteration with the error the client
     /// is told and one error counted against the model under `backend_error`
