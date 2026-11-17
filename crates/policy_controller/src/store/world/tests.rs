@@ -31,6 +31,7 @@ use crate::{
 
 mod list_room;
 mod mode_and_overload;
+mod repeated_models;
 mod written;
 
 const MODEL: &str = "m";

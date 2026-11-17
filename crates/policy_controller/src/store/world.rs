@@ -1686,22 +1686,27 @@ impl Writer {
                 },
                 own: facts.overload,
             };
-            for (n, model) in facts.models.iter().enumerate() {
-                // A model listed twice is one pool's one row.
-                if facts.models[..n].contains(model) {
-                    continue;
-                }
-                let side = role_slot(facts.role);
+            let side = role_slot(facts.role);
+            for model in &facts.models {
                 match groups.get_mut(model.as_str()) {
-                    Some(sides) => sides[side].push(entry),
+                    // A model listed twice is one pool's one row. A member's
+                    // entry is the last of its side until the next member is
+                    // read, so an earlier listing is found there: no model
+                    // before this one is read again.
+                    Some(sides) => {
+                        let list = &mut sides[side];
+                        if list.last().is_none_or(|last| last.row.id != member.id) {
+                            list.push(entry);
+                        }
+                    }
                     None => {
                         // Each side takes room for its pool's last members
                         // and the one this write may add.
                         let before = self.derived.by_model.get(model.as_str());
-                        let standing = before.map_or([0; ROLES], |pools| {
+                        let room = before.map_or([0; ROLES], |pools| {
                             pools.map(|pool| self.derived.members(pool))
                         });
-                        let mut sides: [Vec<Entry<'a>>; ROLES] = standing.map(list_of);
+                        let mut sides: [Vec<Entry<'a>>; ROLES] = room.map(list_of);
                         sides[side].push(entry);
                         groups.insert(model.as_str().into(), sides);
                     }
