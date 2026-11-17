@@ -214,6 +214,16 @@ impl Row {
         });
         self.held = self.vetoes.values().map(Vec::len).sum();
     }
+
+    /// The ends of workers whose rows left since they were noted go: the
+    /// store shows no veto of `gateway` on them. One question a noted
+    /// worker, asked where a gateway's ceiling stands in the way of a frame
+    /// and nowhere else.
+    fn left(&mut self, store: &MemoryStore, gateway: GatewayId, now: Instant) {
+        self.vetoes
+            .retain(|worker, _| store.vetoed(gateway, *worker, now));
+        self.held = self.vetoes.values().map(Vec::len).sum();
+    }
 }
 
 impl Seat {
@@ -512,8 +522,13 @@ impl Gateways {
                         break Vetoed::Full;
                     }
                     // One veto more than a gateway holds, once the ends
-                    // past their instants are out of the count.
+                    // past their instants are out of the count, and then
+                    // the ends of rows that left: the ceiling counts the
+                    // vetoes the store shows.
                     row.prune(now);
+                    if row.held + ends.len() >= VETOES_MAX {
+                        row.left(&self.store, gateway, now);
+                    }
                     if row.held + ends.len() >= VETOES_MAX {
                         break Vetoed::Over;
                     }
@@ -1657,6 +1672,42 @@ pub(crate) mod tests {
         );
         assert!(store.vetoed(A, one_more, t0 + 5 * S));
         assert_eq!(gateways.kept(A), VETOES_MAX - KINDS_MAX + 1);
+        drop(seat);
+    }
+
+    /// A gateway's ceiling counts the vetoes the store shows: the ends of
+    /// workers whose rows left go before the refusal, and the frame that
+    /// would set one more is taken.
+    #[test]
+    fn a_gateways_ceiling_counts_no_end_of_a_row_that_left() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let kinds = i32::try_from(KINDS_MAX).expect("a small number");
+        let workers: Vec<WorkerId> = (0..VETOES_MAX / KINDS_MAX)
+            .map(|n| worker(&store, &format!("http://w{n}:8000")))
+            .collect();
+        let list: Vec<(WorkerId, i32, Instant)> = workers
+            .iter()
+            .flat_map(|&w| (1..=kinds).map(move |kind| (w, kind, t0 + 60 * S)))
+            .collect();
+        assert_eq!(seat.restore(&list, t0), VETOES_MAX);
+        // Every row but the first leaves, and its vetoes with it: the note
+        // still holds their ends.
+        for &w in &workers[1..] {
+            let revision = WorkersStore::get(&*store, w).expect("the row").revision;
+            WorkersStore::remove(&*store, w, revision).expect("removed");
+        }
+        assert_eq!(gateways.kept(A), VETOES_MAX);
+
+        // One veto more, on a worker that holds none: the ends of the rows
+        // that left go, and the veto is shown.
+        let one_more = worker(&store, "http://one-more:8000");
+        assert_eq!(
+            seat.veto(one_more, BREAKER, Some(t0 + 60 * S), t0 + S),
+            Vetoed::Shown
+        );
+        assert!(store.vetoed(A, one_more, t0 + S));
+        assert_eq!(gateways.kept(A), KINDS_MAX + 1);
         drop(seat);
     }
 
