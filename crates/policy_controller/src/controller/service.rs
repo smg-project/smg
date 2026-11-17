@@ -338,6 +338,27 @@ struct Any {
     value: Vec<u8>,
 }
 
+/// The refusal of a replica that does not lead, under `code` and `message`.
+/// Its details are a `google.rpc.Status`, the form every gRPC client decodes
+/// them as: it says both again and holds a `NotLeader` that names the
+/// holder's address; an empty one says no leader is known.
+pub(crate) fn not_leader(code: Code, message: impl Into<String>, leader_address: String) -> Status {
+    let message = message.into();
+    let named = proto::NotLeader {
+        leader_address,
+        successor_id: String::new(),
+    };
+    let details = RpcStatus {
+        code: code as i32,
+        message: message.clone(),
+        details: vec![Any {
+            type_url: "type.googleapis.com/smg.policy.v1.NotLeader".to_owned(),
+            value: named.encode_to_vec(),
+        }],
+    };
+    Status::with_details(code, message, details.encode_to_vec().into())
+}
+
 /// One listener's instance of the service.
 pub(crate) struct Service {
     /// The scopes this listener mounts.
@@ -441,23 +462,8 @@ impl Service {
             }
             return Err(Status::unavailable(NOT_IN_TERM));
         }
-        let named = proto::NotLeader {
-            leader_address: self.leader_info(now).address,
-            successor_id: String::new(),
-        };
-        let details = RpcStatus {
-            code: code as i32,
-            message: message.to_owned(),
-            details: vec![Any {
-                type_url: "type.googleapis.com/smg.policy.v1.NotLeader".to_owned(),
-                value: named.encode_to_vec(),
-            }],
-        };
-        Err(Status::with_details(
-            code,
-            message,
-            details.encode_to_vec().into(),
-        ))
+        let holder = self.leader_info(now).address;
+        Err(not_leader(code, message, holder))
     }
 
     /// The `Leader` call's answer at `now`: [`Shared::leader`] at one read

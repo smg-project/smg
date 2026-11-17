@@ -552,7 +552,9 @@ message WorkerRow {
   HealthPolicy health_policy = 25;
   // How long ago the row was admitted, at the send. Set in a snapshot's
   // rows, where a standby restores the instant from it; 0 in an event's
-  // row, which is admitted where it is applied.
+  // row. A row an event adds, a new worker's or a replacement's, is
+  // admitted where it is applied; a row an event changes keeps the
+  // admission its standby holds.
   uint64 admitted_age_ms = 26;
 }
 
@@ -1131,7 +1133,10 @@ message ReplicaHello {
   uint64 last_applied_seq = 2;
   // The highest term seen: the fencing floor, not the term of any position.
   uint64 term_seen = 3;
-  // Events the standby can hold unacknowledged; the leader cuts a slower one.
+  // Events the standby can hold unacknowledged. The leader sends it no
+  // further, and tells a standby that leaves the bound full for a second
+  // to resync. Zero asks for the leader's own bound, and a bound above
+  // the leader's is cut to it.
   uint32 max_backlog = 4;
   // The term the event at `last_applied_seq` was written under. A leader
   // continues a standby only when its log holds `last_applied_seq` under
