@@ -44,7 +44,7 @@ pub use kv::{
 };
 pub use load::{
     capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity},
-    monitor::{WorkerLoadManager, WorkerMonitor},
+    monitor::{LoadConsumer, WorkerLoadManager, WorkerMonitor},
 };
 // Re-export UNKNOWN_MODEL_ID from protocols
 pub use openai_protocol::UNKNOWN_MODEL_ID;
