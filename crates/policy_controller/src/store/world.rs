@@ -488,9 +488,10 @@ fn with_veto(
 
 /// The gateways' vetoes as the writer keeps them: per gateway its vetoed
 /// workers by id, each until an instant. Replaced whole at each of the
-/// three writes that change them, all rare: a veto's write, a membership
-/// write that takes a departed worker's vetoes with its row, and a window's
-/// publication that drops a veto past its end. A world carries what is
+/// four writes that change them, all rare: a veto's write, a gateway's
+/// leaving that takes its whole list, a membership write that takes a
+/// departed worker's vetoes with its row, and a window's publication that
+/// drops a veto past its end. A world carries what is
 /// derived from them: each pool's runs by gateway ([`PoolVetoes`]).
 #[derive(Debug, Default)]
 struct Vetoes {
@@ -2308,6 +2309,21 @@ impl Writer {
         let vetoes = self.vetoes.with(gateway, id, until)?;
         self.vetoes = Arc::new(vetoes);
         self.write_veto(gateway, id, until);
+        Some(self.publish())
+    }
+
+    /// Lift every veto of `gateway` and publish at once: the gateway is
+    /// gone past its grace period. Every pool's runs are built again, as
+    /// for a membership write. `None` when the gateway held no veto.
+    #[must_use]
+    pub(super) fn drop_gateway(&mut self, gateway: GatewayId) -> Option<Arc<World>> {
+        if !self.vetoes.by_gateway.contains_key(&gateway) {
+            return None;
+        }
+        let mut by_gateway = self.vetoes.by_gateway.clone();
+        by_gateway.remove(&gateway);
+        self.vetoes = Arc::new(Vetoes { by_gateway });
+        self.derive_vetoes();
         Some(self.publish())
     }
 
