@@ -385,6 +385,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   them, as the engines' own chat utils build it. Breaking: `ChatMessage::Assistant` gains the
   fields `refusal: Option<String>`, `audio: Option<ChatAssistantAudio>` and
   `function_call: Option<FunctionCallResponse>`.
+- A Realtime `response.create`'s input may reference an item already in the session,
+  `{"type": "item_reference", "id": ...}`, as the public API takes it: such an input was refused as
+  an unknown conversation item variant. `RealtimeResponseCreateParams.input` holds the new
+  `RealtimeResponseInputItem`, a conversation item or a `RealtimeItemReference`; a reference is
+  taken there only, as the API takes it, not as a new conversation item. Breaking: `input` changes
+  type.
 - A GLM-5.3 request with a `minimal`, `medium` or `xhigh` effort is served. The profile reads the
   name as `low`, `high` or `max`, as z.ai does, in `reasoning_effort` and in `thinking.effort`.
   Since 1.11.0 the profile refused those names with `reasoning_effort_not_allowed`, and `medium`
