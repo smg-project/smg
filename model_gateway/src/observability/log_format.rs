@@ -51,7 +51,8 @@ pub const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 const ENTRY_SEPARATOR: char = '\x1f';
 
 /// The timestamp of every line: [`TIME_FORMAT`] of the UTC clock, written
-/// from the clock's fields instead of through a pattern parsed per line.
+/// from the clock's fields, digit by digit, instead of through a pattern
+/// parsed per line.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UtcSeconds;
 
@@ -61,17 +62,38 @@ impl FormatTime for UtcSeconds {
     }
 }
 
+/// The nineteen characters of a timestamp in one write. Padding six numbers
+/// through the formatting machinery took a third of a line's work, and every
+/// line carries a timestamp. A year of other than four digits keeps the
+/// formatter, whose text this is for every other year.
 fn write_utc_seconds(w: &mut impl fmt::Write, time: DateTime<Utc>) -> fmt::Result {
-    write!(
-        w,
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        time.year(),
-        time.month(),
-        time.day(),
-        time.hour(),
-        time.minute(),
-        time.second()
-    )
+    let (month, day) = (time.month(), time.day());
+    let (hour, minute, second) = (time.hour(), time.minute(), time.second());
+    let Ok(year @ 0..=9999) = u32::try_from(time.year()) else {
+        let year = time.year();
+        return write!(
+            w,
+            "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
+        );
+    };
+    let [y3, y2] = two_digits(year / 100);
+    let [y1, y0] = two_digits(year % 100);
+    let [m1, m0] = two_digits(month);
+    let [d1, d0] = two_digits(day);
+    let [h1, h0] = two_digits(hour);
+    let [n1, n0] = two_digits(minute);
+    let [s1, s0] = two_digits(second);
+    let text = [
+        y3, y2, y1, y0, b'-', m1, m0, b'-', d1, d0, b' ', h1, h0, b':', n1, n0, b':', s1, s0,
+    ];
+    // Digits and punctuation are always UTF-8.
+    str::from_utf8(&text).map_or(Err(fmt::Error), |text| w.write_str(text))
+}
+
+/// The two decimal digits of `value`, which is under 100.
+fn two_digits(value: u32) -> [u8; 2] {
+    // Both operands are under 10, so the casts keep them.
+    [b'0' + (value / 10 % 10) as u8, b'0' + (value % 10) as u8]
 }
 
 /// The span-field format of the JSON layer: a span's entries, each
@@ -993,6 +1015,65 @@ mod tests {
             let mut written = String::new();
             write_utc_seconds(&mut written, time).expect("writes");
             assert_eq!(written, time.format(TIME_FORMAT).to_string());
+        }
+    }
+
+    /// The text the formatting machinery gives for `time`: the writer the
+    /// digit writer replaced, kept to be compared against.
+    fn through_the_formatter(time: DateTime<Utc>) -> String {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            time.year(),
+            time.month(),
+            time.day(),
+            time.hour(),
+            time.minute(),
+            time.second()
+        )
+    }
+
+    #[test]
+    fn the_timestamp_is_the_formatters_text_at_every_instant() {
+        // Seconds since 1970 and the sub-second part: the turn of a day, of
+        // a year and of a century, a leap day, the last second of a month,
+        // instants before 1970 and before the year 1, the first year of
+        // five digits and a leap second.
+        let mut instants: Vec<(i64, u32)> = vec![
+            (0, 0),
+            (-1, 0),
+            (59, 0),
+            (60, 0),
+            (86_399, 0),
+            (86_400, 0),
+            (946_684_799, 0),
+            (946_684_800, 0),
+            (951_782_400, 0),
+            (951_868_799, 0),
+            (1_709_251_199, 0),
+            (1_735_689_599, 0),
+            (1_735_689_600, 0),
+            (4_102_444_799, 0),
+            (253_402_300_799, 0),
+            (253_402_300_800, 0),
+            (-62_135_596_800, 0),
+            (-62_167_219_200, 0),
+            (-62_167_219_201, 0),
+            (1_483_228_799, 1_500_000_000),
+        ];
+        // A sub-second part of every width.
+        instants.extend((0..9).map(|width| (1_700_000_000, 7 * 10u32.pow(width))));
+        // A day, an hour, a minute and a second further at every step, from
+        // 1969 to 2026: every month, day, hour, minute and second.
+        instants.extend((0..20_000).map(|step| (-31_536_000 + step * 90_061, 0)));
+        for (seconds, nanoseconds) in instants {
+            let time = DateTime::<Utc>::from_timestamp(seconds, nanoseconds).expect("a valid time");
+            let mut written = String::new();
+            write_utc_seconds(&mut written, time).expect("writes");
+            assert_eq!(
+                written,
+                through_the_formatter(time),
+                "{seconds} {nanoseconds}"
+            );
         }
     }
 
