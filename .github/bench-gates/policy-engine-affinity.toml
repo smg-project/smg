@@ -50,6 +50,8 @@
 
 # Count: `count = true`, as policy-engine.toml records it. Read on this file's 6 ids, the same work with cold
 # code ahead of the decision (never committed): all 6 count the same in every batch after the first.
+# The three `decide/` ids time a whole decision and carry `whole_pass = true`, as policy-engine.toml
+# records it: two of them are the ids its note names, 15.2 and 11.9 % slower on 2 and 6 instructions more.
 repeats = 3
 count = true
 # The count ends 2,280 s into the run: the gate step's bound is 40 minutes, and the report is written
@@ -71,6 +73,7 @@ sources = [
 [[gate]]
 pattern = "^policy_affinity/decide/"
 threshold = 0.10
+whole_pass = true
 note = "identical build 0.1 - 1.6 % on the hosted runner, 1.4 - 7.4 % on the build host"
 
 [[gate]]
