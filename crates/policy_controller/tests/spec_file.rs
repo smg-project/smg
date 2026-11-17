@@ -53,6 +53,7 @@ use smg_policy_controller::{
     },
 };
 use tempfile::TempDir;
+use tokio::time;
 use tonic::{metadata::AsciiMetadataValue, Code, Request, Response, Status};
 
 const BIN: &str = env!("CARGO_BIN_EXE_smg-policy-controller");
@@ -145,21 +146,23 @@ async fn until<T: Debug, F: Future<Output = T>>(
     mut probe: impl FnMut() -> F,
     met: impl Fn(&T) -> bool,
 ) -> Result<T, String> {
-    let started = Instant::now();
+    // The runtime's clock: a case that holds it passes the room at once.
+    let started = time::Instant::now();
     let mut last = None;
     loop {
         let left = ROOM.saturating_sub(started.elapsed());
-        let Ok(answer) = tokio::time::timeout(left, probe()).await else {
+        if left.is_zero() {
+            // The room ran out between two probes: the last one answered.
+            return Err(format!("not met in {ROOM:?}; the last answer: {last:?}"));
+        }
+        let Ok(answer) = time::timeout(left, probe()).await else {
             return Err(format!("no answer in {ROOM:?}; the last one: {last:?}"));
         };
         if met(&answer) {
             return Ok(answer);
         }
-        if started.elapsed() > ROOM {
-            return Err(format!("not met in {ROOM:?}; the last answer: {answer:?}"));
-        }
         last = Some(answer);
-        tokio::time::sleep(PACE).await;
+        time::sleep(PACE).await;
     }
 }
 
@@ -167,11 +170,29 @@ async fn until<T: Debug, F: Future<Output = T>>(
 /// clock is held, so the room passes at once.
 #[tokio::test(start_paused = true)]
 async fn a_probe_that_never_answers_ends_its_wait_at_the_rooms_end() {
-    let waited = tokio::time::timeout(2 * ROOM, until(std::future::pending::<u8>, |_| true))
+    let waited = time::timeout(2 * ROOM, until(std::future::pending::<u8>, |_| true))
         .await
         .expect("the wait ends inside twice its room");
     let told = waited.expect_err("no probe answered");
     assert!(told.starts_with("no answer in"), "{told}");
+}
+
+/// A probe that answers and is never met ends its wait at the room's end by
+/// that name, with its last answer: a room that ran out between two probes
+/// is not told as a probe with no answer. The probe takes a pace, as a call
+/// does, and the clock is held.
+#[tokio::test(start_paused = true)]
+async fn a_probe_never_met_ends_its_wait_by_its_last_answer() {
+    let probe = || async {
+        time::sleep(PACE).await;
+        7_u8
+    };
+    let waited = time::timeout(2 * ROOM, until(probe, |_| false))
+        .await
+        .expect("the wait ends inside twice its room");
+    let told = waited.expect_err("no answer was met");
+    assert!(told.starts_with("not met in"), "{told}");
+    assert!(told.ends_with("Some(7)"), "{told}");
 }
 
 /// The standing document once the read call answers it as `generation`.
