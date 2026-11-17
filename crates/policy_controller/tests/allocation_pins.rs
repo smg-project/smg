@@ -440,6 +440,54 @@ fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
 }
 
 #[test]
+fn a_write_that_moves_an_offer_allocates_what_a_write_that_moves_none_does() {
+    // Pairs that name no runtime. One prefill names its runtime and unnames
+    // it in turn, which moves its offer at every write and no class: the
+    // writer derives for that worker alone from what it keeps, and hands
+    // back the classes it had.
+    for n in [8_usize, 64] {
+        let store = MemoryStore::new();
+        let facts_of = |index: usize, runtime: &str| {
+            let (role, key) = if index < n {
+                (Role::Prefill, format!("grpc://p{index}:9000"))
+            } else {
+                (Role::Decode, format!("grpc://d{index}:9000"))
+            };
+            WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                role,
+                wire_modes: WireModes::GRPC,
+                engine_kind: runtime.to_string(),
+                models: vec!["m".to_string()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            }
+        };
+        for index in 0..2 * n {
+            store.upsert(facts_of(index, ""));
+        }
+        // The fewest allocation calls of one write among a few: the store's
+        // change log grows by doubling, and one write in many pays for it.
+        let fewest = |runtimes: [&str; 2]| {
+            let one = |turn: usize| {
+                let facts = facts_of(n / 2, runtimes[turn % 2]);
+                allocations_during(|| store.upsert(facts)).1
+            };
+            (0..8).map(one).min()
+        };
+        // The first writes size what the writer keeps of the derivation.
+        fewest(["rt-b", ""]);
+        let (kept, moved) = (fewest(["", ""]), fewest(["rt-b", ""]));
+        assert_eq!(
+            moved, kept,
+            "{n} a side: the written worker's derive allocated"
+        );
+    }
+}
+
+#[test]
 fn a_record_inside_the_window_allocates_nothing_and_a_publication_derives_nothing() {
     let (store, ids, opened) = store_of(64);
     // Inside the window the store's making opened: on file and folded,

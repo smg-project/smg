@@ -28,6 +28,7 @@ use crate::{
 };
 
 mod mode_and_overload;
+mod written;
 
 const MODEL: &str = "m";
 const ASKER: GatewayId = GatewayId(1);
