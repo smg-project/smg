@@ -17,8 +17,8 @@ use crate::{
     proto::{self, worker_event::Event},
     replication::{Entry, Event as Written},
     store::{
-        HealthPolicy, LoadSample, MembershipChange, Overload, Reachability, Signals, WorkerFacts,
-        WorkerPatch, WorkerRow, WorkerStatus,
+        HealthPolicy, LoadSample, MembershipChange, Overload, Position, Reachability, Signals,
+        WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
     },
     view::{Role, SignalSource, WireModes, WorkerId},
 };
@@ -32,6 +32,34 @@ pub(crate) struct Refused {
 
 const fn refused(path: &'static str, why: &'static str) -> Refused {
     Refused { path, why }
+}
+
+/// What a new row names itself: its wire, and its role.
+const NEW_WIRE: Refused = refused("spec.wire", "a new row names its one wire");
+const NEW_ROLE: Refused = refused("spec.role", "a new row names its role");
+
+/// The models a watch names, held to a row's own bounds: the list a peer
+/// sends is kept for its stream's life and read at each row.
+pub(crate) fn watched(models: &[String]) -> Result<(), Refused> {
+    if models.len() > MODELS {
+        return Err(refused("models", "a watch names at most 128 model ids"));
+    }
+    if models.iter().any(|model| model.len() > NAME_BYTES) {
+        return Err(refused("models", "a model id is at most 256 bytes"));
+    }
+    if models.iter().any(|model| model.is_empty() || blank(model)) {
+        return Err(refused(
+            "models",
+            "a model id is not empty and holds no blank and no control character",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `refusal` is a rule of a new row alone, and so no rule of a call
+/// that makes no row.
+pub(crate) fn of_a_new_row(refusal: &Refused) -> bool {
+    *refusal == NEW_WIRE || *refusal == NEW_ROLE
 }
 
 /// The bounds of what a row states (contract: `WorkerSpec`). A row tells
@@ -224,8 +252,8 @@ pub(crate) fn status_changed(id: WorkerId, from: WorkerStatus, to: WorkerStatus)
     })
 }
 
-/// The event in its envelope: the log position it was written at (`0` while
-/// no log numbers one), the membership epoch and the leader's term.
+/// The event in its envelope: a position of the log, the membership epoch
+/// and the term the position was written under.
 pub(crate) fn event(
     event: Event,
     seq: u64,
@@ -319,6 +347,29 @@ fn label(name: &str, value: &str, path: &'static str) -> Result<(), Refused> {
     Ok(())
 }
 
+/// One page of a snapshot: `workers` as the write at `at` left them, and
+/// `last` on the page that ends it. Every page of one snapshot carries that
+/// position.
+pub(crate) fn page(
+    workers: Vec<proto::WorkerRow>,
+    last: bool,
+    at: Position,
+    membership_epoch: u64,
+) -> proto::WorkerEvent {
+    let snapshot = proto::WorkerSnapshot { workers, last };
+    event(Event::Snapshot(snapshot), at.seq, membership_epoch, at.term)
+}
+
+/// The word to a watcher whose place the log does not hold, under no
+/// position of its own: `floor` is the place before the oldest event the
+/// log retains.
+pub(crate) fn start_again(floor: Position) -> proto::WorkerEvent {
+    let word = proto::SnapshotRequired {
+        oldest_seq: floor.seq + 1,
+    };
+    event(Event::SnapshotRequired(word), 0, 0, 0)
+}
+
 /// Whether a stated name holds a blank or a control character.
 fn blank(name: &str) -> bool {
     name.chars().any(|c| c.is_whitespace() || c.is_control())
@@ -348,7 +399,9 @@ pub(crate) fn member(entry: &Entry) -> Option<proto::WorkerEvent> {
             replaced(old, new, new.status != WorkerStatus::Pending)
         }
         (MembershipChange::Removed { .. }, _, Some(last)) => removed(last),
-        (MembershipChange::StatusChanged { id, from, to }, ..) => status_changed(id, from, to),
+        (MembershipChange::StatusChanged { id, from, to }, Some(_), _) => {
+            status_changed(id, from, to)
+        }
         _ => return None,
     };
     Some(event(told, entry.at.seq, *epoch, entry.at.term))
@@ -511,9 +564,12 @@ fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<Work
             "a model id is not empty and holds no blank and no control character",
         ));
     }
+    // A wire or a role left unsaid is the standing row's. A new row names
+    // both, and is told so after every field's own rule: a field past its
+    // bound is refused as itself, whether a row stands or not.
     let wire_modes = match proto::WireMode::try_from(spec.wire) {
-        Ok(proto::WireMode::Http) => WireModes::HTTP,
-        Ok(proto::WireMode::Grpc) => WireModes::GRPC,
+        Ok(proto::WireMode::Http) => Some(WireModes::HTTP),
+        Ok(proto::WireMode::Grpc) => Some(WireModes::GRPC),
         // A host-local wire is reachable from the one gateway that holds its
         // socket, and no field of a registration names a gateway.
         Ok(proto::WireMode::Zmq) => {
@@ -522,23 +578,15 @@ fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<Work
                 "a host-local wire is one gateway's and a registration names none: not served by this build",
             ));
         }
-        // Left unsaid, the wire is the standing row's.
-        Ok(proto::WireMode::Unspecified) => match standing {
-            Some(row) => row.wire_modes,
-            None => return Err(refused("spec.wire", "a new row names its one wire")),
-        },
+        Ok(proto::WireMode::Unspecified) => standing.map(|row| row.wire_modes),
         Err(_) => return Err(refused("spec.wire", "a wire this build does not know")),
     };
     let role = match proto::Role::try_from(spec.role) {
-        Ok(proto::Role::Single) => Role::Single,
-        Ok(proto::Role::Prefill) => Role::Prefill,
-        Ok(proto::Role::Decode) => Role::Decode,
-        Ok(proto::Role::Encode) => Role::Encode,
-        // And so is the role.
-        Ok(proto::Role::Unspecified) => match standing {
-            Some(row) => row.role,
-            None => return Err(refused("spec.role", "a new row names its role")),
-        },
+        Ok(proto::Role::Single) => Some(Role::Single),
+        Ok(proto::Role::Prefill) => Some(Role::Prefill),
+        Ok(proto::Role::Decode) => Some(Role::Decode),
+        Ok(proto::Role::Encode) => Some(Role::Encode),
+        Ok(proto::Role::Unspecified) => standing.map(|row| row.role),
         Err(_) => return Err(refused("spec.role", "a role this build does not know")),
     };
     if spec.dp_size > 1 {
@@ -572,8 +620,6 @@ fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<Work
         facts.engine.clone_from(&spec.url);
         facts.dp_size = 1;
     }
-    facts.role = role;
-    facts.wire_modes = wire_modes;
     if !spec.runtime.is_empty() {
         facts.engine_kind.clone_from(&spec.runtime);
     }
@@ -636,7 +682,11 @@ fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<Work
             scrape_interval_ms: signals.scrape_interval_ms,
         };
     }
-    // The row whole, last: each field is within its own bound here.
+    // Each field is within its own bound here. What a new row leaves
+    // unnamed is told next, and the row whole last: only a row that can be
+    // made has a size.
+    facts.wire_modes = wire_modes.ok_or(NEW_WIRE)?;
+    facts.role = role.ok_or(NEW_ROLE)?;
     fits(&facts, &facts.labels, "spec")?;
     Ok(facts)
 }
@@ -782,9 +832,9 @@ mod tests {
     use prost::Message as _;
 
     use super::{
-        event, load, member, patch, refused, registration, removed, replaced, replication, row,
-        status, status_changed, Refused, KEY_BYTES, LABELS, MODELS, NAME_BYTES, ROW_BYTES,
-        URL_BYTES, VALUE_BYTES,
+        event, load, member, page, patch, refused, registration, removed, replaced, replication,
+        row, start_again, status, status_changed, Refused, KEY_BYTES, LABELS, MODELS, NAME_BYTES,
+        ROW_BYTES, URL_BYTES, VALUE_BYTES,
     };
     use crate::{
         proto::{self, replication_event::Event as Sent, worker_event::Event},
@@ -1017,9 +1067,9 @@ mod tests {
         );
         let change = status_changed(identity(URL, 1), WorkerStatus::Pending, WorkerStatus::Ready);
         assert_eq!(
-            event(change, 0, 9, 4),
+            event(change, 12, 9, 4),
             proto::WorkerEvent {
-                seq: 0,
+                seq: 12,
                 membership_epoch: 9,
                 event: Some(Event::Status(proto::StatusChanged {
                     worker_id: identity(URL, 1).0,
@@ -1028,6 +1078,137 @@ mod tests {
                     health: proto::HealthFlag::Healthy as u32,
                 })),
                 term: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn a_log_entry_of_each_membership_write_has_its_case_at_the_entrys_place() {
+        let old = full();
+        let new = WorkerRow {
+            id: identity(URL, 4),
+            status: WorkerStatus::Ready,
+            revision: old.revision + 3,
+            ..full()
+        };
+        let at = Position { seq: 9, term: 4 };
+        let entry = |change, row: Option<&WorkerRow>, left: Option<&WorkerRow>| Entry {
+            at,
+            event: Written::Member {
+                epoch: 6,
+                change,
+                row: row.cloned().map(Arc::new),
+                left: left.cloned().map(Arc::new),
+            },
+        };
+        let told = |entry: &Entry| {
+            let sent = member(entry).expect("a membership event");
+            assert_eq!((sent.seq, sent.membership_epoch, sent.term), (9, 6, 4));
+            sent.event.expect("a case")
+        };
+
+        let registered = MembershipChange::Registered { id: new.id };
+        assert_eq!(
+            told(&entry(registered, Some(&new), None)),
+            Event::Registered(row(&new))
+        );
+        for change in [
+            MembershipChange::Relabelled { id: new.id },
+            MembershipChange::Resized { id: new.id },
+        ] {
+            assert_eq!(
+                told(&entry(change, Some(&new), None)),
+                Event::Relabelled(row(&new))
+            );
+        }
+        // The new incarnation's status came over from the old one's, or it
+        // is a fresh row's.
+        let replacement = MembershipChange::Replaced {
+            old: old.id,
+            new: new.id,
+        };
+        assert_eq!(
+            told(&entry(replacement, Some(&new), Some(&old))),
+            replaced(&old, &new, true)
+        );
+        let fresh = WorkerRow {
+            status: WorkerStatus::Pending,
+            ..new.clone()
+        };
+        assert_eq!(
+            told(&entry(replacement, Some(&fresh), Some(&old))),
+            replaced(&old, &fresh, false)
+        );
+        assert_eq!(
+            told(&entry(
+                MembershipChange::Removed { id: old.id },
+                None,
+                Some(&old)
+            )),
+            removed(&old)
+        );
+        // A status change is told with the revision its write left the row
+        // at, the row's own.
+        let (from, to) = (WorkerStatus::Pending, WorkerStatus::Ready);
+        let moved = MembershipChange::StatusChanged {
+            id: new.id,
+            from,
+            to,
+        };
+        assert_eq!(
+            told(&entry(moved, Some(&new), None)),
+            status_changed(new.id, from, to)
+        );
+        // A shape the store never tells, and an entry that is no worker's
+        // event.
+        assert_eq!(member(&entry(registered, None, None)), None);
+        assert_eq!(member(&entry(moved, None, Some(&old))), None);
+        assert_eq!(
+            member(&Entry {
+                at,
+                event: Written::Term
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_page_carries_its_rows_at_the_cuts_place_and_the_word_to_start_again_carries_none() {
+        let first = full();
+        let second = WorkerRow {
+            id: identity(URL, 2),
+            ..full()
+        };
+        let at = Position { seq: 9, term: 4 };
+        assert_eq!(
+            page(vec![row(&first), row(&second)], false, at, 6),
+            proto::WorkerEvent {
+                seq: 9,
+                membership_epoch: 6,
+                event: Some(Event::Snapshot(proto::WorkerSnapshot {
+                    workers: vec![row(&first), row(&second)],
+                    last: false,
+                })),
+                term: 4,
+            }
+        );
+        assert_eq!(
+            page(Vec::new(), true, at, 6).event,
+            Some(Event::Snapshot(proto::WorkerSnapshot {
+                workers: Vec::new(),
+                last: true,
+            }))
+        );
+        // The oldest event the log retains is the one after its floor.
+        assert_eq!(
+            start_again(Position { seq: 40, term: 4 }),
+            proto::WorkerEvent {
+                seq: 0,
+                membership_epoch: 0,
+                event: Some(Event::SnapshotRequired(proto::SnapshotRequired {
+                    oldest_seq: 41,
+                })),
+                term: 0,
             }
         );
     }
@@ -1956,95 +2137,6 @@ mod tests {
         // A replacement's answer carries two rows.
         let answer = event(replaced(&fat, &fat, true), u64::MAX, u64::MAX, u64::MAX);
         assert!(answer.encoded_len() <= 2 * ROW_BYTES + 64);
-    }
-
-    #[test]
-    fn a_log_entry_of_each_membership_write_has_its_case_at_the_entrys_place() {
-        let old = full();
-        let new = WorkerRow {
-            id: identity(URL, 4),
-            status: WorkerStatus::Ready,
-            ..full()
-        };
-        let at = Position { seq: 9, term: 4 };
-        let entry = |change, row: Option<&WorkerRow>, left: Option<&WorkerRow>| Entry {
-            at,
-            event: Written::Member {
-                epoch: 6,
-                change,
-                row: row.cloned().map(Arc::new),
-                left: left.cloned().map(Arc::new),
-            },
-        };
-        let told = |entry: &Entry| {
-            let sent = member(entry).expect("a membership event");
-            assert_eq!((sent.seq, sent.membership_epoch, sent.term), (9, 6, 4));
-            sent.event.expect("a case")
-        };
-
-        let registered = MembershipChange::Registered { id: new.id };
-        assert_eq!(
-            told(&entry(registered, Some(&new), None)),
-            Event::Registered(row(&new))
-        );
-        for change in [
-            MembershipChange::Relabelled { id: new.id },
-            MembershipChange::Resized { id: new.id },
-        ] {
-            assert_eq!(
-                told(&entry(change, Some(&new), None)),
-                Event::Relabelled(row(&new))
-            );
-        }
-        // The new incarnation's status came over from the old one's, or it
-        // is a fresh row's.
-        let replacement = MembershipChange::Replaced {
-            old: old.id,
-            new: new.id,
-        };
-        assert_eq!(
-            told(&entry(replacement, Some(&new), Some(&old))),
-            replaced(&old, &new, true)
-        );
-        let fresh = WorkerRow {
-            status: WorkerStatus::Pending,
-            ..new.clone()
-        };
-        assert_eq!(
-            told(&entry(replacement, Some(&fresh), Some(&old))),
-            replaced(&old, &fresh, false)
-        );
-        assert_eq!(
-            told(&entry(
-                MembershipChange::Removed { id: old.id },
-                None,
-                Some(&old)
-            )),
-            removed(&old)
-        );
-        let (from, to) = (WorkerStatus::Pending, WorkerStatus::Ready);
-        assert_eq!(
-            told(&entry(
-                MembershipChange::StatusChanged {
-                    id: new.id,
-                    from,
-                    to
-                },
-                Some(&new),
-                None
-            )),
-            status_changed(new.id, from, to)
-        );
-        // A shape the store never tells, and an entry that is no worker's
-        // event.
-        assert_eq!(member(&entry(registered, None, None)), None);
-        assert_eq!(
-            member(&Entry {
-                at,
-                event: Written::Term
-            }),
-            None
-        );
     }
 
     #[test]

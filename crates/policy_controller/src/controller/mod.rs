@@ -4,10 +4,10 @@
 //! readiness and the drain. The service answers `Leader`, a gateway's
 //! `Session` and its `Decide` streams, whose decisions run on the
 //! controller's deciding threads, and, on the leader, the control scope's
-//! registration calls, and the run loop sweeps the gateways that are gone;
-//! the scopes' other call bodies arrive with the gateway, ingestion and
-//! control scope PRs, the other ingestion drivers with their move out of
-//! the gateway. In the
+//! registration calls and the gateway scope's watch of the worker rows, and
+//! the run loop sweeps the gateways that are gone; the scopes' other call
+//! bodies arrive with the gateway, ingestion and control scope PRs, the
+//! other ingestion drivers with their move out of the gateway. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document, watches the file and
 //! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
@@ -46,6 +46,7 @@ mod service;
 mod session;
 mod spec_file;
 pub mod tls;
+mod watch_workers;
 mod wire;
 mod worker_wire;
 
@@ -59,7 +60,7 @@ use tokio::{
     time::timeout,
 };
 use tonic::transport::{server::TcpIncoming, Server};
-use tonic_health::ServingStatus;
+use tonic_health::{server::HealthReporter, ServingStatus};
 use tracing::{error, info, warn};
 
 // The Decide call's two bounds, for the reference client: it holds them at
@@ -566,7 +567,11 @@ impl Controller {
     /// of the run loop and after every step of the election, so a fence that
     /// closes between two steps reads `SERVING` until the next; a
     /// registration call reads the fence itself and is refused in that
-    /// window.
+    /// window. An open watch of the rows follows the same telling: it ends
+    /// `ABORTED` when this replica stops leading, an idle one at the next
+    /// step of the election. A lead can open between two steps, and a watch
+    /// admitted before the next one is ended by any telling that finds no
+    /// leader here, the drain's first.
     ///
     /// A listener, an election thread or a deciding thread that ends before
     /// the shutdown ends the serve with its error, the other listeners
@@ -634,37 +639,16 @@ impl Controller {
             });
             reporters.push(reporter);
         }
-        if !doors.is_empty() {
-            // A door's word for the service's name follows the role. This
-            // task is its one writer.
-            let mut role = readiness.clone();
-            let mut stop = stop.subscribe();
-            tasks.spawn(async move {
-                let mut told = None;
-                loop {
-                    let leads = role.state() == State::Leader;
-                    if told != Some(leads) {
-                        let word = if leads {
-                            ServingStatus::Serving
-                        } else {
-                            ServingStatus::NotServing
-                        };
-                        for door in &doors {
-                            door.set_service_status(SERVICE_NAME, word).await;
-                        }
-                        told = Some(leads);
-                    }
-                    tokio::select! {
-                        _ = stop.wait_for(|stop| *stop) => return Ok(()),
-                        moved = role.moved() => {
-                            if moved.is_none() {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-            });
-        }
+        let teller = tell_role(
+            readiness.clone(),
+            stop.subscribe(),
+            doors,
+            shared.role.clone(),
+        );
+        tasks.spawn(async move {
+            teller.await;
+            Ok(())
+        });
         let driver = Arc::new(LoadDriver::new(
             Arc::clone(&store),
             probe,
@@ -849,25 +833,92 @@ impl Controller {
     }
 }
 
+/// Tells the role at each change of it and, at the stop, that this replica
+/// left: every door's word for the service's name follows it, and so does
+/// every open watch of the rows. The serve's one writer of both.
+///
+/// A watch is told that this replica does not lead at every move while it
+/// does not, where a door is told at the change alone. A take with no
+/// holder to wait for leads one renew deadline after its write, between
+/// two steps of the election: the fence admits a watch from that instant,
+/// and until the next step such a watch stands under the word that nobody
+/// leads here. The word told again ends it, the drain's included; told at
+/// the change alone, the drain would leave that watch open to the end of
+/// the grace period.
+async fn tell_role(
+    mut role: Readiness,
+    mut stop: watch::Receiver<bool>,
+    doors: Vec<HealthReporter>,
+    told: watch::Sender<bool>,
+) {
+    let (mut last, mut left) = (None, false);
+    loop {
+        let leads = !left && role.state() == State::Leader;
+        // The watches first: nothing is awaited between the read of the
+        // fence and their word.
+        if leads {
+            told.send_if_modified(|was| !std::mem::replace(was, true));
+        } else {
+            told.send_replace(false);
+        }
+        if last != Some(leads) {
+            let word = if leads {
+                ServingStatus::Serving
+            } else {
+                ServingStatus::NotServing
+            };
+            for door in &doors {
+                door.set_service_status(SERVICE_NAME, word).await;
+            }
+            last = Some(leads);
+        }
+        if left {
+            return;
+        }
+        // At the stop the listeners close next: the loop says once more
+        // that this replica left, then ends. A serve that is gone reads the
+        // same.
+        tokio::select! {
+            _ = stop.wait_for(|stop| *stop) => left = true,
+            moved = role.moved() => left = moved.is_none(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! What no case outside the module reaches: a serve whose election
     //! thread is gone on its own, one whose deciding thread unwound, and a
     //! serve that leaves by a listener's error.
 
-    use std::{future::pending, sync::Arc, thread, time::Duration};
+    use std::{
+        future::pending,
+        sync::Arc,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use axum::serve::Listener as _;
     use tokio::{
         net::{TcpListener, TcpStream},
-        sync::oneshot,
+        sync::{oneshot, watch},
+        task::JoinSet,
         time::timeout,
     };
     use tonic::codegen::tokio_stream::StreamExt as _;
 
-    use super::{config::tests::valid, Controller, Error, Phase};
-    use crate::elector::{
-        ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Written,
+    use super::{
+        config::tests::valid,
+        election::Standing,
+        readiness::{self, Phase},
+        tell_role, Controller, Error,
+    };
+    use crate::{
+        elector::{
+            ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Tick,
+            Written,
+        },
+        store::Kinds,
     };
 
     /// A lease that stores `writes` writes: the thread that steps it panics
@@ -949,6 +1000,20 @@ mod tests {
             .map(|index| deciders.of(&format!("model-{index}")))
             .max();
         assert_eq!(highest, Some(2));
+    }
+
+    /// The bind draws its log's first place: two binds of one configuration
+    /// start apart and under no term, so a place of the run before is no
+    /// place of this run.
+    #[tokio::test]
+    async fn the_bind_draws_its_logs_first_place() {
+        let mut starts = Vec::new();
+        for _ in 0..2 {
+            let controller = Controller::bind(valid()).await.expect("the listeners bind");
+            starts.push(controller.shared.feed.log.head(Kinds::Watched));
+        }
+        assert_ne!(starts[0].seq, starts[1].seq, "two runs start apart");
+        assert!(starts.iter().all(|start| start.seq != 0 && start.term == 0));
     }
 
     /// The thread gone at its take, before the serve read ready, and at its
@@ -1166,5 +1231,150 @@ mod tests {
                 "the lease is released when the serve has returned (by an error: {by_error}): {record:?}"
             );
         }
+    }
+
+    /// The role's one teller over a candidate's own fence: it says that the
+    /// replica leads once it does, that it does not at the step after a
+    /// loss, and at the stop that it left. The candidate is alone over its
+    /// lease, so each take leads at once.
+    #[tokio::test]
+    async fn the_role_is_told_at_each_change_and_as_left_at_the_stop() {
+        let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+            .expect("the default settings are in order");
+        let (steps, stepped) = watch::channel(Standing::default());
+        let (phase, readiness) = readiness::channel(elector.fence(), stepped);
+        let (stop, stopped) = watch::channel(false);
+        let (told, mut role) = watch::channel(false);
+        let mut teller = JoinSet::new();
+        teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
+        let mut told_as = async |leads: bool| {
+            let reached =
+                timeout(Duration::from_secs(5), role.wait_for(|told| *told == leads)).await;
+            assert!(
+                matches!(reached, Ok(Ok(_))),
+                "the role was not told as {leads}"
+            );
+        };
+
+        // Serving, and the lease taken: the step after it tells the role.
+        phase.send_replace(Phase::Serving);
+        assert!(matches!(
+            elector.tick(Instant::now()),
+            Ok(Tick::Acquired { .. })
+        ));
+        steps.send_replace(Standing::default());
+        told_as(true).await;
+        // The lease let go with no stop: told at the next step.
+        assert!(elector.release().expect("a release"));
+        steps.send_replace(Standing::default());
+        told_as(false).await;
+        // Taken again, then the stop: the replica left, and the teller ends.
+        assert!(matches!(
+            elector.tick(Instant::now()),
+            Ok(Tick::Acquired { .. })
+        ));
+        steps.send_replace(Standing::default());
+        told_as(true).await;
+        stop.send_replace(true);
+        told_as(false).await;
+        assert!(
+            teller.join_next().await.is_some(),
+            "the teller ends at the stop"
+        );
+    }
+
+    /// A serve whose lead opened with no step of the election since: the
+    /// take of a lease with no holder to wait for leads one renew deadline
+    /// after its write, between two steps. The fence admits a watch from
+    /// that instant, and the word such a watch finds still says that nobody
+    /// leads here.
+    struct Unstepped {
+        elector: Elector,
+        steps: watch::Sender<Standing>,
+        phase: watch::Sender<Phase>,
+        /// The role's word, as a watch admitted now holds it.
+        watch: watch::Receiver<bool>,
+        /// The serve's stop, never said, and the teller's task.
+        _serve: (watch::Sender<bool>, JoinSet<()>),
+    }
+
+    impl Unstepped {
+        async fn new() -> Self {
+            let settings = ElectionSettings {
+                duration: Duration::from_millis(1500),
+                renew_period: Duration::from_millis(100),
+                renew_deadline: Duration::from_millis(500),
+            };
+            let mut elector = Elector::new(
+                Box::new(MemoryLease::new()),
+                "controller-0@127.0.0.1:1",
+                settings,
+            )
+            .expect("the settings are in order");
+            let (steps, stepped) = watch::channel(Standing::default());
+            let (phase, readiness) = readiness::channel(elector.fence(), stepped);
+            let (stop, stopped) = watch::channel(false);
+            let (told, role) = watch::channel(false);
+            let mut teller = JoinSet::new();
+            teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
+
+            // The take, and a renewal just short of its lead's opening that
+            // keeps the fence open most of a renew deadline past it: the
+            // step's telling finds a follower.
+            phase.send_replace(Phase::Serving);
+            let taken = Instant::now();
+            assert_eq!(
+                elector.tick(taken).expect("the take"),
+                Tick::Acquired { term: 1 }
+            );
+            let renewed = taken + settings.renew_deadline - Duration::from_millis(10);
+            assert_eq!(
+                elector.tick(renewed).expect("the renewal"),
+                Tick::Renewed { term: 1 }
+            );
+            steps.send_replace(Standing::default());
+            // The lead opens by itself and the fence admits a watch. No step
+            // came since: the word the watch finds says that nobody leads.
+            tokio::time::sleep(settings.renew_deadline).await;
+            assert_eq!(elector.fence().leader_term(Instant::now()), Some(1));
+            let mut watch = role.clone();
+            assert!(!*watch.borrow_and_update());
+            Self {
+                elector,
+                steps,
+                phase,
+                watch,
+                _serve: (stop, teller),
+            }
+        }
+
+        /// The watch is told again that nobody leads here.
+        async fn hears(&mut self, what: &str) {
+            let heard = timeout(Duration::from_secs(5), self.watch.changed()).await;
+            assert!(
+                matches!(heard, Ok(Ok(()))),
+                "{what} was not told to a watch that stood under the word: {heard:?}"
+            );
+            assert!(!*self.watch.borrow());
+        }
+    }
+
+    /// A watch admitted before any step told the role as leading stands
+    /// under the word that this replica does not lead. The drain tells that
+    /// word again, and the watch hears it.
+    #[tokio::test]
+    async fn a_watch_admitted_before_the_role_was_told_as_leading_hears_the_drain() {
+        let mut serve = Unstepped::new().await;
+        serve.phase.send_replace(Phase::Draining);
+        serve.hears("the drain").await;
+    }
+
+    /// So does the step that finds the lead gone, with no stop.
+    #[tokio::test]
+    async fn a_watch_admitted_before_the_role_was_told_as_leading_hears_the_loss_of_its_lead() {
+        let mut serve = Unstepped::new().await;
+        assert!(serve.elector.release().expect("a release"));
+        serve.steps.send_replace(Standing::default());
+        serve.hears("the lead's loss").await;
     }
 }

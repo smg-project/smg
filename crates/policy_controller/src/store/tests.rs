@@ -327,6 +327,40 @@ fn a_counter_at_its_ranges_end_stays_there() {
 }
 
 #[test]
+fn a_threshold_whose_triple_passes_the_counters_range_fails_no_row_early() {
+    // The first threshold whose triple passes 32 bits: a product that
+    // wrapped would read 2.
+    let threshold = 1_431_655_766;
+    let store = MemoryStore::new();
+    let health: &dyn HealthSink = &store;
+    let mut stated = facts("http://w:8000", 1);
+    stated.health.failure_threshold = threshold;
+    let id = store.upsert(stated).id();
+    let revision = || WorkersStore::get(&store, id).expect("the row").revision;
+    assert_eq!(health.probe_outcome(id, true, revision()), None);
+    assert_eq!(
+        health.probe_outcome(id, true, revision()),
+        Some((WorkerStatus::Pending, WorkerStatus::Ready))
+    );
+    // Ready, the row is not ready at the threshold's own count of failed
+    // probes: the count is set one short of it.
+    store.probed(id, threshold - 1, 0, 0);
+    assert_eq!(
+        health.probe_outcome(id, false, revision()),
+        Some((WorkerStatus::Ready, WorkerStatus::NotReady))
+    );
+    // Not ready, it fails at three thresholds of failed probes: five are
+    // far under them.
+    for _ in 0..5 {
+        assert_eq!(
+            health.probe_outcome(id, false, revision()),
+            None,
+            "not ready under the triple"
+        );
+    }
+}
+
+#[test]
 fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
     let store = MemoryStore::new();
     let health: &dyn HealthSink = &store;

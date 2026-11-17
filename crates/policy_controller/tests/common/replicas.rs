@@ -21,20 +21,51 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use prost::Message as _;
 use smg_policy_controller::{
     elector::ElectionSettings,
     proto::{
         controller_frame, gateway_frame, policy_controller_client::PolicyControllerClient,
-        GatewayFrame, Hello, LeaderInfo, LeaderRequest,
+        GatewayFrame, Hello, LeaderInfo, LeaderRequest, NotLeader,
     },
 };
 use tokio::sync::mpsc;
 use tonic::{
     codegen::tokio_stream::wrappers::ReceiverStream, metadata::AsciiMetadataValue,
-    transport::Channel, Request,
+    transport::Channel, Request, Status,
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_smg-policy-controller");
+
+/// `google.rpc.Status`, as a client of any gRPC stack decodes a status's
+/// details.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<prost_types::Any>,
+}
+
+/// The `NotLeader` in a refusal's details, read the way every gRPC client
+/// reads them: a `google.rpc.Status` that says the refusal's code and
+/// message again and holds the one message under its type's URL.
+pub fn not_leader(refused: &Status) -> NotLeader {
+    let details = RpcStatus::decode(refused.details()).expect("a google.rpc.Status");
+    assert_eq!(
+        (details.code, details.message.as_str()),
+        (refused.code() as i32, refused.message())
+    );
+    assert_eq!(details.details.len(), 1, "one detail: {details:?}");
+    let detail = details.details.first().expect("one detail");
+    assert_eq!(
+        detail.type_url,
+        "type.googleapis.com/smg.policy.v1.NotLeader"
+    );
+    NotLeader::decode(detail.value.as_slice()).expect("a NotLeader")
+}
 
 /// How long a start may take before its listeners are in its log.
 const START: Duration = Duration::from_secs(30);
