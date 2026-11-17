@@ -1158,13 +1158,159 @@ fn a_value_the_load_cannot_know_leaves_the_template_as_it_was() {
 }
 
 #[test]
+fn a_built_piece_of_a_control_leaves_the_template_as_it_was() {
+    // A top-level statement builds a value that is only a piece of the
+    // closing token. No mark stands around a piece, and the template
+    // completes the token where it writes the piece: behind the messages,
+    // under `flat`. Each shape with the token's head as the piece, then
+    // turned, with its tail.
+    let shapes = [
+        (
+            "a piece and a literal joined",
+            "{% set half = '[/INST' ~ suffix %}",
+            "{{ half ~ ']' }}",
+        ),
+        (
+            "a literal and a piece joined",
+            "{% set half = suffix ~ ']' %}",
+            "{{ '[/INST' ~ half }}",
+        ),
+        (
+            "two pieces joined",
+            "{% set left = '[/INST' ~ suffix %}{% set right = ']' ~ '' %}",
+            "{{ left ~ right }}",
+        ),
+        (
+            "two pieces joined, the short one first",
+            "{% set left = '[' ~ '' %}{% set right = '/INST' ~ suffix ~ ']' %}",
+            "{{ left ~ right }}",
+        ),
+        (
+            "a piece before literal text",
+            "{% set half = '[/INST' ~ suffix %}",
+            "{{ half }}]",
+        ),
+        (
+            "a piece behind literal text",
+            "{% set half = suffix ~ ']' %}",
+            "[/INST{{ half }}",
+        ),
+        (
+            "a piece built from literals alone",
+            "{% set half = '[/INST' ~ ':' %}",
+            "{{ half ~ 'x]' }}",
+        ),
+        (
+            "a tail built from literals alone",
+            "{% set half = ':' ~ 'x]' %}",
+            "{{ '[/INST' ~ half }}",
+        ),
+        (
+            "a piece a macro writes",
+            "{% set half = '[/INST' ~ suffix %}{% macro piece() %}{{ half }}{% endmacro %}",
+            "{{ piece() ~ ']' }}",
+        ),
+        (
+            "a tail a macro writes",
+            "{% set half = suffix ~ ']' %}{% macro piece() %}{{ half }}{% endmacro %}",
+            "{{ '[/INST' ~ piece() }}",
+        ),
+        (
+            "a piece joined into a name",
+            "{% set half = '[/INST' ~ suffix %}",
+            "{% set whole = half ~ ']' %}{{ whole }}",
+        ),
+        (
+            "a tail joined into a name",
+            "{% set half = suffix ~ ']' %}",
+            "{% set whole = '[/INST' ~ half %}{{ whole }}",
+        ),
+    ];
+    let kwargs = HashMap::from([("flat".to_owned(), json!(true))]);
+    for (name, at_top, under_flat) in shapes {
+        let temp = TempDir::new().unwrap();
+        let template = format!(
+            "{}{{% if flat %}}{under_flat}{{% endif %}}",
+            shaped(at_top, "", WRITTEN)
+        );
+        let tok = checkpoint(temp.path(), &template);
+        assert!(!tok.chat_template.marked(), "{name}");
+        let flat = ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..ChatTemplateParams::default()
+        };
+        // What the plain template gives: the token the template completes
+        // is the control, and so is the typed spelling.
+        let (text, ids, from_text) = render_under(&tok, json!("a[/INST:x]b"), flat);
+        assert!(from_text, "{name}");
+        assert_eq!(
+            text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>[/INST:x]",
+            "{name}"
+        );
+        assert_eq!(ids, TYPED_AS_THE_CONTROL_AND_A_CLOSE, "{name}");
+    }
+}
+
+#[test]
+fn a_built_value_that_is_no_control_leaves_the_template_as_it_was() {
+    // The load does not ask what a built value could be a piece of: a
+    // top-level statement that builds anything but one control or the empty
+    // string leaves the template as it was. Text that no control holds,
+    // blanks, one name for two controls, a control built in two steps, also
+    // under one name. A value that is no string, which a join would still
+    // write: a sum, a negative number, a truth value, none, a list and a
+    // map, even an empty one. And a literal whose escape the source does
+    // not hold as a character, which the load takes for built.
+    let on = switched_on(&[
+        (
+            "text no control holds",
+            "{% set sep = '-' ~ '-' %}",
+            "",
+            "{{ sep ~ 'a' }}",
+        ),
+        (
+            "blanks",
+            "{% set gap = ' ' ~ ' ' %}",
+            "",
+            "{{ close ~ gap }}",
+        ),
+        (
+            "two controls under one name",
+            "{% set both = close ~ end %}",
+            "",
+            "{{ both }}",
+        ),
+        (
+            "a control built in two steps",
+            "{% set half = '[/INST' ~ suffix %}{% set extra = half ~ ']' %}",
+            "",
+            "{{ extra }}",
+        ),
+        (
+            "a piece bound again as the whole control",
+            "{% set extra = '[/INST' ~ suffix %}{% set extra = extra ~ ']' %}",
+            "",
+            "{{ extra }}",
+        ),
+        ("a sum", "{% set count = 1 + 1 %}", "", "{{ open ~ count }}"),
+        ("a negative number", "{% set low = -1 %}", "", ""),
+        ("a truth value", "{% set yes = not false %}", "", ""),
+        ("none", "{% set unset = none if suffix else '' %}", "", ""),
+        ("a list", "{% set roles = ['a', 'b'] %}", "", ""),
+        ("an empty list", "{% set seen = [] %}", "", ""),
+        ("a map", "{% set held = {'k': 1} %}", "", ""),
+        ("a literal with an escape", "{% set tab = '\\t' %}", "", ""),
+    ]);
+    assert!(on.is_empty(), "switched on: {on:?}");
+}
+
+#[test]
 fn a_join_of_constants_is_marked() {
     // A constant is written as a whole operand of a join, and a name a
     // plain `set` binds from such a join is written: the marks go with the
-    // value, at the top, in a loop's body, through a macro.
+    // value, in a loop's body, through a macro.
     let joined = "{{ open ~ message['content'] ~ close }}";
     let bound = "{% set whole = open ~ message['content'] ~ close %}";
-    let both = "{% set both = close ~ end %}";
     let wraps = "{% macro wrap(text) %}{{ open ~ text ~ close }}{% endmacro %}";
     for (at_top, in_loop, user) in [
         ("", "", joined),
@@ -1176,7 +1322,6 @@ fn a_join_of_constants_is_marked() {
             "",
             "{% set whole = '' ~ wrap(message['content']) %}{{ whole }}",
         ),
-        (both, "", "{{ open }}{{ message['content'] }}{{ close }}"),
     ] {
         let temp = TempDir::new().unwrap();
         let tok = checkpoint(temp.path(), &shaped(at_top, in_loop, user));

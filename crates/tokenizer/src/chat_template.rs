@@ -2065,6 +2065,10 @@ fn unread_bindings<'a>(target: &Expr<'a>, conditional: bool, sets: &mut Vec<Root
 /// the unit separator, an ASCII control character no template writes.
 const VALUE_SEPARATOR: u8 = 0x1f;
 
+/// Stands in that render for a value that is no string: the record
+/// separator, one byte that is no control spelling and is not empty.
+const NOT_A_STRING: u8 = 0x1e;
+
 /// A root `set` statement that binds one control spelling for every render:
 /// the byte span of its expression, and the spelling.
 struct ControlBinding {
@@ -2164,7 +2168,11 @@ type Names<'a> = HashMap<&'a str, Watched>;
 /// spelling, which the marked copy holds between marks, and a render gives
 /// each of the four special tokens between marks too. Such a name is a
 /// carrier; so is a name a plain `set` binds from a join that holds one, and
-/// a macro that writes one. A carrier may stand in three places:
+/// a macro that writes one. Whether a built value is a control spelling is
+/// read later, with the vocabulary: one that is neither that nor empty
+/// leaves the template unmarked there
+/// ([`ChatTemplateState::control_bindings`]). A carrier may stand in three
+/// places:
 ///
 /// - as a written value, alone or as a whole operand of `~`;
 /// - the same way as the value of a plain `set` of one name;
@@ -4217,7 +4225,8 @@ impl ChatTemplateState {
     /// build is only written, joined or asked whether it is empty, and what
     /// it is built from is read by nothing else. A template that reads one
     /// any other way (a filter, a comparison, a search, a slice), binds one
-    /// from a request argument, or spells a control whole stays as it is,
+    /// from a request argument, builds a value that is neither a control
+    /// spelling nor empty, or spells a control whole stays as it is,
     /// its prompts encoded from their text as before. So does one that
     /// writes a control outside its constants on a probe conversation
     /// ([`Self::marks_every_control`]). Every reading is
@@ -4306,7 +4315,11 @@ impl ChatTemplateState {
     /// write as a literal: its statement reads a name that has no one
     /// value, or another statement binds its name another way. The template
     /// would write that control without marks wherever no probe
-    /// conversation goes, so it stays as it is. None as well when the source
+    /// conversation goes, so it stays as it is. None when a statement
+    /// builds a value that is neither one control spelling nor empty,
+    /// whether a string or not ([`NOT_A_STRING`]): it may be a piece of a
+    /// control, which takes no marks, and the template would complete that
+    /// control where it writes the piece. None as well when the source
     /// spells one of the spellings whole: that template is of the other
     /// kind, and it says so here, before the matcher over the added tokens
     /// is asked for.
@@ -4334,13 +4347,15 @@ impl ChatTemplateState {
             statements.push_str(&source[start..end]);
             statements.push_str(" %}");
             // A spelling is a string; a value of any other type is written
-            // empty.
+            // as the byte that stands for one.
             statements.push(char::from(VALUE_SEPARATOR));
             statements.push_str("{{ ");
             statements.push_str(statement.name);
             statements.push_str(" if ");
             statements.push_str(statement.name);
-            statements.push_str(" is string else '' }}");
+            statements.push_str(" is string else '");
+            statements.push(char::from(NOT_A_STRING));
+            statements.push_str("' }}");
         }
         // The statements stand in a copy of this template's environment, in
         // the template's place.
@@ -4374,6 +4389,12 @@ impl ChatTemplateState {
         let mut bindings = Vec::new();
         for (statement, value) in computed.iter().zip(values) {
             if !is_control(value) {
+                // A built value that is no control whole may be a piece of
+                // one: the template would complete that control where it
+                // writes the piece, and no mark would stand around it.
+                if statement.builds && !value.is_empty() {
+                    return Vec::new();
+                }
                 continue;
             }
             if !statement.fixed || unsettled.contains(&statement.name) || source.contains(value) {

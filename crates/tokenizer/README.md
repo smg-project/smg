@@ -71,9 +71,9 @@ as of `tokenizer/src/*`.
   a message, a tool, a document or a template argument stays text, also when it is typed in two
   parts the template joins. The second kind is recognised at load from the template itself, and
   only when its syntax shows that every value it builds is only written (alone, in a join, or
-  asked whether it is empty) and the marks cover every control it writes on a few probe
-  conversations; any other checkpoint renders and encodes as before. The flat `encode` of a rendered text
-  reads a spelling as its token.
+  asked whether it is empty), each of those values is one control spelling or empty, and the
+  marks cover every control it writes on a few probe conversations; any other checkpoint renders
+  and encodes as before. The flat `encode` of a rendered text reads a spelling as its token.
 - GLM-5.3 and GLM-5.3-Flash use native Rust chat rendering when checkpoint metadata and
   the template matches the current official one. Any other template keeps MiniJinja.
 
