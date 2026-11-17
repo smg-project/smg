@@ -243,6 +243,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   upstream. The crate refused the request with ``unknown variant `auto`, expected `low` or
   `high` `` and dropped the variable's detail. Breaking: `FileDetail` gains `Auto`, now its default,
   and `PromptVariableTyped::ResponseInputFile` gains `detail: Option<FileDetail>`.
+- Realtime events read and write as the public API does. A `session.update`, `session.created`
+  or `session.updated` event reads its session into the variant its `type` names, where every
+  one the API writes failed with "missing field `type`", and is written with that `type` once,
+  where it was written twice. A transcription's `completed` event keeps its detected `languages`
+  (an empty list means none was detected), a transcription segment its `start` and `end` at the
+  precision written, and a failed response's error its `message`. Breaking:
+  `ServerEvent::InputAudioTranscriptionCompleted` gains `languages`, the segment's `start` and
+  `end` are `f64`, and `ResponseStatusError` gains `message`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
@@ -273,9 +281,23 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A Responses `tool_choice` of type `computer` or `computer_use`, as the public API lists them
   (`ToolChoiceTypes`), parses. The crate refused the request whole, as matching no variant of
   `ResponsesToolChoice`. Breaking: `BuiltInToolChoiceType` gains `Computer` and `ComputerUse`.
+- A Messages web search result is written with its `type` (`web_search_result`) and its null
+  `page_age`, and the web search error `request_too_large` and a tool search's error result
+  (`tool_search_tool_result_error`) read, as the public API writes them. A result had been written
+  without the `type` that the public API requires of a replayed one, and each of the two errors
+  failed a whole answer or request that held it. A tool reference in a replayed tool search result
+  keeps its `cache_control`, which was dropped. Breaking: `WebSearchResultBlock` gains
+  `block_type`, `WebSearchToolResultErrorCode` gains `RequestTooLarge`, a tool search result's
+  `content` is the new `ToolSearchToolResultContent`, and `ToolReferenceBlock` gains
+  `cache_control`.
 - A completion request with `"echo": null` is served, as the public API allows. The crate refused
   it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
   and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
+- Interactions content takes every MIME type the public API names: audio in `audio/mpeg`, `m4a`,
+  `l16`, `opus`, `alaw`, `mulaw` and `webm`; images in `gif`, `bmp` and `tiff`; documents in
+  `text/csv` and the Office and OpenDocument formats beside PDF. Each was an unknown variant that
+  refused the whole request, or failed the answer that held it. Breaking: `AudioMimeType`,
+  `ImageMimeType` and `DocumentMimeType` gain the variants.
 - A replayed `computer_call_output` input item with `acknowledged_safety_checks: null`, which the
   public API allows (`ComputerCallOutputItemParam`), parses as none acknowledged. The crate refused
   the request whole, as matching no variant of `ResponseInput`.
@@ -292,6 +314,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   written back under the canonical `web_search_preview`, and its `search_content_types`. The crate
   refused a request declaring either, as an unknown tool type or field. Breaking:
   `WebSearchPreviewTool` gains `search_content_types: Option<Vec<String>>`.
+- An Interactions request declaring a `computer_use`, `google_maps` or `retrieval` tool is
+  accepted, an `mcp_server` tool takes its `allowed_tools` as the list the public API declares, and
+  `google_search` keeps its `search_types`. The three tools were unknown variants and the list
+  failed to parse, each refusing the whole request, and `search_types` was dropped. Breaking:
+  `InteractionsTool` gains `ComputerUse`, `GoogleMaps` and `Retrieval`, `GoogleSearch` gains
+  `search_types`, `McpServer.allowed_tools` is a `Vec<AllowedTools>`, and `ToolChoiceType`, which
+  the SDK keeps open as it does the tools' other sets, gains `Other` and is `#[non_exhaustive]`.
 - `EmbeddingRequest` and `ClassifyRequest` run the public API's shape rule on `input` (a string,
   an array of strings, an array of token ids or an array of token id arrays; nothing empty; a
   member of another kind than the first is refused by its index), and `EmbeddingRequest` the
@@ -319,11 +348,6 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `ResponseReasoningParam` gains `mode: Option<String>`, `context: Option<ReasoningContext>` and
   `generate_summary: Option<ReasoningSummary>`, `ReasoningInfo` gains the three as
   `Option<String>`, and the crate gains `ReasoningContext`.
-- Interactions content takes every MIME type the public API names: audio in `audio/mpeg`, `m4a`,
-  `l16`, `opus`, `alaw`, `mulaw` and `webm`; images in `gif`, `bmp` and `tiff`; documents in
-  `text/csv` and the Office and OpenDocument formats beside PDF. Each was an unknown variant that
-  refused the whole request, or failed the answer that held it. Breaking: `AudioMimeType`,
-  `ImageMimeType` and `DocumentMimeType` gain the variants.
 - A usage object whose `prompt_tokens_details` leaves out `cached_tokens` parses, with no tokens
   cached, as the public API defaults the key. The crate refused the whole usage, and the
   completion around it, with ``missing field `cached_tokens` ``. The newer counters an upstream
@@ -366,6 +390,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   them, as the engines' own chat utils build it. Breaking: `ChatMessage::Assistant` gains the
   fields `refusal: Option<String>`, `audio: Option<ChatAssistantAudio>` and
   `function_call: Option<FunctionCallResponse>`.
+- A Realtime `response.create`'s input may reference an item already in the session,
+  `{"type": "item_reference", "id": ...}`, as the public API takes it: such an input was refused as
+  an unknown conversation item variant. `RealtimeResponseCreateParams.input` holds the new
+  `RealtimeResponseInputItem`, a conversation item or a `RealtimeItemReference`; a reference is
+  taken there only, as the API takes it, not as a new conversation item. Breaking: `input` changes
+  type.
 - A GLM-5.3 request with a `minimal`, `medium` or `xhigh` effort is served. The profile reads the
   name as `low`, `high` or `max`, as z.ai does, in `reasoning_effort` and in `thinking.effort`.
   Since 1.11.0 the profile refused those names with `reasoning_effort_not_allowed`, and `medium`

@@ -449,3 +449,7 @@ mod tests {
         assert_eq!(sized.capacity(), capacity);
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_pair_select_rows;

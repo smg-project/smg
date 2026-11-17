@@ -10,18 +10,24 @@ use std::{
 };
 
 use super::{
-    run_of, seek, Ask, Built, GatewayRun, PoolVeto, PoolVetoes, StaleGeneration, ViewBuffers,
-    World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
+    run_of, seek, Ask, Built, Classes, GatewayRun, PairBuffers, PoolVeto, PoolVetoes,
+    StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
-    spec::{BindingSpec, Match, OverloadSpec},
+    spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
-        GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, Overload, Reachability,
-        WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        pairing::Refusal, GatewayId, HealthSink, LoadSink, LoadSource, MembershipTail, MemoryStore,
+        Overload, PairingDescriptor, Reachability, WorkerFacts, WorkerPatch, WorkerRow,
+        WorkerStatus, WorkersStore,
     },
-    view::{fingerprint, AffinityFacts, Candidate, LoadRow, Phase, Role, WireModes, WorkerId},
-    AppliedSpec, PolicySpec,
+    view::{
+        fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
+        WireModes, WorkerId,
+    },
+    AppliedSpec, PairPools, PairTable, PolicySpec, Scratch,
 };
+
+mod mode_and_overload;
 
 const MODEL: &str = "m";
 const ASKER: GatewayId = GatewayId(1);
@@ -218,6 +224,193 @@ fn another_gateways_host_local_row_is_not_written_and_the_slice_is_its_own_index
         },
     );
     assert!(rows.iter().all(|row| !row.session_hit));
+}
+
+#[test]
+fn a_build_names_the_asking_gateways_list_where_the_pool_holds_a_host_local_row() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let open = member(&store, "http://a:8000");
+    let built = |gateway: u64| {
+        let asked = Ask {
+            gateway: GatewayId(gateway),
+            ..ask(now)
+        };
+        let (rows, _, built) = view(&store, &asked);
+        let mut ids: Vec<WorkerId> = rows.iter().map(|row| row.id).collect();
+        ids.sort_unstable();
+        (built.reach, ids)
+    };
+    // A pool every gateway dials whole is one list: no gateway's is named.
+    assert_eq!([built(1), built(2)], [(0, vec![open]), (0, vec![open])]);
+
+    let local = store
+        .upsert(WorkerFacts {
+            reachable_from: Reachability::Gateway(GatewayId(2)),
+            ..facts("unix:///b", Role::Single, &[MODEL])
+        })
+        .id();
+    let mut both = vec![open, local];
+    both.sort_unstable();
+    // One host-local row, and the pool's lists are two under one epoch:
+    // each gateway's is named by its id, the row's holder's and the others'.
+    assert_eq!(
+        [built(1), built(2), built(3)],
+        [(1, vec![open]), (2, both), (3, vec![open])]
+    );
+}
+
+#[test]
+fn a_build_names_the_asking_gateways_list_where_its_veto_masks_a_row() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let vetoed = member(&store, "http://a:8000");
+    let reach = |gateway: u64, at: Instant| {
+        let asked = Ask {
+            gateway: GatewayId(gateway),
+            ..ask(at)
+        };
+        view(&store, &asked).2.reach
+    };
+    assert_eq!([reach(1, now), reach(2, now)], [0, 0]);
+
+    // A veto masks a row of its holder's copy and of no other: that
+    // gateway's list is its own, and the others still read the pool's one.
+    let until = now + Duration::from_secs(1);
+    store.gateway_veto(GatewayId(2), vetoed, Some(until));
+    assert_eq!([reach(1, now), reach(2, now), reach(3, now)], [0, 2, 0]);
+    // A veto that ended masks nothing.
+    assert_eq!(reach(2, until), 0);
+}
+
+#[test]
+fn two_gateways_lists_of_one_size_each_turn_their_own_rotation() {
+    // Twelve rows every gateway dials and four host-local rows a gateway:
+    // each of two gateways is handed sixteen rows under one membership
+    // epoch, the other's four left out.
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let ready = |facts: WorkerFacts| {
+        let id = store.upsert(facts).id();
+        status(&store, id, WorkerStatus::Ready);
+    };
+    for row in 0..12 {
+        ready(facts(
+            &format!("http://w{row}:8000"),
+            Role::Single,
+            &[MODEL],
+        ));
+    }
+    for gateway in [1, 2] {
+        for row in 0..4 {
+            ready(WorkerFacts {
+                reachable_from: Reachability::Gateway(GatewayId(gateway)),
+                ..facts(&format!("unix:///g{gateway}/{row}"), Role::Single, &[MODEL])
+            });
+        }
+    }
+    let engine = PolicySpec::preset("round_robin")
+        .expect("a preset of this build")
+        .validate()
+        .expect("a preset validates");
+    let (mut out, mut scratch) = (ViewBuffers::default(), Scratch::new());
+    let mut drawn = [Vec::new(), Vec::new()];
+    // Their asks alternate through one engine, as a controller's do.
+    for turn in 0..32u64 {
+        let asked = Ask {
+            gateway: GatewayId(1 + turn % 2),
+            ..ask(now)
+        };
+        let built = store
+            .build_view(MODEL, Role::Single, &asked, &mut out)
+            .expect("the pool");
+        assert_eq!(out.candidates.len(), 16);
+        let request = RequestFacts {
+            model: MODEL,
+            now_micros: built.now_micros,
+            ..RequestFacts::default()
+        };
+        let decision = engine.decide(
+            &request,
+            &built.pool_facts(),
+            &out.candidates,
+            &Constraints::default(),
+            &mut scratch,
+        );
+        assert!(decision.trace().drew_first());
+        let pick = decision.pick().expect("a ready row");
+        drawn[(turn % 2) as usize].push(pick.targets.iter().next().expect("a target").id);
+    }
+    // One rotation turned by both lists would hand a gateway every other
+    // row of its own: sixteen decisions of a gateway visit its sixteen rows.
+    for ids in &mut drawn {
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 16);
+    }
+}
+
+#[test]
+fn two_gateways_in_strict_turn_leave_each_others_vetoed_rows_their_share() {
+    // Sixteen rows every gateway dials whole. Two gateways ask in strict
+    // turn, and each holds a veto on a row at each parity: whichever
+    // parity a gateway's turns land on, one of its vetoes stands there.
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    for row in 0..16 {
+        let id = store
+            .upsert(facts(
+                &format!("http://w{row}:8000"),
+                Role::Single,
+                &[MODEL],
+            ))
+            .id();
+        status(&store, id, WorkerStatus::Ready);
+    }
+    let (rows, _, _) = view(&store, &ask(now));
+    let ids: Vec<WorkerId> = rows.iter().map(|row| row.id).collect();
+    let until = now + Duration::from_secs(60);
+    for (at, &id) in ids[..4].iter().enumerate() {
+        store.gateway_veto(GatewayId(1 + at as u64 / 2), id, Some(until));
+    }
+    let engine = PolicySpec::preset("round_robin")
+        .expect("a preset of this build")
+        .validate()
+        .expect("a preset validates");
+    let (mut out, mut scratch) = (ViewBuffers::default(), Scratch::new());
+    let mut picked = [0u32; 16];
+    for turn in 0..224u64 {
+        let asked = Ask {
+            gateway: GatewayId(1 + turn % 2),
+            ..ask(now)
+        };
+        let built = store
+            .build_view(MODEL, Role::Single, &asked, &mut out)
+            .expect("the pool");
+        let request = RequestFacts {
+            model: MODEL,
+            now_micros: built.now_micros,
+            ..RequestFacts::default()
+        };
+        let decision = engine.decide(
+            &request,
+            &built.pool_facts(),
+            &out.candidates,
+            &Constraints::default(),
+            &mut scratch,
+        );
+        let pick = decision.pick().expect("a ready row");
+        let id = pick.targets.iter().next().expect("a target").id;
+        let at = ids.iter().position(|&row| row == id).expect("a row");
+        picked[at] += 1;
+    }
+    // Each gateway turns its own rotation: its 112 asks hand each of its
+    // fourteen kept rows eight. A row one gateway vetoes is the other's
+    // alone. One rotation turned by both would leave a row vetoed at its
+    // vetoer's parity one pick, the other gateway never landing on it.
+    let mut want = [16u32; 16];
+    want[..4].fill(8);
+    assert_eq!(picked, want);
 }
 
 #[test]
@@ -1101,7 +1294,6 @@ fn a_row_carries_its_registrations_fixed_facts_and_reads_its_own_rank() {
         dp_rank: 3,
         dp_size: 4,
         wire_modes: WireModes::GRPC.union(WireModes::HTTP),
-        pair_class: 9,
         reachable_from: Reachability::Gateway(ASKER),
         ..facts(key, Role::Decode, &[MODEL])
     };
@@ -1119,7 +1311,8 @@ fn a_row_carries_its_registrations_fixed_facts_and_reads_its_own_rank() {
     assert_eq!(row.role, Role::Decode);
     assert_eq!((row.dp_rank, row.dp_size), (3, 4));
     assert_eq!(row.wire_modes, WireModes::GRPC.union(WireModes::HTTP));
-    assert_eq!(row.pair_class, 9);
+    // A decode with no prefill of its model is outside any pairing.
+    assert_eq!(row.pair_class, 0);
     assert!(row.host_local);
     // The low 32 bits of the registration key's fingerprint.
     assert_eq!(row.key, fingerprint(key.as_bytes()) as u32);
@@ -1331,45 +1524,55 @@ fn the_pair_door_builds_both_sides_of_one_publication() {
     let decode = store
         .upsert(facts("http://d:8000", Role::Decode, &[MODEL]))
         .id();
-    let (mut first, mut second) = (ViewBuffers::default(), ViewBuffers::default());
+    let mut out = PairBuffers::default();
     let (left, right) = store
-        .build_pair(MODEL, &ask(t0), &mut first, &mut second)
+        .build_pair(MODEL, &ask(t0), &mut out)
         .expect("both pools");
     assert_eq!((left.pool_size, right.pool_size), (1, 1));
     assert_eq!(left.membership_epoch, right.membership_epoch);
     assert_eq!(
-        (first.candidates[0].id, second.candidates[0].id),
+        (out.pools().prefills[0].id, out.pools().decodes[0].id),
         (prefill, decode)
     );
-    // A model served on one side alone has no pair, and neither buffer
-    // keeps a view: not the side that has members, not the last pair's;
-    // neither its rows nor, under an ask that declares it, its column.
+    assert!(!out.pools().table.is_empty());
+    // A model served on one side alone has no pair, and no buffer keeps a
+    // view: not the side that has members, not the last pair's; neither
+    // its rows, nor its table, nor, under an ask that declares it, its
+    // column.
     let with_column = Ask {
         affinity: true,
         ..ask(t0)
     };
-    let empty = |first: &ViewBuffers, second: &ViewBuffers| {
-        first.candidates.is_empty()
-            && first.affinity.is_empty()
-            && second.candidates.is_empty()
-            && second.affinity.is_empty()
+    let empty = |out: &PairBuffers| {
+        let pools = out.pools();
+        pools.prefills.is_empty()
+            && pools.prefill_affinity.is_empty()
+            && pools.decodes.is_empty()
+            && pools.decode_affinity.is_empty()
+            && pools.table.is_empty()
     };
     store.upsert(facts("http://s:8000", Role::Prefill, &["prefill-alone"]));
     assert_eq!(
-        store.build_pair("prefill-alone", &with_column, &mut first, &mut second),
+        store.build_pair("prefill-alone", &with_column, &mut out),
         None
     );
-    assert!(empty(&first, &second));
+    assert!(empty(&out));
     store
-        .build_pair(MODEL, &with_column, &mut first, &mut second)
+        .build_pair(MODEL, &with_column, &mut out)
         .expect("both pools");
-    assert_eq!((first.affinity.len(), second.affinity.len()), (1, 1));
+    assert_eq!(
+        (
+            out.pools().prefill_affinity.len(),
+            out.pools().decode_affinity.len()
+        ),
+        (1, 1)
+    );
     store.upsert(facts("http://t:8000", Role::Decode, &["decode-alone"]));
     assert_eq!(
-        store.build_pair("decode-alone", &with_column, &mut first, &mut second),
+        store.build_pair("decode-alone", &with_column, &mut out),
         None
     );
-    assert!(empty(&first, &second));
+    assert!(empty(&out));
 }
 
 #[test]
@@ -1406,13 +1609,13 @@ fn the_pair_door_racing_the_publications_builds_both_sides_from_one_load() {
             turn
         })
     };
-    let (mut first, mut second) = (ViewBuffers::default(), ViewBuffers::default());
+    let mut out = PairBuffers::default();
     let mut sides = || {
         store
-            .build_pair(MODEL, &ask(t0), &mut first, &mut second)
+            .build_pair(MODEL, &ask(t0), &mut out)
             .expect("both pools");
-        let running = |side: &ViewBuffers| side.candidates[0].load.map(|load| load.running);
-        (running(&first), running(&second))
+        let running = |side: &[Candidate]| side[0].load.map(|load| load.running);
+        (running(out.pools().prefills), running(out.pools().decodes))
     };
     // The case ends at an event, the door read across `SEEN` publications,
     // and holds the door's rule at every read: one load of the world feeds
@@ -1509,7 +1712,7 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
     };
     let leaving = WorkerId(1);
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None);
+    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
     let vetoed = writer
         .veto(ASKER, leaving, Some(t0 + Duration::from_secs(60)))
         .expect("a new veto");
@@ -1519,11 +1722,11 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
     let between = writer.publish_window(t0);
     assert_eq!(masked(&between), [leaving]);
     // The membership write takes the row and its vetoes out together,
-    let after = writer.rebuild(2, members[1..].iter(), |_, _| None);
+    let after = writer.rebuild(2, members[1..].iter(), |_, _| None, Classes::Derive);
     assert_eq!(after.members(MODEL, Role::Single), Some(1));
     assert_eq!(masked(&after), []);
     // and the same id registered again starts without them.
-    let again = writer.rebuild(3, members.iter(), |_, _| None);
+    let again = writer.rebuild(3, members.iter(), |_, _| None, Classes::Derive);
     assert_eq!(again.members(MODEL, Role::Single), Some(2));
     assert_eq!(masked(&again), []);
 }
@@ -1760,7 +1963,7 @@ fn a_spare_of_another_length_is_left_and_the_publication_allocates() {
         row_serving(2, &[MODEL], origin),
     ];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None);
+    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
     // No write leaves a pool a spare of another length: one is planted,
     // the rows of a pool of one, held by the pool alone.
     writer.spares[0] = Some(Arc::from(&writer.working[0].rows[..1]));
@@ -1787,7 +1990,7 @@ fn a_membership_write_leaves_the_writers_lists_at_one_slot_a_pool() {
     ];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
     for epoch in 1..=4 {
-        writer.rebuild(epoch, members.iter(), |_, _| None);
+        writer.rebuild(epoch, members.iter(), |_, _| None, Classes::Derive);
         // Two models, a pool each: one slot a pool in each list, however
         // many membership writes came before.
         assert_eq!(
@@ -1823,7 +2026,7 @@ fn a_vetos_write_builds_its_own_gateways_run_and_shares_every_other() {
         })
         .collect();
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, members.iter(), |_, _| None);
+    writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
     let (writing, other) = (GatewayId(3), GatewayId(7));
     for (gateway, id) in [(other, 2), (other, 6), (writing, 3)] {
         writer
@@ -1900,7 +2103,7 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
         .collect();
     let mut present = [true; 12];
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);
-    writer.rebuild(1, all.iter(), |_, _| None);
+    writer.rebuild(1, all.iter(), |_, _| None, Classes::Derive);
     // A fixed sequence: the case makes the same writes at every run.
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     let mut next = |bound: u64| {
@@ -1922,7 +2125,7 @@ fn the_runs_each_write_leaves_are_the_runs_a_derive_builds_again() {
                     .iter()
                     .zip(present)
                     .filter_map(|(row, here)| here.then_some(row));
-                writer.rebuild(step + 2, members, |_, _| None);
+                writer.rebuild(step + 2, members, |_, _| None, Classes::Derive);
             }
             // A window's publication, which drops what its instant ended.
             1 => {
@@ -1987,9 +2190,26 @@ fn a_seek_from_any_place_finds_what_a_search_of_the_whole_list_finds() {
 
 /// A document that validates, under the generation `number`.
 fn generation(number: u64) -> AppliedSpec {
+    generation_pairing(number, Pairing::default())
+}
+
+/// A document that validates, under the generation `number`, whose pair
+/// plan names the pairing `mode`.
+fn generation_pairing(number: u64, mode: Pairing) -> AppliedSpec {
     let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
     document.generation = number;
+    document.plans.pd_pair.pairing = mode;
     AppliedSpec::validate(&document).expect("a preset validates")
+}
+
+/// A store under a first generation whose document names the pairing
+/// `mode`: the one way a store takes a mode.
+fn store_pairing(mode: Pairing) -> MemoryStore {
+    let store = MemoryStore::new();
+    store
+        .apply(generation_pairing(1, mode))
+        .expect("the first generation");
+    store
 }
 
 #[test]
@@ -2061,13 +2281,15 @@ fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
     let mut writer = Writer::new(PUBLISH_WINDOW, Instant::now());
     let first = Arc::new(generation(1));
     let held = Arc::downgrade(&first);
-    let (world, before) = writer.apply(first).expect("above the unbound start");
+    let (world, before) = writer
+        .apply(first, std::iter::empty(), |_, _| None)
+        .expect("above the unbound start");
     assert!(before.is_none(), "nothing was kept before the first apply");
     // A reader still holds a world of generation 1 when the next is
     // applied; the unbound start, kept since the first apply, is handed
     // back.
     let (_, before) = writer
-        .apply(Arc::new(generation(2)))
+        .apply(Arc::new(generation(2)), std::iter::empty(), |_, _| None)
         .expect("above the standing one");
     assert_eq!(before.map(|spec| spec.generation()), Some(0));
     // The reader lets its world go: the writer keeps the generation, so
@@ -2076,7 +2298,7 @@ fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
     assert_eq!(held.strong_count(), 1, "kept by the writer alone");
     // The next apply hands it back, and the caller's drop is its end.
     let (_, before) = writer
-        .apply(Arc::new(generation(3)))
+        .apply(Arc::new(generation(3)), std::iter::empty(), |_, _| None)
         .expect("above the standing one");
     let before = before.expect("the generation before the last");
     assert_eq!((before.generation(), held.strong_count()), (1, 1));
@@ -2116,19 +2338,842 @@ fn the_pair_door_builds_no_decode_side_beside_an_empty_prefill_pool() {
     let store = MemoryStore::new();
     let t0 = Instant::now();
     let _decode = store.upsert(facts("http://d:8000", Role::Decode, &[MODEL]));
-    let (mut prefill, mut decode) = (ViewBuffers::default(), ViewBuffers::default());
-    assert_eq!(
-        store.build_pair(MODEL, &ask(t0), &mut prefill, &mut decode),
-        None
-    );
+    let mut out = PairBuffers::default();
+    assert_eq!(store.build_pair(MODEL, &ask(t0), &mut out), None);
     // The decode pool has a member and its buffer never grew: the door
     // stopped at the prefill pool it did not find.
-    assert_eq!(decode.candidates.capacity(), 0);
+    assert_eq!(out.decode.candidates.capacity(), 0);
     let _prefill = store.upsert(facts("http://p:8000", Role::Prefill, &[MODEL]));
-    assert!(store
-        .build_pair(MODEL, &ask(t0), &mut prefill, &mut decode)
-        .is_some());
-    assert_eq!((prefill.candidates.len(), decode.candidates.len()), (1, 1));
+    assert!(store.build_pair(MODEL, &ask(t0), &mut out).is_some());
+    assert_eq!(
+        (out.prefill.candidates.len(), out.decode.candidates.len()),
+        (1, 1)
+    );
+}
+
+/// One decision's view of one side of the model's pair.
+fn side(store: &MemoryStore, role: Role, ask: &Ask) -> (Vec<Candidate>, Vec<AffinityFacts>, Built) {
+    let mut out = ViewBuffers::default();
+    let built = store
+        .build_view(MODEL, role, ask, &mut out)
+        .expect("the pool");
+    (out.candidates, out.affinity, built)
+}
+
+/// A prefill or decode of the model on the runtime-specific side, of one
+/// known runtime, that names its KV transport or none.
+fn pair_facts(key: &str, role: Role, transport: Option<&str>) -> WorkerFacts {
+    WorkerFacts {
+        wire_modes: WireModes::GRPC,
+        engine_kind: "rt-a".to_string(),
+        pairing: transport.map(|transport| PairingDescriptor {
+            transport: Some(transport.to_string()),
+            ..PairingDescriptor::default()
+        }),
+        ..facts(key, role, &[MODEL])
+    }
+}
+
+/// The id and the class of each row, in the rows' order.
+fn classes(rows: &[Candidate]) -> Vec<(WorkerId, u32)> {
+    rows.iter().map(|row| (row.id, row.pair_class)).collect()
+}
+
+/// The class on the row of worker `id`.
+fn class_of(rows: &[Candidate], id: WorkerId) -> u32 {
+    let row = rows.iter().find(|row| row.id == id);
+    row.expect("the worker's row").pair_class
+}
+
+fn sorted(mut ids: Vec<WorkerId>) -> Vec<WorkerId> {
+    ids.sort_unstable();
+    ids
+}
+
+/// Two prefills of two transports and three decodes, one of each transport
+/// and one that names none: leniently the silent decode pairs with both
+/// prefills, one row of one class that both prefill classes list. The
+/// prefills, then the decodes of the first transport, of the second and the
+/// silent one.
+fn two_classes(store: &MemoryStore) -> ([WorkerId; 2], [WorkerId; 3]) {
+    let member = |key: &str, role: Role, transport: Option<&str>| {
+        store.upsert(pair_facts(key, role, transport)).id()
+    };
+    let prefills = [
+        member("grpc://pa:9000", Role::Prefill, Some("tx-a")),
+        member("grpc://pb:9000", Role::Prefill, Some("tx-b")),
+    ];
+    let decodes = [
+        member("grpc://da:9000", Role::Decode, Some("tx-a")),
+        member("grpc://db:9000", Role::Decode, Some("tx-b")),
+        member("grpc://dn:9000", Role::Decode, None),
+    ];
+    (prefills, decodes)
+}
+
+/// A pair plan whose stages read nothing of a row but its class and whether
+/// the host excluded it.
+const PAIR_PLAN: &str = r#"{
+  "apiVersion": "smg.policy/v1",
+  "profiles": { "p": { "filter": ["not-tried"], "pick": "best" } },
+  "bindings": [
+    { "match": { "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "p", "decode": "p" } }
+  ]
+}"#;
+
+/// How a pair decision is handed which classes pair.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pairs {
+    /// As the door hands them: the rows and the table.
+    ByTable,
+    /// The door's rows with no table: a class pairs with its own number.
+    ByNumber,
+}
+
+/// The decodes the engine's pair entry pairs `prefill` with over what the
+/// store's pair door builds for `ask`, sorted by id: one decision after
+/// another, every other prefill excluded and each decode already drawn
+/// excluded from the next. The exclusion is soft, so the draws end when the
+/// entry has nobody new to pair: it pairs another prefill, or a decode
+/// again, or nobody.
+fn partners_drawn(
+    store: &MemoryStore,
+    ask: &Ask,
+    prefill: WorkerId,
+    pairs: Pairs,
+) -> Vec<WorkerId> {
+    let spec: PolicySpec = serde_json::from_str(PAIR_PLAN).expect("a well-formed document");
+    let engine = spec.validate().expect("the engine");
+    let (mut out, mut scratch) = (PairBuffers::default(), Scratch::new());
+    let mut drawn = Vec::new();
+    loop {
+        let (built, _) = store.build_pair(MODEL, ask, &mut out).expect("both pools");
+        let others: Vec<WorkerId> = classes(out.pools().prefills)
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|&id| id != prefill)
+            .collect();
+        let request = RequestFacts {
+            model: MODEL,
+            phase: Phase::Prefill,
+            now_micros: built.now_micros,
+            ..RequestFacts::default()
+        };
+        let pools = match pairs {
+            Pairs::ByTable => out.pools(),
+            Pairs::ByNumber => PairPools {
+                table: PairTable::default(),
+                ..out.pools()
+            },
+        };
+        let decision = engine.decide_pair(
+            &request,
+            &built.pool_facts(),
+            pools,
+            &Constraints {
+                excluded: &others,
+                ..Constraints::default()
+            },
+            &Constraints {
+                excluded: &drawn,
+                ..Constraints::default()
+            },
+            &mut scratch,
+        );
+        let target = decision
+            .pick()
+            .and_then(|pick| pick.targets.first().copied());
+        let decode = target
+            .filter(|target| target.id == prefill)
+            .and_then(|target| target.pair)
+            .map(|pair| pair.decode_id)
+            .filter(|decode| !drawn.contains(decode));
+        match decode {
+            Some(decode) => drawn.push(decode),
+            None => return sorted(drawn),
+        }
+    }
+}
+
+/// The step's one sentence: a pair built from the store pairs through the
+/// engine's pair entry. Before, no row carried a class and the entry paired
+/// nobody.
+#[test]
+fn a_pair_built_from_the_store_pairs_through_the_engines_pair_entry() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    two_classes(&store);
+    let spec: PolicySpec = serde_json::from_str(PAIR_PLAN).expect("a well-formed document");
+    let engine = spec.validate().expect("the engine");
+    let (mut out, mut scratch) = (PairBuffers::default(), Scratch::new());
+    let (built, _) = store
+        .build_pair(MODEL, &ask(now), &mut out)
+        .expect("both pools");
+    let request = RequestFacts {
+        model: MODEL,
+        phase: Phase::Prefill,
+        now_micros: built.now_micros,
+        ..RequestFacts::default()
+    };
+    let decision = engine.decide_pair(
+        &request,
+        &built.pool_facts(),
+        out.pools(),
+        &Constraints::default(),
+        &Constraints::default(),
+        &mut scratch,
+    );
+    assert!(decision.pick().is_some(), "the pair routes: {decision:?}");
+}
+
+#[test]
+fn the_pair_door_hands_the_table_its_rows_classes_are_numbered_for() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let ([pa, pb], [da, db, dn]) = two_classes(&store);
+    // A prefill of another runtime: no decode pairs with it, so the entry
+    // pairs another prefill before it.
+    let apart = store
+        .upsert(WorkerFacts {
+            engine_kind: "rt-b".to_string(),
+            ..pair_facts("grpc://px:9000", Role::Prefill, None)
+        })
+        .id();
+
+    // Through the door a prefill pairs with the decode of its transport and
+    // with the silent one, and with no other.
+    let drawn = |prefill: WorkerId, pairs: Pairs| partners_drawn(&store, &ask(now), prefill, pairs);
+    assert_eq!(drawn(pa, Pairs::ByTable), sorted(vec![da, dn]));
+    assert_eq!(drawn(pb, Pairs::ByTable), sorted(vec![db, dn]));
+    assert_eq!(drawn(apart, Pairs::ByTable), []);
+    // The table is what says so. Each side's classes are numbered by
+    // themselves, so by its number alone a prefill class meets one decode
+    // class, never its two.
+    assert_eq!(drawn(pa, Pairs::ByNumber).len(), 1);
+    assert_eq!(drawn(pb, Pairs::ByNumber).len(), 1);
+}
+
+#[test]
+fn a_worker_has_one_row_of_one_class_and_the_world_holds_which_classes_pair() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let ([pa, pb], [da, db, dn]) = two_classes(&store);
+    // A decode of another runtime: no prefill pairs with it.
+    let apart = store
+        .upsert(WorkerFacts {
+            engine_kind: "rt-b".to_string(),
+            ..pair_facts("grpc://dx:9000", Role::Decode, None)
+        })
+        .id();
+
+    // One row a worker on each side: the silent decode pairs with both
+    // prefills and is still one row, with one position and one column entry.
+    let (prefills, _, built) = side(&store, Role::Prefill, &ask(now));
+    assert_eq!(built.pool_size, 2);
+    let with_column = Ask {
+        affinity: true,
+        ..ask(now)
+    };
+    let (decodes, column, built) = side(&store, Role::Decode, &with_column);
+    assert_eq!((built.pool_size, column.len()), (4, 4));
+    assert_eq!(
+        decodes.iter().map(|row| row.position).collect::<Vec<_>>(),
+        [0, 1, 2, 3]
+    );
+
+    // Each side's classes are numbered as their first worker comes in id
+    // order; the decode no prefill pairs with is class 0 and takes no number.
+    let numbered = |ids: &[WorkerId]| -> Vec<(WorkerId, u32)> {
+        sorted(ids.to_vec()).into_iter().zip(1..).collect()
+    };
+    assert_eq!(classes(&prefills), numbered(&[pa, pb]));
+    let mut expected = numbered(&[da, db, dn]);
+    expected.push((apart, 0));
+    expected.sort_unstable();
+    assert_eq!(classes(&decodes), expected);
+
+    // The world holds what the rows were written from: a prefill class
+    // lists the class of its transport's decode and the silent decode's.
+    let world = store.world();
+    let pairs = world.pairs(MODEL).expect("the model's classes");
+    assert_eq!((pairs.classes(), pairs.pairs()), (2, 4));
+    for (prefill, partners) in [(pa, [da, dn]), (pb, [db, dn])] {
+        let mut listed = partners.map(|id| class_of(&decodes, id));
+        listed.sort_unstable();
+        assert_eq!(pairs.table().of(&class_of(&prefills, prefill)), listed);
+    }
+    assert_eq!(pairs.refusal(WireModes::GRPC), None);
+    assert!(world.pairs("other").is_none());
+}
+
+#[test]
+fn a_pool_less_another_gateways_host_local_rows_pairs_by_the_same_table() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let other = GatewayId(2);
+    let prefill = |key: &str, transport: &str| {
+        store
+            .upsert(pair_facts(key, Role::Prefill, Some(transport)))
+            .id()
+    };
+    let (pa, pb) = (
+        prefill("grpc://pa:9000", "tx-a"),
+        prefill("grpc://pb:9000", "tx-b"),
+    );
+    // Host-local decodes of each gateway on the first transport, and a
+    // silent decode every gateway dials.
+    let local = |key: String, gateway: GatewayId| {
+        let registered = WorkerFacts {
+            reachable_from: Reachability::Gateway(gateway),
+            ..pair_facts(&key, Role::Decode, Some("tx-a"))
+        };
+        store.upsert(registered).id()
+    };
+    let of_other: Vec<WorkerId> = (0..4)
+        .map(|index| local(format!("ipc://o{index}"), other))
+        .collect();
+    let of_asker: Vec<WorkerId> = (0..4)
+        .map(|index| local(format!("ipc://a{index}"), ASKER))
+        .collect();
+    let dn = store
+        .upsert(pair_facts("grpc://dn:9000", Role::Decode, None))
+        .id();
+
+    let world = store.world();
+    let held = world.pairs(MODEL).expect("the model's classes");
+    let lists = |table: PairTable<'_>| -> Vec<Vec<u32>> {
+        (1..=held.classes())
+            .map(|class| table.of(&class).to_vec())
+            .collect()
+    };
+    for (gateway, own) in [(ASKER, &of_asker), (other, &of_other)] {
+        let asked = Ask {
+            gateway,
+            ..ask(now)
+        };
+        // The gateway's decode pool is its own host-local rows and the
+        // shared one. A row's position is the gateway's own; its class and
+        // the table are the world's.
+        let mut out = PairBuffers::default();
+        store
+            .build_pair(MODEL, &asked, &mut out)
+            .expect("both pools");
+        let mut reached = own.clone();
+        reached.push(dn);
+        let rows = classes(out.pools().decodes);
+        assert_eq!(
+            rows.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+            sorted(reached.clone()),
+            "{gateway:?}"
+        );
+        assert!(
+            rows.iter().all(|row| held.decodes().contains(row)),
+            "{gateway:?}"
+        );
+        assert_eq!(lists(out.pools().table), lists(held.table()), "{gateway:?}");
+
+        // The first transport's prefill pairs with every decode the gateway
+        // reaches, the second's with the silent one alone.
+        let drawn = |prefill: WorkerId| partners_drawn(&store, &asked, prefill, Pairs::ByTable);
+        assert_eq!(drawn(pa), sorted(reached), "{gateway:?}");
+        assert_eq!(drawn(pb), [dn], "{gateway:?}");
+    }
+}
+
+#[test]
+fn the_classes_follow_the_membership_and_are_each_models_own() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let class_in = |model: &str, role: Role, id: WorkerId| {
+        let mut out = ViewBuffers::default();
+        store.build_view(model, role, &ask(now), &mut out)?;
+        let row = out.candidates.iter().find(|row| row.id == id)?;
+        Some(row.pair_class)
+    };
+    // A prefill of two models and no decode: outside any pairing in both.
+    let prefill = store
+        .upsert(facts("grpc://p:9000", Role::Prefill, &[MODEL, "other"]))
+        .id();
+    assert_eq!(class_in(MODEL, Role::Prefill, prefill), Some(0));
+    assert!(store.world().pairs(MODEL).is_none());
+
+    // A decode of one of the two models arrives: a class in that model.
+    let decode = store
+        .upsert(facts("grpc://d:9000", Role::Decode, &[MODEL]))
+        .id();
+    assert_eq!(class_in(MODEL, Role::Prefill, prefill), Some(1));
+    assert_eq!(class_in(MODEL, Role::Decode, decode), Some(1));
+    assert_eq!(class_in("other", Role::Prefill, prefill), Some(0));
+    let world = store.world();
+    assert_eq!(world.pairs(MODEL).map(|pairs| pairs.classes()), Some(1));
+    assert!(world.pairs("other").is_none());
+
+    // It leaves: the prefill is outside any pairing again.
+    let revision = WorkersStore::get(&store, decode).expect("the row").revision;
+    store.remove(decode, revision).expect("removed");
+    assert_eq!(class_in(MODEL, Role::Prefill, prefill), Some(0));
+    assert!(store.world().pairs(MODEL).is_none());
+
+    // A decode no prefill pairs with: no class, and the world says why.
+    let apart = store
+        .upsert(WorkerFacts {
+            engine_kind: "rt-b".to_string(),
+            ..facts("grpc://e:9000", Role::Decode, &[MODEL])
+        })
+        .id();
+    store.upsert(WorkerFacts {
+        engine_kind: "rt-a".to_string(),
+        ..facts("grpc://p:9000", Role::Prefill, &[MODEL, "other"])
+    });
+    assert_eq!(class_in(MODEL, Role::Prefill, prefill), Some(0));
+    assert_eq!(class_in(MODEL, Role::Decode, apart), Some(0));
+    let world = store.world();
+    let pairs = world.pairs(MODEL).expect("both pools hold a worker");
+    assert_eq!(pairs.classes(), 0);
+    assert_eq!(
+        pairs.refusal(WireModes::NONE),
+        Some(&Refusal {
+            prefill: vec!["rt-a/?/?".to_string()],
+            decode: vec!["rt-b/?/?".to_string()],
+            mismatches: vec!["runtime".to_string()],
+        })
+    );
+}
+
+#[test]
+fn two_stores_fed_one_membership_in_two_orders_number_its_classes_alike_under_each_mode() {
+    // Three prefills of three transports; a decode of each of two of them
+    // and one that names none.
+    let fleet = [
+        ("grpc://pa:9000", Role::Prefill, Some("tx-a")),
+        ("grpc://pb:9000", Role::Prefill, Some("tx-b")),
+        ("grpc://pc:9000", Role::Prefill, Some("tx-c")),
+        ("grpc://da:9000", Role::Decode, Some("tx-a")),
+        ("grpc://db:9000", Role::Decode, Some("tx-b")),
+        ("grpc://dn:9000", Role::Decode, None),
+    ];
+    let now = Instant::now();
+    // The prefill classes, the decode classes and the prefills outside any
+    // pairing.
+    let expected = [
+        (Pairing::Off, 1, 1, 0),
+        (Pairing::Lenient, 3, 3, 0),
+        (Pairing::Strict, 2, 2, 1),
+    ];
+    for (mode, prefill_classes, decode_classes, unpaired) in expected {
+        let fed = |order: &mut dyn Iterator<Item = &(&str, Role, Option<&str>)>| {
+            let store = store_pairing(mode);
+            for &(key, role, transport) in order {
+                store.upsert(pair_facts(key, role, transport));
+            }
+            store
+        };
+        let (one, other) = (fed(&mut fleet.iter()), fed(&mut fleet.iter().rev()));
+        let (prefills, _, _) = side(&one, Role::Prefill, &ask(now));
+        let (decodes, _, _) = side(&one, Role::Decode, &ask(now));
+        // One row a worker, whatever the mode pairs.
+        assert_eq!((prefills.len(), decodes.len()), (3, 3), "{mode:?}");
+        let largest = |rows: &[Candidate]| rows.iter().map(|row| row.pair_class).max();
+        assert_eq!(largest(&decodes), Some(decode_classes), "{mode:?}");
+        assert_eq!(
+            prefills.iter().filter(|row| row.pair_class == 0).count(),
+            unpaired,
+            "{mode:?}"
+        );
+        let world = one.world();
+        let pairs = world.pairs(MODEL).expect("the model's classes");
+        assert_eq!(pairs.classes(), prefill_classes, "{mode:?}");
+
+        // The other store numbers every class alike, row for row, and holds
+        // the same table.
+        assert_eq!(
+            classes(&side(&other, Role::Prefill, &ask(now)).0),
+            classes(&prefills),
+            "{mode:?}"
+        );
+        assert_eq!(
+            classes(&side(&other, Role::Decode, &ask(now)).0),
+            classes(&decodes),
+            "{mode:?}"
+        );
+        assert_eq!(other.world().pairs(MODEL), Some(pairs), "{mode:?}");
+    }
+}
+
+#[test]
+fn a_generation_of_another_pairing_mode_derives_the_classes_again_at_the_same_epoch() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    // A prefill and a decode of two known runtimes on the plain wire: a
+    // comparing mode refuses the pair, off compares nothing of the handoff.
+    for (key, role, runtime) in [
+        ("w://p:1", Role::Prefill, "rt-a"),
+        ("w://d:1", Role::Decode, "rt-b"),
+    ] {
+        store.upsert(WorkerFacts {
+            wire_modes: WireModes::HTTP,
+            engine_kind: runtime.to_string(),
+            ..facts(key, role, &[MODEL])
+        });
+    }
+    let class = || side(&store, Role::Prefill, &ask(now)).0[0].pair_class;
+    // The prefill's load record on file, as its row carries it.
+    let record = || {
+        let row = side(&store, Role::Prefill, &ask(now)).0[0];
+        (
+            row.load_sampled_at_micros,
+            row.load.map(|load| load.running),
+        )
+    };
+    let prefill = side(&store, Role::Prefill, &ask(now)).0[0].id;
+    store.record(prefill, 0, load(3, 0), now, LoadSource::Stream);
+    let on_file = record();
+    assert_eq!(on_file.1, Some(3));
+    let epoch = store.epoch();
+    let unbound = store.world();
+    assert_eq!(class(), 0, "the unbound generation holds the default mode");
+
+    // A generation of the standing mode publishes the rows as they are:
+    // what the membership derived is shared, by pointer.
+    store.apply(generation(1)).expect("the first generation");
+    let first = store.world();
+    assert!(Arc::ptr_eq(&unbound.derived, &first.derived));
+    assert_eq!((first.epoch(), first.spec().generation()), (epoch, 1));
+    assert_eq!(class(), 0);
+
+    // A generation of another mode, with no member moved: the classes are
+    // derived again and published once under the new generation.
+    store
+        .apply(generation_pairing(2, Pairing::Off))
+        .expect("above the first");
+    let second = store.world();
+    assert!(!Arc::ptr_eq(&first.derived, &second.derived));
+    assert_eq!(class(), 1);
+    assert_eq!(second.pairs(MODEL).map(|pairs| pairs.classes()), Some(1));
+    assert_eq!(second.spec().generation(), 2);
+    // Each row is derived with its load record on file.
+    assert_eq!(record(), on_file);
+    // The epoch is the membership's: it reads the same in the store and on
+    // the world, and a watcher that saw it is told nothing.
+    assert_eq!((store.epoch(), second.epoch()), (epoch, epoch));
+    assert_eq!(
+        store.changes_since(epoch),
+        MembershipTail::Changes(Vec::new())
+    );
+    // The world a decision took before the apply keeps its own classes.
+    assert_eq!(first.pairs(MODEL).map(|pairs| pairs.classes()), Some(0));
+
+    // A membership write under the new mode derives under it,
+    store.upsert(WorkerFacts {
+        wire_modes: WireModes::HTTP,
+        engine_kind: "rt-b".to_string(),
+        ..facts("w://d:2", Role::Decode, &[MODEL])
+    });
+    assert_eq!(class(), 1);
+    assert_eq!(store.epoch(), epoch + 1);
+    // and a refused generation changes no class.
+    assert!(store.apply(generation_pairing(2, Pairing::Strict)).is_err());
+    assert_eq!(class(), 1);
+    store
+        .apply(generation_pairing(3, Pairing::Lenient))
+        .expect("above the second");
+    assert_eq!(class(), 0);
+    assert_eq!(store.epoch(), epoch + 1);
+}
+
+#[test]
+fn the_store_hands_the_rule_each_workers_wires_and_its_own_mode() {
+    let now = Instant::now();
+    // A prefill and a decode of two known runtimes, both on `wires`, in a
+    // store of `mode`: the class of the prefill's row.
+    let class = |mode: Pairing, wires: WireModes| {
+        let store = store_pairing(mode);
+        for (key, role, runtime) in [
+            ("w://p:1", Role::Prefill, "rt-a"),
+            ("w://d:1", Role::Decode, "rt-b"),
+        ] {
+            store.upsert(WorkerFacts {
+                wire_modes: wires,
+                engine_kind: runtime.to_string(),
+                ..facts(key, role, &[MODEL])
+            });
+        }
+        side(&store, Role::Prefill, &ask(now)).0[0].pair_class
+    };
+    // Off compares nothing of the handoff: the two pair on the plain wire.
+    assert_eq!(class(Pairing::Off, WireModes::HTTP), 1);
+    // A comparing mode refuses them there, and no mode pairs them where a
+    // pair shares a runtime.
+    assert_eq!(class(Pairing::Lenient, WireModes::HTTP), 0);
+    assert_eq!(class(Pairing::Off, WireModes::GRPC), 0);
+
+    // A prefill and a decode on two sides of the wire's fact never pair,
+    // and nothing is refused: neither side holds both pools.
+    let store = store_pairing(Pairing::Off);
+    for (key, role, wires) in [
+        ("http://p:1", Role::Prefill, WireModes::HTTP),
+        ("grpc://d:1", Role::Decode, WireModes::GRPC),
+    ] {
+        store.upsert(WorkerFacts {
+            wire_modes: wires,
+            ..facts(key, role, &[MODEL])
+        });
+    }
+    assert_eq!(side(&store, Role::Prefill, &ask(now)).0[0].pair_class, 0);
+    assert_eq!(side(&store, Role::Decode, &ask(now)).0[0].pair_class, 0);
+    let world = store.world();
+    let pairs = world.pairs(MODEL).expect("both pools hold a worker");
+    assert_eq!(pairs.classes(), 0);
+    assert_eq!(
+        (
+            pairs.refusal(WireModes::HTTP),
+            pairs.refusal(WireModes::GRPC)
+        ),
+        (None, None)
+    );
+}
+
+/// The id and the class of every prefill row and then every decode row of
+/// the model, as views built from the store's world of this instant read
+/// them.
+fn pair_rows(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
+    let mut out = ViewBuffers::default();
+    let mut rows = Vec::new();
+    for role in [Role::Prefill, Role::Decode] {
+        let built = store.build_view(MODEL, role, &ask(Instant::now()), &mut out);
+        if built.is_some() {
+            rows.extend(classes(&out.candidates));
+        }
+    }
+    rows
+}
+
+#[test]
+fn a_membership_write_that_moves_no_offer_carries_the_classes() {
+    let store = MemoryStore::new();
+    let (prefills, _) = two_classes(&store);
+    // The world is kept, so its classes stand where they are: one address
+    // in a later world is those classes carried, never others in their
+    // place.
+    let before = store.world();
+    let derived = before.pairs(MODEL).expect("the model's classes");
+    let rows = pair_rows(&store);
+    let carried = |what: &str| {
+        let world = store.world();
+        let pairs = world.pairs(MODEL).expect("the model's classes");
+        assert!(std::ptr::eq(derived, pairs), "{what}: derived again");
+        assert_eq!(pair_rows(&store), rows, "{what}");
+        world.epoch()
+    };
+    // The same registration again: a membership write all the same.
+    store.upsert(pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-a")));
+    assert!(carried("the same facts") > before.epoch());
+    // Facts no pair reads.
+    store.upsert(WorkerFacts {
+        zone: Some("z".to_string()),
+        max_running: Some(9),
+        priority: 2,
+        ..pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-a"))
+    });
+    carried("facts no pair reads");
+    // A patch moves labels, a priority and an overload alone.
+    let revision = WorkersStore::get(&store, prefills[0])
+        .expect("the row")
+        .revision;
+    let patch = WorkerPatch {
+        labels: None,
+        priority: Some(3),
+        overload: None,
+    };
+    store.patch(prefills[0], patch, revision).expect("patched");
+    carried("a patch");
+}
+
+#[test]
+fn a_membership_write_that_moves_an_offer_derives_the_classes_again() {
+    // Each fact that places a worker in its pools or makes its offer, moved
+    // on one prefill by its registration refreshed.
+    let first = || pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-a"));
+    let moved = [
+        (
+            "the descriptor",
+            pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-b")),
+        ),
+        (
+            "the runtime",
+            WorkerFacts {
+                engine_kind: "rt-b".to_string(),
+                ..first()
+            },
+        ),
+        (
+            "the wires",
+            WorkerFacts {
+                wire_modes: WireModes::HTTP,
+                ..first()
+            },
+        ),
+        (
+            "the role",
+            WorkerFacts {
+                role: Role::Decode,
+                ..first()
+            },
+        ),
+        (
+            "the models",
+            WorkerFacts {
+                models: vec!["other".to_string()],
+                ..first()
+            },
+        ),
+    ];
+    for (what, facts) in moved {
+        let store = MemoryStore::new();
+        two_classes(&store);
+        let before = pair_rows(&store);
+        store.upsert(facts.clone());
+        // A store that never held the first version: every write of it
+        // registers a worker, and derives.
+        let fresh = MemoryStore::new();
+        fresh.upsert(facts);
+        for (key, role, transport) in [
+            ("grpc://pb:9000", Role::Prefill, Some("tx-b")),
+            ("grpc://da:9000", Role::Decode, Some("tx-a")),
+            ("grpc://db:9000", Role::Decode, Some("tx-b")),
+            ("grpc://dn:9000", Role::Decode, None),
+        ] {
+            fresh.upsert(pair_facts(key, role, transport));
+        }
+        let after = pair_rows(&store);
+        assert_eq!(after, pair_rows(&fresh), "{what}");
+        assert_eq!(
+            store.world().pairs(MODEL),
+            fresh.world().pairs(MODEL),
+            "{what}"
+        );
+        assert_ne!(after, before, "{what}: the classes moved");
+    }
+}
+
+/// The five workers of [`two_classes`], by key, role and transport.
+const PAIR_FLEET: [(&str, Role, Option<&str>); 5] = [
+    ("grpc://pa:9000", Role::Prefill, Some("tx-a")),
+    ("grpc://pb:9000", Role::Prefill, Some("tx-b")),
+    ("grpc://da:9000", Role::Decode, Some("tx-a")),
+    ("grpc://db:9000", Role::Decode, Some("tx-b")),
+    ("grpc://dn:9000", Role::Decode, None),
+];
+
+#[test]
+fn a_member_that_leaves_a_model_of_two_sides_derives_its_classes_again() {
+    let store = MemoryStore::new();
+    let (_, decodes) = two_classes(&store);
+    let before = pair_rows(&store);
+    // The decode of the first transport leaves: both sides keep a member.
+    let revision = WorkersStore::get(&store, decodes[0])
+        .expect("the row")
+        .revision;
+    store.remove(decodes[0], revision).expect("removed");
+    // A store that never held it.
+    let fresh = MemoryStore::new();
+    for (key, role, transport) in PAIR_FLEET {
+        if key != "grpc://da:9000" {
+            fresh.upsert(pair_facts(key, role, transport));
+        }
+    }
+    let after = pair_rows(&store);
+    assert_eq!(after, pair_rows(&fresh));
+    assert_eq!(store.world().pairs(MODEL), fresh.world().pairs(MODEL));
+    assert_ne!(after, before);
+}
+
+#[test]
+fn a_new_incarnation_under_a_key_derives_the_classes_again() {
+    let store = MemoryStore::new();
+    let (prefills, _) = two_classes(&store);
+    // The first prefill comes again under its key: a new id in its pool.
+    let again = WorkerFacts {
+        incarnation: 2,
+        ..pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-a"))
+    };
+    store.upsert(again.clone());
+    // A store that never held the first incarnation.
+    let fresh = MemoryStore::new();
+    fresh.upsert(again);
+    for &(key, role, transport) in &PAIR_FLEET[1..] {
+        fresh.upsert(pair_facts(key, role, transport));
+    }
+    let after = pair_rows(&store);
+    assert_eq!(after, pair_rows(&fresh));
+    assert_eq!(store.world().pairs(MODEL), fresh.world().pairs(MODEL));
+    assert!(
+        after.iter().all(|&(id, _)| id != prefills[0]),
+        "the first incarnation left"
+    );
+    assert!(after.iter().all(|&(_, class)| class != 0), "{after:?}");
+}
+
+#[test]
+fn a_write_that_moves_no_offer_carries_each_models_own_classes() {
+    let store = MemoryStore::new();
+    two_classes(&store);
+    // A second model, of one prefill and one decode: classes of its own.
+    store.upsert(facts("grpc://op:9000", Role::Prefill, &["other"]));
+    store.upsert(facts("grpc://od:9000", Role::Decode, &["other"]));
+    let classes_of = |world: &World, model: &str| {
+        std::ptr::from_ref(world.pairs(model).expect("the model's classes"))
+    };
+    // The world is kept, so each model's classes stand where they are.
+    let before = store.world();
+    let (first, second) = (classes_of(&before, MODEL), classes_of(&before, "other"));
+    assert_ne!(first, second);
+    // A worker of each model writes its registration again.
+    store.upsert(pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-a")));
+    store.upsert(facts("grpc://od:9000", Role::Decode, &["other"]));
+    let after = store.world();
+    assert_eq!(classes_of(&after, MODEL), first);
+    assert_eq!(classes_of(&after, "other"), second);
+}
+
+#[test]
+fn a_blank_value_of_a_descriptor_is_dropped_at_the_door() {
+    // The fleet of `two_classes` written with blanks: a blank protocol and
+    // version on every worker, each transport between blanks, and a blank
+    // one where the fleet names none.
+    let blanked = MemoryStore::new();
+    let ids: Vec<WorkerId> = PAIR_FLEET
+        .iter()
+        .map(|&(key, role, transport)| {
+            let transport = transport.map_or_else(|| " ".to_string(), |name| format!(" {name} "));
+            let facts = WorkerFacts {
+                pairing: Some(PairingDescriptor {
+                    protocol: Some(String::new()),
+                    transport: Some(transport),
+                    version: Some(String::new()),
+                    kv_layout: [Some(" ".to_string()), None, None, None],
+                }),
+                ..pair_facts(key, role, None)
+            };
+            blanked.upsert(facts).id()
+        })
+        .collect();
+    let plain = MemoryStore::new();
+    two_classes(&plain);
+    // Two blank protocols settle no pair: the transports decide, as where no
+    // worker sets a protocol.
+    assert_eq!(pair_rows(&blanked), pair_rows(&plain));
+    assert_eq!(blanked.world().pairs(MODEL), plain.world().pairs(MODEL));
+    // The row of record holds each value as the rule reads it.
+    let first = ids.first().copied().expect("a worker");
+    let row = WorkersStore::get(&blanked, first).expect("the row");
+    assert_eq!(
+        row.facts.pairing,
+        Some(PairingDescriptor {
+            transport: Some("tx-a".to_string()),
+            ..PairingDescriptor::default()
+        })
+    );
 }
 
 // ------------------------------------------------------ the overload verdict
@@ -2752,4 +3797,35 @@ fn a_membership_write_and_a_new_generation_judge_again_from_what_is_on_file() {
         0,
         "no write of the load table moved one"
     );
+}
+
+#[test]
+fn the_deciding_door_hands_the_rows_and_the_engine_of_one_publication() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    member(&store, "http://a:8000");
+    store.apply(generation(1)).expect("above the unbound start");
+    store.deciding(|world| {
+        // A generation applied and a member admitted while a decision holds
+        // its world are the next decision's: this one reads the rows and
+        // the engine it was handed, whole.
+        store.apply(generation(2)).expect("above the standing one");
+        member(&store, "http://b:8000");
+        let mut out = ViewBuffers::default();
+        let built = world
+            .build(MODEL, Role::Single, &ask(t0), &mut out)
+            .expect("the pool");
+        assert_eq!(
+            (built.generation, world.spec().generation(), built.pool_size),
+            (1, 1, 1)
+        );
+        assert_eq!(world.spec().engine().generation(), 1);
+    });
+    let next = store.deciding(|world| {
+        (
+            world.spec().generation(),
+            world.members(MODEL, Role::Single),
+        )
+    });
+    assert_eq!(next, (2, Some(2)));
 }

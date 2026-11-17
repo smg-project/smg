@@ -486,7 +486,10 @@ pub enum InteractionsTool {
     /// Function tool with function declaration
     Function(Function),
     /// Google Search built-in tool
-    GoogleSearch {},
+    GoogleSearch {
+        /// The kinds of search to run (`web_search`, `image_search`, ...)
+        search_types: Option<Vec<String>>,
+    },
     /// Code Execution built-in tool
     CodeExecution {},
     /// URL Context built-in tool
@@ -496,7 +499,8 @@ pub enum InteractionsTool {
         name: Option<String>,
         url: Option<String>,
         headers: Option<HashMap<String, String>>,
-        allowed_tools: Option<AllowedTools>,
+        /// The server's tools the model may call, a list of configurations
+        allowed_tools: Option<Vec<AllowedTools>>,
     },
     /// File Search built-in tool
     FileSearch {
@@ -506,6 +510,29 @@ pub enum InteractionsTool {
         top_k: Option<u32>,
         /// Metadata filter for search
         metadata_filter: Option<String>,
+    },
+    /// Computer Use built-in tool. The open sets of values (the
+    /// environment, the safety policies) are kept as strings.
+    ComputerUse {
+        environment: Option<String>,
+        excluded_predefined_functions: Option<Vec<String>>,
+        disabled_safety_policies: Option<Vec<String>>,
+        enable_prompt_injection_detection: Option<bool>,
+    },
+    /// Google Maps built-in tool
+    GoogleMaps {
+        enable_widget: Option<bool>,
+        latitude: Option<f64>,
+        longitude: Option<f64>,
+    },
+    /// Retrieval built-in tool. Each source's configuration is kept as
+    /// written, as the gateway reads none of them.
+    Retrieval {
+        retrieval_types: Option<Vec<String>>,
+        vertex_ai_search_config: Option<Value>,
+        rag_store_config: Option<Value>,
+        exa_ai_search_config: Option<Value>,
+        parallel_ai_search_config: Option<Value>,
     },
 }
 
@@ -519,13 +546,19 @@ pub struct AllowedTools {
     pub tools: Option<Vec<String>>,
 }
 
+/// A tool choice mode. The SDK keeps the set open, so a mode this build does
+/// not name is kept as written (`Other`), as the tools' other open sets are.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ToolChoiceType {
     Auto,
     Any,
     None,
     Validated,
+    /// A mode this build does not name, kept as the client wrote it
+    #[serde(untagged)]
+    Other(String),
 }
 
 // ============================================================================
@@ -1433,6 +1466,65 @@ mod tests {
         }
     }
 
+    /// The tools the public API declares beside the ones the gateway knew
+    /// read, validate and are written back as sent: computer use, Google
+    /// Maps, retrieval, an MCP server's list of allowed tools, and Google
+    /// Search's search types.
+    #[test]
+    fn a_request_declaring_each_public_tool_writes_it_back_as_sent() {
+        let tools = serde_json::json!([
+            {
+                "type": "computer_use",
+                "environment": "browser",
+                "excluded_predefined_functions": ["drag_and_drop"],
+                "disabled_safety_policies": ["financial_transactions"],
+                "enable_prompt_injection_detection": true
+            },
+            {"type": "google_maps", "enable_widget": true, "latitude": 37.7749, "longitude": -122.4194},
+            {
+                "type": "retrieval",
+                "retrieval_types": ["vertex_ai_search"],
+                "vertex_ai_search_config": {"datastores": ["projects/p/locations/global/dataStores/d"]}
+            },
+            {
+                "type": "mcp_server",
+                "name": "weather",
+                "url": "https://mcp.example.com/mcp",
+                "allowed_tools": [{"mode": "validated", "tools": ["get_forecast"]}]
+            },
+            {"type": "google_search", "search_types": ["web_search", "image_search"]}
+        ]);
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "Find a cafe near the office.", "store": false, "tools": tools
+        }))
+        .unwrap();
+        assert!(request.validate().is_ok(), "{:?}", request.validate());
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(written["tools"], tools);
+
+        let open_mode: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Find a cafe near the office.",
+            "store": false,
+            "tools": [{
+                "type": "mcp_server",
+                "name": "maps",
+                "allowed_tools": [{"mode": "a_mode_of_no_api", "tools": ["find_place"]}]
+            }],
+            "generation_config": {"tool_choice": "a_mode_of_no_api"}
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&open_mode).unwrap();
+        assert_eq!(
+            written["tools"][0]["allowed_tools"][0]["mode"],
+            "a_mode_of_no_api"
+        );
+        assert_eq!(
+            written["generation_config"]["tool_choice"],
+            "a_mode_of_no_api"
+        );
+    }
+
     /// A modeled field's camelCase spelling fills the typed field, where the
     /// gateway's checks read it, and leaves `other` empty; it is written back
     /// for the upstream in snake_case. A body with both spellings of one field
@@ -1576,7 +1668,7 @@ mod tests {
     #[test]
     fn a_function_tool_has_a_name() {
         let tools = |names: &[&str]| -> Vec<InteractionsTool> {
-            let mut tools = vec![InteractionsTool::GoogleSearch {}];
+            let mut tools = vec![InteractionsTool::GoogleSearch { search_types: None }];
             tools.extend(names.iter().map(|name| {
                 serde_json::from_value::<InteractionsTool>(
                     serde_json::json!({"type": "function", "name": name}),

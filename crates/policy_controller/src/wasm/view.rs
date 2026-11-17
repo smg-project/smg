@@ -1510,6 +1510,7 @@ mod tests {
             regime: OverloadRegime::Partial,
             generation: 7,
             zones: &zones,
+            reach: 0,
         };
         let mut packed = Packed::default();
         packed.fill_pool(&pool);

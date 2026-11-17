@@ -1,12 +1,12 @@
 //! Canonical multimodal request planning shared by protocol adapters, rendering,
 //! and preprocessing.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use anyhow::Result;
 use llm_multimodal::{
-    registry::modality_limit_override, EncoderInputFormat, FetchSourceKind, MediaContentPart,
-    MediaPartOrder, Modality, ModelMetadata,
+    registry::{modality_limit_override, ModelRegistryError},
+    EncoderInputFormat, FetchSourceKind, MediaContentPart, MediaPartOrder, Modality, ModelMetadata,
 };
 use llm_tokenizer::{traits::PromptEncoding, TokenizerTrait};
 use openai_protocol::worker::MmProcessingMode;
@@ -237,6 +237,48 @@ pub(crate) async fn prepare_placeholder_tokens(
     .await
 }
 
+/// A failure of the placeholder preparation that the request itself causes
+/// and its client can fix: more items than a limit takes, a modality or an
+/// image override the model's spec does not take, media for a model with no
+/// media spec on the router. The stage that finds it in a failure's chain
+/// writes one WARN and marks its answer; every other failure of the
+/// preparation is the deployment's (the model's files, its vocabulary) and
+/// keeps the stage's ERROR line.
+#[derive(Debug)]
+pub(crate) struct RequestRefusal(String);
+
+impl RequestRefusal {
+    /// Whether `error` is this refusal, at any depth of its chain.
+    pub(crate) fn is(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<Self>())
+    }
+
+    /// `message` as the failure for a registry `error`: this refusal for a
+    /// variant the request brings (a modality the spec does not take, more
+    /// items than its limit), a plain failure for every other variant: one
+    /// about the model's files, or one no request can bring (a modality
+    /// counted twice, when the plan counts each modality once).
+    fn of_registry(error: &ModelRegistryError, message: String) -> anyhow::Error {
+        if matches!(
+            error,
+            ModelRegistryError::UnsupportedModality { .. }
+                | ModelRegistryError::ModalityLimitExceeded { .. }
+        ) {
+            Self(message).into()
+        } else {
+            anyhow::anyhow!(message)
+        }
+    }
+}
+
+impl fmt::Display for RequestRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RequestRefusal {}
+
 /// `prepare_placeholder_tokens` with the deployment-wide limit override (the
 /// `SMG_*_MAX_COUNT` variables, read once per process) passed in: a test
 /// passes `|_| None` and holds the spec default under test whatever the shell
@@ -274,9 +316,11 @@ async fn prepare_placeholder_tokens_with_env(
     else {
         anyhow::ensure!(
             components.processing != MmProcessingMode::Router,
-            "multimodal not supported for model: {model_id} on the router (no media spec for \
-             its family); a vLLM worker with --mm-processor inprocess|redis processes its media \
-             itself under --mm-processing worker"
+            RequestRefusal(format!(
+                "multimodal not supported for model: {model_id} on the router (no media spec \
+                 for its family); a vLLM worker with --mm-processor inprocess|redis processes \
+                 its media itself under --mm-processing worker"
+            ))
         );
         return Ok(PlaceholderTokens::worker_only());
     };
@@ -290,7 +334,10 @@ async fn prepare_placeholder_tokens_with_env(
                     ..
                 }
             )),
-            "Inkling2 requires original image dimensions. max_long_side_pixel is unsupported"
+            RequestRefusal(
+                "Inkling2 requires original image dimensions. max_long_side_pixel is unsupported"
+                    .to_string()
+            )
         );
     }
     let spec_limits = spec.modality_limits(&metadata).map_err(|error| {
@@ -304,7 +351,7 @@ async fn prepare_placeholder_tokens_with_env(
         &components.modality_limit_overrides,
         env_override,
     );
-    check_item_counts(plan, &limits).map_err(|error| anyhow::anyhow!("{error}"))?;
+    check_item_counts(plan, &limits).map_err(RequestRefusal)?;
     let requested = plan
         .modalities()
         .iter()
@@ -314,12 +361,17 @@ async fn prepare_placeholder_tokens_with_env(
     // loosens what the engine takes.
     spec.validate_media_request_with_limits(&metadata, &requested, &limit_numbers(&limits))
         .map_err(|error| {
-            anyhow::anyhow!("invalid media request for model {}: {error}", spec.name())
+            RequestRefusal::of_registry(
+                &error,
+                format!("invalid media request for model {}: {error}", spec.name()),
+            )
         })?;
     let mut placeholders = PlaceholderTokens::default();
     for &modality in plan.modalities() {
         let token = spec
             .placeholder_token_for(&metadata, modality)
+            // The validation above has accepted the modality, so a failure
+            // here is about the spec or the model's files, never the request.
             .map_err(|error| {
                 anyhow::anyhow!(
                     "model {} supports {modality} but its placeholder token could not be resolved: {error}",
@@ -1219,6 +1271,7 @@ pub(crate) mod tests {
         )
         .await
         .expect_err("the router cannot process media it has no spec for");
+        assert!(RequestRefusal::is(&error), "{error:#}");
         let message = format!("{error:#}");
         assert!(
             message.contains("multimodal not supported for model: m6"),
@@ -1226,6 +1279,37 @@ pub(crate) mod tests {
         );
         assert!(message.contains("no media spec"), "{message}");
         assert!(message.contains("--mm-processing worker"), "{message}");
+    }
+
+    /// Only a registry refusal the request brings is typed as the request's:
+    /// a modality the spec does not take, more items than its limit. A config
+    /// field the model's files lack, a token its vocabulary lacks and a
+    /// modality counted twice (the plan counts each once) are not.
+    #[test]
+    fn only_a_registry_refusal_the_request_brings_is_typed_as_the_requests() {
+        let typed = |error: ModelRegistryError| {
+            RequestRefusal::is(&RequestRefusal::of_registry(&error, error.to_string()))
+        };
+        assert!(typed(ModelRegistryError::UnsupportedModality {
+            spec: "s",
+            modality: Modality::Audio,
+        }));
+        assert!(typed(ModelRegistryError::ModalityLimitExceeded {
+            spec: "s",
+            modality: Modality::Image,
+            limit: 1,
+            requested: 2,
+        }));
+        assert!(!typed(ModelRegistryError::MissingConfigField {
+            field: "image_token_id".to_string(),
+        }));
+        assert!(!typed(ModelRegistryError::TokenNotFound {
+            token: "<image>".to_string(),
+        }));
+        assert!(!typed(ModelRegistryError::DuplicateModality {
+            spec: "s",
+            modality: Modality::Image,
+        }));
     }
 
     /// A chat request with one image part, its `max_long_side_pixel` as `cap`.

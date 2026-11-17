@@ -30,7 +30,7 @@ fn default_model_type() -> ModelType {
 /// # Example
 ///
 /// ```
-/// use openai_protocol::{model_type::ModelType, model_card::ModelCard, worker::ProviderType};
+/// use smg_worker::{model_type::ModelType, model_card::ModelCard, worker::ProviderType};
 ///
 /// let card = ModelCard::new("meta-llama/Llama-3.1-8B-Instruct")
 ///     .with_display_name("Llama 3.1 8B Instruct")

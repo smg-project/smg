@@ -88,13 +88,14 @@ pub(super) const CHAT_BURST_ROOM: usize = CHUNK_FLUSH_BYTES + 2 * CHAT_BURST_MAR
 /// head up to and including `"choices":[` is serialized once per stream and
 /// copied in front of each chunk, so a chunk costs the serialization of its
 /// choice and usage only. The bytes are exactly those of a serialized
-/// [`super::ChatChunkWithUsage`] (the chunk-level `usage: null` placeholder included).
-pub(super) struct ChatChunkFrame {
+/// `ChatCompletionStreamResponse`, plus the chunk-level `usage: null`
+/// placeholder where the wire asks for one.
+pub(crate) struct ChatChunkFrame {
     head: Vec<u8>,
 }
 
 impl ChatChunkFrame {
-    pub(super) fn new(
+    pub(crate) fn new(
         request_id: &str,
         model: &str,
         created: u64,
@@ -117,7 +118,7 @@ impl ChatChunkFrame {
 
     /// Append `data: {...}\n\n` for `choice` (and `usage`, or the `null`
     /// placeholder when `emit_usage_null`) to `buffer`.
-    pub(super) fn write_chunk<C: Serialize>(
+    pub(crate) fn write_chunk<C: Serialize>(
         &self,
         buffer: &mut BytesMut,
         choice: &C,
@@ -197,6 +198,13 @@ impl ChatChunkFrame {
         push_logprobs_view(buffer, view, requested, &decode);
         buffer.extend_from_slice(b",\"finish_reason\":null}");
         Self::close_chunk(buffer, start, Ok(()), usage, emit_usage_null);
+    }
+
+    /// Append the chunk that closes a stream with its usage and no choice.
+    pub(crate) fn write_usage_chunk(&self, buffer: &mut BytesMut, usage: &Usage) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head);
+        Self::close_chunk(buffer, start, Ok(()), Some(usage), false);
     }
 
     /// The chunk's end after its choice: `]`, the usage or its `null`
@@ -581,7 +589,7 @@ pub(super) fn forces_tool_call(spec: &ChatResponseSpec) -> bool {
 /// A streamed choice carrying whichever of `content`, `reasoning_content` and
 /// `tool_calls` the caller sets; the role is not repeated, the first chunk
 /// ([`opening_choice`]) carried it.
-pub(super) fn assistant_choice(
+pub(crate) fn assistant_choice(
     index: u32,
     content: Option<String>,
     reasoning_content: Option<String>,

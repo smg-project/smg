@@ -75,7 +75,7 @@ impl ProcessStage for EmbeddingResponseProcessingStage {
             ));
         };
 
-        let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
+        let dispatch = ctx.dispatch.take().ok_or_else(|| {
             error!(
                 function = "EmbeddingResponseProcessingStage::convert_response",
                 "Dispatch metadata missing in context"
@@ -87,7 +87,7 @@ impl ProcessStage for EmbeddingResponseProcessingStage {
         // the engine's wire carries the floats whatever the request said, so
         // the gateway encodes here.
         ctx.response.final_response = Some(FinalResponse::Embedding(embedding_response(
-            dispatch.model.clone(),
+            dispatch.model,
             &responses,
             base64,
         )));
