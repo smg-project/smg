@@ -94,7 +94,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     framework::{OverloadThresholds, PairPools, PairTable},
-    spec::{AppliedSpec, Pairing},
+    spec::{AppliedSpec, Listed, Pairing},
     store::{
         encoding::{EncodeClasses, EncodeMember},
         loads::LoadSample,
@@ -1042,12 +1042,28 @@ impl Iterator for Segments<'_> {
     }
 }
 
+/// One member's fields under the standing generation's lists as last read
+/// ([`Writer::rebuild`], [`Writer::list`]).
+#[derive(Clone, Copy)]
+struct Held {
+    id: WorkerId,
+    /// The revision of the member's row at the read: a write of the row's
+    /// facts moves it.
+    revision: u64,
+    listed: Listed,
+}
+
 /// The candidate row of one member: its fixed fields from its registration,
-/// its status bits, and its load record when one is on file. Its pair class
-/// is the membership's to derive ([`pair_up`]), and its engine family, zone
-/// and labels are the standing generation's lists' to say
-/// ([`Writer::list`]).
-fn row_of(member: &WorkerRow, sample: Option<&LoadSample>, origin: Instant) -> Candidate {
+/// its status bits, its load record when one is on file, and its engine
+/// family, zone and labels as `listed` reads them under the standing
+/// generation's lists. Its pair class is the membership's to derive
+/// ([`pair_up`]).
+fn row_of(
+    member: &WorkerRow,
+    sample: Option<&LoadSample>,
+    origin: Instant,
+    listed: Listed,
+) -> Candidate {
     let facts = &member.facts;
     Candidate {
         id: member.id,
@@ -1061,6 +1077,9 @@ fn row_of(member: &WorkerRow, sample: Option<&LoadSample>, origin: Instant) -> C
         host_local: facts.reachable_from != Reachability::Any,
         // The low 32 bits of the registration key's fingerprint.
         key: fingerprint(facts.key.as_bytes()) as u32,
+        engine_kind: listed.engine_kind,
+        zone: listed.zone,
+        labels: listed.labels,
         ..Candidate::default()
     }
 }
@@ -1433,6 +1452,14 @@ pub(super) struct Writer {
     flips: u64,
     /// The standing members outside the standing generation's lists.
     outside: OutsideLists,
+    /// Each member's fields under the standing generation's lists, in id
+    /// order, beside the revision of its row they were read at. A
+    /// membership write reads a member again only where that revision
+    /// moved, so it reads the member it writes and carries every other's.
+    /// Empty while the generation declares no list.
+    listed: Vec<Held>,
+    /// The write before's `listed`, kept for its room.
+    listed_spare: Vec<Held>,
     /// The last publication the window counts from: a window's end, or a
     /// load write that published by itself.
     last_window: Option<Instant>,
@@ -1472,6 +1499,8 @@ impl Writer {
             silenced: 0,
             flips: 0,
             outside: OutsideLists::default(),
+            listed: Vec::new(),
+            listed_spare: Vec::new(),
             last_window: None,
             waiting: false,
         }
@@ -1516,11 +1545,12 @@ impl Writer {
     /// The pair classes are derived under the generation's pairing mode.
     /// A generation of the standing mode keeps the rows' classes; one
     /// of another mode derives `members`, the standing membership, again by
-    /// the membership write's own door ([`Writer::rebuild`]), which reads
-    /// each member under the lists that stand, and publishes once, under
-    /// the new generation at the standing epoch: the epoch is the
-    /// membership's and the generation the document's, and what is derived
-    /// from both is published under both.
+    /// the membership write's own door ([`Writer::rebuild`]) and publishes
+    /// once, under the new generation at the standing epoch: the epoch is
+    /// the membership's and the generation the document's, and what is
+    /// derived from both is published under both. That door reads every
+    /// member where the generation's lists differ from the standing one's
+    /// and carries each member's fields where they are the same.
     ///
     /// The generation this one replaces is kept until the next apply, and
     /// the one kept until now is handed back for the caller to let go
@@ -1545,6 +1575,10 @@ impl Writer {
         let derive = spec.pairing() != self.spec.pairing();
         let before = self.retired.replace(mem::replace(&mut self.spec, spec));
         let world = if derive {
+            if relisted {
+                // No member's fields are carried into other lists.
+                self.listed.clear();
+            }
             self.rebuild(self.epoch, members, sample_of, Classes::Derive)
         } else {
             if relisted {
@@ -1563,24 +1597,34 @@ impl Writer {
 
     /// Read every member under the standing generation's lists: its engine
     /// family and its zone as positions, its labels as bits, in each of
-    /// its rows. For a membership write, whose rows are new, and for an
-    /// apply whose lists differ. A pool with a row that moved is published
-    /// whole.
+    /// its rows. For an apply whose lists differ: a membership write reads
+    /// the member it writes and carries every other's ([`Writer::rebuild`]).
+    /// A pool with a row that moved is published whole.
     fn list<'a>(&mut self, members: impl Iterator<Item = &'a WorkerRow>) {
         let Self {
             places,
             working,
             spec,
             outside,
+            listed: held,
             ..
         } = self;
         let lists = spec.lists();
+        let listing = !lists.is_empty();
         *outside = OutsideLists::default();
+        held.clear();
         for member in members {
             let facts = &member.facts;
             let listed = lists.listed(&facts.engine_kind, facts.zone.as_deref(), &facts.labels);
             outside.engines += u32::from(listed.engine_outside);
             outside.zones += u32::from(listed.zone_outside);
+            if listing {
+                held.push(Held {
+                    id: member.id,
+                    revision: member.revision,
+                    listed,
+                });
+            }
             let now = (listed.engine_kind, listed.zone, listed.labels);
             for place in places_of(places, member.id) {
                 let Some(pool) = working.get_mut(place.pool as usize) else {
@@ -1596,6 +1640,7 @@ impl Writer {
                 pool.dirty = true;
             }
         }
+        held.sort_unstable_by_key(|held| held.id);
     }
 
     /// Each pool's thresholds under the standing generation: those of the
@@ -1932,7 +1977,10 @@ impl Writer {
     /// door copies none, every earlier fold is in the world this returns
     /// and nothing waits. The pair classes are derived for the written
     /// worker alone, derived whole or carried from the last write, as the
-    /// caller says (`classes`).
+    /// caller says (`classes`). A member's engine family, zone and labels
+    /// under the standing generation's lists are read where its row's
+    /// revision moved since they were last read, and carried where it
+    /// stands.
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
@@ -1980,6 +2028,18 @@ impl Writer {
         let mut members: Vec<(WorkerId, &'a WorkerRow)> =
             members.map(|member| (member.id, member)).collect();
         members.sort_unstable_by_key(|&(id, _)| id);
+        // Each member's three fields under the standing generation's lists:
+        // carried from the last read where the member's row stands at the
+        // revision it was read at, read again where it moved or is new. A
+        // write so reads the member it writes, and a generation with no
+        // list costs it this one test.
+        let lists = self.spec.lists();
+        let listing = !lists.is_empty();
+        let outgoing = mem::take(&mut self.listed);
+        let mut incoming = mem::take(&mut self.listed_spare);
+        incoming.clear();
+        let mut from = 0;
+        let mut outside = OutsideLists::default();
         for &(_, member) in &members {
             if standing {
                 ids.push(member.id);
@@ -1996,8 +2056,29 @@ impl Writer {
                 ranked.push((member.id, group, heard));
             }
             owned |= facts.overload != Overload::default();
+            let listed = if listing {
+                while outgoing.get(from).is_some_and(|held| held.id < member.id) {
+                    from += 1;
+                }
+                let listed = match outgoing.get(from) {
+                    Some(held) if held.id == member.id && held.revision == member.revision => {
+                        held.listed
+                    }
+                    _ => lists.listed(&facts.engine_kind, facts.zone.as_deref(), &facts.labels),
+                };
+                outside.engines += u32::from(listed.engine_outside);
+                outside.zones += u32::from(listed.zone_outside);
+                incoming.push(Held {
+                    id: member.id,
+                    revision: member.revision,
+                    listed,
+                });
+                listed
+            } else {
+                Listed::default()
+            };
             let entry = Entry {
-                row: row_of(member, sample.as_ref(), origin),
+                row: row_of(member, sample.as_ref(), origin, listed),
                 facts,
                 admitted_micros: micros(origin, member.admitted_at),
                 local: match facts.reachable_from {
@@ -2128,16 +2209,12 @@ impl Writer {
         }
         self.places
             .sort_unstable_by_key(|place| (place.id, place.pool));
-        // Each row's engine family, zone and labels under the standing
-        // generation's lists, before the rows are cut for the publication.
-        // The members are walked once more where the generation declares a
-        // list. One with none counts no member outside a list: an apply
-        // that derives the classes again may have dropped the last one's.
-        if self.spec.lists().is_empty() {
-            self.outside = OutsideLists::default();
-        } else {
-            self.list(members.iter().map(|&(_, member)| member));
-        }
+        // The members' fields as this write read or carried them, and the
+        // count outside the lists: none where the generation declares no
+        // list, whatever the last one counted.
+        self.listed = incoming;
+        self.listed_spare = outgoing;
+        self.outside = outside;
         // The engines, from the places, which stand by member: a member's
         // first place is where its record is read, each is where a verdict
         // is written. The writer's lists are written over in place, so the
