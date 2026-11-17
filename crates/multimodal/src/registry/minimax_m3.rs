@@ -71,10 +71,7 @@ impl MiniMaxM3VisionSpec {
             Modality::Image | Modality::Video => {
                 Ok((Self::IMAGE_START_TOKEN, Self::IMAGE_END_TOKEN))
             }
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: "minimax_m3",
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported("minimax_m3", modality)),
         }
     }
 
@@ -349,10 +346,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         match modality {
             Modality::Image => self.placeholder_token(metadata),
             Modality::Video => Ok(Self::VIDEO_TOKEN.to_string()),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -364,10 +358,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         match modality {
             Modality::Image => Self::image_token_id(metadata),
             Modality::Video => Self::video_token_id(metadata),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -412,10 +403,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
                     },
                 )?,
             )),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -447,10 +435,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
                 let placeholder_token = self.placeholder_token_for(metadata, Modality::Video)?;
                 Self::video_replacements(metadata, preprocessed, &placeholder_token, &[])
             }
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
