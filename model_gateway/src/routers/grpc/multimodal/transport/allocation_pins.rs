@@ -23,8 +23,8 @@ use crate::{
     },
 };
 
-/// The label the labelled workers carry; the one copy an assembly keeps of it
-/// is the label's own bytes.
+/// The label the labelled workers carry. An assembly keeps one copy of it; what
+/// that copy costs the allocator is read in the pin, not taken from its length.
 const LABEL: &str = "bfloat16";
 
 fn worker(url: &str, runtime: RuntimeType, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
@@ -51,6 +51,10 @@ fn selection(url: &str, labels: &[(&str, &str)]) -> WorkerSelection {
 /// name: resolving it allocates nothing on the default path for the vLLM,
 /// TokenSpeed and SGLang shapes alike, and a worker's label costs the one
 /// copy an assembly keeps (none for SGLang, which parses it in place).
+///
+/// The expectations follow the process's own overrides, read from the cells
+/// the resolvers read: under an inherited override the answer is the override,
+/// a borrowed name, and a worker's label is not copied.
 #[test]
 fn resolving_a_media_items_dtype_allocates_nothing_on_the_default_path() {
     let plain = selection("grpc://plain:8000", &[]);
@@ -62,15 +66,31 @@ fn resolving_a_media_items_dtype_allocates_nothing_on_the_default_path() {
     let _ = mm_encoder_input_dtype(Modality::Image, Some(&plain));
     let _ = mm_vllm_encoder_input_dtype(Some(&plain));
     let _ = mm_sglang_encoder_input_dtype(Some(&plain));
+    // The process's own overrides, from the cells the resolvers read: an
+    // inherited one is the answer, and the pins below follow it.
+    let overrides = DtypeOverrides::from_env();
+    let tokenspeed_override = overrides.image.or(overrides.default);
+    // The allocator's counter adds a copy's size class, not its length: read
+    // what one copy of the label costs. Under an override the name is the
+    // process's own and the label is not copied.
+    let one_copy = bytes_allocated_during(|| drop(std::hint::black_box(LABEL.to_owned())));
+    let label_copy = if tokenspeed_override.is_some() {
+        0
+    } else {
+        one_copy
+    };
 
     let tokenspeed_default = bytes_allocated_during(|| {
         assert_eq!(
             mm_encoder_input_dtype(Modality::Image, Some(&plain)),
-            "bfloat16"
+            tokenspeed_override.unwrap_or("bfloat16")
         );
     });
     let vllm_default = bytes_allocated_during(|| {
-        assert_eq!(mm_vllm_encoder_input_dtype(Some(&plain)), "float32");
+        assert_eq!(
+            mm_vllm_encoder_input_dtype(Some(&plain)),
+            overrides.vllm.unwrap_or("float32")
+        );
     });
     let sglang_default = bytes_allocated_during(|| {
         assert_eq!(
@@ -87,7 +107,7 @@ fn resolving_a_media_items_dtype_allocates_nothing_on_the_default_path() {
     let tokenspeed_label = bytes_allocated_during(|| {
         assert_eq!(
             mm_encoder_input_dtype(Modality::Image, Some(&labelled)),
-            LABEL
+            tokenspeed_override.unwrap_or(LABEL)
         );
     });
 
@@ -104,7 +124,7 @@ fn resolving_a_media_items_dtype_allocates_nothing_on_the_default_path() {
         ("vLLM, the default", 0),
         ("SGLang, the default", 0),
         ("SGLang, a worker's label", 0),
-        ("TokenSpeed, a worker's label", LABEL.len() as u64),
+        ("TokenSpeed, a worker's label", label_copy),
     ];
     assert_eq!(
         read, pinned,
