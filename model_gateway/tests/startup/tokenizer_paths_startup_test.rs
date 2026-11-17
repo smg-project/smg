@@ -41,8 +41,8 @@ struct Launch {
 /// hub id is never fetched by this test.
 fn launch(args: &[&str], log_path: &Path) -> Launch {
     // The binary's launches run one at a time: the ports picked here are
-    // released for the gateway to bind, and another test's pick or listener
-    // must not take one meanwhile.
+    // for this gateway to bind, and another test's pick or listener must
+    // not take one meanwhile.
     let _serial = serial();
     let [port, metrics_port] = free_ports();
     let ip = IP.to_string();

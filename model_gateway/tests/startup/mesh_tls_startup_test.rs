@@ -207,8 +207,8 @@ fn spawn_pair(
     peers_before_a: &[u16],
     worker_urls: &[&str],
 ) -> (Gateway, Gateway) {
-    // One launch at a time in this binary: the six ports are released for the
-    // two gateways to bind, and no other test's pick may take one meanwhile.
+    // One launch at a time in this binary: the six ports are for the two
+    // gateways to bind, and no other test's pick may take one meanwhile.
     let _serial = serial();
     let mut attempts = 0;
     loop {
