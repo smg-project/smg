@@ -621,7 +621,7 @@ fn process_message_content_format(
                 // gets it as a user turn there instead, once the system prompt is
                 // in (`system_messages_after_the_first_as_user_turns`).
                 messages::Role::System => {
-                    result.push(convert_system_message(&message.content));
+                    result.push(convert_system_message(index, &message.content)?);
                 }
             }
             Ok(result)
@@ -630,20 +630,31 @@ fn process_message_content_format(
 
 /// Convert a `system`-role message's content to a chat-template JSON value,
 /// preserving its position in `messages[]`. System content is text; text blocks
-/// are concatenated.
-fn convert_system_message(content: &InputContent) -> Value {
+/// are concatenated. A server tool's result or a container upload is refused
+/// by name, as in a user or assistant turn (`server_tool_block_refusal`); the
+/// other non-text blocks are dropped, as before.
+fn convert_system_message(index: usize, content: &InputContent) -> Result<Value, String> {
     let text = match content {
         InputContent::String(text) => text.clone(),
-        InputContent::Blocks(blocks) => blocks
-            .iter()
-            .filter_map(|block| match block {
-                InputContentBlock::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        InputContent::Blocks(blocks) => {
+            let mut texts = Vec::<&str>::new();
+            for (position, block) in blocks.iter().enumerate() {
+                match block {
+                    InputContentBlock::Text(t) => texts.push(t.text.as_str()),
+                    InputContentBlock::WebFetchToolResult(_)
+                    | InputContentBlock::CodeExecutionToolResult(_)
+                    | InputContentBlock::BashCodeExecutionToolResult(_)
+                    | InputContentBlock::TextEditorCodeExecutionToolResult(_)
+                    | InputContentBlock::ContainerUpload(_) => {
+                        return Err(server_tool_block_refusal(block, index, position));
+                    }
+                    _ => {}
+                }
+            }
+            texts.join("\n")
+        }
     };
-    json!({"role": "system", "content": text})
+    Ok(json!({"role": "system", "content": text}))
 }
 
 /// For a renderer whose reference writes no turn for a system message after
@@ -2708,9 +2719,10 @@ mod tests {
 
     /// A block of the public API's server tools is refused on the engine
     /// routes naming the block and its place, a server tool's result in the
-    /// assistant turn and a container upload in the user turn alike: the
-    /// engine runs no server tool, and a silent drop would answer a turn
-    /// whose input it threw away. A token count reads the same conversion.
+    /// assistant turn, a container upload in the user turn and either in a
+    /// `system` message of `messages[]` alike: the engine runs no server
+    /// tool, and a silent drop would answer a turn whose input it threw
+    /// away. A token count reads the same conversion.
     #[test]
     fn a_server_tool_block_is_refused_naming_the_block() {
         let convert = |messages: &[InputMessage]| {
@@ -2750,6 +2762,21 @@ mod tests {
         assert!(
             err.starts_with(
                 "messages.0.content.1: block type 'container_upload' is not supported on an engine route"
+            ),
+            "{err}"
+        );
+        let system: Vec<InputMessage> = serde_json::from_value(json!([
+            {"role": "user", "content": "run it"},
+            {"role": "system", "content": [
+                {"type": "text", "text": "the environment:"},
+                {"type": "container_upload", "file_id": "file_1"}
+            ]}
+        ]))
+        .unwrap();
+        let err = convert(&system);
+        assert!(
+            err.starts_with(
+                "messages.1.content.1: block type 'container_upload' is not supported on an engine route"
             ),
             "{err}"
         );
