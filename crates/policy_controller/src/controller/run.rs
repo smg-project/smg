@@ -527,6 +527,13 @@ async fn bind(
 pub fn run(catalog: Catalog) -> ExitCode {
     let cli = Cli::parse();
     init_logging(&cli.log_level, cli.log_json);
+    run_with(cli, catalog)
+}
+
+/// [`run`] from its parsed command line on, the log set: configure, then
+/// the runtime, bind and serve on it. Apart from the parse, which reads the
+/// process's own arguments, and from the log, which a process sets once.
+fn run_with(cli: Cli, catalog: Catalog) -> ExitCode {
     let config = match cli.config() {
         Ok(config) => config,
         Err(error) => {
@@ -570,13 +577,14 @@ mod tests {
     use std::{
         ffi::OsStr,
         path::{Path, PathBuf},
-        sync::mpsc,
+        process::ExitCode,
+        sync::{mpsc, Arc, Mutex},
         thread,
         time::Duration,
     };
 
     use clap::Parser;
-    use tokio::sync::oneshot;
+    use tokio::{runtime::Handle, sync::oneshot};
 
     use super::{bind, color_for, set, truthy, Cli};
     use crate::{
@@ -1121,6 +1129,61 @@ mod tests {
         let waited = end.recv_timeout(Duration::from_secs(5));
         drop(release);
         assert_eq!(waited, Ok(7), "the end returns with a call still blocked");
+    }
+
+    /// The run's own call ends it so: a start refused after a stage of the
+    /// host's left a blocking call gives its code inside five seconds.
+    #[test]
+    fn a_refused_start_ends_the_run_with_a_call_still_blocked() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("policy.yaml");
+        // The first filter is built, then the second is refused by name.
+        let document =
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [any, nowhere]\n    pick: random\n";
+        std::fs::write(&path, document).expect("the file");
+        let (release, blocked) = mpsc::channel::<()>();
+        let blocked = Arc::new(Mutex::new(blocked));
+        let (left, leaves) = mpsc::channel::<()>();
+        let mut stages = Catalog::builtin();
+        stages
+            .filter("any", move || {
+                // On the run's runtime alone: a registration builds the
+                // stage once too, for its name.
+                if let Ok(runtime) = Handle::try_current() {
+                    let (begun, begin) = mpsc::channel::<()>();
+                    let blocked = Arc::clone(&blocked);
+                    runtime.spawn_blocking(move || {
+                        let _ = begun.send(());
+                        // Returns when `release` goes, at the case's end.
+                        if let Ok(blocked) = blocked.lock() {
+                            let _ = blocked.recv();
+                        }
+                    });
+                    // The call is on its thread before the stage is handed
+                    // out: an end leaves a call that has not begun unrun.
+                    if begin.recv().is_ok() {
+                        let _ = left.send(());
+                    }
+                }
+                Box::new(Any)
+            })
+            .expect("a free name");
+        let mut args: Vec<&str> = EPHEMERAL.to_vec();
+        args.extend(["--spec-file", path.to_str().expect("a path in UTF-8")]);
+        let cli = parse(&args);
+
+        let (ended, end) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = ended.send(super::run_with(cli, stages));
+        });
+        let waited = end.recv_timeout(Duration::from_secs(5));
+        drop(release);
+        leaves.try_recv().expect("the stage left a blocking call");
+        assert_eq!(
+            waited,
+            Ok(ExitCode::FAILURE),
+            "the run returns with a call still blocked"
+        );
     }
 
     #[test]

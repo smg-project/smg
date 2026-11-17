@@ -611,6 +611,66 @@ mod tests {
         }
     }
 
+    /// An open takes no terminal: a process that leads a session of its own
+    /// opens a terminal's end and still has none, where an open without the
+    /// flag takes it. A process leads a session once, so the case runs
+    /// itself again as that process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_open_takes_no_terminal() {
+        use std::{env, ffi::OsStr, mem::ManuallyDrop, os::unix::ffi::OsStrExt};
+
+        use rustix::{
+            io::Errno,
+            pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags},
+        };
+
+        const NAME: &str = "controller::spec_file::tests::an_open_takes_no_terminal";
+        const LEADS: &str = "SMG_POLICY_SPEC_LEADS_A_SESSION";
+
+        if env::var_os(LEADS).is_none() {
+            let this = env::current_exe().expect("this executable");
+            let child = Command::new(this)
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(LEADS, "1")
+                .output()
+                .expect("the session's own process");
+            let mut said = String::from_utf8_lossy(&child.stdout).into_owned();
+            said.push_str(&String::from_utf8_lossy(&child.stderr));
+            // One case ran there: a name that runs none passes too.
+            assert!(
+                child.status.success() && said.contains("1 passed"),
+                "{said}"
+            );
+            return;
+        }
+
+        rustix::process::setsid().expect("a session of the process's own");
+        let own = || {
+            fs::File::open("/dev/tty")
+                .map(drop)
+                .map_err(|refused| refused.raw_os_error())
+        };
+        let none = Err(Some(Errno::NXIO.raw_os_error()));
+        assert_eq!(own(), none, "a new session has no terminal");
+
+        // The pair stays open to the process's end: its close hangs the
+        // terminal up, which ends a process that took it.
+        let pair = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("a terminal pair");
+        let pair = ManuallyDrop::new(pair);
+        grantpt(&*pair).expect("the pair's other end is granted");
+        unlockpt(&*pair).expect("the pair's other end is unlocked");
+        let name = ptsname(&*pair, Vec::new()).expect("the other end's name");
+        let end = Path::new(OsStr::from_bytes(name.to_bytes()));
+
+        let opened = open(end).expect("the terminal's end opens");
+        assert_eq!(own(), none, "the open took the terminal");
+        drop(opened);
+        // The control: here an open without the flag takes it.
+        let _plain = fs::File::open(end).expect("the end opens again");
+        assert_eq!(own(), Ok(()), "an open without the flag takes the terminal");
+    }
+
     /// The identity reads the file's change time: an edit in place that
     /// keeps the file's size and puts its modified time back is a new
     /// identity. The change time has the file system's grain, so the edit
