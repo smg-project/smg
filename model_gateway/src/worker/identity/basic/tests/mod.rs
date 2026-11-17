@@ -203,10 +203,10 @@ fn test_max_running_requests_zero_treated_as_none() {
 }
 
 #[test]
-fn test_max_running_requests_reads_the_tokenspeed_spelling() {
+fn test_max_running_requests_reads_the_max_num_seqs_spelling() {
     use crate::worker::BasicWorkerBuilder;
-    // TokenSpeed advertises the same scheduler window as `max_num_seqs`;
-    // without this a TokenSpeed worker looks like a non-reporter to both
+    // Some engines advertise the same scheduler window as `max_num_seqs`;
+    // without this such a worker looks like a non-reporter to both
     // fleet capacity and PD admission.
     let mut labels = HashMap::new();
     labels.insert("max_num_seqs".to_string(), "16".to_string());

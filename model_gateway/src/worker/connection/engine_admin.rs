@@ -60,8 +60,8 @@ fn require_backend_client(
     client.ok_or_else(|| failed(url, operation, "no backend client available".to_string()))
 }
 
-/// A ZMQ engine whose wire carries no control calls (vLLM's EngineCore, a
-/// TokenSpeed scheduler that declares none) has no admin RPC: refused before
+/// A ZMQ engine whose wire carries no control calls (an engine core with
+/// none, a scheduler that declares none) has no admin RPC: refused before
 /// anything is sent.
 fn zmq_admin_unsupported(url: &str, operation: &str) -> WorkerError {
     failed(

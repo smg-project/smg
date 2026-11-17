@@ -2195,9 +2195,9 @@ fn routing_pools_filter_regular_workers_by_transport() {
         urls(RoutingPool::GrpcPipelineRegular),
         HashSet::from(["grpc://regular".to_string(), "zmq://regular".to_string()])
     );
-    // The disaggregated pools hold gRPC workers and TokenSpeed's direct-ZMQ
-    // engines, whose wire carries the rendezvous and the encode request:
-    // another runtime's ZMQ prefill worker that slipped past registration
+    // The disaggregated pools hold gRPC workers and the direct-ZMQ engines
+    // whose wire carries the rendezvous and the encode request: a ZMQ
+    // prefill worker on another wire that slipped past registration
     // must not appear.
     assert_eq!(
         urls(RoutingPool::GrpcPrefill),

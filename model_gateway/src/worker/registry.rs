@@ -111,15 +111,15 @@ pub struct WorkerDescriptor {
 pub(crate) enum RoutingPool {
     HttpRegular,
     GrpcPipelineRegular,
-    /// gRPC workers, and direct-ZMQ TokenSpeed engines, unlike
-    /// [`Self::GrpcPipelineRegular`]'s every ZMQ worker: the other ZMQ wires
-    /// carry no KV-transfer rendezvous, so such a worker must never join a PD
-    /// pool even though it rides the gRPC pipeline elsewhere.
+    /// gRPC workers, and direct-ZMQ engines whose wire carries the
+    /// KV-transfer rendezvous, unlike [`Self::GrpcPipelineRegular`]'s every
+    /// ZMQ worker: the other ZMQ wires carry none, so such a worker must
+    /// never join a PD pool even though it rides the gRPC pipeline elsewhere.
     GrpcPrefill,
     /// The members [`Self::GrpcPrefill`] admits.
     GrpcDecode,
-    /// The members [`Self::GrpcPrefill`] admits: a TokenSpeed encode server
-    /// takes its encode request on the ZMQ lane; the other runtimes' encode
+    /// The members [`Self::GrpcPrefill`] admits: a direct-ZMQ encode server
+    /// takes its encode request on the ZMQ lane; a gRPC one's encode
     /// dispatch is a gRPC encoder RPC.
     GrpcEncode,
     /// HTTP-transport prefill pool for the HTTP PD router: it proxies plain
@@ -184,8 +184,8 @@ impl RoutingPool {
 }
 
 /// Whether a worker of a disaggregated role rides the gRPC pipeline's
-/// encode/prefill/decode dispatch: a gRPC worker, or a direct-ZMQ TokenSpeed
-/// engine, whose wire carries the rendezvous and the encode request (the
+/// encode/prefill/decode dispatch: a gRPC worker, or a direct-ZMQ
+/// engine whose wire carries the rendezvous and the encode request (the
 /// other ZMQ wires carry neither, and registration refuses them a role).
 fn serves_disaggregated_role(worker: &Arc<dyn Worker>) -> bool {
     match worker.connection_mode() {
@@ -1140,7 +1140,7 @@ impl WorkerRegistry {
     /// - `model_id`: scope to a single model (uses the O(1) model index)
     /// - `worker_type`: `Regular` / `Prefill` / `Decode`
     /// - `connection_mode`: `Http` / `Grpc`
-    /// - `runtime_type`: `Sglang` / `Vllm` / `External` / …
+    /// - `runtime_type`: one `RuntimeType` variant
     /// - `healthy_only`: skip workers whose `is_healthy()` is false
     ///
     /// Only workers that pass every filter are cloned; the source collection

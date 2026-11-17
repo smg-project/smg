@@ -35,8 +35,8 @@ use crate::worker::MORIIO_MODE_LABEL;
 pub const PAIRING_PROTOCOL_LABEL: &str = "pairing_protocol";
 
 /// The KV layout facts engines report: the short name used in the pairing
-/// key, the canonical label, and alias labels (vLLM's `block_size` is the
-/// page size before canonicalisation).
+/// key, the canonical label, and alias labels (one engine's `block_size` is
+/// the page size before canonicalisation).
 const LAYOUT_FACTS: [(&str, &str, &[&str]); 4] = [
     ("dtype", "kv_cache_dtype", &[]),
     ("page", "page_size", &["block_size"]),
@@ -257,7 +257,7 @@ impl PdPairing {
     /// difference refuses the pair in every mode but `Off`, a fact one side
     /// reports and the other does not only under `Strict`, and a layout fact
     /// neither side reports is not compared. Version is a soft fact: engines
-    /// report it unevenly (vLLM's gRPC server info carries none) and a
+    /// report it unevenly (one engine's gRPC server info carries none) and a
     /// rolling upgrade legitimately mixes versions, so it counts only under
     /// `Strict`, and only when both sides report one.
     pub fn mismatch(&self, other: &Self, mode: PdPairingMode) -> Option<PairingMismatch> {
@@ -324,7 +324,7 @@ fn non_empty(value: Option<&String>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The connector a vLLM worker names: on its spec, else as a discovered label.
+/// The connector a worker names: on its spec, else as a discovered label.
 fn vllm_connector(spec: &WorkerSpec) -> Option<String> {
     spec.kv_connector
         .as_deref()
@@ -333,9 +333,10 @@ fn vllm_connector(spec: &WorkerSpec) -> Option<String> {
         .or_else(|| non_empty(spec.labels.get("kv_connector")))
 }
 
-/// The transfer profile by runtime: a vLLM connector's name says whether it
-/// writes to a store (see [`connector_profile`]); the transfer backends of
-/// SGLang and TokenSpeed all rendezvous per pair. Unknown when the transport
+/// The transfer profile by runtime: where a runtime names a
+/// connector, its name says whether it writes to a store (see
+/// [`connector_profile`]); the other runtimes' transfer
+/// backends all rendezvous per pair. Unknown when the transport
 /// is.
 fn profile_of(spec: &WorkerSpec, transport_known: bool) -> Option<KvTransferProfile> {
     match spec.runtime_type {
@@ -376,8 +377,8 @@ pub fn connector_profile(connector: &str) -> KvTransferProfile {
     }
 }
 
-/// The KV transport by runtime: vLLM names a connector, SGLang a transfer
-/// backend, TokenSpeed has only Mooncake.
+/// The KV transport by runtime: one names a connector, one a transfer
+/// backend, one has only Mooncake.
 fn transport_of(spec: &WorkerSpec) -> Option<String> {
     let labels = &spec.labels;
     match spec.runtime_type {
@@ -458,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn vllm_derives_transport_from_the_connector_and_layout_from_the_labels() {
+    fn a_connector_runtime_derives_transport_from_the_connector_and_layout_from_the_labels() {
         let mut s = spec(
             RuntimeType::Vllm,
             &[
@@ -593,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn sglang_and_tokenspeed_derive_transport_from_the_transfer_backend() {
+    fn the_backend_runtimes_derive_transport_from_the_transfer_backend() {
         let sglang = spec(
             RuntimeType::Sglang,
             &[
@@ -603,7 +604,7 @@ mod tests {
             ],
         );
         assert_eq!(PdPairing::derive(&sglang).key(), "sglang/nixl/page=64");
-        // TokenSpeed has only Mooncake, so an unreported backend is Mooncake.
+        // This runtime has only Mooncake, so an unreported backend is Mooncake.
         let tokenspeed = spec(RuntimeType::TokenSpeed, &[("version", "0.3.0")]);
         assert_eq!(
             PdPairing::derive(&tokenspeed).key(),

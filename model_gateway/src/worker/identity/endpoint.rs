@@ -137,7 +137,7 @@ pub struct Endpoint {
     host: Host,
     port: Option<u16>,
     /// What follows the authority, when the address carries anything: a
-    /// path prefix (`validate_worker_url` accepts `http://proxy:8080/sglang`,
+    /// path prefix (`validate_worker_url` accepts `http://proxy:8080/engine`,
     /// and `endpoint_url` appends the route to it, so the prefix is part of
     /// which backend this names), with any query or fragment as written.
     /// Stored from its leading `/`, `?` or `#` and without a trailing slash.
