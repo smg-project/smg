@@ -1258,6 +1258,11 @@ impl PDRouter {
     /// stream: nothing of the response is out, and a client reads an error
     /// status's body as the envelope, not as events. An error body that
     /// cannot be read says so in the detail.
+    ///
+    /// The answer is marked as the worker's own. Its 500 is definitive for
+    /// the payload and names the side for the request's ledger
+    /// ([`Self::settle_attempt`]). Its other statuses name no side and are
+    /// replayed as before.
     async fn side_refused(side: PdSide, response: reqwest::Response) -> Response {
         let status = response.status();
         // Taken before the body read consumes the response.
@@ -1273,26 +1278,21 @@ impl PDRouter {
         if let Some(value) = retry_after {
             answer.headers_mut().insert(RETRY_AFTER, value);
         }
+        mark_upstream_answer(&mut answer);
+        if is_definitive_failure(&answer) {
+            answer.extensions_mut().insert(OwnFailure(side));
+        }
         answer
     }
 
-    /// The answer for a decode worker that answered an error status before
-    /// the side's first byte ([`Self::side_refused`]), marked as the
-    /// worker's own answer. Its 500 is definitive for the payload and names
-    /// the decode side for the request's ledger ([`Self::settle_attempt`]).
-    /// Its other statuses name no side and are replayed as before.
+    /// [`Self::side_refused`] for a decode worker, with the refusal logged.
     async fn decode_refused(decode: &dyn Worker, response: reqwest::Response) -> Response {
         error!(
             "Decode server returned error status decode_url={} status={}",
             decode.redacted_url(),
             response.status()
         );
-        let mut answer = Self::side_refused(PdSide::Decode, response).await;
-        mark_upstream_answer(&mut answer);
-        if is_definitive_failure(&answer) {
-            answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
-        }
-        answer
+        Self::side_refused(PdSide::Decode, response).await
     }
 
     /// An attempt's definitive answer on the request's ledger, settled as
@@ -8574,9 +8574,9 @@ mod tests {
         }
     }
 
-    /// A decode server that answers `status` with an error body before the
-    /// side's first byte, and what arrived at it.
-    async fn refusing_decode_stub(status: StatusCode) -> (String, Arrivals) {
+    /// A server that answers `status` with an error body before its side's
+    /// first byte, and what arrived at it.
+    async fn refusing_stub(status: StatusCode) -> (String, Arrivals) {
         spawn_delayed_stub(
             status,
             json!({"error": {"message": REFUSAL}}),
@@ -8616,7 +8616,7 @@ mod tests {
                 (StatusCode::SERVICE_UNAVAILABLE, true),
             ] {
                 let prefill_url = healthy_stub(shape, PdSide::Prefill).await;
-                let (decode_url, arrivals) = refusing_decode_stub(status).await;
+                let (decode_url, arrivals) = refusing_stub(status).await;
                 let router = quick_retry_router();
                 register_fleet(&router, shape, &prefill_url, &[decode_url.as_str()]);
 
@@ -8649,8 +8649,7 @@ mod tests {
     async fn the_retry_leaves_a_decode_worker_that_answered_its_own_500() {
         for shape in [Shape::Sequential, Shape::Parallel] {
             let prefill_url = healthy_stub(shape, PdSide::Prefill).await;
-            let (refusing_url, refused) =
-                refusing_decode_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+            let (refusing_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
             let (free_url, served) = spawn_recording_stub(r#"{"choices":[]}"#).await;
             let router = quick_retry_router();
             register_fleet(
@@ -8678,6 +8677,111 @@ mod tests {
         }
     }
 
+    /// The prefill side's twin of the lone decode worker: a prefill worker's
+    /// own 500, answered before the side's first byte, is its answer for
+    /// the payload. With no other pair to take the request it makes one
+    /// attempt and the client reads the worker's 500. A 503 is replayed for
+    /// every attempt the retry config allows. Both dispatch shapes.
+    #[tokio::test]
+    async fn a_lone_prefill_workers_own_500_goes_back_after_one_attempt() {
+        let mut mismatches = Vec::new();
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            for (status, replayed) in [
+                (StatusCode::INTERNAL_SERVER_ERROR, false),
+                (StatusCode::SERVICE_UNAVAILABLE, true),
+            ] {
+                let (prefill_url, arrivals) = refusing_stub(status).await;
+                let decode_url = healthy_stub(shape, PdSide::Decode).await;
+                let router = quick_retry_router();
+                register_fleet(&router, shape, &prefill_url, &[decode_url.as_str()]);
+
+                let response = chat_through(&router, false).await;
+
+                let attempts = arrivals.lock().unwrap().len();
+                let expected = if replayed {
+                    router.retry_config.max_retries as usize
+                } else {
+                    1
+                };
+                if response.status() != status || attempts != expected {
+                    mismatches.push(format!(
+                        "{shape:?}: {} after {attempts} attempts on the refusing prefill worker, \
+                         expected {status} after {expected}",
+                        response.status()
+                    ));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// With another prefill worker available the retry leaves the prefill
+    /// worker that answered its own 500, even under a policy that picks
+    /// that worker whenever it is a candidate: one attempt on it, then the
+    /// answer through the free worker. Both dispatch shapes.
+    #[tokio::test]
+    async fn the_retry_leaves_a_prefill_worker_that_answered_its_own_500() {
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            let (refusing_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+            let (free_url, served) =
+                spawn_recording_stub(healthy_answer(shape, PdSide::Prefill)).await;
+            let decode_url = healthy_stub(shape, PdSide::Decode).await;
+            let router = quick_retry_router();
+            for prefill_url in [&refusing_url, &free_url] {
+                register_fleet(&router, shape, prefill_url, &[decode_url.as_str()]);
+            }
+            router
+                .policy_registry
+                .set_prefill_policy(Arc::new(Favours(refusing_url)));
+
+            let response = chat_through(&router, false).await;
+
+            assert_eq!(
+                (
+                    response.status(),
+                    refused.lock().unwrap().len(),
+                    served.lock().unwrap().len()
+                ),
+                (StatusCode::OK, 1, 1),
+                "{shape:?}: the answer, the attempts on the refusing prefill worker, the \
+                 requests the free one served"
+            );
+        }
+    }
+
+    /// The last prefill worker that can pair is not left on its own 500
+    /// while another decode worker can take the request with it: the retry
+    /// leaves the decode partner and keeps the prefill worker, as it does
+    /// on the other side, even under a policy that picks that decode worker
+    /// whenever it is a candidate. One attempt with each decode worker, then
+    /// the prefill worker's 500 goes back. Both dispatch shapes.
+    #[tokio::test]
+    async fn the_retry_leaves_the_partner_of_the_last_prefill_worker_that_can_pair() {
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            let (prefill_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+            let first_url = healthy_stub(shape, PdSide::Decode).await;
+            let second_url = healthy_stub(shape, PdSide::Decode).await;
+            let router = quick_retry_router();
+            register_fleet(
+                &router,
+                shape,
+                &prefill_url,
+                &[first_url.as_str(), second_url.as_str()],
+            );
+            router
+                .policy_registry
+                .set_decode_policy(Arc::new(Favours(first_url)));
+
+            let response = chat_through(&router, false).await;
+
+            assert_eq!(
+                (response.status(), refused.lock().unwrap().len()),
+                (StatusCode::INTERNAL_SERVER_ERROR, 2),
+                "{shape:?}: the answer, the attempts on the refusing prefill worker"
+            );
+        }
+    }
+
     /// A decode side's status can carry its prefill partner's part of the
     /// handoff, so the last decode worker that can pair is not left on its
     /// own 500 while another prefill worker can take the request: the retry
@@ -8691,8 +8795,7 @@ mod tests {
             let answer = healthy_answer(shape, PdSide::Prefill);
             let (first_url, first) = spawn_recording_stub(answer).await;
             let (second_url, second) = spawn_recording_stub(answer).await;
-            let (decode_url, refused) =
-                refusing_decode_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+            let (decode_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
             let router = quick_retry_router();
             for prefill_url in [&first_url, &second_url] {
                 register_fleet(&router, shape, prefill_url, &[decode_url.as_str()]);
@@ -8728,7 +8831,7 @@ mod tests {
     #[tokio::test]
     async fn a_decode_worker_no_prefill_worker_can_hand_off_to_is_no_alternative() {
         let prefill_url = healthy_stub(Shape::Sequential, PdSide::Prefill).await;
-        let (decode_url, refused) = refusing_decode_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (decode_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
         let (unpaired_url, unpaired) = spawn_recording_stub(r#"{"choices":[]}"#).await;
         let router = quick_retry_router();
         let register = |url: &str, worker_type: WorkerType, connector: &str, ready: bool| {
@@ -8775,7 +8878,7 @@ mod tests {
     async fn a_concurrent_write_pairs_decode_500_goes_back_after_one_attempt() {
         let computing = std::time::Duration::from_secs(30);
         let (prefill_url, _) = spawn_delayed_stub(StatusCode::OK, json!({}), computing).await;
-        let (decode_url, refused) = refusing_decode_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (decode_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
         let router = quick_retry_router();
         register_moriio_pair_with(
             &router,
