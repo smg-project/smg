@@ -1146,6 +1146,16 @@ livenessProbe:
 sglang serve --model-path meta-llama/Llama-2-7b-hf --grpc-mode
 ```
 
+With an object storage source (`s3://`, `gs://`, or `az://`), the frontend
+prepares SGLang's metadata cache before reading model configuration. Weights
+keep streaming from the original URI; only metadata is downloaded to disk.
+Both servicers use that local cache for `GetTokenizer`, so the gateway can
+fetch the tokenizer, chat templates, generation and processor configs from
+the worker without object storage credentials or a shared filesystem.
+The checkpoint must include those files. An explicit `--tokenizer-path`
+selects its own tokenizer source, including a local directory or Hub ID.
+Metadata download errors stop startup before the gRPC server binds.
+
 Without `--kv-events-config`, the servicer turns SGLang's ZMQ KV-event
 publisher on by itself, under either implementation, before the schedulers are
 started, at a port found free on the host rather than SGLang's fixed default,

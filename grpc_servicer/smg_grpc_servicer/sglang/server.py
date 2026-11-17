@@ -40,6 +40,7 @@ from smg_grpc_servicer.rust_lifecycle import (
 from smg_grpc_servicer.sglang.compat import get_disaggregation_types
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
+from smg_grpc_servicer.sglang.model_artifacts import prepare_model_metadata
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
 from smg_grpc_servicer.sglang.rust import (
     KV_EVENTS_ENV,
@@ -201,6 +202,7 @@ async def serve_grpc(
         # is refused here as on the Rust path.
         if default_kv_events_config(server_args) is not None:
             announce_kv_events_default("SGLang", KV_EVENTS_ENV, logger)
+        prepare_model_metadata(server_args)
     except ServicerConfigError as error:
         # A knob the servicer cannot use: one named ERROR line and exit code
         # 2, before any scheduler or engine work, not a traceback.
