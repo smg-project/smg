@@ -1315,7 +1315,7 @@ pub struct PairPools<'a> {
 /// of the prefills it partners.
 ///
 /// A host builds a table ([`PairTable::new`]) and can ask once whether it
-/// is one the engine honours whole ([`PairTable::check`]). How a decision
+/// is one the engine honours whole ([`PairTable::validate`]). How a decision
 /// reads it is the engine's own.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PairTable<'a> {
@@ -1332,13 +1332,14 @@ impl<'a> PairTable<'a> {
     /// ascending order.
     ///
     /// A host numbers its decode classes densely from 1, each named by some
-    /// list, so no number is above the count of the lists' entries. A
-    /// decision keeps one bit a class number up to that count, never more:
-    /// a number above it is no class of the table, and no decode pairs
-    /// through it.
+    /// list, so a list's classes are the numbers from 1 to the count of the
+    /// lists' entries. What a list names outside them is no class of the
+    /// table, and no decode pairs through it: class 0, which is outside any
+    /// pairing, and a number above the count. A decision keeps one bit a
+    /// class number up to that count, never more.
     ///
     /// Nothing is checked here, so a decision of a release build pays for no
-    /// check: a table that fails [`PairTable::check`] costs it the pairs the
+    /// check: a table that fails [`PairTable::validate`] costs it the pairs the
     /// table misnames and a set of at most the table's own size, never the
     /// process.
     pub const fn new(ends: &'a [u32], classes: &'a [u32]) -> Self {
@@ -1396,35 +1397,54 @@ impl<'a> PairTable<'a> {
     /// the largest class a list names, which is at most the count of the
     /// lists' entries ([`PairTable::of`]). A table costs a decision a set
     /// of its own size, whatever numbers it names. Lists ascend, so a
-    /// list's last entry is its largest.
+    /// list's last entry is its largest; the width is capped at the count
+    /// all the same, so the bound stands for a list out of order too.
     fn width(&self) -> usize {
         let largest = self
             .prefill_classes()
             .filter_map(|class| self.of(&class).last().copied())
             .max()
             .unwrap_or(0);
-        largest as usize + 1
+        Self::capped(largest, self.classes.len())
+    }
+
+    /// One past `largest`, and at most one past `count`: the width's cap,
+    /// apart from the lists so that a case asks it. A list's read ends at
+    /// the count ([`PairTable::of`]), so no table hands the width a larger
+    /// number while the library's search answers as it does today.
+    fn capped(largest: u32, count: usize) -> usize {
+        (largest as usize).min(count) + 1
     }
 
     /// Whether this is a table the engine honours whole, and the first
-    /// clause it fails when it is not: the ends ascend and stay within the
-    /// lists, and each list names its classes in ascending order, none above
-    /// the count of the lists' entries. No table passes.
+    /// clause it fails when it is not: the ends ascend and the last stands
+    /// where the lists end, and each list names its classes in ascending
+    /// order, none of them class 0 and none above the count of the lists'
+    /// entries. The default, no table, is valid.
     ///
     /// One question, two askers: a host asks it once where it builds a
     /// table, in every build, and a debug build asks it where a decision
     /// takes one.
-    pub fn check(&self) -> Result<(), PairTableError> {
+    pub fn validate(&self) -> Result<(), PairTableError> {
         if !self.ends.windows(2).all(|pair| pair[0] <= pair[1]) {
             return Err(PairTableError::EndsDescend);
         }
+        // Every entry stands in a list, so the count a read holds a list
+        // to is the lists' own.
         let entries = self.classes.len();
-        if self.ends.last().is_some_and(|&end| end as usize > entries) {
+        let end = self.ends.last().map_or(0, |&end| end as usize);
+        if end > entries {
             return Err(PairTableError::EndPastLists);
+        }
+        if end < entries {
+            return Err(PairTableError::EntriesPastEnds);
         }
         for list in (0..self.ends.len()).map(|at| self.list(at)) {
             if !list.windows(2).all(|pair| pair[0] < pair[1]) {
                 return Err(PairTableError::ListOutOfOrder);
+            }
+            if list.first() == Some(&0) {
+                return Err(PairTableError::ClassZero);
             }
             if list.last().is_some_and(|&last| last as usize > entries) {
                 return Err(PairTableError::NumberAboveCount);
@@ -1483,15 +1503,19 @@ impl<'a> PairTable<'a> {
     }
 }
 
-/// The clause of [`PairTable::check`] a host's table fails.
+/// The clause of [`PairTable::validate`] a host's table fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PairTableError {
     #[error("an end stands before the end of the list before it")]
     EndsDescend,
     #[error("an end stands past the lists")]
     EndPastLists,
+    #[error("the lists hold entries past the last end")]
+    EntriesPastEnds,
     #[error("a list names its classes out of ascending order")]
     ListOutOfOrder,
+    #[error("a list names class 0")]
+    ClassZero,
     #[error("a list names a number above the count of the lists' entries")]
     NumberAboveCount,
 }
@@ -2148,11 +2172,11 @@ impl Engine {
         // its targets: a pair that exists is found. A decode of class 0 is
         // outside any pairing and partners nobody.
         debug_assert!(
-            pools.table.check().is_ok(),
-            "the pair table fails its check: {}",
+            pools.table.validate().is_ok(),
+            "the pair table is not valid: {}",
             pools
                 .table
-                .check()
+                .validate()
                 .map_or_else(|clause| clause.to_string(), |()| String::new())
         );
         let open = decodes
@@ -4532,22 +4556,50 @@ mod tests {
     /// The question a host asks once where it builds a table: each clause
     /// is refused by its name, the first a table fails.
     #[test]
-    fn a_hosts_check_names_the_clause_a_table_fails() {
-        let check = |ends: &[u32], classes: &[u32]| PairTable::new(ends, classes).check();
-        assert_eq!(PairTable::default().check(), Ok(()), "no table");
-        assert_eq!(check(&[2, 2, 3], &[1, 3, 2]), Ok(()), "an empty list too");
-        assert_eq!(check(&[2, 1], &[1, 2, 3]), Err(PairTableError::EndsDescend));
-        assert_eq!(check(&[3], &[1, 2]), Err(PairTableError::EndPastLists));
+    fn a_hosts_validation_names_the_clause_a_table_fails() {
+        let validate = |ends: &[u32], classes: &[u32]| PairTable::new(ends, classes).validate();
+        assert_eq!(PairTable::default().validate(), Ok(()), "no table");
+        assert_eq!(
+            validate(&[2, 2, 3], &[1, 3, 2]),
+            Ok(()),
+            "an empty list too"
+        );
+        assert_eq!(
+            validate(&[2, 1], &[1, 2, 3]),
+            Err(PairTableError::EndsDescend)
+        );
+        assert_eq!(validate(&[3], &[1, 2]), Err(PairTableError::EndPastLists));
+        // Ends written as each list's start: every list reads the one before.
+        for (ends, classes) in [
+            (&[0, 2][..], &[1, 2, 3, 4][..]),
+            (&[1], &[1, 2]),
+            (&[], &[1]),
+        ] {
+            assert_eq!(
+                validate(ends, classes),
+                Err(PairTableError::EntriesPastEnds),
+                "{ends:?}"
+            );
+        }
         for misnamed in [[2, 1], [1, 1]] {
             assert_eq!(
-                check(&[2], &misnamed),
+                validate(&[2], &misnamed),
                 Err(PairTableError::ListOutOfOrder),
                 "{misnamed:?}"
             );
         }
-        assert_eq!(check(&[2], &[1, 3]), Err(PairTableError::NumberAboveCount));
+        for zero in [&[0][..], &[0, 2]] {
+            let ends = [zero.len() as u32];
+            assert_eq!(validate(&ends, zero), Err(PairTableError::ClassZero));
+        }
+        assert_eq!(
+            validate(&[2], &[1, 3]),
+            Err(PairTableError::NumberAboveCount)
+        );
         // The first clause a table fails is the one named.
-        assert_eq!(check(&[3, 1], &[2, 1]), Err(PairTableError::EndsDescend));
+        assert_eq!(validate(&[3, 1], &[2, 1]), Err(PairTableError::EndsDescend));
+        assert_eq!(validate(&[2], &[0, 0]), Err(PairTableError::ListOutOfOrder));
+        assert_eq!(validate(&[2], &[0, 3]), Err(PairTableError::ClassZero));
         // Each clause reads as what it found.
         assert_eq!(
             PairTableError::NumberAboveCount.to_string(),
@@ -4563,18 +4615,18 @@ mod tests {
         // of a dense table is.
         let dense = PairTable::new(&[2], &[1, 2]);
         assert_eq!(dense.of(&1), [1, 2]);
-        assert_eq!(dense.check(), Ok(()));
+        assert_eq!(dense.validate(), Ok(()));
         // One above the count is no class.
         let above = PairTable::new(&[2], &[1, 3]);
         assert_eq!(above.of(&1), [1]);
-        assert_eq!(above.check(), Err(PairTableError::NumberAboveCount));
+        assert_eq!(above.validate(), Err(PairTableError::NumberAboveCount));
 
         // Three entries, two of them near the top of the number's range.
         let far = u32::MAX - 1;
         let entries = [1, far, u32::MAX];
         let sparse = PairTable::new(&[3], &entries);
         assert_eq!(sparse.of(&1), [1], "every read asks here");
-        assert_eq!(sparse.check(), Err(PairTableError::NumberAboveCount));
+        assert_eq!(sparse.validate(), Err(PairTableError::NumberAboveCount));
         assert_eq!(sparse.width(), 2);
         // The partner question: a decode of such a number opens nothing,
         // and the set of bits stays the table's size.
@@ -4593,6 +4645,53 @@ mod tests {
         let lone = PairTable::new(&[1], &[u32::MAX]);
         assert!(lone.of(&1).is_empty());
         assert_eq!(lone.width(), 1);
+
+        // The cap itself, asked apart: no table's read hands it a number
+        // above the count.
+        assert_eq!(PairTable::capped(3, 3), 4, "the count is a class");
+        assert_eq!(PairTable::capped(far, 3), 4);
+        assert_eq!(PairTable::capped(u32::MAX, 0), 1);
+
+        // A list out of order is cut wherever the search lands: the set
+        // stays the table's size all the same.
+        for unordered in [[u32::MAX, 1, far], [far, u32::MAX, 1], [2, u32::MAX, far]] {
+            let table = PairTable::new(&[3], &unordered);
+            assert!(table.width() <= 4, "{unordered:?}: {}", table.width());
+            assert_eq!(table.validate(), Err(PairTableError::ListOutOfOrder));
+        }
+    }
+
+    /// Class 0 is no class of the table, whatever a list names: the row
+    /// tests pass it over, and the validation names the clause.
+    #[test]
+    fn a_listed_class_zero_is_no_class_of_the_table() {
+        // Alone it is a list of no class: no pass compares a row with it.
+        let alone = PairTable::new(&[1], &[0]);
+        assert_eq!(alone.of(&1), [0], "a read answers the list as it stands");
+        assert_eq!(only(alone.of(&1)), None);
+        assert!(!classed(alone.of(&1), 0));
+        assert_eq!(alone.validate(), Err(PairTableError::ClassZero));
+        // Beside a class it adds no row to that class's.
+        let beside = PairTable::new(&[2], &[0, 2]);
+        assert_eq!(beside.of(&1), [0, 2]);
+        assert_eq!(only(beside.of(&1)), None);
+        assert!(classed(beside.of(&1), 2));
+        assert!(!classed(beside.of(&1), 0));
+        assert_eq!(beside.validate(), Err(PairTableError::ClassZero));
+        // The partner question: an open decode class finds the prefill
+        // class through the class beside, never through the 0.
+        let mut scratch = Scratch::new();
+        let (classes, marks) = (&mut scratch.classes, &mut scratch.marks);
+        alone.partnered([2].into_iter(), classes, marks);
+        assert!(classes.is_empty(), "{classes:?}");
+        beside.partnered([2].into_iter(), classes, marks);
+        assert_eq!(*classes, [1]);
+        // The shed's list holds the 0 a list names, and a decode of class 0
+        // is none of the decodes that name the shed.
+        beside.listed(classes, marks);
+        assert_eq!(*classes, [0, 2]);
+        assert!(classed(classes, 2));
+        assert!(!classed(classes, 0));
     }
 
     #[test]
@@ -4905,8 +5004,18 @@ mod tests {
                 "{how}: {decision:?}"
             );
         }
-        // A list that names class 0 pairs no decode of class 0: alone it is
-        // no partner, and beside a class it adds no decode to that class's.
+    }
+
+    /// A list that names class 0 is not valid: a debug build stops at the
+    /// clause, and a release build pairs no decode of class 0 through it.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "the pair table is not valid: a list names class 0")
+    )]
+    fn a_listed_class_zero_stops_a_debug_build_and_pairs_nothing_in_a_release_build() {
+        // Alone it is no partner, and beside a class it adds no decode to
+        // that class's.
         let engine = strict_pair_engine();
         let prefills = classed_rows(&[1]);
         let decodes = classed_rows(&[0, 2]);
@@ -4930,7 +5039,7 @@ mod tests {
     #[cfg_attr(
         debug_assertions,
         should_panic(
-            expected = "the pair table fails its check: a list names its classes out of ascending order"
+            expected = "the pair table is not valid: a list names its classes out of ascending order"
         )
     )]
     fn a_misnamed_table_stops_a_debug_build_and_costs_a_release_build_its_pairs() {

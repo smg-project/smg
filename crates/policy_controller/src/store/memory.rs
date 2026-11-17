@@ -31,7 +31,10 @@ use crate::{
             identity, MembershipChange, MembershipTail, WorkerFacts, WorkerPatch, WorkerRow,
             WorkerStatus, WorkersStore,
         },
-        world::{micros, Ask, Built, StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW},
+        world::{
+            micros, same_offer, Ask, Built, Classes, PairBuffers, StaleGeneration, ViewBuffers,
+            World, Writer, PUBLISH_WINDOW,
+        },
         GatewayId,
     },
     view::{LoadRow, Role, WorkerId},
@@ -209,9 +212,9 @@ impl MemoryStore {
     }
 
     /// Apply a generation: every world from here on is published under
-    /// `spec`, the first at once, with the standing membership and its rows
-    /// as they are. The store's one entry for a generation; a store starts
-    /// under [`AppliedSpec::unbound`].
+    /// `spec`, the first at once, with the standing membership. The store's
+    /// one entry for a generation; a store starts under
+    /// [`AppliedSpec::unbound`].
     ///
     /// The number only rises. A generation whose number is not above the
     /// standing one is refused by naming the standing one, and nothing is
@@ -221,13 +224,28 @@ impl MemoryStore {
     /// The generation applied before the standing one is let go here, by
     /// the applying thread and outside the store's lock, and so is a
     /// generation the store refuses.
+    ///
+    /// The generation is the one writer of the mode the pair classes are
+    /// derived under ([`AppliedSpec::pairing`]). A generation of another
+    /// mode derives the standing membership's pools again and publishes
+    /// them once, under the new generation: no member moved, so the
+    /// store's epoch stays and no watcher is told. An apply takes the
+    /// workers lock and then the load lock, as a membership write does: a
+    /// writer's wait, never a decision's.
     pub fn apply(&self, spec: AppliedSpec) -> Result<(), StaleGeneration> {
         // The writer takes a second reference: when it refuses, the last
         // one is this one, let go after the lock.
         let spec = Arc::new(spec);
         let before = {
+            let workers = self.workers.lock();
             let mut loads = self.loads.lock();
-            let (world, before) = loads.writer.apply(Arc::clone(&spec))?;
+            let Loads { ranks, writer } = &mut *loads;
+            let ranks = &*ranks;
+            let (world, before) = writer.apply(
+                Arc::clone(&spec),
+                workers.rows.values().map(|row| &row.row),
+                |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
+            )?;
             self.world.store(world);
             before
         };
@@ -270,38 +288,21 @@ impl MemoryStore {
     }
 
     /// Build both sides of one pair decision from the world of this instant
-    /// under one borrow: the model's prefill pool into `prefill` and its
-    /// decode pool into `decode`, both of one publication. `None`, with
-    /// both buffers cleared, when either pool has no member: one side
-    /// alone is no pair.
+    /// under one borrow ([`World::build_pair`]): the model's prefill pool,
+    /// its decode pool and the table of their classes, all of one
+    /// publication. `None`, with every buffer cleared, when either pool has
+    /// no member: one side alone is no pair.
     ///
     /// This is a pair decision's door. It borrows the world, so the two
-    /// builds read one publication and no deciding thread writes the
-    /// world's shared count.
+    /// builds and the table read one publication and no deciding thread
+    /// writes the world's shared count.
     pub fn build_pair(
         &self,
         model: &str,
         ask: &Ask,
-        prefill: &mut ViewBuffers,
-        decode: &mut ViewBuffers,
+        out: &mut PairBuffers,
     ) -> Option<(Built, Built)> {
-        let world = self.world.load();
-        // The decode side is built only beside a prefill pool: a model
-        // with no prefill member costs one lookup, not a second build.
-        let pair = world
-            .build(model, Role::Prefill, ask, prefill)
-            .and_then(|first| {
-                world
-                    .build(model, Role::Decode, ask, decode)
-                    .map(|second| (first, second))
-            });
-        if pair.is_none() {
-            for side in [prefill, decode] {
-                side.candidates.clear();
-                side.affinity.clear();
-            }
-        }
-        pair
+        self.world.load().build_pair(model, ask, out)
     }
 
     /// One decision's door: `decide` is handed the world of this instant
@@ -325,8 +326,9 @@ impl MemoryStore {
     /// them in one world. Called under the workers lock by every membership
     /// write; it takes the load lock, as those writes do, so each row
     /// carries the load record on file and no record is lost across the
-    /// swap.
-    fn rebuild_world(&self, workers: &Workers) {
+    /// swap. `classes` says whether the write moved a member or a member's
+    /// offer: the pair classes are derived, or carried where it moved none.
+    fn rebuild_world(&self, workers: &Workers, classes: Classes) {
         let mut loads = self.loads.lock();
         let Loads { ranks, writer } = &mut *loads;
         let ranks = &*ranks;
@@ -334,6 +336,7 @@ impl MemoryStore {
             workers.epoch,
             workers.rows.values().map(|row| &row.row),
             |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
+            classes,
         );
         self.world.store(world);
     }
@@ -569,6 +572,13 @@ impl WorkersStore for MemoryStore {
                     return MembershipChange::Removed { id: old_id };
                 };
                 let resized = row.row.facts.dp_size != facts.dp_size;
+                // A registration refreshed with the offer it had moves no
+                // pair class.
+                let classes = if same_offer(&row.row.facts, &facts) {
+                    Classes::Carry
+                } else {
+                    Classes::Derive
+                };
                 row.row.facts = facts;
                 row.row.revision += 1;
                 let change = workers.record(if resized {
@@ -577,7 +587,7 @@ impl WorkersStore for MemoryStore {
                     MembershipChange::Relabelled { id: old_id }
                 });
                 self.index_member(&workers, old_id);
-                self.rebuild_world(&workers);
+                self.rebuild_world(&workers, classes);
                 return change;
             }
             // A new incarnation under the key: the old id leaves with its
@@ -629,7 +639,7 @@ impl WorkersStore for MemoryStore {
             // one's, and no load of it stands before the replacement.
             self.loads.lock().ranks.insert(new_id, Ranks::default());
             self.index_member(&workers, new_id);
-            self.rebuild_world(&workers);
+            self.rebuild_world(&workers, Classes::Derive);
             return change;
         }
         let id = identity(&facts.key, facts.incarnation);
@@ -654,7 +664,7 @@ impl WorkersStore for MemoryStore {
         // writes go into.
         self.loads.lock().ranks.insert(id, Ranks::default());
         self.index_member(&workers, id);
-        self.rebuild_world(&workers);
+        self.rebuild_world(&workers, Classes::Derive);
         change
     }
 
@@ -672,7 +682,8 @@ impl WorkersStore for MemoryStore {
         }
         row.row.revision += 1;
         let change = workers.record(MembershipChange::Relabelled { id });
-        self.rebuild_world(&workers);
+        // Labels, a priority and an overload are no part of an offer.
+        self.rebuild_world(&workers, Classes::Carry);
         Some(change)
     }
 
@@ -689,7 +700,7 @@ impl WorkersStore for MemoryStore {
         // later finds no load entry and writes nothing.
         self.forget_worker(id);
         let change = workers.record_over(MembershipChange::Removed { id }, Some(&row.row));
-        self.rebuild_world(&workers);
+        self.rebuild_world(&workers, Classes::Derive);
         Some(change)
     }
 

@@ -46,6 +46,13 @@
 //! this binary is built on the base branch with the pull request's bench
 //! sources, so a row here calls nothing the base's store lacks.
 //!
+//! `policy_store_pairs/kept/<n>` and `policy_store_pairs/moved/<n>` are
+//! one membership write of a fleet of pairs, `n` prefills and `n` decodes
+//! of one model that name no runtime: one prefill's registration written
+//! again as it stands, which moves no offer, and its runtime named and
+//! unnamed in turn, which moves its offer at every write. The gate reads
+//! both at 512 a side.
+//!
 //! `policy_store_cadence/*` reads the build beside a writer on another
 //! core, for a run pinned to two cores (both threads spin, so each keeps
 //! its core): `quiet/<n>` with the writer idle, `busy/<n>` with it writing
@@ -748,6 +755,78 @@ fn cadence(c: &mut Criterion, fixtures: &mut [Fixture]) {
     group.finish();
 }
 
+/// One membership write of a fleet of pairs: `n` prefills and `n` decodes
+/// of one model, every one ready with a record on file and published, none
+/// naming a runtime. `policy_store_pairs/kept/<n>` writes one prefill's
+/// registration again as it stands, which moves no offer;
+/// `policy_store_pairs/moved/<n>` names its runtime and unnames it in turn,
+/// which moves its offer at every write. A store of its own a size: the
+/// other cells' pools hold one role.
+fn pair_writes(c: &mut Criterion) {
+    for n in SIZES {
+        let facts_of = |index: usize| {
+            let (role, key) = if index < n {
+                (Role::Prefill, format!("http://p{index}:8000"))
+            } else {
+                (Role::Decode, format!("http://d{}:8000", index - n))
+            };
+            WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                role,
+                models: vec![MODEL.to_string()],
+                dp_size: 1,
+                max_running: Some(4),
+                ..WorkerFacts::default()
+            }
+        };
+        let store = MemoryStore::new();
+        let opened = Instant::now();
+        for index in 0..2 * n {
+            let id = store.upsert(facts_of(index)).id();
+            let revision = WorkersStore::get(&store, id).expect("the row").revision;
+            store
+                .set_status(id, WorkerStatus::Ready, revision)
+                .expect("ready");
+            store.record(id, 0, record_of(index, 0), opened, LoadSource::Stream);
+        }
+        store.publish(opened + PUBLISH_WINDOW);
+        assert_eq!(store.publish_due(), None);
+        let written = facts_of(n / 2);
+        let named = WorkerFacts {
+            engine_kind: "rt-b".to_string(),
+            ..written.clone()
+        };
+        let mut group = c.benchmark_group("policy_store_pairs");
+        group.bench_with_input(BenchmarkId::new("kept", n), &n, |b, _| {
+            b.iter_batched(
+                || written.clone(),
+                |facts| store.upsert(black_box(facts)),
+                BatchSize::SmallInput,
+            );
+        });
+        // The writes come in the order their facts were made: named,
+        // unnamed, named, so each moves the offer the one before left.
+        let mut name = false;
+        group.bench_with_input(BenchmarkId::new("moved", n), &n, |b, _| {
+            b.iter_batched(
+                || {
+                    name = !name;
+                    if name {
+                        named.clone()
+                    } else {
+                        written.clone()
+                    }
+                },
+                |facts| store.upsert(black_box(facts)),
+                BatchSize::SmallInput,
+            );
+        });
+        group.finish();
+    }
+}
+
 fn store_view(c: &mut Criterion) {
     let mut fixtures: Vec<Fixture> = SIZES.iter().map(|&n| Fixture::new(n)).collect();
     floor(c, &mut fixtures);
@@ -758,6 +837,7 @@ fn store_view(c: &mut Criterion) {
     vetoed(c, &mut fixtures);
     writes_beside_vetoes(c, &mut fixtures);
     member_write_beside_spread_vetoes(c);
+    pair_writes(c);
 }
 
 criterion_group!(benches, store_view);

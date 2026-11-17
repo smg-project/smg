@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, time::Instant};
 
 use crate::{
     lease::Membership,
-    store::GatewayId,
+    store::{pairing::PairingDescriptor, GatewayId},
     view::{fingerprint, Role, WireModes, WorkerId},
 };
 
@@ -133,11 +133,11 @@ pub struct WorkerFacts {
     /// descriptor's fields).
     pub labels: BTreeMap<String, String>,
     pub zone: Option<String>,
-    /// The prefill-decode pairing descriptor, when the worker has one.
-    pub pairing: Option<String>,
-    /// The pairing class, derived by the store at each membership change;
-    /// `0` outside any pairing.
-    pub pair_class: u32,
+    /// What the worker offers a prefill-decode partner, when the handshake
+    /// learned any of it. The store derives the pair classes from it, with
+    /// the engine kind as the runtime, at each membership write
+    /// ([`pairing`](super::pairing)): a registration hands no class in.
+    pub pairing: Option<PairingDescriptor>,
     /// The engine's admission window (maximum running requests); `None`
     /// when it reports none.
     pub max_running: Option<u32>,
