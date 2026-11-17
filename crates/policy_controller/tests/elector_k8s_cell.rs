@@ -592,18 +592,93 @@ async fn two_binaries_elect_over_the_lease_object_and_hand_over_at_a_stop() {
     record.check().expect("the election's promise holds");
 }
 
+/// How many times a cell whose stand-in the host can hold is made. A try
+/// that fails where its witness says the host held this process says so and
+/// is made again. No witness passes a run: the last try stands whatever its
+/// witness says, so a leader that fails by itself fails each try, and the
+/// cell.
+#[cfg(feature = "controller")]
+const TRIES: u32 = 3;
+
+/// A witness of the host's holds beside such a cell: a thread that naps
+/// 5 ms at a time and keeps the longest it overslept. A host that holds
+/// this process, the stand-in with it, holds its witness too.
+#[cfg(feature = "controller")]
+struct Witness {
+    end: mpsc::Sender<()>,
+    naps: thread::JoinHandle<Duration>,
+}
+
+#[cfg(feature = "controller")]
+impl Witness {
+    fn start() -> Self {
+        let (end, ended) = mpsc::channel();
+        let naps = thread::spawn(move || {
+            let nap = Duration::from_millis(5);
+            let mut longest = Duration::ZERO;
+            loop {
+                let began = Instant::now();
+                if ended.recv_timeout(nap) != Err(mpsc::RecvTimeoutError::Timeout) {
+                    return longest;
+                }
+                longest = longest.max(began.elapsed().saturating_sub(nap));
+            }
+        });
+        Self { end, naps }
+    }
+
+    /// Ends the witness: the longest hold it saw.
+    fn held(self) -> Duration {
+        drop(self.end);
+        self.naps.join().expect("the witness returns")
+    }
+}
+
 /// A release the stand-in refuses once (design 5.3): the stopped leader
 /// writes it again no sooner than a renew period after the first, the
 /// stand-in stores that one, and the other replica takes the object. The
-/// row of the Numbers table is printed: the signal to the stored release
-/// and to the take, at the cell's timings or the three of
+/// row of the Numbers table is printed for that stop: the signal to the
+/// stored release and to the take, at the cell's timings or the three of
 /// `SMG_REPLICAS_TIMINGS_MS`. A leader the host held back past the duration
 /// has lost the object by its second release: the other replica took it
-/// unreleased, and the replica left is stopped alone and refused once in
-/// its turn.
+/// unreleased, the replica left is stopped alone and refused once in its
+/// turn, and no row is printed, since no replica is left to take.
+///
+/// The stand-in lives in this process. A host that holds it for a renew
+/// period can lose the leader the answer to a release that was stored, with
+/// no fault of the leader's: a try that fails where the witness saw such a
+/// hold says so and is made again, [`TRIES`] at most.
 #[cfg(feature = "controller")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_release_is_written_again_a_renew_period_later() {
+#[test]
+fn a_refused_release_is_written_again_a_renew_period_later() {
+    for tried in 1..=TRIES {
+        let witness = Witness::start();
+        let failed = std::panic::catch_unwind(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("a runtime")
+                .block_on(a_refused_release());
+        });
+        let held = witness.held();
+        let Err(failure) = failed else {
+            return;
+        };
+        if held < settings().renew_period || tried == TRIES {
+            std::panic::resume_unwind(failure);
+        }
+        writeln!(
+            std::io::stdout(),
+            "a refused release: made again in this run: the host held the stand-in {held:?}"
+        )
+        .expect("stdout");
+    }
+}
+
+/// One try of the cell above.
+#[cfg(feature = "controller")]
+async fn a_refused_release() {
     use replicas::{Lease as Place, Record, Replica, ROOM};
 
     let mut out = std::io::stdout();

@@ -1137,6 +1137,68 @@ mod tests {
         }
     }
 
+    /// How many times a case that bounds the loop on the real clock is made.
+    /// A try that fails where its witness says the host held this process
+    /// says so and is made again. No witness passes a run: the last try
+    /// stands whatever its witness says, so a loop that fails by itself
+    /// fails each try, and the case.
+    const TRIES: u32 = 3;
+
+    /// A witness of the host's holds beside such a case: a thread that naps
+    /// 5 ms at a time and keeps the longest it overslept. A host that holds
+    /// this process holds its witness too.
+    struct Witness {
+        end: mpsc::Sender<()>,
+        naps: thread::JoinHandle<Duration>,
+    }
+
+    impl Witness {
+        fn start() -> Self {
+            let (end, ended) = mpsc::channel();
+            let naps = thread::spawn(move || {
+                let nap = Duration::from_millis(5);
+                let mut longest = Duration::ZERO;
+                loop {
+                    let began = Instant::now();
+                    if ended.recv_timeout(nap) != Err(mpsc::RecvTimeoutError::Timeout) {
+                        return longest;
+                    }
+                    longest = longest.max(began.elapsed().saturating_sub(nap));
+                }
+            });
+            Self { end, naps }
+        }
+
+        /// Ends the witness: the longest hold it saw.
+        fn held(self) -> Duration {
+            drop(self.end);
+            self.naps.join().expect("the witness returns")
+        }
+    }
+
+    /// Runs `case`, whose bounds on the real clock leave the loop `room`. A
+    /// host that holds this process longer breaks such a bound with no
+    /// fault of the loop's, so a try that fails where the witness saw a
+    /// hold of half the room is made again, [`TRIES`] at most.
+    fn unheld(name: &str, room: Duration, case: fn()) {
+        for tried in 1..=TRIES {
+            let witness = Witness::start();
+            let failed = std::panic::catch_unwind(case);
+            let held = witness.held();
+            let Err(failure) = failed else {
+                return;
+            };
+            if held < room / 2 || tried == TRIES {
+                std::panic::resume_unwind(failure);
+            }
+            writeln!(
+                std::io::stdout(),
+                "{name}: made again in this run: the host held the test {held:?}"
+            )
+            .expect("the test's output");
+        }
+    }
+
     /// A lease whose reads fail while `away` is set.
     struct Away {
         lease: MemoryLease,
@@ -1537,6 +1599,15 @@ mod tests {
 
     #[test]
     fn a_leader_whose_renewals_take_under_the_margin_never_closes_its_fence() {
+        unheld(
+            "a slow store under the margin",
+            Duration::from_secs(1),
+            renewals_under_the_margin,
+        );
+    }
+
+    /// One try of the case above: a second of room.
+    fn renewals_under_the_margin() {
         // The fence's margin is the smaller of the deadline less the period
         // and half the deadline, both 2.5 s here. Every write takes 1.5 s.
         // That is over half the margin: steps that began a period after the
@@ -1565,6 +1636,15 @@ mod tests {
 
     #[test]
     fn the_loop_holds_the_fence_just_under_the_margin_and_follows_a_slow_step_at_once() {
+        unheld(
+            "a slow store just under the margin",
+            Duration::from_millis(500),
+            just_under_the_margin,
+        );
+    }
+
+    /// One try of the case above: half a second of room.
+    fn just_under_the_margin() {
         // A write of three quarters of the margin, 1.5 s under 2 s: half a
         // second of room for a held host. A wait that put any share of the
         // step's own time on top of the period would land the renewal after
@@ -1993,6 +2073,15 @@ mod tests {
 
     #[test]
     fn a_holder_whose_record_is_emptied_logs_that_it_is_gone_and_no_fallen_term() {
+        unheld(
+            "an emptied record",
+            Duration::from_millis(500),
+            an_emptied_record_is_gone,
+        );
+    }
+
+    /// One try of the case above, inside the wait: half a second of room.
+    fn an_emptied_record_is_gone() {
         let settings = ElectionSettings {
             duration: Duration::from_millis(600),
             renew_period: Duration::from_millis(20),
@@ -2201,6 +2290,15 @@ mod tests {
 
     #[test]
     fn a_release_that_fails_is_tried_again_a_renew_period_after_it_began() {
+        unheld(
+            "a release that fails",
+            Duration::from_secs(1),
+            failed_releases_tried_again,
+        );
+    }
+
+    /// One try of the case above: a second of room on each of its most.
+    fn failed_releases_tried_again() {
         // Every write fails, and the first takes the whole period: three
         // writes and no more, and the lease is left to expire by its
         // duration.
