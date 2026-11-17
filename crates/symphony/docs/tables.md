@@ -419,8 +419,8 @@ What this table says beyond the DeepSeek one:
 - **Spelling is not token identity.** Ordinary token pieces can spell the same bytes inside
   reasoning examples or JSON strings. A tokenized caller can bind the declared
   `<|open|>` and `<|close|>` atoms to its vocabulary and supply their byte origins before
-  feeding the text. Only those origins authorize these framing transitions; an ordinary-token
-  lookalike stays in its current channel. No quote-state heuristic is used: a genuine
+  feeding the text. Only those origins authorize these framing transitions and XTML argument
+  delimiters; an ordinary-token lookalike stays in its current channel or argument value. No quote-state heuristic is used: a genuine
   structural token still frames a transition after unmatched quotes or prose. Text-only
   callers, and a caller without a complete vocabulary binding before output, retain the
   existing string-marker behavior. Once bound, missing counting spans cannot change modes.

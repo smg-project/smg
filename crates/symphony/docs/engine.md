@@ -249,8 +249,17 @@ atom's identity. Prompt replay stays text-only and starts generated coordinates 
 The engine keeps this provenance separate from the token-count ledger. Invalid counting spans
 may make counts unavailable, but cannot switch bound framing back to string matching. A
 separate cursor follows raw pieces and rewinds any suffix returned for a header rescan; origins
-are retained until their bytes have been emitted. EOF cut-tag handling checks the same origin.
-Unbound text-only callers retain their prior behavior, as do formats without structural atoms.
+are retained until their bytes have been emitted and pruned when another origin is announced.
+The attributed assembler receives the origins in each arguments piece, translated into its own
+byte coordinates, so an ordinary-token XTML argument tag remains part of the value. EOF
+cut-tag handling checks the same origin, including a partial argument tag inside a string.
+Unbound text-only callers retain their prior behavior, as do formats without structural atoms;
+the optional cursor and origin map are allocated only when a caller binds.
+
+`Engine::refused_structural_tags` counts complete engine framing tags that were read as text
+because no matching origin was announced. It is zero when unbound and excludes argument tags
+and EOF tails. A reader can combine this with its binding mode and announced-origin count to
+observe a bad binding without logging model text or token IDs.
 
 Binding is an explicit caller contract: the caller verifies vocabulary atoms and supplies
 their ranges. The engine does not infer token identity from decoded spellings or counting

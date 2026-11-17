@@ -54,14 +54,14 @@
 //! [`formats::deepseek_v4_1`]: crate::formats::deepseek_v4_1()
 //! [`formats::kimi_k3`]: crate::formats::kimi_k3()
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::BTreeMap, ops::Range};
 
 use super::object::{Mode, Object};
 use crate::{
     engine::part,
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
     json::named_arguments,
-    markers::Scanner,
+    markers::{Piece, Scanner},
     tagged::{
         end_cut_call, held_text,
         value::{cut as cut_json, json, Kind},
@@ -337,6 +337,14 @@ pub struct Assembler {
     /// The buffer the events of a piece the scanner held fill before they go out owned
     /// (`take_owned`): kept between pieces with its room.
     scratch: Events<'static>,
+    provenance: Option<Box<Provenance>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Provenance {
+    fed: usize,
+    cursor: usize,
+    origins: BTreeMap<usize, usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -420,7 +428,26 @@ impl Assembler {
             close_held: false,
             done: false,
             scratch: Events::new(),
+            provenance: None,
         }
+    }
+
+    fn structural_origin_allows(&self, text: &str) -> bool {
+        let Some(provenance) = &self.provenance else {
+            return true;
+        };
+        if !self
+            .tags
+            .structural_tokens
+            .iter()
+            .any(|atom| text.starts_with(atom))
+        {
+            return true;
+        }
+        provenance
+            .origins
+            .get(&provenance.cursor)
+            .is_some_and(|&atom| text.starts_with(self.tags.structural_tokens[atom]))
     }
 
     /// Whether a call has started, that is, whether `ToolCallStart` has been pushed.
@@ -617,7 +644,7 @@ impl Assembler {
         let mut cut_tag = None;
         if !tail.is_empty() {
             if section_closed
-                || self.tags.is_cut_tag(&tail)
+                || (self.tags.is_cut_tag(&tail) && self.structural_origin_allows(&tail))
                 || (self.tags.structural_tokens.is_empty()
                     && self.tags.parameter_close.starts_with(tail.as_str()))
             {
@@ -757,7 +784,7 @@ impl Assembler {
         let mut text = self.take_held();
         if !section_closed {
             let tail = self.scanner.set_aside();
-            if self.tags.is_cut_tag(&tail) {
+            if self.tags.is_cut_tag(&tail) && self.structural_origin_allows(&tail) {
                 cut_tag = Some(tail);
             } else {
                 text.push_str(&tail);
@@ -1474,8 +1501,57 @@ impl TaggedAssembler for Assembler {
 }
 
 impl crate::engine::CallAssembler for Assembler {
+    fn note_structural_origins(
+        &mut self,
+        piece: Range<usize>,
+        origins: &BTreeMap<usize, usize>,
+        atoms: &[String],
+    ) {
+        if self.tags.structural_tokens.is_empty() {
+            return;
+        }
+        let provenance = self.provenance.get_or_insert_with(Box::default);
+        provenance
+            .origins
+            .retain(|start, _| *start >= provenance.cursor);
+        for (&start, &atom) in origins.range(piece.clone()) {
+            if let Some(index) = self
+                .tags
+                .structural_tokens
+                .iter()
+                .position(|text| *text == atoms[atom])
+            {
+                provenance
+                    .origins
+                    .insert(provenance.fed + (start - piece.start), index);
+            }
+        }
+        provenance.fed += piece.end - piece.start;
+    }
+
     fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
-        TaggedAssembler::feed(self, text, declared, out);
+        if self.provenance.is_none() {
+            TaggedAssembler::feed(self, text, declared, out);
+        } else if !self.done {
+            let scanned = self.scanner.feed(text);
+            for piece in scanned.pieces_of_delta() {
+                let length = match &piece {
+                    Piece::Text(text) => text.len(),
+                    Piece::Marker(tag) => self.tags.text(*tag).len(),
+                };
+                let piece = match piece {
+                    Piece::Marker(tag) if !self.structural_origin_allows(self.tags.text(tag)) => {
+                        Piece::Text(Cow::Borrowed(self.tags.text(tag)))
+                    }
+                    other => other,
+                };
+                self.take(piece, declared, out);
+                if let Some(provenance) = &mut self.provenance {
+                    provenance.cursor += length;
+                }
+            }
+            self.scanner.reclaim(scanned);
+        }
         text.len()
     }
 
