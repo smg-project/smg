@@ -75,10 +75,6 @@ pub(crate) type StreamResult = Result<ProtoStream, tonic::Status>;
 pub(crate) type SideDispatch = Pin<Box<dyn Future<Output = StreamResult> + Send>>;
 
 /// How the two parallel sides resolved.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "consumed by its caller on the next line; boxing would add an allocation to the success path to save one stack move"
-)]
 enum PdDispatchOutcome {
     /// Both sides answered; either or both may carry an error.
     Both(StreamResult, StreamResult),
