@@ -18,6 +18,9 @@ name = "smg_worker"
 default = []
 # The HTTP responses of the worker's admin types.
 axum = ["dep:axum"]
+# The mechanism the worker's metric writers share with a host's: the bounded
+# label set, the model labels' one set and the handles a record keeps.
+metrics = ["dep:dashmap", "dep:rustc-hash"]
 # The worker's runtime, for the process that hosts the workers. Its first
 # part is the HTTP client factory and the cache of worker-directed clients.
 runtime = ["dep:reqwest", "dep:rustls", "dep:tracing"]
@@ -27,7 +30,9 @@ test-util = ["runtime"]
 [dependencies]
 axum = { workspace = true, optional = true }
 bitflags.workspace = true
+dashmap = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true, features = ["blocking", "http2", "rustls-no-provider"] }
+rustc-hash = { version = "2", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 schemars.workspace = true
 serde = { workspace = true, features = ["derive", "rc"] }

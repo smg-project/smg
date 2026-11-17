@@ -8299,9 +8299,11 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bitflags 2.13.2",
+ "dashmap",
  "http",
  "openssl",
  "reqwest 0.13.4",
+ "rustc-hash 2.1.3",
  "rustls",
  "schemars 1.2.2",
  "serde",
