@@ -553,8 +553,8 @@ fn a_constant_passed_to_a_format_leaves_the_template_as_it_was() {
 #[test]
 fn a_template_that_refuses_a_typed_spelling_is_left_as_it_was() {
     let temp = TempDir::new().unwrap();
-    // The refusal reads request text by an operator, which no string method
-    // sees: marked, the template would render what it refuses.
+    // The refusal looks for a constant in request text: marked, the template
+    // would render what it refuses.
     let refuses = "{% for message in messages %}{% if close in message['content'] %}\
         {{ raise_exception('no control spellings') }}{% endif %}{% endfor %}";
     let guarded = format!(
@@ -598,9 +598,8 @@ fn a_name_bound_inside_a_block_is_the_block_s_own() {
 fn a_template_that_takes_a_history_only_with_a_spelling_in_it_is_left_as_it_was() {
     let temp = TempDir::new().unwrap();
     // Any message but the user's is refused unless it holds the closing
-    // spelling: the template refuses the probe histories and takes them with
-    // the spelling typed, so its refusal reads request text, by an operator
-    // no string method sees. Marked, it would refuse the history it takes.
+    // spelling: the refusal looks for a constant in request text. Marked,
+    // the template would refuse the history it takes.
     let requires = "{% for message in messages %}{% if message['role'] != 'user' \
         and close not in message['content'] %}{{ raise_exception('no closing spelling') }}\
         {% endif %}{% endfor %}";
@@ -715,21 +714,23 @@ fn a_control_the_load_cannot_write_as_a_literal_leaves_the_template_as_it_was() 
         assert_eq!(ids, [2, 13, 14, 3, 13, 14, 1, 3], "{tail}");
     }
 
-    // A filter over the template's own constants whose value is no control
-    // changes nothing: the template is marked.
+    // A filter over the template's own constants gives a value the load
+    // reads once, and nothing in the syntax says that every render gives
+    // the same: the statement leaves the template as it was, whatever the
+    // one value is.
     let temp = TempDir::new().unwrap();
     let counts = format!("{}{{% set width = suffix | length %}}", builds());
     let tok = checkpoint(temp.path(), &counts);
     let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
-    assert!(!from_text);
-    assert_eq!(ids, TYPED_AS_TEXT);
+    assert!(from_text);
+    assert_eq!(ids, TYPED_AS_THE_CONTROL);
 }
 
 #[test]
 fn a_search_made_only_under_the_thinking_switch_leaves_the_template_as_it_was() {
     let temp = TempDir::new().unwrap();
-    // A filter, which no string method sees, and only with thinking switched
-    // off: the typed spellings show it when they are rendered in that mode.
+    // A filter takes the constant as an argument, and only with thinking
+    // switched off: the syntax shows it, whatever a render passes.
     let search = "(message['content'] | replace(close, '')) \
         if enable_thinking is defined and not enable_thinking else message['content']";
     let searches = format!("{CONSTANTS}{}", SEARCHES.replace("SEARCH", search));
@@ -771,4 +772,498 @@ fn a_conversation_the_template_refuses_is_not_judged_but_the_bare_turn_is() {
     assert!(from_text);
     assert_eq!(text, "ab</s:x>[INST:x]a[/INST:x]b[/INST:x]");
     assert_eq!(ids, [13, 14, 1, 2, 13, 3, 14, 3]);
+}
+
+/// The messages with room for a shape: AT_TOP stands behind the constants,
+/// IN_LOOP first in the body of the message loop, and USER writes a user
+/// message; any other message is its text and the end token.
+const SHAPED: &str = "AT_TOP{% for message in messages %}IN_LOOP\
+    {% if message['role'] == 'user' %}USER{% else %}{{ message['content'] }}{{ end }}\
+    {% endif %}{% endfor %}";
+
+/// A user message between the opening and the closing token, each written by
+/// its name alone.
+const WRITTEN: &str = "{{ open }}{{ message['content'] }}{{ close }}";
+
+/// [`CONSTANTS`] and [`SHAPED`] with its three places filled.
+fn shaped(at_top: &str, in_loop: &str, user: &str) -> String {
+    let body = SHAPED
+        .replace("AT_TOP", at_top)
+        .replace("IN_LOOP", in_loop)
+        .replace("USER", user);
+    format!("{CONSTANTS}{body}")
+}
+
+/// The names of those `shapes` whose template is switched on. A shape is its
+/// name and three pieces of a template that writes its constants by their
+/// names ([`shaped`], [`WRITTEN`]): one behind the constants, one in the
+/// loop's body, and one behind the messages that runs only under `flat`. No
+/// conversation of the load's check passes `flat`, so only the syntax tells
+/// what the template does under it. A template left as it was encodes its
+/// prompt from its text, a typed spelling as the control, with the argument
+/// and without.
+fn switched_on<'a>(shapes: &[(&'a str, &str, &str, &str)]) -> Vec<&'a str> {
+    let kwargs = HashMap::from([("flat".to_owned(), json!(true))]);
+    let mut on = Vec::new();
+    for (name, at_top, in_loop, under_flat) in shapes {
+        let temp = TempDir::new().unwrap();
+        let template = format!(
+            "{}{{% if flat %}}{under_flat}{{% endif %}}",
+            shaped(at_top, in_loop, WRITTEN)
+        );
+        let tok = checkpoint(temp.path(), &template);
+        let flat = ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..ChatTemplateParams::default()
+        };
+        if tok.chat_template.marked()
+            || render(&tok, json!("a[/INST:x]b")).1 != TYPED_AS_THE_CONTROL
+            || !render_under(&tok, json!("a[/INST:x]b"), flat).2
+        {
+            on.push(*name);
+        }
+    }
+    on
+}
+
+#[test]
+fn a_write_that_is_no_plain_write_leaves_the_template_as_it_was() {
+    // What a block around a write does with the text, and what reads the
+    // text a block or a macro kept, is not the write of a name.
+    let on = switched_on(&[
+        (
+            "a filter block",
+            "",
+            "",
+            "{% filter upper %}{{ close }}{% endfilter %}",
+        ),
+        (
+            "an autoescape block",
+            "",
+            "",
+            "{% autoescape true %}{{ end }}{% endautoescape %}",
+        ),
+        (
+            "a block set read later",
+            "",
+            "",
+            "{% set kept %}{{ close }}{% endset %}{{ kept | length }}",
+        ),
+        (
+            "a macro's text read later",
+            "{% macro closing() %}{{ close }}{% endmacro %}",
+            "",
+            "{{ closing() | length }}",
+        ),
+        (
+            "a macro's text bound and read later",
+            "{% macro closing() %}{{ close }}{% endmacro %}",
+            "",
+            "{% set kept = closing() %}{{ kept[1:] }}",
+        ),
+        (
+            "a macro under another name",
+            "{% macro closing() %}{{ close }}{% endmacro %}",
+            "",
+            "{% set other = closing %}{{ other() | length }}",
+        ),
+        (
+            "a call block",
+            "{% macro counted() %}{{ caller() | length }}{% endmacro %}",
+            "",
+            "{% call counted() %}{{ close }}{% endcall %}",
+        ),
+    ]);
+    assert!(on.is_empty(), "switched on: {on:?}");
+}
+
+#[test]
+fn a_join_that_is_no_plain_join_leaves_the_template_as_it_was() {
+    let on = switched_on(&[
+        ("under a filter", "", "", "{{ (open ~ close) | length }}"),
+        ("under a test", "", "", "{{ (open ~ close) is string }}"),
+        ("under a subscript", "", "", "{{ (open ~ close)[0] }}"),
+        ("under a slice", "", "", "{{ (open ~ close)[1:] }}"),
+        (
+            "under a comparison",
+            "",
+            "",
+            "{% if (open ~ close) == messages[0]['content'] %}{{ end }}{% endif %}",
+        ),
+        ("under a method", "", "", "{{ (open ~ close).upper() }}"),
+        (
+            "as a method's argument",
+            "",
+            "",
+            "{{ ''.join([open ~ close]) }}",
+        ),
+    ]);
+    assert!(on.is_empty(), "switched on: {on:?}");
+}
+
+#[test]
+fn a_constant_carried_on_leaves_the_template_as_it_was() {
+    // The value goes on under another name, or inside a value, and is read
+    // there in a way that is no write.
+    let on = switched_on(&[
+        (
+            "an alias at the top",
+            "",
+            "",
+            "{% set alias = close %}{{ alias | length }}",
+        ),
+        (
+            "an alias in a loop's body",
+            "",
+            "{% set alias = close %}{% if flat %}{{ alias | length }}{% endif %}",
+            "",
+        ),
+        (
+            "a with",
+            "",
+            "",
+            "{% with held = close %}{{ held | length }}{% endwith %}",
+        ),
+        (
+            "a list",
+            "",
+            "",
+            "{% set held = [close] %}{{ held[0] | length }}",
+        ),
+        (
+            "a map",
+            "",
+            "",
+            "{% set held = {'k': close} %}{{ held['k'] | length }}",
+        ),
+        (
+            "a namespace's attribute",
+            "{% set ns = namespace(held='') %}",
+            "",
+            "{% set ns.held = close %}{{ ns.held | length }}",
+        ),
+        (
+            "a loop's sequence",
+            "",
+            "",
+            "{% for letter in close %}{{ letter }}.{% endfor %}",
+        ),
+        (
+            "a conditional expression bound",
+            "",
+            "",
+            "{% set held = close if flat else '' %}{{ held | length }}",
+        ),
+        (
+            "a conditional expression written",
+            "",
+            "",
+            "{{ close if flat else '' }}",
+        ),
+        (
+            "a macro's argument",
+            "{% macro counted(text) %}{{ text | length }}{% endmacro %}",
+            "",
+            "{{ counted(close) }}",
+        ),
+    ]);
+    assert!(on.is_empty(), "switched on: {on:?}");
+}
+
+#[test]
+fn a_joined_name_read_otherwise_than_by_a_write_leaves_the_template_as_it_was() {
+    // `whole` is bound in the loop's body from a join that holds two
+    // constants: it carries them, and the rule for a constant is its rule.
+    const BOUND: &str = "{% set whole = open ~ message['content'] ~ close %}";
+    let read = |shape: &str| format!("{BOUND}{{% if flat %}}{shape}{{% endif %}}");
+    let shapes = [
+        ("a filter", read("{{ whole | length }}")),
+        ("a method", read("{{ whole.upper() }}")),
+        ("a subscript", read("{{ whole[0] }}")),
+        ("a slice", read("{{ whole[1:] }}")),
+        (
+            "a search",
+            read("{{ message['content'].split(whole)[-1] }}"),
+        ),
+        // The one test a carrying name may stand under is whether it is
+        // empty, in the condition of an `if`: nothing else there.
+        (
+            "its length in a condition",
+            read("{% if whole | length %}{{ end }}{% endif %}"),
+        ),
+        (
+            "a comparison in a condition",
+            read("{% if whole == '' %}{{ end }}{% endif %}"),
+        ),
+        (
+            "a test word in a condition",
+            read("{% if whole is string %}{{ end }}{% endif %}"),
+        ),
+        (
+            "in, in a condition",
+            read("{% if whole in message['content'] %}{{ end }}{% endif %}"),
+        ),
+        (
+            "a conditional expression's condition",
+            read("{{ 'y' if whole else 'n' }}"),
+        ),
+    ];
+    let shapes: Vec<_> = shapes
+        .iter()
+        .map(|(name, in_loop)| (*name, "", in_loop.as_str(), ""))
+        .collect();
+    let on = switched_on(&shapes);
+    assert!(on.is_empty(), "switched on: {on:?}");
+}
+
+#[test]
+fn a_read_of_a_constant_that_is_no_write_leaves_the_template_as_it_was() {
+    let on = switched_on(&[
+        ("its length", "", "", "{{ close | length }}"),
+        ("a slice of it", "", "", "{{ close[1:] }}"),
+        (
+            "a comparison of it",
+            "",
+            "",
+            "{% if close == messages[0]['content'] %}{{ end }}{% endif %}",
+        ),
+        (
+            "in",
+            "",
+            "",
+            "{% if close in messages[0]['content'] %}{{ end }}{% endif %}",
+        ),
+        (
+            "a search for it",
+            "",
+            "",
+            "{{ messages[0]['content'].split(close)[-1] }}",
+        ),
+        ("a method of it", "", "", "{{ close.strip('[') }}"),
+        ("a test word", "", "", "{{ close is string }}"),
+        // A macro's own `set` of the name does not hide the constant from
+        // what the macro reads before it.
+        (
+            "a macro that reads it before its own set",
+            "{% macro peek(text) %}{{ close | length }}{% set close = text %}{% endmacro %}",
+            "",
+            "{{ peek('') }}",
+        ),
+        (
+            "a special token's name sliced",
+            "",
+            "",
+            "{{ eos_token[1:] }}",
+        ),
+        (
+            "a special token's name compared",
+            "",
+            "",
+            "{% if messages[0]['content'] == eos_token %}{{ end }}{% endif %}",
+        ),
+    ]);
+    assert!(on.is_empty(), "switched on: {on:?}");
+}
+
+#[test]
+fn a_search_only_another_spelling_opens_leaves_the_template_as_it_was() {
+    let temp = TempDir::new().unwrap();
+    // The search for the closing token runs only on a text that holds a
+    // spelling no conversation of the load's check types.
+    let hidden = format!(
+        "{CONSTANTS}{}",
+        SEARCHES.replace(
+            "SEARCH",
+            "message['content'].split(close)[-1] if ('<hi' ~ 'dden>') in message['content'] \
+             else message['content']"
+        )
+    );
+    let tok = checkpoint(temp.path(), &hidden);
+    assert!(!tok.chat_template.marked());
+    let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+    assert!(from_text);
+    assert_eq!(ids, TYPED_AS_THE_CONTROL);
+}
+
+#[test]
+fn a_part_of_a_constant_read_elsewhere_leaves_the_template_as_it_was() {
+    // `suffix` is what the constants are built from. Read anywhere but in
+    // the top-level statements the load computes, it may build a control
+    // the load never saw: in a statement that also reads a request
+    // argument, where a value is written, in a loop's body, beside literal
+    // text, under another name.
+    let on = switched_on(&[
+        (
+            "a statement that reads a request argument",
+            "{% set extra = custom if custom is defined else '[/INST' ~ suffix ~ ']' %}",
+            "",
+            "{{ extra }}",
+        ),
+        (
+            "a default",
+            "{% set extra = custom | default('[/INST' ~ suffix ~ ']') %}",
+            "",
+            "{{ extra }}",
+        ),
+        (
+            "built where it is written",
+            "",
+            "",
+            "{{ '[/INST' ~ suffix ~ ']' }}",
+        ),
+        (
+            "bound in a loop's body",
+            "",
+            "{% set built = '[/INST' ~ suffix ~ ']' %}{% if flat %}{{ built }}{% endif %}",
+            "",
+        ),
+        ("beside literal text", "", "", "[/INST{{ suffix }}]"),
+        (
+            "under another name",
+            "{% set tail = suffix %}",
+            "",
+            "{{ '[/INST' ~ tail ~ ']' }}",
+        ),
+        (
+            "in a macro",
+            "{% macro closing() %}{{ '[/INST' ~ suffix ~ ']' }}{% endmacro %}",
+            "",
+            "{{ closing() }}",
+        ),
+    ]);
+    assert!(on.is_empty(), "switched on: {on:?}");
+}
+
+#[test]
+fn a_value_the_load_cannot_know_leaves_the_template_as_it_was() {
+    // The load computes a top-level statement once. One that builds its
+    // value from a name with two bindings, or through a filter, may build
+    // another value in a render: here the closing token, under `flat`.
+    let on = switched_on(&[
+        (
+            "a name bound again under a condition",
+            "{% set tail = ':x' %}{% if not flat %}{% set tail = ':y' %}{% endif %}\
+             {% set extra = '[/INST{}]'.format(tail) %}",
+            "",
+            "{{ extra }}",
+        ),
+        (
+            "a filter",
+            "{% set extra = ['[/INST:y]', '[/INST' ~ suffix ~ ']'] | last %}",
+            "",
+            "{{ extra }}",
+        ),
+    ]);
+    assert!(on.is_empty(), "switched on: {on:?}");
+}
+
+#[test]
+fn a_join_of_constants_is_marked() {
+    // A constant is written as a whole operand of a join, and a name a
+    // plain `set` binds from such a join is written: the marks go with the
+    // value, at the top, in a loop's body, through a macro.
+    let joined = "{{ open ~ message['content'] ~ close }}";
+    let bound = "{% set whole = open ~ message['content'] ~ close %}";
+    let both = "{% set both = close ~ end %}";
+    let wraps = "{% macro wrap(text) %}{{ open ~ text ~ close }}{% endmacro %}";
+    for (at_top, in_loop, user) in [
+        ("", "", joined),
+        ("", bound, "{{ whole }}"),
+        ("", bound, "{% set again = whole %}{{ '' ~ again }}"),
+        (wraps, "", "{{ wrap(message['content']) }}"),
+        (
+            wraps,
+            "",
+            "{% set whole = '' ~ wrap(message['content']) %}{{ whole }}",
+        ),
+        (both, "", "{{ open }}{{ message['content'] }}{{ close }}"),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint(temp.path(), &shaped(at_top, in_loop, user));
+        assert!(tok.chat_template.marked(), "{at_top}{in_loop}{user}");
+        let (text, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+        assert!(!from_text);
+        assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>");
+        assert_eq!(ids, TYPED_AS_TEXT, "{at_top}{in_loop}{user}");
+    }
+}
+
+#[test]
+fn a_carrying_name_under_a_truth_test_is_marked() {
+    let temp = TempDir::new().unwrap();
+    // `content` is bound from a join of two constants in one branch of the
+    // loop's body, and from a macro's text in the other, where an `if` asks
+    // whether it is empty before it is written. Two macros have a name of
+    // the same spelling, a parameter and a `set` of their own, and read it
+    // by a test word, a loop, a method and a subscript: those are the
+    // macros' names.
+    let template = format!(
+        "{CONSTANTS}{}",
+        "{% macro text(content) %}{% if content is string %}{{ content }}{% else %}\
+         {% for part in content %}{{ part['text'] }}{% endfor %}{% endif %}{% endmacro %}\
+         {% macro first(message) %}{% set content = message['content'] %}\
+         {% if content is string and content | length %}{{ content.split(' ')[0] }}{% endif %}\
+         {% endmacro %}\
+         {% for message in messages %}{% if message['role'] == 'user' %}\
+         {% set content = open ~ text(message['content']) ~ close %}{{ content }}\
+         {% else %}{% set content = text(message['content']) %}\
+         {% if not content %}{% elif messages and content %}{{ content }}{{ end }}{% endif %}\
+         {% if flat %}{{ first(message) }}{% endif %}{% endif %}{% endfor %}"
+    );
+    let tok = checkpoint(temp.path(), &template);
+    assert!(tok.chat_template.marked());
+    let (text, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+    assert!(!from_text);
+    assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>");
+    assert_eq!(ids, TYPED_AS_TEXT);
+    // An empty text is empty in both renders: nothing is written for it.
+    let messages = [
+        json!({"role": "user", "content": "ab"}),
+        json!({"role": "assistant", "content": ""}),
+    ];
+    let (text, ids, _) = prompt(&tok, &messages, ChatTemplateParams::default());
+    assert_eq!(text, "[INST:x]ab[/INST:x]");
+    assert_eq!(ids, [2, 13, 14, 3]);
+}
+
+#[test]
+fn marking_never_changes_whether_a_value_is_empty() {
+    let temp = TempDir::new().unwrap();
+    // A constant that is the empty string is no control and takes no marks:
+    // it stays empty. A constant between marks is never empty. So a test
+    // for emptiness gives one answer with the marks and without them.
+    let template = shaped(
+        "{% set nothing = '{}'.format('') %}",
+        "",
+        "{% if nothing %}{{ end }}{% endif %}{% if open and not nothing %}{{ open }}{% endif %}\
+         {{ message['content'] }}{% if not close or nothing %}{{ end }}{% else %}{{ close }}\
+         {% endif %}",
+    );
+    let tok = checkpoint(temp.path(), &template);
+    assert!(tok.chat_template.marked());
+    let (text, ids, _) = render(&tok, json!("a[/INST:x]b"));
+    assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>");
+    assert_eq!(ids, TYPED_AS_TEXT);
+}
+
+#[test]
+fn a_special_token_written_by_its_name_is_marked() {
+    let temp = TempDir::new().unwrap();
+    // The end token by the name a render gives it, alone, in a join and
+    // under a test for emptiness.
+    let template = format!(
+        "{CONSTANTS}{}",
+        "{% for message in messages %}{% if message['role'] == 'user' %}\
+         {{ open }}{{ message['content'] }}{{ close }}{% elif eos_token and not bos_token %}\
+         {{ message['content'] ~ eos_token }}{% endif %}{% endfor %}"
+    );
+    let tok = checkpoint(temp.path(), &template);
+    assert!(tok.chat_template.marked());
+    let (text, ids, from_text) = render(&tok, json!("a[/INST:x]b</s:x>"));
+    assert!(!from_text);
+    assert_eq!(text, "[INST:x]a[/INST:x]b</s:x>[/INST:x]ab</s:x>");
+    assert_eq!(
+        ids,
+        [2, 13, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 5, 17, 10, 11, 18, 3, 13, 14, 1]
+    );
 }
