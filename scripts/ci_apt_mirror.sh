@@ -9,7 +9,8 @@
 # verifies the signed release files and package hashes whatever host serves
 # them, so switching hosts changes nothing about what gets installed.
 #
-# Usage: bash ci_apt_mirror.sh
+# Usage: bash ci_apt_mirror.sh [--reprobe]
+# --reprobe bypasses the cached choice and prefers another reachable mirror.
 #
 # Idempotent: call it right before each `apt-get update`. It probes the
 # mirrors in order, rewrites the Ubuntu sources to the first one that answers,
@@ -54,7 +55,7 @@ fi
 
 # An earlier call in this job already settled it, unless no mirror answered
 # then: re-probe in that case, since the outage may have cleared.
-if [ -f "${CONF}" ] && ! grep -q "mirror=none" "${CONF}"; then
+if [ "${1:-}" != "--reprobe" ] && [ -f "${CONF}" ] && ! grep -q "mirror=none" "${CONF}"; then
     log "already configured ($(grep -o 'mirror=[^ )]*' "${CONF}" | head -n 1))"
     exit 0
 fi
@@ -117,7 +118,7 @@ serves_both() {
 }
 
 chosen=""
-if [ -n "${current}" ] && serves_both "${current}"; then
+if [ "${1:-}" != "--reprobe" ] && [ -n "${current}" ] && serves_both "${current}"; then
     chosen="${current}"
 fi
 for mirror in "${MIRRORS[@]}"; do
@@ -127,6 +128,11 @@ for mirror in "${MIRRORS[@]}"; do
         chosen="${mirror}"
     fi
 done
+
+if [ -z "${chosen}" ] && [ "${1:-}" = "--reprobe" ] && [ -n "${current}" ] \
+    && serves_both "${current}"; then
+    chosen="${current}"
+fi
 
 # The marker records the outcome; "none" makes the next call probe again.
 write_conf() {

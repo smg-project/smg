@@ -158,9 +158,18 @@ cmd_create_postgres_db() {
     local postgres_host="${1:-postgres-db}"
     local admin_url="postgresql://postgres:postgres@${postgres_host}:5432/postgres"
 
-    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq postgresql-client
+    local apt_mirror
+    apt_mirror="$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
+    bash "$apt_mirror" || return "$?"
+    sudo apt-get update -qq || return "$?"
+    if ! sudo apt-get install -y -qq postgresql-client; then
+        # A live mirror can serve an index whose .deb objects return 404.
+        # Reuse the mirror helper's bounded reprobe once, then fail closed.
+        echo "Postgres client install failed; reprobe the Ubuntu mirror and refresh once" >&2
+        bash "$apt_mirror" --reprobe || return "$?"
+        sudo apt-get update -qq || return "$?"
+        sudo apt-get install -y -qq postgresql-client || return "$?"
+    fi
 
     TEST_DB="$(ci_postgres_dbname)"
     echo "Creating Postgres test database: $TEST_DB"
