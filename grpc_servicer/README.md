@@ -1023,6 +1023,16 @@ disaggregation role; under attention data parallelism the servicer routes a
 request by load, not by rank, so each prefill shape, the chunk remainders
 included, warms one rank and the log says so: there the remainder hazard
 stays open on the ranks a count did not reach until the wire can pin a rank),
+`SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS` (whether the `full` level plans
+those remainders: `auto`, the default, on an engine of more than one process
+or of an unknown layout, as above; `on` whatever the layout; `off` never, for
+an engine that loads those kernels itself before it reports ready, with a
+WARNING at start on an engine of more than one process or of an unknown
+layout; any other value refuses to start, on either servicer and whatever
+the warm-up level or the role: one ERROR line and exit code 2 before the
+engine starts; the engine's prefill graphs do not cover the remainders,
+since those library GEMMs run eagerly, in the attention graph break or the
+eager narrowing layer, at each forward's real token count),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
 bounds as for vLLM above: the launcher reports the scheduler process alive each
