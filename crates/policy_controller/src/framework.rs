@@ -162,11 +162,12 @@ impl Narrowed {
     }
 }
 
-/// The most rows a decision that draws first ([`Picker::draw_first`]) may see
-/// refused before it stops drawing: the one bound every picker that draws
-/// first counts against. A draw asks the filters about no more rows than
-/// the targets it hands out and these, and a decision about no more than
-/// those and the whole pass's.
+/// The most rows a decision that draws its one or two picks first
+/// ([`Picker::draw_first`]) may see refused before it stops drawing: the
+/// bound those pickers count against. Such a draw asks the filters about no
+/// more rows than the targets it hands out and these, and a decision about
+/// no more than those and the whole pass's. A picker that draws a sample
+/// counts none: its own draws, twice the sample, bound what it asks.
 pub const DRAW_BOUND: u32 = 8;
 
 /// The smallest pool at which a decision draws first, set by run. A draw
@@ -240,8 +241,9 @@ pub trait Picker: Lifecycle + Debug {
     /// it hands out, each one kept by `keep` and none twice: the scorers are
     /// handed them and [`Picker::order_drawn`] orders them. On `false`
     /// nothing is decided, what `kept` holds is dropped and the whole pass
-    /// runs: the picker does not draw first, or [`DRAW_BOUND`] rows were
-    /// refused before it held its pick. A draw that keeps nobody says
+    /// runs: the picker does not draw first, or its bound ran out before it
+    /// held its pick ([`DRAW_BOUND`] refused rows, or a sample's draws). A
+    /// draw that keeps nobody says
     /// nothing of the pool: the pass alone sheds. `draw` is the seed's stream: the
     /// picker takes its values from it and from nowhere else, and whatever
     /// follows the draw reads the stream past them.
@@ -356,7 +358,14 @@ impl Profile {
     pub fn needs(&self) -> Needs {
         let filters = self.filters.iter().map(|f| f.needs());
         let scorers = self.scorers.iter().map(|w| w.scorer.needs());
-        filters.chain(scorers).fold(self.picker.needs(), Needs::or)
+        let needs = filters.chain(scorers).fold(self.picker.needs(), Needs::or);
+        // A sample is the need of a profile that may draw. Under a stage
+        // that is not row-wise the pool is read whole, and lists capped at
+        // the sample would hide holders from that pass.
+        Needs {
+            sample: if draws_first(self) { needs.sample } else { 0 },
+            ..needs
+        }
     }
 
     /// Whether any stage holds a [`DecisionScope`].
@@ -987,10 +996,7 @@ fn join_named(
     let mean = mean_in_flight(candidates, kept);
     let holders = named.holders.iter().map(|holder| holder.row);
     for row in holders.chain(named.warming.iter().copied()) {
-        let Some(candidate) = candidates.get(row as usize) else {
-            continue;
-        };
-        if !kept.contains(&row) && keep(candidate) {
+        if !kept.contains(&row) && candidates.get(row as usize).is_some_and(&mut *keep) {
             kept.push(row);
         }
     }
@@ -7532,6 +7538,8 @@ mod tests {
             1,
             Needs::default(),
         );
+        // It says no sample: a host feeds such a profile a column.
+        assert_eq!(engine.needs().sample, 0);
         let holders = [holding(3, 12)];
         let pool = pool_of(64, |_| false);
         for seed in 0..20u64 {
@@ -7678,5 +7686,24 @@ mod tests {
         };
         let decision = drawn(&engine, &facts, &pool_of(8, |_| false));
         panic!("a mean the host wrote answered {decision:?}");
+    }
+
+    /// A sampled `best` counts no refused rows: under a filter that refuses
+    /// half of the pool every decision still draws, and none of its targets
+    /// is a refused row. A pool refused whole is the whole pass's to shed.
+    #[test]
+    fn a_sampled_draw_stands_under_a_filter_that_refuses_half_of_the_pool() {
+        let engine = preset("cache_aware");
+        let holders = [holding(5, 12)];
+        let pool = pool_of(64, |i| i % 2 == 0);
+        for seed in 0..500u64 {
+            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            assert!(got.trace().drew_first(), "seed {seed}");
+            let rows = positions(&got);
+            assert!(rows.iter().all(|row| row % 2 == 1), "seed {seed}: {rows:?}");
+        }
+        let got = drawn(&engine, &naming(1, &holders), &pool_of(64, |_| true));
+        assert!(!got.trace().drew_first());
+        assert!(got.pick().is_none());
     }
 }
