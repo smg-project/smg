@@ -91,10 +91,12 @@ pub struct Ring {
     index: FxHashMap<WorkerId, u32>,
     /// `(position, member index)`, sorted by position.
     entries: Vec<(u64, u32)>,
-    /// The ids pruned within [`FENCE`], oldest first, each with its
-    /// retirement.
+    /// The retirements within [`FENCE`], oldest first. Those of an id the
+    /// feed named since stay until they lapse and lift nothing.
     retired: VecDeque<(WorkerId, Instant)>,
-    retired_set: FxHashSet<WorkerId>,
+    /// Each fenced id with its last retirement, the one whose lapse lifts
+    /// the fence.
+    fenced: FxHashMap<WorkerId, Instant>,
 }
 
 impl Ring {
@@ -179,10 +181,10 @@ impl Ring {
         now: Instant,
     ) -> usize {
         self.expire(now);
-        let retired = &self.retired_set;
+        let fenced = &self.fenced;
         let fresh: Vec<(WorkerId, u32)> = members
             .into_iter()
-            .filter(|(id, _)| !retired.contains(id))
+            .filter(|(id, _)| !fenced.contains_key(id))
             .collect();
         self.add_many(fresh)
     }
@@ -190,16 +192,16 @@ impl Ring {
     /// Whether `id` was pruned within [`FENCE`] of `now` and is fenced
     /// against relearning.
     pub fn is_retired(&self, id: WorkerId, now: Instant) -> bool {
-        self.retired
-            .iter()
-            .any(|&(retired, at)| retired == id && now.saturating_duration_since(at) < FENCE)
+        self.fenced
+            .get(&id)
+            .is_some_and(|&at| now.saturating_duration_since(at) < FENCE)
     }
 
     /// Lift the fence on `id`: the feed named it as a member again.
     pub fn admit(&mut self, id: WorkerId) {
-        if self.retired_set.remove(&id) {
-            self.retired.retain(|&(retired, _)| retired != id);
-        }
+        // Its retirements stay in the list: none is its last any more, so
+        // their lapses lift nothing.
+        self.fenced.remove(&id);
     }
 
     /// Forget the retirements older than [`FENCE`] at `now`.
@@ -209,15 +211,18 @@ impl Ring {
                 break;
             }
             self.retired.pop_front();
-            if !self.retired.iter().any(|&(retired, _)| retired == old) {
-                self.retired_set.remove(&old);
+            // The fence lifts with the id's last retirement. The map says
+            // whether this entry is it: no pass over the list for a lapse.
+            if self.fenced.get(&old) == Some(&at) {
+                self.fenced.remove(&old);
             }
         }
     }
 
     fn retire(&mut self, id: WorkerId, now: Instant) {
         self.expire(now);
-        self.retired_set.insert(id);
+        let last = self.fenced.entry(id).or_insert(now);
+        *last = (*last).max(now);
         self.retired.push_back((id, now));
     }
 
@@ -898,6 +903,57 @@ mod tests {
         assert!(ring.remove(id, later));
         assert!(ring.is_retired(id, later + FENCE / 2));
         assert!(!ring.is_retired(id, later + FENCE));
+    }
+
+    /// An id retired twice inside one window stays fenced until its last
+    /// retirement lapses: the lapse of the first lifts nothing.
+    #[test]
+    fn an_id_retired_twice_stays_fenced_until_its_last_retirement_lapses() {
+        let mut ring = ring_of(4);
+        let t0 = Instant::now();
+        let id = WorkerId(1_002);
+        assert!(ring.remove(id, t0));
+        // The removal of an id the ring no longer holds retires it again.
+        let again = t0 + FENCE / 2;
+        assert!(!ring.remove(id, again));
+        let first_lapsed = t0 + FENCE;
+        assert_eq!(
+            ring.learn([(id, key_of(id))], first_lapsed),
+            0,
+            "the later retirement stands"
+        );
+        assert!(ring.is_retired(id, first_lapsed));
+        let both_lapsed = again + FENCE;
+        assert_eq!(ring.learn([(id, key_of(id))], both_lapsed), 1);
+        assert!(ring.contains(id));
+        // Many ids retired at one instant lapse together and each is
+        // learned again.
+        let many: Vec<WorkerId> = (2_000..2_512).map(WorkerId).collect();
+        for &gone in &many {
+            ring.remove(gone, both_lapsed);
+        }
+        let pool = many.iter().map(|&gone| (gone, key_of(gone)));
+        assert_eq!(ring.learn(pool.clone(), both_lapsed + FENCE / 2), 0);
+        assert_eq!(ring.learn(pool, both_lapsed + FENCE), many.len());
+    }
+
+    /// An id the feed names and the ring prunes again is fenced by the
+    /// later retirement alone: the lapse of the first lifts nothing.
+    #[test]
+    fn an_id_named_and_pruned_again_stays_fenced_until_the_later_retirement_lapses() {
+        let mut ring = ring_of(4);
+        let t0 = Instant::now();
+        let id = WorkerId(1_001);
+        assert!(ring.remove(id, t0));
+        ring.admit(id);
+        assert!(!ring.is_retired(id, t0), "named again");
+        assert_eq!(ring.learn([(id, key_of(id))], t0), 1);
+        let again = t0 + FENCE / 2;
+        assert!(ring.remove(id, again));
+        let first_lapsed = t0 + FENCE;
+        assert_eq!(ring.learn([(id, key_of(id))], first_lapsed), 0);
+        assert!(ring.is_retired(id, first_lapsed));
+        assert_eq!(ring.learn([(id, key_of(id))], again + FENCE), 1);
     }
 
     /// Learning many members at once builds the ring one add at a time
