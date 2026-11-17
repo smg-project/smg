@@ -34,7 +34,6 @@ pub use identity::{
         WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR,
         MORIIO_MODE_LABEL, NIXL_CONNECTOR,
     },
-    builder::BasicWorkerBuilder,
     error::{WorkerError, WorkerResult},
     metadata::DecodingLabels,
     sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
@@ -58,3 +57,12 @@ pub(crate) use pd::pair_index::{PdPairIndex, PdWire};
 pub use pd::pairing::{PairingMismatch, PdPairing, PdPairingMode};
 pub use registry::{service::WorkerService, WorkerOrigin, WorkerRegistry};
 pub(crate) use registry::{ModelLabels, ModelWorkerSnapshot, RoutingPool, WindowFloor};
+
+// The gateway's connector, for the gateway's name for the builder below.
+use crate::routers::grpc::backend_client::BackendConnector;
+
+/// The worker builder as the gateway names it: a worker it builds connects
+/// through the gateway's client unless the builder is handed another
+/// connector. The two lines are the gateway's, and stay with it when the
+/// runtime moves into the worker crate.
+pub type BasicWorkerBuilder = identity::builder::BasicWorkerBuilder<BackendConnector>;

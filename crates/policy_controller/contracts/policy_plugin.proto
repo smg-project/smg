@@ -277,7 +277,8 @@ message RequestFacts {
   uint32 max_output_tokens = 6;
   uint32 prompt_tokens = 7;  // the host's count or estimate
   // Prefix block hashes, capped by `view.max_block_hashes`: a controller
-  // reads the first that many of a longer list and refuses none.
+  // reads the first of a longer list, as many as the stages of its
+  // generation read and that many at most, and refuses none.
   repeated fixed64 block_hashes = 8 [packed = true];
   HashKind hash_kind = 9;
   // The routing key as the host derives it; its `hash` form is the

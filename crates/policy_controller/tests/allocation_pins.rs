@@ -488,6 +488,35 @@ fn a_write_that_moves_an_offer_allocates_what_a_write_that_moves_none_does() {
 }
 
 #[test]
+fn a_registration_into_a_standing_pool_allocates_its_list_once() {
+    // A membership write walks every member into its pool's list. A
+    // standing pool's list starts at the pool's last length and one more,
+    // so what a registration allocates does not follow the fleet: one into
+    // 512 workers makes the allocator calls of one into 8.
+    let fewest = |n: usize| {
+        let (store, _, _) = store_of(n);
+        // The fewest allocation calls of one registration among a few: the
+        // store's tables and the writer's kept lists grow by doubling, and
+        // one write in many pays for it.
+        let one = |turn: usize| {
+            let key = format!("http://new{turn}:8000");
+            let facts = WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                models: vec!["m".to_string()],
+                dp_size: 1,
+                ..WorkerFacts::default()
+            };
+            allocations_during(|| store.upsert(facts)).1
+        };
+        (0..8).map(one).min()
+    };
+    let (few, many) = (fewest(8), fewest(512));
+    assert_eq!(many, few, "a registration's allocations follow the fleet");
+}
+
+#[test]
 fn a_record_inside_the_window_allocates_nothing_and_a_publication_derives_nothing() {
     let (store, ids, opened) = store_of(64);
     // Inside the window the store's making opened: on file and folded,

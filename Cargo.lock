@@ -8296,10 +8296,16 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bitflags 2.13.2",
+ "http",
+ "openssl",
+ "reqwest 0.13.4",
+ "rustls",
  "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_with",
+ "tokio",
+ "tracing",
  "url",
 ]
 

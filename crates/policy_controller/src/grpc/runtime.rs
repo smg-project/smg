@@ -5,6 +5,7 @@
 
 use std::{
     any::Any,
+    borrow::Cow,
     error::Error,
     fmt,
     future::Future,
@@ -1098,8 +1099,7 @@ async fn observe_streams(
         {
             Ok(Ok(channel)) => channel,
             outcome => {
-                if !reported {
-                    reported = true;
+                if outage_says(&mut reported, false) {
                     match outcome {
                         Ok(Err(why)) => lane.failed(&why),
                         _ => lane.failed("the connect did not settle within its frame"),
@@ -1119,55 +1119,98 @@ async fn observe_streams(
             continue;
         }
         let call = client.observe(tonic::Request::new(ReceiverStream::new(rx)));
-        tokio::pin!(call);
-        // Forwards until the plugin is dropped (its queue closes: `false`)
-        // or the call lets its receiver go (`true`).
-        let carried = AtomicBool::new(false);
-        let forward = async {
-            loop {
-                match queue.recv().await {
-                    Some(mut event) => {
-                        // Numbered here, where it enters the stream: one
-                        // task numbers every event, in the order it sends.
-                        if let Some(proto::observe_request::Request::Event(numbered)) =
-                            event.request.as_mut()
-                        {
-                            numbered.seq = number(sent, lost, numbered.seq);
-                        }
-                        if tx.send(event).await.is_err() {
-                            return true;
-                        }
-                        carried.store(true, Ordering::Relaxed);
-                    }
-                    None => return false,
-                }
-            }
-        };
-        let plugin_lives = tokio::select! {
-            outcome = &mut call => {
-                if carried.load(Ordering::Relaxed) {
-                    reported = false;
-                }
-                if !reported {
-                    reported = true;
-                    match outcome {
-                        Ok(_) => lane.failed("the plugin ended the observe stream"),
-                        Err(status) => lane.failed(&bounded(status.to_string())),
-                    }
-                }
-                true
-            }
-            alive = forward => alive,
-        };
-        if !plugin_lives {
-            // The request stream ends with its sender; the plugin answers
-            // its one Ack, awaited no longer than a connect.
-            drop(tx);
-            let _ = tokio::time::timeout(peer.connect, &mut call).await;
+        let Some(ended) = forward(call, tx, queue, sent, lost, peer.connect).await else {
             return;
+        };
+        if outage_says(&mut reported, ended.carried) {
+            lane.failed(&ended.why);
         }
         tokio::time::sleep(peer.connect).await;
     }
+}
+
+/// Whether a failure says its line: once an outage. An outage is the
+/// failures with no event carried between them, so a call that carried an
+/// event arms the line again, whichever side of the task saw that call end.
+fn outage_says(reported: &mut bool, carried: bool) -> bool {
+    if carried {
+        *reported = false;
+    }
+    !std::mem::replace(reported, true)
+}
+
+/// How one `Observe` call ended, its plugin still loaded.
+struct Ended {
+    /// Why, in the words of the host's line.
+    why: Cow<'static, str>,
+    /// Whether the call carried an event.
+    carried: bool,
+}
+
+/// One `Observe` call until it ends, the queue's events forwarded into it:
+/// `None` once the plugin is dropped, its queue closed.
+///
+/// A call's end shows on two sides, and the select takes either first: the
+/// call's own outcome, or a send that finds the call's receiver gone. A send
+/// that saw the end first waits for the outcome, no longer than `frame`, so
+/// the same end is said from either side.
+async fn forward<C, T>(
+    call: C,
+    tx: mpsc::Sender<proto::ObserveRequest>,
+    queue: &mut mpsc::Receiver<proto::ObserveRequest>,
+    sent: &mut u64,
+    lost: &mut u64,
+    frame: Duration,
+) -> Option<Ended>
+where
+    C: Future<Output = Result<T, tonic::Status>>,
+{
+    tokio::pin!(call);
+    let carried = AtomicBool::new(false);
+    // Sends until the plugin is dropped (its queue closes: `false`) or the
+    // call lets its receiver go (`true`).
+    let sends = async {
+        loop {
+            match queue.recv().await {
+                Some(mut event) => {
+                    // Numbered here, where it enters the stream: one
+                    // task numbers every event, in the order it sends.
+                    if let Some(proto::observe_request::Request::Event(numbered)) =
+                        event.request.as_mut()
+                    {
+                        numbered.seq = number(sent, lost, numbered.seq);
+                    }
+                    if tx.send(event).await.is_err() {
+                        return true;
+                    }
+                    carried.store(true, Ordering::Relaxed);
+                }
+                None => return false,
+            }
+        }
+    };
+    let outcome = tokio::select! {
+        outcome = &mut call => Some(outcome),
+        plugin_lives = sends => {
+            if !plugin_lives {
+                // The request stream ends with its sender; the plugin
+                // answers its one Ack, awaited no longer than a connect.
+                drop(tx);
+                let _ = tokio::time::timeout(frame, &mut call).await;
+                return None;
+            }
+            tokio::time::timeout(frame, &mut call).await.ok()
+        }
+    };
+    let why = match outcome {
+        Some(Ok(_)) => Cow::Borrowed("the plugin ended the observe stream"),
+        Some(Err(status)) => Cow::Owned(bounded(status.to_string())),
+        None => Cow::Borrowed("the observe stream took no more events"),
+    };
+    Some(Ended {
+        why,
+        carried: carried.load(Ordering::Relaxed),
+    })
 }
 
 #[cfg(test)]
@@ -1184,8 +1227,9 @@ mod tests {
     use tokio::{sync::mpsc, task::JoinSet};
 
     use super::{
-        number, run_commands, streak_says, Command, Lane, LaneEvents, LaneState, ObserveLane, Peer,
-        Runtime, SendError, Wait, Witness, PROMISE_MICROS, RECONNECT_PAUSE, WINDOW,
+        forward, number, outage_says, run_commands, streak_says, Command, Lane, LaneEvents,
+        LaneState, ObserveLane, Peer, Runtime, SendError, Wait, Witness, OBSERVE_WINDOW,
+        PROMISE_MICROS, RECONNECT_PAUSE, WINDOW,
     };
     use crate::{grpc::config::Transport, plugins::OpenDecisions, proto};
 
@@ -1652,6 +1696,74 @@ mod tests {
         assert!(!streak_says(&mut said_at, 7));
     }
 
+    /// A failure says its line once an outage: the failures with no event
+    /// carried between them are one outage, and a call that carried an event
+    /// starts another.
+    #[test]
+    fn an_outage_says_one_line_until_a_call_carries_an_event() {
+        let mut reported = false;
+        assert!(outage_says(&mut reported, false));
+        assert!(!outage_says(&mut reported, false));
+        assert!(outage_says(&mut reported, true));
+        assert!(!outage_says(&mut reported, false));
+    }
+
+    fn raised() -> proto::ObserveRequest {
+        proto::ObserveRequest {
+            request: Some(proto::observe_request::Request::Event(
+                proto::LifecycleEvent::default(),
+            )),
+        }
+    }
+
+    /// A send that finds the call's receiver gone, ahead of the call's own
+    /// outcome, ends the call as that outcome does. Here the call takes one
+    /// event and lets its receiver go, a second event is raised, and the
+    /// outcome comes a moment later: the send waits for it, and the end says
+    /// the outcome and that the call carried an event.
+    #[tokio::test(start_paused = true)]
+    async fn a_send_that_sees_a_calls_end_first_says_the_calls_outcome() {
+        let (raise, mut queue) = mpsc::channel(4);
+        raise.try_send(raised()).expect("the queue takes an event");
+        let (tx, mut rx) = mpsc::channel(OBSERVE_WINDOW);
+        let call = async move {
+            assert!(rx.recv().await.is_some(), "the call takes an event");
+            drop(rx);
+            raise.try_send(raised()).expect("the queue takes an event");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            Err::<(), _>(tonic::Status::unavailable("the plugin went"))
+        };
+        let (mut sent, mut lost) = (0, 0);
+        let ended = forward(call, tx, &mut queue, &mut sent, &mut lost, RECONNECT_PAUSE)
+            .await
+            .expect("the plugin is loaded");
+        assert!(ended.why.contains("the plugin went"), "{}", ended.why);
+        assert!(ended.carried, "the call carried the first event");
+        assert_eq!(sent, 2, "the second event was numbered, then lost");
+    }
+
+    /// A call that lets its receiver go and says no outcome within the frame
+    /// is said as that, at the frame.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_gone_with_no_outcome_is_said_at_the_frame() {
+        let (raise, mut queue) = mpsc::channel(4);
+        raise.try_send(raised()).expect("the queue takes an event");
+        let (tx, rx) = mpsc::channel(OBSERVE_WINDOW);
+        drop(rx);
+        let call = std::future::pending::<Result<(), tonic::Status>>();
+        let (mut sent, mut lost) = (0, 0);
+        let before = tokio::time::Instant::now();
+        let ended = forward(call, tx, &mut queue, &mut sent, &mut lost, RECONNECT_PAUSE)
+            .await
+            .expect("the plugin is loaded");
+        assert_eq!(ended.why, "the observe stream took no more events");
+        assert!(!ended.carried, "the call carried nothing");
+        assert!(
+            before.elapsed() >= RECONNECT_PAUSE,
+            "the frame was not waited"
+        );
+    }
+
     /// A count carried late moves no number back. Two threads raise at a
     /// full queue, and the one that read the count first enters the queue
     /// last: the counts handed here are the ones the events carried.
@@ -1744,6 +1856,28 @@ mod tests {
                 "a panicked turn was started again at once"
             );
         }
+    }
+
+    /// A plugin that cannot be reached says its failure once, not once a
+    /// connect: the failed connects of one outage are one line. The loop's
+    /// clock is paused here and moves by its sleeps alone, and the listener
+    /// records every telling and panics at none.
+    #[tokio::test(start_paused = true)]
+    async fn the_failed_connects_of_one_outage_say_one_line() {
+        let (commands, taken) = mpsc::unbounded_channel();
+        let mut looping = JoinSet::new();
+        looping.spawn(run_commands(taken, Arc::new(Witness::new())));
+        let events = Arc::new(PanicsUntil {
+            last: 1,
+            told: parking_lot::Mutex::new(Vec::new()),
+        });
+        let listener: Arc<dyn LaneEvents> = Arc::clone(&events) as _;
+        let (_queue, raised) = mpsc::channel(4);
+        let lane = ObserveLane::new(nowhere(), Arc::downgrade(&listener), raised);
+        assert!(commands.send(Command::Observe(Arc::new(lane))).is_ok());
+        // The peer's connect frame is one second: five connects fail here.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(events.told.lock().len(), 1, "one line an outage");
     }
 
     /// An answer that lands in its place as the wait runs out is read: the

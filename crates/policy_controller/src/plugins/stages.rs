@@ -364,6 +364,13 @@ macro_rules! forward_lifecycle {
                     fallback.on_signal(signal);
                 }
             }
+
+            // A plugin declares no such need: its fallback's word stands.
+            fn needs_lifecycle(&self) -> bool {
+                self.fallback
+                    .as_ref()
+                    .is_some_and(|fallback| fallback.needs_lifecycle())
+            }
         }
     };
 }

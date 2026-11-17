@@ -1785,6 +1785,62 @@ pub(crate) mod tests {
         assert_eq!(generations.counts(), counts(2));
     }
 
+    /// Scores every worker alike, by state the lifecycle's calls keep.
+    #[derive(Debug)]
+    struct Kept;
+
+    impl crate::Lifecycle for Kept {
+        fn needs_lifecycle(&self) -> bool {
+            true
+        }
+    }
+
+    impl crate::Scorer for Kept {
+        fn name(&self) -> &'static str {
+            "kept"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> crate::TieBand {
+            out.fill(1.0);
+            crate::TieBand::NORMALIZED
+        }
+    }
+
+    /// A dry run answers a stage in need of the lifecycle's calls as an
+    /// apply does: refused by the stage's field, as not in this build.
+    #[test]
+    fn a_dry_run_refuses_a_stage_in_need_of_the_lifecycle_as_an_apply_does() {
+        let mut stages = Catalog::builtin();
+        stages
+            .scorer("kept", || Box::new(Kept))
+            .expect("a free name");
+        let store = Arc::new(MemoryStore::new());
+        let generations = Generations::new(store, Arc::new(stages.without_lifecycle()));
+        let document =
+            b"apiVersion: smg.policy/v1\nprofiles:\n  default:\n    score: [kept]\n    pick: best\n"
+                .to_vec();
+        let refused = generations
+            .dry_run(&document, Format::Yaml)
+            .would_run
+            .expect_err("refused");
+        assert_eq!(
+            refused.field_path(),
+            "profiles.default.score[0].kept",
+            "{refused}"
+        );
+        assert!(
+            refused.to_string().contains("is not in this build"),
+            "{refused}"
+        );
+        assert_eq!(yaml(&generations, document), Err(refused));
+    }
+
     /// A dry run refuses what an apply would, by the same name: a changed
     /// document under the standing line, a line under the standing one (the
     /// refusal of the store's entry, in its words), a document the validator

@@ -29,6 +29,7 @@ use crate::{
     },
     server::http_client,
     worker::{
+        connection::engine::EngineConnection,
         health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         registry::WorkerId,
         BasicWorker, ConnectionMode, RuntimeType,
@@ -1009,7 +1010,8 @@ async fn zmq_update_preserves_transport_state_and_the_live_client() {
         ),
     );
     let _engine = engine.expect("mock engine");
-    let client = Arc::new(BackendClient::Zmq(client.expect("adapter connect")));
+    let client: Arc<dyn EngineConnection> =
+        Arc::new(BackendClient::Zmq(client.expect("adapter connect")));
 
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(ep("ts0.ipc"))
@@ -1030,7 +1032,7 @@ async fn zmq_update_preserves_transport_state_and_the_live_client() {
         .as_any()
         .downcast_ref::<BasicWorker>()
         .expect("BasicWorker");
-    old.backend_client
+    old.engine_connection
         .load_full()
         .set(Arc::clone(&client))
         .ok()
@@ -1078,7 +1080,7 @@ async fn zmq_update_preserves_transport_state_and_the_live_client() {
     );
 
     let adopted = new
-        .backend_client
+        .engine_connection
         .load_full()
         .get()
         .cloned()
@@ -1102,7 +1104,7 @@ async fn zmq_worker_with_its_link(
     by_hand: HashMap<String, String>,
 ) -> (
     Arc<dyn Worker>,
-    Arc<BackendClient>,
+    Arc<dyn EngineConnection>,
     MockEngine,
     tempfile::TempDir,
 ) {
@@ -1129,7 +1131,8 @@ async fn zmq_worker_with_its_link(
         connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready),
     );
     let engine = engine.expect("mock engine");
-    let client = Arc::new(BackendClient::Zmq(client.expect("adapter connect")));
+    let client: Arc<dyn EngineConnection> =
+        Arc::new(BackendClient::Zmq(client.expect("adapter connect")));
     let mut labels = recorded.clone();
     labels.extend(by_hand);
     let worker: Arc<dyn Worker> = Arc::new(
@@ -1147,7 +1150,7 @@ async fn zmq_worker_with_its_link(
         .as_any()
         .downcast_ref::<BasicWorker>()
         .expect("BasicWorker")
-        .backend_client
+        .engine_connection
         .load_full()
         .set(Arc::clone(&client))
         .ok()
@@ -1204,7 +1207,7 @@ async fn a_zmq_refresh_gives_the_card_the_handshake_window() {
         .downcast_ref::<BasicWorker>()
         .expect("BasicWorker");
     let adopted = new
-        .backend_client
+        .engine_connection
         .load_full()
         .get()
         .cloned()

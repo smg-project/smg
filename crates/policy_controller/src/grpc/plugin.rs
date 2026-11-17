@@ -219,7 +219,9 @@ impl Inner {
         // cannot send a later number first. A refused event is counted
         // here, and an event carries that count as it enters the queue: the
         // stream's task adds the highest it has seen, so a gap sits behind
-        // the last event raised before the loss.
+        // every event that entered the queue before the loss. An event whose
+        // thread stood between this read and its entry when the loss fell
+        // can arrive on either side.
         let request = proto::ObserveRequest {
             request: Some(proto::observe_request::Request::Event(
                 proto::LifecycleEvent {

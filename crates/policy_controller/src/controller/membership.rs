@@ -10,6 +10,13 @@
 //! of its own registration alone: one that states no policy is checked,
 //! whatever stood under its URL.
 //!
+//! An answer carries the log's place after the call's write, with the term
+//! that place was written under: the write's own place, since the door is
+//! the only writer of the kinds a watcher follows but the start of a term.
+//! A caller that watches the rows holds the call's write once its stream
+//! has passed that place. A call that wrote nothing answers the place the
+//! log stands at.
+//!
 //! **The door is the process's only membership writer.** A call's read, its
 //! write and its read back run under the door's one lock, so a mode's test
 //! and the answered row are exact. A second writer (discovery, a standby's
@@ -42,21 +49,34 @@ use super::{
 };
 use crate::{
     proto::{self, register_worker_request::Mode, worker_event::Event},
-    store::{HealthSink, MemoryStore, WorkerRow, WorkerStatus, WorkersStore},
+    replication::Log,
+    store::{HealthSink, Kinds, MemoryStore, Position, WorkerRow, WorkerStatus, WorkersStore},
     view::WorkerId,
 };
+
+/// A registration's refusal where the store's log does not lead the term the
+/// call was admitted under.
+const LEADS_NO_TERM: &str =
+    "this replica's store does not lead the term the call was admitted under";
 
 /// The door over one store.
 pub(crate) struct Door {
     store: Arc<MemoryStore>,
     /// Where this run's count of lives starts: below 2^39, drawn once.
     base: u64,
+    /// The log the store journals to: where an answer reads its place.
+    log: Arc<Log>,
     /// One call at a time, from its read to its read back.
     turn: Mutex<()>,
 }
 
 fn invalid(refused: Refused) -> Status {
     Status::invalid_argument(format!("{}: {}", refused.path, refused.why))
+}
+
+/// A `REPLACE` of a URL no row stands under.
+fn absent() -> Status {
+    Status::not_found("no worker is registered under the URL")
 }
 
 /// A row that left or moved between a call's read and its write: no call of
@@ -102,21 +122,46 @@ fn life(term: u64, base: u64, epoch: u64) -> u64 {
 }
 
 impl Door {
-    /// The door over `store`, its count starting at a draw of this run: 39
-    /// bits of a hash under the keys the standard library draws for a
-    /// process's maps, so the crate gains no generator for one number.
-    pub(crate) fn new(store: Arc<MemoryStore>) -> Self {
-        Self::based(store, RandomState::new().hash_one(0u8) % HALF)
+    /// The door over `store` and the log it journals to, its count starting
+    /// at a draw of this run: 39 bits of a hash under the keys the standard
+    /// library draws for a process's maps, so the crate gains no generator
+    /// for one number.
+    pub(crate) fn new(store: Arc<MemoryStore>, log: Arc<Log>) -> Self {
+        Self::based(store, log, RandomState::new().hash_one(0u8) % HALF)
     }
 
-    /// The door over `store`, its count starting at `base`, below 2^39: a
-    /// run draws it, a case fixes it.
-    pub(crate) fn based(store: Arc<MemoryStore>, base: u64) -> Self {
+    /// The door over `store` and its log, its count starting at `base`,
+    /// below 2^39: a run draws it, a case fixes it.
+    pub(crate) fn based(store: Arc<MemoryStore>, log: Arc<Log>, base: u64) -> Self {
         Self {
             store,
             base,
+            log,
             turn: Mutex::new(()),
         }
+    }
+
+    /// The log's place: read after a call's write, that write's own.
+    fn place(&self) -> Position {
+        self.log.head(Kinds::Watched)
+    }
+
+    /// The number of the life a registration makes now, under `admitted`,
+    /// the term its call was admitted under. **A life is minted only under
+    /// a term its log leads:** the log's term is the highest it has seen, so
+    /// where the store follows another history, or the term moved after the
+    /// call's admission, a number under it could be one another leader gave
+    /// another worker. The call is refused then, and no life is made.
+    ///
+    /// The lead is read first. The call was admitted where the log stood at
+    /// that term, and the log's term never falls: a store that leads at the
+    /// first read and stands at the admitted term at the second led that
+    /// term at the first.
+    fn next_life(&self, admitted: u64) -> Result<u64, Status> {
+        if self.log.followed().is_some() || self.log.term() != admitted {
+            return Err(Status::unavailable(LEADS_NO_TERM));
+        }
+        Ok(life(admitted, self.base, self.store.epoch()))
     }
 
     /// One call of the door, admitted from `by`: its turn, the term
@@ -171,7 +216,7 @@ impl Door {
     fn upsert(
         &self,
         by: &Principal,
-        term: u64,
+        admitted: u64,
         request: &proto::RegisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
         let Some(spec) = &request.spec else {
@@ -191,9 +236,18 @@ impl Door {
             }
         };
         // The conversion reads the standing row once the URL holds its own
-        // rules: a URL past its bound is never looked up.
-        let (mut facts, standing) =
-            worker_wire::registration(spec, |url| self.store.by_key(url)).map_err(invalid)?;
+        // rules: a URL past its bound is never looked up. What a new row
+        // names is no rule of a call that makes none: a REPLACE of a URL
+        // that does not stand is not found, whatever it leaves unsaid. The
+        // conversion tells a new row's names after every field's own rule,
+        // so a field past its bound is refused as itself here too.
+        let read = worker_wire::registration(spec, |url| self.store.by_key(url));
+        let (mut facts, standing) = match read {
+            Err(unnamed) if mode == Mode::Replace && worker_wire::of_a_new_row(&unnamed) => {
+                return Err(absent());
+            }
+            read => read.map_err(invalid)?,
+        };
         if request.wait_ready && facts.health.probes {
             return Err(invalid(Refused {
                 path: "wait_ready",
@@ -207,18 +261,17 @@ impl Door {
                     row.id.0, row.revision
                 )));
             }
-            (Mode::Replace, None) => {
-                return Err(Status::not_found("no worker is registered under the URL"));
-            }
+            (Mode::Replace, None) => return Err(absent()),
             (_, None) => {
-                facts.incarnation = life(term, self.base, self.store.epoch());
+                facts.incarnation = self.next_life(admitted)?;
                 None
             }
             (mode, Some(row)) => {
                 if mode == Mode::Upsert && facts == row.facts {
                     let epoch = self.store.epoch();
+                    let at = self.place();
                     let unmoved = worker_wire::relabelled(&row);
-                    return Ok(told(REGISTER, by, unmoved, false, epoch, term));
+                    return Ok(told(REGISTER, by, unmoved, false, epoch, at));
                 }
                 // The store carries a status across incarnations only where
                 // these three stand: a change of one is a new worker under
@@ -228,20 +281,22 @@ impl Door {
                     || facts.wire_modes != row.facts.wire_modes
                     || !facts.same_models(&row.facts);
                 if mode == Mode::Replace || another {
-                    facts.incarnation = life(term, self.base, self.store.epoch());
+                    facts.incarnation = self.next_life(admitted)?;
                 }
                 Some(row)
             }
         };
         let id = self.store.upsert(facts).id();
-        let (mut now, mut epoch) = (self.read(id)?, self.store.epoch());
+        // The row, the epoch and the place as the registration's write left
+        // them: the answer of a call that does not wait.
+        let (mut now, mut epoch, mut at) = (self.read(id)?, self.store.epoch(), self.place());
         // A fresh row is pending: any other status the write left came over
         // from the old incarnation. Read before the connect signal moves it.
         let carried = now.status != WorkerStatus::Pending;
         if !now.facts.health.probes {
             self.store.connected(id, now.revision);
             if request.wait_ready {
-                (now, epoch) = (self.read(id)?, self.store.epoch());
+                (now, epoch, at) = (self.read(id)?, self.store.epoch(), self.place());
             }
         }
         let event = match old {
@@ -249,7 +304,7 @@ impl Door {
             Some(old) if old.id == id => worker_wire::relabelled(&now),
             Some(old) => worker_wire::replaced(&old, &now, carried),
         };
-        Ok(told(REGISTER, by, event, true, epoch, term))
+        Ok(told(REGISTER, by, event, true, epoch, at))
     }
 
     /// `PatchWorker`, admitted from `by` under the term `leading` reads: the
@@ -261,14 +316,13 @@ impl Door {
         leading: impl FnOnce() -> Result<u64, Status>,
         request: &proto::PatchWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        self.call(PATCH, by, leading, |term| self.relabel(by, term, request))
+        self.call(PATCH, by, leading, |_| self.relabel(by, request))
     }
 
     /// The write of [`Self::patch`], in the door's turn.
     fn relabel(
         &self,
         by: &Principal,
-        term: u64,
         request: &proto::PatchWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
         let standing = self.guarded(request.worker_id, request.revision)?;
@@ -288,7 +342,7 @@ impl Door {
             worker_wire::relabelled(&now),
             wrote,
             epoch,
-            term,
+            self.place(),
         ))
     }
 
@@ -303,16 +357,13 @@ impl Door {
         leading: impl FnOnce() -> Result<u64, Status>,
         request: &proto::DeregisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
-        self.call(DEREGISTER, by, leading, |term| {
-            self.remove(by, term, request)
-        })
+        self.call(DEREGISTER, by, leading, |_| self.remove(by, request))
     }
 
     /// The write of [`Self::deregister`], in the door's turn.
     fn remove(
         &self,
         by: &Principal,
-        term: u64,
         request: &proto::DeregisterWorkerRequest,
     ) -> Result<proto::WorkerEvent, Status> {
         let standing = self.guarded(request.worker_id, request.revision)?;
@@ -332,7 +383,7 @@ impl Door {
             (event, true)
         };
         let epoch = self.store.epoch();
-        Ok(told(DEREGISTER, by, event, wrote, epoch, term))
+        Ok(told(DEREGISTER, by, event, wrote, epoch, self.place()))
     }
 
     /// The row under `id` when `revision` is the one it stands at.
@@ -356,17 +407,17 @@ impl Door {
     }
 }
 
-/// The call's answer, and its audit line: the call, who it was from, the
-/// worker and what the call made of it (`nothing` where it wrote none).
-/// Never the URL: it may carry a credential. No log numbers a position yet,
-/// so the answer's is `0`.
+/// The call's answer at `at`, the log's place after the call, and its audit
+/// line: the call, who it was from, the worker, what the call made of it
+/// (`nothing` where it wrote none) and that place. Never the URL: it may
+/// carry a credential.
 fn told(
     call: &'static str,
     by: &Principal,
     event: Event,
     wrote: bool,
     membership_epoch: u64,
-    term: u64,
+    at: Position,
 ) -> proto::WorkerEvent {
     let (made, worker) = match &event {
         Event::Registered(row) => ("registered", row.id),
@@ -383,10 +434,11 @@ fn told(
         worker = %format_args!("{worker:016x}"),
         made,
         membership_epoch,
-        term,
+        seq = at.seq,
+        term = at.term,
         "membership write"
     );
-    worker_wire::event(event, 0, membership_epoch, term)
+    worker_wire::event(event, at.seq, membership_epoch, at.term)
 }
 
 #[cfg(test)]
@@ -403,11 +455,15 @@ mod tests {
     use parking_lot::Mutex;
     use tonic::{Code, Status};
 
-    use super::Door;
+    use super::{Door, Position};
     use crate::{
-        controller::principal::{tests::told, Principal},
+        controller::{
+            election::LeasePlace,
+            principal::{tests::told, Principal},
+            replication::{journaled, journaled_from},
+        },
         proto::{self, register_worker_request::Mode, worker_event::Event},
-        store::{identity, MemoryStore, WorkerStatus, WorkersStore},
+        store::{self, identity, MemoryStore, WorkerStatus, WorkersStore},
         view::WorkerId,
     };
 
@@ -431,10 +487,18 @@ mod tests {
         move || Ok(term)
     }
 
-    /// A door whose count starts at zero, so a case's table reads [`life`].
+    /// A door over a journaled store that stands in [`TERM`], its count
+    /// starting at zero so a case's table reads [`life`]: the term's start
+    /// is the log's first place, so a case's first write is its second.
     fn door() -> (Arc<MemoryStore>, Door) {
-        let store = Arc::new(MemoryStore::new());
-        (Arc::clone(&store), Door::based(store, 0))
+        door_in(TERM)
+    }
+
+    /// The same under another term.
+    fn door_in(term: u64) -> (Arc<MemoryStore>, Door) {
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        store::LeasesStore::set_term(store.as_ref(), term);
+        (Arc::clone(&store), Door::based(store, feed.log, 0))
     }
 
     /// A life's number at a door whose count starts at zero.
@@ -496,7 +560,7 @@ mod tests {
         assert_eq!(
             told,
             proto::WorkerEvent {
-                seq: 0,
+                seq: 2,
                 membership_epoch: 1,
                 event: Some(Event::Registered(super::worker_wire::row(&stored))),
                 term: TERM,
@@ -521,7 +585,7 @@ mod tests {
             .register(&operator(), under(TERM), &unset)
             .expect("registered");
         assert!(matches!(told.event, Some(Event::Registered(_))));
-        assert_eq!(told.membership_epoch, 2);
+        assert_eq!((told.membership_epoch, told.seq, told.term), (2, 3, TERM));
     }
 
     #[test]
@@ -551,6 +615,62 @@ mod tests {
             .register(&operator(), under(TERM), &ask(spec(URL), Mode::Replace))
             .expect_err("nothing to replace");
         assert_eq!(absent.code(), Code::NotFound);
+        // What a new row names is no rule of a call that makes none: a
+        // REPLACE that leaves the wire and the role unsaid is not found
+        // either, and so is one that leaves the role alone unsaid.
+        let bare = proto::WorkerSpec {
+            url: URL.to_owned(),
+            models: vec!["model-a".to_owned()],
+            ..Default::default()
+        };
+        let roleless = proto::WorkerSpec {
+            wire: proto::WireMode::Grpc as i32,
+            ..bare.clone()
+        };
+        for unsaid in [bare.clone(), roleless] {
+            let absent = door
+                .register(&operator(), under(TERM), &ask(unsaid, Mode::Replace))
+                .expect_err("nothing to replace");
+            assert_eq!(
+                (absent.code(), absent.message()),
+                (Code::NotFound, "no worker is registered under the URL")
+            );
+        }
+        // A field past its bounds is refused as itself, found or not, and
+        // whatever the call leaves unsaid: a field read ahead of the wire
+        // (the models) and one read after it (the labels), each with the
+        // wire and the role stated and with both left unsaid.
+        let wide = |over: proto::WorkerSpec| proto::WorkerSpec {
+            models: (0..129).map(|n| format!("model-{n}")).collect(),
+            ..over
+        };
+        let labelled = |over: proto::WorkerSpec| proto::WorkerSpec {
+            labels: (0..129)
+                .map(|n| (format!("label-{n}"), String::new()))
+                .collect(),
+            ..over
+        };
+        let models = "spec.models: a row names at most 128 model ids";
+        let labels = "spec.labels: a row holds at most 128 labels";
+        for (past, field) in [
+            (wide(spec(URL)), models),
+            (wide(bare.clone()), models),
+            (labelled(spec(URL)), labels),
+            (labelled(bare.clone()), labels),
+        ] {
+            let refused = door
+                .register(&operator(), under(TERM), &ask(past, Mode::Replace))
+                .expect_err("past a bound");
+            assert_eq!(
+                (refused.code(), refused.message()),
+                (Code::InvalidArgument, field)
+            );
+        }
+        // An UPSERT of the same would make a row, and is held to its names.
+        let unnamed = door
+            .register(&operator(), under(TERM), &ask(bare, Mode::Upsert))
+            .expect_err("a new row names its wire");
+        assert_eq!(unnamed.code(), Code::InvalidArgument);
         assert_eq!(store.epoch(), 0);
 
         door.register(&operator(), under(TERM), &ask(spec(URL), Mode::Add))
@@ -634,7 +754,7 @@ mod tests {
             assert_eq!(
                 told,
                 proto::WorkerEvent {
-                    seq: 0,
+                    seq: 2,
                     membership_epoch: 1,
                     event: Some(Event::Relabelled(super::worker_wire::row(&stood))),
                     term: TERM,
@@ -853,6 +973,56 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_carries_the_place_of_its_calls_write_under_that_places_term() {
+        let (store, door) = door();
+        // Not waited: the registration as its write left it. The connect
+        // signal's write is the next place.
+        let told = door
+            .register(&operator(), under(TERM), &ask(unchecked(URL), Mode::Add))
+            .expect("registered");
+        assert_eq!((told.seq, told.term, told.membership_epoch), (2, TERM, 1));
+        assert_eq!(row_of(&told).status, proto::WorkerStatus::Pending as i32);
+        // Waited: the row after its connect signal, at that write's place.
+        let other = "grpc://10.0.0.6:8000";
+        let waited = proto::RegisterWorkerRequest {
+            wait_ready: true,
+            ..ask(unchecked(other), Mode::Add)
+        };
+        let told = door
+            .register(&operator(), under(TERM), &waited)
+            .expect("registered");
+        assert_eq!((told.seq, told.term, told.membership_epoch), (5, TERM, 4));
+        assert_eq!(row_of(&told).status, proto::WorkerStatus::Ready as i32);
+        // A call that writes nothing answers the place the log stands at:
+        // here the start of the next term.
+        store::LeasesStore::set_term(store.as_ref(), TERM + 1);
+        let told = door
+            .register(
+                &operator(),
+                under(TERM + 1),
+                &ask(unchecked(other), Mode::Upsert),
+            )
+            .expect("answered");
+        assert_eq!(
+            (told.seq, told.term, told.membership_epoch),
+            (6, TERM + 1, 4)
+        );
+        // And the next write is made under that term.
+        let drain = proto::DeregisterWorkerRequest {
+            worker_id: row_of(&told).id,
+            revision: row_of(&told).revision,
+            drain: true,
+        };
+        let told = door
+            .deregister(&operator(), under(TERM + 1), &drain)
+            .expect("draining");
+        assert_eq!(
+            (told.seq, told.term, told.membership_epoch),
+            (7, TERM + 1, 5)
+        );
+    }
+
+    #[test]
     fn a_patch_merges_under_the_revision_its_caller_read() {
         let (store, door) = door();
         let labelled = proto::WorkerSpec {
@@ -878,8 +1048,8 @@ mod tests {
         let now = row_of(&told);
         assert_eq!(now.labels, [("lane".to_owned(), "b".to_owned())].into());
         assert_eq!(
-            (now.revision, told.membership_epoch, told.term),
-            (2, 2, TERM)
+            (now.revision, told.membership_epoch, told.seq, told.term),
+            (2, 2, 3, TERM)
         );
 
         // The same patch under the revision it read: the row moved.
@@ -897,7 +1067,10 @@ mod tests {
         let told = door
             .patch(&operator(), under(TERM), &again)
             .expect("answered");
-        assert_eq!((row_of(&told).revision, told.membership_epoch), (2, 2));
+        assert_eq!(
+            (row_of(&told).revision, told.membership_epoch, told.seq),
+            (2, 2, 3)
+        );
         assert_eq!(store.epoch(), 2);
 
         let nobody = proto::PatchWorkerRequest {
@@ -998,7 +1171,7 @@ mod tests {
                 health: proto::HealthFlag::Draining as u32,
             }))
         );
-        assert_eq!(told.membership_epoch, 2);
+        assert_eq!((told.membership_epoch, told.seq), (2, 3));
         // A second drain writes nothing and answers the row as it stands,
         // under the revision its registration gave: no status change moved
         // it.
@@ -1011,8 +1184,13 @@ mod tests {
             Some(Event::Relabelled(super::worker_wire::row(&stood)))
         );
         assert_eq!(
-            (stood.status, stood.revision, told.membership_epoch),
-            (WorkerStatus::Draining, row.revision, 2)
+            (
+                stood.status,
+                stood.revision,
+                told.membership_epoch,
+                told.seq
+            ),
+            (WorkerStatus::Draining, row.revision, 2, 3)
         );
 
         let removal = proto::DeregisterWorkerRequest {
@@ -1031,7 +1209,7 @@ mod tests {
                 draining: true,
             }))
         );
-        assert_eq!((told.membership_epoch, store.epoch()), (3, 3));
+        assert_eq!((told.membership_epoch, told.seq, store.epoch()), (3, 4, 3));
         assert_eq!(store.by_key(URL), None);
         let gone = door
             .deregister(&operator(), under(TERM), &removal)
@@ -1409,8 +1587,8 @@ mod tests {
 
         // Two leaders that take the same URL first number two lives: the
         // pair read at one names no row at the other.
-        let (_, earlier) = door();
-        let (store, later) = door();
+        let (_, earlier) = door_in(7);
+        let (store, later) = door_in(8);
         let first = row_of(
             &earlier
                 .register(&operator(), under(7), &ask(spec(URL), Mode::Add))
@@ -1440,6 +1618,42 @@ mod tests {
     }
 
     #[test]
+    fn a_life_is_minted_only_under_a_term_its_log_leads() {
+        let (store, door) = door();
+        let refused = |told: Result<proto::WorkerEvent, Status>| {
+            let status = told.expect_err("no life under a term the log does not lead");
+            assert_eq!(
+                (status.code(), status.message()),
+                (Code::Unavailable, super::LEADS_NO_TERM)
+            );
+        };
+        // The call was admitted under a term the log has left, or one it
+        // has not entered: the two terms are compared at the mint.
+        for admitted in [TERM - 1, TERM + 1] {
+            let told = door.register(&operator(), under(admitted), &ask(spec(URL), Mode::Add));
+            refused(told);
+        }
+        // The store follows another leader's history at the admitted term:
+        // a number under it could be one that leader gave another worker.
+        door.log.restart(Position {
+            seq: 40,
+            term: TERM + 1,
+        });
+        let told = door.register(&operator(), under(TERM + 1), &ask(spec(URL), Mode::Add));
+        refused(told);
+        assert_eq!(store.epoch(), 0, "a refused registration writes nothing");
+        assert!(store.by_key(URL).is_none());
+        // A take above every term the log has seen starts a lead again.
+        store::LeasesStore::set_term(store.as_ref(), TERM + 2);
+        let row = row_of(
+            &door
+                .register(&operator(), under(TERM + 2), &ask(spec(URL), Mode::Add))
+                .expect("registered"),
+        );
+        assert_eq!(row.incarnation, life(TERM + 2, 0));
+    }
+
+    #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "a term past its 24 bits")]
     fn a_term_past_its_bits_is_asserted_in_a_debug_build() {
@@ -1463,7 +1677,10 @@ mod tests {
     #[test]
     fn a_run_draws_its_base_below_the_bound_and_apart_from_another_runs() {
         let drawn: Vec<u64> = (0..64)
-            .map(|_| Door::new(Arc::new(MemoryStore::new())).base)
+            .map(|_| {
+                let (store, feed) = journaled(&LeasePlace::Process);
+                Door::new(store, feed.log).base
+            })
             .collect();
         assert!(drawn.iter().all(|&base| base < BOUND), "{drawn:?}");
         let mut apart = drawn.clone();
@@ -1477,8 +1694,9 @@ mod tests {
         // A controller with no shared lease leads under term one at every
         // start: each run's door draws where its count starts.
         let run = || {
-            let store = Arc::new(MemoryStore::new());
-            let door = Door::new(Arc::clone(&store));
+            let (store, feed) = journaled(&LeasePlace::Process);
+            store::LeasesStore::set_term(store.as_ref(), 1);
+            let door = Door::new(Arc::clone(&store), feed.log);
             let first = row_of(
                 &door
                     .register(&operator(), under(1), &ask(spec(URL), Mode::Add))

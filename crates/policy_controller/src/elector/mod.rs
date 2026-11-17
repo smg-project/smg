@@ -76,20 +76,23 @@
 //!   record went before this candidate's read or between that read and the
 //!   write: its own fence is closed by then, and a holder stops serving
 //!   before any taker of its lease serves, for replicas that share their
-//!   settings. A taker that gives the lease up inside that wait hands the
-//!   wait on: its release says the renew deadline as the record's duration.
+//!   settings. A taker that gives the lease up inside that wait hands on
+//!   what it still owed: its release says the time left to its opening as
+//!   the record's duration, rounded up.
 //!   An elector alone over a store it made itself ([`Elector::alone`]) has
 //!   no other holder to wait for: its take leads at once.
 //!
-//! The elector keeps three private instants, each with one meaning. Before
+//! The elector keeps four private instants, each with one meaning. Before
 //! the first it writes no record that names it: it takes nothing, and a
 //! holder told to leave whose release has not landed tries that release
 //! again in place of a renewal. A step-down sets it one lease duration
 //! ahead. The second is the instant its lead opens: the take's own
 //! instant, or one renew deadline after the write of a take of a record
 //! with no holder to wait for. The fence reads closed before it, and a
-//! release before it hands the wait on. The third is the end it stamped
-//! its fence with last: a renewal no later than it keeps the opening.
+//! release before it hands on the wait left to it. The third is the end it
+//! stamped its fence with last: a renewal no later than it keeps the opening.
+//! The fourth is the latest instant a step or a word was handed: a call
+//! handed no instant reads the later of it and the clock.
 //!
 //! The settings ([`ElectionSettings`]): duration 3 s, renew period 1 s, renew
 //! deadline 2 s by default; a deployment that prefers fewer leadership
@@ -201,7 +204,7 @@ pub struct LeaseRecord {
     pub renewed_at_micros: u64,
     /// The holder's duration in milliseconds: how long the record may stand
     /// unchanged before another candidate takes it. A leader's release says
-    /// `0`; a release inside its take's wait says the renew deadline.
+    /// `0`; a release inside its take's wait says the wait still owed.
     pub duration_ms: u64,
 }
 
@@ -292,8 +295,9 @@ pub enum Tick {
     /// whatever the record.
     Acquired { term: u64 },
     /// The lease is renewed under `term`; the fence is open for another
-    /// renew deadline, or still closed inside the first one after a take of
-    /// a record with no holder to wait for.
+    /// renew deadline, or still closed after a take of a record with no
+    /// holder to wait for: it opens one renew deadline after that take's
+    /// write, by itself where this renewal's deadline is past that instant.
     Renewed { term: u64 },
     /// The lease moved under this holder: a candidate took it after it stood
     /// unchanged for the duration, or the record was rewritten by hand. The
@@ -308,7 +312,8 @@ pub enum Tick {
     /// once that record's duration has passed since this candidate first saw
     /// the change. Also the answer at a record under `term` with no holder
     /// and a duration: a hand's clearing leaves one, and so does a release
-    /// inside its take's wait.
+    /// inside its take's wait. A candidate inside its own hold answers
+    /// [`Tick::Waiting`] there.
     Gone { term: u64 },
     /// The lease stands free, released or unrenewed past its duration, and
     /// this candidate waits its turn: it left on a word and takes nothing
@@ -514,8 +519,17 @@ impl Elector {
     /// holder's: a loss and a release end it, and a run that holds nothing
     /// answers no.
     pub fn waits_to_lead(&self) -> bool {
+        !self.owed().is_zero()
+    }
+
+    /// The wait this run's take still owes: the time from the latest
+    /// instant this elector knows to the instant its lead opens, none once
+    /// that instant has come or where no take of this run waits.
+    fn owed(&self) -> Duration {
         let latest = self.latest();
-        self.opens.is_some_and(|opens| latest < opens)
+        self.opens.map_or(Duration::ZERO, |opens| {
+            opens.saturating_duration_since(latest)
+        })
     }
 
     /// The latest instant this elector knows: the clock, or its last step's
@@ -523,6 +537,12 @@ impl Elector {
     fn latest(&self) -> Instant {
         let clock = Instant::now();
         self.stepped.map_or(clock, |at| at.max(clock))
+    }
+
+    /// Keeps the latest instant a step or a word was handed: an earlier one
+    /// moves nothing back.
+    fn step_at(&mut self, now: Instant) {
+        self.stepped = Some(self.stepped.map_or(now, |at| at.max(now)));
     }
 
     /// This elector made its store itself ([`Elector::alone`]): no other
@@ -556,7 +576,7 @@ impl Elector {
     /// changes nothing: a holder keeps its record and its fence closes by
     /// itself at the deadline; the next successful step settles it.
     pub fn tick(&mut self, now: Instant) -> Result<Tick, ElectError> {
-        self.stepped = Some(self.stepped.map_or(now, |at| at.max(now)));
+        self.step_at(now);
         let current = self.backend.read()?;
         // A first sight is dated when the read returned, never before it: a
         // slow read may return a record the holder wrote during the read, and
@@ -586,9 +606,11 @@ impl Elector {
     /// retries the write; a caller that ticks instead renews, or answers
     /// [`Tick::Lost`] when the release landed after all.
     ///
-    /// A release while this run's own take still waits to lead hands that
-    /// wait on: the record says the renew deadline as its duration, and the
-    /// next candidate waits it out before it takes.
+    /// A release while this run's own take still waits to lead hands on
+    /// what that wait still owed: the record says the time left to the
+    /// take's opening as its duration, rounded up, and the next candidate
+    /// waits it out before it takes. It leads no later than this run would
+    /// have, by one look.
     pub fn release(&mut self) -> Result<bool, ElectError> {
         let Some(mine) = self.held.clone() else {
             return Ok(false);
@@ -596,20 +618,18 @@ impl Elector {
         self.fence.set(mine.term, None);
         // No duration: it tells a holder's release, taken at once, from a
         // holder that another hand cleared in place. A release while this
-        // run's own take still waits to lead says the renew deadline
-        // instead: a holder this run never saw may still lead that long,
-        // this run's wait was all that covered it, and the next candidate
-        // waits the release out as it waits out a cleared record. The term
+        // run's own take still waits to lead says the wait it still owed
+        // instead: a holder this run never saw may lead until that take's
+        // opening, this run's wait was all that covered it, and the next
+        // candidate waits the release out as it waits out a cleared record.
+        // It times the wait from its own sight of the release, after the
+        // write, so it takes no earlier than that opening. The term
         // is the highest this run saw, its own unless it was told one above:
         // the next holder leads above it, whoever it is.
         let released = LeaseRecord {
             holder: String::new(),
             term: self.highest_term.max(mine.term),
-            duration_ms: if self.waits_to_lead() {
-                whole_millis_up(self.settings.renew_deadline)
-            } else {
-                0
-            },
+            duration_ms: whole_millis_up(self.owed()),
             renewed_at_micros: next_wall_micros(mine.renewed_at_micros),
             ..mine.clone()
         };
@@ -691,7 +711,7 @@ impl Elector {
     /// place of a renewal, until it lands or the record moves.
     pub fn step_down(&mut self, above: Option<u64>, now: Instant) -> Result<bool, ElectError> {
         term_said(above)?;
-        self.stepped = Some(self.stepped.map_or(now, |at| at.max(now)));
+        self.step_at(now);
         self.highest_term = self.highest_term.max(above.unwrap_or(0));
         let duration = match &self.held {
             Some(mine) if above.is_none_or(|term| term > mine.term) => mine.duration(),
@@ -840,8 +860,10 @@ impl Elector {
     /// Stamps the fence at a write of this run's own record at `now`: the
     /// window runs from the lead's opening to one renew deadline past `now`.
     /// A write past the end stamped last opens a new window at `now`, since
-    /// the fence had closed by itself. An opening at or past the new end is
-    /// no window: a take whose renewals do not land never leads.
+    /// the fence had closed by itself, unless the lead's opening is still
+    /// ahead of `now`: a take's wait is kept however late its first renewal
+    /// lands. An opening at or past the new end is no window: a take whose
+    /// renewals do not land never leads.
     fn stamp(&mut self, term: u64, now: Instant) {
         let opens = match self.opens {
             Some(opens) if opens > now || self.until.is_some_and(|until| now <= until) => opens,
@@ -923,8 +945,8 @@ impl Elector {
             // A record with no holder is waited out for the duration it
             // says, from this run's first sight of it. A holder's release
             // says none and is taken at once, unless its own take still
-            // waited to lead: then it says the renew deadline, that take's
-            // whole wait. A record whose holder another hand cleared in place
+            // waited to lead: then it says the wait that take still owed.
+            // A record whose holder another hand cleared in place
             // keeps its duration, and that holder may lead until its own
             // next step reads the lease.
             Some(record) if record.is_released() => {
@@ -1072,7 +1094,8 @@ fn later(at: Instant, by: Duration) -> Instant {
 
 /// A duration in whole milliseconds, rounded up: the record's duration is
 /// never shorter than the settings' and so never shorter than the renew
-/// deadline the fence runs on.
+/// deadline the fence runs on, and a wait handed on is never shorter than
+/// what was owed.
 fn whole_millis_up(duration: Duration) -> u64 {
     let whole = duration.as_millis();
     let rounded = if duration.subsec_nanos().is_multiple_of(1_000_000) {
@@ -2283,8 +2306,8 @@ mod tests {
     #[test]
     fn a_word_inside_the_takes_wait_hands_the_wait_on_as_a_stop_does() {
         // A taker told to leave before its fence opened never led, so its
-        // release pays no wait: the record says the renew deadline as its
-        // duration, as at a stop inside the wait.
+        // release pays no wait: the record says the second its wait still
+        // owed as its duration, as at a stop inside the wait.
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
         let t0 = Instant::now() + AHEAD;
@@ -2293,7 +2316,7 @@ mod tests {
         assert!(a.step_down(None, t0 + S).expect("the word"));
         let released = a.observed().expect("the release").clone();
         assert!(released.is_released());
-        assert_eq!(released.duration_ms, 2_000);
+        assert_eq!(released.duration_ms, 1_000);
         assert!(!a.waits_to_lead());
         // Its own next steps wait their turn: the release it reads is its
         // own, and no record is gone.
@@ -2577,6 +2600,37 @@ mod tests {
         assert!(!a.waits_to_lead());
         assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
         assert!(!a.waits_to_lead(), "the opening stays passed");
+    }
+
+    #[test]
+    fn a_taker_stopped_at_half_its_wait_hands_on_the_half_it_still_owed() {
+        // The take's lead would open two seconds after it. Stopped a second
+        // into that wait, the taker hands on the second it still owed: the
+        // next candidate takes a second after its sight of the release and
+        // leads at its take, when the taker would have and one look.
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let mut b = candidate(&lease, "b@host:2");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        // A microsecond past the second: the wait still owed has a
+        // fraction, and the record's millisecond rounds it up.
+        let stopped = t0 + S + Duration::from_micros(1);
+        assert_eq!(a.tick(stopped).expect("renew"), Tick::Renewed { term: 1 });
+        assert!(a.waits_to_lead());
+        assert!(a.release().expect("the stop"));
+        let released = lease.clone().read().expect("read").expect("the record");
+        assert!(released.is_released());
+        assert_eq!(released.duration_ms, 1_000);
+        let saw = t0 + S + Duration::from_millis(1);
+        assert_eq!(b.tick(saw).expect("look"), Tick::Gone { term: 1 });
+        assert_eq!(
+            b.tick(saw + S - Duration::from_micros(1)).expect("look"),
+            Tick::Gone { term: 1 }
+        );
+        assert_eq!(b.tick(saw + S).expect("take"), Tick::Acquired { term: 2 });
+        assert_eq!(b.fence().leader_term(saw + S), Some(2));
+        assert!(!b.waits_to_lead());
     }
 
     #[test]
@@ -2972,7 +3026,7 @@ mod tests {
     fn a_release_inside_the_wait_over_a_renewal_that_landed_hands_the_wait_on() {
         // This run's renewal landed with its answer lost, inside the take's
         // wait. The release finds that renewal, releases over it, and still
-        // says the take's wait as the record's duration.
+        // says what the take's wait owed as the record's duration.
         let lease = MemoryLease::new();
         let fails = Arc::new(AtomicU32::new(0));
         let backend = LandsThenErrors {
@@ -2989,7 +3043,7 @@ mod tests {
         assert!(!a.waits_to_lead(), "a release ends the wait");
         let stored = lease.clone().read().expect("read").expect("the record");
         assert!(stored.is_released());
-        assert_eq!(stored.duration_ms, 2_000);
+        assert_eq!(stored.duration_ms, 1_000);
     }
 
     /// A backend whose reads fail while `read_fails` is above zero, whose

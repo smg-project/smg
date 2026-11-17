@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use openai_protocol::worker::{ConnectionMode, WorkerStatus, WorkerType};
 
 use crate::{
-    routers::grpc::{backend_client::BackendClient, proto_wrapper::DispatchBooking},
+    routers::grpc::proto_wrapper::DispatchBooking,
     worker::{
+        connection::engine::EngineConnection,
         health::circuit_breaker::CircuitState,
         identity::basic::{BasicWorker, WorkerMetadata},
         runtime::WorkerRuntime,
@@ -96,8 +97,8 @@ impl Worker for DoorOnly {
     async fn check_health_async(&self) -> WorkerResult<()> {
         self.0.check_health_async().await
     }
-    async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
-        self.0.get_backend_client().await
+    async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {
+        self.0.engine_connection().await
     }
     fn runtime_state(&self) -> Option<Arc<WorkerRuntime>> {
         self.0.runtime_state()

@@ -24,7 +24,10 @@ use serial_test::serial;
 use smg::{
     config::{GroupedDpSticky, ParserChoice},
     middleware::{RouteRequestMeta, TenantKey},
-    routers::{grpc::backend_client::BackendClient, RouterTrait},
+    routers::{
+        grpc::backend_client::{get_backend_client, BackendClient},
+        RouterTrait,
+    },
     worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
 };
 
@@ -169,7 +172,7 @@ async fn build_router_with(
     // handshake; wait for it to land so requests hit a connected worker. The
     // budget covers a loaded CI runner, not the local ~100ms case.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+    while !matches!(worker.engine_connection().await, Ok(Some(_))) {
         assert!(
             tokio::time::Instant::now() < deadline,
             "ZMQ handshake never completed against the mock engine(s)"
@@ -195,8 +198,7 @@ async fn build_router_with(
 async fn expect_worker_idle(worker: &Arc<BasicWorker>, what: &str) {
     let settled = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let link = worker
-            .get_backend_client()
+        let link = get_backend_client(worker.as_ref())
             .await
             .ok()
             .flatten()
@@ -649,7 +651,7 @@ async fn grammar_over_zmq(parser: &str, led: bool) {
             )
             .await;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-            while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+            while !matches!(worker.engine_connection().await, Ok(Some(_))) {
                 assert!(
                     tokio::time::Instant::now() < deadline,
                     "ZMQ handshake never completed against the mock engine"
@@ -832,7 +834,7 @@ async fn a_budget_beyond_the_window_is_refused_before_the_engine_over_zmq() {
     let router =
         build_grpc_router(config, MODEL, vec![Arc::clone(&worker) as Arc<dyn Worker>]).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+    while !matches!(worker.engine_connection().await, Ok(Some(_))) {
         assert!(
             tokio::time::Instant::now() < deadline,
             "ZMQ handshake never completed against the mock engine"
@@ -935,7 +937,7 @@ async fn usage_prompt_count_over_zmq_is_the_gateways_until_the_engine_reports_on
             )
             .await;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-            while !matches!(worker.get_backend_client().await, Ok(Some(_))) {
+            while !matches!(worker.engine_connection().await, Ok(Some(_))) {
                 assert!(
                     tokio::time::Instant::now() < deadline,
                     "ZMQ handshake never completed against the mock engine"

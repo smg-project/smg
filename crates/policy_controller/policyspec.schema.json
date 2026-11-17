@@ -643,7 +643,7 @@
       "additionalProperties": false
     },
     "ConsistentHashParams": {
-      "description": "The consistent-hash scorer: a per-model ring keyed by the routing key or\nby the request's prefix, with a bounded-load rule.",
+      "description": "The consistent-hash scorer: a per-model ring keyed by the routing key\nand, under `prefix_tokens`, by the prefix of a request that carries none,\nwith a bounded-load rule.",
       "type": "object",
       "properties": {
         "weight": {
@@ -654,7 +654,7 @@
           "exclusiveMinimum": 0
         },
         "prefix_tokens": {
-          "description": "How many prefix tokens hash when the ring keys by prefix; above zero\n(default 256).",
+          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix: the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Absent, such a request has no key.",
           "type": [
             "integer",
             "null"
@@ -677,7 +677,7 @@
       "additionalProperties": false
     },
     "BoundedLoadParams": {
-      "description": "The bounded-load rule of the consistent-hash scorer: a ring owner loaded\nthis far past the mean passes the request on.",
+      "description": "The bounded-load rule of the consistent-hash scorer: a ring owner whose\nrequests in flight are past both parts of the rule over the candidates'\nmean, the request being placed counted in the mean, is passed over, and\nthe profile's next stage places the request.",
       "type": "object",
       "properties": {
         "factor": {
@@ -686,7 +686,7 @@
             "number",
             "null"
           ],
-          "format": "float",
+          "format": "double",
           "minimum": 1.0
         },
         "abs_margin": {
@@ -888,7 +888,7 @@
           }
         },
         "overload": {
-          "description": "The overload veto's defaults for the binding's workers.",
+          "description": "The overload veto's defaults for the workers of the pools decided\nunder the binding: the pools whose model and phase it is the first\nto match. A decode pool of a model with a pair binding (`pd-pair`\nor `epd`) is decided under that binding, so its block judges the\npool: a decode-phase binding's block is not read for it, and a pair\nbinding with its block switched off leaves the pool unjudged.",
           "anyOf": [
             {
               "$ref": "#/$defs/OverloadSpec"

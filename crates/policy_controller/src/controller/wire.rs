@@ -32,9 +32,9 @@
 //!
 //! A range the contract fixes refuses a frame, its size and its id's
 //! length among them; a bound a generation's document sets never does,
-//! since the gateway may be a generation behind. The block hashes past the
-//! view's cap of the deciding generation are cut at the read, the first
-//! ones kept: a prefix cut short is still a prefix.
+//! since the gateway may be a generation behind. The block hashes past what
+//! the deciding generation reads of the request are cut at the read, the
+//! first ones kept: a prefix cut short is still a prefix.
 //!
 //! A request that carries its prompt as text is checked like any other and
 //! says so ([`Checked::has_text`]): the controller is to hash the text into
@@ -52,7 +52,7 @@ use prost::Message as _;
 use crate::{
     decision::{Decision, ShedReason, Target, Trace},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
-    spec::MAX_HEADERS,
+    spec::{AppliedSpec, MAX_HEADERS},
     view::{
         fingerprint, key_of_session, AffinityFacts, Constraints, HashKind, Header, Identity,
         MediaCounts, ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
@@ -186,9 +186,16 @@ impl Checked {
     }
 
     /// How many block hashes the frame carries: a read hands the engine
-    /// its view's cap of them at most.
+    /// as many as its generation reads of them ([`Self::hashes_read`]).
     pub(crate) fn hashes(&self) -> usize {
         self.facts.block_hashes.len()
+    }
+
+    /// How many of the frame's block hashes a decision under `spec` reads:
+    /// the depth of the generation's stages, in blocks as the frame's host
+    /// hashed them ([`AppliedSpec::block_hashes_read`]).
+    pub(crate) fn hashes_read(&self, spec: &AppliedSpec) -> usize {
+        spec.block_hashes_read(self.hash_kind, self.facts.block_size)
     }
 
     /// The request's id, for its answer.
@@ -255,7 +262,7 @@ impl Checked {
                 streaming: facts.streaming,
                 max_output_tokens: facts.max_output_tokens,
                 prompt_tokens: facts.prompt_tokens,
-                // The first hashes, up to the view's cap.
+                // The first hashes, as deep as the generation reads.
                 block_hashes: facts
                     .block_hashes
                     .get(..view.max_block_hashes)
@@ -304,7 +311,8 @@ pub(crate) struct Viewed<'a> {
     pub(crate) budget_micros: u32,
     /// The candidates' affinity column, as the view's build filled it.
     pub(crate) affinity: &'a [AffinityFacts],
-    /// How many block hashes the deciding generation's view reads.
+    /// How many of the request's block hashes the deciding generation
+    /// reads.
     pub(crate) max_block_hashes: usize,
 }
 
@@ -848,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn the_hashes_past_the_views_cap_are_cut_at_the_read_and_the_first_ones_kept() {
+    fn the_hashes_past_what_the_generation_reads_are_cut_at_the_read_and_the_first_ones_kept() {
         let frame = with(|facts| facts.block_hashes = (1..=6).collect());
         let checked = Checked::new(frame).expect("a frame the record holds");
         assert_eq!(checked.hashes(), 6);

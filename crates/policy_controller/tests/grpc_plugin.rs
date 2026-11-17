@@ -92,37 +92,17 @@ fn made_again(case: &str, why: &str) {
     println!("{case}: made again in this run: {why}");
 }
 
-/// The host's frame of a WebAssembly guest's `init`. Nothing watches an
-/// `init`: it ends at this deadline on the wall clock, whatever its thread
-/// had of the CPU.
+/// The loads of the one WebAssembly guest a case makes at most.
 #[cfg(feature = "wasm")]
-const INIT_FRAME: Duration = Duration::from_millis(100);
+const GUEST_LOADS: u32 = 10;
 
-/// The calling thread's own time on the CPU where the host has a thread
-/// clock, the wall clock elsewhere, from an origin of its own.
-#[cfg(feature = "wasm")]
-fn thread_clock() -> Duration {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let now = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
-        Duration::new(
-            u64::try_from(now.tv_sec).unwrap_or(0),
-            u32::try_from(now.tv_nsec).unwrap_or(0),
-        )
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-        ORIGIN.get_or_init(Instant::now).elapsed()
-    }
-}
-
-/// Loads the WebAssembly guest of the case over both kinds. A runner that
-/// holds the loading thread for the init frame has the host end an `init`
-/// that did nothing. Such a load is made again, three loads at most, when
-/// its thread was off the CPU half the frame: the WebAssembly plugin
-/// binary's own loads do the same. A load that fails with its thread on the
-/// CPU, or a third time, ends here as it did.
+/// Loads the WebAssembly guest of the case over both kinds. Nothing watches
+/// an `init`: the host ends it at its frame on the wall clock, so a runner
+/// that holds the loading thread ends an `init` that did nothing. The load
+/// claims nothing of that time, so it is made again whenever the host ended
+/// its `init` at the frame, ten loads at most: the last load asserts what it
+/// says. The WebAssembly plugin binary's loads that must succeed do the
+/// same.
 #[cfg(feature = "wasm")]
 fn guest_loaded(
     runtime: &Arc<smg_policy_controller::wasm::Runtime>,
@@ -132,22 +112,18 @@ fn guest_loaded(
 
     let mut loads = 0;
     loop {
-        let (wall, cpu) = (Instant::now(), thread_clock());
         let load = wasm::Plugin::load(runtime, spec.clone());
         loads += 1;
-        let off_the_cpu = wall
-            .elapsed()
-            .saturating_sub(thread_clock().saturating_sub(cpu));
-        let held = matches!(
+        let ended = matches!(
             &load,
             Err(wasm::LoadError::Trap { reason, .. }) if reason.ends_with("wasm trap: interrupt")
-        ) && off_the_cpu >= INIT_FRAME / 2;
-        if !held || loads == 3 {
+        );
+        if !ended || loads == GUEST_LOADS {
             return load.expect("the guest loads");
         }
         made_again(
             "a guest's load",
-            "its thread was off the CPU half the init frame",
+            "the host ended its init at the frame's deadline",
         );
     }
 }
@@ -2985,6 +2961,55 @@ fn a_dropped_plugin_ends_its_streams() {
 
 // --- the lifecycle and the exposure -------------------------------------------
 
+/// A scorer whose state the lifecycle's calls keep.
+#[derive(Debug)]
+struct Kept;
+
+impl Lifecycle for Kept {
+    fn needs_lifecycle(&self) -> bool {
+        true
+    }
+}
+
+impl Scorer for Kept {
+    fn name(&self) -> &'static str {
+        "kept"
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(1.0);
+        TieBand::NORMALIZED
+    }
+}
+
+/// A plugin declares no need of the lifecycle's calls: an adapter needs
+/// them where its fallback does, and an engine built in code says so.
+#[test]
+fn an_adapter_needs_the_lifecycle_where_its_fallback_does() {
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "kept");
+    let binder = plugin.binder();
+    let adapter = |fallback: Option<Box<dyn Scorer>>| GrpcScorer::new(binder.bind(), fallback);
+    assert!(adapter(Some(Box::new(Kept))).needs_lifecycle());
+    assert!(!adapter(Some(Box::new(LeastRequests))).needs_lifecycle());
+    assert!(!adapter(None).needs_lifecycle());
+
+    let engine_of = |fallback: Option<Box<dyn Scorer>>| {
+        single_engine(Profile {
+            name: "adapted".into(),
+            filters: vec![],
+            scorers: vec![Weighted {
+                scorer: Box::new(adapter(fallback)),
+                weight: 1.0,
+            }],
+            picker: Box::new(Best),
+        })
+    };
+    assert!(engine_of(Some(Box::new(Kept))).needs_lifecycle());
+    assert!(!engine_of(None).needs_lifecycle());
+}
+
 #[test]
 fn the_lifecycle_reaches_the_plugin_once_in_order() {
     let served = TestPlugin::serve();
@@ -3068,20 +3093,47 @@ fn events_raised_on_many_threads_are_numbered_in_the_order_they_are_sent() {
 /// so nothing leaves it while 2,000 events are raised.
 #[test]
 fn events_past_the_queue_are_dropped_and_counted() {
-    let served = TestPlugin::serve();
-    let runtime = runtime();
-    let plugin = load(&runtime, &served, "flooded-observer");
-    let engine = single_engine(profile(&plugin, ALL));
-    runtime.hold_io(Duration::from_millis(300));
+    for _ in 0..FLOODS {
+        let served = TestPlugin::serve();
+        let runtime = runtime();
+        let plugin = load(&runtime, &served, "flooded-observer");
+        let engine = single_engine(profile(&plugin, ALL));
+        if !flooded_under_a_hold(&runtime, &engine) {
+            made_again("a flood", HELD_PAST_THE_HOLD);
+            continue;
+        }
+        let stats = plugin.stats();
+        assert_eq!(stats.observed + stats.observe_dropped, 2_000, "{stats:?}");
+        assert!(
+            stats.observed >= 1_024 && stats.observe_dropped > 0,
+            "the queue holds 1,024 and the rest is dropped: {stats:?}"
+        );
+        return;
+    }
+    panic!("the runner held every flood");
+}
+
+/// The floods a case makes at most: one whose test thread a held runner
+/// paused past the hold of the I/O thread is made again.
+const FLOODS: u32 = 5;
+
+/// How long a flood holds the I/O thread off the queue.
+const FLOOD_HOLD: Duration = Duration::from_millis(300);
+
+/// What a flood that is made again says of itself.
+const HELD_PAST_THE_HOLD: &str = "its thread was held past the hold of the I/O thread";
+
+/// Raises 2,000 events while the I/O thread is held off the queue, and says
+/// whether the hold outlasted them. A test thread paused past the hold lets
+/// the queue drain under the events, and what is raised after it carries the
+/// count of refusals: that flood asserts nothing.
+fn flooded_under_a_hold(runtime: &Arc<Runtime>, engine: &Engine) -> bool {
+    let asked = Instant::now();
+    runtime.hold_io(FLOOD_HOLD);
     for _ in 0..2_000 {
         engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
     }
-    let stats = plugin.stats();
-    assert_eq!(stats.observed + stats.observe_dropped, 2_000, "{stats:?}");
-    assert!(
-        stats.observed >= 1_024 && stats.observe_dropped > 0,
-        "the queue holds 1,024 and the rest is dropped: {stats:?}"
-    );
+    asked.elapsed() < FLOOD_HOLD
 }
 
 /// A refused event leaves its mark on the numbers, where the loss fell. An
@@ -3094,40 +3146,46 @@ fn events_past_the_queue_are_dropped_and_counted() {
 /// it.
 #[test]
 fn a_refused_event_leaves_a_gap_in_the_numbers() {
-    let served = TestPlugin::serve();
-    let runtime = runtime();
-    let plugin = load(&runtime, &served, "ledger-keeper");
-    let engine = single_engine(profile(&plugin, ALL));
-    let dispatch = || engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
-    for _ in 0..3 {
+    for _ in 0..FLOODS {
+        let served = TestPlugin::serve();
+        let runtime = runtime();
+        let plugin = load(&runtime, &served, "ledger-keeper");
+        let engine = single_engine(profile(&plugin, ALL));
+        let dispatch =
+            || engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+        for _ in 0..3 {
+            dispatch();
+        }
+        assert!(eventually(|| served.seen().events.len() == 3));
+        if !flooded_under_a_hold(&runtime, &engine) {
+            made_again("a refused event", HELD_PAST_THE_HOLD);
+            continue;
+        }
+        let stats = plugin.stats();
+        let (sent, refused) = (stats.observed, stats.observe_dropped);
+        assert!(refused > 0, "the queue refused some: {stats:?}");
+        assert!(eventually(|| served.seen().events.len() as u64 == sent));
+        let seqs: Vec<u64> = served.seen().events.iter().map(|e| e.seq).collect();
+        assert!(
+            seqs.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+            "an event raised before the loss arrived behind a gap"
+        );
+        assert_eq!(
+            seqs.last().copied(),
+            Some(sent),
+            "the events raised before the loss read gapless"
+        );
         dispatch();
+        assert!(eventually(|| served.seen().events.len() as u64 == sent + 1));
+        assert_eq!(
+            served.seen().events.last().map(|e| e.seq),
+            Some(sent + 1 + refused),
+            "the next event raised skips by what the queue refused"
+        );
+
+        return;
     }
-    assert!(eventually(|| served.seen().events.len() == 3));
-    runtime.hold_io(Duration::from_millis(300));
-    for _ in 0..2_000 {
-        dispatch();
-    }
-    let stats = plugin.stats();
-    let (sent, refused) = (stats.observed, stats.observe_dropped);
-    assert!(refused > 0, "the queue refused some: {stats:?}");
-    assert!(eventually(|| served.seen().events.len() as u64 == sent));
-    let seqs: Vec<u64> = served.seen().events.iter().map(|e| e.seq).collect();
-    assert!(
-        seqs.windows(2).all(|pair| pair[0] + 1 == pair[1]),
-        "an event raised before the loss arrived behind a gap"
-    );
-    assert_eq!(
-        seqs.last().copied(),
-        Some(sent),
-        "the events raised before the loss read gapless"
-    );
-    dispatch();
-    assert!(eventually(|| served.seen().events.len() as u64 == sent + 1));
-    assert_eq!(
-        served.seen().events.last().map(|e| e.seq),
-        Some(sent + 1 + refused),
-        "the next event raised skips by what the queue refused"
-    );
+    panic!("the runner held every flood");
 }
 
 /// The numbers go on across two `Observe` streams: the first server goes, a
@@ -3254,6 +3312,137 @@ fn a_streak_of_panicked_turns_says_its_line_once() {
         1,
         "{:?}",
         lines("panics-in-a-row", "observe task panicked")
+    );
+}
+
+/// A stream's end is said whichever side of the host's task saw it: the
+/// call's own outcome, or a send that found the stream gone. Events are
+/// raised here while each server goes, so a send can see the end first, and
+/// every end of a stream that carried an event is one line.
+#[test]
+fn a_streams_end_is_said_whichever_side_saw_it() {
+    const ENDS: usize = 4;
+    said();
+    let name = "ends-under-sends";
+    let mut served = TestPlugin::serve();
+    let runtime = runtime();
+    let mut row = spec(&served, name);
+    row.connect_micros = 1_000_000;
+    let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    let raise = || engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    let path = served.socket.clone();
+    let mut stopped = Vec::new();
+    for end in 1..=ENDS {
+        let mut raised = 0_u32;
+        while served.seen().events.is_empty() {
+            raised += 1;
+            assert!(raised <= 15_000, "no event reached server {end}");
+            raise();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let going = AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while going.load(Ordering::Relaxed) {
+                    raise();
+                }
+            });
+            served.stop();
+            let said = eventually(|| lines(name, "observe stream failed").len() >= end);
+            going.store(false, Ordering::Relaxed);
+            assert!(said, "end {end} of {ENDS} was not said");
+        });
+        assert_eq!(
+            lines(name, "observe stream failed").len(),
+            end,
+            "{:?}",
+            lines(name, "observe stream failed")
+        );
+        if end < ENDS {
+            // A stopped server stays to the case's end: the path is in the
+            // first one's directory.
+            stopped.push(std::mem::replace(&mut served, TestPlugin::serve()));
+            std::fs::rename(&served.socket, &path).expect("the next server takes the path");
+        }
+    }
+}
+
+/// A panic after an event was sent says the task's line again: a streak
+/// ends with an event sent. Here the host's line of a failed stream panics
+/// as the first server goes, before any event was raised: a task that has
+/// sent nothing says its first panic too. An event then reaches the second
+/// server, and the line panics again as that one goes: the host says the
+/// task's line twice.
+#[test]
+fn a_panic_after_an_event_was_sent_says_the_tasks_line_again() {
+    let name = "panics-over-an-event";
+    let mut first = TestPlugin::serve();
+    let runtime = runtime();
+    let mut row = spec(&first, name);
+    row.connect_micros = 1_000_000;
+    let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    let raise = || engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    assert!(eventually(|| first.seen().observe_hellos.len() == 1));
+    let path = first.socket.clone();
+    panic_at(name, "observe stream failed", 1);
+    first.stop();
+    assert!(
+        eventually(|| trap_spent(name)),
+        "the line of the first end did not panic"
+    );
+    assert!(
+        eventually(|| lines(name, "observe task panicked").len() == 1),
+        "the first panic of a task that sent nothing was not said"
+    );
+    let mut second = TestPlugin::serve();
+    std::fs::rename(&second.socket, &path).expect("the second server takes the first's path");
+    let mut raised = 0_u32;
+    while second.seen().events.is_empty() {
+        raised += 1;
+        assert!(raised <= 15_000, "no event reached the second server");
+        raise();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic_at(name, "observe stream failed", 1);
+    second.stop();
+    assert!(
+        eventually(|| trap_spent(name)),
+        "the line of the second end did not panic"
+    );
+    assert!(
+        eventually(|| lines(name, "observe task panicked").len() == 2),
+        "{:?}",
+        lines(name, "observe task panicked")
+    );
+}
+
+/// A plugin that ends every `Observe` call at its hello is one outage: the
+/// calls that carried no event say one line between them. The server's word
+/// is set before the load and no event is raised, so the first call ends at
+/// its hello and says the line; the next two end at theirs, a connect frame
+/// apart, and say nothing.
+#[test]
+fn calls_that_end_with_no_event_carried_say_one_line() {
+    said();
+    let name = "ends-at-the-hello";
+    let served = TestPlugin::serve();
+    served.script(|s| s.observe_ack = "enough".to_owned());
+    let runtime = runtime();
+    let mut row = spec(&served, name);
+    row.connect_micros = 1_000_000;
+    let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
+    assert!(
+        eventually(|| served.seen().observe_hellos.len() >= 3),
+        "the stream was not asked for again: {:?}",
+        plugin.stats()
+    );
+    assert_eq!(
+        lines(name, "observe stream failed").len(),
+        1,
+        "{:?}",
+        lines(name, "observe stream failed")
     );
 }
 

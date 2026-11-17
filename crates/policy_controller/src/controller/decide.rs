@@ -456,7 +456,7 @@ mod tests {
             election::{LeasePlace, Standing},
             gateways::{tests::PATIENT, Seat},
             principal::{tests::told, Layer, ENTRY},
-            replication::journaled,
+            replication::journaled_from,
             service::{Service, Shared},
             session::GRACE_PERIOD,
             wire::{Checked, MAX_FRAME},
@@ -517,7 +517,7 @@ mod tests {
         cap: Option<u32>,
         steps: impl IntoIterator<Item = Step>,
     ) -> Bed {
-        let (store, log) = journaled(&LeasePlace::Process);
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         let (workers, _sides) = fleet(&store);
         store
             .apply(preset("random", 1))
@@ -557,7 +557,7 @@ mod tests {
             ADDRESS.to_owned(),
             &elector,
             stood.clone(),
-            (Arc::clone(&store), log),
+            (Arc::clone(&store), feed),
             Arc::new(crate::Catalog::builtin()),
             1,
         )

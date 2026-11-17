@@ -26,8 +26,8 @@ use smg::{
         BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
         RoundRobinPolicy, SelectWorkerInfo,
     },
-    routers::grpc::backend_client::BackendClient,
     worker::{
+        connection::engine::EngineConnection,
         health::{
             circuit_breaker::{CircuitBreaker, CircuitState},
             resilience::ResolvedResilience,
@@ -239,7 +239,7 @@ impl Worker for GrpcWorker {
         Some(Arc::clone(&self.http_client))
     }
 
-    async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
+    async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {
         // Not used by policies — the FFI layer handles the backend directly.
         Ok(None)
     }

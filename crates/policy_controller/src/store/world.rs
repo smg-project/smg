@@ -289,6 +289,12 @@ impl Derived {
         let prefill = self.by_model.get(model)?[role_slot(Role::Prefill)]?;
         self.pools.get(prefill as usize)?.pairs.as_ref()
     }
+
+    /// How many members `pool` holds: none where there is no pool.
+    fn members(&self, pool: Option<u32>) -> usize {
+        pool.and_then(|pool| self.pools.get(pool as usize))
+            .map_or(0, |shape| shape.admitted_micros.len())
+    }
 }
 
 /// One standing veto as its gateway's run in a pool carries it: the row it
@@ -891,6 +897,18 @@ struct Entry<'a> {
     own: Overload,
 }
 
+/// The list a membership write fills for a pool that stood at `standing`
+/// members: room for them and one more, the most a membership write adds a
+/// pool, so the list is allocated once. A pool that did not stand takes no
+/// room, and its list grows as it fills.
+fn list_of<T>(standing: usize) -> Vec<T> {
+    if standing == 0 {
+        Vec::new()
+    } else {
+        Vec::with_capacity(standing + 1)
+    }
+}
+
 /// What the pairing rule reads of one side's entries, in place: each
 /// worker's id, wires, runtime and descriptor.
 impl<'a> Pool<'a> for [Entry<'a>] {
@@ -1057,10 +1075,11 @@ struct EngineRow {
 
 /// How many report periods a rank's sample may lie behind its engine's
 /// newest receipt and still be judged. The period told is no shorter than
-/// the caller's poll and its deadline, so a rank that loses a report is
-/// heard again well inside three periods. A rank that stays silent is
-/// counted through three periods, so through two lost reports, and ends
-/// at the first judged write after them.
+/// the time between two of the caller's polls and than a poll's deadline,
+/// so a rank that loses a report is heard again inside three periods. A
+/// rank that stays silent is counted through three periods, so through
+/// one lost report at the least, and ends at the first judged write
+/// after them.
 const SAMPLE_PERIODS: u64 = 3;
 
 /// The engine's rows, in the writer's list of every engine's.
@@ -1271,7 +1290,10 @@ impl Writer {
     }
 
     /// Each pool's thresholds under the standing generation: those of the
-    /// first binding that matches the pool's model and its role's phase.
+    /// binding the pool is decided under, which is the first to match its
+    /// model and its role's phase, or the model's pair binding for a
+    /// decode pool
+    /// ([`Engine::pool_binding`](crate::framework::Engine::pool_binding)).
     /// Whether any pool has a pair.
     fn bind(&mut self) -> bool {
         let Self {
@@ -1291,7 +1313,7 @@ impl Writer {
                 };
                 pool.binding = spec
                     .engine()
-                    .binding(model, phase_of(role))
+                    .pool_binding(model, phase_of(role))
                     .and_then(|binding| binding.overload);
                 bound |= pool.binding.is_some();
             }
@@ -1673,7 +1695,13 @@ impl Writer {
                 match groups.get_mut(model.as_str()) {
                     Some(sides) => sides[side].push(entry),
                     None => {
-                        let mut sides: [Vec<Entry<'a>>; ROLES] = Default::default();
+                        // Each side takes room for its pool's last members
+                        // and the one this write may add.
+                        let before = self.derived.by_model.get(model.as_str());
+                        let standing = before.map_or([0; ROLES], |pools| {
+                            pools.map(|pool| self.derived.members(pool))
+                        });
+                        let mut sides: [Vec<Entry<'a>>; ROLES] = standing.map(list_of);
                         sides[side].push(entry);
                         groups.insert(model.as_str().into(), sides);
                     }

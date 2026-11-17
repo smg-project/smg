@@ -1377,7 +1377,7 @@ impl WorkerMonitor {
         members: &[Arc<dyn Worker>],
     ) -> Option<WorkerLoadResponse> {
         let worker = members.first()?;
-        let backend_client = match worker.get_backend_client().await {
+        let backend_client = match worker.engine_connection().await {
             Ok(Some(client)) => client,
             Ok(None) => {
                 debug!("No backend client for worker {}", worker.redacted_url());

@@ -32,6 +32,7 @@ use crate::{
         },
         gateway::Gateway,
         grpc::{
+            backend_client::BackendConnector,
             multimodal::MultimodalConfigRegistry,
             regular::symphony::{check_names, named_table},
             utils::{Names, ALIASES},
@@ -808,7 +809,9 @@ impl AppContextBuilder {
 
     /// Create worker registry
     fn with_worker_registry(mut self) -> Self {
-        self.worker_registry = Some(Arc::new(WorkerRegistry::new()));
+        self.worker_registry = Some(Arc::new(
+            WorkerRegistry::new().with_engine_connector(BackendConnector::shared()),
+        ));
         self
     }
 
@@ -1012,7 +1015,7 @@ fn mcp_bootstrap_config(file: Option<&smg_mcp::McpConfig>) -> smg_mcp::McpConfig
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::{HealthCheckConfig, WorkerSpec, WorkerStatus};
     use tracing_test::traced_test;
 
     use super::*;
@@ -1020,7 +1023,8 @@ mod tests {
         config::types::PolicyConfig,
         routers::common::prefill_admission::PrefillAdmissionAttempt,
         worker::{
-            test_support::{select_worker, worker_of},
+            connection::engine::NO_ENGINE_CONNECTOR,
+            test_support::{select_worker, worker_of, RefusedAddress},
             BasicWorkerBuilder, ConnectionMode, SubscriptionKind, Worker, WorkerType,
         },
     };
@@ -1404,6 +1408,40 @@ policy:
                 .and_then(|proxy| proxy.https.as_deref()),
             Some("http://env-proxy.example:3128")
         );
+    }
+
+    /// The registry the gateway builds connects its mesh imports through
+    /// the gateway's connector: an imported gRPC worker's connect reaches
+    /// for its engine, it is not refused for want of a connector.
+    #[tokio::test]
+    async fn the_gateways_registry_connects_its_mesh_imports() {
+        let refused = RefusedAddress::reserve();
+        let registry = AppContextBuilder::new()
+            .with_worker_registry()
+            .worker_registry
+            .expect("the registry");
+        let mut spec = WorkerSpec::new(format!("grpc://{}", refused.addr()));
+        spec.connection_mode = ConnectionMode::Grpc;
+        registry.on_remote_worker_state(&smg_mesh::WorkerState {
+            worker_id: "peer-w1".to_string(),
+            model_id: "m".to_string(),
+            url: spec.url.clone(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: serde_json::to_vec(&spec).expect("a spec encodes"),
+            owner: "peer".to_string(),
+        });
+        let import = registry.get_all().pop().expect("the import");
+        assert_eq!(*import.connection_mode(), ConnectionMode::Grpc);
+
+        match import.engine_connection().await {
+            Ok(connection) => assert!(connection.is_some()),
+            Err(refusal) => assert!(
+                !refusal.to_string().contains(NO_ENGINE_CONNECTOR),
+                "{refusal}"
+            ),
+        }
     }
 
     #[tokio::test]
