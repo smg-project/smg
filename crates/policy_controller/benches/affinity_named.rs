@@ -23,7 +23,7 @@ use column::build_column;
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    Constraints, NamedAffinity, NamedHolder, PoolFacts, RequestFacts, Scratch,
+    Constraints, NamedAffinity, NamedHolder, Phase, PoolFacts, RequestFacts, Scratch,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -54,7 +54,7 @@ fn decide(c: &mut Criterion) {
         let mut held = Vec::with_capacity(n);
         build_column(&fleet, &mut held);
         // The holders of the fleet's column as a host names them: the deepest
-        // first, at most the picker's sample.
+        // first, at most the sample of the profile that decides.
         let mut holders: Vec<NamedHolder> = (0u32..)
             .zip(&held)
             .filter(|(_, entry)| entry.overlap_blocks > 0 || entry.predicted_blocks > 0)
@@ -64,7 +64,7 @@ fn decide(c: &mut Criterion) {
                 predicted_blocks: entry.predicted_blocks,
             })
             .collect();
-        let cap = engine.needs().sample as usize;
+        let cap = engine.needs_for("m", Phase::Single).sample as usize;
         if cap > 0 && holders.len() > cap {
             holders.sort_by_key(|holder| std::cmp::Reverse(holder.overlap_blocks));
             let edge = holders[cap].overlap_blocks;

@@ -340,7 +340,8 @@ pub struct AffinityFacts {
 /// column, so nothing of the pool's length is filled for a decision. Both
 /// lists are the host's to keep ascending by row and under the candidates'
 /// count: a debug build asserts it where a decision takes its inputs, and a
-/// release build reads them as they stand. In-process only.
+/// release build reads them as they stand, a row past the count naming
+/// nobody. In-process only.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NamedAffinity<'a> {
     /// The rows that hold a leading part of the request, ascending by row,
@@ -356,7 +357,7 @@ pub struct NamedAffinity<'a> {
     /// mean of the rows the picker drew, so a row the host named does not
     /// move the mean it is judged against. The engine sets it; a host
     /// leaves `None`, which reads as the mean of the rows a stage is
-    /// handed.
+    /// handed, and a debug build asserts that it did.
     pub mean_in_flight: Option<f32>,
 }
 

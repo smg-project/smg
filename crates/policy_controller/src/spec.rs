@@ -164,7 +164,10 @@ pub struct Needs {
     /// depth, whole depth groups from the deepest while they fit and the
     /// group at the cap's edge by a uniform draw from the decision's seed;
     /// the warming rows by that draw over their whole list. A host that
-    /// cannot fills the column, and the pool is read whole.
+    /// cannot fills the column, and the pool is read whole. The cap of a
+    /// decision is its own profile's, which
+    /// [`Engine::needs_for`](crate::Engine::needs_for) says: the engine's
+    /// summary holds the largest sample of every profile.
     pub sample: u32,
 }
 

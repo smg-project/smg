@@ -976,8 +976,8 @@ fn draws_first(profile: &Profile) -> bool {
 /// ([`Picker::joined_by_named`]): each named row every filter keeps is
 /// pushed behind the draw, none twice, the holders before the warming rows.
 /// Returns the mean in flight of the rows drawn, which the spill gate reads
-/// in place of the mean of the rows handed. A named row past the pool fails
-/// here, as an index past the candidates does.
+/// in place of the mean of the rows handed. A named row past the pool names
+/// no candidate and is passed over.
 fn join_named(
     named: &NamedAffinity<'_>,
     candidates: &[Candidate],
@@ -987,7 +987,10 @@ fn join_named(
     let mean = mean_in_flight(candidates, kept);
     let holders = named.holders.iter().map(|holder| holder.row);
     for row in holders.chain(named.warming.iter().copied()) {
-        if !kept.contains(&row) && keep(&candidates[row as usize]) {
+        let Some(candidate) = candidates.get(row as usize) else {
+            continue;
+        };
+        if !kept.contains(&row) && keep(candidate) {
             kept.push(row);
         }
     }
@@ -1717,21 +1720,24 @@ fn column_fits(column: &[AffinityFacts], pool: &[Candidate]) -> bool {
 /// A debug build asserts that the rows a host named in the column's place
 /// ([`NamedAffinity`](crate::NamedAffinity)) stand for `pool`, once where a
 /// decision takes its inputs: both lists ascending and under the pool's
-/// size, beside an empty column. A list out of order hides a holder from
-/// the stages' search, and a column beside the rows is read in their
-/// place. A release build does not check what the host derived: the test
-/// would ride every decision, a keyed one among them.
+/// size, beside an empty column, and no mean in flight, which is the
+/// engine's to set behind a draw. A list out of order hides a holder from
+/// the stages' search, a column beside the rows is read in their place,
+/// and a mean the host wrote is read for the mean of the rows wherever
+/// the pool is read whole. A release build does not check what the host
+/// derived: the test would ride every decision, a keyed one among them.
 fn debug_assert_named(facts: &RequestFacts<'_>, pool: &[Candidate]) {
     let under = |row: u32| (row as usize) < pool.len();
     debug_assert!(
         facts.named.is_none_or(|named| {
             facts.affinity.is_empty()
+                && named.mean_in_flight.is_none()
                 && named.holders.is_sorted_by(|a, b| a.row < b.row)
                 && named.holders.last().is_none_or(|holder| under(holder.row))
                 && named.warming.is_sorted_by(|a, b| a < b)
                 && named.warming.last().is_none_or(|&row| under(row))
         }),
-        "rows named in the column's place stand ascending and under the pool's size, beside an empty column"
+        "rows named in the column's place stand ascending and under the pool's size, beside an empty column and no mean in flight"
     );
 }
 
@@ -7480,5 +7486,118 @@ mod tests {
         }
         // A draw that takes all four holders reads a mean they pass: rare.
         assert!(led < 20, "{led} of 200 decisions were led by a busy holder");
+    }
+
+    /// A named row past the pool names no candidate: the join passes over
+    /// it in every build and asks no filter about it. A decision of a debug
+    /// build stops before the join ([`debug_assert_named`]).
+    #[test]
+    fn the_join_passes_over_a_row_named_past_the_pool() {
+        let pool = pool_of(4, |i| i == 2);
+        let holders = [holding(1, 12), holding(2, 12), holding(9, 12)];
+        let named = NamedAffinity {
+            holders: &holders,
+            warming: &[3, 4, u32::MAX],
+            ..NamedAffinity::default()
+        };
+        let mut asked = Vec::new();
+        let mut keep = |row: &Candidate| {
+            asked.push(row.position);
+            row.health.healthy
+        };
+        let mut kept = vec![0];
+        join_named(&named, &pool, &mut keep, &mut kept);
+        assert_eq!(kept, [0, 1, 3], "the pool's rows a filter keeps join");
+        assert_eq!(
+            asked,
+            [1, 2, 3],
+            "a filter is asked of the pool's rows alone"
+        );
+    }
+
+    /// Two profiles whose `best` takes a sample of four and of sixteen, for
+    /// the models `narrow` and `wide`.
+    fn two_samples() -> Engine {
+        let sampled = |name: &str, sample| Profile {
+            name: name.into(),
+            filters: vec![Box::new(Healthy)],
+            scorers: Vec::new(),
+            picker: Box::new(crate::builtins::SampledBest::new(sample)),
+        };
+        let bound = |model: &str, profile| Binding {
+            model: model.into(),
+            profile,
+            ..single_binding()
+        };
+        Engine::new(
+            vec![sampled("narrow", 4), sampled("wide", 16)],
+            vec![bound("narrow", 0), bound("wide", 1)],
+            1,
+            Needs::default(),
+        )
+    }
+
+    /// A host caps the rows it names by the sample of the profile that
+    /// decides, which [`Engine::needs_for`] says; the engine's summary
+    /// holds the largest sample of every profile. The cache-aware preset
+    /// says sixteen for a model's single decision.
+    #[test]
+    fn a_host_reads_the_cap_of_the_rows_it_names_from_the_profile_that_decides() {
+        let engine = two_samples();
+        assert_eq!(engine.needs().sample, 16);
+        let pool = pool_of(64, |_| false);
+        let holders: Vec<crate::NamedHolder> = (0..16).map(|row| holding(row, 12)).collect();
+        for (model, sample) in [("narrow", 4usize), ("wide", 16)] {
+            let cap = engine.needs_for(model, Phase::Single).sample as usize;
+            assert_eq!(cap, sample, "{model}");
+            let facts = RequestFacts {
+                model,
+                ..naming(1, &holders[..cap])
+            };
+            let got = drawn(&engine, &facts, &pool);
+            assert!(got.trace().drew_first(), "{model}: capped so, it draws");
+        }
+        let cache_aware = preset("cache_aware");
+        assert_eq!(cache_aware.needs_for("m", Phase::Single).sample, 16);
+    }
+
+    /// Capped by the engine's summary instead, the rows a host names under
+    /// the narrower profile stand past its picker's sample: a debug build
+    /// stops, by the assertion's own words.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "at or under the sample of the picker that draws")]
+    fn rows_capped_by_the_engines_summary_stop_a_debug_build_under_a_narrower_profile() {
+        let engine = two_samples();
+        let holders: Vec<crate::NamedHolder> = (0..engine.needs().sample)
+            .map(|row| holding(row, 12))
+            .collect();
+        let facts = RequestFacts {
+            model: "narrow",
+            ..naming(1, &holders)
+        };
+        let decision = drawn(&engine, &facts, &pool_of(64, |_| false));
+        panic!("sixteen rows named under a sample of four answered {decision:?}");
+    }
+
+    /// The mean in flight is the engine's to set behind a draw. A host that
+    /// writes one stops a debug build, by the assertion's own words: on a
+    /// pool read whole the stages would read its number for their rows'.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "beside an empty column and no mean in flight")]
+    fn a_mean_in_flight_a_host_wrote_stops_a_debug_build() {
+        let engine = preset("cache_aware");
+        let holders = [holding(3, 12)];
+        let facts = RequestFacts {
+            named: Some(NamedAffinity {
+                holders: &holders,
+                mean_in_flight: Some(2.0),
+                ..NamedAffinity::default()
+            }),
+            ..request(1)
+        };
+        let decision = drawn(&engine, &facts, &pool_of(8, |_| false));
+        panic!("a mean the host wrote answered {decision:?}");
     }
 }
