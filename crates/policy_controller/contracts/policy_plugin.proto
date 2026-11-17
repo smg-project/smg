@@ -297,9 +297,11 @@ message RequestFacts {
   // Wire-only, foreign hosts only (a front with text and no tokenizer): the
   // controller hashes it into `block_hashes` before any stage sees the view,
   // bounded by `view.max_prompt_text_bytes`, a field of the spec still to
-  // come with the step that hashes text. A controller that does not hash
-  // it yet keeps none of it: it answers the request `Busy` with no reason
-  // and never decides it as a request with no prefix.
+  // come with the step that hashes text: a text over the cap is read to the
+  // cap and its tail is not read, and a cap of 0 takes no text. A
+  // controller that does not hash it yet keeps none of it: it answers the
+  // request `Busy` with no reason and never decides it as a request with no
+  // prefix.
   bytes prompt_text = 18;
   // The size in tokens of one of the request's blocks as the host counted
   // them: an index's learned block size on an event-fed request, the

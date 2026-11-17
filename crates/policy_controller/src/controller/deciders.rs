@@ -261,7 +261,9 @@ pub(crate) struct Deciders {
     queues: Box<[SyncSender<Job>]>,
     /// Shows `true` once a decider's thread unwound.
     told: Arc<watch::Sender<bool>>,
-    /// What every decider reads: the scrape reads its counts.
+    /// What a stream's reader reads beside its deciders: the clock a
+    /// frame's receipt is stamped by and the term the reader's own answers
+    /// carry.
     reads: Reads,
 }
 
@@ -319,6 +321,22 @@ impl Deciders {
     /// goes to one, whichever stream carries it.
     pub(crate) fn of(&self, model: &str) -> usize {
         (fingerprint(model.as_bytes()) % self.queues.len() as u64) as usize
+    }
+
+    /// The deciders' clock. A stream's reader stamps a frame's receipt by
+    /// it, so a budget is counted on one clock.
+    pub(crate) fn now(&self) -> Instant {
+        (self.reads.clock)()
+    }
+
+    /// The highest term this replica knows ([`Reads::known_term`]).
+    pub(crate) fn known_term(&self) -> u64 {
+        self.reads.known_term()
+    }
+
+    /// A `Busy` of a stream's reader ([`Reads::busy`]).
+    pub(crate) fn busy(&self, id: Vec<u8>, reason: Reason) -> proto::DecideAnswer {
+        self.reads.busy(id, reason)
     }
 
     /// What the deciders and their streams count.
