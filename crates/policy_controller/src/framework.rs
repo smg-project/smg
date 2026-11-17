@@ -824,27 +824,85 @@ fn trace_of(
     kept: &[u32],
     scores: &[f32],
 ) -> Trace {
+    trace_by::<false>(profile, facts, pool, candidates, kept, scores)
+}
+
+/// [`trace_of`] behind a draw. The rows stand in the draw's order, so
+/// their best are read as a draw's ([`top_drawn`]); and a draw reads a
+/// part of the pool, so its survivors are not counted.
+fn trace_drawn(
+    profile: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    candidates: &[Candidate],
+    kept: &[u32],
+    scores: &[f32],
+) -> Trace {
+    trace_by::<true>(profile, facts, pool, candidates, kept, scores)
+}
+
+/// The trace of a decision over the rows `kept` and their `scores`: a
+/// pool read whole, or the rows of a draw (`DRAWN`). One body, the read
+/// of the best scores chosen where it is entered.
+#[inline(always)]
+fn trace_by<const DRAWN: bool>(
+    profile: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    candidates: &[Candidate],
+    kept: &[u32],
+    scores: &[f32],
+) -> Trace {
     let mut trace = Trace {
         profile,
-        survivors: Survivors::counted(kept.len() as u32),
+        survivors: if DRAWN {
+            Survivors::NOT_COUNTED
+        } else {
+            Survivors::counted(kept.len() as u32)
+        },
         seed: facts.seed,
         generation: pool.generation,
         ..Trace::default()
     };
-    // One pass: a row enters the top when it beats the lowest row kept, and
-    // moves above a kept row only when strictly better, so equal scores keep
-    // the scan's order (the earlier row ahead).
-    let mut top: [(usize, f32); TRACE_TOP] = [(0, f32::NEG_INFINITY); TRACE_TOP];
+    let mut top = [(0, f32::NEG_INFINITY); TRACE_TOP];
+    let len = if DRAWN {
+        top_drawn(scores, &mut top)
+    } else {
+        top_pass(scores, &mut top)
+    };
+    for (slot, &(i, score)) in top.iter().enumerate().take(len) {
+        trace.top[slot] = (candidates[kept[i] as usize].id, score);
+    }
+    trace.top_len = len as u8;
+    trace
+}
+
+/// The `K` best of `scores` in descending order, each with its place in
+/// the scan, into the first slots of `top`; the answer is how many there
+/// are, and a slot past them is left as it was. A row enters when it
+/// beats the lowest row kept, and moves above a kept row only when
+/// strictly better, so equal scores keep the scan's order (the earlier
+/// row ahead).
+///
+/// This is the read of a pool read whole. Its rows come in the host's
+/// order decision after decision: a row that beats nobody kept is passed
+/// over by one test, which a processor predicts.
+///
+/// The slots are the caller's, not an array handed back: by count, the
+/// array by value cost a whole pass a copy a decision in the ranked push
+/// and four instructions a row in the trace.
+#[inline(always)]
+pub(crate) fn top_pass<const K: usize>(scores: &[f32], top: &mut [(usize, f32); K]) -> usize {
     let mut len = 0usize;
     for (i, &score) in scores.iter().enumerate() {
-        if len == TRACE_TOP && score <= top[TRACE_TOP - 1].1 {
+        if len == K && score <= top[K - 1].1 {
             continue;
         }
-        let mut slot = if len < TRACE_TOP {
+        let mut slot = if len < K {
             len += 1;
             len - 1
         } else {
-            TRACE_TOP - 1
+            K - 1
         };
         while slot > 0 && score > top[slot - 1].1 {
             top[slot] = top[slot - 1];
@@ -852,11 +910,67 @@ fn trace_of(
         }
         top[slot] = (i, score);
     }
-    for (slot, &(i, score)) in top.iter().enumerate().take(len) {
-        trace.top[slot] = (candidates[kept[i] as usize].id, score);
+    len
+}
+
+/// [`top_pass`] behind a draw: the same answer at another cost. The rows
+/// come in the draw's order and no test of a score is predicted, so each
+/// row is placed by its key ([`top_keyed`]), the same work whatever it
+/// scores. Three lists are read as the pass reads them: one under
+/// [`KEYED_FROM`] rows, one that holds a score without an order, and one
+/// past the keys' places.
+#[inline(always)]
+pub(crate) fn top_drawn<const K: usize>(scores: &[f32], top: &mut [(usize, f32); K]) -> usize {
+    if scores.len() >= KEYED_FROM
+        && scores.len() <= 1 << PLACE_BITS
+        && !scores.iter().fold(false, |nan, score| nan | score.is_nan())
+    {
+        return top_keyed(scores, top);
     }
-    trace.top_len = len as u8;
-    trace
+    top_pass(scores, top)
+}
+
+/// From how many rows a draw's best scores are read by keys. A shorter
+/// list holds few tests to mispredict, and the pass's form reads it in
+/// fewer instructions: by count the four rows another picker draws cost
+/// 92 more a decision by keys. Keys were measured over lists of sixteen
+/// rows and more.
+const KEYED_FROM: usize = 16;
+
+/// How many bits of a key name a row's place: a list of up to
+/// `1 << PLACE_BITS` rows is read by keys.
+const PLACE_BITS: u32 = 20;
+
+/// [`top_drawn`] over scores that order. Each row is one key: its score's
+/// bits in the scores' order, above its place counted from the end, so the
+/// greater key is the better score and, between equal scores, the earlier
+/// row. The best `K` keys are kept by a maximum and a minimum a slot, the
+/// same work whatever a row scores. A key is a whole number
+/// under 2^52 and exact as an `f64`: a processor takes the greater of two
+/// such numbers by one instruction, and of two integers by a conditional
+/// move, which a compiler turns back into a branch inside a loop.
+#[inline(always)]
+fn top_keyed<const K: usize>(scores: &[f32], top: &mut [(usize, f32); K]) -> usize {
+    let places = (1u64 << PLACE_BITS) - 1;
+    let mut keys = [0.0f64; K];
+    for (i, &score) in scores.iter().enumerate() {
+        // A negative zero reads as zero. The sign bit is turned, and under
+        // a set sign every other bit, so the bits order as the scores do.
+        let bits = (score + 0.0).to_bits();
+        let order = bits ^ (((bits as i32 >> 31) as u32) | 0x8000_0000);
+        let mut key = ((u64::from(order) << PLACE_BITS | (places - i as u64)) as i64) as f64;
+        for slot in &mut keys {
+            let held = *slot;
+            *slot = held.max(key);
+            key = held.min(key);
+        }
+    }
+    let len = scores.len().min(K);
+    for (slot, &key) in top.iter_mut().zip(&keys).take(len) {
+        let i = (places - (key as u64 & places)) as usize;
+        *slot = (i, scores[i]);
+    }
+    len
 }
 
 fn shed(reason: ShedReason, emptied_by: &'static str, trace: Trace) -> Decision {
@@ -1134,10 +1248,7 @@ fn run_drawn(
             }
         }
         if !targets.is_empty() {
-            let trace = Trace {
-                survivors: Survivors::NOT_COUNTED,
-                ..trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores)
-            };
+            let trace = trace_drawn(index, facts, pool, candidates, &buf.kept, &buf.scores);
             return Decision::Pick(Pick {
                 targets,
                 trace,
@@ -7705,5 +7816,84 @@ mod tests {
         let got = drawn(&engine, &naming(1, &holders), &pool_of(64, |_| true));
         assert!(!got.trace().drew_first());
         assert!(got.pick().is_none());
+    }
+
+    /// A draw's read of the best scores is the whole pass's, slot for slot:
+    /// ties, scores without an order and every count of rows around the
+    /// count kept. The keys' own read is held to the pass's at every count,
+    /// under the count a draw reads by keys too.
+    #[test]
+    fn the_best_scores_of_a_draw_are_the_best_scores_of_a_pass() {
+        fn bits<const K: usize>(
+            read: impl Fn(&[f32], &mut [(usize, f32); K]) -> usize,
+            scores: &[f32],
+        ) -> ([(usize, u32); K], usize) {
+            let mut top = [(usize::MAX, f32::NEG_INFINITY); K];
+            let len = read(scores, &mut top);
+            (top.map(|(i, score)| (i, score.to_bits())), len)
+        }
+        fn held<const K: usize>(scores: &[f32]) {
+            assert_eq!(
+                bits(top_drawn::<K>, scores),
+                bits(top_pass::<K>, scores),
+                "{scores:?}"
+            );
+            if !scores.iter().any(|score| score.is_nan()) {
+                assert_eq!(
+                    bits(top_keyed::<K>, scores),
+                    bits(top_pass::<K>, scores),
+                    "{scores:?}"
+                );
+            }
+        }
+        let values = [
+            0.0f32,
+            -0.0,
+            0.25,
+            0.5,
+            0.5,
+            0.75,
+            1.0,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..4_000usize {
+            let scores: Vec<f32> = (0..round % 41)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    // Every second list holds no score without an order.
+                    values[(state >> 33) as usize % (values.len() - round % 2)]
+                })
+                .collect();
+            held::<1>(&scores);
+            held::<TRACE_TOP>(&scores);
+            held::<5>(&scores);
+        }
+    }
+
+    /// A draw's trace names the best of its rows as a pass's trace does,
+    /// equal scores among them, and does not count its survivors.
+    #[test]
+    fn a_draws_trace_names_its_best_rows_as_a_passes_trace_does() {
+        let pool = pool_of(40, |_| false);
+        let facts = request(7);
+        // A draw's order, and scores that tie.
+        let kept: Vec<u32> = (0..40u32).rev().step_by(3).collect();
+        let scores: Vec<f32> = kept.iter().map(|&row| (row % 7) as f32 / 8.0).collect();
+        let pass = trace_of(3, &facts, &PoolFacts::default(), &pool, &kept, &scores);
+        let draw = trace_drawn(3, &facts, &PoolFacts::default(), &pool, &kept, &scores);
+        assert_eq!(usize::from(pass.top_len), TRACE_TOP);
+        assert_eq!(draw.survivors, Survivors::NOT_COUNTED);
+        assert_eq!(
+            Trace {
+                survivors: pass.survivors,
+                ..draw
+            },
+            pass
+        );
     }
 }

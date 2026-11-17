@@ -18,7 +18,7 @@ use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::{
     decision::{Target, Targets, MAX_TARGETS},
-    framework::{Filter, Narrowed, Picker, Scorer, TieBand, DRAW_BOUND},
+    framework::{top_drawn, top_pass, Filter, Narrowed, Picker, Scorer, TieBand, DRAW_BOUND},
     lease::{Lease, Lifecycle, Membership, Side},
     spec::Needs,
     view::{Candidate, Constraints, LoadRow, ModelFingerprint, PoolFacts, RequestFacts, WorkerId},
@@ -1149,8 +1149,9 @@ fn draw_flat(
 /// rows on, a slot costs the passes of [`draw_in_band`] and one value of the
 /// draw; where that band's rows score alike, its slots are drawn by rank in
 /// one count ([`draw_flat`]). The taken slots
-/// live in a fixed array: nothing is allocated.
-fn push_ranked(
+/// live in a fixed array: nothing is allocated. `DRAWN` is the order of a
+/// draw: the five best are read with no branch on a score ([`top_drawn`]).
+fn push_ranked<const DRAWN: bool>(
     mut draw: Draw,
     candidates: &[Candidate],
     kept: &[u32],
@@ -1159,25 +1160,12 @@ fn push_ranked(
     out: &mut Targets,
 ) {
     let slots = MAX_TARGETS.min(kept.len());
-    let mut best_five: [(usize, f32); MAX_TARGETS + 1] =
-        [(usize::MAX, f32::NEG_INFINITY); MAX_TARGETS + 1];
-    let mut len = 0usize;
-    for (i, &s) in scores.iter().enumerate() {
-        if len == best_five.len() && s <= best_five[len - 1].1 {
-            continue;
-        }
-        let mut at = if len < best_five.len() {
-            len += 1;
-            len - 1
-        } else {
-            best_five.len() - 1
-        };
-        while at > 0 && s > best_five[at - 1].1 {
-            best_five[at] = best_five[at - 1];
-            at -= 1;
-        }
-        best_five[at] = (i, s);
-    }
+    let mut best_five = [(usize::MAX, f32::NEG_INFINITY); MAX_TARGETS + 1];
+    let len = if DRAWN {
+        top_drawn(scores, &mut best_five)
+    } else {
+        top_pass(scores, &mut best_five)
+    };
     let mut taken = [usize::MAX; MAX_TARGETS];
     let mut filled = 0usize;
     while filled < slots
@@ -1289,7 +1277,7 @@ impl Picker for Best {
         band: TieBand,
         out: &mut Targets,
     ) {
-        push_ranked(Draw::new(facts.seed), candidates, kept, scores, band, out);
+        push_ranked::<false>(Draw::new(facts.seed), candidates, kept, scores, band, out);
     }
 }
 
@@ -1331,7 +1319,21 @@ impl Picker for SampledBest {
         band: TieBand,
         out: &mut Targets,
     ) {
-        push_ranked(Draw::new(facts.seed), candidates, kept, scores, band, out);
+        push_ranked::<false>(Draw::new(facts.seed), candidates, kept, scores, band, out);
+    }
+
+    /// The pick over the rows drawn and joined, which stand in the draw's
+    /// order: their five best are read as a draw's.
+    fn order_drawn(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        push_ranked::<true>(Draw::new(facts.seed), candidates, kept, scores, band, out);
     }
 
     fn draws_first(&self) -> bool {
@@ -1825,7 +1827,7 @@ impl Picker for CountFirst {
         // The narrowing leaves one count, and among equal counts the pick is
         // the best picker's.
         if kept.windows(2).all(|pair| count(pair[0]) == count(pair[1])) {
-            return push_ranked(draw, candidates, kept, scores, band, out);
+            return push_ranked::<false>(draw, candidates, kept, scores, band, out);
         }
         // Rows that were never narrowed: the same rule a slot, among the
         // fewest in flight of the rows left. Every row here came with a

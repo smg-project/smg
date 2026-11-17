@@ -377,15 +377,26 @@ pub struct NamedHolder {
 impl<'a> NamedAffinity<'a> {
     /// Row `index`'s entry: what the host said the row holds when it is
     /// named, nothing held otherwise.
+    ///
+    /// The search ends on the first holder at or past the row, and the
+    /// entry is read from that holder or from a holder of nothing, by
+    /// whether it is the row: a choice between two places, where a branch
+    /// would tell a named row from another. Behind a draw the rows asked
+    /// come in the draw's order, and such a branch is one nothing predicts.
     #[inline]
     pub(crate) fn entry(&self, index: u32) -> AffinityFacts {
-        let Ok(at) = self
-            .holders
-            .binary_search_by_key(&index, |holder| holder.row)
-        else {
+        const NOBODY: NamedHolder = NamedHolder {
+            row: 0,
+            overlap_blocks: 0,
+            predicted_blocks: 0,
+        };
+        let Some(last) = self.holders.len().checked_sub(1) else {
             return AffinityFacts::default();
         };
-        self.holders[at].facts()
+        let at = self.holders.partition_point(|holder| holder.row < index);
+        let found = &self.holders[at.min(last)];
+        let holder = if found.row == index { found } else { &NOBODY };
+        holder.facts()
     }
 
     /// One pass's reads of the rows, walked beside the rows the pass asks.
