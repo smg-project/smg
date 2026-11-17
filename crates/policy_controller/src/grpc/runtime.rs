@@ -1025,10 +1025,10 @@ async fn run_observe(lane: Arc<ObserveLane>) {
     let Some(mut queue) = lane.queue.lock().take() else {
         return;
     };
-    // The events sent, one count for the plugin's life. An event's number
-    // is that count plus the events the queue refused: both only grow, so a
-    // number never goes down, on one stream or across two, and a gap is
-    // what the plugin lost.
+    // The events sent, one count for this load of the plugin. An event's
+    // number is that count plus the highest count of refusals an event has
+    // carried: both only grow, so a number never goes down, on one stream or
+    // across two, and a gap is what the plugin lost.
     let mut sent = 0_u64;
     // The refusals the events carried, the highest so far.
     let mut lost = 0_u64;
@@ -1036,22 +1036,33 @@ async fn run_observe(lane: Arc<ObserveLane>) {
     // telling of a failure). The queue and the counts are held here, outside
     // the turn: the events raised meanwhile wait in the queue, the numbers
     // go on, and the stream is asked for again a pause later. No decision
-    // asks for this stream, as one does for a `Decide` stream.
+    // asks for this stream, as one does for a `Decide` stream. A panic at
+    // every start says its line once: the count of events sent at the last
+    // line said.
+    let mut said_at = None;
     while let Err(panicked) = Caught(Box::pin(observe_streams(
         &lane, &mut queue, &mut sent, &mut lost,
     )))
     .await
     {
-        tracing::error!(
-            error = panic_text(&*panicked),
-            "a plugin's observe task panicked"
-        );
+        if streak_says(&mut said_at, sent) {
+            tracing::error!(
+                plugin = lane.peer.name,
+                error = panic_text(&*panicked),
+                "a plugin's observe task panicked"
+            );
+        }
         tokio::time::sleep(RECONNECT_PAUSE).await;
     }
 }
 
-/// The `Observe` calls of one plugin, each opened when the one before it
-/// ended, until the plugin is dropped.
+/// Whether a panicked turn says its line: once a streak. A streak is the
+/// panicked turns that sent no event between them, so a panic at every start
+/// says itself once, and a panic after an event was sent says itself again.
+fn streak_says(said_at: &mut Option<u64>, sent: u64) -> bool {
+    said_at.replace(sent) != Some(sent)
+}
+
 /// The number of the next event sent: the events sent, this one with them,
 /// plus the events lost ahead of it. An event comes with the refusals its
 /// thread had seen as it entered the queue, and the highest carried so far
@@ -1063,6 +1074,8 @@ fn number(sent: &mut u64, lost: &mut u64, carried: u64) -> u64 {
     *sent + *lost
 }
 
+/// The `Observe` calls of one plugin, each opened when the one before it
+/// ended, until the plugin is dropped.
 async fn observe_streams(
     lane: &ObserveLane,
     queue: &mut mpsc::Receiver<proto::ObserveRequest>,
@@ -1171,8 +1184,8 @@ mod tests {
     use tokio::{sync::mpsc, task::JoinSet};
 
     use super::{
-        number, run_commands, Command, Lane, LaneEvents, LaneState, ObserveLane, Peer, Runtime,
-        SendError, Wait, Witness, PROMISE_MICROS, RECONNECT_PAUSE, WINDOW,
+        number, run_commands, streak_says, Command, Lane, LaneEvents, LaneState, ObserveLane, Peer,
+        Runtime, SendError, Wait, Witness, PROMISE_MICROS, RECONNECT_PAUSE, WINDOW,
     };
     use crate::{grpc::config::Transport, plugins::OpenDecisions, proto};
 
@@ -1625,6 +1638,18 @@ mod tests {
             let earlier = self.told.fetch_add(1, Ordering::Relaxed);
             assert_ne!(earlier, 0, "the first telling panics");
         }
+    }
+
+    /// A panicked turn says its line once a streak: turns that sent no event
+    /// between them are one streak, and a turn that sent one starts another.
+    #[test]
+    fn a_streak_of_panicked_turns_says_one_line() {
+        let mut said_at = None;
+        assert!(streak_says(&mut said_at, 0));
+        assert!(!streak_says(&mut said_at, 0));
+        assert!(!streak_says(&mut said_at, 0));
+        assert!(streak_says(&mut said_at, 7));
+        assert!(!streak_says(&mut said_at, 7));
     }
 
     /// A count carried late moves no number back. Two threads raise at a
