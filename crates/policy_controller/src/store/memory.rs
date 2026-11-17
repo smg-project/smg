@@ -17,7 +17,7 @@ use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    lease::{LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+    lease::{LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass},
     spec::AppliedSpec,
     store::{
         health::{HealthSink, VetoWrite},
@@ -247,6 +247,11 @@ impl MemoryStore {
     /// store's epoch stays and no watcher is told. An apply takes the
     /// workers lock and then the load lock, as a membership write does: a
     /// writer's wait, never a decision's.
+    ///
+    /// The generation's engine is then told every member once, by id
+    /// ([`Membership::Snapshot`]), under the workers lock and with the load
+    /// lock let go: its stages start empty, and each membership write after
+    /// it is told behind the same lock, in its order.
     pub fn apply(&self, spec: AppliedSpec) -> Result<(), StaleGeneration> {
         // The writer takes a second reference: when it refuses, the last
         // one is this one, let go after the lock.
@@ -262,6 +267,10 @@ impl MemoryStore {
                 |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
             )?;
             writer.replaced(self.world.swap(world));
+            drop(loads);
+            let mut members: Vec<WorkerId> = workers.rows.keys().copied().collect();
+            members.sort_unstable();
+            spec.engine().on_membership(&Membership::Snapshot(&members));
             before
         };
         drop(before);
@@ -356,7 +365,18 @@ impl MemoryStore {
     /// swap. `classes` names the worker whose write moved a member or a
     /// member's offer: the pair classes are derived for it alone, or carried
     /// where the write moved none.
-    fn rebuild_world(&self, workers: &Workers, classes: Classes) {
+    ///
+    /// The write then tells that world's engine what `change` is to it
+    /// ([`MembershipChange::as_lifecycle`]): the swap first and the call
+    /// after it, with the load lock let go, so a load write waits for no
+    /// stage. The workers lock is still held, so the engine hears the
+    /// writes in their order, and an apply, which takes that lock, moves no
+    /// generation in between: the engine told is the one the world was
+    /// published under. A decision takes neither lock and meets the call at
+    /// a stage's own lock alone. One that built its view before the swap may
+    /// still name a worker the call took out: a stage answers that from its
+    /// own state, as the ring fences a pruned id ([`crate::ring::FENCE`]).
+    fn rebuild_world(&self, workers: &Workers, classes: Classes, change: MembershipChange) {
         let mut loads = self.loads.lock();
         let Loads { ranks, writer } = &mut *loads;
         let ranks = &*ranks;
@@ -367,6 +387,10 @@ impl MemoryStore {
             classes,
         );
         writer.replaced(self.world.swap(world));
+        drop(loads);
+        if let Some(change) = change.as_lifecycle() {
+            self.world.load().spec().engine().on_membership(&change);
+        }
     }
 
     /// Show the deciders the world a write made, when it made one. Called
@@ -711,7 +735,7 @@ impl WorkersStore for MemoryStore {
                     MembershipChange::Relabelled { id: old_id }
                 });
                 self.index_member(&workers, old_id);
-                self.rebuild_world(&workers, classes);
+                self.rebuild_world(&workers, classes, change);
                 return change;
             }
             // A new incarnation under the key: the old id leaves with its
@@ -767,7 +791,7 @@ impl WorkersStore for MemoryStore {
                 left: Some(old_id),
                 joined: Some(new_id),
             };
-            self.rebuild_world(&workers, classes);
+            self.rebuild_world(&workers, classes, change);
             return change;
         }
         let id = identity(&facts.key, facts.incarnation);
@@ -796,7 +820,7 @@ impl WorkersStore for MemoryStore {
             left: None,
             joined: Some(id),
         };
-        self.rebuild_world(&workers, classes);
+        self.rebuild_world(&workers, classes, change);
         change
     }
 
@@ -822,7 +846,7 @@ impl WorkersStore for MemoryStore {
         row.row.revision += 1;
         let change = workers.record(MembershipChange::Relabelled { id });
         // Labels, a priority and an overload are no part of an offer.
-        self.rebuild_world(&workers, Classes::Carry);
+        self.rebuild_world(&workers, Classes::Carry, change);
         Some(change)
     }
 
@@ -843,7 +867,7 @@ impl WorkersStore for MemoryStore {
             left: Some(id),
             joined: None,
         };
-        self.rebuild_world(&workers, classes);
+        self.rebuild_world(&workers, classes, change);
         Some(change)
     }
 
