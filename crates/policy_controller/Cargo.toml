@@ -336,5 +336,10 @@ harness = false
 name = "pair_classes"
 harness = false
 
+[[bench]]
+name = "decide_stream"
+harness = false
+required-features = ["controller"]
+
 [lints]
 workspace = true
