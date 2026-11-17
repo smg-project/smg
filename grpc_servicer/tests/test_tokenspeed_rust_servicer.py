@@ -1578,6 +1578,71 @@ def test_serve_rust_refuses_a_warm_up_knob_it_cannot_read_before_the_server_bind
     assert created == {}
 
 
+def test_the_remainders_knob_is_a_named_configuration_error_where_the_launchers_read_it():
+    assert rust.read_remainders_setting({}) == "auto"
+    assert rust.read_remainders_setting({rust.REMAINDERS_ENV: " Off "}) == "off"
+    assert rust.read_remainders_setting({rust.REMAINDERS_ENV: "1"}) == "on"
+    with pytest.raises(
+        rust_lifecycle.ServicerConfigError,
+        match="SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS='sometimes'",
+    ):
+        rust.read_remainders_setting({rust.REMAINDERS_ENV: "sometimes"})
+
+
+@pytest.mark.parametrize(
+    ("warmup", "role"),
+    [(None, "null"), ("off", "null"), (None, "decode")],
+    ids=["warm-up on", "warm-up off", "decode role"],
+)
+def test_serve_rust_refuses_a_remainders_knob_it_cannot_read_before_any_engine_work(
+    monkeypatch, tmp_path, warmup, role
+):
+    """The chunk-remainders knob is read with the launcher's other knobs, so a
+    value it does not take refuses the start before the model config is read
+    and the server binds, whether or not the warm-up runs and on a
+    disaggregation role, which plans none."""
+    created: dict = {}
+    configs_read: list = []
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.setattr(rust, "_model_config", lambda args: configs_read.append(args))
+    monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    if warmup is not None:
+        monkeypatch.setenv(rust.WARMUP_ENV, warmup)
+    monkeypatch.setenv(rust.REMAINDERS_ENV, "sometimes")
+    with pytest.raises(
+        rust_lifecycle.ServicerConfigError,
+        match="SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS='sometimes'",
+    ):
+        asyncio.run(rust.serve_rust(FakeServerArgs(port=50123, disaggregation_mode=role)))
+    assert created == {} and configs_read == []
+
+
+def test_serve_rust_plans_the_chunk_remainders_the_knob_asks_for(monkeypatch, tmp_path, caplog):
+    """The setting read with the launcher's knobs reaches the plan: on the
+    fake engine's unstated layout, auto keeps the chunk remainders, and off
+    plans the rest without them and says the hazard is open."""
+    _run_serve_rust(monkeypatch, tmp_path)
+    plan = _run_serve_rust.recorded["supervise_kwargs"]["warmup"].args[0]
+    assert any(step.kind == "remainder" for step in plan.steps)
+
+    monkeypatch.setenv(rust.REMAINDERS_ENV, "off")
+    caplog.set_level(logging.WARNING, logger="smg_grpc_servicer")
+    _run_serve_rust(monkeypatch, tmp_path)
+    plan = _run_serve_rust.recorded["supervise_kwargs"]["warmup"].args[0]
+    assert plan.steps and not any(step.kind == "remainder" for step in plan.steps)
+    assert any(
+        "no chunk remainders" in r.getMessage()
+        and "an unknown number of processes" in r.getMessage()
+        for r in caplog.records
+    )
+
+
 def test_serve_rust_defaults_both_startup_bounds(monkeypatch, tmp_path):
     """Without the environment variables the server gets the lifecycle's
     defaults for the silence bound and the ceiling."""
