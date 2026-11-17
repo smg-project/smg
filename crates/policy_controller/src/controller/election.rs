@@ -539,12 +539,16 @@ fn run(
                     }
                     None => {
                         seen.holder.clear();
-                        // A tick that names nobody still read a term, a
-                        // release's or a gone record's: the standing counts
-                        // it, so a holder restored under a lower term is
-                        // not named.
+                        // A step that names nobody still read a term: the
+                        // tick says a gone record's or a wait's, and the
+                        // record says a release's, read at the look that
+                        // lost the lease. The standing counts both, so a
+                        // holder restored under a lower term is not named.
                         if let Tick::Gone { term } | Tick::Waiting { term } = &tick {
                             seen.term = seen.term.max(*term);
+                        }
+                        if let Some(record) = elector.observed() {
+                            seen.term = seen.term.max(record.term);
                         }
                     }
                 }
@@ -816,6 +820,7 @@ fn give_up(elector: &mut Elector) {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         io::Write,
         net::{Ipv4Addr, Ipv6Addr, SocketAddr},
         path::PathBuf,
@@ -2019,11 +2024,13 @@ mod tests {
 
     /// A lease in this process that a case can lose: after `lose` it holds
     /// no record, as a deleted object or a deleted file. Every write that
-    /// lands is counted.
+    /// lands is counted. A case can also say what the next looks find: one
+    /// record stored before each read.
     #[derive(Clone, Default)]
     struct Losable {
         lease: MemoryLease,
         landed: Arc<AtomicU32>,
+        ahead: Arc<Mutex<VecDeque<LeaseRecord>>>,
     }
 
     impl Losable {
@@ -2042,6 +2049,12 @@ mod tests {
             });
         }
 
+        /// Records no candidate wrote, stored one before each of the next
+        /// reads, in order.
+        fn put_before_the_next_looks(&self, records: impl IntoIterator<Item = LeaseRecord>) {
+            self.ahead.lock().extend(records);
+        }
+
         fn landed(&self) -> u32 {
             self.landed.load(Ordering::SeqCst)
         }
@@ -2049,6 +2062,10 @@ mod tests {
 
     impl LeaseBackend for Losable {
         fn read(&mut self) -> Result<Option<LeaseRecord>, ElectError> {
+            let next = self.ahead.lock().pop_front();
+            if let Some(record) = next {
+                self.put(&record);
+            }
             self.lease.read()
         }
 
@@ -2318,6 +2335,53 @@ mod tests {
         let (_, text) = looping.stopped_with("the lease");
         assert_eq!(at_the_loss.holder, "b@127.0.0.1:2", "{text}");
         assert_eq!(at_the_loss.term, 2, "{text}");
+    }
+
+    /// A lease lost to nobody under a higher term. The tick of the look
+    /// that loses it says the term this replica held; the record it read,
+    /// a release another replica wrote, says the release's own. The
+    /// standing counts the record's, so a holder restored under a term
+    /// between the two is not named.
+    #[test]
+    fn a_term_read_at_the_look_that_loses_the_lease_stands_over_a_holder_restored_under_it() {
+        let store = Losable::default();
+        let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", brisk())
+            .expect("the settings are in order");
+        let fence = holder.fence();
+        let (standing, stood) = watch::channel(Standing::default());
+        let looping = looping(holder, standing);
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        // Between two looks another replica takes the lease and gives it up
+        // under term nine: the next look loses the lease and names nobody.
+        // Before the look after it a holder is restored under term seven.
+        store.put_before_the_next_looks([
+            LeaseRecord {
+                term: 9,
+                ..LeaseRecord::default()
+            },
+            LeaseRecord {
+                holder: "x@127.0.0.1:9".to_owned(),
+                term: 7,
+                duration_ms: 60_000,
+                ..LeaseRecord::default()
+            },
+        ]);
+        until("the look at the restored holder", || {
+            stood.borrow().holder == "x@127.0.0.1:9"
+                || looping.said("the lease's term is under the highest")
+        });
+        assert_eq!(
+            *stood.borrow(),
+            Standing {
+                holder: String::new(),
+                term: 9,
+                looked: true,
+            }
+        );
+        let (fallen, text) = looping.stopped_with("the lease's term is under the highest");
+        assert_eq!(fallen, 1, "{text}");
     }
 
     /// A record lost under a live holder, by no release. The holder's fence
@@ -2747,6 +2811,29 @@ mod tests {
             !text.contains("takes nothing for one lease duration"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_leader_told_its_own_term_keeps_on_and_logs_no_second_line_of_leading() {
+        // A word that moves no lease leaves the report's flag as it stood:
+        // the leader renews on under its term, and no renewal says again
+        // that it leads.
+        let elector = Elector::alone("a@127.0.0.1:1", brisk()).expect("the settings are in order");
+        let fence = elector.fence();
+        let (standing, mut stood) = watch::channel(Standing::default());
+        let looping = looping(elector, standing);
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        until("the line of leading", || looping.said(": leading"));
+        looping
+            .stop
+            .send(Word::StepDown(Some(1)))
+            .expect("the loop runs");
+        looks(&mut stood, 3);
+        assert_eq!(fence.leader_term(Instant::now()), Some(1));
+        let (leading, text) = looping.stopped_with(": leading");
+        assert_eq!(leading, 1, "{text}");
     }
 
     #[test]
