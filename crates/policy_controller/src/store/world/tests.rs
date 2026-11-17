@@ -3764,6 +3764,267 @@ fn a_single_rank_worker_is_an_engine_alone_and_ranks_share_their_engine_s_key() 
     assert_eq!(overloaded(&store, t0), ranks);
 }
 
+/// The report period the age cases tell.
+const REPORT_PERIOD: Duration = Duration::from_secs(10);
+
+#[test]
+fn a_stale_low_usage_masks_a_hot_rank_only_until_its_sample_ends() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 0.6)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    // A hot rank beside a cool one: their mean is under the threshold.
+    store.record(one, 1, pressure(0, 100), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 900), at(0), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(0)), []);
+    // The cool rank falls silent. Three periods behind the engine's
+    // newest receipt its sample is still the engine's word.
+    store.record(zero, 0, pressure(0, 900), at(30), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(30)), []);
+    // Past them it ends, and the hot rank is judged alone.
+    store.record(zero, 0, pressure(0, 900), at(31), LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, at(31)), store.overload_flips()),
+        (vec![zero, one], 1)
+    );
+    // Heard again, the rank's sample counts again.
+    store.record(one, 1, pressure(0, 100), at(40), LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, at(40)), store.overload_flips()),
+        (vec![], 2)
+    );
+}
+
+#[test]
+fn a_stale_high_count_holds_its_veto_only_until_its_sample_ends() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(0), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(0)), [zero, one]);
+    // The rank with the queue falls silent: inside the bound its count
+    // holds the veto, past it the engine's silence takes it back.
+    store.record(zero, 0, pressure(0, 0), at(30), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(30)), [zero, one]);
+    store.record(zero, 0, pressure(0, 0), at(31), LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, at(31)), store.overload_flips()),
+        (vec![], 2)
+    );
+}
+
+#[test]
+fn no_sample_ends_by_its_age_until_a_report_period_is_told() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(1_000), LoadSource::Stream);
+    // No period was told: the silent rank's count stands, however old.
+    assert_eq!(overloaded(&store, at(1_000)), [zero, one]);
+    // The telling judges every engine again under the period, and is
+    // shown as a write with no instant of its own is: at the window's
+    // end.
+    assert!(store.heard_every(REPORT_PERIOD));
+    store.publish(at(1_000));
+    assert_eq!(overloaded(&store, at(1_000)), []);
+    // A period is told once: the same one stands, another changes
+    // nothing, and the next judgment reads the first.
+    assert!(store.heard_every(REPORT_PERIOD));
+    assert!(!store.heard_every(Duration::from_secs(1_000)));
+    store.record(zero, 0, pressure(0, 0), at(1_001), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(1_001)), []);
+}
+
+#[test]
+fn an_engine_none_of_whose_ranks_is_heard_keeps_its_verdict() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(0), LoadSource::Stream);
+    // No rank is heard again: no write judges the engine, and a
+    // membership write judges it from samples as old as each other.
+    assert_eq!(overloaded(&store, at(1_000)), [zero, one]);
+    member(&store, "http://b:8000");
+    assert_eq!(overloaded(&store, at(1_000)), [zero, one]);
+}
+
+#[test]
+fn a_membership_write_ages_each_sample_from_its_own_receipt() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(31), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(31)), []);
+    // Every row is made again and every engine judged again: the ended
+    // sample stays ended, by the receipts of the samples on file.
+    member(&store, "http://b:8000");
+    assert_eq!(overloaded(&store, at(31)), []);
+}
+
+/// The bound is the third period whole: a rank exactly three periods
+/// behind its engine's newest is still counted, and one a microsecond
+/// further is not.
+#[test]
+fn a_rank_exactly_three_periods_behind_is_counted_and_a_microsecond_past_it_ends() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    let bound = REPORT_PERIOD * 3;
+    // Rank one holds the queue that vetoes. Rank zero is heard at the
+    // bound: rank one's sample still counts.
+    store.record(one, 1, pressure(9, 0), t0, LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), t0 + bound, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t0 + bound), [zero, one]);
+    // A microsecond further, and it has ended.
+    let past = t0 + bound + Duration::from_micros(1);
+    store.record(zero, 0, pressure(0, 0), past, LoadSource::Stream);
+    assert_eq!(overloaded(&store, past), []);
+}
+
+/// A membership write finds each rank's receipt among single-rank
+/// members: an engine's ranks do not stand together in the id order the
+/// write walks, and a single-rank member has no receipt.
+#[test]
+fn a_membership_write_finds_each_rank_s_receipt_among_single_rank_members() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    member(&store, "http://a:8000");
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    member(&store, "http://b:8000");
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(31), LoadSource::Stream);
+    // The write makes every row again: rank one's sample stays ended.
+    member(&store, "http://c:8000");
+    assert_eq!(overloaded(&store, at(31)), []);
+    // Heard again, rank one is counted beside rank zero's sample, which
+    // the next write still reads nine seconds behind it.
+    store.record(one, 1, pressure(9, 0), at(40), LoadSource::Stream);
+    member(&store, "http://d:8000");
+    assert_eq!(overloaded(&store, at(40)), [zero, one]);
+}
+
+#[test]
+fn a_generation_applied_over_standing_rows_ages_each_sample_from_its_own_receipt() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    assert!(store.heard_every(REPORT_PERIOD));
+    // No threshold stands yet. One rank falls silent with a queue on
+    // file, the other is heard long after it, and no membership write
+    // comes between.
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(0), LoadSource::Stream);
+    member(&store, "http://b:8000");
+    store.record(zero, 0, pressure(0, 0), at(100), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(100)), []);
+    // The generation's first judgment reads the receipts of the samples
+    // on file: the silent rank's count ended long ago.
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, at(100)), []);
+    // Heard again, the rank's count is its engine's word.
+    store.record(one, 1, pressure(9, 0), at(101), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(101)), [zero, one]);
+}
+
+#[test]
+fn a_poll_s_rows_are_heard_at_the_instant_their_poll_began() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    store.report(
+        &[
+            (zero, 0, Some(pressure(0, 0))),
+            (one, 1, Some(pressure(9, 0))),
+        ],
+        at(0),
+        LoadSource::Poll,
+    );
+    assert_eq!(overloaded(&store, at(0)), [zero, one]);
+    // Later answers omit rank 1, which keeps its sample: it ends three
+    // periods behind the poll that last brought its engine a row.
+    let omitting = [(zero, 0, Some(pressure(0, 0))), (one, 1, None)];
+    store.report(&omitting, at(30), LoadSource::Poll);
+    assert_eq!(overloaded(&store, at(30)), [zero, one]);
+    store.report(&omitting, at(31), LoadSource::Poll);
+    assert_eq!(overloaded(&store, at(31)), []);
+}
+
+#[test]
+fn a_single_rank_worker_s_sample_is_its_engine_s_newest_at_any_age() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let a = member(&store, "http://a:8000");
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    // Beside a data-parallel engine that is heard long after it, a
+    // single-rank worker's one sample stands: no other engine's receipt
+    // ages it, at a record's write or at a membership write.
+    store.record(a, 0, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(1_000), LoadSource::Stream);
+    store.record(one, 1, pressure(0, 0), at(1_000), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(1_000)), [a]);
+    member(&store, "http://b:8000");
+    assert_eq!(overloaded(&store, at(1_000)), [a]);
+}
+
 #[test]
 fn a_membership_write_and_a_new_generation_judge_again_from_what_is_on_file() {
     let store = MemoryStore::with_publish_window(Duration::ZERO);

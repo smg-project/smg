@@ -1019,11 +1019,36 @@ struct EngineRow {
     rank: bool,
 }
 
+/// How many report periods a rank's sample may lie behind its engine's
+/// newest receipt and still be judged. The period told is no shorter than
+/// the caller's poll and its deadline, so a rank that loses a report is
+/// heard again well inside three periods. A rank that stays silent is
+/// counted through three periods, so through two lost reports, and ends
+/// at the first judged write after them.
+const SAMPLE_PERIODS: u64 = 3;
+
 /// The engine's rows, in the writer's list of every engine's.
 fn rows_of<'a>(rows: &'a [EngineRow], engine: &EngineRows) -> &'a [EngineRow] {
     let from = engine.at as usize;
     rows.get(from..from + engine.len as usize)
         .unwrap_or_default()
+}
+
+/// The group and the receipt of the rank `id` in `ranked`, which stands by
+/// id, or `None` for a member that is no rank of a data-parallel engine.
+/// The callers ask in rising id order: `next` is their cursor.
+fn ranked_at(
+    ranked: &[(WorkerId, u32, u64)],
+    next: &mut usize,
+    id: WorkerId,
+) -> Option<(u32, u64)> {
+    while ranked.get(*next).is_some_and(|&(at, ..)| at < id) {
+        *next += 1;
+    }
+    ranked
+        .get(*next)
+        .filter(|&&(at, ..)| at == id)
+        .map(|&(_, group, heard)| (group, heard))
 }
 
 /// The write side of the world, behind the store's load lock: the working
@@ -1083,6 +1108,18 @@ pub(super) struct Writer {
     /// in them, so a write that judges no engine steps over them as it
     /// did.
     place_engines: Vec<u32>,
+    /// When each rank of a data-parallel engine was last heard: the
+    /// receipt of its record on file, in microseconds from the origin,
+    /// in the engine rows' order. Empty for a membership of single-rank
+    /// workers, whose one sample is its engine's newest. A record's
+    /// write keeps it while an engine has a threshold, and the writes
+    /// that start a judgment, a membership write and an applied
+    /// generation, read every receipt again from the samples.
+    heard: Vec<u64>,
+    /// How far behind its engine's newest receipt a rank's sample may
+    /// lie and still be judged, in microseconds; none until a report
+    /// period is told.
+    sample_bound: Option<u64>,
     /// An engine has a threshold.
     judging: bool,
     /// How many engines' last word was that no report came.
@@ -1119,6 +1156,8 @@ impl Writer {
             engines: Vec::new(),
             engine_rows: Vec::new(),
             place_engines: Vec::new(),
+            heard: Vec::new(),
+            sample_bound: None,
             judging: false,
             silenced: 0,
             flips: 0,
@@ -1180,6 +1219,10 @@ impl Writer {
             self.rebuild(self.epoch, members, sample_of, Classes::Derive)
         } else {
             self.bind();
+            // A generation of the standing mode comes with no membership
+            // write: the receipts are read from the samples as the rows
+            // stand.
+            self.hear_again(sample_of);
             self.judge_every();
             self.publish()
         };
@@ -1269,26 +1312,69 @@ impl Writer {
             engines,
             engine_rows,
             working,
+            heard,
+            sample_bound,
             ..
         } = self;
         let Some(engine) = engines.get(engine as usize).filter(|engine| engine.judged) else {
             return false;
         };
         let rows = rows_of(engine_rows, engine);
-        let (mut queued, mut usage, mut ranks) = (0_u64, 0_u64, 0_u64);
-        if !engine.silent {
-            for at in rows.iter().filter(|at| at.rank) {
-                let load = working
-                    .get(at.pool as usize)
-                    .and_then(|pool| pool.rows.get(at.row as usize))
-                    .and_then(|row| row.load);
-                if let Some(load) = load {
-                    queued += u64::from(load.queued);
-                    usage += u64::from(load.active_kv_permille);
-                    ranks += 1;
+        let load_of = |at: &EngineRow| {
+            working
+                .get(at.pool as usize)
+                .and_then(|pool| pool.rows.get(at.row as usize))
+                .and_then(|row| row.load)
+        };
+        // A sample is a fact while its engine still says it: once a report
+        // period is told, a rank whose receipt lies further behind the
+        // engine's newest than the bound is not counted. One rank's sample
+        // is its engine's newest. An engine no rank of which is heard is
+        // judged by no write: its verdict stands as it was last judged.
+        let from = engine.at as usize;
+        let receipts = match *sample_bound {
+            Some(bound) if rows.len() > 1 => heard
+                .get(from..from + rows.len())
+                .map(|heard| (heard, bound)),
+            _ => None,
+        };
+        // The sums over the ranks heard no earlier than `oldest`, then the
+        // newest and the eldest receipt among them.
+        let sum = |oldest: u64| {
+            let (mut queued, mut usage, mut ranks) = (0_u64, 0_u64, 0_u64);
+            let (mut newest, mut eldest) = (0_u64, u64::MAX);
+            for (index, at) in rows.iter().enumerate().filter(|(_, at)| at.rank) {
+                let Some(load) = load_of(at) else {
+                    continue;
+                };
+                let heard = receipts
+                    .and_then(|(heard, _)| heard.get(index))
+                    .copied()
+                    .unwrap_or(0);
+                if heard < oldest {
+                    continue;
                 }
+                queued += u64::from(load.queued);
+                usage += u64::from(load.active_kv_permille);
+                ranks += 1;
+                newest = newest.max(heard);
+                eldest = eldest.min(heard);
             }
-        }
+            ((queued, usage, ranks), (newest, eldest))
+        };
+        // One walk sums an engine no sample of which has ended; a second
+        // leaves the ended ones out.
+        let (queued, usage, ranks) = if engine.silent {
+            (0, 0, 0)
+        } else {
+            let (whole, (newest, eldest)) = sum(0);
+            let oldest = receipts.map_or(0, |(_, bound)| newest.saturating_sub(bound));
+            if eldest < oldest {
+                sum(oldest).0
+            } else {
+                whole
+            }
+        };
         let mut moved = false;
         for &EngineRow { pool, row, .. } in rows {
             let Some(pool) = working.get_mut(pool as usize) else {
@@ -1352,17 +1438,84 @@ impl Writer {
         self.place_engines.get(place as usize).copied()
     }
 
-    /// A record changed what is on file for the member whose first place
-    /// stands at `place`: its engine is heard, and judged once
-    /// ([`Self::judged`]). While no engine has a threshold and none is
-    /// silent there is no word to end and no verdict to move, and the
-    /// write reads no engine.
-    pub(super) fn recorded(&mut self, place: u32) -> bool {
+    /// A record received at `at` changed what is on file for the member
+    /// whose first place stands at `place`: its engine is heard, and
+    /// judged once ([`Self::judged`]). While no engine has a threshold
+    /// and none is silent there is no word to end and no verdict to
+    /// move, and the write reads no engine.
+    pub(super) fn recorded(&mut self, place: u32, at: Instant) -> bool {
         if !self.judging && self.silenced == 0 {
             return false;
         }
-        self.engine_at(place)
-            .is_some_and(|engine| self.judged(engine, true))
+        let Some(engine) = self.engine_at(place) else {
+            return false;
+        };
+        self.hear(engine, place, at);
+        self.judged(engine, true)
+    }
+
+    /// The member whose first place stands at `place`, a rank of
+    /// `engine`, was heard at `at`: the receipt its sample is aged from.
+    /// Kept for the ranks of a data-parallel engine, and only while an
+    /// engine has a threshold: a write that starts a judgment reads
+    /// every receipt again from the samples, a membership write in its
+    /// walk and an applied generation by [`Self::hear_again`].
+    pub(super) fn hear(&mut self, engine: u32, place: u32, at: Instant) {
+        if self.heard.is_empty() || !self.judging {
+            return;
+        }
+        let (Some(rows), Some(place)) = (
+            self.engines.get(engine as usize),
+            self.places.get(place as usize),
+        ) else {
+            return;
+        };
+        let found = rows_of(&self.engine_rows, rows)
+            .iter()
+            .position(|row| row.rank && row.pool == place.pool && row.row == place.row);
+        let heard = found.and_then(|index| self.heard.get_mut(rows.at as usize + index));
+        if let Some(heard) = heard {
+            *heard = micros(self.origin, at);
+        }
+    }
+
+    /// Every rank's receipt again, from its sample on file: what an
+    /// applied generation judges by, since a record's write keeps the
+    /// receipts only while an engine has a threshold. A membership write
+    /// reads them in its own walk.
+    fn hear_again(&mut self, sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>) {
+        for (heard, at) in self.heard.iter_mut().zip(&self.engine_rows) {
+            if !at.rank {
+                continue;
+            }
+            let sample = self
+                .working
+                .get(at.pool as usize)
+                .and_then(|pool| pool.rows.get(at.row as usize))
+                .and_then(|row| sample_of(row.id, row.dp_rank));
+            *heard = sample.map_or(0, |sample| micros(self.origin, sample.received_at));
+        }
+    }
+
+    /// Every ready rank is heard once a `period` from here on: a judgment
+    /// counts a rank only while its receipt lies within three periods of
+    /// its engine's newest, and every engine with a threshold is judged
+    /// again under it. A period is told once: another changes nothing.
+    /// Whether `period` is the one that stands, and whether a verdict
+    /// moved.
+    pub(super) fn heard_every(&mut self, period: Duration) -> (bool, bool) {
+        let bound = u64::try_from(period.as_micros())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(SAMPLE_PERIODS);
+        if let Some(told) = self.sample_bound {
+            return (told == bound, false);
+        }
+        self.sample_bound = Some(bound);
+        let mut moved = false;
+        for index in 0..self.engines.len() {
+            moved |= self.judge(index as u32);
+        }
+        (true, moved)
     }
 
     /// The engine's ranks, each by its member and its rank's number.
@@ -1432,9 +1585,10 @@ impl Writer {
             silent.dedup();
         }
         // The ranks of the data-parallel engines, each with its engine's
-        // group by key. A fleet of single-rank workers lists none.
+        // group by key and the receipt of its sample on file. A fleet of
+        // single-rank workers lists none.
         let mut by_key: FxHashMap<&'a str, u32> = FxHashMap::default();
-        let mut ranked: Vec<(WorkerId, u32)> = Vec::new();
+        let mut ranked: Vec<(WorkerId, u32, u64)> = Vec::new();
         // A member names a threshold of its own.
         let mut owned = false;
         let mut groups: FxHashMap<Box<str>, [Vec<Entry<'a>>; ROLES]> = FxHashMap::default();
@@ -1454,7 +1608,8 @@ impl Writer {
             if facts.dp_size > 1 {
                 let next = by_key.len() as u32;
                 let group = *by_key.entry(facts.engine.as_str()).or_insert(next);
-                ranked.push((member.id, group));
+                let heard = sample.map_or(0, |sample| micros(origin, sample.received_at));
+                ranked.push((member.id, group, heard));
             }
             owned |= facts.overload != Overload::default();
             let entry = Entry {
@@ -1561,7 +1716,9 @@ impl Writer {
         let mut last = None;
         if ranked.is_empty() {
             // Single-rank workers alone: a member is an engine, and its
-            // rows are the engine's as they come, in one walk.
+            // rows are the engine's as they come, in one walk. One rank's
+            // sample is its engine's newest, so no receipt is kept.
+            self.heard.clear();
             for place in &self.places {
                 let rank = last != Some(place.id);
                 if rank {
@@ -1589,18 +1746,18 @@ impl Writer {
         } else {
             // Ranks that share an engine do not stand together: each place
             // takes its engine, the engines' rows are counted and given
-            // their room, then written in the places' order.
-            ranked.sort_unstable_by_key(|&(id, _)| id);
+            // their room, then written in the places' order. The places
+            // and the ranks both stand by id, so a cursor finds a place's
+            // rank as the places pass.
+            ranked.sort_unstable_by_key(|&(id, ..)| id);
             let mut of_group = vec![u32::MAX; by_key.len()];
             let mut engine = 0_u32;
+            let mut next = 0;
             for place in &self.places {
                 if last != Some(place.id) {
                     last = Some(place.id);
-                    let group = ranked
-                        .binary_search_by_key(&place.id, |&(id, _)| id)
-                        .ok()
-                        .and_then(|at| ranked.get(at))
-                        .and_then(|&(_, group)| of_group.get_mut(group as usize));
+                    let group = ranked_at(&ranked, &mut next, place.id)
+                        .and_then(|(group, _)| of_group.get_mut(group as usize));
                     let known = group.as_deref().copied().filter(|&known| known != u32::MAX);
                     engine = match known {
                         Some(known) => known,
@@ -1630,18 +1787,32 @@ impl Writer {
                 rows += mem::take(&mut engine.len);
             }
             self.engine_rows.resize(rows as usize, EngineRow::default());
+            // Each rank's receipt stands beside its row, from its sample on
+            // file as the walk above read it: a judgment ages a sample from
+            // where the writes before left it.
+            self.heard.clear();
+            self.heard.resize(rows as usize, 0);
             last = None;
+            next = 0;
             for (place, &engine) in self.places.iter().zip(&self.place_engines) {
                 let Some(engine) = engines.get_mut(engine as usize) else {
                     continue;
                 };
                 let at = (engine.at + engine.len) as usize;
-                if let Some(at) = self.engine_rows.get_mut(at) {
-                    *at = EngineRow {
+                let rank = last != Some(place.id);
+                if let Some(row) = self.engine_rows.get_mut(at) {
+                    *row = EngineRow {
                         pool: place.pool,
                         row: place.row,
-                        rank: last != Some(place.id),
+                        rank,
                     };
+                }
+                if rank {
+                    let receipt =
+                        ranked_at(&ranked, &mut next, place.id).map_or(0, |(_, heard)| heard);
+                    if let Some(heard) = self.heard.get_mut(at) {
+                        *heard = receipt;
+                    }
                 }
                 engine.len += 1;
                 last = Some(place.id);

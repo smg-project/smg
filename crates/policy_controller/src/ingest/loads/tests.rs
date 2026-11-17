@@ -1522,6 +1522,34 @@ async fn an_answer_with_no_row_says_nothing_of_an_engine_whose_other_rank_its_st
     assert_eq!(driver.stats().rows.load(Ordering::Relaxed), 0);
 }
 
+#[test]
+fn the_driver_tells_the_sink_the_longer_of_its_interval_and_its_poll_s_deadline() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let _driver = driver(&store, &probe, TEN);
+    // Told once, where the driver is built. Another period is asked
+    // first: a sink the driver told nothing would take it as its own.
+    assert!(!store.heard_every(Duration::from_secs(5)));
+    assert!(store.heard_every(TEN));
+
+    // An interval shorter than the poll's deadline: the deadline, three
+    // seconds, and a tick make the period, so a poll that takes its whole
+    // deadline is still heard inside it. The scrape's five seconds are not
+    // in it: a scrape reads an engine of one rank, which never ages.
+    let store = Arc::new(MemoryStore::new());
+    let _driver = driver(&store, &probe, Duration::from_secs(1));
+    assert!(!store.heard_every(Duration::from_millis(5_100)));
+    assert!(store.heard_every(Duration::from_millis(3_100)));
+
+    // The largest deadline a host can set saturates the sum, so the
+    // driver still builds.
+    let largest = LoadDriverConfig {
+        poll_deadline: Duration::MAX,
+        ..LoadDriverConfig::default()
+    };
+    assert_eq!(largest.report_period(), Duration::MAX);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_rank_that_is_not_ready_does_not_hold_the_word_off() {
     let store = Arc::new(MemoryStore::new());

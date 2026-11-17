@@ -1020,7 +1020,7 @@ impl LoadSink for MemoryStore {
             journal.load(id, rank, &sample);
         }
         if let Some(place) = writer.fold_load(id, rank, Some(&sample)) {
-            writer.recorded(place);
+            writer.recorded(place, received_at);
             let world = writer.folded_at(received_at);
             self.show(world);
         }
@@ -1068,7 +1068,12 @@ impl LoadSink for MemoryStore {
                         journal.load(id, rank, &sample);
                     }
                     let place = writer.fold_load(id, rank, Some(&sample));
-                    (place.and_then(|place| writer.engine_at(place)), true)
+                    let engine = place.and_then(|place| {
+                        let engine = writer.engine_at(place)?;
+                        writer.hear(engine, place, polled_at);
+                        Some(engine)
+                    });
+                    (engine, true)
                 }
                 // A rank the answer omits keeps what is on file.
                 None => (writer.engine_of(id), false),
@@ -1112,6 +1117,18 @@ impl LoadSink for MemoryStore {
             let world = writer.folded_at(polled_at);
             self.show(world);
         }
+    }
+
+    fn heard_every(&self, period: Duration) -> bool {
+        let mut loads = self.loads.lock();
+        let (stands, moved) = loads.writer.heard_every(period);
+        if moved {
+            // Every engine was judged again under the period: shown as
+            // a load write with no instant of its own is.
+            let world = loads.writer.folded();
+            self.show(world);
+        }
+        stands
     }
 
     fn poll_mode(&self, id: WorkerId, now: Instant, interval: Duration) -> PollMode {
