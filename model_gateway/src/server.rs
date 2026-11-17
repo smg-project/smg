@@ -108,7 +108,7 @@ use crate::{
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
-        health::manager::{WorkerManager, WorkerManagerConfig},
+        health::manager::{WorkerJobs, WorkerManager, WorkerManagerConfig},
         identity::endpoint::Endpoint,
         ConnectionMode,
     },
@@ -2445,7 +2445,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             default_check_interval_secs: config.router_config.health_check.check_interval_secs,
             remove_unhealthy: config.router_config.unhealthy_removal_scope(),
         },
-        app_context.worker_job_queue.get().cloned(),
+        app_context
+            .worker_job_queue
+            .get()
+            .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>),
         !config.router_config.health_check.disable_health_check,
         config.router_config.connection_mode == ConnectionMode::Zmq,
     );

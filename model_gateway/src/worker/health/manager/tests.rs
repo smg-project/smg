@@ -295,7 +295,10 @@ fn labels_follow_the_engine_for_local_self_hosted_workers_only() {
 /// with no removal queue (the shape of `remove_unhealthy = false`).
 #[tokio::test]
 async fn a_transition_into_ready_submits_a_label_refresh() {
-    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    use crate::{
+        service_discovery::testing::create_test_app_context,
+        workflow::{JobQueue, JobQueueConfig},
+    };
     let app_context = create_test_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
     let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -304,7 +307,7 @@ async fn a_transition_into_ready_submits_a_label_refresh() {
     worker.set_status(WorkerStatus::NotReady);
     let worker_id = registry.register(worker.clone()).unwrap();
     let completion = passing_probe(worker_id, &worker);
-    let applied = apply_probe_completion(&registry, completion, None, Some(&job_queue)).await;
+    let applied = apply_probe_completion(&registry, completion, None, Some(&*job_queue)).await;
     assert!(matches!(
         applied,
         ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
@@ -325,7 +328,10 @@ async fn a_transition_into_ready_submits_a_label_refresh() {
 /// transition into service is then what fills them in.
 #[tokio::test]
 async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_service() {
-    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    use crate::{
+        service_discovery::testing::create_test_app_context,
+        workflow::{JobQueue, JobQueueConfig},
+    };
     let app_context = create_test_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
     let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -335,7 +341,7 @@ async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_serv
     worker.set_status(WorkerStatus::NotReady);
     let worker_id = registry.register(worker.clone()).unwrap();
     let completion = passing_probe(worker_id, &worker);
-    let applied = apply_probe_completion(&registry, completion, None, Some(&job_queue)).await;
+    let applied = apply_probe_completion(&registry, completion, None, Some(&*job_queue)).await;
     assert!(matches!(
         applied,
         ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
@@ -343,6 +349,79 @@ async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_serv
     assert!(
         job_queue.get_status("http://local:8").is_some(),
         "a worker whose registration discovered nothing is refreshed all the same"
+    );
+}
+
+/// What a recorded removal names: the address, the worker's id and its revision.
+type Removal = (String, String, u64);
+
+/// A `WorkerJobs` that keeps the removals it is asked for.
+#[derive(Default)]
+struct RecordedJobs(parking_lot::Mutex<Vec<Removal>>);
+
+#[async_trait]
+impl WorkerJobs for RecordedJobs {
+    async fn remove_worker(
+        &self,
+        url: String,
+        worker_id: &WorkerId,
+        revision: u64,
+    ) -> Result<(), String> {
+        self.0
+            .lock()
+            .push((url, worker_id.as_str().to_string(), revision));
+        Ok(())
+    }
+
+    async fn refresh_worker_labels(&self, _url: String) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
+/// A worker that fails under a removal scope is handed over for removal
+/// once: at its address, named by its own id at the revision its probe saw.
+#[tokio::test]
+async fn a_worker_that_fails_under_a_removal_scope_is_handed_over_by_id_and_revision() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = make_worker("http://w:1", 2, 1);
+    let worker_id = registry.register(worker.clone()).unwrap();
+    let revision = worker.revision();
+    let recorded = RecordedJobs::default();
+    let jobs: &dyn WorkerJobs = &recorded;
+    let removal = Some((jobs, UnhealthyRemovalScope::AllLocal));
+    let failed_probe = || ProbeCompletion {
+        worker_id: worker_id.clone(),
+        worker: worker.clone(),
+        expected_revision: revision,
+        launched_status: WorkerStatus::Pending,
+        probe_result: Err(WorkerError::HealthCheckFailed {
+            url: worker.url().to_string(),
+            reason: "refused".to_string(),
+        }),
+    };
+
+    // A failure threshold of one: the tenth failed probe of a pending worker
+    // fails it.
+    for _ in 1..10 {
+        let applied = apply_probe_completion(&registry, failed_probe(), removal, None).await;
+        assert!(matches!(applied, ProbeApplyResult::Applied(None)));
+    }
+    assert!(
+        recorded.0.lock().is_empty(),
+        "a pending worker is not removed"
+    );
+    let applied = apply_probe_completion(&registry, failed_probe(), removal, None).await;
+    assert!(matches!(
+        applied,
+        ProbeApplyResult::Applied(Some((WorkerStatus::Pending, WorkerStatus::Failed)))
+    ));
+    assert_eq!(
+        *recorded.0.lock(),
+        vec![(
+            worker.base_url().to_string(),
+            worker_id.as_str().to_string(),
+            revision,
+        )]
     );
 }
 
@@ -1230,7 +1309,10 @@ fn apply_connect_signal_reports_the_promoted_worker() {
 /// the label refresh is submitted for a locally registered worker.
 #[tokio::test]
 async fn a_connect_signal_promotion_submits_a_label_refresh() {
-    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    use crate::{
+        service_discovery::testing::create_test_app_context,
+        workflow::{JobQueue, JobQueueConfig},
+    };
     let app_context = create_test_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
     let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -1254,7 +1336,7 @@ async fn a_connect_signal_promotion_submits_a_label_refresh() {
         },
         &mut next_check,
         &test_config(),
-        Some(&job_queue),
+        Some(&*job_queue),
     )
     .await;
 
@@ -1273,7 +1355,10 @@ async fn a_connect_signal_promotion_submits_a_label_refresh() {
 /// transition to retry on. The registration's status stays its own.
 #[tokio::test]
 async fn a_connect_signal_during_the_registration_job_keeps_the_refresh() {
-    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    use crate::{
+        service_discovery::testing::create_test_app_context,
+        workflow::{JobQueue, JobQueueConfig},
+    };
     let app_context = create_test_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
     let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -1298,7 +1383,7 @@ async fn a_connect_signal_during_the_registration_job_keeps_the_refresh() {
         },
         &mut HashMap::new(),
         &test_config(),
-        Some(&job_queue),
+        Some(&*job_queue),
     )
     .await;
 
