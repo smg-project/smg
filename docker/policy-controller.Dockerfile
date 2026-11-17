@@ -112,6 +112,16 @@ USER 65532
 # being built.
 RUN ["/usr/local/bin/smg-policy-controller", "--version"]
 
+# The allocator of an arm64 binary is built for 64 KiB pages, the largest an
+# arm64 kernel runs with: a binary built for a smaller page ends at its start
+# on such a kernel. The repository's cargo configuration sets the page for
+# the target, and the allocator's statistics say the page it was built for.
+ARG TARGETARCH
+RUN if [ "${TARGETARCH}" = "arm64" ]; then \
+        stats="$(_RJEM_MALLOC_CONF=stats_print:true /usr/local/bin/smg-policy-controller --version 2>&1)" \
+        && printf '%s\n' "${stats}" | grep -F "Page size: 65536"; \
+    fi
+
 # The listeners' default ports: the gateways and the relays (30100), the
 # operators (30101), the standbys (30102) and the HTTP admin listener with
 # the probes and the metrics (30103).
