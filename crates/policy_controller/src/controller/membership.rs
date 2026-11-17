@@ -442,7 +442,7 @@ fn told(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         io,
         sync::{
@@ -1418,7 +1418,7 @@ mod tests {
 
     /// The lines a case's own subscriber wrote.
     #[derive(Clone, Default)]
-    struct Logged(Arc<Mutex<Vec<u8>>>);
+    pub(crate) struct Logged(pub(crate) Arc<Mutex<Vec<u8>>>);
 
     impl io::Write for Logged {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {

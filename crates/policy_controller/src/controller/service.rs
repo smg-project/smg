@@ -1959,6 +1959,51 @@ mod tests {
         assert_eq!(control.shared.generations.standing().0, 1);
     }
 
+    /// The lease is taken before the store is told its term. In between a
+    /// spec write, its dry run and a rollback are refused as a registration
+    /// is, `UNAVAILABLE`, and the standing generation does not move; each
+    /// answers once the store stands in the term.
+    #[tokio::test]
+    async fn a_spec_call_is_refused_until_the_store_stands_in_its_term() {
+        // The dry run's kit before the store enters the term: the take of a
+        // candidate alone, its fence open.
+        let (mut elector, standing, control) = sourced(false);
+        elector.lead_at(Instant::now());
+        standing.send_replace(saw(IDENTITY, 1));
+        let stands = control.shared.generations.standing();
+        let calls = async || {
+            [
+                control
+                    .apply_policy_spec(apply(proto::ApplyMode::Enforce, RANDOM, "yaml", ""))
+                    .await,
+                control
+                    .apply_policy_spec(apply(proto::ApplyMode::DryRun, RANDOM, "yaml", ""))
+                    .await,
+                control
+                    .rollback_policy_spec(from(
+                        "operator-a",
+                        proto::RollbackRequest { generation: 1 },
+                    ))
+                    .await,
+            ]
+        };
+        for early in calls().await {
+            let early = early.expect_err("refused");
+            assert_eq!(
+                (early.code(), early.message()),
+                (Code::Unavailable, super::NOT_IN_TERM)
+            );
+        }
+        assert_eq!(control.shared.generations.standing(), stands);
+
+        control.shared.store.set_term(1);
+        for answer in calls().await {
+            let answer = answer.expect("an answer").into_inner();
+            assert!(answer.read_only, "{answer:?}");
+        }
+        assert_eq!(control.shared.generations.standing(), stands);
+    }
+
     /// The checks of a write call run in one order, each neighbour pair by
     /// a call that fails both: the scope before the lead, the lead before
     /// the mode, the mode before the source, the source before the guard,

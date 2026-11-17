@@ -27,6 +27,9 @@
 //! row's models change with its incarnation at the door, so a row leaves a
 //! watcher's models by a replacement, which names both rows.
 //!
+//! A membership entry the wire has no form for is told to no watch. The
+//! store writes none; one that lands is logged once a replica.
+//!
 //! No peer sets a size here. A principal holds at most [`WATCHES_MAX`]
 //! watches open at a replica, and as many principals watch a replica as may
 //! be present at a leader: an open past either bound is refused by name. A
@@ -96,6 +99,9 @@ pub(crate) struct Feed {
     wake: watch::Receiver<Position>,
     /// The feed's one task ([`Feed::start`]), ended with the last feed.
     teller: Arc<Mutex<JoinSet<()>>>,
+    /// The place of the last membership entry the wire had no form for
+    /// ([`Feed::untold`]): such an entry is logged once a replica.
+    unwired: Arc<Mutex<Position>>,
     /// The rows at one place of the log: the cut the first watch took
     /// there, kept for every other that starts there. It is let go when a
     /// write moves the log past that place and when the last watch leaves:
@@ -124,6 +130,7 @@ impl Feed {
             told,
             wake,
             teller: Arc::default(),
+            unwired: Arc::default(),
             rows: Arc::default(),
         }
     }
@@ -168,6 +175,35 @@ impl Feed {
         {
             *kept = None;
         }
+    }
+
+    /// A membership entry the wire has no form for: no watch is told it,
+    /// so a watcher's rows miss that write. The store writes none. One
+    /// that lands is logged once a replica, with its change, by the first
+    /// stream that comes to it ([`Asked::tells`]), whatever the count of
+    /// streams that read it.
+    ///
+    /// The mark orders places by term, then by number: an entry of a later
+    /// term is logged where a restart of the log left its number under the
+    /// mark's. An entry under no term after a marked term is not.
+    fn untold(&self, entry: &Entry) {
+        let Event::Member { change, .. } = &entry.event else {
+            return;
+        };
+        let at = entry.at;
+        {
+            let mut last = self.unwired.lock();
+            if (at.term, at.seq) <= (last.term, last.seq) {
+                return;
+            }
+            *last = at;
+        }
+        warn!(
+            seq = at.seq,
+            term = at.term,
+            ?change,
+            "a membership entry has no wire form: no watch is told it"
+        );
     }
 }
 
@@ -407,13 +443,18 @@ impl Asked {
                 .any(|model| self.models.contains(model))
     }
 
-    /// Whether the write is told: a row it names serves an asked model.
+    /// Whether a watch comes to the write: a row it names serves an asked
+    /// model. A membership entry that names no row has no wire form, and
+    /// every watch comes to it: the first logs it ([`Feed::untold`]).
     fn tells(&self, entry: &Entry) -> bool {
         match &entry.event {
-            Event::Member { row, left, .. } => [row, left]
-                .into_iter()
-                .flatten()
-                .any(|row| self.serves(row)),
+            Event::Member { row, left, .. } => {
+                (row.is_none() && left.is_none())
+                    || [row, left]
+                        .into_iter()
+                        .flatten()
+                        .any(|row| self.serves(row))
+            }
             Event::Load { .. } | Event::Term => false,
         }
     }
@@ -582,10 +623,12 @@ async fn run(
             if !asked.tells(&entry) {
                 continue;
             }
-            if let Some(told) = worker_wire::member(&entry) {
-                if !hand_over(&mut source, &hand, told).await {
-                    return;
-                }
+            let Some(told) = worker_wire::member(&entry) else {
+                source.feed.untold(&entry);
+                continue;
+            };
+            if !hand_over(&mut source, &hand, told).await {
+                return;
             }
         }
     }
@@ -615,6 +658,7 @@ mod tests {
         controller::{
             election::LeasePlace,
             gateways::tests::PATIENT,
+            membership::tests::Logged,
             principal::tests::told,
             replication::{journaled, journaled_from, FIRST_PLACES, WATCHED_EVENTS},
             worker_wire,
@@ -622,8 +666,8 @@ mod tests {
         elector::{Elector, Tick},
         proto::{self, worker_event::Event},
         store::{
-            Kinds, LeasesStore, LoadSink, LoadSource, MemoryStore, Position, WorkerFacts,
-            WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+            Journal, Kinds, LeasesStore, LoadSink, LoadSource, MembershipChange, MemoryStore,
+            Position, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
         },
         view::{LoadRow, WorkerId},
     };
@@ -941,6 +985,72 @@ mod tests {
             [0, 1, 2, 3, 4],
             "an epoch a write"
         );
+    }
+
+    /// A membership entry the wire has no form for is told to no watch. The
+    /// store writes none; one that lands is logged once a replica, whatever
+    /// the count of streams that read it, and the tail goes on with the
+    /// write after it. One that names no row is logged as one that names
+    /// one is, and so is one of a later term whose number a restart of the
+    /// log left under the last one logged.
+    #[tokio::test]
+    async fn a_membership_entry_with_no_wire_form_is_logged_once_and_told_to_no_watch() {
+        // The case's own subscriber keeps this thread's lines, a second one
+        // registered beside it, as in the door's audit case.
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+
+        let leader = leader();
+        let id = leader.register(0, 1, "model-a");
+        let row = WorkersStore::get(leader.store.as_ref(), id).expect("the row");
+        let mut streams = [
+            leader.watch(Start::Snapshot, &[]),
+            leader.watch(Start::Snapshot, &[]),
+        ];
+        for stream in &mut streams {
+            next(stream).await;
+        }
+        // Two shapes the store never tells, written here by the journal's
+        // own calls: a removal that names no row at all, and a replacement
+        // that names no row it took out.
+        let journal: &dyn Journal = leader.feed.log.as_ref();
+        let logged = || {
+            let text = String::from_utf8(lines.0.lock().clone()).expect("the lines as text");
+            text.matches("has no wire form").count()
+        };
+        journal.member(2, MembershipChange::Removed { id }, None, None);
+        let replaced = MembershipChange::Replaced { old: id, new: id };
+        journal.member(3, replaced, Some(&row), None);
+        journal.released();
+        let unwired = leader.head();
+        leader.register(1, 1, "model-a");
+        for stream in &mut streams {
+            let told = next(stream).await;
+            assert_eq!(told.seq, unwired.seq + 1, "the write after the two entries");
+        }
+        assert_eq!(logged(), 2, "one line an entry, whatever the streams");
+
+        // The log starts again at a lower number and the store takes a
+        // later term: an entry there is under the last one logged by its
+        // number and past it by its term.
+        leader.feed.log.restart(Position { seq: 1, term: 2 });
+        leader.store.set_term(3);
+        let mut later = leader.watch(Start::Snapshot, &[]);
+        next(&mut later).await;
+        journal.member(4, MembershipChange::Removed { id }, None, None);
+        journal.released();
+        let again = leader.head();
+        assert!(again.seq < unwired.seq && again.term == 3, "{again:?}");
+        leader.register(2, 1, "model-a");
+        let told = next(&mut later).await;
+        assert_eq!(told.seq, again.seq + 1, "the write after the entry");
+        assert_eq!(logged(), 3, "the entry of the later term");
     }
 
     /// Where the lease lives in the process a term is taken again at each
@@ -1271,6 +1381,32 @@ mod tests {
             "the status write: {told:?}"
         );
         assert!(wakes.has_changed().expect("the log lives"));
+    }
+
+    /// A write that lands before the feed's task first parks is kept for
+    /// it, once: the task tells the log's place at its first turn. A wake
+    /// of a parked task alone would lose that write's telling.
+    #[tokio::test]
+    async fn a_write_before_the_feeds_task_parks_is_told_at_its_first_turn() {
+        let leader = leader();
+        let mut wakes = leader.feed.wake.clone();
+        wakes.mark_unchanged();
+        // No watch is open and the feed has no task: the write's wake is
+        // kept.
+        leader.register(0, 1, "model-a");
+        assert!(leader.feed.teller.lock().is_empty(), "before any watch");
+        assert!(
+            !wakes.has_changed().expect("the log lives"),
+            "no task has told the watches"
+        );
+        // The first watch starts the task, and the task's first turn takes
+        // the kept wake.
+        let _stream = leader.watch(Start::Snapshot, &[]);
+        tokio::time::timeout(Duration::from_secs(5), wakes.changed())
+            .await
+            .expect("told within five seconds")
+            .expect("the log lives");
+        assert_eq!(*wakes.borrow(), leader.head());
     }
 
     /// The watches of one feed share its one task, started with the first
@@ -1656,6 +1792,34 @@ mod tests {
         assert_eq!(word.code(), Code::Aborted);
         assert_eq!(taken, HELD, "what the stream held");
         assert!(stream.next().await.is_none(), "the end");
+    }
+
+    /// The last word waits on its watcher as an event does, and no longer:
+    /// a watcher that takes nothing is not waited on past [`STALL`] for the
+    /// word that its replica left. What its channel held is the watcher's
+    /// still; the word that found no room is not told.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_word_waits_on_a_watcher_that_takes_nothing_to_its_bound_and_no_longer() {
+        let leader = leader();
+        let mut stream = leader.watch(Start::Snapshot, &[]);
+        next(&mut stream).await;
+        for n in 0..HELD + 8 {
+            leader.register(n, 1, "model-a");
+        }
+        holding(&stream, HELD).await;
+        // The word finds the channel full, the fence open still.
+        leader.role.send_replace(false);
+        tokio::time::sleep(STALL + Duration::from_secs(1)).await;
+        assert!(
+            stream.events.is_closed(),
+            "the task ended at the last word's bound"
+        );
+        let mut taken = 0;
+        while let Some(told) = stream.next().await {
+            told.expect("an event");
+            taken += 1;
+        }
+        assert_eq!(taken, HELD);
     }
 
     /// A tail that lets the kept cut go waits behind no watch that holds
