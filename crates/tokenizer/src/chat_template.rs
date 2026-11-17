@@ -1637,8 +1637,46 @@ fn sort_json_keys(value: &JsonValue) -> JsonValue {
 /// Hugging Face chat-template helper for surfacing model-authored validation
 /// errors instead of a generic "unknown function" render failure.
 fn raise_exception(message: String) -> std::result::Result<String, MinijinjaError> {
-    Err(MinijinjaError::new(ErrorKind::InvalidOperation, message))
+    Err(MinijinjaError::new(ErrorKind::InvalidOperation, message).with_source(RaisedByTemplate))
 }
+
+/// The source of the error [`raise_exception`] returns. The template engine
+/// reports an operation it could not run under the same kind, so the kind
+/// alone does not say that the template refused its input on purpose; this
+/// source does.
+#[derive(Debug)]
+struct RaisedByTemplate;
+
+impl std::fmt::Display for RaisedByTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("raised by the template")
+    }
+}
+
+impl std::error::Error for RaisedByTemplate {}
+
+/// A render the template itself refused through `raise_exception`: the helper
+/// a template's author calls to reject a conversation the template cannot
+/// format (roles out of order, a field it needs). The caller's input is at
+/// fault; any other render failure may be the template's own. The text is the
+/// render failure's, as every render failure reads.
+#[derive(Debug)]
+pub struct TemplateRefusal(String);
+
+impl TemplateRefusal {
+    /// Whether `error` is this refusal, at any depth of its chain.
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<Self>())
+    }
+}
+
+impl std::fmt::Display for TemplateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TemplateRefusal {}
 
 /// Transformers' `{% generation %}` ... `{% endgeneration %}` block marks the
 /// assistant tokens for a training mask and renders its body unchanged; the
@@ -2675,8 +2713,18 @@ fn render_messages<'a>(
     // Render into a buffer sized by the last render through this template:
     // the text grows past no capacity on the way.
     let mut rendered = Vec::with_capacity(output_len.hint());
-    tmpl.render_captured_to(&ctx, &mut rendered)
-        .map_err(|e| anyhow!("Failed to render template: {e}"))?;
+    tmpl.render_captured_to(&ctx, &mut rendered).map_err(|e| {
+        let message = format!("Failed to render template: {e}");
+        // The template's own refusal keeps its type, at any depth of the
+        // error's sources (a macro or an include wraps it).
+        let raised = iter::successors(std::error::Error::source(&e), |cause| cause.source())
+            .any(|cause| cause.is::<RaisedByTemplate>());
+        if raised {
+            anyhow::Error::new(TemplateRefusal(message))
+        } else {
+            anyhow!(message)
+        }
+    })?;
     let mut rendered = String::from_utf8(rendered)
         .map_err(|e| anyhow!("Failed to render template: the output is not UTF-8: {e}"))?;
     output_len.record(rendered.len());

@@ -13,7 +13,7 @@ use openai_protocol::responses::{
 };
 use serde_json::json;
 use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput};
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 use super::{
     common::{
@@ -33,9 +33,12 @@ use crate::{
             openai_bridge::{self, ResponseFormat},
         },
         error,
-        grpc::common::responses::{
-            collect_user_function_names, ensure_mcp_connection, load_history,
-            persist_response_if_needed, NotStored, ReplayInto, ResponsesContext,
+        grpc::{
+            common::responses::{
+                collect_user_function_names, ensure_mcp_connection, load_history,
+                persist_response_if_needed, NotStored, ReplayInto, ResponsesContext,
+            },
+            utils,
         },
     },
     tenant::storage_tenant,
@@ -112,12 +115,12 @@ async fn execute_without_mcp(
 ) -> Result<(ResponsesResponse, Option<ParserChoice>), Response> {
     // Convert ResponsesRequest → ChatCompletionRequest
     let chat_request = conversions::responses_to_chat(modified_request).map_err(|e| {
-        error!(
+        warn!(
             function = "execute_without_mcp",
             error = %e,
             "Failed to convert ResponsesRequest to ChatCompletionRequest"
         );
-        error::bad_request(e.code(), e.to_string())
+        utils::reported(error::bad_request(e.code(), e.to_string()))
     })?;
 
     // Execute chat pipeline (errors already have proper HTTP status codes)
@@ -199,13 +202,13 @@ pub(super) async fn execute_tool_loop(
         let mut chat_request =
             conversions::responses_to_chat_with_mcp_tools(&current_request, &mcp_chat_tools)
                 .map_err(|e| {
-                    error!(
+                    warn!(
                         function = "tool_loop",
                         iteration = state.iteration,
                         error = %e,
                         "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
                     );
-                    error::bad_request(e.code(), e.to_string())
+                    utils::reported(error::bad_request(e.code(), e.to_string()))
                 })?;
 
         // Prepare tool_choice for this iteration
