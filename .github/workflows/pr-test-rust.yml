@@ -273,9 +273,7 @@ jobs:
       # runner's image ships no build tools (go-unit-tests installs its own too).
       - name: Install the tools the tooling tests drive
         run: |
-          bash scripts/ci_apt_mirror.sh
-          bash scripts/ci_apt_update.sh sudo
-          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends make
+          bash scripts/ci_apt_install.sh sudo -y --no-install-recommends make
 
       # Every test under scripts/tests runs: the Python files as one pytest run, the
       # shell tests one by one. The tools the step above can install come from there; a
@@ -478,8 +476,7 @@ jobs:
         run: |
           sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
           export DEBIAN_FRONTEND=noninteractive
-          bash scripts/ci_apt_update.sh $sudo
-          bash scripts/ci_retry.sh 3 10 $sudo apt-get install -y --no-install-recommends ffmpeg
+          bash scripts/ci_apt_install.sh $sudo -y --no-install-recommends ffmpeg
 
       # libjpeg-turbo lets the TurboJPEG decode tests run instead of returning early.
       - name: Install libjpeg-turbo
@@ -487,8 +484,7 @@ jobs:
         run: |
           sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
           export DEBIAN_FRONTEND=noninteractive
-          bash scripts/ci_apt_update.sh $sudo
-          bash scripts/ci_retry.sh 3 10 $sudo apt-get install -y --no-install-recommends libturbojpeg
+          bash scripts/ci_apt_install.sh $sudo -y --no-install-recommends libturbojpeg
 
       - name: Build the Rust tests
         timeout-minutes: 40
@@ -625,8 +621,7 @@ jobs:
       - name: Install libjpeg-turbo
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          bash scripts/ci_apt_update.sh sudo
-          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends libturbojpeg
+          bash scripts/ci_apt_install.sh sudo -y --no-install-recommends libturbojpeg
 
       - name: Test the crates with AArch64-only code
         env:
@@ -894,6 +889,7 @@ jobs:
               - '.github/actions/setup-rust/**'
               - 'scripts/ci_install_rust.sh'
               - 'scripts/ci_apt_mirror.sh'
+              - 'scripts/ci_apt_install.sh'
               - 'scripts/ci_apt_update.sh'
               - 'scripts/ci_retry.sh'
               - 'scripts/ci_install_build_deps.sh'
@@ -919,6 +915,7 @@ jobs:
               - 'scripts/ci_rust_tests.sh'
               - 'scripts/ci_install_rust.sh'
               - 'scripts/ci_apt_mirror.sh'
+              - 'scripts/ci_apt_install.sh'
               - 'scripts/ci_apt_update.sh'
               - 'scripts/ci_retry.sh'
               - 'scripts/ci_install_build_deps.sh'
@@ -2421,9 +2418,7 @@ jobs:
 
       - name: Install build tools
         run: |
-          bash scripts/ci_apt_mirror.sh
-          bash scripts/ci_apt_update.sh sudo
-          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y build-essential
+          bash scripts/ci_apt_install.sh sudo -y build-essential
 
       - name: Download build artifacts
         uses: ./.github/actions/download-build-artifacts
