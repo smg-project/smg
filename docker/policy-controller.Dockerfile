@@ -116,10 +116,14 @@ RUN ["/usr/local/bin/smg-policy-controller", "--version"]
 # arm64 kernel runs with: a binary built for a smaller page ends at its start
 # on such a kernel. The repository's cargo configuration sets the page for
 # the target, and the allocator's statistics say the page it was built for.
+# A controller of your own that registers no such allocator prints no
+# statistics, and nothing is asked of it.
 ARG TARGETARCH
 RUN if [ "${TARGETARCH}" = "arm64" ]; then \
         stats="$(_RJEM_MALLOC_CONF=stats_print:true /usr/local/bin/smg-policy-controller --version 2>&1)" \
-        && printf '%s\n' "${stats}" | grep -F "Page size: 65536"; \
+        && if printf '%s\n' "${stats}" | grep -qF "Begin jemalloc statistics"; then \
+            printf '%s\n' "${stats}" | grep -F "Page size: 65536"; \
+        fi; \
     fi
 
 # The listeners' default ports: the gateways and the relays (30100), the
