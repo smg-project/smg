@@ -1546,19 +1546,18 @@ mod tests {
         tail.join().expect("the tail's thread");
     }
 
-    /// The draw is made where the lease lives in the process, whose log no
-    /// standby follows: there a term is taken again at each start. Under a
-    /// shared lease the term is the guard, and the log starts at the start,
-    /// where a standby joins it.
+    /// The draw is made wherever the lease lives. A later run takes a term
+    /// again at each start where the lease lives in the process, and where
+    /// a shared lease's record was lost.
     #[test]
-    fn the_draw_is_made_where_the_lease_lives_in_the_process_alone() {
-        let alone = journaled(&LeasePlace::Process).1.log.head(Kinds::Watched);
-        assert!(
-            alone.seq != 0 && alone.term == 0,
-            "a drawn start: {alone:?}"
-        );
-        let shared = journaled(&LeasePlace::File("lease".into())).1;
-        assert_eq!(shared.log.head(Kinds::Watched), Position::default());
+    fn the_draw_is_made_wherever_the_lease_lives() {
+        for place in [LeasePlace::Process, LeasePlace::File("lease".into())] {
+            let first = journaled(&place).1.log.head(Kinds::Watched);
+            assert!(
+                first.seq != 0 && first.term == 0,
+                "a drawn start: {first:?}"
+            );
+        }
     }
 
     /// The fence is read at each turn of the tail, before the log: once it

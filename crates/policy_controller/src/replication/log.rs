@@ -134,6 +134,11 @@ struct Ring {
     /// ([`Ring::fresh`]), so it names one write for as long as the log
     /// lives.
     unnamed: u64,
+    /// The place before the store's first write: the default, or the
+    /// number its run drew ([`Log::starting_after`]). A ring stands at it
+    /// until it lets its first write go or the log restarts at another
+    /// place, a snapshot's.
+    first: Position,
 }
 
 impl Ring {
@@ -228,6 +233,7 @@ impl Log {
                 adopting: None,
                 leads: false,
                 unnamed: 0,
+                first: Position::default(),
             }),
             term: AtomicU64::new(0),
             watched,
@@ -246,6 +252,28 @@ impl Log {
     #[must_use]
     pub fn on_watched(mut self, told: impl Fn(Position) + Send + Sync + 'static) -> Self {
         self.told = Some(Box::new(told));
+        self
+    }
+
+    /// The log with its places starting after `first`: the number a run
+    /// draws, so that a place of another run names no write of this one.
+    /// The head of every kind is that place under no term, and the next
+    /// write follows it: from there the log is its store's whole history
+    /// ([`Log::first`]). The number is one of the store's own line, so a
+    /// restart at another store's place under no term stands past it
+    /// ([`Log::restart`]).
+    #[must_use]
+    pub fn starting_after(mut self, first: u64) -> Self {
+        let ring = self.ring.get_mut();
+        let at = Position {
+            seq: first,
+            term: 0,
+        };
+        ring.watched.restart(at);
+        ring.loads.restart(at);
+        ring.head = at;
+        ring.first = at;
+        ring.unnamed = first;
         self
     }
 
@@ -270,6 +298,23 @@ impl Log {
         } else {
             watched
         }
+    }
+
+    /// The place before the store's first write, where a reader of `kinds`
+    /// that holds nothing joins the log: while the log is its store's whole
+    /// history and retains every write of `kinds`. `None` once a ring of
+    /// those kinds let its first write go, after a restart at another place
+    /// (what the store held at a snapshot is no event here), and for a
+    /// reader of every kind where the log carries no load row: that reader
+    /// starts from a snapshot.
+    pub fn first(&self, kinds: Kinds) -> Option<Position> {
+        if !self.serves(kinds) {
+            return None;
+        }
+        let ring = self.ring.lock();
+        let first = ring.first;
+        let stands = |kept: &Kept| kept.floor == first;
+        (stands(&ring.watched) && (kinds == Kinds::Watched || stands(&ring.loads))).then_some(first)
     }
 
     /// The highest term the log has seen: the store's last take, or a later
@@ -1533,6 +1578,56 @@ mod tests {
             at(100, 7),
             "no membership write since the restart"
         );
+    }
+
+    #[test]
+    fn a_log_says_its_first_place_while_it_is_its_stores_whole_history() {
+        // Four watched writes and two load rows are retained, and the
+        // places start after a number the run drew.
+        assert_eq!(Log::new(4, 2).first(All), Some(at(0, 0)), "no draw");
+        let log = Log::new(4, 2).starting_after(1_000);
+        for kinds in [All, Watched] {
+            assert_eq!(log.head(kinds), at(1_000, 0));
+            assert_eq!(log.floor(kinds), at(1_000, 0));
+            assert_eq!(log.first(kinds), Some(at(1_000, 0)));
+            assert!(!log.holds(kinds, at(0, 0)), "no place of this run");
+        }
+        log.term_rose(3);
+        load(&log, 1);
+        load(&log, 2);
+        assert_eq!(
+            places(&all_after(&log, All, at(1_000, 0))),
+            [at(1_001, 3), at(1_002, 3), at(1_003, 3)]
+        );
+        assert_eq!(log.first(All), Some(at(1_000, 0)), "every write retained");
+        // The load ring lets its first row go: a reader of every kind that
+        // holds nothing starts from a snapshot, one of the watched kinds
+        // still joins at the first place.
+        load(&log, 3);
+        assert_eq!(log.first(All), None);
+        assert_eq!(log.first(Watched), Some(at(1_000, 0)));
+        for epoch in 1..=4 {
+            member(&log, epoch);
+        }
+        assert_eq!(log.first(Watched), None, "the term's start is let go");
+    }
+
+    #[test]
+    fn a_log_restarted_at_a_snapshots_place_has_no_first_place() {
+        let log = Log::new(8, 8).starting_after(1_000);
+        log.restart(at(1_050, 7));
+        // What the store held at the snapshot is no event of the log.
+        assert_eq!((log.first(All), log.first(Watched)), (None, None));
+        // Another store's place under no term, at the first place's own
+        // number: the log stands past it, as past a write of its own line.
+        let log = Log::new(8, 8).starting_after(1_000);
+        log.restart(at(1_000, 0));
+        assert_eq!(log.head(All), at(1_001, 0));
+        assert_eq!(log.first(All), None);
+        // A log that carries no load row serves no reader of every kind.
+        let watched = Log::new(8, 0).starting_after(1_000);
+        assert_eq!(watched.first(All), None);
+        assert_eq!(watched.first(Watched), Some(at(1_000, 0)));
     }
 
     #[test]
