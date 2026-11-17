@@ -2526,6 +2526,40 @@ mod tests {
         );
     }
 
+    /// The byte vocabulary with three controls and one more added token,
+    /// `extra`, that is the beginning of one of them.
+    fn begins_another_dir(extra: &str) -> tempfile::TempDir {
+        let config = serde_json::json!({"added_tokens_decoder": {
+            "300": {"content": "</s:x>", "special": true},
+            "301": {"content": "[INST:x]", "special": true},
+            "302": {"content": "[/INST:x]", "special": false},
+            "303": {"content": extra, "special": false},
+        }});
+        write_tiktoken_dir(&full_byte_tiktoken_model(), &config.to_string(), None)
+    }
+
+    /// Of two added tokens that begin at one place the file's own encoder
+    /// takes the one its map of them walks first. The tokens go into that
+    /// map by ascending id, so every load of the same files reads the same
+    /// way: the way the format's reference package reads them when it is
+    /// handed the tokens in that order.
+    #[test]
+    fn two_added_tokens_that_begin_at_one_place_read_the_same_at_every_load() {
+        for (extra, end, open) in [
+            ("</s:", &[303, 120, 62][..], &[301][..]),
+            ("[INST:x", &[300][..], &[301][..]),
+        ] {
+            let dir = begins_another_dir(extra);
+            for load in 0..32 {
+                let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+                assert!(!tokenizer.uses_native_encoder());
+                let ids = |text: &str| tokenizer.encode(text, false).unwrap().token_ids().to_vec();
+                assert_eq!(ids("</s:x>"), end, "{extra}, load {load}");
+                assert_eq!(ids("[INST:x]"), open, "{extra}, load {load}");
+            }
+        }
+    }
+
     /// A file whose ranks give a complete merge table and whose pattern
     /// the engine reads encodes on the crate's direct path; the ids are the
     /// file's own encoder's, special tokens included.
@@ -2579,40 +2613,6 @@ mod tests {
         let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
         assert!(!tokenizer.uses_native_encoder());
         assert_eq!(tokenizer.encode("abcd", false).unwrap().token_ids(), &[259]);
-    }
-
-    /// The byte vocabulary with three controls and one more added token,
-    /// `extra`, that is the beginning of one of them.
-    fn begins_another_dir(extra: &str) -> tempfile::TempDir {
-        let config = serde_json::json!({"added_tokens_decoder": {
-            "300": {"content": "</s:x>", "special": true},
-            "301": {"content": "[INST:x]", "special": true},
-            "302": {"content": "[/INST:x]", "special": false},
-            "303": {"content": extra, "special": false},
-        }});
-        write_tiktoken_dir(&full_byte_tiktoken_model(), &config.to_string(), None)
-    }
-
-    /// Of two added tokens that begin at one place the file's own encoder
-    /// takes the one its map of them walks first. The tokens go into that
-    /// map by ascending id, so every load of the same files reads the same
-    /// way: the way the format's reference package reads them when it is
-    /// handed the tokens in that order.
-    #[test]
-    fn two_added_tokens_that_begin_at_one_place_read_the_same_at_every_load() {
-        for (extra, end, open) in [
-            ("</s:", &[303, 120, 62][..], &[301][..]),
-            ("[INST:x", &[300][..], &[301][..]),
-        ] {
-            let dir = begins_another_dir(extra);
-            for load in 0..32 {
-                let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
-                assert!(!tokenizer.uses_native_encoder());
-                let ids = |text: &str| tokenizer.encode(text, false).unwrap().token_ids().to_vec();
-                assert_eq!(ids("</s:x>"), end, "{extra}, load {load}");
-                assert_eq!(ids("[INST:x]"), open, "{extra}, load {load}");
-            }
-        }
     }
 
     /// The Kimi checkpoint's pieces hold on the direct path: a text with a
