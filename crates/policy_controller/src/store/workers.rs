@@ -138,8 +138,9 @@ pub struct WorkerFacts {
     /// the engine kind as the runtime, where a membership write moves a
     /// member or an offer and where a generation moves the pairing mode
     /// ([`pairing`](super::pairing)): a registration hands no class in. The
-    /// door drops a blank value and reads a name past its blanks.
-    pub pairing: Option<PairingDescriptor>,
+    /// door drops a blank value and reads a name past its blanks. Behind a
+    /// pointer: a worker that reports none holds one word for it.
+    pub pairing: Option<Box<PairingDescriptor>>,
     /// The engine's admission window (maximum running requests); `None`
     /// when it reports none.
     pub max_running: Option<u32>,

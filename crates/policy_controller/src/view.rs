@@ -637,8 +637,11 @@ pub struct Candidate {
     /// prefill of the same class. The store derives the classes and their
     /// table where a membership write moves a member or an offer, and again
     /// under a generation of another pairing mode
-    /// ([`store::pairing`](crate::store::pairing)); a host that builds its
-    /// own rows keys it by the open prefill a decode partners with.
+    /// ([`store::pairing`](crate::store::pairing)). It numbers each side by
+    /// itself, so a store's class pairs through its table alone: a prefill
+    /// and a decode of one number are not a pair for that. A host that
+    /// builds its own rows keys it by the open prefill a decode partners
+    /// with.
     pub pair_class: u32,
     /// Host-supplied admission bit: the prefill capacity window has a slot.
     pub has_capacity: bool,

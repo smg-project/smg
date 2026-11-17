@@ -53,6 +53,11 @@
 //! unnamed in turn, which moves its offer at every write. The gate reads
 //! both at 512 a side.
 //!
+//! `policy_store_models/member_write/<ids>` is one membership write beside
+//! a worker that lists `ids` models: one small worker's registration
+//! written again as it stands, in a store of eight workers of one model and
+//! one worker of `ids` models of its own. The gate reads it at 1,024.
+//!
 //! `policy_store_cadence/*` reads the build beside a writer on another
 //! core, for a run pinned to two cores (both threads spin, so each keeps
 //! its core): `quiet/<n>` with the writer idle, `busy/<n>` with it writing
@@ -824,6 +829,52 @@ fn pair_writes(c: &mut Criterion) {
     }
 }
 
+/// One membership write beside a worker that lists many models, in a store
+/// of its own a size: eight workers of one model and one worker that lists
+/// `ids` models of its own, every one ready with a record on file and
+/// published. `policy_store_models/member_write/<ids>` writes one of the
+/// eight's registration again as it stands. The write reads every row's
+/// models into their pools: the row fails when that read looks back over
+/// the models a row listed before.
+fn member_write_beside_many_models(c: &mut Criterion) {
+    let facts_of = |key: String, models: Vec<String>| WorkerFacts {
+        engine: key.clone(),
+        key,
+        incarnation: 1,
+        models,
+        dp_size: 1,
+        max_running: Some(4),
+        ..WorkerFacts::default()
+    };
+    let small = |index: usize| facts_of(format!("http://w{index}:8000"), vec![MODEL.to_string()]);
+    let mut group = c.benchmark_group("policy_store_models");
+    for ids in [128_usize, 1_024, 4_096] {
+        let listed = (0..ids).map(|model| format!("model-{model}")).collect();
+        let wide = facts_of("http://wide:8000".to_string(), listed);
+        let store = MemoryStore::new();
+        let opened = Instant::now();
+        for (index, facts) in (0..8).map(&small).chain([wide]).enumerate() {
+            let id = store.upsert(facts).id();
+            let revision = WorkersStore::get(&store, id).expect("the row").revision;
+            store
+                .set_status(id, WorkerStatus::Ready, revision)
+                .expect("ready");
+            store.record(id, 0, record_of(index, 0), opened, LoadSource::Stream);
+        }
+        store.publish(opened + PUBLISH_WINDOW);
+        assert_eq!(store.publish_due(), None);
+        let written = small(3);
+        group.bench_with_input(BenchmarkId::new("member_write", ids), &ids, |b, _| {
+            b.iter_batched(
+                || written.clone(),
+                |facts| store.upsert(black_box(facts)),
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 fn store_view(c: &mut Criterion) {
     // Every size's buffers are placed before the first store is built. A
     // count's runner bounds the program break, and the stores cross that
@@ -850,6 +901,7 @@ fn store_view(c: &mut Criterion) {
     writes_beside_vetoes(c, &mut fixtures);
     member_write_beside_spread_vetoes(c);
     pair_writes(c);
+    member_write_beside_many_models(c);
 }
 
 criterion_group!(benches, store_view);

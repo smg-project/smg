@@ -20,14 +20,16 @@
 //! writes a publication derives nothing: it is one small object, a pointer
 //! per pool, and new rows for each pool a write was folded into.
 //!
-//! **A pair class is a fact of the rows.** A membership write derives each
-//! model's pair classes from what its prefills and decodes report
-//! ([`PairClasses`]) before any row is built: a worker's row carries its one
+//! **A pair class is a fact of the rows.** A model's pair classes come from
+//! what its prefills and decodes report ([`PairClasses`]), and a membership
+//! write holds them before any row is built: a worker's row carries its one
 //! class, and the model's table says which classes pair. The table names
 //! classes, never rows, so a pool with another gateway's host-local rows
-//! left out reads the same table. A write that moves no member and no
-//! member's offer carries the last write's classes and reads no member's
-//! facts for them.
+//! left out reads the same table. A write that moves one worker or its
+//! offer derives the classes for that worker alone, in the models it left
+//! and joined, from what the writer keeps of each model's derivation. A
+//! write that moves no member and no member's offer carries the last
+//! write's classes and reads no member's facts for them.
 //!
 //! A row in a pool is the candidate row itself. Its fixed fields are
 //! written when the membership's first world is built. Its moving facts
@@ -239,8 +241,10 @@ struct PoolShape {
     locals: Box<[(u32, GatewayId)]>,
     /// The pair classes of the pool's model, on its prefill pool where the
     /// model has a decode too: a pair build reads them by the one lookup
-    /// that finds its two pools. Counted: a membership write that moves no
-    /// offer hands them to the shape it derives ([`Classes::Carry`]).
+    /// that finds its two pools. Counted: a membership write hands them to
+    /// the shape it derives where they stand, a write that moves no offer
+    /// ([`Classes::Carry`]) and a written worker's derive that leaves them
+    /// as they were ([`Classes::Written`]).
     pairs: Option<Arc<PairClasses>>,
 }
 
@@ -927,7 +931,7 @@ impl<'a> Pool<'a> for [Entry<'a>] {
             entry.row.id,
             facts.wire_modes,
             &facts.engine_kind,
-            facts.pairing.as_ref(),
+            facts.pairing.as_deref(),
         )
     }
 }
@@ -949,9 +953,8 @@ pub(super) enum Classes {
         joined: Option<WorkerId>,
     },
     /// No member joined or left and no member's offer moved
-    /// ([`same_offer`]): the classes are the last write's, carried. A
-    /// derivation reads the written member's facts, so a write that moves
-    /// none of them pays for none.
+    /// ([`same_offer`]): the classes are the last write's, carried, and no
+    /// member's facts are read for them.
     Carry,
 }
 
@@ -1698,22 +1701,27 @@ impl Writer {
                 },
                 own: facts.overload,
             };
-            for (n, model) in facts.models.iter().enumerate() {
-                // A model listed twice is one pool's one row.
-                if facts.models[..n].contains(model) {
-                    continue;
-                }
-                let side = role_slot(facts.role);
+            let side = role_slot(facts.role);
+            for model in &facts.models {
                 match groups.get_mut(model.as_str()) {
-                    Some(sides) => sides[side].push(entry),
+                    // A model listed twice is one pool's one row. A member's
+                    // entry is the last of its side until the next member is
+                    // read, so an earlier listing is found there: no model
+                    // before this one is read again.
+                    Some(sides) => {
+                        let list = &mut sides[side];
+                        if list.last().is_none_or(|last| last.row.id != member.id) {
+                            list.push(entry);
+                        }
+                    }
                     None => {
                         // Each side takes room for its pool's last members
                         // and the one this write may add.
                         let before = self.derived.by_model.get(model.as_str());
-                        let standing = before.map_or([0; ROLES], |pools| {
+                        let room = before.map_or([0; ROLES], |pools| {
                             pools.map(|pool| self.derived.members(pool))
                         });
-                        let mut sides: [Vec<Entry<'a>>; ROLES] = standing.map(list_of);
+                        let mut sides: [Vec<Entry<'a>>; ROLES] = room.map(list_of);
                         sides[side].push(entry);
                         groups.insert(model.as_str().into(), sides);
                     }

@@ -25,7 +25,6 @@ use crate::{
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore},
         loads::{LoadSample, LoadSink, LoadSource, PollMode},
-        pairing::PairingDescriptor,
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionsStore},
         workers::{
@@ -594,7 +593,9 @@ impl WorkersStore for MemoryStore {
     fn upsert(&self, mut facts: WorkerFacts) -> MembershipChange {
         // A blank value of a descriptor is no report: the row of record holds
         // what the pairing rule reads.
-        facts.pairing = facts.pairing.map(PairingDescriptor::normalized);
+        if let Some(descriptor) = facts.pairing.as_deref_mut() {
+            descriptor.normalize();
+        }
         let mut workers = self.workers.lock();
         let now = Instant::now();
         if let Some(old_id) = workers.by_key.get(&facts.key).copied() {
