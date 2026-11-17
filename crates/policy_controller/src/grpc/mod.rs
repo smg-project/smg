@@ -81,14 +81,22 @@
 //! never a wait on a deciding thread. A number counts the events sent and
 //! the events refused, for one load of the plugin and across that load's
 //! streams, so a gap tells the plugin what it lost: events refused at a full
-//! queue, or in flight on a stream that ended. A gap sits at the loss: an
-//! event carries the refusals its thread had seen as it entered the queue,
-//! so every event that entered the queue before a loss arrives ahead of the
-//! gap, an event whose thread stood between its read of the count and its
-//! entry when the loss fell arrives on either side, and a loss after the
-//! last event raised shows at the next. The stream's task is started again
-//! a pause after one that panicked, the queue and the numbers kept, and a
-//! panic at every start is said once. Each profile
+//! queue, or in flight on a stream that ended. A gap sits at the loss. For
+//! a refusal, an event carries the refusals its thread had seen as it
+//! entered the queue, so every event that entered the queue before the
+//! refusal arrives ahead of the gap, an event whose thread stood between its
+//! read of the count and its entry when the refusal fell arrives on either
+//! side, and a refusal after the last event raised shows at the next. For a
+//! stream that ended, the gap is the events in flight on it: it sits before
+//! the first event of the next stream, and the events that waited in the
+//! queue behind them arrive after it. A stream that fails says one warning
+//! an outage. The stream's task is started again a pause after a turn that
+//! panicked, the queue and the numbers kept, and says one error a streak of
+//! such turns. One edge starts an outage and a streak anew: the end of a
+//! call that stood a minute, which only the plugin makes. An event sent
+//! does not, and two outages with less than a minute of standing between
+//! them are one line. The process's panic hook writes its own line to
+//! stderr at every panicked turn. Each profile
 //! that binds the plugin holds one [`Bound`] set, taken from its engine
 //! build's [`Binder`]: one adapter of a build forwards, so an event reaches
 //! the plugin once per engine.

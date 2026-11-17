@@ -612,11 +612,14 @@ message LifecycleEvent {
   // numbers what it owed: the events it sent and the events it refused at a
   // full queue. A gap is events the plugin never received (refused at a
   // full queue, or in flight on a stream that ended), and a plugin that
-  // keeps a ledger of leases treats it as a loss. A gap sits at the loss:
-  // every event that entered the host's queue before the loss arrives ahead
-  // of the gap. An event whose thread stood between its read of the count
-  // and its entry when the loss fell can arrive on either side. A loss
-  // after the last event raised shows at the next event.
+  // keeps a ledger of leases treats it as a loss. A gap sits at the loss.
+  // For a refusal, every event that entered the host's queue before it
+  // arrives ahead of the gap; an event whose thread stood between its read
+  // of the count and its entry when the refusal fell can arrive on either
+  // side; a refusal after the last event raised shows at the next event.
+  // For a stream that ended, the gap is the events in flight on it: it sits
+  // before the first event of the next stream, and events that waited in
+  // the host's queue behind them arrive after it.
   uint64 seq = 1;
   oneof event {
     Issued issued = 2;
