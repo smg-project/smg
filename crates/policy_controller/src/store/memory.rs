@@ -137,7 +137,7 @@ impl MemoryStore {
         // that far: a sample older than the store keeps an instant of its
         // own.
         let origin = now.checked_sub(Duration::from_secs(3_600)).unwrap_or(now);
-        let writer = Writer::new(window, origin);
+        let mut writer = Writer::new(window, origin);
         let world = ArcSwap::new(writer.world());
         Self {
             workers: Mutex::default(),
@@ -296,6 +296,18 @@ impl MemoryStore {
         out: &mut ViewBuffers,
     ) -> Option<Built> {
         self.world.load().build(model, role, ask, out)
+    }
+
+    /// Read the world of this instant under one load, held until `read`
+    /// returns: the rows it takes ([`World::view`]), the generation and its
+    /// engine ([`World::spec`]) are of one publication, and a decision made
+    /// inside is made over that publication's rows where they stand. Like
+    /// [`build_view`](Self::build_view) it borrows the world and writes no
+    /// shared count. The load is held for as long as `read` runs: a reader
+    /// that waits inside keeps the publication's rows from their next use.
+    pub fn with_world<R>(&self, read: impl FnOnce(&World) -> R) -> R {
+        let world = self.world.load();
+        read(&world)
     }
 
     /// Build both sides of one pair decision from the world of this instant

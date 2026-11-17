@@ -288,12 +288,17 @@ impl Checked {
                 // The wire carries the name: each read of the request's
                 // session fingerprints it.
                 model_fingerprint: ModelFingerprint::NONE,
+                // The decision's rows are written for it: none is pinned
+                // beside its own session bit.
+                pinned_at: 0,
             },
             &Constraints {
                 excluded: &lists.excluded,
                 wire_modes: self.wires().unwrap_or_default(),
                 overload_lifted: constraints.overload_lifted,
                 subset_hint: constraints.subset_hint,
+                // And each carries its own stalled bit.
+                stalled: &[],
             },
         );
         lists.headers = emptied(headers);

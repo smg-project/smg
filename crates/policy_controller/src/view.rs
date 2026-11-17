@@ -182,7 +182,10 @@ pub struct LoadRow {
     /// count them sends none, which is not a count of zero. The host's own
     /// reading of the report, in no plugin's view.
     pub resident_counted: bool,
-    /// Age of the report's sample at the decision, in milliseconds.
+    /// Age of the report's sample at the decision, in milliseconds. On a
+    /// row a store lends, it is the age the report carried when it was
+    /// recorded: the age at the decision is then the request's
+    /// `now_micros` less the row's `load_sampled_at_micros`.
     pub report_age_ms: u32,
     /// Where the row came from.
     pub source: SignalSource,
@@ -751,6 +754,13 @@ pub struct RequestFacts<'a> {
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,
+    /// One more than the position of the row the request's session key is
+    /// pinned to, where the host did not write the session bit into the
+    /// row: a view of a publication's own rows hands the pin here, and a
+    /// reader of a row's session bit asks both ([`RequestFacts::pins`]).
+    /// Zero for no pin, and where the rows were written for the decision.
+    /// In-process only.
+    pub pinned_at: u32,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
     /// the candidates' own order. It is EMPTY or holds exactly one entry a
@@ -848,6 +858,13 @@ impl<'a> RequestFacts<'a> {
         }
     }
 
+    /// Whether the request's session key is pinned to the row at
+    /// `position`, beside the row's own session bit.
+    #[inline]
+    pub fn pins(&self, position: u32) -> bool {
+        self.pinned_at.wrapping_sub(1) == position
+    }
+
     /// The affinity facts of the candidate at `index` of the slice the
     /// decision is made over. An empty column reads as nothing held for
     /// every candidate. Any other column holds the candidate's own entry,
@@ -917,6 +934,22 @@ pub struct Constraints<'a> {
     pub overload_lifted: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
+    /// The rows a standing veto of this host masks, by position, in order,
+    /// where the host did not write them into the rows: a view of a
+    /// publication's own rows hands them here, and a reader of a row's
+    /// stalled bit asks both ([`Constraints::masks`]). Empty where the rows
+    /// were written for the decision. In-process only.
+    pub stalled: &'a [u32],
+}
+
+impl Constraints<'_> {
+    /// Whether a standing veto of this host masks the row at `position`,
+    /// beside the row's own stalled bit. A decision under no such veto pays
+    /// the first test alone.
+    #[inline]
+    pub fn masks(&self, position: u32) -> bool {
+        !self.stalled.is_empty() && self.stalled.binary_search(&position).is_ok()
+    }
 }
 
 /// Healthy capacity of one zone, by the zone's position.

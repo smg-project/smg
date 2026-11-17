@@ -834,6 +834,7 @@ fn store_view(c: &mut Criterion) {
         .map(|&n| ViewBuffers {
             candidates: page_start_buffer(n),
             affinity: page_start_buffer(n),
+            stalled: Vec::new(),
         })
         .collect();
     let mut fixtures: Vec<Fixture> = SIZES

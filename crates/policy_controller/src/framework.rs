@@ -1996,6 +1996,12 @@ impl Engine {
         let _opened = if marks.asks_nothing_first() {
             None
         } else {
+            // A plugin is shown each row as a record of the row's own
+            // fields: its host hands rows written for the decision.
+            debug_assert!(
+                !marks.scoped() || (cx.stalled.is_empty() && facts.pinned_at == 0),
+                "a profile that shows its rows to a plugin is handed rows written for the decision"
+            );
             let opened = marks
                 .scoped()
                 .then(|| profile.open(facts, candidates, pool));

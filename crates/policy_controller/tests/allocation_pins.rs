@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers, PairingDescriptor,
-        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, PairBuffers,
+        PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow, PairPools, PolicySpec,
     PoolFacts, RequestFacts, Role, Scratch, Side, SignalSource, Target, WireModes, WorkerId,
@@ -557,4 +557,43 @@ fn index_keys_that_pass_add_no_allocation_to_a_validation() {
         allocations
     };
     assert_eq!(allocations(2_000), allocations(1_000));
+}
+
+#[test]
+fn a_lent_view_from_the_store_after_the_first_allocates_nothing() {
+    for n in [8usize, 64, 512] {
+        let (store, ids, opened) = store_of(n);
+        let asker = GatewayId(1);
+        store.gateway_veto(asker, ids[1], Some(opened + Duration::from_secs(3_600)));
+        let mut out = ViewBuffers::default();
+        for affinity in [false, true] {
+            let ask = Ask {
+                gateway: asker,
+                now: opened + Duration::from_secs(1),
+                pinned: Some(ids[0]),
+                affinity,
+            };
+            // The first view sizes the host's buffers: the mask and the
+            // column.
+            store.with_world(|world| {
+                let first = world.view("m", Role::Single, &ask, false, &mut out);
+                assert!(first.is_some());
+            });
+            let (read, allocations) = allocations_during(|| {
+                store.with_world(|world| {
+                    let view = world
+                        .view("m", Role::Single, &ask, false, &mut out)
+                        .expect("the pool");
+                    let (rows, column) = (view.candidates.len(), view.affinity.len());
+                    (rows, view.stalled.len(), view.pinned_at != 0, column)
+                })
+            });
+            assert_eq!(read, (n, 1, true, if affinity { n } else { 0 }));
+            assert_eq!(
+                allocations, 0,
+                "a lent view of {n} rows allocated (affinity {affinity})"
+            );
+        }
+        assert!(out.candidates.is_empty(), "a lent view copies no row");
+    }
 }
