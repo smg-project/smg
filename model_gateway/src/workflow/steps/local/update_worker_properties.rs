@@ -16,8 +16,8 @@ use super::create_worker::{
 use crate::{
     service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
-        health::overload::OverloadThresholds, identity::basic::merge_labels,
-        registry::service::MAX_WORKER_LABELS, BasicWorker, BasicWorkerBuilder, RuntimeType, Worker,
+        identity::basic::merge_labels, registry::service::MAX_WORKER_LABELS, BasicWorker,
+        BasicWorkerBuilder, RuntimeType, Worker,
     },
     workflow::data::WorkerUpdateWorkflowData,
 };
@@ -289,9 +289,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .cost(updated_cost)
                 // The effective overload thresholds re-resolve against the
                 // same gateway defaults registration used.
-                .overload_defaults(OverloadThresholds::from_gateway_config(
-                    &app_context.router_config,
-                ))
+                .overload_defaults(app_context.router_config.worker_overload_thresholds())
                 .status(next_status);
             if refresh {
                 // A connector or role the operator configured none of follows

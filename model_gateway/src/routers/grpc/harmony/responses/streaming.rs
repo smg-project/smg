@@ -445,10 +445,7 @@ async fn execute_mcp_tool_loop_streaming(
                         );
                     }
                     let usage_json = usage_total.as_ref().map(|usage| json!(usage));
-                    if let Err(e) = emitter
-                        .emit_terminal(usage_json.as_ref(), Some(&error), tx)
-                        .await
-                    {
+                    if let Err(e) = emitter.emit_terminal(usage_json, Some(&error), tx).await {
                         warn!(error = %e, "Failed to end the Harmony Responses stream at the tool-call limit");
                     }
                     return;

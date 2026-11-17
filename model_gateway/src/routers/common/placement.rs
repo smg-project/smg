@@ -1936,7 +1936,7 @@ mod tests {
             let registry = gated_pd_registry(8);
             let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
             policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
-            let feed = TestFeed::attached_to(decode_policy.as_ref());
+            let feed = TestFeed::attached_to(|rx| decode_policy.as_ref().set_load_receiver(rx));
             policies.set_decode_policy(decode_policy);
             // d:1 runs its whole window of eight at 160 tokens/s and holds
             // every room; d:2 runs one request at 20 tokens/s.

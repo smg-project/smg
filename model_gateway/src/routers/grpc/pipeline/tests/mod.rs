@@ -7,6 +7,7 @@ mod glm53;
 mod model_label;
 mod pretokenized;
 mod rate_limit_reserve;
+mod refusal_lines;
 
 use std::{
     path::{Path, PathBuf},
@@ -779,16 +780,15 @@ async fn chat_pipeline_over(
     (pipeline, components, seen_ids)
 }
 
-/// The error body of a chat request the pipeline answered within its
-/// budget.
-async fn chat_error_body(
+/// The chat pipeline's answer to `request`, within its budget.
+async fn chat_response(
     pipeline: &RequestPipeline,
     components: Arc<SharedComponents>,
     request: serde_json::Value,
-) -> (http::StatusCode, serde_json::Value) {
+) -> Response {
     let request: Arc<ChatCompletionRequest> =
         Arc::new(serde_json::from_value(request).expect("chat request"));
-    let response = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(10),
         pipeline.execute_chat(
             request,
@@ -802,7 +802,17 @@ async fn chat_error_body(
         ),
     )
     .await
-    .expect("the pipeline answers within its budget");
+    .expect("the pipeline answers within its budget")
+}
+
+/// The error body of a chat request the pipeline answered within its
+/// budget.
+async fn chat_error_body(
+    pipeline: &RequestPipeline,
+    components: Arc<SharedComponents>,
+    request: serde_json::Value,
+) -> (http::StatusCode, serde_json::Value) {
+    let response = chat_response(pipeline, components, request).await;
     let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await

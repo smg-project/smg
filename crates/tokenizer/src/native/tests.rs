@@ -2601,8 +2601,9 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
 /// runs of a mark beyond ASCII), one whose prefixes stand whole (every
 /// token shorter than the prefix length), one the library declines as it
 /// stands (one-byte tab and newline tokens among twenty-two prefixes: the
-/// tokens' five first bytes stand in), and two sets of added words whose
-/// prefixes would be under the floor (they keep the automaton's search).
+/// tokens' five first bytes stand in), two sets of added words whose
+/// prefixes would be under the floor (they keep the automaton's search),
+/// and one cut to thirteen-byte prefixes for the narrow searcher.
 #[test]
 fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
     let sets: [(&[&str], bool); 5] = [
@@ -2689,6 +2690,10 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
         "zaed",
         "ed",
         "qa",
+        "<\u{FF5C}call_07__a_tail\u{FF5C}>",
+        "<\u{FF5C}call_07__b_tail\u{FF5C}>",
+        "<\u{FF5C}call_07__",
+        "\u{FF5C}end\u{FF5C}",
     ];
     // Sets of added words: the prefixes that fit are one byte (70 words with
     // distinct two-byte prefixes) or two bytes (60 pairs sharing one), under
@@ -2713,6 +2718,9 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
         .into_iter()
         .chain(tags.iter().map(String::as_str))
         .collect();
+    // A set cut to thirteen-byte prefixes for the narrow searcher: a hit
+    // names its token less closely, and the anchored automaton still decides.
+    let calls = bar_fenced_calls();
     let mut all: Vec<(Vec<&str>, bool)> = sets
         .iter()
         .map(|(tokens, by_prefixes)| (tokens.to_vec(), *by_prefixes))
@@ -2720,6 +2728,7 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
     all.push((words_one.iter().map(String::as_str).collect(), false));
     all.push((words_two.iter().map(String::as_str).collect(), false));
     all.push((declined, true));
+    all.push((calls.iter().map(String::as_str).collect(), true));
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     for (tokens, by_prefixes) in &all {
         let list: Vec<Added> = tokens
@@ -2756,6 +2765,66 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
             );
         }
     }
+}
+
+/// Forty-one added tokens, most fenced in fullwidth bars: twenty-one
+/// distinct prefixes of thirteen bytes, forty-one of sixteen.
+fn bar_fenced_calls() -> Vec<String> {
+    let letter = |i: usize| (b'a' + i as u8) as char;
+    (0..40)
+        .map(|i| {
+            format!(
+                "<\u{FF5C}call_{:02}__{}_tail\u{FF5C}>",
+                i % 20,
+                letter(i / 20)
+            )
+        })
+        .chain(["\u{FF5C}end\u{FF5C}".to_owned()])
+        .collect()
+}
+
+/// The prefixes an added-token set is searched by: the longest of at most
+/// thirty-two when they keep eight bytes or more (the library then takes
+/// its narrow searcher), else the longest of at most sixty-four.
+#[test]
+fn the_added_tokens_prefixes_fit_the_narrow_searcher_where_they_stay_long() {
+    let chosen = |tokens: Vec<String>| {
+        let list: Vec<Added> = tokens
+            .into_iter()
+            .enumerate()
+            .map(|(i, token)| Added::plain(token, 1000 + i as u32))
+            .collect();
+        let picked = Prefixes::chosen(&list).map(|prefixes| {
+            let longest = prefixes.iter().map(|prefix| prefix.len()).max();
+            (prefixes.len(), longest.unwrap_or(0))
+        });
+        picked
+    };
+    let letter = |i: usize| (b'a' + i as u8) as char;
+    // Forty-one prefixes of sixteen bytes, twenty-one of thirteen: cut to
+    // the narrow searcher's count.
+    assert_eq!(chosen(bar_fenced_calls()), Some((21, 13)));
+    // Thirty-two prefixes of sixteen bytes fit as they stand; a
+    // thirty-third cuts them to the fifteen bytes that five share.
+    let reserved = |count: usize| -> Vec<String> {
+        (0..count)
+            .map(|i| format!("<|reserved_tok{}{}|>", letter(i / 8), i % 8))
+            .collect()
+    };
+    assert_eq!(chosen(reserved(32)), Some((32, 16)));
+    assert_eq!(chosen(reserved(33)), Some((5, 15)));
+    // Forty prefixes that only seven bytes would bring under thirty-two:
+    // too short to name a token, so the wide searcher keeps all sixteen.
+    let tools: Vec<String> = (0..40)
+        .map(|i| format!("<tool_{}{}_and_a_long_tail>", i % 10, letter(i / 10)))
+        .collect();
+    assert_eq!(chosen(tools), Some((40, 16)));
+    // Seventy words with distinct two-byte prefixes: nothing of three
+    // bytes fits, and the set keeps the automaton's own search.
+    let words: Vec<String> = (0..70)
+        .map(|i| format!("{}{}ing", letter(i % 26), letter(i / 26)))
+        .collect();
+    assert_eq!(chosen(words), None);
 }
 
 /// An added token matched after normalization whose inner space is the
@@ -6692,4 +6761,120 @@ fn a_unit_opens_as_ascii_up_to_one_byte_in_eight_of_its_head() {
     assert!(NativeEncoder::opens_as_ascii("abcdefg"));
     assert!(!NativeEncoder::opens_as_ascii("abcde\u{e9}"));
     assert!(!NativeEncoder::opens_as_ascii("abcdefgh\u{e9}"));
+}
+
+/// A piece that holds no byte whose image a stage over the image can begin
+/// a match with is final before its image is built (`image_opens`). Its
+/// pieces are the full walk's and the reference's: on the two listed shapes
+/// with digit stages over the image and on one with two opening classes
+/// there (digit runs, then runs of `!`, the whole unit one piece). The
+/// texts: words without an opening byte, with one at either end and inside,
+/// with the bytes beyond ASCII whose image is numeric, and random ones over
+/// such an alphabet.
+#[test]
+fn a_piece_without_an_opening_byte_is_final_before_its_image() {
+    let mut state = 0x494D_4147_4546_494Cu64;
+    let random = |state: &mut u64| {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    };
+    let table = bytes_char();
+    let listed = [
+        "punctuation-then-byte-level-regex-then-digits",
+        "punctuation-then-byte-level-regex-then-digit-runs-then-threes",
+    ];
+    let mut cases: Vec<Shape> = shapes()
+        .into_iter()
+        .filter(|shape| listed.contains(&shape.name))
+        .collect();
+    assert_eq!(cases.len(), listed.len());
+    cases.push(Shape {
+        name: "byte-level-then-digit-runs-then-bangs",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            byte_level(false),
+            PreTokenizerWrapper::Digits(Digits::new(false)),
+            split("!+", SplitDelimiterBehavior::Isolated, false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    });
+    let alphabet: Vec<char> = "ab z0189!,.\u{B2}\u{BC}\u{E9}\u{4E32}\u{4E39}\u{E52} \n"
+        .chars()
+        .collect();
+    let fixed = [
+        "word",
+        "two words",
+        "a1",
+        "1a",
+        "a1b",
+        "12345",
+        "a!b",
+        "!!1!!",
+        "x\u{B2}",
+        "caf\u{E9}",
+        "\u{4E32}\u{4E39}",
+        "price 1234 units!",
+        "tab\there 7\n",
+    ];
+    for shape in &cases {
+        let name = shape.name;
+        let tokenizer = tokenizer_of(shape, &mut state);
+        let native = seeded(&tokenizer);
+        let from = native.mapped_from.expect("the map");
+        let opens = native.image_opens.as_deref().expect("the opening bytes");
+        for byte in [b'0', b'7', 0xB2, 0xBC] {
+            assert!(opens[usize::from(byte)], "{name}: {byte:#x}");
+        }
+        for byte in [b'a', b' ', 0xA9, 0xC3, 0xE4] {
+            assert!(!opens[usize::from(byte)], "{name}: {byte:#x}");
+        }
+        assert_eq!(opens[usize::from(b'!')], name.ends_with("bangs"), "{name}");
+        let mut full = seeded(&tokenizer);
+        full.image_opens = None;
+        let pre_tokenizer = tokenizer.get_pre_tokenizer().expect("the pre-tokenizer");
+        let mut image = String::new();
+        let mut texts: Vec<String> = fixed.iter().map(|text| (*text).to_owned()).collect();
+        for _ in 0..300 {
+            let len = 1 + (random(&mut state) % 24) as usize;
+            texts.push(
+                (0..len)
+                    .map(|_| alphabet[(random(&mut state) % alphabet.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        for text in &texts {
+            let mut split = PreTokenizedString::from(text.as_str());
+            pre_tokenizer
+                .pre_tokenize(&mut split)
+                .expect("the reference");
+            let theirs: Vec<String> = split
+                .get_splits(OffsetReferential::Original, OffsetType::Byte)
+                .into_iter()
+                .map(|(piece, _, _)| piece.to_owned())
+                .collect();
+            let mut ours = Vec::new();
+            native.pieces_mapping(0, from, text, &mut image, &mut |raw: &[u8]| {
+                ours.push(
+                    raw.iter()
+                        .map(|&b| table[usize::from(b)])
+                        .collect::<String>(),
+                );
+            });
+            let mut walked = Vec::new();
+            full.pieces_mapping(0, from, text, &mut image, &mut |raw: &[u8]| {
+                walked.push(
+                    raw.iter()
+                        .map(|&b| table[usize::from(b)])
+                        .collect::<String>(),
+                );
+            });
+            assert_eq!(ours, walked, "{name}: the full walk's pieces of {text:?}");
+            assert_eq!(ours, theirs, "{name}: the reference's pieces of {text:?}");
+        }
+    }
 }

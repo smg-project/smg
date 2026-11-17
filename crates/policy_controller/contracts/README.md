@@ -85,8 +85,9 @@ a replay rebuilds the view from the fixture, which keeps them beside the
 record, checks it against `view_digest`, then runs the plugin in place of the
 recorded stages. The verdicts cover determinism, validity, budget, fallback,
 exposure, replay agreement, lifecycle, version, transport and the packed
-layout. The fixtures (the records with their views) live in the fixture
-repository (bellwether) under a pinned tree, never in this repository.
+layout. The fixtures (the records with their views) live in this
+repository beside the tests that read them, as the recorded policy sheets
+do (`tests/classic/sheets`).
 
 ## Wire budgets
 

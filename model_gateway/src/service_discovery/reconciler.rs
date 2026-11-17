@@ -435,10 +435,18 @@ pub(super) async fn reconcile(
             config: Box::new(build_worker_spec(worker, kind, app_context)),
             registration_mode: WorkerRegistrationMode::Upsert,
         };
-        match job_queue.submit(job).await {
-            Ok(()) => Metrics::record_discovery_registration(
+        // The status read above and this submission are two steps, and the
+        // pass can wait for a queue slot between them: the claim is taken
+        // with the check, so a registration that took the URL since (a
+        // `POST`'s) keeps it, and the next pass adds what is still missing.
+        match job_queue.submit_unless_registering(job).await {
+            Ok(true) => Metrics::record_discovery_registration(
                 kind.metric_label(),
                 metrics_labels::REGISTRATION_SUCCESS,
+            ),
+            Ok(false) => info!(
+                "Worker {} has a registration in flight; its addition is left to the next pass",
+                worker.endpoint
             ),
             Err(e) => {
                 error!(

@@ -526,9 +526,13 @@ impl RequestPipeline {
                         &ctx.input.model_id,
                         response,
                     );
-                    if response.extensions().get::<ReportedRefusal>().is_some() {
-                        // The one line this refusal gets was written
-                        // (rate-limited, with the pool's state).
+                    if response.extensions().get::<ReportedRefusal>().is_some()
+                        || response.status().is_client_error()
+                    {
+                        // A refusal is the gateway's answer, not a failure of
+                        // its own: a reported one has its line from the stage
+                        // that refused, any other 4xx the access log's WARN
+                        // line.
                         debug!(
                             "Stage {} refused the request with status {}",
                             $stage,
@@ -547,12 +551,9 @@ impl RequestPipeline {
             stages.preparation.name(),
             stages.preparation.execute(ctx).await
         )?;
+        step!("RateLimitReserve", stages.rate_limit.execute(ctx).await)?;
         step!(
-            stages.rate_limit.name(),
-            stages.rate_limit.execute(ctx).await
-        )?;
-        step!(
-            stages.worker_selection.name(),
+            "WorkerSelection",
             stages.worker_selection.execute(ctx).await
         )?;
         let workers = stage_output(ctx.state.workers.as_ref(), "run_ingress")?;

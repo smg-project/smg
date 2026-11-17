@@ -78,7 +78,7 @@ async fn assemble_multimodal_data_impl(
     // Defense in depth: worker selection already rejected unsupported (backend,
     // modality) combinations. Re-assert here against the same capability matrix
     // so assembly can never silently mishandle a modality the backend lacks.
-    ensure_client_supports_intermediate(client, &intermediate)?;
+    ensure_backend_supports_modalities(client.runtime_type(), &intermediate)?;
     match client {
         BackendClient::Grpc(GrpcClient::Sglang(_)) => assemble_sglang_data(intermediate, workers),
         BackendClient::Grpc(GrpcClient::Vllm(_)) => Ok(MultimodalData::Vllm(
@@ -296,7 +296,7 @@ pub(super) fn assemble_vllm_batches_with(
 
 /// TRT-LLM takes a single preprocessed batch (one modality). The
 /// per-modality capability is enforced by
-/// [`ensure_client_supports_intermediate`]; this only enforces the structural
+/// [`ensure_backend_supports_modalities`]; this only enforces the structural
 /// single-batch constraint.
 pub(super) fn into_single_batch(
     intermediate: MultimodalIntermediate,
@@ -311,16 +311,6 @@ pub(super) fn into_single_batch(
         .into_batches()
         .pop()
         .context("multimodal intermediate is missing its sole batch")
-}
-
-/// Defense-in-depth capability assertion mirroring the early worker-selection
-/// check, keyed on the concrete backend client. See
-/// [`crate::routers::grpc::multimodal::capability::ensure_backend_supports_modalities`].
-fn ensure_client_supports_intermediate(
-    client: &BackendClient,
-    intermediate: &MultimodalIntermediate,
-) -> Result<()> {
-    ensure_backend_supports_modalities(client.runtime_type(), intermediate)
 }
 
 /// Serialize worker pixels in the configured vision dtype, preserving integer metadata.

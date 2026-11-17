@@ -3,30 +3,43 @@
 //! health service, one instance a listener, holding that listener's scopes.
 //!
 //! `Leader` is served, on every listener and by every replica, to a caller
-//! with a principal or with none. `Session` is served to a gateway
-//! ([`session`](super::session)). Every other call is refused:
+//! with a principal or with none. `Session` and `Decide` are served to a
+//! gateway ([`session`], [`decide`]), and the control scope's three
+//! registration calls by the leader. `GetPolicySpec` is served on the
+//! control scope by a controller given a spec source. Every other call is
+//! refused:
 //! `PERMISSION_DENIED` where the listener mounts none of the call's scopes
 //! (the contract: the scope does not cover the RPC), `UNAUTHENTICATED`
 //! where it does and the listener's layer placed no principal on the call
-//! ([`principal`](super::principal)), `UNIMPLEMENTED` where one stands and
+//! ([`principal`]), `UNIMPLEMENTED` where one stands and
 //! no step serves the call yet. The step that serves a call replaces that
 //! call's one line here, behind [`Service::admit`], acts for the principal
 //! it hands back and for no other peer, and adds what it reads to
 //! [`Shared`], which [`Shared::new`] alone builds.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    io,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use prost::Message as _;
 use tokio::sync::watch;
-use tonic::{service::Routes, Request, Response, Status, Streaming};
+use tonic::{service::Routes, Code, Request, Response, Status, Streaming};
 
 use super::{
     config::Scope,
+    decide::{self, Streams},
+    deciders::{self, Deciders, Reads},
     election::{split_identity, Standing},
     gateways::Gateways,
+    generations::Generations,
+    membership::Door,
     principal::{self, Layer, Principal},
     session, PROTOCOL_VERSION,
 };
 use crate::{
+    catalog::Catalog,
     elector::{Elector, Fence},
     proto::{
         self,
@@ -55,6 +68,21 @@ pub(crate) struct Shared {
     /// Who is present: the gateways a `Session` welcomed, over this fence
     /// and this store.
     pub(crate) gateways: Arc<Gateways>,
+    /// The spec's generations over that store: the door a spec source
+    /// applies through, and the document the spec calls read.
+    pub(crate) generations: Arc<Generations>,
+    /// How long a `Session` stream may stand with no `Hello`.
+    pub(crate) hello_deadline: Duration,
+    /// The membership door over that store: the control scope's
+    /// registration calls.
+    pub(crate) door: Door,
+    /// The threads the decisions run on, a model's on one.
+    pub(crate) deciders: Deciders,
+    /// The decide streams each gateway holds open.
+    pub(crate) streams: Arc<Streams>,
+    /// The run loop's word that the listeners close: `true` from the end
+    /// of the drain's settle window on. An open decide stream ends at it.
+    pub(crate) stop: watch::Sender<bool>,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -74,29 +102,53 @@ impl Shared {
     /// its state as a field and fills it here, from these arguments where
     /// it can, so the other builders do not change. The identity and the
     /// fence are `elector`'s, so no instance answers under an identity
-    /// another fence guards.
+    /// another fence guards. A spec document names the stages `catalog`
+    /// holds. `deciders` is how many threads decide.
+    ///
+    /// # Errors
+    ///
+    /// A deciding thread could not be started.
     pub(crate) fn new(
         controller_id: String,
         address: String,
         elector: &Elector,
         standing: watch::Receiver<Standing>,
         store: Arc<MemoryStore>,
-    ) -> Self {
+        catalog: Arc<Catalog>,
+        deciders: usize,
+    ) -> io::Result<Self> {
         let gateways = Arc::new(Gateways::new(
             session::GRACE_PERIOD,
             session::PRESENT_MAX,
             elector.fence(),
             Arc::clone(&store),
         ));
-        Self {
+        let deciders = Deciders::start(
+            deciders,
+            deciders::QUEUE_DEPTH,
+            &Reads {
+                store: Arc::clone(&store),
+                fence: elector.fence(),
+                standing: standing.clone(),
+                clock: Arc::new(Instant::now),
+                counts: Arc::default(),
+            },
+        )?;
+        Ok(Self {
             controller_id,
             address,
             identity: elector.identity().to_owned(),
             fence: elector.fence(),
             standing,
+            generations: Arc::new(Generations::new(Arc::clone(&store), catalog)),
+            door: Door::new(Arc::clone(&store)),
             store,
             gateways,
-        }
+            hello_deadline: session::HELLO_DEADLINE,
+            deciders,
+            streams: Arc::new(Streams::new(decide::MAX_STREAMS)),
+            stop: watch::Sender::new(false),
+        })
     }
 
     /// Who leads, given `leading`, one read of the fence: the term this
@@ -228,6 +280,28 @@ impl Call {
 /// serves the call names its own stream.
 type Unserved<T> = Streaming<T>;
 
+/// `google.rpc.Status`: what every gRPC client decodes a status's details
+/// as. It says the code and the message again and holds each detail as an
+/// [`Any`].
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<Any>,
+}
+
+/// `google.protobuf.Any`: a message under its type's URL.
+#[derive(Clone, PartialEq, prost::Message)]
+struct Any {
+    #[prost(string, tag = "1")]
+    type_url: String,
+    #[prost(bytes = "vec", tag = "2")]
+    value: Vec<u8>,
+}
+
 /// One listener's instance of the service.
 pub(crate) struct Service {
     /// The scopes this listener mounts.
@@ -286,6 +360,48 @@ impl Service {
         )))
     }
 
+    /// The answer to a spec call on a controller that was given no spec
+    /// source, behind the listener's admission: this build serves the call,
+    /// and this controller's start named no source for it.
+    fn sourceless<T, R>(&self, call: Call, request: &Request<T>) -> Result<R, Status> {
+        self.admit(call, request)?;
+        Err(Status::unimplemented(format!(
+            "{} is not served by a controller started with no spec file",
+            call.name()
+        )))
+    }
+
+    /// The term this replica leads under at `now`: what a write is admitted
+    /// under. A replica that does not lead refuses the write: its status
+    /// details are a `google.rpc.Status`, the form every gRPC client decodes
+    /// them as, holding a `NotLeader` that names the holder as `Leader` does
+    /// (no address: no leader known). That address is the holder's gateway
+    /// listener; a control client finds the leader's control listener by
+    /// the health service's word.
+    pub(crate) fn leading(&self, now: Instant) -> Result<u64, Status> {
+        const REFUSAL: &str = "this replica does not lead";
+        if let Some(term) = self.shared.fence.leader_term(now) {
+            return Ok(term);
+        }
+        let named = proto::NotLeader {
+            leader_address: self.leader_info(now).address,
+            successor_id: String::new(),
+        };
+        let details = RpcStatus {
+            code: Code::FailedPrecondition as i32,
+            message: REFUSAL.to_owned(),
+            details: vec![Any {
+                type_url: "type.googleapis.com/smg.policy.v1.NotLeader".to_owned(),
+                value: named.encode_to_vec(),
+            }],
+        };
+        Err(Status::with_details(
+            Code::FailedPrecondition,
+            REFUSAL,
+            details.encode_to_vec().into(),
+        ))
+    }
+
     /// The `Leader` call's answer at `now`: [`Shared::leader`] at one read
     /// of the fence.
     fn leader_info(&self, now: Instant) -> proto::LeaderInfo {
@@ -315,7 +431,7 @@ impl Service {
 #[tonic::async_trait]
 impl PolicyController for Service {
     type SessionStream = session::Frames;
-    type DecideStream = Unserved<proto::DecideAnswer>;
+    type DecideStream = decide::Answers;
     type WatchWorkersStream = Unserved<proto::WorkerEvent>;
     type WatchRegimeStream = Unserved<proto::Regime>;
     type ReplicateStream = Unserved<proto::ReplicationBatch>;
@@ -333,7 +449,9 @@ impl PolicyController for Service {
         &self,
         request: Request<Streaming<proto::DecideRequest>>,
     ) -> Result<Response<Self::DecideStream>, Status> {
-        self.unserved(Call::Decide, &request)
+        let principal = self.admit(Call::Decide, &request)?.clone();
+        let answers = decide::serve(Arc::clone(&self.shared), &principal, request.into_inner())?;
+        Ok(Response::new(answers))
     }
 
     async fn watch_workers(
@@ -361,21 +479,33 @@ impl PolicyController for Service {
         &self,
         request: Request<proto::RegisterWorkerRequest>,
     ) -> Result<Response<proto::WorkerEvent>, Status> {
-        self.unserved(Call::RegisterWorker, &request)
+        let by = self.admit(Call::RegisterWorker, &request)?;
+        self.shared
+            .door
+            .register(by, || self.leading(Instant::now()), request.get_ref())
+            .map(Response::new)
     }
 
     async fn patch_worker(
         &self,
         request: Request<proto::PatchWorkerRequest>,
     ) -> Result<Response<proto::WorkerEvent>, Status> {
-        self.unserved(Call::PatchWorker, &request)
+        let by = self.admit(Call::PatchWorker, &request)?;
+        self.shared
+            .door
+            .patch(by, || self.leading(Instant::now()), request.get_ref())
+            .map(Response::new)
     }
 
     async fn deregister_worker(
         &self,
         request: Request<proto::DeregisterWorkerRequest>,
     ) -> Result<Response<proto::WorkerEvent>, Status> {
-        self.unserved(Call::DeregisterWorker, &request)
+        let by = self.admit(Call::DeregisterWorker, &request)?;
+        self.shared
+            .door
+            .deregister(by, || self.leading(Instant::now()), request.get_ref())
+            .map(Response::new)
     }
 
     async fn get_snapshot(
@@ -399,11 +529,23 @@ impl PolicyController for Service {
         self.unserved(Call::ApplyPolicySpec, &request)
     }
 
+    /// The standing generation's document as its source wrote it, with the
+    /// number and the digest beside it: every replica answers from its own
+    /// holder. A controller that was given no spec source serves no spec
+    /// call.
     async fn get_policy_spec(
         &self,
         request: Request<proto::GetPolicySpecRequest>,
     ) -> Result<Response<proto::PolicySpecDocument>, Status> {
-        self.unserved(Call::GetPolicySpec, &request)
+        let generations = &self.shared.generations;
+        if !generations.bound() {
+            return self.sourceless(Call::GetPolicySpec, &request);
+        }
+        self.admit(Call::GetPolicySpec, &request)?;
+        generations
+            .document(request.get_ref().generation)
+            .map(Response::new)
+            .map_err(|not_held| Status::not_found(not_held.to_string()))
     }
 
     async fn rollback_policy_spec(
@@ -455,6 +597,7 @@ mod tests {
     };
 
     use http::uri::PathAndQuery;
+    use prost::Message as _;
     use tokio::{net::TcpListener, sync::watch, task::JoinSet};
     use tonic::{
         client::Grpc,
@@ -463,11 +606,13 @@ mod tests {
     };
     use tonic_prost::ProstCodec;
 
-    use super::{Call, Service, Shared};
+    use super::{Call, RpcStatus, Service, Shared};
     use crate::{
+        catalog::Catalog,
         controller::{
             config::Scope,
             election::{self, Standing},
+            generations::{tests::LEAST_LOAD, Format},
             principal::{
                 tests::{stating, told, NO_PRINCIPAL},
                 Layer,
@@ -496,13 +641,18 @@ mod tests {
         )
         .expect("the default settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let shared = Arc::new(Shared::new(
-            ID.to_owned(),
-            ADDRESS.to_owned(),
-            &elector,
-            stood,
-            Arc::new(MemoryStore::new()),
-        ));
+        let shared = Arc::new(
+            Shared::new(
+                ID.to_owned(),
+                ADDRESS.to_owned(),
+                &elector,
+                stood,
+                Arc::new(MemoryStore::new()),
+                Arc::new(Catalog::builtin()),
+                2,
+            )
+            .expect("the deciders start"),
+        );
         (elector, standing, Service::new(scopes.to_vec(), shared))
     }
 
@@ -552,13 +702,18 @@ mod tests {
             .expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
         let store = Arc::new(MemoryStore::new());
-        let shared = Arc::new(Shared::new(
-            ID.to_owned(),
-            ADDRESS.to_owned(),
-            &elector,
-            stood,
-            Arc::clone(&store),
-        ));
+        let shared = Arc::new(
+            Shared::new(
+                ID.to_owned(),
+                ADDRESS.to_owned(),
+                &elector,
+                stood,
+                Arc::clone(&store),
+                Arc::new(Catalog::builtin()),
+                2,
+            )
+            .expect("the deciders start"),
+        );
         let service = Service::new(vec![Scope::Gateway], shared);
         let mut running = election::start(elector, store, standing).expect("a thread");
         let mut last = 0;
@@ -727,7 +882,7 @@ mod tests {
         assert_eq!(unserved.code(), Code::Unimplemented);
         assert_eq!(
             unserved.message(),
-            "GetPolicySpec is not served by this build"
+            "GetPolicySpec is not served by a controller started with no spec file"
         );
         // A caller no layer placed is refused before the call is named
         // unserved: no call body is reached without a principal.
@@ -765,6 +920,15 @@ mod tests {
             .collect()
     }
 
+    /// The calls a step serves, beside `Leader`. Each is the leader's to
+    /// answer: a replica that never took the lease refuses it as a write.
+    const fn served(call: Call) -> bool {
+        matches!(
+            call,
+            Call::RegisterWorker | Call::PatchWorker | Call::DeregisterWorker
+        )
+    }
+
     /// Every method of the contract, called by its own name over a socket
     /// on a listener of each scope set, three ways: a name stated to a
     /// listener with no layer, a name stated to one that takes identities
@@ -772,8 +936,9 @@ mod tests {
     /// way; any other answers in its own name: denied off the listener's
     /// scopes, and on them unauthenticated to a caller the layer did not
     /// place. To the caller it placed, a call no step serves is
-    /// unimplemented, and `Session` is reached: the empty message is no
-    /// `Hello`. The names are read from the contract, so a method added
+    /// unimplemented, `Session` is reached (the empty message is no
+    /// `Hello`), and a registration call is refused by a replica that does
+    /// not lead. The names are read from the contract, so a method added
     /// there joins the case, and fails it until the table holds its call.
     #[tokio::test]
     async fn every_method_of_the_contract_answers_by_its_calls_scopes_and_its_callers_principal() {
@@ -851,6 +1016,23 @@ mod tests {
                         "no session stands on this stream: Hello is the first frame, a frame of no kind came first"
                             .to_owned(),
                     )
+                } else if layer == Layer::AsTold && stated && *method == "GetPolicySpec" {
+                    (
+                        Code::Unimplemented,
+                        format!("{method} is not served by a controller started with no spec file"),
+                    )
+                } else if layer == Layer::AsTold && stated && call.is_some_and(served) {
+                    (
+                        Code::FailedPrecondition,
+                        "this replica does not lead".to_owned(),
+                    )
+                } else if layer == Layer::AsTold && stated && *method == "Decide" {
+                    // The stream opens, and the call itself refuses the
+                    // case's one frame: it carries no id.
+                    (
+                        Code::InvalidArgument,
+                        "request_id is out of its range in this protocol version".to_owned(),
+                    )
                 } else if layer == Layer::AsTold && stated {
                     (
                         Code::Unimplemented,
@@ -859,7 +1041,7 @@ mod tests {
                 } else {
                     (Code::Unauthenticated, NO_PRINCIPAL.to_owned())
                 };
-                let status = answered.expect_err("no step serves the call");
+                let status = answered.expect_err("no listener here serves the call");
                 assert_eq!(
                     (status.code(), status.message().to_owned()),
                     expected,
@@ -920,13 +1102,18 @@ mod tests {
         let (standing, stood) = watch::channel(Standing::default());
         let service = Service::new(
             vec![Scope::Gateway],
-            Arc::new(Shared::new(
-                ID.to_owned(),
-                ADDRESS.to_owned(),
-                &elector,
-                stood,
-                Arc::new(MemoryStore::new()),
-            )),
+            Arc::new(
+                Shared::new(
+                    ID.to_owned(),
+                    ADDRESS.to_owned(),
+                    &elector,
+                    stood,
+                    Arc::new(MemoryStore::new()),
+                    Arc::new(Catalog::builtin()),
+                    2,
+                )
+                .expect("the deciders start"),
+            ),
         );
 
         // The other replica holds the lease under term 1; this one's look
@@ -980,12 +1167,22 @@ mod tests {
             answer("", "", 0, false)
         );
 
-        let taken = Instant::now();
+        // The lease held no record: the take opens no fence, and the answer
+        // names nobody under the take's term until the first renewal a renew
+        // deadline later. The instants are ahead of the clock: the wait is
+        // dated by the later of the two.
+        let took = Instant::now() + ElectionSettings::default().renew_period;
         assert_eq!(
-            elector.tick(taken).expect("the take"),
+            elector.tick(took).expect("the take"),
             Tick::Acquired { term: 1 }
         );
         standing.send_replace(saw(IDENTITY, 1));
+        assert_eq!(service.leader_info(took), answer("", "", 1, false));
+        let taken = took + ElectionSettings::default().renew_deadline;
+        assert_eq!(
+            elector.tick(taken).expect("the renewal"),
+            Tick::Renewed { term: 1 }
+        );
         assert_eq!(service.leader_info(taken), answer(ID, ADDRESS, 1, true));
 
         // Past the renew deadline the fence is closed: the record still
@@ -997,6 +1194,44 @@ mod tests {
         // lags the take still answers as the leader.
         standing.send_replace(Standing::default());
         assert_eq!(service.leader_info(taken), answer(ID, ADDRESS, 1, true));
+    }
+
+    #[test]
+    fn a_replica_that_does_not_lead_refuses_a_write_in_the_form_every_client_decodes() {
+        let (_elector, standing, service) = service(&[Scope::Control]);
+        standing.send_replace(saw("controller-1@10.0.0.8:30100", 4));
+        let refused = service
+            .leading(Instant::now())
+            .expect_err("this replica follows");
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (Code::FailedPrecondition, "this replica does not lead")
+        );
+        // The details are a `google.rpc.Status`: the code and the message
+        // again, and the `NotLeader` under its type's URL.
+        let details = RpcStatus::decode(refused.details()).expect("a google.rpc.Status");
+        assert_eq!(
+            (details.code, details.message.as_str()),
+            (
+                Code::FailedPrecondition as i32,
+                "this replica does not lead"
+            )
+        );
+        let [detail] = details.details.as_slice() else {
+            panic!("one detail: {details:?}");
+        };
+        assert_eq!(
+            detail.type_url,
+            "type.googleapis.com/smg.policy.v1.NotLeader"
+        );
+        let named = proto::NotLeader::decode(detail.value.as_slice()).expect("a NotLeader");
+        assert_eq!(
+            named,
+            proto::NotLeader {
+                leader_address: "10.0.0.8:30100".to_owned(),
+                successor_id: String::new(),
+            }
+        );
     }
 
     #[test]
@@ -1050,5 +1285,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A controller with a spec source serves the read call on the control
+    /// scope: the source's bytes under the standing number, to a caller with
+    /// a principal. A number that does not stand is not found, by name, and
+    /// the scope's rules stand as for every call.
+    #[tokio::test]
+    async fn the_read_call_answers_the_standing_document_once_a_source_applied_one() {
+        let (_elector, _standing, control) = service(&[Scope::Control]);
+        let (_elector, _standing, gateway) = service(&[Scope::Gateway, Scope::Ingestion]);
+        for service in [&control, &gateway] {
+            service
+                .shared
+                .generations
+                .apply(LEAST_LOAD.into(), Format::Yaml)
+                .expect("a valid document");
+        }
+        let read = |generation| from("operator-a", proto::GetPolicySpecRequest { generation });
+
+        let answer = control
+            .get_policy_spec(read(0))
+            .await
+            .expect("the standing document")
+            .into_inner();
+        assert_eq!(answer.generation, 1);
+        assert_eq!(answer.document, LEAST_LOAD.as_bytes());
+        assert_eq!(answer.format, "yaml");
+        assert!(answer.digest.starts_with("sha256:"), "{}", answer.digest);
+
+        let older = control.get_policy_spec(read(4)).await.expect_err("refused");
+        assert_eq!(older.code(), Code::NotFound);
+        assert_eq!(
+            older.message(),
+            "no document is held for generation 4: the spec source's document is generation 1, generation 1 stands, and the standing generation's document alone is retained"
+        );
+
+        let unplaced = control
+            .get_policy_spec(Request::new(proto::GetPolicySpecRequest::default()))
+            .await
+            .expect_err("refused");
+        assert_eq!(unplaced.code(), Code::Unauthenticated);
+        let denied = gateway.get_policy_spec(read(0)).await.expect_err("refused");
+        assert_eq!(denied.code(), Code::PermissionDenied);
     }
 }

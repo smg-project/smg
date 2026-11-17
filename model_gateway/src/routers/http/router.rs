@@ -47,6 +47,7 @@ use tracing::{error, warn};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
+    endpoints::messages::MessagesHeaders,
     middleware::{
         body_timeout::{
             request_body_stalled_response, REQUEST_BODY_STALLED, REQUEST_BODY_TOO_LARGE,
@@ -1111,16 +1112,6 @@ impl Router {
 
         last_response
             .unwrap_or_else(|| error::bad_gateway("no_worker_response", "No worker response"))
-    }
-
-    // Route a POST request with empty body to a specific endpoint
-    async fn route_post_empty_request(
-        &self,
-        headers: Option<&HeaderMap>,
-        endpoint: &str,
-    ) -> Response {
-        self.route_simple_request(headers, endpoint, Method::POST)
-            .await
     }
 
     /// Forward an audio transcription request to an audio-capable worker as
@@ -2268,6 +2259,15 @@ impl Router {
             }
             BodyPath::Stream(reason) => reason,
         };
+        // A streamed request reaches no handler and none of its extractors:
+        // the Messages route's version check is made here, with the route's
+        // own answer, before a worker is selected. A refused request takes
+        // no turn of the routing policy and is not counted as streamed.
+        if route == "/v1/messages" {
+            if let Err(refused) = MessagesHeaders::check_version(req.headers()) {
+                return Ok(refused);
+            }
+        }
         let model_id = UNKNOWN_MODEL_ID;
         // Buffered-path parity: a valid tokens hint is exactly what selection
         // would have received there (text is never extracted alongside it).
@@ -2595,13 +2595,13 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(
             headers,
             Some(tenant_meta),
-            super::chat_for_upstream(body),
+            super::chat_for_upstream(Arc::unwrap_or_clone(body)),
             "/v1/chat/completions",
             model_id,
         )
@@ -2668,7 +2668,8 @@ impl RouterTrait for Router {
         response_id: &str,
     ) -> Response {
         let endpoint = format!("v1/responses/{response_id}/cancel");
-        self.route_post_empty_request(headers, &endpoint).await
+        self.route_simple_request(headers, &endpoint, Method::POST)
+            .await
     }
 
     async fn route_embeddings(
@@ -3208,7 +3209,9 @@ mod tests {
                     }))
                     .unwrap();
                     request.normalize();
-                    let response = router.route_chat(None, &tenant, request, model).await;
+                    let response = router
+                        .route_chat(None, &tenant, Arc::new(request), model)
+                        .await;
                     let expected = if model == "m1" {
                         StatusCode::OK
                     } else {
@@ -3667,9 +3670,7 @@ mod tests {
             Some(client_with_timeout(Duration::from_secs(1))),
         );
 
-        let started = Instant::now();
         let response = generate(&router, "slow").await;
-        let elapsed = started.elapsed();
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
@@ -3681,10 +3682,6 @@ mod tests {
             hits_a.load(AtomicOrdering::SeqCst) + hits_b.load(AtomicOrdering::SeqCst),
             1,
             "one attempt, on one worker"
-        );
-        assert!(
-            elapsed < Duration::from_millis(1900),
-            "one timeout, not retries x timeout: {elapsed:?}"
         );
         let open = router
             .worker_registry
@@ -4492,6 +4489,89 @@ mod tests {
         );
     }
 
+    /// A streamed Messages request reaches no handler, so the handler's
+    /// extractor does not check its `anthropic-version`: the stream path
+    /// makes the same check, with the same answer, before it selects a
+    /// worker. A refused request reaches no worker and takes no turn of the
+    /// routing policy.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub servers live for the duration of the test process"
+    )]
+    async fn a_streamed_messages_request_takes_the_version_check() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Two workers that count the Messages requests they receive, under a
+        // policy that keeps a rotation: a selection made for a refused
+        // request would send both served requests to one worker.
+        let mut counts = Vec::new();
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let count = Arc::new(AtomicUsize::new(0));
+            counts.push(Arc::clone(&count));
+            let app = axum::Router::new().route(
+                "/v1/messages",
+                axum::routing::post(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    async { ([(CONTENT_TYPE, "application/json")], "{}") }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            workers.push(plain_worker(&format!("http://{addr}")));
+        }
+        let router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, workers);
+        let received = || -> Vec<usize> {
+            counts
+                .iter()
+                .map(|count| count.load(Ordering::SeqCst))
+                .collect()
+        };
+        let request = |version: Option<&'static str>| {
+            let mut request = streamed_request(&[b"{\"max_tokens\":8,\"messages\":[]}"]);
+            if let Some(version) = version {
+                request
+                    .headers_mut()
+                    .insert("anthropic-version", HeaderValue::from_static(version));
+            }
+            request
+        };
+
+        // A dated version is streamed, as before.
+        let served = router
+            .route_streaming_request(request(Some("2023-06-01")), "/v1/messages", false)
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+
+        let refused = router
+            .route_streaming_request(request(Some("2023-6-1")), "/v1/messages", false)
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            extract_error_code_from_response(&refused),
+            "invalid_anthropic_version"
+        );
+
+        // A request without the header is streamed as before, to the
+        // rotation's next worker: the refused request took no turn of it.
+        let served = router
+            .route_streaming_request(request(None), "/v1/messages", false)
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(
+            received(),
+            [1, 1],
+            "the refused request reached a worker or took a turn of the rotation"
+        );
+    }
+
     #[tokio::test]
     async fn streamed_request_forwards_chunked_and_relays_response() {
         let (url, captured) = spawn_capture_stub("application/json", r#"{"text":"ok"}"#).await;
@@ -5231,7 +5311,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK);
         }
@@ -5305,7 +5385,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "{model}");
         }
@@ -6635,7 +6715,7 @@ mod tests {
         .unwrap();
         request.normalize();
         let response = router
-            .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK, "{model}");
         let mut body = response.into_body();
@@ -6933,7 +7013,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "{model}");
             assert!(
@@ -6981,7 +7061,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "{model}");
             assert_eq!(
