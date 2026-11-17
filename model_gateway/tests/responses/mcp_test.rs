@@ -7,7 +7,7 @@
 // - Schema adaptation and validation
 // - Mock server integration for reliable testing
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use common::mock_mcp_server::{MockMCPServer, MockSearchResponseMCPServer, MockSearchResponseMode};
 use openai_protocol::responses::{ResponseOutputItem, WebSearchAction};
@@ -18,7 +18,7 @@ use smg::routers::common::openai_bridge::{
 use smg_mcp::{
     core::config::{ResponseFormatConfig, ToolConfig},
     McpConfig, McpOrchestrator, McpServerBinding, McpServerConfig, McpToolSession, McpTransport,
-    ToolExecutionInput,
+    QualifiedToolName, Tool, ToolEntry, ToolExecutionInput,
 };
 
 use crate::common;
@@ -523,16 +523,10 @@ async fn two_connects_at_once_for_one_server_share_one_pooled_connection() {
     let key = McpOrchestrator::server_key(&server);
     // An entry under the server's key that no listing brings back: it stays
     // unless the key is cleared.
-    manager
-        .tool_inventory()
-        .insert_entry(smg_mcp::ToolEntry::new(
-            smg_mcp::QualifiedToolName::new(&key, "marker"),
-            smg_mcp::Tool::new(
-                "marker",
-                "a marker",
-                std::sync::Arc::new(serde_json::Map::new()),
-            ),
-        ));
+    manager.tool_inventory().insert_entry(ToolEntry::new(
+        QualifiedToolName::new(&key, "marker"),
+        Tool::new("marker", "a marker", Arc::new(serde_json::Map::new())),
+    ));
 
     // Neither connect finds the server pooled: each looks before the other
     // has connected.
