@@ -931,7 +931,7 @@ impl<'a> Pool<'a> for [Entry<'a>] {
             entry.row.id,
             facts.wire_modes,
             &facts.engine_kind,
-            facts.pairing.as_ref(),
+            facts.pairing.as_deref(),
         )
     }
 }

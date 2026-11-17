@@ -399,9 +399,11 @@ fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
             wire_modes: WireModes::GRPC,
             models: vec!["m".to_string()],
             dp_size: 1,
-            pairing: transport.map(|transport| PairingDescriptor {
-                transport: Some(transport.to_string()),
-                ..PairingDescriptor::default()
+            pairing: transport.map(|transport| {
+                Box::new(PairingDescriptor {
+                    transport: Some(transport.to_string()),
+                    ..PairingDescriptor::default()
+                })
             }),
             ..WorkerFacts::default()
         });

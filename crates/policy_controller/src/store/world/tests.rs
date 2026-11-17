@@ -2371,9 +2371,11 @@ fn pair_facts(key: &str, role: Role, transport: Option<&str>) -> WorkerFacts {
     WorkerFacts {
         wire_modes: WireModes::GRPC,
         engine_kind: "rt-a".to_string(),
-        pairing: transport.map(|transport| PairingDescriptor {
-            transport: Some(transport.to_string()),
-            ..PairingDescriptor::default()
+        pairing: transport.map(|transport| {
+            Box::new(PairingDescriptor {
+                transport: Some(transport.to_string()),
+                ..PairingDescriptor::default()
+            })
         }),
         ..facts(key, role, &[MODEL])
     }
@@ -3152,12 +3154,12 @@ fn a_blank_value_of_a_descriptor_is_dropped_at_the_door() {
         .map(|&(key, role, transport)| {
             let transport = transport.map_or_else(|| " ".to_string(), |name| format!(" {name} "));
             let facts = WorkerFacts {
-                pairing: Some(PairingDescriptor {
+                pairing: Some(Box::new(PairingDescriptor {
                     protocol: Some(String::new()),
                     transport: Some(transport),
                     version: Some(String::new()),
                     kv_layout: [Some(" ".to_string()), None, None, None],
-                }),
+                })),
                 ..pair_facts(key, role, None)
             };
             blanked.upsert(facts).id()
@@ -3174,10 +3176,10 @@ fn a_blank_value_of_a_descriptor_is_dropped_at_the_door() {
     let row = WorkersStore::get(&blanked, first).expect("the row");
     assert_eq!(
         row.facts.pairing,
-        Some(PairingDescriptor {
+        Some(Box::new(PairingDescriptor {
             transport: Some("tx-a".to_string()),
             ..PairingDescriptor::default()
-        })
+        }))
     );
 }
 
