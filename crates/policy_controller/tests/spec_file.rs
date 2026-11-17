@@ -49,7 +49,8 @@ use replicas::{Lease, Replica, ROOM};
 use smg_policy_controller::{
     elector::ElectionSettings,
     proto::{
-        policy_controller_client::PolicyControllerClient, GetPolicySpecRequest, PolicySpecDocument,
+        policy_controller_client::PolicyControllerClient, ApplyMode, ApplyRequest, ApplyResult,
+        GetPolicySpecRequest, PolicySpecDocument,
     },
 };
 use tempfile::TempDir;
@@ -123,18 +124,46 @@ fn start(id: &str, lease: &TempDir, file: Option<&Path>) -> Replica {
     .expect("the replica starts")
 }
 
-/// One `GetPolicySpec` call on the control listener, as `operator-a`.
-async fn read(replica: &Replica, generation: u64) -> Result<PolicySpecDocument, Status> {
-    let mut client = PolicyControllerClient::connect(format!("http://{}", replica.control))
+/// A client of the replica's control listener.
+async fn control(
+    replica: &Replica,
+) -> Result<PolicyControllerClient<tonic::transport::Channel>, Status> {
+    PolicyControllerClient::connect(format!("http://{}", replica.control))
         .await
-        .map_err(|error| Status::unavailable(error.to_string()))?;
-    let mut request = Request::new(GetPolicySpecRequest { generation });
+        .map_err(|error| Status::unavailable(error.to_string()))
+}
+
+/// `message` as a call `operator-a` makes.
+fn as_operator<T>(message: T) -> Request<T> {
+    let mut request = Request::new(message);
     request.metadata_mut().insert(
         "x-smg-principal",
         AsciiMetadataValue::from_static("operator-a"),
     );
-    client
-        .get_policy_spec(request)
+    request
+}
+
+/// One `GetPolicySpec` call on the control listener, as `operator-a`.
+async fn read(replica: &Replica, generation: u64) -> Result<PolicySpecDocument, Status> {
+    control(replica)
+        .await?
+        .get_policy_spec(as_operator(GetPolicySpecRequest { generation }))
+        .await
+        .map(Response::into_inner)
+}
+
+/// One `ApplyPolicySpec` call of a YAML document on the control listener,
+/// as `operator-a`.
+async fn apply(replica: &Replica, mode: ApplyMode, document: &str) -> Result<ApplyResult, Status> {
+    let request = ApplyRequest {
+        document: document.as_bytes().to_vec(),
+        format: "yaml".to_owned(),
+        mode: mode.into(),
+        expected_digest: String::new(),
+    };
+    control(replica)
+        .await?
+        .apply_policy_spec(as_operator(request))
         .await
         .map(Response::into_inner)
 }
@@ -299,6 +328,49 @@ async fn a_swapped_link_under_a_running_replica_is_the_next_generation() {
             "no line {line:?} in {metrics}"
         );
     }
+}
+
+/// A dry run on a running replica answers its document's verdict and writes
+/// nothing: the next number for a document that would run, the field for
+/// one that would not, and `read_only` for an enforce. The standing
+/// generation keeps answering its document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dry_run_on_a_running_replica_answers_its_verdict_and_writes_nothing() {
+    let lease = tempfile::tempdir().expect("a directory");
+    let mount = Mount::new(LEAST_LOAD);
+    let replica = start("spec-dry", &lease, Some(&mount.file()));
+    let first = answers(&replica, 1).await;
+
+    // A write is the leader's: the replica answers once it leads its lease.
+    let led = until(|| apply(&replica, ApplyMode::DryRun, RANDOM), Result::is_ok);
+    let would = led.await.expect("the leader answers").expect("a verdict");
+    assert!(would.accepted && would.read_only, "{would:?}");
+    assert_eq!(would.generation, 2);
+
+    let unweighed = LEAST_LOAD.replace("[least-load]", "[{ least-load: { weight: -1.0 } }]");
+    let refused = apply(&replica, ApplyMode::DryRun, &unweighed)
+        .await
+        .expect("a verdict");
+    assert!(!refused.accepted, "{refused:?}");
+    assert_eq!((refused.generation, &refused.digest), (1, &first.digest));
+    let [issue] = refused.issues.as_slice() else {
+        panic!("one issue: {refused:?}")
+    };
+    assert!(
+        issue.field_path.starts_with("profiles.default.score[0]"),
+        "{issue:?}"
+    );
+
+    let enforced = apply(&replica, ApplyMode::Enforce, RANDOM)
+        .await
+        .expect("an answer");
+    assert!(enforced.read_only && !enforced.accepted, "{enforced:?}");
+
+    let standing = read(&replica, 0).await.expect("the standing document");
+    assert_eq!(
+        (standing.generation, standing.document.as_slice()),
+        (1, LEAST_LOAD.as_bytes())
+    );
 }
 
 /// A start on a document the validator refuses exits with the refusal in

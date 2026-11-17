@@ -1578,6 +1578,60 @@ pub enum SpecError {
     NoCanonicalForm(String),
 }
 
+impl SpecError {
+    /// The field of the document the error is about, as a path from the
+    /// document's root in the document's own names (`profiles.default.pick`,
+    /// `bindings[2].match.model`): what a `SpecIssue` carries. It names the
+    /// field to edit: an unknown stage is at the list that names it, a
+    /// binding's error at the binding's field, and a path the validator
+    /// built is handed back as it stands. Empty where the error is about no
+    /// one field of a document.
+    pub fn field_path(&self) -> String {
+        match self {
+            Self::Kind(_) => "kind".to_owned(),
+            Self::ApiVersion(_) => "apiVersion".to_owned(),
+            Self::UnknownFilter { profile, .. } => format!("profiles.{profile}.filter"),
+            Self::UnknownScorer { profile, .. } | Self::PickerRunsNoScorer { profile, .. } => {
+                format!("profiles.{profile}.score")
+            }
+            Self::UnknownPicker { profile, .. } | Self::PickerNeedsScorer { profile, .. } => {
+                format!("profiles.{profile}.pick")
+            }
+            Self::UnknownProfile { index, .. } => format!("bindings[{index}]"),
+            Self::NoProfile { index }
+            | Self::ProfileUnderPlan { index, .. }
+            | Self::ProfileTwice { index } => format!("bindings[{index}].profile"),
+            Self::SideUnnamed { index, side, .. } => format!("bindings[{index}].profiles.{side}"),
+            Self::UnknownSide { index, side } | Self::SideNotInPlan { index, side, .. } => {
+                format!("bindings[{index}].profiles.{side}")
+            }
+            Self::PlanPhases { index, .. } => format!("bindings[{index}].match.phase"),
+            Self::BadModelGlob { index, .. } => format!("bindings[{index}].match.model"),
+            // The one sessions refusal that is about the binding's plan.
+            Self::BadSessions {
+                index,
+                name: "plan",
+                ..
+            } => format!("bindings[{index}].plan"),
+            Self::BadSessions { index, name, .. } => format!("bindings[{index}].sessions.{name}"),
+            Self::NoBindings { .. } => "bindings".to_owned(),
+            Self::IndexOverlap { first, .. } => format!("index.{first}"),
+            Self::HashIndexNeedsBoundaries { model } => format!("index.{model}.kind"),
+            Self::TooManyProfiles { .. } | Self::Empty => "profiles".to_owned(),
+            Self::TooManyHeaders { .. } => "view.headers".to_owned(),
+            Self::BadField { path, .. }
+            | Self::NotInBuild { path, .. }
+            | Self::DeniedHeader { path, .. }
+            | Self::HeaderNotAllowed { path, .. }
+            | Self::Duplicate { path, .. }
+            | Self::UnknownProfileAt { path, .. }
+            | Self::CanaryForm { path, .. }
+            | Self::Reserved { path, .. } => path.clone(),
+            Self::UnknownPreset(_) | Self::NoCanonicalForm(_) => String::new(),
+        }
+    }
+}
+
 /// A field path under construction, for the messages.
 struct At(String);
 
@@ -4076,6 +4130,25 @@ mod tests {
         assert_eq!(hashed.index["chat-*"].sweep_s, 120);
     }
 
+    /// A zero count of an index key is refused whole: by its path, its
+    /// value and its reason.
+    #[test]
+    fn a_zero_count_of_an_index_key_is_refused_by_path_value_and_reason() {
+        for count in ["ttl_s", "max_size", "sweep_s"] {
+            let spec = doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","index":{{"*":{{"{count}":0}}}},"profiles":{{"p":{{"pick":"best"}}}}}}"#
+            ));
+            assert_eq!(
+                spec.validate().err(),
+                Some(SpecError::BadField {
+                    path: format!("index.*.{count}"),
+                    value: "0".to_owned(),
+                    reason: "above zero",
+                })
+            );
+        }
+    }
+
     #[test]
     fn the_power_of_two_preset_has_four_forms_by_its_load_metric() {
         let form = |metric| {
@@ -4938,6 +5011,257 @@ mod tests {
                 count: spec.profiles.len(),
                 max: u16::MAX
             })
+        );
+    }
+
+    /// Every refusal names the field it is about, in the document's own
+    /// names; a path the validator built is handed back as it stands.
+    #[test]
+    fn every_refusal_names_its_field() {
+        let word = || "x".to_owned();
+        let profile = || "default".to_owned();
+        let built = || "a.b[0]".to_owned();
+        let rows = [
+            (SpecError::Kind(word()), "kind"),
+            (SpecError::ApiVersion(word()), "apiVersion"),
+            (
+                SpecError::UnknownFilter {
+                    profile: profile(),
+                    name: word(),
+                },
+                "profiles.default.filter",
+            ),
+            (
+                SpecError::UnknownScorer {
+                    profile: profile(),
+                    name: word(),
+                },
+                "profiles.default.score",
+            ),
+            (
+                SpecError::PickerRunsNoScorer {
+                    profile: profile(),
+                    picker: word(),
+                },
+                "profiles.default.score",
+            ),
+            (
+                SpecError::UnknownPicker {
+                    profile: profile(),
+                    name: word(),
+                },
+                "profiles.default.pick",
+            ),
+            (
+                SpecError::PickerNeedsScorer {
+                    profile: profile(),
+                    picker: word(),
+                },
+                "profiles.default.pick",
+            ),
+            (
+                SpecError::UnknownProfile {
+                    index: 2,
+                    name: word(),
+                },
+                "bindings[2]",
+            ),
+            (SpecError::NoProfile { index: 2 }, "bindings[2].profile"),
+            (
+                SpecError::ProfileUnderPlan {
+                    index: 2,
+                    plan: "pd-pair",
+                },
+                "bindings[2].profile",
+            ),
+            (SpecError::ProfileTwice { index: 2 }, "bindings[2].profile"),
+            (
+                SpecError::SideUnnamed {
+                    index: 2,
+                    plan: "pd-pair",
+                    side: "decode",
+                },
+                "bindings[2].profiles.decode",
+            ),
+            (
+                SpecError::UnknownSide {
+                    index: 2,
+                    side: "left".to_owned(),
+                },
+                "bindings[2].profiles.left",
+            ),
+            (
+                SpecError::SideNotInPlan {
+                    index: 2,
+                    plan: "single",
+                    side: "decode".to_owned(),
+                },
+                "bindings[2].profiles.decode",
+            ),
+            (
+                SpecError::PlanPhases {
+                    index: 2,
+                    plan: "pd-pair",
+                    side: "decode",
+                },
+                "bindings[2].match.phase",
+            ),
+            (
+                SpecError::BadModelGlob {
+                    index: 2,
+                    model: word(),
+                },
+                "bindings[2].match.model",
+            ),
+            (
+                SpecError::BadSessions {
+                    index: 2,
+                    name: "plan",
+                    reason: "so",
+                },
+                "bindings[2].plan",
+            ),
+            (
+                SpecError::BadSessions {
+                    index: 2,
+                    name: "sweep_s",
+                    reason: "so",
+                },
+                "bindings[2].sessions.sweep_s",
+            ),
+            (SpecError::NoBindings { profiles: 2 }, "bindings"),
+            (
+                SpecError::IndexOverlap {
+                    first: "a*".to_owned(),
+                    second: "*b".to_owned(),
+                },
+                "index.a*",
+            ),
+            (
+                SpecError::HashIndexNeedsBoundaries {
+                    model: "a*".to_owned(),
+                },
+                "index.a*.kind",
+            ),
+            (
+                SpecError::TooManyProfiles {
+                    count: 70_000,
+                    max: u16::MAX,
+                },
+                "profiles",
+            ),
+            (SpecError::Empty, "profiles"),
+            (
+                SpecError::TooManyHeaders {
+                    count: 300,
+                    max: 256,
+                },
+                "view.headers",
+            ),
+            (
+                SpecError::BadField {
+                    path: built(),
+                    value: word(),
+                    reason: "so",
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::NotInBuild {
+                    path: built(),
+                    what: "it",
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::DeniedHeader {
+                    path: built(),
+                    name: word(),
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::HeaderNotAllowed {
+                    path: built(),
+                    name: word(),
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::Duplicate {
+                    path: built(),
+                    name: word(),
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::UnknownProfileAt {
+                    path: built(),
+                    name: word(),
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::CanaryForm {
+                    path: built(),
+                    count: 2,
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::Reserved {
+                    path: built(),
+                    reason: "so",
+                },
+                "a.b[0]",
+            ),
+            (SpecError::UnknownPreset(word()), ""),
+            (SpecError::NoCanonicalForm(word()), ""),
+        ];
+        for (error, path) in rows {
+            assert_eq!(error.field_path(), path, "{error}");
+        }
+    }
+
+    /// The path is the validator's own finding's: a document refused for a
+    /// stage, a weight, a binding or its version reads the field to edit.
+    #[test]
+    fn a_refused_document_reads_the_field_to_edit() {
+        let refused = |document: &str| {
+            let document: PolicySpec = serde_yaml::from_str(document).expect("a document");
+            document.validate().expect_err("refused").field_path()
+        };
+        let profile =
+            |stages: &str| format!("apiVersion: smg.policy/v1\nprofiles:\n  default:\n{stages}");
+        assert_eq!(
+            refused(&profile("    filter: [nowhere]\n    pick: random\n")),
+            "profiles.default.filter"
+        );
+        assert_eq!(
+            refused(&profile("    pick: nothing\n")),
+            "profiles.default.pick"
+        );
+        let weight = refused(&profile(
+            "    score: [{ least-load: { weight: -1.0 } }]\n    pick: best\n",
+        ));
+        assert!(weight.starts_with("profiles.default.score[0]"), "{weight}");
+        let bound = |binding: &str| {
+            refused(&format!(
+                "{}bindings:\n  - {binding}\n",
+                profile("    pick: random\n")
+            ))
+        };
+        assert_eq!(
+            bound("{ match: { model: \"*\" }, profile: nowhere }"),
+            "bindings[0]"
+        );
+        assert_eq!(
+            bound("{ match: { model: \"a*b*\" }, profile: default }"),
+            "bindings[0].match.model"
+        );
+        assert_eq!(
+            refused("apiVersion: smg.policy/v9\nprofiles:\n  default:\n    pick: random\n"),
+            "apiVersion"
         );
     }
 
