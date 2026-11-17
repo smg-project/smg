@@ -27,9 +27,10 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// The allocator's settings, the stock binary's: a background thread hands
 /// freed pages back to the system ten seconds after their last use, the
-/// threads share sixteen arenas at most, and an allocation up to 32 MB takes
+/// threads share sixteen arenas at most, and an allocation up to 32 MiB takes
 /// the room the last one freed. The allocator reads them from this symbol as
-/// it starts.
+/// it starts, and the `_RJEM_MALLOC_CONF` environment variable after it,
+/// entry by entry.
 #[cfg(all(
     not(target_env = "msvc"),
     not(target_env = "musl"),

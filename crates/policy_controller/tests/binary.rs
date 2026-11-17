@@ -125,6 +125,25 @@ fn the_binarys_settings_are_the_gateways_constant() {
     assert_eq!(ours, theirs, "the binary's settings are not the gateway's");
 }
 
+/// The example controller's settings are a copy of this binary's, in a file
+/// a user copies out of the tree: no case of the copy can read this one.
+/// The example's source is read by path: its copy moves with the binary's,
+/// or this case fails.
+#[test]
+fn the_examples_settings_are_the_binarys() {
+    let binary = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bin/smg-policy-controller.rs"
+    ));
+    let example = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/policy-controller/src/main.rs"
+    ));
+    let ours = settings_after(binary, "const SETTINGS").expect("the binary's settings");
+    let theirs = settings_after(example, "pub static MALLOC_CONF").expect("the example's copy");
+    assert_eq!(theirs, ours, "the example's settings are not the binary's");
+}
+
 /// The byte string a source assigns after `name`, without its quotes.
 fn settings_after<'a>(source: &'a str, name: &str) -> Option<&'a str> {
     let (_, rest) = source.split_once(name)?;
