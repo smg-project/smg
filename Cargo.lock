@@ -5796,10 +5796,13 @@ dependencies = [
 name = "policy-controller-example"
 version = "0.1.0"
 dependencies = [
+ "mock-worker",
  "serde_yaml",
+ "smg-grpc-client",
  "smg-policy-controller",
  "tikv-jemallocator",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

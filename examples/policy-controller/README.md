@@ -29,10 +29,14 @@ instead ([`wasm-guest-policy`](../wasm/wasm-guest-policy)).
   and an idle fleet ties. A gateway's veto takes its worker out for that
   gateway alone. A worker whose queue reaches its overload threshold is
   passed over, and the idle one opens. The catalog a controller is bound
-  with validates the document, and the stock controller's refuses it by the
-  scorer's name. The built binary's start-up line names `pack` among its
-  scorers. It runs on the allocator it registers, with the settings it
-  exports.
+  with validates the document. Handed the document as its spec file, that
+  controller decides by it over its own store, and the stock controller
+  refuses the file by the scorer's name. The built binary's start-up line
+  names `pack` among its scorers, and started on the document it runs
+  generation 1. It runs on the allocator it registers, with the settings it
+  exports. Handed a worker through its door, it polls the engine behind it.
+  Asked by a gateway to decide between two such workers, it names the one
+  with requests running.
 - `Cargo.toml`: the crate with its `controller` feature, and the allocator
   the binary registers.
 
@@ -109,8 +113,9 @@ drops a worker whose engine the store judges overloaded: the queue or the
 KV-cache usage in its load reports stands at or over a threshold. The
 threshold is the worker's own, named at its registration, or its pool's,
 from the policy document applied to the store: 8 queued requests and a usage
-of 0.8 where the document names none. The example's test registers each
-worker with a queue threshold of its own.
+of 0.8 where the document names none. The example's tests show both: a fleet
+whose workers each name a queue threshold, and a controller handed this
+document, where the default stands.
 
 The stock build's catalog refuses this document by the scorer's name. The
 published schema (`crates/policy_controller/policyspec.schema.json`) lists
@@ -121,8 +126,17 @@ validates over this build's catalog.
 
 ```sh
 cargo build --release -p policy-controller-example
-target/release/policy-controller-example --controller-id controller-0
+target/release/policy-controller-example --controller-id controller-0 \
+  --spec-file examples/policy-controller/policy.yaml
 ```
+
+`--spec-file` hands the controller its policy document. The file is read at
+the start, judged over this build's stages and run as generation 1. It is
+watched from then on: a changed file is applied as the next generation, and
+one that does not run is rejected whole while the running generation stays.
+The stock controller refuses the same file by the scorer's name.
+`smg_policy_spec_generation` on the admin listener's `/metrics` names the
+generation that runs.
 
 The flags are the stock controller's, and `--help` lists them. `--log-level`
 sets the level of the crate's own log lines. Lines your own crate writes show
@@ -156,6 +170,8 @@ smg-policy-controller = { git = "https://github.com/smg-project/smg", features =
 
 - `controller`: the listeners, the command line and `controller::run`.
 - `kubernetes`: the Lease election the Helm chart's replicas use.
+- `client`: the reference client of the protocol. The example's tests ask
+  the started controller its decisions through it.
 - The default features hold the WebAssembly plugin host.
 
 The build wants the Rust release this repository pins (`rust-toolchain.toml`)
@@ -163,12 +179,16 @@ and `protoc` with the well-known types on its include path: the crate and the
 gRPC client it links compile their contracts in their build scripts.
 
 `own-repository.sh <directory>` writes this example as such a repository: its
-source, document and tests, a manifest with the line above and the
-allocator's dependency, the allocator's page setting (`.cargo/config.toml`),
-and this checkout's toolchain pin and lock file. `cargo test` passes there.
-With `--snapshot` the git source is a snapshot of this checkout, written
-beside the copy. CI builds and tests the example that way, against the change
-under test.
+source, document and tests, a manifest with the line above, the allocator's
+dependency and the release profile the stock controller is built with, the
+allocator's page setting (`.cargo/config.toml`), and this checkout's
+toolchain pin and lock file. The line names no revision, so the first build
+takes the crate at the tip of the repository's default branch and the lock
+keeps it there. `cargo test` passes in a copy written from a checkout of that
+tip. From an older checkout, name its `rev` or `tag` beside `git`. With
+`--snapshot` the git source is a snapshot of this checkout, written beside
+the copy. CI builds and tests the example that way, against the change under
+test.
 
 ## The image
 
@@ -208,6 +228,3 @@ repository of your own needs its tag.
   version, as the stock controller does.
 - Data the store does not feed yet. The table above names each field that
   reads as its default.
-- A decision through the started controller. The tests validate the
-  document over the controller's catalog and run `pack` over the store's
-  rows. No case asks the started controller for a decision yet.
