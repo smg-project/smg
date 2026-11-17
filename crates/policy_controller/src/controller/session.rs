@@ -506,7 +506,7 @@ mod tests {
             },
             lifecycle::tests::{a_completed, a_dispatched, a_released, worker},
             principal::{tests::told, Layer, ENTRY},
-            replication::journaled,
+            replication::journaled_from,
             service::{Service, Shared},
             PROTOCOL_VERSION,
         },
@@ -553,7 +553,7 @@ mod tests {
             ADDRESS.to_owned(),
             &elector,
             stood,
-            journaled(&LeasePlace::Process),
+            journaled_from(&LeasePlace::Process, 0),
             Arc::new(crate::Catalog::builtin()),
             2,
         )

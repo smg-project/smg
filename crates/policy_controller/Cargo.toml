@@ -260,6 +260,10 @@ required-features = ["controller"]
 name = "replication"
 required-features = ["controller"]
 
+[[test]]
+name = "watch_workers"
+required-features = ["controller"]
+
 [[bench]]
 name = "decision"
 harness = false

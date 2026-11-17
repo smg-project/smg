@@ -17,6 +17,8 @@
 //! and both calls are refused by that state of its configuration.
 
 use std::{
+    collections::hash_map::RandomState,
+    hash::BuildHasher,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -27,7 +29,7 @@ use prost::Message as _;
 use tokio::time::{interval, Interval, MissedTickBehavior};
 use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
 
-use super::{election::LeasePlace, worker_wire};
+use super::{election::LeasePlace, watch_workers, worker_wire};
 use crate::{
     elector::Fence,
     proto::{self, replica_frame::Frame},
@@ -58,17 +60,51 @@ const BEAT: Duration = Duration::from_secs(1);
 /// message a client reads.
 const SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
-/// A store and the log it journals to, for a lease at `place`: the one
-/// place the two are built. Where the lease is shared the log carries the
-/// load rows from the start, so a replica added to a running leader follows
-/// it with no restart; where the lease lives in this process the log
-/// carries the watched kinds alone and a load write tells nothing.
-pub(crate) fn journaled(place: &LeasePlace) -> (Arc<MemoryStore>, Arc<Log>) {
-    let loads = if place.is_shared() { LOAD_EVENTS } else { 0 };
-    let log = Arc::new(Log::new(WATCHED_EVENTS, loads));
-    let journal: Arc<dyn Journal> = Arc::clone(&log) as _;
-    (Arc::new(MemoryStore::journaled(journal)), log)
+/// A store and the feed of the log it journals to, for a lease at `place`:
+/// the one place the two are built. Where the lease is shared the log
+/// carries the load rows from the start, so a replica added to a running
+/// leader follows it with no restart; where the lease lives in this process
+/// the log carries the watched kinds alone, and a load write tells nothing
+/// and wakes nobody.
+///
+/// Where the lease lives in the process the log's places start after a
+/// number drawn once a run. A term is taken again at each start there, so a
+/// place and its term would name the writes of two runs alike: a watcher
+/// that resumed at a place of the run before would be held, and never told
+/// this run's first writes. After a draw that place is outside this run's
+/// log, and its watcher is told to start again. No standby follows such a
+/// log, so a drawn start meets no leader's event. Where the lease is shared
+/// the log starts at the start, where a standby joins it: the term is the
+/// guard there, for as long as the lease's record lives.
+pub(crate) fn journaled(place: &LeasePlace) -> (Arc<MemoryStore>, watch_workers::Feed) {
+    let first = if place.is_shared() {
+        0
+    } else {
+        RandomState::new().hash_one(0u8) % FIRST_PLACES
+    };
+    journaled_from(place, first)
 }
+
+/// The same with the log's places starting after `first`: zero in the
+/// cases, whose tables read a log's places from one.
+pub(crate) fn journaled_from(
+    place: &LeasePlace,
+    first: u64,
+) -> (Arc<MemoryStore>, watch_workers::Feed) {
+    let loads = if place.is_shared() { LOAD_EVENTS } else { 0 };
+    let feed = watch_workers::Feed::of(Log::new(WATCHED_EVENTS, loads));
+    if first != 0 {
+        feed.log.restart(Position {
+            seq: first,
+            term: 0,
+        });
+    }
+    let journal: Arc<dyn Journal> = Arc::<Log>::clone(&feed.log);
+    (Arc::new(MemoryStore::journaled(journal)), feed)
+}
+
+/// The places a run's log may start after: below 2^48, drawn once a run.
+pub(super) const FIRST_PLACES: u64 = 1 << 48;
 
 /// The replication scope's calls over one store and its log.
 pub(crate) struct Replication {
@@ -510,11 +546,11 @@ mod tests {
             let Ok(Tick::Acquired { term }) = elector.tick(at) else {
                 panic!("a free lease is taken at the first tick");
             };
-            let (store, log) = journaled(&LeasePlace::File("shared".into()));
+            let (store, feed) = journaled_from(&LeasePlace::File("shared".into()), 0);
             Self {
                 elector,
                 store,
-                log,
+                log: feed.log,
                 term,
                 at,
             }
@@ -1006,10 +1042,10 @@ mod tests {
     #[test]
     fn a_controller_whose_lease_lives_in_its_process_serves_no_standby() {
         let leader = Leader::elected();
-        let (store, log) = journaled(&LeasePlace::Process);
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         store.set_term(leader.term);
-        assert!(!log.carries_loads());
-        let refused = Replication::new(store, log, leader.elector.fence())
+        assert!(!feed.log.carries_loads());
+        let refused = Replication::new(store, feed.log, leader.elector.fence())
             .snapshot(leader.term, "controller-0", leader.at)
             .expect_err("no standby follows it");
         assert_eq!(refused.code(), Code::FailedPrecondition);

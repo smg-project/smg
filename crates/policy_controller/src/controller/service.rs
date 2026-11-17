@@ -4,10 +4,10 @@
 //!
 //! `Leader` is served, on every listener and by every replica, to a caller
 //! with a principal or with none. `Session` and `Decide` are served to a
-//! gateway ([`session`], [`decide`]), and the control scope's three
-//! registration calls by the leader. `GetPolicySpec` is served on the
-//! control scope by a controller given a spec source. Every other call is
-//! refused:
+//! gateway ([`session`], [`decide`]); the leader serves the control scope's
+//! three registration calls and the watch of the worker rows
+//! ([`watch_workers`]). `GetPolicySpec` is served on the control scope by a
+//! controller given a spec source. Every other call is refused:
 //! `PERMISSION_DENIED` where the listener mounts none of the call's scopes
 //! (the contract: the scope does not cover the RPC), `UNAUTHENTICATED`
 //! where it does and the listener's layer placed no principal on the call
@@ -43,7 +43,9 @@ use super::{
     membership::Door,
     principal::{self, Layer, Principal},
     replication::{Batches, Replication},
-    session, PROTOCOL_VERSION,
+    session,
+    watch_workers::{self, Feed, Source, Watchers, Watching},
+    PROTOCOL_VERSION,
 };
 use crate::{
     catalog::Catalog,
@@ -52,9 +54,15 @@ use crate::{
         self,
         policy_controller_server::{PolicyController, PolicyControllerServer},
     },
-    replication::Log,
     store::MemoryStore,
 };
+
+/// A leader's refusal in the instant between its take of the lease and its
+/// store's entry into the term.
+const NOT_IN_TERM: &str = "this replica leads a term its store has not entered yet";
+
+/// A watch's refusal by a replica that does not lead.
+const FOLLOWS_NO_LOG: &str = "this replica does not lead and follows no leader's log";
 
 /// What every listener's instance of the service reads. A step that serves
 /// a call adds its state here.
@@ -93,6 +101,14 @@ pub(crate) struct Shared {
     /// The run loop's word that the listeners close: `true` from the end
     /// of the drain's settle window on. An open decide stream ends at it.
     pub(crate) stop: watch::Sender<bool>,
+    /// The log that store journals to and the wake of its watched writes:
+    /// what a watch of the rows reads.
+    pub(crate) feed: Feed,
+    /// Whether this replica leads, told at a change alone by the run loop's
+    /// one task: how an idle watch learns its replica stopped leading.
+    pub(crate) role: watch::Sender<bool>,
+    /// Who watches this replica: the bounds of a watch's open.
+    pub(crate) watchers: Arc<Watchers>,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -114,7 +130,8 @@ impl Shared {
     /// fence are `elector`'s, so no instance answers under an identity
     /// another fence guards. A spec document names the stages `catalog`
     /// holds. `deciders` is how many threads decide. The store comes with
-    /// the log it journals to, the pair one place builds.
+    /// the feed of the log it journals to, the one value one place builds
+    /// ([`journaled`](super::replication::journaled)).
     ///
     /// # Errors
     ///
@@ -124,7 +141,7 @@ impl Shared {
         address: String,
         elector: &Elector,
         standing: watch::Receiver<Standing>,
-        (store, log): (Arc<MemoryStore>, Arc<Log>),
+        (store, feed): (Arc<MemoryStore>, Feed),
         catalog: Arc<Catalog>,
         deciders: usize,
     ) -> io::Result<Self> {
@@ -152,14 +169,21 @@ impl Shared {
             fence: elector.fence(),
             standing,
             generations: Arc::new(Generations::new(Arc::clone(&store), catalog)),
-            door: Door::new(Arc::clone(&store)),
-            replication: Replication::new(Arc::clone(&store), log, elector.fence()),
+            door: Door::new(Arc::clone(&store), Arc::clone(&feed.log)),
+            replication: Replication::new(
+                Arc::clone(&store),
+                Arc::clone(&feed.log),
+                elector.fence(),
+            ),
             store,
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
             deciders,
             streams: Arc::new(Streams::new(decide::MAX_STREAMS)),
             stop: watch::Sender::new(false),
+            feed,
+            role: watch::channel(false).0,
+            watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
         })
     }
 
@@ -383,33 +407,55 @@ impl Service {
         )))
     }
 
-    /// The term this replica leads under at `now`: what a write is admitted
-    /// under. A replica that does not lead refuses the write: its status
-    /// details are a `google.rpc.Status`, the form every gRPC client decodes
-    /// them as, holding a `NotLeader` that names the holder as `Leader` does
-    /// (no address: no leader known). That address is the holder's gateway
-    /// listener; a control client finds the leader's control listener by
-    /// the health service's word.
+    /// The term this replica leads under at `now`, once its store stands in
+    /// it: what a write is admitted under. A replica that does not lead
+    /// refuses the write: its status details are a `google.rpc.Status`, the
+    /// form every gRPC client decodes them as, holding a `NotLeader` that
+    /// names the holder as `Leader` does (no address: no leader known). That
+    /// address is the holder's gateway listener; a control client finds the
+    /// leader's control listener by the health service's word. The lease is
+    /// taken before the store is told its term; in between the answer is
+    /// `UNAVAILABLE`, so no write is numbered under the term this replica
+    /// followed.
     pub(crate) fn leading(&self, now: Instant) -> Result<u64, Status> {
-        const REFUSAL: &str = "this replica does not lead";
+        self.led(now, Code::FailedPrecondition, "this replica does not lead")
+    }
+
+    /// The term a watch of the rows is served under at `now`. A standby
+    /// serves one once it follows the leader's log; none does in this
+    /// build, so a replica that does not lead is a standby not yet synced:
+    /// `UNAVAILABLE`, with the `NotLeader` a write's refusal carries, in the
+    /// same form.
+    fn watched(&self, now: Instant) -> Result<u64, Status> {
+        self.led(now, Code::Unavailable, FOLLOWS_NO_LOG)
+    }
+
+    /// The term this replica leads under at `now`, once its store stands in
+    /// it. A replica that does not lead refuses under `code` with `message`:
+    /// the details are the `google.rpc.Status` that says both again and
+    /// holds the `NotLeader`.
+    fn led(&self, now: Instant, code: Code, message: &'static str) -> Result<u64, Status> {
         if let Some(term) = self.shared.fence.leader_term(now) {
-            return Ok(term);
+            if self.shared.feed.log.term() == term {
+                return Ok(term);
+            }
+            return Err(Status::unavailable(NOT_IN_TERM));
         }
         let named = proto::NotLeader {
             leader_address: self.leader_info(now).address,
             successor_id: String::new(),
         };
         let details = RpcStatus {
-            code: Code::FailedPrecondition as i32,
-            message: REFUSAL.to_owned(),
+            code: code as i32,
+            message: message.to_owned(),
             details: vec![Any {
                 type_url: "type.googleapis.com/smg.policy.v1.NotLeader".to_owned(),
                 value: named.encode_to_vec(),
             }],
         };
         Err(Status::with_details(
-            Code::FailedPrecondition,
-            REFUSAL,
+            code,
+            message,
             details.encode_to_vec().into(),
         ))
     }
@@ -489,7 +535,7 @@ fn verdict(dry_run: DryRun) -> proto::ApplyResult {
 impl PolicyController for Service {
     type SessionStream = session::Frames;
     type DecideStream = decide::Answers;
-    type WatchWorkersStream = Unserved<proto::WorkerEvent>;
+    type WatchWorkersStream = Watching;
     type WatchRegimeStream = Unserved<proto::Regime>;
     type ReplicateStream = Batches;
 
@@ -515,7 +561,20 @@ impl PolicyController for Service {
         &self,
         request: Request<proto::WatchWorkersRequest>,
     ) -> Result<Response<Self::WatchWorkersStream>, Status> {
-        self.unserved(Call::WatchWorkers, &request)
+        let by = self.admit(Call::WatchWorkers, &request)?;
+        let term = self.watched(Instant::now())?;
+        let asked = request.get_ref();
+        let start = watch_workers::start(asked)?;
+        let source = Source {
+            store: Arc::clone(&self.shared.store),
+            feed: self.shared.feed.clone(),
+            fence: Arc::clone(&self.shared.fence),
+            role: self.shared.role.subscribe(),
+            term,
+        };
+        let watchers = &self.shared.watchers;
+        let watching = watch_workers::open(source, watchers, by, start, asked.models.clone())?;
+        Ok(Response::new(watching))
     }
 
     async fn push_load(
@@ -732,6 +791,7 @@ mod tests {
     use tokio::{net::TcpListener, sync::watch, task::JoinSet};
     use tonic::{
         client::Grpc,
+        codegen::tokio_stream::StreamExt as _,
         transport::{server::TcpIncoming, Channel, Server},
         Code, Request,
     };
@@ -743,12 +803,13 @@ mod tests {
         controller::{
             config::Scope,
             election::{self, LeasePlace, Standing},
+            gateways::tests::PATIENT,
             generations::{tests::LEAST_LOAD, Format},
             principal::{
                 tests::{stating, told, NO_PRINCIPAL},
                 Layer,
             },
-            replication::journaled,
+            replication::journaled_from,
             PROTOCOL_VERSION,
         },
         elector::{
@@ -756,6 +817,7 @@ mod tests {
             MemoryLease, Tick, Written,
         },
         proto::{self, policy_controller_server::PolicyController},
+        store::{LeasesStore, WorkersStore},
     };
 
     const ID: &str = "controller-0";
@@ -774,6 +836,13 @@ mod tests {
         over(elector, scopes)
     }
 
+    /// The same over a candidate alone over its lease: its take leads at
+    /// once, by the clock a call reads.
+    fn service_alone(scopes: &[Scope]) -> (Elector, watch::Sender<Standing>, Service) {
+        let elector = Elector::alone(IDENTITY, PATIENT).expect("the settings are in order");
+        over(elector, scopes)
+    }
+
     /// The election's writer and one listener's service over the fence of
     /// `elector`, handed back beside them.
     fn over(elector: Elector, scopes: &[Scope]) -> (Elector, watch::Sender<Standing>, Service) {
@@ -784,7 +853,7 @@ mod tests {
                 ADDRESS.to_owned(),
                 &elector,
                 stood,
-                journaled(&LeasePlace::Process),
+                journaled_from(&LeasePlace::Process, 0),
                 Arc::new(Catalog::builtin()),
                 2,
             )
@@ -838,14 +907,14 @@ mod tests {
         let elector = Elector::new(Box::new(FileLease::new(&path)), IDENTITY, settings)
             .expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let (store, log) = journaled(&LeasePlace::Process);
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         let shared = Arc::new(
             Shared::new(
                 ID.to_owned(),
                 ADDRESS.to_owned(),
                 &elector,
                 stood,
-                (Arc::clone(&store), log),
+                (Arc::clone(&store), feed),
                 Arc::new(Catalog::builtin()),
                 2,
             )
@@ -1046,6 +1115,146 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_watch_past_its_principals_ceiling_is_refused_by_name() {
+        let (mut elector, _standing, service) = service_alone(&[Scope::Gateway]);
+        elector.lead_at(Instant::now());
+        service.shared.store.set_term(1);
+        let watch = |by| from(by, proto::WatchWorkersRequest::default());
+        // A request refused by its field takes no seat.
+        let needs = proto::WatchWorkersRequest {
+            with_needs: true,
+            ..Default::default()
+        };
+        let refused = service
+            .watch_workers(from("gateway-a", needs))
+            .await
+            .expect_err("refused");
+        assert_eq!(refused.code(), Code::InvalidArgument);
+        let mut held = Vec::new();
+        for _ in 0..super::watch_workers::WATCHES_MAX {
+            let opened = service.watch_workers(watch("gateway-a")).await;
+            held.push(opened.expect("a seat"));
+        }
+        let refused = service
+            .watch_workers(watch("gateway-a"))
+            .await
+            .expect_err("one watch past the ceiling");
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (
+                Code::ResourceExhausted,
+                "this principal holds its ceiling of 4 open watches: end one, then watch again"
+            )
+        );
+        // Another principal's watches are its own.
+        service
+            .watch_workers(watch("gateway-b"))
+            .await
+            .expect("another principal's seat");
+    }
+
+    #[tokio::test]
+    async fn a_watch_is_served_by_the_leader_once_its_store_stands_in_the_term() {
+        let (mut elector, _standing, service) = service_alone(&[Scope::Gateway, Scope::Control]);
+        let watch = || from("gateway-a", proto::WatchWorkersRequest::default());
+        let register = || {
+            let spec = proto::WorkerSpec {
+                url: "grpc://10.0.0.5:8000".to_owned(),
+                wire: proto::WireMode::Grpc as i32,
+                role: proto::Role::Single as i32,
+                models: vec!["model-a".to_owned()],
+                ..Default::default()
+            };
+            let request = proto::RegisterWorkerRequest {
+                spec: Some(spec),
+                ..Default::default()
+            };
+            from("operator-a", request)
+        };
+        // A replica that does not lead follows no log in this build: a
+        // standby not yet synced, with the `NotLeader` a write's refusal
+        // carries.
+        let refused = service.watch_workers(watch()).await.expect_err("refused");
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (Code::Unavailable, super::FOLLOWS_NO_LOG)
+        );
+        let details = RpcStatus::decode(refused.details()).expect("a google.rpc.Status");
+        assert_eq!(
+            (details.code, details.message.as_str()),
+            (Code::Unavailable as i32, super::FOLLOWS_NO_LOG)
+        );
+        let [detail] = details.details.as_slice() else {
+            panic!("one detail: {details:?}");
+        };
+        let named = proto::NotLeader::decode(detail.value.as_slice()).expect("a NotLeader");
+        assert_eq!(named, proto::NotLeader::default());
+
+        // The lease is taken and its fence is open, at the take of a
+        // candidate alone; the store has not entered the term: no watch is
+        // cut and no write is numbered under the term before it.
+        elector.lead_at(Instant::now());
+        let early = service.watch_workers(watch()).await.expect_err("refused");
+        assert_eq!(
+            (early.code(), early.message()),
+            (Code::Unavailable, super::NOT_IN_TERM)
+        );
+        let early = service
+            .register_worker(register())
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            (early.code(), early.message()),
+            (Code::Unavailable, super::NOT_IN_TERM)
+        );
+        assert_eq!(service.shared.store.epoch(), 0);
+
+        // In the term: the watch is cut at the term's start, and the answer
+        // of a registration and the watch tell one event at one place.
+        service.shared.store.set_term(1);
+        let mut stream = service
+            .watch_workers(watch())
+            .await
+            .expect("opened")
+            .into_inner();
+        let mut next = async || {
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("an event within five seconds")
+                .expect("the stream is open")
+                .expect("an event, not a status")
+        };
+        let page = next().await;
+        assert_eq!((page.seq, page.term, page.membership_epoch), (1, 1, 0));
+        let answered = service
+            .register_worker(register())
+            .await
+            .expect("registered")
+            .into_inner();
+        assert_eq!(
+            (answered.seq, answered.term, answered.membership_epoch),
+            (2, 1, 1)
+        );
+        assert_eq!(next().await, answered);
+
+        // A request this build cannot serve is refused by its field.
+        let needs = proto::WatchWorkersRequest {
+            with_needs: true,
+            ..Default::default()
+        };
+        let refused = service
+            .watch_workers(from("gateway-a", needs))
+            .await
+            .expect_err("refused");
+        assert_eq!(refused.code(), Code::InvalidArgument);
+        assert!(
+            refused.message().starts_with("with_needs: "),
+            "{}",
+            refused.message()
+        );
+    }
+
     /// The methods of the contract's service, by the contract's own text.
     fn methods() -> Vec<&'static str> {
         const CONTRACT: &str = include_str!("../../contracts/policy_controller.proto");
@@ -1058,14 +1267,21 @@ mod tests {
             .collect()
     }
 
-    /// The calls a step serves on a listener of `scopes`, beside `Leader`.
-    /// Each is the leader's to answer: a replica that never took the lease
-    /// refuses it. The snapshot is served on the replication scope alone.
-    fn served(call: Call, scopes: &[Scope]) -> bool {
-        matches!(
-            call,
-            Call::RegisterWorker | Call::PatchWorker | Call::DeregisterWorker | Call::Replicate
-        ) || (matches!(call, Call::GetSnapshot) && scopes.contains(&Scope::Replication))
+    /// The calls a step serves, beside `Leader`, each with its refusal by a
+    /// replica that never took the lease: a write is the leader's alone, as
+    /// are a standby's batches and, on the replication scope alone, the
+    /// snapshot; a watch of the rows is a standby's once it follows the
+    /// leader's log, which none does in this build.
+    fn refused_off_the_leader(call: Call, scopes: &[Scope]) -> Option<(Code, &'static str)> {
+        const NOT_LEADING: (Code, &str) = (Code::FailedPrecondition, "this replica does not lead");
+        match call {
+            Call::RegisterWorker | Call::PatchWorker | Call::DeregisterWorker | Call::Replicate => {
+                Some(NOT_LEADING)
+            }
+            Call::GetSnapshot if scopes.contains(&Scope::Replication) => Some(NOT_LEADING),
+            Call::WatchWorkers => Some((Code::Unavailable, super::FOLLOWS_NO_LOG)),
+            _ => None,
+        }
     }
 
     /// Every method of the contract, called by its own name over a socket
@@ -1076,9 +1292,10 @@ mod tests {
     /// scopes, and on them unauthenticated to a caller the layer did not
     /// place. To the caller it placed, a call no step serves is
     /// unimplemented, `Session` is reached (the empty message is no
-    /// `Hello`), and a registration call is refused by a replica that does
-    /// not lead. The names are read from the contract, so a method added
-    /// there joins the case, and fails it until the table holds its call.
+    /// `Hello`), and a registration call or a watch of the rows is refused
+    /// by a replica that does not lead. The names are read from the
+    /// contract, so a method added there joins the case, and fails it until
+    /// the table holds its call.
     #[tokio::test]
     async fn every_method_of_the_contract_answers_by_its_calls_scopes_and_its_callers_principal() {
         let methods = methods();
@@ -1166,14 +1383,6 @@ mod tests {
                         Code::Unimplemented,
                         format!("{method} is not served by a controller started with no spec file"),
                     )
-                } else if layer == Layer::AsTold
-                    && stated
-                    && call.is_some_and(|call| served(call, scopes))
-                {
-                    (
-                        Code::FailedPrecondition,
-                        "this replica does not lead".to_owned(),
-                    )
                 } else if layer == Layer::AsTold && stated && *method == "Decide" {
                     // The stream opens, and the call itself refuses the
                     // case's one frame: it carries no id.
@@ -1182,10 +1391,13 @@ mod tests {
                         "request_id is out of its range in this protocol version".to_owned(),
                     )
                 } else if layer == Layer::AsTold && stated {
-                    (
-                        Code::Unimplemented,
-                        format!("{method} is not served by this build"),
-                    )
+                    match call.and_then(|call| refused_off_the_leader(call, scopes)) {
+                        Some((code, why)) => (code, why.to_owned()),
+                        None => (
+                            Code::Unimplemented,
+                            format!("{method} is not served by this build"),
+                        ),
+                    }
                 } else {
                     (Code::Unauthenticated, NO_PRINCIPAL.to_owned())
                 };
@@ -1248,6 +1460,7 @@ mod tests {
         )
         .expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
         let service = Service::new(
             vec![Scope::Gateway],
             Arc::new(
@@ -1256,7 +1469,7 @@ mod tests {
                     ADDRESS.to_owned(),
                     &elector,
                     stood,
-                    journaled(&LeasePlace::Process),
+                    (store, feed),
                     Arc::new(Catalog::builtin()),
                     2,
                 )
@@ -1493,6 +1706,9 @@ mod tests {
         let (mut elector, standing, control) = over(elector, &[Scope::Control]);
         if leads {
             elector.lead_at(Instant::now());
+            // The store enters the term, as the election has it at a take: a
+            // write call is answered under a term the store stands in.
+            control.shared.store.set_term(1);
             standing.send_replace(saw(IDENTITY, 1));
         } else {
             standing.send_replace(saw("controller-1@10.0.0.8:30100", 4));

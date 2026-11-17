@@ -830,7 +830,7 @@ mod tests {
         Running, Standing, Word,
     };
     use crate::{
-        controller::{config::ConfigError, replication::journaled},
+        controller::{config::ConfigError, replication::journaled_from},
         elector::{
             ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Written,
             TERM_CEILING,
@@ -1574,9 +1574,9 @@ mod tests {
                 renew_period: Duration::from_millis(20),
                 renew_deadline: Duration::from_millis(400),
             };
-            let (store, log) = journaled(&LeasePlace::Process);
+            let (store, feed) = journaled_from(&LeasePlace::Process, 0);
             if followed {
-                log.restart(Position { seq: 9, term: 5 });
+                feed.log.restart(Position { seq: 9, term: 5 });
             }
             let candidate = Elector::new(Box::new(MemoryLease::new()), name, settings)
                 .expect("the settings are in order");
