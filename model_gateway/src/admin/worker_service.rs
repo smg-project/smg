@@ -247,6 +247,20 @@ fn discovery_provider(worker: &dyn Worker) -> Option<&String> {
     worker.metadata().spec.labels.get(DISCOVERY_PROVIDER_LABEL)
 }
 
+/// The candidate with the lowest URL among those that still have an id, with
+/// that id. The candidates and the ids come from two reads of the registry,
+/// and a worker can leave between them: such a candidate is passed over, so
+/// the next one answers instead of none.
+fn lowest_with_id(
+    candidates: impl IntoIterator<Item = Arc<dyn Worker>>,
+    id_of: impl Fn(&str) -> Option<WorkerId>,
+) -> Option<(WorkerId, Arc<dyn Worker>)> {
+    candidates
+        .into_iter()
+        .filter_map(|worker| id_of(worker.url()).map(|id| (id, worker)))
+        .min_by(|(_, a), (_, b)| a.url().cmp(b.url()))
+}
+
 /// Error types for worker service operations
 #[derive(Debug)]
 pub enum WorkerServiceError {
@@ -626,16 +640,14 @@ impl WorkerService {
                 // a worker that carries the rank holds the base. The registry
                 // walks in hash order: the lowest URL, so the answer names
                 // the same worker every time.
-                let other = find_workers_by_url(&self.worker_registry, &worker_url)
+                let candidates = find_workers_by_url(&self.worker_registry, &worker_url)
                     .into_iter()
                     .filter(|other| {
                         Endpoint::parse_with_rank(other.url()).is_ok_and(|(address, rank)| {
                             rank == other.dp_rank() || !address.is_ipc()
                         })
-                    })
-                    .min_by(|a, b| a.url().cmp(b.url()))?;
-                let id = self.worker_registry.get_id_by_url(other.url())?;
-                Some((id, other))
+                    });
+                lowest_with_id(candidates, |url| self.worker_registry.get_id_by_url(url))
             });
         if let Some((worker_id, existing)) = live {
             let url = existing.url().to_string();
@@ -1421,6 +1433,46 @@ mod tests {
             .create_worker(worker_spec("ipc:///tmp/w"))
             .await
             .expect("a socket path that only reads like a rank's base is another worker");
+    }
+
+    /// The fallback's candidates and their ids come from two reads of the
+    /// registry, and a worker can leave between them. A candidate whose id is
+    /// gone is passed over and the lowest of the others answers. Before this,
+    /// the lowest candidate was chosen first and its id read after: when that
+    /// one left, the others were dropped and the POST went on to its add job.
+    #[test]
+    fn the_lowest_candidate_that_still_has_an_id_answers() {
+        let base = "grpc://10.0.0.9:8000";
+        let ranks: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|rank| {
+                let ranked = BasicWorkerBuilder::new(base)
+                    .worker_type(WorkerType::Regular)
+                    .dp_config(rank, 3);
+                Arc::new(ranked.build()) as Arc<dyn Worker>
+            })
+            .collect();
+        let id_of = |url: &str| WorkerId::from_string(format!("id-of-{url}"));
+
+        let (id, worker) = lowest_with_id(ranks.iter().rev().cloned(), |url| Some(id_of(url)))
+            .expect("every candidate has an id");
+        assert_eq!(worker.url(), format!("{base}@0"), "the lowest URL answers");
+        assert_eq!(id, id_of(worker.url()), "with its own id");
+
+        let (id, worker) = lowest_with_id(ranks.iter().cloned(), |url| {
+            (!url.ends_with("@0")).then(|| id_of(url))
+        })
+        .expect("the ranks that stayed still hold the address");
+        assert_eq!(
+            worker.url(),
+            format!("{base}@1"),
+            "the lowest rank left between the two reads: the next one answers"
+        );
+        assert_eq!(id, id_of(worker.url()), "with its own id");
+
+        assert!(
+            lowest_with_id(ranks.iter().cloned(), |_| None).is_none(),
+            "no candidate has an id: nothing holds the address"
+        );
     }
 
     /// An id with no worker behind it is a registration in flight: a PATCH
