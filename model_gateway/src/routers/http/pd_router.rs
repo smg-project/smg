@@ -5192,6 +5192,99 @@ mod tests {
         assert_eq!(body.get("bootstrap_room"), None, "no bootstrap on vLLM PD");
     }
 
+    /// What a Mooncake pair's two sides are sent for one chat request, the
+    /// prefill body first. The prefill engine's id was discovered
+    /// (`engine_id`) or was not, and its server answers with handoff params
+    /// of its own, which neither Mooncake form relays.
+    async fn sent_to_a_mooncake_pair(engine_id: Option<&str>) -> [Value; 2] {
+        let (prefill_url, prefill_seen) =
+            spawn_recording_stub(r#"{"kv_transfer_params":{"remote_engine_id":"its-own"}}"#).await;
+        let (decode_url, decode_seen) =
+            spawn_recording_stub(r#"{"object":"chat.completion"}"#).await;
+        let mut prefill = BasicWorkerBuilder::new(prefill_url)
+            .worker_type(WorkerType::Prefill)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("MooncakeConnector")
+            .bootstrap_port(Some(9123));
+        if let Some(engine_id) = engine_id {
+            prefill = prefill.kv_engine_id(engine_id);
+        }
+        let decode = BasicWorkerBuilder::new(decode_url)
+            .worker_type(WorkerType::Decode)
+            .runtime_type(RuntimeType::Vllm);
+        let router = create_test_pd_router();
+        for worker in [prefill.build(), decode.build()] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register_or_replace(Arc::new(worker));
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        let response = router
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        [(prefill_seen, "prefill"), (decode_seen, "decode")].map(|(seen, side)| {
+            let mut requests = taken(&seen);
+            assert_eq!(requests.len(), 1, "exactly one {side} request");
+            let (path, body) = requests.remove(0);
+            assert_eq!(path, "/v1/chat/completions", "{side}");
+            body
+        })
+    }
+
+    /// A Mooncake pair whose prefill engine's id was discovered: one minted
+    /// transfer id goes to both sides. The prefill side pins its blocks
+    /// under it; the decode side pulls them by it from the prefill engine's
+    /// bootstrap address.
+    #[tokio::test]
+    async fn vllm_pd_mooncake_mints_one_transfer_id_for_both_sides() {
+        let [prefill, decode] = sent_to_a_mooncake_pair(Some("eng0")).await;
+        let transfer_id = prefill
+            .pointer("/kv_transfer_params/transfer_id")
+            .and_then(Value::as_str)
+            .expect("a transfer id on the prefill side");
+        assert!(transfer_id.starts_with("xfer-"), "{transfer_id}");
+        assert_eq!(
+            prefill.get("kv_transfer_params"),
+            Some(&json!({
+                "do_remote_decode": true,
+                "do_remote_prefill": false,
+                "transfer_id": transfer_id,
+            }))
+        );
+        assert_eq!(
+            decode.get("kv_transfer_params"),
+            Some(&json!({
+                "do_remote_decode": false,
+                "do_remote_prefill": true,
+                "transfer_id": transfer_id,
+                "remote_engine_id": "eng0",
+                "remote_bootstrap_addr": "http://127.0.0.1:9123",
+            }))
+        );
+    }
+
+    /// A Mooncake pair whose prefill engine's id was not discovered: nothing
+    /// is minted, neither side carries handoff params, and the gateway warns
+    /// that the decode side recomputes the prompt.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn vllm_pd_mooncake_without_an_engine_id_sends_no_handoff_params() {
+        let [prefill, decode] = sent_to_a_mooncake_pair(None).await;
+        assert_eq!(prefill.get("kv_transfer_params"), None);
+        assert_eq!(decode.get("kv_transfer_params"), None);
+        assert!(logs_contain(
+            "Mooncake without a discovered kv_engine_id cannot be minted for"
+        ));
+    }
+
     #[tokio::test]
     async fn vllm_pd_fanout_skips_the_prefill_side() {
         let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
