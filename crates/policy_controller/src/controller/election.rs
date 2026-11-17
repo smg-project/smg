@@ -15,8 +15,8 @@
 //! to the store at a take and publishes what it saw. At the shutdown signal
 //! it closes the fence and rewrites the record released, in that order, so
 //! no instant has two open fences and the next candidate to look takes the
-//! lease at once, or one renew deadline later when this thread's own take
-//! still waited to lead; it then stops and never takes again.
+//! lease at once, or after the wait this thread's own take still owed; it
+//! then stops and never takes again.
 //!
 //! A word to leave (`Running::step_down`: a planned hand-over, or a term a
 //! caller says it saw) is taken by the same thread between two steps: the
@@ -586,6 +586,11 @@ fn run(
                     let Some(left) = step_down(&mut elector, above) else {
                         continue;
                     };
+                    // The fence closed at the word: the take that opens it
+                    // again says so, as the first take did.
+                    if left {
+                        leading = false;
+                    }
                     let told = above.unwrap_or(0);
                     // A lease this replica left names nobody, and so does a
                     // term above the one the holder is named under.
@@ -767,8 +772,8 @@ fn step_down(elector: &mut Elector, above: Option<u64>) -> Option<bool> {
 }
 
 /// The planned stop: the elector closes the fence, then rewrites the record
-/// released, so the next candidate to look takes the lease at once, or one
-/// renew deadline later when the take still waited to lead. The first
+/// released, so the next candidate to look takes the lease at once, or
+/// after the wait the take still owed. The first
 /// release follows the loop's last step at once: a stop does not wait for
 /// the period. A release that fails is tried again, a bounded number of
 /// times, and no sooner than one renew period after the attempt before it
@@ -2638,6 +2643,8 @@ mod tests {
         let (said, text) =
             looping.stopped_with("alone over its lease, takes it again at its next step");
         assert_eq!(said, 1, "{text}");
+        // The fence closed at the word, and the retake says it leads again.
+        assert_eq!(text.matches(": leading").count(), 2, "{text}");
         assert!(!text.contains("waits its turn"), "{text}");
         assert!(
             !text.contains("takes nothing for one lease duration"),
