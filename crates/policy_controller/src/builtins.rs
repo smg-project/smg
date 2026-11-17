@@ -1293,6 +1293,101 @@ impl Picker for Best {
     }
 }
 
+/// The best of a sample: `best` over the rows it draws first. Where the
+/// host named the request's holders and the pool's warming rows
+/// ([`NamedAffinity`](crate::NamedAffinity)) and the pool holds more than
+/// twice the sample, it draws `sample` rows the filters keep, uniformly and
+/// with replacement (a repeat or a refused row costs one of its `2 * sample`
+/// draws), the named rows join them, and the highest combined score among
+/// those wins. Any other pool is read whole, as `best` reads it.
+#[derive(Debug)]
+pub struct SampledBest {
+    sample: u32,
+}
+
+impl SampledBest {
+    /// The picker over a sample of `sample` rows, at least one.
+    pub fn new(sample: u32) -> Self {
+        Self {
+            sample: sample.max(1),
+        }
+    }
+}
+
+impl Lifecycle for SampledBest {}
+
+impl Picker for SampledBest {
+    fn name(&self) -> &'static str {
+        "best"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        push_ranked(Draw::new(facts.seed), candidates, kept, scores, band, out);
+    }
+
+    fn draws_first(&self) -> bool {
+        true
+    }
+
+    fn joined_by_named(&self) -> bool {
+        true
+    }
+
+    /// At most `2 * sample` uniform draws until `sample` rows are kept; a
+    /// repeat is dropped. A pool of at most twice the sample and
+    /// [`DRAW_BOUND`] refused rows each leave the decision to the whole
+    /// pass. Whether the host named rows is the engine's to ask
+    /// ([`Picker::joined_by_named`]).
+    fn draw_first(
+        &self,
+        _: &RequestFacts<'_>,
+        _: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        keep: &mut dyn FnMut(&Candidate) -> bool,
+        kept: &mut Vec<u32>,
+        draw: &mut Draw,
+    ) -> bool {
+        let sample = self.sample as usize;
+        if candidates.len() <= 2 * sample {
+            return false;
+        }
+        let mut refused = 0;
+        for _ in 0..2 * sample {
+            if kept.len() == sample {
+                break;
+            }
+            let row = draw.below(candidates.len()) as u32;
+            if kept.contains(&row) {
+                continue;
+            }
+            if keep(&candidates[row as usize]) {
+                kept.push(row);
+            } else {
+                refused += 1;
+                if refused == DRAW_BOUND {
+                    return false;
+                }
+            }
+        }
+        !kept.is_empty()
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            sample: self.sample,
+            ..Needs::default()
+        }
+    }
+}
+
 /// The first survivor, as the host lists them.
 #[derive(Debug)]
 pub struct Passthrough;
@@ -4095,5 +4190,101 @@ mod tests {
         assert_eq!(scores, [0.0, 1.0]);
         assert!(SessionAffinity.needs().headers);
         assert!(LeastLoad::new(0.15, 1024, 2000.0).needs().loads);
+    }
+
+    /// A sampled `best` draws over a pool of more than twice its sample and
+    /// over no smaller one: it keeps `sample` rows the filters keep, none
+    /// twice, and hands the decision to the whole pass at [`DRAW_BOUND`]
+    /// refused rows. Whether the host named rows is the engine's to ask.
+    #[test]
+    fn a_sampled_best_draws_its_sample_from_a_pool_over_twice_it() {
+        let picker = SampledBest::new(8);
+        assert_eq!(picker.needs().sample, 8);
+        assert_eq!(SampledBest::new(0).needs().sample, 1);
+        let pool: Vec<Candidate> = (0..64).map(|i| candidate(i, 0)).collect();
+        let request = RequestFacts {
+            seed: 9,
+            ..RequestFacts::default()
+        };
+        // What a draw answers: it drew, the rows it kept, and whether it
+        // read a value of the stream.
+        let draws =
+            |facts: &RequestFacts<'_>, rows: usize, keep: &mut dyn FnMut(&Candidate) -> bool| {
+                let (mut kept, mut draw) = (Vec::new(), Draw::new(facts.seed));
+                let drew = picker.draw_first(
+                    facts,
+                    &PoolFacts::default(),
+                    &pool[..rows],
+                    keep,
+                    &mut kept,
+                    &mut draw,
+                );
+                (drew, kept, draw.state() != facts.seed)
+            };
+        let (drew, kept, read) = draws(&request, 64, &mut |_| true);
+        assert!(drew && read);
+        let mut once = kept.clone();
+        once.sort_unstable();
+        once.dedup();
+        assert_eq!((kept.len(), once.len()), (8, 8), "{kept:?}");
+        // A pool of at most twice the sample: no draw, and no value of the
+        // stream read. One row more is drawn from.
+        assert_eq!(
+            draws(&request, 16, &mut |_| true),
+            (false, Vec::new(), false)
+        );
+        assert!(draws(&request, 17, &mut |_| true).0);
+        // Every row refused: the bound of refused rows ends the draw.
+        let mut asked = 0u32;
+        let (drew, ..) = draws(&request, 64, &mut |_| {
+            asked += 1;
+            false
+        });
+        assert!(!drew);
+        assert_eq!(asked, DRAW_BOUND);
+    }
+
+    /// A sampled `best` reads at most twice its sample of the stream's
+    /// values. Where repeats use them up it hands out the rows it kept,
+    /// fewer than the sample, and reads no value more.
+    #[test]
+    fn a_sampled_best_reads_at_most_twice_its_sample_of_the_stream() {
+        let picker = SampledBest::new(2);
+        // One row past twice the sample: one seed in about a hundred draws
+        // one row four times.
+        let pool: Vec<Candidate> = (0..5).map(|i| candidate(i, 0)).collect();
+        let mut short = 0u32;
+        for seed in 0..2_000u64 {
+            let facts = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let (mut kept, mut draw) = (Vec::new(), Draw::new(seed));
+            let pool_facts = PoolFacts::default();
+            assert!(picker.draw_first(
+                &facts,
+                &pool_facts,
+                &pool,
+                &mut |_| true,
+                &mut kept,
+                &mut draw
+            ));
+            // The values read: the stream's steps from the seed to its state.
+            let (mut twin, mut read) = (Draw::new(seed), 0usize);
+            while twin.state() != draw.state() {
+                twin.next_u64();
+                read += 1;
+                assert!(read <= 4, "seed {seed}: more than twice the sample read");
+            }
+            assert!(
+                read >= kept.len(),
+                "seed {seed}: {kept:?} from {read} values"
+            );
+            if kept.len() < 2 {
+                assert_eq!(read, 4, "seed {seed}: {kept:?}");
+                short += 1;
+            }
+        }
+        assert!(short > 0, "no seed spent its draws on one row");
     }
 }
