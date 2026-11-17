@@ -163,8 +163,10 @@ async fn router_with_cap(
     cap: usize,
     client: Option<Arc<reqwest::Client>>,
 ) -> (HttpRouter, Arc<dyn Worker>) {
-    let ctx =
-        create_test_app_context_with_config(&TestRouterConfig::with_payload_limit(3000, cap)).await;
+    // One attempt: each case here pins one read of one worker answer.
+    let mut config = TestRouterConfig::with_payload_limit(3000, cap);
+    config.retry.max_retries = 1;
+    let ctx = create_test_app_context_with_config(&config).await;
     let mut builder = BasicWorkerBuilder::new(upstream_url)
         .models(vec![ModelCard::new("mock-model")])
         .health_config(HealthCheckConfig {
