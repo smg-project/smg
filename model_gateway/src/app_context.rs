@@ -19,6 +19,7 @@ use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, info};
 
 use crate::{
+    admin::worker_service::WorkerService,
     config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
@@ -45,7 +46,7 @@ use crate::{
             build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS,
         },
         health::liveness,
-        KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService,
+        KvEventMonitor, WorkerHttpClientCache, WorkerMonitor, WorkerRegistry,
     },
     workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
@@ -1021,10 +1022,12 @@ mod tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        routers::common::prefill_admission::PrefillAdmissionAttempt,
+        routers::common::prefill_admission::{
+            test_support::select_worker, PrefillAdmissionAttempt,
+        },
         worker::{
             connection::engine::NO_ENGINE_CONNECTOR,
-            test_support::{select_worker, worker_of, RefusedAddress},
+            test_support::{worker_of, RefusedAddress},
             BasicWorkerBuilder, ConnectionMode, SubscriptionKind, Worker, WorkerType,
         },
     };
@@ -1592,6 +1595,7 @@ pub(crate) mod testing {
 
     use super::{AppContext, ToolParserFactory};
     use crate::{
+        admin::worker_service::WorkerService,
         config::RouterConfig,
         middleware::{AuthConfig, TokenBucket},
         observability::inflight_tracker::InFlightRequestTracker,
@@ -1601,7 +1605,7 @@ pub(crate) mod testing {
             grpc::multimodal::MultimodalConfigRegistry,
         },
         server::http_client,
-        worker::{WorkerHttpClientCache, WorkerRegistry, WorkerService},
+        worker::{WorkerHttpClientCache, WorkerRegistry},
     };
 
     /// An `AppContext` over `router_config` and `worker_registry`: in-memory

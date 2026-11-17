@@ -1,18 +1,11 @@
-use metrics_exporter_prometheus::{DistributionBuilder, PrometheusBuilder};
-use metrics_util::parse_quantiles;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
 use super::{
     series::{WorkerSeries, WorkerSeriesRecorder},
     *,
 };
-use crate::{
-    observability::metrics::{
-        test_support::{assert_metric, render_with_recorder, sorted_series},
-        DEFAULT_SUMMARY_QUANTILES,
-    },
-    worker::test_support::{gone, held},
-};
+use crate::worker::test_support::{assert_metric, gone, held, render_with_recorder, sorted_series};
 
 /// Core engine gauges share these labels for the snapshot fixtures.
 const CORE_LABELS: [&str; 3] = ["dp_rank=\"2\"", "model=\"m\"", "worker=\"http://w:1\""];
@@ -273,14 +266,7 @@ fn test_interner_size_grows() {
 /// instead of feeding the handle built while the address was retired.
 #[test]
 fn kept_worker_counters_follow_the_workers_registrations() {
-    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
-        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )));
+    let workers = Arc::new(WorkerSeries::with_exporter_quantiles());
     let recorder = WorkerSeriesRecorder::new(
         PrometheusBuilder::new().build_recorder(),
         Arc::clone(&workers),
@@ -328,14 +314,7 @@ fn kept_worker_counters_follow_the_workers_registrations() {
 /// gets a fresh handle.
 #[test]
 fn kept_worker_gauges_set_the_recorders_series() {
-    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
-        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )));
+    let workers = Arc::new(WorkerSeries::with_exporter_quantiles());
     let recorder = WorkerSeriesRecorder::new(
         PrometheusBuilder::new().build_recorder(),
         Arc::clone(&workers),
@@ -398,14 +377,7 @@ fn kept_worker_gauges_set_the_recorders_series() {
 /// once the handle is gone.
 #[test]
 fn a_held_removed_worker_keeps_its_address_retired_through_upkeep() {
-    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
-        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )));
+    let workers = Arc::new(WorkerSeries::with_exporter_quantiles());
     let recorder = WorkerSeriesRecorder::new(
         PrometheusBuilder::new().build_recorder(),
         Arc::clone(&workers),
@@ -458,14 +430,7 @@ fn a_registration_or_a_removal_drops_the_kept_worker_counters() {
 /// built while the address was retired.
 #[test]
 fn kept_worker_outcome_counters_follow_the_workers_registrations() {
-    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
-        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )));
+    let workers = Arc::new(WorkerSeries::with_exporter_quantiles());
     let recorder = WorkerSeriesRecorder::new(
         PrometheusBuilder::new().build_recorder(),
         Arc::clone(&workers),
@@ -558,14 +523,7 @@ fn the_kv_event_set_renders_the_same_through_kept_handles() {
 /// built while the address was retired.
 #[test]
 fn kept_kv_event_handles_follow_the_workers_registrations() {
-    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
-        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )));
+    let workers = Arc::new(WorkerSeries::with_exporter_quantiles());
     let recorder = WorkerSeriesRecorder::new(
         PrometheusBuilder::new().build_recorder(),
         Arc::clone(&workers),

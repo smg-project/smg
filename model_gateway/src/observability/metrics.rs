@@ -2533,43 +2533,11 @@ pub(crate) mod test_support {
         })
     }
 
-    /// Run `f` under a thread-local Prometheus recorder and return the
-    /// rendered `/metrics` text — the same scrape output the :29000 endpoint
-    /// serves in production.
-    pub(crate) fn render_with_recorder(f: impl FnOnce()) -> String {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        metrics::with_local_recorder(&recorder, f);
-        handle.render()
-    }
-
-    /// Assert the rendered scrape has a line for `name` carrying every label in
-    /// `labels` and ending in `value`. Label order is exporter-defined, so this
-    /// matches on substrings rather than a fixed label set.
-    pub(crate) fn assert_metric(rendered: &str, name: &str, labels: &[&str], value: &str) {
-        let line = rendered
-            .lines()
-            .find(|l| l.starts_with(&format!("{name}{{")))
-            .unwrap_or_else(|| panic!("metric {name} missing; rendered:\n{rendered}"));
-        for label in labels {
-            assert!(line.contains(label), "{name} missing label {label}: {line}");
-        }
-        assert!(
-            line.ends_with(&format!(" {value}")),
-            "{name} expected value {value}: {line}"
-        );
-    }
-
-    /// The lines of a scrape that are series (not `# HELP` or `# TYPE`),
-    /// sorted, for comparing two recorders' output.
-    pub(crate) fn sorted_series(rendered: &str) -> Vec<&str> {
-        let mut series: Vec<&str> = rendered
-            .lines()
-            .filter(|line| !line.starts_with('#') && !line.is_empty())
-            .collect();
-        series.sort_unstable();
-        series
-    }
+    /// The scrape a test renders under its own recorder, with the two
+    /// readers of it: the worker's test support owns them.
+    pub(crate) use crate::worker::test_support::{
+        assert_metric, render_with_recorder, sorted_series,
+    };
 }
 
 #[cfg(test)]

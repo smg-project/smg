@@ -35,10 +35,8 @@ use openai_protocol::{
 use serde::Serialize;
 
 use super::*;
-use crate::{
-    config::types::PolicyConfig,
-    policies::PolicyRegistry,
-    worker::{health::overload::OverloadThresholds, BasicWorkerBuilder, WorkerType},
+use crate::worker::{
+    health::overload::OverloadThresholds, test_support::LoadReaders, BasicWorkerBuilder, WorkerType,
 };
 
 const URL: &str = "http://w0:8000";
@@ -203,10 +201,9 @@ fn answer(ranks: usize, figures: &[Option<Figures>]) -> WorkerLoadResponse {
 /// own.
 fn run(gateway: Thresholds, own: Thresholds, ranks: usize, steps: &[Step]) -> Vec<bool> {
     let registry = Arc::new(WorkerRegistry::new());
-    let policies = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
     let monitor = Arc::new(WorkerMonitor::new(
         Arc::clone(&registry),
-        policies,
+        Arc::new(LoadReaders::Blind),
         1,
         false,
         false,

@@ -56,10 +56,6 @@ use crate::worker::{
 
 pub mod event;
 pub mod hash_ring;
-// The admin API's service over this registry lives with the control plane
-// (`crate::admin::worker_service`); the path it had here is kept until the
-// runtime moves into the worker crate.
-pub use crate::admin::worker_service as service;
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]

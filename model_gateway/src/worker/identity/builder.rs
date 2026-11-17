@@ -538,7 +538,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::{server::http_client, worker::identity::basic::Worker};
+    use crate::worker::{connection::client_factory::http_client, identity::basic::Worker};
 
     /// The builder without a default connector, as this module has it.
     type BasicWorkerBuilder = super::BasicWorkerBuilder;

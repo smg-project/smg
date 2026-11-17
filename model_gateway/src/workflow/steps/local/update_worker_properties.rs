@@ -14,11 +14,9 @@ use super::create_worker::{
     warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
 };
 use crate::{
+    admin::worker_service::MAX_WORKER_LABELS,
     service_discovery::DISCOVERY_PROVIDER_LABEL,
-    worker::{
-        identity::basic::merge_labels, registry::service::MAX_WORKER_LABELS, BasicWorker,
-        BasicWorkerBuilder, RuntimeType, Worker,
-    },
+    worker::{identity::basic::merge_labels, BasicWorker, BasicWorkerBuilder, RuntimeType, Worker},
     workflow::data::{require_app_context, WorkerUpdateWorkflowData},
 };
 
