@@ -12,7 +12,7 @@ use axum::{
     Json,
 };
 use openai_protocol::worker::{
-    WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec, WorkerStatus,
+    HealthCheckUpdate, WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec, WorkerStatus,
     WorkerUpdateRequest,
 };
 use serde_json::json;
@@ -25,6 +25,7 @@ use crate::{
     routers::provider_support,
     service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL},
     worker::{
+        health::manager::MAX_PROBE_DELAY,
         identity::{
             basic::{merge_labels, worker_to_info},
             endpoint::Endpoint,
@@ -79,7 +80,8 @@ fn bad_request(message: String) -> WorkerServiceError {
 /// labels the routers read as numbers or booleans and none under the prefix
 /// reserved for discovery; the fields the routers rely on (a positive,
 /// finite cost; a KV block size and a data-parallel size of at least 1; a
-/// rank only with a size and below it; a bootstrap port that is a port). A
+/// rank only with a size and below it; a bootstrap port that is a port); a
+/// probe interval and a probe timeout the health schedule can hold. A
 /// violation is a `400 Bad Request` naming the field.
 fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     if spec.url.len() > MAX_WORKER_URL_BYTES {
@@ -109,6 +111,7 @@ fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     }
     validate_labels(&spec.labels)?;
     validate_cost(spec.cost)?;
+    validate_health(&spec.health)?;
     if spec.kv_block_size == Some(0) {
         return Err(bad_request(
             "kv_block_size must be at least 1 (tokens per KV block)".to_string(),
@@ -140,6 +143,9 @@ fn validate_update(update: &WorkerUpdateRequest) -> Result<(), WorkerServiceErro
     if let Some(labels) = &update.labels {
         validate_labels(labels)?;
     }
+    if let Some(health) = &update.health {
+        validate_health(health)?;
+    }
     Ok(())
 }
 
@@ -149,6 +155,24 @@ fn validate_cost(cost: f32) -> Result<(), WorkerServiceError> {
         return Err(bad_request(format!(
             "cost must be a finite number above 0 (baseline 1.0), not {cost}"
         )));
+    }
+    Ok(())
+}
+
+/// The health settings a caller sends: a probe interval and a probe timeout
+/// the schedule can hold. The schedule adds each to its clock.
+fn validate_health(health: &HealthCheckUpdate) -> Result<(), WorkerServiceError> {
+    let max = MAX_PROBE_DELAY.as_secs();
+    let delays = [
+        ("check_interval_secs", health.check_interval_secs),
+        ("timeout_secs", health.timeout_secs),
+    ];
+    for (field, secs) in delays {
+        if let Some(secs) = secs.filter(|secs| *secs > max) {
+            return Err(bad_request(format!(
+                "health.{field} is {secs}; at most {max} (thirty years) are accepted"
+            )));
+        }
     }
     Ok(())
 }
@@ -1904,6 +1928,65 @@ mod tests {
                 .expect_err("queue is uninitialized"),
             WorkerServiceError::QueueNotInitialized
         ));
+    }
+
+    /// A probe interval or timeout the health schedule cannot hold is refused
+    /// at the door, on POST, PUT and PATCH; the longest it can hold is taken.
+    #[tokio::test]
+    async fn a_probe_delay_past_the_schedules_bound_is_refused_on_post_put_and_patch() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "grpc://10.0.0.8:8000", Some("m"));
+        let id = registry.reserve_id_for_url("grpc://10.0.0.8:8000");
+        let service = make_service(Arc::clone(&registry));
+        for field in ["check_interval_secs", "timeout_secs"] {
+            let refused = |err: WorkerServiceError, verb: &str| {
+                assert!(
+                    matches!(&err, WorkerServiceError::BadRequest { message }
+                        if message.contains(&format!("health.{field} is"))),
+                    "{verb} {field}: {err}"
+                );
+            };
+            for secs in [946_080_001, u64::MAX] {
+                let health = json!({ field: secs });
+                let post: WorkerSpec = serde_json::from_value(
+                    json!({"url": "grpc://10.0.0.9:8000", "health": health}),
+                )
+                .expect("a spec");
+                refused(service.create_worker(post).await.expect_err("POST"), "POST");
+                let put: WorkerSpec = serde_json::from_value(
+                    json!({"url": "grpc://10.0.0.8:8000", "health": health}),
+                )
+                .expect("a spec");
+                refused(
+                    service
+                        .replace_worker(id.as_str(), put)
+                        .await
+                        .expect_err("PUT"),
+                    "PUT",
+                );
+                let patch: WorkerUpdateRequest =
+                    serde_json::from_value(json!({ "health": health })).expect("an update");
+                refused(
+                    service
+                        .update_worker(id.as_str(), patch)
+                        .await
+                        .expect_err("PATCH"),
+                    "PATCH",
+                );
+            }
+            let longest: WorkerSpec = serde_json::from_value(json!({
+                "url": "grpc://10.0.0.9:8000",
+                "health": { field: 946_080_000_u64 }
+            }))
+            .expect("a spec");
+            assert!(matches!(
+                service
+                    .create_worker(longest)
+                    .await
+                    .expect_err("queue is uninitialized"),
+                WorkerServiceError::QueueNotInitialized
+            ));
+        }
     }
 
     /// A discovered worker's spec and labels are changed at its discovery

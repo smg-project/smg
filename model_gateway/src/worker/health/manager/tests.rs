@@ -1047,6 +1047,116 @@ async fn a_brought_forward_read_never_lands_after_the_scheduled_one() {
     manager.shutdown().await;
 }
 
+/// A worker whose probe interval is past what the clock can hold does not
+/// stop the loop: its registration probe reads, and a worker registered
+/// after it is probed on its own interval.
+#[tokio::test]
+async fn an_interval_past_the_clock_leaves_the_other_workers_probed() {
+    let serving = Arc::new(AtomicBool::new(true));
+    let far_hits = Arc::new(AtomicUsize::new(0));
+    let near_hits = Arc::new(AtomicUsize::new(0));
+    let far_url = start_health_stub(serving.clone(), far_hits.clone()).await;
+    let near_url = start_health_stub(serving.clone(), near_hits.clone()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut manager = manager_over(&registry);
+    let start = tokio::time::Instant::now();
+
+    registry
+        .register(probed_worker_with(
+            &far_url,
+            ConnectionMode::Http,
+            1,
+            u64::MAX,
+        ))
+        .unwrap();
+    wait_until(
+        start + Duration::from_secs(5),
+        "the registration probe of the worker with the longest interval did not read",
+        || far_hits.load(Ordering::SeqCst) > 0,
+    )
+    .await;
+    registry
+        .register(probed_worker_with(&near_url, ConnectionMode::Http, 1, 1))
+        .unwrap();
+
+    wait_until(
+        start + Duration::from_secs(10),
+        "the worker registered after it was not probed on its interval",
+        || near_hits.load(Ordering::SeqCst) >= 2,
+    )
+    .await;
+
+    manager.shutdown().await;
+}
+
+/// A demoted worker whose probe timeout is past what the clock can hold does
+/// not stop the loop either: its pass short of the success threshold brings
+/// its next read forward by that timeout, and a worker registered after it
+/// is probed on its own interval.
+#[tokio::test]
+async fn a_timeout_past_the_clock_leaves_the_other_workers_probed() {
+    let serving = Arc::new(AtomicBool::new(true));
+    let far_hits = Arc::new(AtomicUsize::new(0));
+    let near_hits = Arc::new(AtomicUsize::new(0));
+    let far_url = start_health_stub(serving.clone(), far_hits.clone()).await;
+    let near_url = start_health_stub(serving.clone(), near_hits.clone()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut manager = manager_over(&registry);
+    let start = tokio::time::Instant::now();
+
+    let far = probed_worker_with_timeout(&far_url, ConnectionMode::Http, 2, 1, u64::MAX);
+    far.set_status(WorkerStatus::NotReady);
+    registry.register(far).unwrap();
+    wait_until(
+        start + Duration::from_secs(5),
+        "the first probe of the worker with the longest timeout did not read",
+        || far_hits.load(Ordering::SeqCst) > 0,
+    )
+    .await;
+    registry
+        .register(probed_worker_with(&near_url, ConnectionMode::Http, 1, 1))
+        .unwrap();
+
+    wait_until(
+        start + Duration::from_secs(10),
+        "the worker registered after it was not probed on its interval",
+        || near_hits.load(Ordering::SeqCst) >= 2,
+    )
+    .await;
+
+    manager.shutdown().await;
+}
+
+/// A deadline whose sum the clock cannot hold is put thirty years out: the
+/// worker keeps its slot, and the slot is never due.
+#[test]
+fn a_deadline_past_the_clock_is_put_at_the_schedules_bound() {
+    let registry = WorkerRegistry::new();
+    let worker_id = registry
+        .register(probed_worker_with(
+            "http://w:1",
+            ConnectionMode::Http,
+            1,
+            u64::MAX,
+        ))
+        .unwrap();
+    let now = tokio::time::Instant::now();
+    let mut next_check = HashMap::new();
+
+    schedule_at(
+        &mut next_check,
+        worker_id.clone(),
+        ProbeSlot::Probe(Duration::from_secs(u64::MAX)),
+        now,
+        false,
+    );
+
+    assert_eq!(
+        next_check.get(&worker_id),
+        Some(&(now + Duration::from_secs(946_080_000)))
+    );
+}
+
 #[test]
 fn apply_connect_signal_reschedules_a_promoted_worker() {
     // A worker that hit the Pending cap is dropped from the schedule. A
