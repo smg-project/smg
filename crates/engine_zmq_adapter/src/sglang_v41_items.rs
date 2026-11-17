@@ -53,6 +53,9 @@ pub(crate) fn deepseek_v41_items(
         ));
     }
     let images = grids.len();
+    if images == 0 {
+        return Err(format!("{PREFIX} no images"));
+    }
     for (name, count) in [
         ("placeholders", offsets.len()),
         ("patch counts", patches.len()),
@@ -62,10 +65,14 @@ pub(crate) fn deepseek_v41_items(
             return Err(format!("{PREFIX} {images} images but {count} {name}"));
         }
     }
-    let Some((&rows, row_dims)) = feature.shape.split_first() else {
-        return Err(format!(
-            "{PREFIX} pixel_values is a scalar, not a tensor of patch rows"
-        ));
+    let (rows, row_dims) = match feature.shape.split_first() {
+        Some((&rows, row_dims)) if !row_dims.is_empty() => (rows, row_dims),
+        _ => {
+            return Err(format!(
+                "{PREFIX} pixel_values has shape {:?}, not rows of patches",
+                feature.shape
+            ))
+        }
     };
     let total = patches
         .iter()
@@ -328,6 +335,38 @@ mod tests {
         pixel_less.pixel_values = None;
         pixel_less.feature_hash = Some(7);
         refused(pixel_less, "no pixel_values");
+        let mut flat_pixels = v41_batch(&GRIDS, &PATCHES, &SPANS);
+        let floats: Vec<u8> = (0..8).flat_map(|row| (row as f32).to_le_bytes()).collect();
+        flat_pixels.pixel_values = Some(tensor("float32", vec![8], floats));
+        refused(
+            flat_pixels,
+            "pixel_values has shape [8], not rows of patches",
+        );
+    }
+
+    /// Empty grids make no items. Refused alone, and refused, not a panic,
+    /// as the extra batch after a video batch, where the caller reads the
+    /// first item of each batch.
+    #[test]
+    fn a_batch_without_images_is_refused() {
+        let empty = v41_batch(&[], &[], &[]);
+        let error = translate_sglang_multimodal(empty.clone(), Vec::new(), PROMPT_LEN).unwrap_err();
+        assert!(
+            error.contains("DeepSeek-V4.1 image batch: no images"),
+            "{error:?}"
+        );
+        let video = sglang_proto::MultimodalInputs {
+            modalities: vec!["video".to_string()],
+            im_token_id: Some(8),
+            pixel_values: Some(tensor("float32", vec![2], vec![0; 8])),
+            mm_placeholders: vec![sglang_proto::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            }],
+            ..Default::default()
+        };
+        let error = translate_sglang_multimodal(video, vec![empty], PROMPT_LEN).unwrap_err();
+        assert!(error.contains("no images"), "{error:?}");
     }
 
     /// The token counts are optional, as in the Python servicer; a batch hash

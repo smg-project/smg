@@ -94,6 +94,7 @@ PROFILE_COMM_TIMEOUT = 600.0
 
 # The grids the Router's DeepSeek-V4.1 preprocessor sends with an image batch.
 V41_GRID_KEYS = ("vit_grid", "patches_per_image")
+V41_PREFIX = "DeepSeek-V4.1 image batch:"
 
 
 def _deepseek_v41_items(feature, tensors: dict, offsets: list) -> list:
@@ -105,12 +106,26 @@ def _deepseek_v41_items(feature, tensors: dict, offsets: list) -> list:
     ``n_vit_w``; a batch whose counts disagree is refused here, before the
     scheduler, where it would stop the engine.
     """
-    grids = tensors["vit_grid"].reshape(-1, 2).tolist()
-    patches = tensors["patches_per_image"].reshape(-1).tolist()
-    tokens = tensors.get("types_per_image")
-    tokens = None if tokens is None else tokens.reshape(-1).tolist()
+    prefix = V41_PREFIX
+    counts = {}
+    for name in ("vit_grid", "patches_per_image", "types_per_image"):
+        tensor = tensors.get(name)
+        if tensor is None:
+            continue
+        if tensor.is_floating_point() or tensor.is_complex():
+            raise ValueError(f"{prefix} {name} is {tensor.dtype}, not an integer tensor")
+        counts[name] = tensor.reshape(-1).tolist()
+    grid_values = counts["vit_grid"]
+    if len(grid_values) % 2:
+        raise ValueError(
+            f"{prefix} vit_grid holds {len(grid_values)} values, not (height, width) pairs"
+        )
+    grids = list(zip(grid_values[0::2], grid_values[1::2]))
+    patches = counts["patches_per_image"]
+    tokens = counts.get("types_per_image")
     images = len(grids)
-    prefix = "DeepSeek-V4.1 image batch:"
+    if images == 0:
+        raise ValueError(f"{prefix} no images")
     for name, count in (
         ("placeholders", len(offsets)),
         ("patch counts", len(patches)),
@@ -118,8 +133,10 @@ def _deepseek_v41_items(feature, tensors: dict, offsets: list) -> list:
     ):
         if count != images:
             raise ValueError(f"{prefix} {images} images but {count} {name}")
-    if len(feature.shape) == 0:
-        raise ValueError(f"{prefix} pixel_values is a scalar, not a tensor of patch rows")
+    if len(feature.shape) < 2:
+        raise ValueError(
+            f"{prefix} pixel_values has shape {list(feature.shape)}, not rows of patches"
+        )
     rows = feature.shape[0]
     if sum(patches) != rows:
         raise ValueError(f"{prefix} {sum(patches)} patches but the pixel tensor has {rows} rows")
@@ -1062,6 +1079,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Parse multimodal inputs if present
         mm_inputs = None
+        if (
+            grpc_req.HasField("mm_inputs")
+            and not grpc_req.mm_inputs.HasField("pixel_values")
+            and all(key in grpc_req.mm_inputs.model_specific_tensors for key in V41_GRID_KEYS)
+        ):
+            # Grids without the pixels they describe would drop the images unseen.
+            raise ValueError(f"{V41_PREFIX} no pixel_values to cut its per-image items from")
         if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values"):
             mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs, extra_mm_inputs, len(input_ids))
 

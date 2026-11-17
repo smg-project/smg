@@ -175,6 +175,69 @@ def test_span_length_must_match_the_image_tokens(v41_converter):
         _convert(servicer, pb, batch)
 
 
+@pytest.mark.parametrize(
+    "name, values, shape, dtype, message",
+    [
+        ("vit_grid", [2, 3, 1], (3,), torch.int64, "vit_grid holds 3 values, not"),
+        (
+            "vit_grid",
+            [[2.0, 3.0], [1.0, 2.0]],
+            (2, 2),
+            torch.float32,
+            "vit_grid is torch.float32, not an integer tensor",
+        ),
+        (
+            "patches_per_image",
+            [6.0, 2.0],
+            (2,),
+            torch.float32,
+            "patches_per_image is torch.float32, not an integer tensor",
+        ),
+        (
+            "pixel_values",
+            [0.0] * 8,
+            (8,),
+            torch.float32,
+            r"pixel_values has shape \[8\], not rows of patches",
+        ),
+    ],
+)
+def test_malformed_tensors_are_refused(v41_converter, name, values, shape, dtype, message):
+    """Unpaired grids, counts that are not integers and pixels that are not patch rows are
+    refused as the caller's error, not failed on inside the servicer."""
+    servicer, pb = v41_converter
+    batch = _v41_batch(pb)
+    replacement = _tensor(pb, values, shape, dtype)
+    target = batch.pixel_values if name == "pixel_values" else batch.model_specific_tensors[name]
+    target.CopyFrom(replacement)
+    with pytest.raises(ValueError, match=message):
+        _convert(servicer, pb, batch)
+
+
+def test_a_batch_without_images_is_refused(v41_converter):
+    """Empty grids make no items; the batch is refused rather than sent with none."""
+    servicer, pb = v41_converter
+    batch = _v41_batch(pb, grids=[], patches=[], spans=[])
+    with pytest.raises(ValueError, match="DeepSeek-V4.1 image batch: no images"):
+        _convert(servicer, pb, batch)
+
+
+def test_grids_without_pixels_are_refused(v41_converter):
+    """V4.1 grids with no pixel_values are refused, not dropped with the images."""
+    servicer, pb = v41_converter
+    batch = _v41_batch(pb)
+    batch.ClearField("pixel_values")
+    with pytest.raises(ValueError, match="no pixel_values to cut its per-image items from"):
+        _convert(servicer, pb, batch)
+
+
+def test_media_references_without_tensors_still_convert(v41_converter):
+    """A request carrying only media references (the encode dispatch's) is not refused."""
+    servicer, pb = v41_converter
+    batch = pb.MultimodalInputs(modalities=["image"], image_urls=["https://example.test/a.png"])
+    assert _convert(servicer, pb, batch) is None
+
+
 def test_other_families_keep_one_item_per_batch(v41_converter):
     """A batch without the V4.1 grids (a Qwen-style ``image_grid_thw``) is not cut."""
     servicer, pb = v41_converter

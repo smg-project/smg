@@ -32,7 +32,8 @@ model encodes one image per item and reads that image's grid as `n_vit_h` /
 `n_vit_w`, so both SGLang servicers cut the batch into one item per image, the
 shape SGLang's own processor builds: the image's patch rows, its placeholder
 range and its grid. A batch whose grids, patch counts, token counts and
-placeholders disagree is refused with `INVALID_ARGUMENT` before the scheduler.
+placeholders disagree, or that carries no images or no pixels, is refused with
+`INVALID_ARGUMENT` before the scheduler.
 Other families keep one item per batch.
 
 ## Mixed images and videos
