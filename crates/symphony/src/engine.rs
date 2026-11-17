@@ -110,6 +110,10 @@ struct Provenance {
     cursor: usize,
     origins: BTreeMap<usize, usize>,
     refused_tags: usize,
+    /// Boundary already pruned; a newly eligible origin invalidates this cache.
+    pruned_emitted: Option<usize>,
+    #[cfg(test)]
+    prune_checks: usize,
 }
 
 /// The bytes of the call region being assembled: how many the assembler took, how many its events
@@ -687,6 +691,9 @@ impl Engine {
             ));
         }
         provenance.origins.insert(range.start, index);
+        if range.end <= self.tokens.emitted_bytes() {
+            provenance.pruned_emitted = None;
+        }
         Ok(())
     }
 
@@ -710,9 +717,17 @@ impl Engine {
         // bytes. Pending headers can rescan un-emitted bytes; keep their atoms.
         if let Some(provenance) = &mut self.provenance {
             let emitted = self.tokens.emitted_bytes();
+            if provenance.pruned_emitted == Some(emitted) {
+                return;
+            }
+            #[cfg(test)]
+            {
+                provenance.prune_checks += provenance.origins.len();
+            }
             provenance.origins.retain(|start, atom| {
                 *start + self.format.structural_token_texts()[*atom].len() > emitted
             });
+            provenance.pruned_emitted = Some(emitted);
         }
     }
 
@@ -1925,6 +1940,63 @@ mod tests {
             .unwrap();
         assert_eq!(crate::testing::content(events.as_slice()), "<a>b");
         assert!(crate::testing::reasoning(events.as_slice()).is_empty());
+    }
+
+    #[test]
+    fn batched_origins_prune_only_after_emitted_bytes_advance() {
+        const OPEN: &str = "<|open|>";
+        const CLOSE: &str = "<|close|>";
+        const PREFIX: &str = "<|open|>response<|sep|>x";
+        const PIECE: &str = "<|open|>response<|sep|>x<|close|>response<|sep|>";
+        const COUNT: usize = 256;
+        let format = crate::formats::kimi_k3();
+        let mut engine = Engine::new(format.clone(), Declared::default());
+        engine.bind_structural_token_origins().unwrap();
+        for i in 0..COUNT {
+            let at = i * PIECE.len();
+            engine
+                .note_structural_token_origin(OPEN, at..at + OPEN.len())
+                .unwrap();
+            let close = at + PREFIX.len();
+            engine
+                .note_structural_token_origin(CLOSE, close..close + CLOSE.len())
+                .unwrap();
+        }
+        // A complete-output reader announces the batch before its one feed.
+        // Count entries actually offered to retain, not elapsed CPU time.
+        assert_eq!(engine.provenance.as_ref().unwrap().prune_checks, 0);
+        let mut events = Events::new();
+        engine
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: PIECE,
+                    spans: &[],
+                },
+                &mut events,
+            )
+            .unwrap();
+        for i in 0..64 {
+            let at = COUNT * PIECE.len() + i * OPEN.len();
+            engine
+                .note_structural_token_origin(OPEN, at..at + OPEN.len())
+                .unwrap();
+        }
+        let provenance = engine.provenance.as_ref().unwrap();
+        assert_eq!(provenance.prune_checks, 2 * COUNT);
+        assert!(!provenance.origins.contains_key(&0));
+        assert!(!provenance.origins.contains_key(&PREFIX.len()));
+        assert!(provenance.origins.contains_key(&PIECE.len()));
+        assert!(provenance.origins.contains_key(&(COUNT * PIECE.len())));
+
+        // Preserve the existing public contract for a zero-length declaration:
+        // an origin already eligible at insertion must invalidate the cached prune.
+        let mut empty = Engine::new(format.structural_token(""), Declared::default());
+        empty.bind_structural_token_origins().unwrap();
+        empty.note_structural_token_origin("", 0..0).unwrap();
+        empty
+            .note_structural_token_origin(OPEN, 0..OPEN.len())
+            .unwrap();
     }
 
     #[test]
