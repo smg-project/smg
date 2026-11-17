@@ -972,18 +972,15 @@ impl TreeSyncAdapter {
         };
 
         let key = (page.model_id.clone(), page.tree_kind);
-        let mut entry = match self.outstanding_repairs.get_mut(&key) {
-            Some(e) => e,
-            None => {
-                debug!(
-                    model_id = %page.model_id,
-                    kind = ?page.tree_kind,
-                    session_id = %page.session_id,
-                    page_index = page.page_index,
-                    "received tree:page: with no matching outstanding session; dropping",
-                );
-                return;
-            }
+        let Some(mut entry) = self.outstanding_repairs.get_mut(&key) else {
+            debug!(
+                model_id = %page.model_id,
+                kind = ?page.tree_kind,
+                session_id = %page.session_id,
+                page_index = page.page_index,
+                "received tree:page: with no matching outstanding session; dropping",
+            );
+            return;
         };
 
         if entry.session_id != page.session_id {
