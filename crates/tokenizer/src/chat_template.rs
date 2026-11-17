@@ -878,13 +878,16 @@ struct Detected {
     /// Every name the template reads (see [`ChatTemplateState::reads`]);
     /// `None` where the template did not parse, the names being unknown.
     names_read: Option<HashSet<String>>,
+    /// Whether a root `set` statement builds a value the source does not
+    /// spell (see [`ChatTemplateState::control_bindings`]).
+    builds_constants: bool,
 }
 
-/// Single-pass detection of content format, think-in-prefill, thinking toggle
-/// and the names read.
+/// Single-pass detection of content format, think-in-prefill, thinking toggle,
+/// the names read and whether a root statement builds a value.
 fn detect_all(template: &str) -> Detected {
     let (thinking_toggle, thinking_key_name) = detect_thinking_toggle(template);
-    let (content_format, think_in_prefill, prefill_opens_think_block, names_read) =
+    let (content_format, think_in_prefill, prefill_opens_think_block, names_read, builds_constants) =
         detect_all_with_ast(template);
     Detected {
         content_format,
@@ -893,12 +896,14 @@ fn detect_all(template: &str) -> Detected {
         thinking_key_name,
         prefill_opens_think_block,
         names_read,
+        builds_constants,
     }
 }
 
 /// AST detection of content format, think-in-prefill, whether the generation
-/// prompt leaves a think block open, and the names the template reads
-/// (`None` where it did not parse).
+/// prompt leaves a think block open, the names the template reads (`None`
+/// where it did not parse), and whether a root `set` statement builds a
+/// value the source does not spell ([`Computed::builds`]).
 fn detect_all_with_ast(
     template: &str,
 ) -> (
@@ -906,6 +911,7 @@ fn detect_all_with_ast(
     bool,
     bool,
     Option<HashSet<String>>,
+    bool,
 ) {
     let template = plain_generation_blocks(template);
     let ast = match parse(
@@ -915,7 +921,7 @@ fn detect_all_with_ast(
         WhitespaceConfig::default(),
     ) {
         Ok(ast) => ast,
-        Err(_) => return (ChatTemplateContentFormat::String, false, false, None),
+        Err(_) => return (ChatTemplateContentFormat::String, false, false, None, false),
     };
 
     let nodes = Nodes::of(&ast);
@@ -925,11 +931,18 @@ fn detect_all_with_ast(
     };
     let names_read = Some(nodes.names.iter().map(|name| (*name).to_string()).collect());
     let (think_in_prefill, prefill_opens_think_block) = ThinkDetector::run(&ast);
+    let mut sets = Vec::new();
+    root_set_statement(&ast, &template, false, &mut sets);
+    let builds_constants = computed_statements(&sets)
+        .0
+        .iter()
+        .any(|statement| statement.builds);
     (
         content_format,
         think_in_prefill,
         prefill_opens_think_block,
         names_read,
+        builds_constants,
     )
 }
 
@@ -1814,19 +1827,25 @@ struct RootSet<'a> {
     /// The expression the name is bound to. `None` when nothing says what
     /// the value reads: the statement binds the name another way (a block's
     /// output, one of several names at once, a macro, an import), or its
-    /// expression computes more than the syntax itself does
-    /// ([`names_read`]).
+    /// expression calls what the load cannot follow ([`names_read`]).
     expression: Option<Expression<'a>>,
     /// Whether the statement stands under a top-level `if` or in the `else`
     /// of a top-level `for`: it may not run.
     conditional: bool,
 }
 
-/// The expression of a root `set` statement: its byte span in the source,
-/// and the names it reads.
+/// The expression of a root `set` statement.
 struct Expression<'a> {
+    /// Its byte span in the source.
     span: (usize, usize),
+    /// The names it reads.
     names: Vec<&'a str>,
+    /// A filter or a test takes part in it: its value may be another at the
+    /// next render (`random`).
+    draws: bool,
+    /// The source spells its value already: it is a literal the source
+    /// holds as it stands, or another name alone.
+    spelled: bool,
 }
 
 /// The root `set` statements of `source`, a chat template, in the template's
@@ -1900,10 +1919,23 @@ fn root_set_statement<'a>(
                 let assign = rest.bytes().position(|byte| byte == b'=')?;
                 Some((end - rest[assign + 1..].trim_start().len(), end))
             });
-            let mut names = Vec::new();
+            let spelled = match &set.expr {
+                Expr::Const(literal) => literal
+                    .value
+                    .as_str()
+                    .is_none_or(|text| source.contains(text)),
+                Expr::Var(_) => true,
+                _ => false,
+            };
+            let (mut names, mut draws) = (Vec::new(), false);
             let expression = span
-                .filter(|_| names_read(&set.expr, &mut names))
-                .map(|span| Expression { span, names });
+                .filter(|_| names_read(&set.expr, &mut names, &mut draws))
+                .map(|span| Expression {
+                    span,
+                    names,
+                    draws,
+                    spelled,
+                });
             sets.push(RootSet {
                 name: target.id,
                 expression,
@@ -1925,64 +1957,86 @@ fn root_set_statement<'a>(
     }
 }
 
-/// Whether `expr` computes its value from literals and names alone, by what
-/// the syntax itself does: operators, subscripts, and the methods of such
-/// values (`'<{}>'.format(suffix)`). The names it reads go to `names`. A
-/// filter, a test and any other call run code that no name stands for:
-/// `random` draws anew at each render, and a function, a macro or a block
-/// reads what it likes.
-fn names_read<'a>(expr: &Expr<'a>, names: &mut Vec<&'a str>) -> bool {
+/// Whether the load can compute `expr` from literals and names: by what the
+/// syntax itself does (operators, subscripts, the methods of such values,
+/// `'<{}>'.format(suffix)`), by filters and by tests. The names it reads go
+/// to `names`. `draws` is set where a filter or a test takes part: one may
+/// answer anew at each render (`random`), so such a value is computed and
+/// never kept. Any other call is beyond the load: a function, a macro or a
+/// block reads what it likes.
+fn names_read<'a>(expr: &Expr<'a>, names: &mut Vec<&'a str>, draws: &mut bool) -> bool {
     match expr {
         Expr::Var(var) => {
             names.push(var.id);
             true
         }
         Expr::Const(_) => true,
-        Expr::UnaryOp(op) => names_read(&op.expr, names),
-        Expr::BinOp(op) => names_read(&op.left, names) && names_read(&op.right, names),
+        Expr::UnaryOp(op) => names_read(&op.expr, names, draws),
+        Expr::BinOp(op) => {
+            names_read(&op.left, names, draws) && names_read(&op.right, names, draws)
+        }
         Expr::Compare(compare) => {
-            names_read(&compare.expr, names)
-                && compare.ops.iter().all(|op| names_read(&op.expr, names))
+            names_read(&compare.expr, names, draws)
+                && compare
+                    .ops
+                    .iter()
+                    .all(|op| names_read(&op.expr, names, draws))
         }
         Expr::IfExpr(cond) => {
-            names_read(&cond.test_expr, names)
-                && names_read(&cond.true_expr, names)
+            names_read(&cond.test_expr, names, draws)
+                && names_read(&cond.true_expr, names, draws)
                 && cond
                     .false_expr
                     .as_ref()
-                    .is_none_or(|expr| names_read(expr, names))
+                    .is_none_or(|expr| names_read(expr, names, draws))
         }
-        Expr::GetAttr(attr) => names_read(&attr.expr, names),
+        Expr::GetAttr(attr) => names_read(&attr.expr, names, draws),
         Expr::GetItem(item) => {
-            names_read(&item.expr, names) && names_read(&item.subscript_expr, names)
+            names_read(&item.expr, names, draws) && names_read(&item.subscript_expr, names, draws)
         }
         Expr::Slice(slice) => {
-            names_read(&slice.expr, names)
+            names_read(&slice.expr, names, draws)
                 && [&slice.start, &slice.stop, &slice.step]
                     .into_iter()
                     .flatten()
-                    .all(|bound| names_read(bound, names))
+                    .all(|bound| names_read(bound, names, draws))
         }
-        Expr::List(list) => list.items.iter().all(|item| names_read(item, names)),
+        Expr::List(list) => list.items.iter().all(|item| names_read(item, names, draws)),
         Expr::Map(map) => map
             .keys
             .iter()
             .chain(&map.values)
-            .all(|expr| names_read(expr, names)),
+            .all(|expr| names_read(expr, names, draws)),
         // A method of a value, as the engine itself reads the call: a call
         // through `self` runs a block of the template.
         Expr::Call(call) => {
             matches!(call.identify_call(), CallType::Method(..))
-                && names_read(&call.expr, names)
-                && call.args.iter().all(|arg| match arg {
-                    CallArg::Pos(expr)
-                    | CallArg::Kwarg(_, expr)
-                    | CallArg::PosSplat(expr)
-                    | CallArg::KwargSplat(expr) => names_read(expr, names),
-                })
+                && names_read(&call.expr, names, draws)
+                && arguments_read(&call.args, names, draws)
         }
-        Expr::Filter(_) | Expr::Test(_) => false,
+        Expr::Filter(filter) => {
+            *draws = true;
+            filter
+                .expr
+                .as_ref()
+                .is_none_or(|expr| names_read(expr, names, draws))
+                && arguments_read(&filter.args, names, draws)
+        }
+        Expr::Test(test) => {
+            *draws = true;
+            names_read(&test.expr, names, draws) && arguments_read(&test.args, names, draws)
+        }
     }
+}
+
+/// [`names_read`] of `args`, the arguments of a call, a filter or a test.
+fn arguments_read<'a>(args: &[CallArg<'a>], names: &mut Vec<&'a str>, draws: &mut bool) -> bool {
+    args.iter().all(|arg| match arg {
+        CallArg::Pos(expr)
+        | CallArg::Kwarg(_, expr)
+        | CallArg::PosSplat(expr)
+        | CallArg::KwargSplat(expr) => names_read(expr, names, draws),
+    })
 }
 
 /// The names `target` binds, in a block `set` or a `set` of several names at
@@ -2015,39 +2069,71 @@ struct ControlBinding {
     spelling: String,
 }
 
-/// For each of `sets`, the root `set` statements of a template
-/// ([`root_sets`]), whether its value is the same at every render; and the
-/// names that some statement binds to no one value. A statement's value is
-/// the same at every render when its expression reads nothing of a request
-/// and draws nothing ([`names_read`]): literals, and names that such
-/// statements bound at the top level before it (a name bound under an `if`,
-/// or in a way nothing reads, has no one value from there on). A value that
-/// a request argument may carry is never one of them
+/// A root `set` statement whose value the load computes
+/// ([`computed_statements`]).
+struct Computed<'a> {
+    name: &'a str,
+    /// The byte span of its expression.
+    span: (usize, usize),
+    /// Its value is the same at every render: it may stand as a literal.
+    fixed: bool,
+    /// Its expression builds the value: the source does not spell it
+    /// already ([`Expression::spelled`]).
+    builds: bool,
+}
+
+/// The root `set` statements among `sets` ([`root_sets`]) whose value the
+/// load computes, in the template's order; and the names that some
+/// statement binds to no one value.
+///
+/// The load computes a statement whose expression reads nothing of a
+/// request ([`names_read`]): literals, and names that such statements bound
+/// before it. The value is the same at every render, `fixed`, when also no
+/// filter or test takes part in it and each name it reads was bound at the
+/// top level by a statement of that kind: a name bound under an `if`, by a
+/// statement that draws, or in a way nothing reads has no one value from
+/// there on. A value that a request argument may carry is never computed
 /// (`{% set close = custom if custom is defined else '</s>' %}`), and its
 /// name is the request's to set, whatever else binds it
 /// (`{% if custom is defined %}{% set close = custom %}{% endif %}` after
 /// `{% set close = '</s>' %}`).
-fn fixed_statements<'a>(sets: &[RootSet<'a>]) -> (Vec<bool>, Vec<&'a str>) {
-    // The names whose value every render sees from here on.
-    let mut fixed: HashSet<&str> = HashSet::new();
+fn computed_statements<'a>(sets: &[RootSet<'a>]) -> (Vec<Computed<'a>>, Vec<&'a str>) {
+    // The names the load has a value for; `true` where every render sees
+    // that value from here on.
+    let mut known: HashMap<&str, bool> = HashMap::new();
     let mut unsettled = Vec::new();
-    let mut is_fixed = Vec::with_capacity(sets.len());
+    let mut computed = Vec::new();
     for set in sets {
-        let reads_fixed = set
+        let expression = set
             .expression
             .as_ref()
-            .is_some_and(|expression| expression.names.iter().all(|name| fixed.contains(name)));
-        if reads_fixed && !set.conditional {
-            fixed.insert(set.name);
-        } else {
-            fixed.remove(set.name);
+            .filter(|expression| expression.names.iter().all(|name| known.contains_key(name)));
+        let fixed = expression.is_some_and(|expression| {
+            !expression.draws
+                && expression
+                    .names
+                    .iter()
+                    .all(|name| known.get(name) == Some(&true))
+        });
+        match expression {
+            Some(expression) => {
+                known.insert(set.name, fixed && !set.conditional);
+                computed.push(Computed {
+                    name: set.name,
+                    span: expression.span,
+                    fixed,
+                    builds: !expression.spelled,
+                });
+            }
+            None => {
+                known.remove(set.name);
+            }
         }
-        if !reads_fixed {
+        if !fixed {
             unsettled.push(set.name);
         }
-        is_fixed.push(reads_fixed);
     }
-    (is_fixed, unsettled)
+    (computed, unsettled)
 }
 
 /// `spelling` between the marks of `encoders::marks`, as a string literal of
@@ -2108,20 +2194,18 @@ fn searches_for_a_mark(method: &str, args: &[Value]) -> bool {
     })
 }
 
-/// The spellings of `tokens`, the special tokens a template reads by name.
+/// The spellings of the special tokens a render holds: the four of `tokens`
+/// that a template reads by name ([`RENDER_CONTEXT_NAMES`]). No template
+/// reads any other special token of the vocabulary.
 fn special_spellings(tokens: &SpecialTokens) -> impl Iterator<Item = &str> {
     [
         &tokens.bos_token,
         &tokens.eos_token,
         &tokens.unk_token,
-        &tokens.sep_token,
         &tokens.pad_token,
-        &tokens.cls_token,
-        &tokens.mask_token,
     ]
     .into_iter()
     .flatten()
-    .chain(&tokens.additional_special_tokens)
     .map(String::as_str)
 }
 
@@ -3539,6 +3623,11 @@ pub struct ChatTemplateState {
     /// Every name the default template reads (see [`Self::reads`]); `None`
     /// where the template did not parse, the names being unknown.
     names_read: Option<HashSet<String>>,
+    /// Whether a root `set` statement of the default template builds a
+    /// value its source does not spell: only such a template may bind a
+    /// control spelling, and the load reads no other for one (see
+    /// [`Self::control_bindings`]).
+    builds_constants: bool,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -3563,6 +3652,7 @@ impl ChatTemplateState {
             thinking_key_name,
             prefill_opens_think_block,
             names_read,
+            builds_constants,
         } = template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
         let developer_role_supported = template
             .as_deref()
@@ -3584,6 +3674,7 @@ impl ChatTemplateState {
             processor: None,
             marked: false,
             names_read,
+            builds_constants,
         };
         state.settle_by_behaviour();
         Ok(state)
@@ -3721,6 +3812,7 @@ impl ChatTemplateState {
             processor: None,
             marked: false,
             names_read: None,
+            builds_constants: false,
         }
     }
 
@@ -3911,8 +4003,9 @@ impl ChatTemplateState {
     /// marked together or not at all, and only when the marks are complete
     /// on the probe conversations ([`Self::marks_every_control`]): a template
     /// that spells a control whole, builds one where it writes it, binds one
-    /// from a request argument, or searches request text for one stays as it
-    /// is, its prompts encoded from their text as before. Every reading is
+    /// from a request argument or through a filter, or searches request text
+    /// for one stays as it is, its prompts encoded from their text as before.
+    /// Every reading is
     /// made through copies of the templates ([`Self::twin`]), so the render
     /// of a request carries nothing for it. `controls`, the matcher over the
     /// added tokens, is asked for only once a template binds a control
@@ -3981,64 +4074,67 @@ impl ChatTemplateState {
             processor: None,
             marked: false,
             names_read: None,
+            builds_constants: false,
         }
     }
 
     /// The root `set` statements of this template that bind a control
     /// spelling for every render: those whose value is the same at every
-    /// render ([`fixed_statements`]) and is one control spelling
+    /// render ([`computed_statements`]) and is one control spelling
     /// (`is_control`), under a name no statement binds another way. The
-    /// template engine says the values: those statements alone, each
-    /// followed by its value behind a separator ([`VALUE_SEPARATOR`]), are
-    /// rendered once, the way a request's template is. None when the source
-    /// spells one of the spellings whole: that template is of the other
-    /// kind, and it says so here, before the matcher over the added tokens
-    /// is asked for.
+    /// template engine says the values: the statements the load computes,
+    /// alone, each followed by its value behind a separator
+    /// ([`VALUE_SEPARATOR`]), are rendered once, the way a request's
+    /// template is.
+    ///
+    /// None when one of those values is a control spelling the load cannot
+    /// write as a literal: a filter or a test takes part in it, or another
+    /// statement binds its name another way. The template would write that
+    /// control without marks wherever no probe conversation goes, so it
+    /// stays as it is. None as well when the source spells one of the
+    /// spellings whole: that template is of the other kind, and it says so
+    /// here, before the matcher over the added tokens is asked for.
     fn control_bindings(
         &self,
         is_control: &dyn Fn(&str) -> bool,
         special_tokens: &SpecialTokens,
     ) -> Vec<ControlBinding> {
-        let Some(template) = self
-            .env
-            .as_ref()
-            .and_then(|env| env.get_template("chat").ok())
-        else {
+        // A template none of whose root statements builds a value binds no
+        // spelling its source does not hold: nothing is read again for it.
+        let Some(plain) = self.env.as_ref().filter(|_| self.builds_constants) else {
+            return Vec::new();
+        };
+        let Ok(template) = plain.get_template("chat") else {
             return Vec::new();
         };
         let source = template.source();
-        let sets = root_sets(source);
-        let (is_fixed, unsettled) = fixed_statements(&sets);
-        let fixed: Vec<(&str, (usize, usize))> = sets
-            .iter()
-            .zip(is_fixed)
-            .filter(|(_, is_fixed)| *is_fixed)
-            .filter_map(|(set, _)| Some((set.name, set.expression.as_ref()?.span)))
-            .collect();
-        // A template with no such statement builds no constant: nothing is
-        // compiled for it.
-        if fixed.is_empty() {
-            return Vec::new();
-        }
+        let (computed, unsettled) = computed_statements(&root_sets(source));
         let mut statements = String::new();
-        for (name, (start, end)) in &fixed {
+        for statement in &computed {
+            let (start, end) = statement.span;
             statements.push_str("{% set ");
-            statements.push_str(name);
+            statements.push_str(statement.name);
             statements.push_str(" = ");
-            statements.push_str(&source[*start..*end]);
+            statements.push_str(&source[start..end]);
             statements.push_str(" %}");
             // A spelling is a string; a value of any other type is written
             // empty.
             statements.push(char::from(VALUE_SEPARATOR));
             statements.push_str("{{ ");
-            statements.push_str(name);
+            statements.push_str(statement.name);
             statements.push_str(" if ");
-            statements.push_str(name);
+            statements.push_str(statement.name);
             statements.push_str(" is string else '' }}");
         }
-        let Ok(env) = build_environment(statements) else {
+        // The statements stand in a copy of this template's environment, in
+        // the template's place.
+        let mut alone = plain.clone();
+        if alone
+            .add_template_owned("chat".to_owned(), statements)
+            .is_err()
+        {
             return Vec::new();
-        };
+        }
         let messages = [serde_json::json!({"role": "user", "content": "probe"})];
         let params = ChatTemplateParams {
             add_generation_prompt: true,
@@ -4046,7 +4142,7 @@ impl ChatTemplateState {
             now: Some(render_instant()),
             ..Default::default()
         };
-        let Ok((rendered, _)) = self.twin(env).apply_with_continuation(&messages, params) else {
+        let Ok((rendered, _)) = self.twin(alone).apply_with_continuation(&messages, params) else {
             return Vec::new();
         };
         // One value behind each separator, in the statements' order; before
@@ -4056,23 +4152,21 @@ impl ChatTemplateState {
             .split(char::from(VALUE_SEPARATOR))
             .skip(1)
             .collect();
-        if values.len() != fixed.len() {
+        if values.len() != computed.len() {
             return Vec::new();
         }
-        let bindings: Vec<ControlBinding> = fixed
-            .iter()
-            .zip(values)
-            .filter(|((name, _), value)| is_control(value) && !unsettled.contains(name))
-            .map(|((_, span), value)| ControlBinding {
-                span: *span,
+        let mut bindings = Vec::new();
+        for (statement, value) in computed.iter().zip(values) {
+            if !is_control(value) {
+                continue;
+            }
+            if !statement.fixed || unsettled.contains(&statement.name) || source.contains(value) {
+                return Vec::new();
+            }
+            bindings.push(ControlBinding {
+                span: statement.span,
                 spelling: value.to_owned(),
-            })
-            .collect();
-        if bindings
-            .iter()
-            .any(|binding| source.contains(binding.spelling.as_str()))
-        {
-            return Vec::new();
+            });
         }
         bindings
     }
@@ -4289,6 +4383,7 @@ impl ChatTemplateState {
             thinking_key_name,
             prefill_opens_think_block,
             names_read,
+            builds_constants,
         } = detect_all(&template);
         let developer_role_supported = detect_developer_role_support(&template);
         let root_role_supported = detect_root_role_support(&template);
@@ -4301,6 +4396,7 @@ impl ChatTemplateState {
         self.think_in_prefill = think_in_prefill;
         self.prefill_opens_think_block = prefill_opens_think_block;
         self.names_read = names_read;
+        self.builds_constants = builds_constants;
         self.env = Some(env);
         // A replacement template stands alone, as a template file does.
         self.tool_use = None;

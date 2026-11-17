@@ -684,6 +684,48 @@ fn a_constant_drawn_by_a_filter_leaves_the_template_as_it_was() {
 }
 
 #[test]
+fn a_control_the_load_cannot_write_as_a_literal_leaves_the_template_as_it_was() {
+    // A statement may bind a control spelling in a way the load computes
+    // and cannot keep: a filter takes part in it, it reads a name bound
+    // under a condition, or a request argument may bind its name again.
+    // Written only under `flat`, an argument no probe conversation passes,
+    // that control would leave the marked template without marks and be
+    // read as text. The template stays as it was instead, and the control
+    // it writes under `flat` is the token it always was.
+    let filtered = "{% if flat %}{% set extra = ('[/INST' ~ suffix ~ ']') | trim %}\
+        {{ extra }}{% endif %}";
+    let chained = "{% if flat %}{% set part = '[/INST' %}{% set extra = part ~ suffix ~ ']' %}\
+        {{ extra }}{% endif %}";
+    let rebound = "{% set extra = '[/INST' ~ suffix ~ ']' %}{% if custom is defined %}\
+        {% set extra = custom %}{% endif %}{% if flat %}{{ extra }}{% endif %}";
+    for tail in [filtered, chained, rebound] {
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint(temp.path(), &format!("{}{tail}", builds()));
+        let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+        assert!(from_text, "{tail}");
+        assert_eq!(ids, TYPED_AS_THE_CONTROL, "{tail}");
+        let kwargs = HashMap::from([("flat".to_owned(), json!(true))]);
+        let flat = ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..ChatTemplateParams::default()
+        };
+        let (text, ids, from_text) = render_under(&tok, json!("ab"), flat);
+        assert!(from_text, "{tail}");
+        assert_eq!(text, "[INST:x]ab[/INST:x]ab</s:x>[/INST:x]", "{tail}");
+        assert_eq!(ids, [2, 13, 14, 3, 13, 14, 1, 3], "{tail}");
+    }
+
+    // A filter over the template's own constants whose value is no control
+    // changes nothing: the template is marked.
+    let temp = TempDir::new().unwrap();
+    let counts = format!("{}{{% set width = suffix | length %}}", builds());
+    let tok = checkpoint(temp.path(), &counts);
+    let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+    assert!(!from_text);
+    assert_eq!(ids, TYPED_AS_TEXT);
+}
+
+#[test]
 fn a_search_made_only_under_the_thinking_switch_leaves_the_template_as_it_was() {
     let temp = TempDir::new().unwrap();
     // A filter, which no string method sees, and only with thinking switched
