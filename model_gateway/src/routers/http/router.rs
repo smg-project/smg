@@ -47,6 +47,7 @@ use tracing::{error, warn};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
+    endpoints::messages::MessagesHeaders,
     middleware::{
         body_timeout::{
             request_body_stalled_response, REQUEST_BODY_STALLED, REQUEST_BODY_TOO_LARGE,
@@ -2258,6 +2259,15 @@ impl Router {
             }
             BodyPath::Stream(reason) => reason,
         };
+        // A streamed request reaches no handler and none of its extractors:
+        // the Messages route's version check is made here, with the route's
+        // own answer, before a worker is selected. A refused request takes
+        // no turn of the routing policy and is not counted as streamed.
+        if route == "/v1/messages" {
+            if let Err(refused) = MessagesHeaders::check_version(req.headers()) {
+                return Ok(refused);
+            }
+        }
         let model_id = UNKNOWN_MODEL_ID;
         // Buffered-path parity: a valid tokens hint is exactly what selection
         // would have received there (text is never extracted alongside it).
@@ -4476,6 +4486,89 @@ mod tests {
         assert!(
             forwarded.get("model").is_none(),
             "the wildcard placeholder leaked upstream: {forwarded}"
+        );
+    }
+
+    /// A streamed Messages request reaches no handler, so the handler's
+    /// extractor does not check its `anthropic-version`: the stream path
+    /// makes the same check, with the same answer, before it selects a
+    /// worker. A refused request reaches no worker and takes no turn of the
+    /// routing policy.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub servers live for the duration of the test process"
+    )]
+    async fn a_streamed_messages_request_takes_the_version_check() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Two workers that count the Messages requests they receive, under a
+        // policy that keeps a rotation: a selection made for a refused
+        // request would send both served requests to one worker.
+        let mut counts = Vec::new();
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let count = Arc::new(AtomicUsize::new(0));
+            counts.push(Arc::clone(&count));
+            let app = axum::Router::new().route(
+                "/v1/messages",
+                axum::routing::post(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    async { ([(CONTENT_TYPE, "application/json")], "{}") }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            workers.push(plain_worker(&format!("http://{addr}")));
+        }
+        let router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, workers);
+        let received = || -> Vec<usize> {
+            counts
+                .iter()
+                .map(|count| count.load(Ordering::SeqCst))
+                .collect()
+        };
+        let request = |version: Option<&'static str>| {
+            let mut request = streamed_request(&[b"{\"max_tokens\":8,\"messages\":[]}"]);
+            if let Some(version) = version {
+                request
+                    .headers_mut()
+                    .insert("anthropic-version", HeaderValue::from_static(version));
+            }
+            request
+        };
+
+        // A dated version is streamed, as before.
+        let served = router
+            .route_streaming_request(request(Some("2023-06-01")), "/v1/messages", false)
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+
+        let refused = router
+            .route_streaming_request(request(Some("2023-6-1")), "/v1/messages", false)
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            extract_error_code_from_response(&refused),
+            "invalid_anthropic_version"
+        );
+
+        // A request without the header is streamed as before, to the
+        // rotation's next worker: the refused request took no turn of it.
+        let served = router
+            .route_streaming_request(request(None), "/v1/messages", false)
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(
+            received(),
+            [1, 1],
+            "the refused request reached a worker or took a turn of the rotation"
         );
     }
 
