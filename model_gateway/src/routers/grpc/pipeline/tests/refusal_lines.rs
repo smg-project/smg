@@ -246,8 +246,8 @@ async fn a_conversation_the_template_refuses_is_one_warn_and_marked_on_both_door
 }
 
 /// A tokenizer with no chat template fails every request at the render, whatever the request
-/// holds: the deployment's to fix. Both doors keep the stage's ERROR line and leave the answer
-/// unmarked.
+/// holds: the deployment's to fix. Both doors keep the stage's ERROR line, leave the answer
+/// unmarked and say in it what the model lacks and that no request can supply it.
 #[tokio::test]
 async fn a_tokenizer_with_no_chat_template_keeps_the_error_line_on_both_doors() {
     let tokenizer_dir = tempfile::tempdir().expect("a tokenizer directory");
@@ -282,6 +282,19 @@ async fn a_tokenizer_with_no_chat_template_keeps_the_error_line_on_both_doors() 
             (Level::ERROR, "Failed to process messages".to_string()),
         ]
     );
+    for response in answers {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the answer's body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains(
+                "Failed to apply chat template: The model has no chat template. One must be \
+                 configured for the model; a request cannot supply it."
+            ),
+            "{body}"
+        );
+    }
 }
 
 /// A Responses input the chat pipeline has no form for is refused by the conversion: one WARN
