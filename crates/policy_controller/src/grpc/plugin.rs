@@ -131,7 +131,8 @@ pub struct Stats {
     pub late_answers: u64,
     /// Lifecycle events handed to the `Observe` stream.
     pub observed: u64,
-    /// Lifecycle events dropped at a full queue.
+    /// Lifecycle events refused at a full queue: each leaves a gap of one in
+    /// the events' numbers.
     pub observe_dropped: u64,
     /// Times the breaker opened.
     pub breaker_opens: u64,
@@ -157,7 +158,8 @@ struct Tally {
     failed_streams: AtomicU64,
     late_answers: AtomicU64,
     observed: AtomicU64,
-    observe_dropped: AtomicU64,
+    /// Shared with the `Observe` stream's task, which numbers an event by it.
+    observe_dropped: Arc<AtomicU64>,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -214,7 +216,8 @@ impl Inner {
     fn observe(&self, event: proto::lifecycle_event::Event) {
         // The number is the stream's: the I/O thread writes it where the
         // event enters the stream, so threads that raise events at once
-        // cannot send a later number first.
+        // cannot send a later number first. A refused event is counted
+        // here, and the number of every later event counts it too.
         let request = proto::ObserveRequest {
             request: Some(proto::observe_request::Request::Event(
                 proto::LifecycleEvent {
@@ -234,7 +237,12 @@ impl LaneEvents for Inner {
     fn connected(&self) {
         bump(&self.tally.connects);
         if let Some(queue) = self.observe_rx.lock().take() {
-            let lane = ObserveLane::new(Arc::clone(&self.peer), self.events(), queue);
+            let lane = ObserveLane::new(
+                Arc::clone(&self.peer),
+                self.events(),
+                queue,
+                Arc::clone(&self.tally.observe_dropped),
+            );
             self.runtime.send(Command::Observe(Arc::new(lane)));
         }
     }

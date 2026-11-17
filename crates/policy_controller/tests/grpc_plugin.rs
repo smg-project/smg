@@ -2882,6 +2882,50 @@ fn events_past_the_queue_are_dropped_and_counted() {
     );
 }
 
+/// A refused event leaves its mark on the numbers. An event's number counts
+/// what the stream owed: the events sent before it and the events the queue
+/// refused. The number after a loss skips by what was lost, so a plugin that
+/// keeps a ledger of leases reads the gap. Three events go first and arrive;
+/// then the I/O thread is held off the queue while it fills and refuses.
+#[test]
+fn a_refused_event_leaves_a_gap_in_the_numbers() {
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "ledger-keeper");
+    let engine = single_engine(profile(&plugin, ALL));
+    let dispatch = || engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    for _ in 0..3 {
+        dispatch();
+    }
+    assert!(eventually(|| served.seen().events.len() == 3));
+    runtime.hold_io(Duration::from_millis(300));
+    for _ in 0..2_000 {
+        dispatch();
+    }
+    let stats = plugin.stats();
+    let (sent, refused) = (stats.observed, stats.observe_dropped);
+    assert!(refused > 0, "the queue refused some: {stats:?}");
+    assert!(eventually(|| served.seen().events.len() as u64 == sent));
+    let seqs: Vec<u64> = served.seen().events.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs[..3], [1, 2, 3], "nothing was lost before the hold");
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "the numbers only grow"
+    );
+    let skipped: u64 = seqs.windows(2).map(|pair| pair[1] - pair[0] - 1).sum();
+    assert_eq!(
+        skipped,
+        refused,
+        "the numbers skip by what the queue refused: the last is {:?} of {sent} sent",
+        seqs.last()
+    );
+    assert_eq!(
+        seqs.last().copied(),
+        Some(sent + refused),
+        "the last number counts every event raised, sent or refused"
+    );
+}
+
 /// A build that binds the plugin to two profiles takes both bound sets from
 /// one binder: the engine hands an event to every profile and the plugin
 /// hears it once. An engine built later over the same plugin has an observer
