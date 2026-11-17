@@ -246,7 +246,8 @@ impl RefusedAddress {
     }
 }
 
-/// A removed worker nothing holds any more: a dead witness for `retire`.
+/// A removed worker nothing holds any more: a dead witness for the series
+/// store's `retire`.
 pub fn gone(url: &str) -> Weak<dyn Worker> {
     let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
     Arc::downgrade(&worker)

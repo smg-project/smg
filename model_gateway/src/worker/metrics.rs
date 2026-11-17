@@ -4,7 +4,8 @@
 //! interner every writer of the gateway shares.
 //!
 //! `describe_series` holds the describing line of each series written
-//! here; the gateway's list calls it.
+//! here; the gateway's list calls it. `series` is the store the series
+//! labelled `worker` live in, so they leave `/metrics` with their worker.
 
 use std::sync::{Arc, Weak};
 
@@ -14,7 +15,9 @@ use once_cell::sync::Lazy;
 use rustc_hash::FxBuildHasher;
 use smg_worker::metrics::intern_model_label;
 
-use crate::{observability::worker_metrics, worker::Worker};
+use crate::worker::Worker;
+
+pub(crate) mod series;
 
 /// `smg_kv_event_lag_seconds`, named for the exporter's bucket list: without
 /// buckets of its own the recorder renders a histogram as a summary.
@@ -418,13 +421,6 @@ mod handles {
     }
 }
 
-/// Drops this thread's kept handles of the worker's families, for the
-/// gateway's test reset.
-#[cfg(test)]
-pub(crate) fn reset_kept_handles() {
-    handles::reset();
-}
-
 /// Describes the series this module writes. The gateway's list calls it.
 pub(crate) fn describe_series() {
     describe_counter!(
@@ -697,9 +693,9 @@ impl Metrics {
     /// whose rendezvous failed) and `phase` (`probe` at registration and
     /// `request` on the request path, the prefill side's port probed by the
     /// gateway; `bootstrap` or `transfer` as the engine reported it). Its
-    /// own family: the injection
-    /// failures above keep their unlabelled series, so a bare selector on
-    /// it still reads them alone.
+    /// own family: the injection failures keep their unlabelled series,
+    /// `smg_pd_bootstrap_failures_total`, so a bare selector on it still
+    /// reads them alone.
     pub fn record_pd_rendezvous_failure(side: &'static str, phase: &'static str) {
         counter!(
             "smg_pd_rendezvous_failures_total",
@@ -1432,7 +1428,7 @@ impl Metrics {
     /// A worker registered at `worker_url`: its series record again if the
     /// address was retired by an earlier removal.
     pub fn worker_registered(worker_url: &str) {
-        if let Some(series) = worker_metrics::installed() {
+        if let Some(series) = series::installed() {
             series.activate(worker_url);
         }
         handles::worker_set_changed();
@@ -1443,20 +1439,20 @@ impl Metrics {
     /// taken before the replacement): the store keeps its witness, so a
     /// later removal of the address drops those writes until it is gone too.
     pub fn worker_replaced(worker_url: &str, worker: Weak<dyn Worker>) {
-        if let Some(series) = worker_metrics::installed() {
+        if let Some(series) = series::installed() {
             series.replaced(worker_url, worker);
         }
     }
 
     /// The registration at `worker_url` was removed: drop the address's
-    /// series (every family labelled `worker`, see `worker_metrics`), so the
+    /// series (every family labelled `worker`, see `series`), so the
     /// scrape and the time-series database stop growing with pod churn, and
     /// drop the writes that arrive after the removal until the address
     /// registers again or `worker`, the removed one, is gone from every
     /// handle that could still write for it. The interned label goes with
     /// them.
     pub fn remove_worker_metrics(worker_url: &str, worker: Weak<dyn Worker>) {
-        if let Some(series) = worker_metrics::installed() {
+        if let Some(series) = series::installed() {
             series.retire(worker_url, worker);
         }
         handles::worker_set_changed();

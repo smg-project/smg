@@ -915,9 +915,9 @@ mod tests {
     fn a_removals_late_write_recreates_no_series_for_the_address() {
         use metrics_exporter_prometheus::PrometheusBuilder;
 
-        use crate::observability::worker_metrics::{self, WorkerSeriesRecorder};
+        use crate::worker::metrics::series::{self as worker_series, WorkerSeriesRecorder};
 
-        let series = worker_metrics::installed_or_default();
+        let series = worker_series::installed_or_default();
         let recorder = WorkerSeriesRecorder::new(
             PrometheusBuilder::new().build_recorder(),
             Arc::clone(series),

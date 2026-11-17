@@ -17,13 +17,13 @@ pub use smg_external_router::metrics::{
     metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
 
-use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
 use crate::{
     config::{ConfigError, ConfigResult},
     routers::grpc::regular::symphony::telemetry as symphony_telemetry,
     worker::metrics::{
-        describe_series as describe_worker_series, intern_string, KV_EVENT_APPLY_SECONDS,
-        KV_EVENT_LAG_SECONDS,
+        describe_series as describe_worker_series, intern_string,
+        series::{self as worker_series, WorkerSeries, WorkerSeriesRecorder},
+        KV_EVENT_APPLY_SECONDS, KV_EVENT_LAG_SECONDS,
     },
 };
 
@@ -48,9 +48,6 @@ mod handles {
     pub(super) use smg_external_router::metrics::handles::{
         keep_handles, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
     };
-
-    #[cfg(test)]
-    use crate::worker::metrics::reset_kept_handles as reset_worker_handles;
 
     /// Handles by the matched path (the only label a request computes: the
     /// route template, the gateway's own, so these maps hash with FxHash).
@@ -175,6 +172,9 @@ mod handles {
         pub(super) static REQUEST_BUFFERS_RELEASED_EARLY: RefCell<Option<Counter>> = const { RefCell::new(None) };
     }
 
+    /// For tests: this thread's kept handles of the gateway's families,
+    /// dropped, and the installed flag given its say back. The worker's
+    /// module keeps its own handles and has its own reset.
     #[cfg(test)]
     pub(super) fn reset() {
         force_on_this_thread(None);
@@ -184,7 +184,6 @@ mod handles {
         HTTP_RATE_LIMITS.with_borrow_mut(HashMap::clear);
         HTTP_CONNECTIONS_ACTIVE.set(None);
         STREAMS.with_borrow_mut(HashMap::clear);
-        reset_worker_handles();
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
         MANUAL_BRANCHES.with_borrow_mut(HashMap::clear);
@@ -1123,7 +1122,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     let handle = recorder.handle();
 
     // Series labelled `worker` live in a store of their own so they can be
-    // dropped with their worker (see `worker_metrics`); it renders histograms
+    // dropped with their worker (see `worker::metrics::series`); it renders histograms
     // with the exporter's buckets and quantiles.
     let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
         parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
@@ -1133,7 +1132,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         Some(bucket_overrides),
         None,
     )));
-    worker_metrics::install(Arc::clone(&workers));
+    worker_series::install(Arc::clone(&workers));
     metrics::set_global_recorder(WorkerSeriesRecorder::new(recorder, workers))
         .expect("failed to install Prometheus recorder");
     handles::recorder_installed();

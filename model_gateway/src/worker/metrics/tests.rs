@@ -2,14 +2,14 @@ use metrics_exporter_prometheus::{DistributionBuilder, PrometheusBuilder};
 use metrics_util::parse_quantiles;
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
-use super::*;
+use super::{
+    series::{WorkerSeries, WorkerSeriesRecorder},
+    *,
+};
 use crate::{
-    observability::{
-        metrics::{
-            test_support::{assert_metric, render_with_recorder, sorted_series},
-            DEFAULT_SUMMARY_QUANTILES,
-        },
-        worker_metrics::{WorkerSeries, WorkerSeriesRecorder},
+    observability::metrics::{
+        test_support::{assert_metric, render_with_recorder, sorted_series},
+        DEFAULT_SUMMARY_QUANTILES,
     },
     worker::test_support::{gone, held},
 };
