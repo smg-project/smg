@@ -4079,6 +4079,99 @@ fn a_removed_workers_address_is_retired_until_its_last_handle_is_gone() {
     );
 }
 
+/// The registry hands the series store a worker's id with its registration:
+/// of two workers whose addresses differ in the userinfo alone, the scrape
+/// tells the second from the first by its id, and writes neither credential.
+#[test]
+fn a_registration_hands_the_series_store_the_workers_id() {
+    let series = worker_metrics::installed_or_default();
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(series),
+    );
+    let worker = |url: &str| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("m"))
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    metrics::with_local_recorder(&recorder, || {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker("http://key-one@id-seam:8080"))
+            .unwrap();
+        let second = registry
+            .register(worker("http://key-two@id-seam:8080"))
+            .unwrap();
+        let mut rendered = String::new();
+        series.render_into(&mut rendered);
+        let health = |label: &str| {
+            let line = format!("smg_worker_health{{worker=\"{label}\"}} ");
+            rendered.lines().any(|rendered| rendered.starts_with(&line))
+        };
+        assert!(health("http://***@id-seam:8080"), "{rendered}");
+        let with_id = format!("http://***@id-seam:8080 {}", second.as_str());
+        assert!(health(&with_id), "{rendered}");
+        assert!(!rendered.contains("key-one") && !rendered.contains("key-two"));
+    });
+}
+
+/// A worker registered at an address the endpoint parser refuses is named in
+/// the scrape by the marker, never by its address: the registration check
+/// takes an empty port, and digits alone as the host after a userinfo that
+/// reads as no host and port, and each may follow a credential. Every
+/// refused address shares the one marker and the store is the whole
+/// process's, so the case reads its own series by the name of its model:
+/// two labels, each the marker alone or the marker and that worker's id, as
+/// the other cases' refused addresses come and go.
+#[test]
+fn a_registered_address_the_parser_refuses_is_not_in_the_scrape() {
+    let series = worker_metrics::installed_or_default();
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(series),
+    );
+    let model = "a-refused-address-case";
+    let worker = |url: &str| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model))
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    metrics::with_local_recorder(&recorder, || {
+        let registry = WorkerRegistry::new();
+        let first = registry
+            .register(worker("http://key-three@refused-seam:/v1"))
+            .unwrap();
+        let second = registry.register(worker("http://key-four:x@8080")).unwrap();
+        let mut rendered = String::new();
+        series.render_into(&mut rendered);
+        for part in ["key-three", "refused-seam", "key-four"] {
+            assert!(!rendered.contains(part), "{part} is in:\n{rendered}");
+        }
+        let of_this_case = format!("model=\"{model}\"");
+        let own = rendered
+            .lines()
+            .filter(|line| line.contains(&of_this_case))
+            .filter_map(|line| line.split_once("worker=\"")?.1.split_once('"'))
+            .map(|(label, _)| label)
+            .collect::<HashSet<_>>();
+        let marker = "<unparsable address>";
+        let by_id = [&first, &second].map(|id| format!("{marker} {}", id.as_str()));
+        assert_eq!(own.len(), 2, "{own:?} in:\n{rendered}");
+        for label in &own {
+            assert!(
+                *label == marker || by_id.iter().any(|by_id| by_id == label),
+                "{label} in:\n{rendered}"
+            );
+        }
+    });
+}
+
 /// A worker replaced at its URL stays alive in the handles taken before the
 /// replacement (a load guard) and writes under the URL when they go: the
 /// registry hands the store its witness at the replacement, so once the URL

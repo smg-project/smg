@@ -17,9 +17,13 @@
 //! all gone, so the retired set is bounded by the removed and replaced
 //! workers still referenced. The series render after the exporter's output,
 //! in the exporter's format and with the exporter's histogram configuration.
+//!
+//! A series is keyed by the address as registered, and the scrape shows that
+//! address masked: a userinfo masked whole, a query or fragment cut (see
+//! [`Labels`]). An address with none of them is shown byte for byte.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::{Display, Write as _},
     sync::{atomic::Ordering, Arc, OnceLock, Weak},
 };
@@ -42,9 +46,10 @@ use metrics_util::{
 use parking_lot::{Mutex, RwLock};
 use quanta::Instant;
 
-use crate::worker::Worker;
+use crate::worker::{identity::endpoint::Endpoint, Worker};
 
-/// The label that keys a series to a worker; its value is the worker URL.
+/// The label that keys a series to a worker; its value is the worker URL as
+/// registered, and a scrape shows it by [`Labels`].
 const WORKER_LABEL: &str = "worker";
 
 /// The store the installed recorder routes per-worker series to.
@@ -107,6 +112,158 @@ struct Address {
     writers: Vec<Weak<dyn Worker>>,
 }
 
+/// What a scrape shows for each value of the `worker` label it has decided:
+/// `None` shows the value as it is.
+type Shown = HashMap<String, Option<String>>;
+
+/// What a scrape shows for the values of the `worker` label.
+///
+/// A series is keyed by the address as registered, userinfo and query
+/// included: the worker registry keys a worker by that string, and this
+/// store's removal and replacement find a worker's series by it. The scrape
+/// shows the address as a log line and the routed-worker header do
+/// ([`Endpoint::redacted_url`]): an address with a userinfo, a query or a
+/// fragment by its masked form, any other address by its own bytes, so its
+/// series keep their label. A value the parser refuses reads as that
+/// rendering's marker, never as its own text. The runtime's thread index
+/// rides the label too: it is digits, which the mask leaves as they are.
+///
+/// Two addresses of one masked form are two workers and stay two label
+/// sets: the one decided first holds the masked form alone, a later one the
+/// masked form followed by its worker id, or by a number until the registry
+/// has given it one. An address is decided when the registry names its id
+/// or at the first scrape that finds a series of it, whichever comes first,
+/// and the decision stands until the address is retired, with two
+/// exceptions, each a label that changes once. A numbered label gives way
+/// to the worker id when the registry names it. A value shown as it is
+/// keeps its bytes, so a masked address that reads the same gives way to it
+/// and is decided again: `grpc://w:8000?token=t` reads `grpc://w:8000`
+/// until a worker at `grpc://w:8000` itself is first decided.
+#[derive(Default)]
+struct Labels {
+    /// The decision for each value seen. A scrape holds the map it read
+    /// while it writes, so every line of it follows one state of the
+    /// decisions: a decision made meanwhile goes to a copy.
+    shown: Arc<Shown>,
+    /// The address that shows each masked label.
+    holders: HashMap<String, String>,
+    /// The worker id of each registered address whose label is masked.
+    ids: HashMap<String, String>,
+}
+
+impl Labels {
+    /// The decisions as they stand.
+    fn shown(&self) -> Arc<Shown> {
+        Arc::clone(&self.shown)
+    }
+
+    /// Decide what a scrape shows for `value`, unless it is decided.
+    fn decide(&mut self, value: &str) {
+        if !self.shown.contains_key(value) {
+            self.settle(value);
+        }
+    }
+
+    /// The registry's id for the worker at `url`. A label decided before it
+    /// stands when it is the masked form alone; a numbered one gives way to
+    /// the id.
+    fn identify(&mut self, url: &str, worker_id: &str) {
+        let Some(masked) = masked_form(url) else {
+            return;
+        };
+        self.ids.insert(url.to_owned(), worker_id.to_owned());
+        let with_id = format!("{masked} {worker_id}");
+        let stands = self.shown.get(url).is_some_and(|shown| {
+            shown
+                .as_deref()
+                .is_some_and(|label| label == masked || label == with_id)
+        });
+        if !stands {
+            self.settle(url);
+        }
+    }
+
+    /// The address was retired: its label is free for the next address of
+    /// its masked form, and the worker id it had is no longer its own.
+    fn forget(&mut self, url: &str) {
+        self.release(url);
+        self.ids.remove(url);
+    }
+
+    /// Take back the decision for `value`: its label is free for the next
+    /// value of its masked form. What the registry said of the address
+    /// stands.
+    fn release(&mut self, value: &str) {
+        if self.shown.contains_key(value) {
+            if let Some(Some(label)) = Arc::make_mut(&mut self.shown).remove(value) {
+                self.holders.remove(&label);
+            }
+        }
+    }
+
+    /// Decide `value` beside the decisions that stand.
+    fn settle(&mut self, value: &str) {
+        let Some(masked) = masked_form(value) else {
+            // Shown as it is, and its own bytes come before a masked address
+            // that reads the same: that address is decided again.
+            let gives_way = self.holders.get(value).cloned();
+            Arc::make_mut(&mut self.shown).insert(value.to_owned(), None);
+            if let Some(address) = gives_way {
+                self.settle(&address);
+            }
+            return;
+        };
+        let label = self.unshared(value, &masked);
+        let before = Arc::make_mut(&mut self.shown).insert(value.to_owned(), Some(label.clone()));
+        if let Some(Some(before)) = before {
+            self.holders.remove(&before);
+        }
+        self.holders.insert(label, value.to_owned());
+    }
+
+    /// The first of `masked`, `masked` followed by the worker id of `value`
+    /// (once the registry has given it one) and `masked` followed by a
+    /// number, that no other value shows.
+    fn unshared(&self, value: &str, masked: &str) -> String {
+        // Shown by another value: its own bytes when that one is shown as
+        // it is, its label when it is masked.
+        let taken = |label: &str| {
+            self.shown.get(label).is_some_and(Option::is_none)
+                || self.holders.get(label).is_some_and(|other| other != value)
+        };
+        let with_id = self.ids.get(value).map(|id| format!("{masked} {id}"));
+        for label in [Some(masked.to_owned()), with_id].into_iter().flatten() {
+            if !taken(&label) {
+                return label;
+            }
+        }
+        let mut number = 2;
+        loop {
+            let label = format!("{masked} #{number}");
+            if !taken(&label) {
+                return label;
+            }
+            number += 1;
+        }
+    }
+}
+
+/// The masked form of a `worker` label's value, when the scrape must not
+/// show the value itself: an address with a userinfo, a query or a fragment,
+/// and a value the address parser refuses, which reads as the marker a log
+/// line writes for it. The registration check takes spellings the parser
+/// refuses (an empty port, port 0, digits alone as the host after a
+/// userinfo that reads as no host and port), and each may carry a
+/// credential, so the mask asks nothing of the parser on its own. An
+/// address the parser reads as a host and its rank (`http://token@8080`)
+/// has no userinfo by that reading and keeps its bytes, as in a log line.
+/// `None` for a value the mask leaves as it is: an address with nothing to
+/// mask, and a thread index, which is digits.
+fn masked_form(value: &str) -> Option<String> {
+    let masked = Endpoint::redacted_url(value);
+    (masked != value).then_some(masked)
+}
+
 /// The per-worker series of the process, keyed by the worker URL.
 pub(crate) struct WorkerSeries {
     /// The addresses with a removed registration or a replaced worker (see
@@ -122,6 +279,9 @@ pub(crate) struct WorkerSeries {
     distribution_builder: DistributionBuilder,
     /// Histogram samples aggregated per series, the exporter's way.
     distributions: Mutex<HashMap<Key, Distribution>>,
+    /// What a scrape shows for each value of the worker label. The last
+    /// lock taken: nothing takes another of the store's locks under it.
+    labels: Mutex<Labels>,
 }
 
 impl WorkerSeries {
@@ -133,7 +293,14 @@ impl WorkerSeries {
             descriptions: RwLock::new(HashMap::new()),
             distribution_builder,
             distributions: Mutex::new(HashMap::new()),
+            labels: Mutex::new(Labels::default()),
         }
+    }
+
+    /// The registry's id for the worker registered at `url`: what tells its
+    /// label from another address of the same masked form (see [`Labels`]).
+    pub(crate) fn identify(&self, url: &str, worker_id: &str) {
+        self.labels.lock().identify(url, worker_id);
     }
 
     /// A worker registered at `url`: its series record (again). The workers
@@ -176,6 +343,7 @@ impl WorkerSeries {
         self.distributions
             .lock()
             .retain(|key, _| !keyed_to(key, url));
+        self.labels.lock().forget(url);
     }
 
     fn describe(&self, name: &KeyName, description: &SharedString) {
@@ -256,16 +424,84 @@ impl WorkerSeries {
     }
 
     /// Append the stored series to `out` in the exposition format: one
-    /// family per metric name, the samples in label order.
+    /// family per metric name, the samples in label order. Every line names
+    /// its worker by one state of the decisions (see [`Labels`]), so no
+    /// label changes within a scrape: a scrape that meets a value with no
+    /// decision decides it and is written again.
     pub(crate) fn render_into(&self, out: &mut String) {
+        let start = out.len();
+        let shown = self.labels.lock().shown();
+        let undecided = self.render_by(out, &shown, None).undecided;
+        if undecided.is_empty() {
+            return;
+        }
+        // Let go of the map first: a decision copies a map that is held.
+        drop(shown);
+        self.render_decided(out, start, &undecided);
+    }
+
+    /// The second writing of a scrape whose first met `undecided`, the
+    /// values with no decision: they are decided, and the scrape is written
+    /// again from `start` by the new decisions. A value first met in this
+    /// second writing is left to the next scrape.
+    ///
+    /// A removal may land between the two writings, and a decision made for
+    /// its address would stand for good: nothing retires an address twice,
+    /// and the label it held would stay taken from the next address of its
+    /// masked form. So an address retired by then is passed over, under the
+    /// lock a retirement takes. And a decision of this scrape whose series
+    /// the second writing does not find is taken back: the upkeep may have
+    /// let go of a retired address before its label is decided here.
+    fn render_decided(&self, out: &mut String, start: usize, undecided: &BTreeSet<String>) {
+        let shown = {
+            let addresses = self.addresses.read();
+            let mut labels = self.labels.lock();
+            for value in undecided {
+                let retired = addresses
+                    .get(value.as_str())
+                    .is_some_and(|address| address.retired);
+                if !retired {
+                    labels.decide(value);
+                }
+            }
+            labels.shown()
+        };
+        out.truncate(start);
+        let found = self.render_by(out, &shown, Some(undecided)).found;
+        drop(shown);
+        if found.len() < undecided.len() {
+            let mut labels = self.labels.lock();
+            for value in undecided.difference(&found) {
+                labels.release(value);
+            }
+        }
+    }
+
+    /// Write the series whose worker value `shown` holds a decision for, and
+    /// return what the writing met: the values `shown` holds no decision
+    /// for, in byte order whatever order the registry visits them in (their
+    /// series are left out), and, of the values in `decided`, the ones it
+    /// found a series of. The upkeep runs here, so a scrape written again
+    /// runs it twice: the second run folds the samples recorded since the
+    /// first.
+    fn render_by<'a>(
+        &self,
+        out: &mut String,
+        shown: &Shown,
+        decided: Option<&'a BTreeSet<String>>,
+    ) -> Met<'a> {
+        let mut met = Met::of_a_writing(decided);
         let descriptions = self.descriptions.read();
 
         let mut counters: BTreeMap<String, Vec<(Vec<String>, u64)>> = BTreeMap::new();
         self.registry.visit_counters(|key, counter| {
+            let Some(labels) = label_pairs(key, shown, &mut met) else {
+                return;
+            };
             counters
                 .entry(sanitize_metric_name(key.name()))
                 .or_default()
-                .push((label_pairs(key), counter.load(Ordering::Acquire)));
+                .push((labels, counter.load(Ordering::Acquire)));
         });
         for (name, mut series) in counters {
             series.sort_by(|a, b| a.0.cmp(&b.0));
@@ -278,13 +514,13 @@ impl WorkerSeries {
 
         let mut gauges: BTreeMap<String, Vec<(Vec<String>, f64)>> = BTreeMap::new();
         self.registry.visit_gauges(|key, gauge| {
+            let Some(labels) = label_pairs(key, shown, &mut met) else {
+                return;
+            };
             gauges
                 .entry(sanitize_metric_name(key.name()))
                 .or_default()
-                .push((
-                    label_pairs(key),
-                    f64::from_bits(gauge.load(Ordering::Acquire)),
-                ));
+                .push((labels, f64::from_bits(gauge.load(Ordering::Acquire))));
         });
         for (name, mut series) in gauges {
             series.sort_by(|a, b| a.0.cmp(&b.0));
@@ -299,10 +535,13 @@ impl WorkerSeries {
         let distributions = self.distributions.lock();
         let mut by_name: BTreeMap<String, Vec<(Vec<String>, &Distribution)>> = BTreeMap::new();
         for (key, distribution) in distributions.iter() {
+            let Some(labels) = label_pairs(key, shown, &mut met) else {
+                continue;
+            };
             by_name
                 .entry(sanitize_metric_name(key.name()))
                 .or_default()
-                .push((label_pairs(key), distribution));
+                .push((labels, distribution));
         }
         for (name, mut series) in by_name {
             let kind = self.distribution_builder.get_distribution_type(&name);
@@ -357,6 +596,29 @@ impl WorkerSeries {
                 write_sample(out, &name, Some("count"), &labels, None, &count);
             }
             out.push('\n');
+        }
+        met
+    }
+}
+
+/// What one writing of the scrape met among the worker values.
+struct Met<'a> {
+    /// The values with no decision: their series were left out.
+    undecided: BTreeSet<String>,
+    /// The values decided for this writing, when it is a scrape's second.
+    decided: Option<&'a BTreeSet<String>>,
+    /// The values of `decided` the writing found a series of.
+    found: BTreeSet<String>,
+}
+
+impl<'a> Met<'a> {
+    /// Nothing met yet, for a writing that follows the decision of `decided`
+    /// (a scrape's second) or none (its first).
+    fn of_a_writing(decided: Option<&'a BTreeSet<String>>) -> Self {
+        Self {
+            undecided: BTreeSet::new(),
+            decided,
+            found: BTreeSet::new(),
         }
     }
 }
@@ -456,16 +718,44 @@ fn keyed_to(key: &Key, url: &str) -> bool {
     worker_url(key) == Some(url)
 }
 
-fn label_pairs(key: &Key) -> Vec<String> {
-    key.labels()
-        .map(|label| {
-            format!(
-                "{}=\"{}\"",
-                sanitize_label_key(label.key()),
-                sanitize_label_value(label.value())
-            )
-        })
-        .collect()
+/// A series' labels as a scrape writes them: the worker label by what `shown`
+/// holds for its value, every other label as it is. `None` when the worker's
+/// value has no decision in `shown`: the value joins `met.undecided`, and the
+/// scrape leaves the series out until the value is decided. A scrape never
+/// falls back to the value itself. The worker's label is read first, so a
+/// series left out builds nothing, and one written is a vector of its
+/// labels' count.
+fn label_pairs(key: &Key, shown: &Shown, met: &mut Met<'_>) -> Option<Vec<String>> {
+    let worker = match worker_url(key) {
+        Some(value) => {
+            let Some(label) = shown.get(value) else {
+                if !met.undecided.contains(value) {
+                    met.undecided.insert(value.to_owned());
+                }
+                return None;
+            };
+            let decided_now = met.decided.is_some_and(|decided| decided.contains(value));
+            if decided_now && !met.found.contains(value) {
+                met.found.insert(value.to_owned());
+            }
+            Some(label.as_deref().unwrap_or(value))
+        }
+        None => None,
+    };
+    let labels = key.labels();
+    let mut pairs = Vec::with_capacity(labels.len());
+    for label in labels {
+        let value = match worker {
+            Some(shown) if label.key() == WORKER_LABEL => shown,
+            _ => label.value(),
+        };
+        pairs.push(format!(
+            "{}=\"{}\"",
+            sanitize_label_key(label.key()),
+            sanitize_label_value(value)
+        ));
+    }
+    Some(pairs)
 }
 
 fn write_family(out: &mut String, name: &str, kind: &str, description: Option<&SharedString>) {
@@ -504,12 +794,12 @@ fn write_sample(
 
 #[cfg(test)]
 mod tests {
-    use metrics::{counter, describe_counter, gauge, histogram};
+    use metrics::{counter, describe_counter, gauge, histogram, Label};
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
     use metrics_util::parse_quantiles;
 
     use super::*;
-    use crate::worker::BasicWorker;
+    use crate::worker::{BasicWorker, BasicWorkerBuilder};
 
     const WORKER_A: &str = "grpc://[fd00::a]:50051";
     const WORKER_B: &str = "grpc://[fd00::b]:50051";
@@ -568,6 +858,307 @@ mod tests {
             line(&workers, "requests_total{"),
             Some(format!("requests_total{{worker=\"{WORKER_A}\",model=\"m\"}} 2").as_str()),
             "{workers}"
+        );
+    }
+
+    /// A worker registered with a credential in its address is named in the
+    /// scrape by its masked address: in a gauge, a counter, a bucketed
+    /// histogram and a summary.
+    #[test]
+    fn a_registered_credential_is_not_in_the_scrape() {
+        const WITH_A_SECRET: &str = "http://user:s3cret@w:8000/v1?token=s3cret";
+        let series = store();
+        let (_, workers) = scrape(&series, || {
+            gauge!("health", "worker" => WITH_A_SECRET).set(1.0);
+            counter!("requests_total", "worker" => WITH_A_SECRET, "model" => "m").increment(1);
+            histogram!("apply_seconds", "worker" => WITH_A_SECRET).record(0.005);
+            histogram!("lag_seconds", "worker" => WITH_A_SECRET).record(0.5);
+        });
+        assert!(!workers.contains("s3cret"), "{workers}");
+        for family in [
+            "health{",
+            "requests_total{",
+            "apply_seconds_bucket{",
+            "lag_seconds{",
+        ] {
+            let line = line(&workers, family).unwrap_or_else(|| panic!("no {family} line"));
+            assert!(line.contains("worker=\"http://***@w:8000/v1\""), "{line}");
+        }
+    }
+
+    /// A value with nothing to mask is shown as it is: an address with no
+    /// userinfo, query or fragment keeps its bytes, and so does the runtime's
+    /// thread index, which rides the worker label too and is digits.
+    #[test]
+    fn a_value_with_nothing_to_mask_is_shown_as_it_is() {
+        let series = store();
+        let (_, workers) = scrape(&series, || {
+            for value in ["3", "17", WORKER_A, "http://w:8000/v1"] {
+                gauge!("busy_ratio", "worker" => value).set(0.5);
+            }
+        });
+        for value in ["3", "17", WORKER_A, "http://w:8000/v1"] {
+            let label = format!("busy_ratio{{worker=\"{value}\"}} 0.5");
+            assert!(workers.contains(&label), "{label} is not in:\n{workers}");
+        }
+    }
+
+    /// An address the endpoint parser refuses reads as the marker a log line
+    /// writes for it, never as its own text. The registration check takes
+    /// spellings the parser does not, and each may carry a credential: an
+    /// empty port, port 0, a host of digits alone, a backslash or a tab in
+    /// the authority. As many label sets as addresses: the first holds the
+    /// marker alone, a later one a number until the registry names it.
+    #[test]
+    fn an_address_the_parser_refuses_reads_as_the_marker() {
+        let refused = [
+            "http://user:s3cret@w:/v1",
+            "http://user:s3cret@[fd00::1]:",
+            "http://user:s3cret@w:0",
+            "http://user:s3cret@8080",
+            "grpc://user:s3cret@4711",
+            "http://user:s3cret@w\\x:8000",
+            "http://user:s3cret@w\tx:8000",
+        ];
+        let series = store();
+        let (_, workers) = scrape(&series, || {
+            for value in refused {
+                assert!(Endpoint::parse_with_rank(value).is_err(), "{value}");
+                gauge!("health", "worker" => value).set(1.0);
+            }
+        });
+        assert!(!workers.contains("s3cret"), "{workers}");
+        let shown: BTreeSet<&str> = workers
+            .lines()
+            .filter(|line| line.starts_with("health{"))
+            .collect();
+        let marked: BTreeSet<String> = (1..=refused.len())
+            .map(|nth| match nth {
+                1 => String::from("health{worker=\"<unparsable address>\"} 1"),
+                nth => format!("health{{worker=\"<unparsable address> #{nth}\"}} 1"),
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            marked.iter().map(String::as_str).collect(),
+            "{workers}"
+        );
+    }
+
+    /// A masked worker's removal drops its series, and its registration
+    /// brings them back under the same masked label.
+    #[test]
+    fn a_masked_worker_leaves_and_returns_under_one_label() {
+        const WITH_A_SECRET: &str = "http://user:s3cret@w:8000";
+        let health = "health{worker=\"http://***@w:8000\"}";
+        let series = store();
+        let (_, workers) = scrape(&series, || {
+            gauge!("health", "worker" => WITH_A_SECRET).set(1.0);
+        });
+        assert_eq!(
+            line(&workers, "health{"),
+            Some(format!("{health} 1").as_str())
+        );
+
+        series.retire(WITH_A_SECRET, Weak::<BasicWorker>::new());
+        let (_, workers) = scrape(&series, || {
+            gauge!("health", "worker" => WITH_A_SECRET).set(0.0);
+        });
+        assert_eq!(line(&workers, "health{"), None, "{workers}");
+
+        series.activate(WITH_A_SECRET);
+        series.identify(WITH_A_SECRET, "id-1");
+        let (_, workers) = scrape(&series, || {
+            gauge!("health", "worker" => WITH_A_SECRET).set(1.0);
+        });
+        assert_eq!(
+            line(&workers, "health{"),
+            Some(format!("{health} 1").as_str())
+        );
+        assert!(!workers.contains("s3cret"), "{workers}");
+    }
+
+    /// Addresses of one masked form are as many workers and label sets: the
+    /// first holds the masked form alone, a later one carries its worker id,
+    /// or a number until the registry has given it one. A number given back
+    /// is the next unidentified address's, and removing the first frees the
+    /// masked form for the next address that reads the same.
+    #[test]
+    fn addresses_of_one_masked_form_are_as_many_label_sets() {
+        const FIRST: &str = "https://key-1@api:443";
+        const SECOND: &str = "https://key-2@api:443";
+        const THIRD: &str = "https://key-3@api:443";
+        const FOURTH: &str = "https://key-4@api:443";
+        const FIFTH: &str = "https://key-5@api:443";
+        let series = store();
+        let healths = |workers: &str| -> Vec<String> {
+            workers
+                .lines()
+                .filter(|line| line.starts_with("health{"))
+                .map(str::to_string)
+                .collect()
+        };
+        series.identify(FIRST, "id-1");
+        let (_, workers) = scrape(&series, || {
+            gauge!("health", "worker" => FIRST).set(1.0);
+            // Seen before their registration: a builder writes first.
+            gauge!("health", "worker" => SECOND).set(0.0);
+            gauge!("health", "worker" => THIRD).set(0.5);
+        });
+        // In label order: a space sorts before the closing quote.
+        assert_eq!(
+            healths(&workers),
+            [
+                "health{worker=\"https://***@api:443 #2\"} 0",
+                "health{worker=\"https://***@api:443 #3\"} 0.5",
+                "health{worker=\"https://***@api:443\"} 1",
+            ]
+        );
+
+        // The second takes its id and gives its number back: the fourth,
+        // unidentified, takes it.
+        series.identify(SECOND, "id-2");
+        let (_, workers) = scrape(&series, || {
+            gauge!("health", "worker" => FOURTH).set(0.25);
+        });
+        assert_eq!(
+            healths(&workers),
+            [
+                "health{worker=\"https://***@api:443 #2\"} 0.25",
+                "health{worker=\"https://***@api:443 #3\"} 0.5",
+                "health{worker=\"https://***@api:443 id-2\"} 0",
+                "health{worker=\"https://***@api:443\"} 1",
+            ]
+        );
+
+        // The first is removed: the others keep their labels, and the
+        // fifth takes the masked form alone.
+        series.retire(FIRST, Weak::<BasicWorker>::new());
+        let (_, workers) = scrape(&series, || {
+            gauge!("health", "worker" => FIFTH).set(0.75);
+        });
+        assert_eq!(
+            healths(&workers),
+            [
+                "health{worker=\"https://***@api:443 #2\"} 0.25",
+                "health{worker=\"https://***@api:443 #3\"} 0.5",
+                "health{worker=\"https://***@api:443 id-2\"} 0",
+                "health{worker=\"https://***@api:443\"} 0.75",
+            ]
+        );
+        assert!(!workers.contains("key-"), "{workers}");
+    }
+
+    /// A masked label never repeats the text of a value shown as it is: an
+    /// address whose label reads as such a value's own bytes is decided
+    /// again, and takes a number when its id form is that text.
+    #[test]
+    fn a_masked_label_never_repeats_another_values_text() {
+        const FIRST: &str = "https://key-1@api:443/v1";
+        const SECOND: &str = "https://key-2@api:443/v1";
+        // The parser takes a space in a path, and this one's masked form is
+        // itself: shown as it is.
+        const TEXT: &str = "https://***@api:443/v1 id-2";
+        let series = store();
+        series.identify(FIRST, "id-1");
+        series.identify(SECOND, "id-2");
+        let (_, workers) = scrape(&series, || {
+            gauge!("health", "worker" => FIRST).set(1.0);
+            gauge!("health", "worker" => SECOND).set(0.0);
+            gauge!("health", "worker" => TEXT).set(0.5);
+        });
+        let healths: Vec<&str> = workers
+            .lines()
+            .filter(|line| line.starts_with("health{"))
+            .collect();
+        assert_eq!(
+            healths,
+            [
+                "health{worker=\"https://***@api:443/v1 #2\"} 0",
+                "health{worker=\"https://***@api:443/v1 id-2\"} 0.5",
+                "health{worker=\"https://***@api:443/v1\"} 1",
+            ]
+        );
+    }
+
+    /// A series whose worker value has no decision is left out and its value
+    /// is noted: a scrape never falls back to the value itself.
+    #[test]
+    fn a_series_with_no_decision_is_left_out() {
+        const WITH_A_SECRET: &str = "http://user:s3cret@w:8000";
+        let key = Key::from_parts("health", vec![Label::new("worker", WITH_A_SECRET)]);
+        let mut met = Met::of_a_writing(None);
+        assert_eq!(label_pairs(&key, &Shown::new(), &mut met), None);
+        assert_eq!(met.undecided, BTreeSet::from([WITH_A_SECRET.to_owned()]));
+
+        let mut labels = Labels::default();
+        labels.decide(WITH_A_SECRET);
+        let decided = BTreeSet::from([WITH_A_SECRET.to_owned()]);
+        let mut met = Met::of_a_writing(Some(&decided));
+        assert_eq!(
+            label_pairs(&key, &labels.shown(), &mut met),
+            Some(vec![String::from("worker=\"http://***@w:8000\"")])
+        );
+        assert_eq!(met.undecided, BTreeSet::new());
+        assert_eq!(met.found, decided, "a decided value's series is found");
+    }
+
+    /// An address shown as it is keeps its label before a masked address that
+    /// reads the same, whichever was decided first: the masked one carries
+    /// its worker id.
+    #[test]
+    fn a_plain_address_keeps_its_label_before_a_masked_twin() {
+        const PLAIN: &str = "grpc://w:8000";
+        const TWIN: &str = "grpc://w:8000?token=s3cret";
+        let expected = [
+            "health{worker=\"grpc://w:8000 id-2\"} 0",
+            "health{worker=\"grpc://w:8000\"} 1",
+        ];
+        for twin_first in [false, true] {
+            let series = store();
+            // The first of the two alone, decided at its first scrape.
+            let first = if twin_first { TWIN } else { PLAIN };
+            let (_, workers) = scrape(&series, || {
+                gauge!("health", "worker" => first).set(0.5);
+            });
+            assert_eq!(
+                line(&workers, "health{"),
+                Some("health{worker=\"grpc://w:8000\"} 0.5"),
+                "alone, either reads as the plain address"
+            );
+            series.identify(TWIN, "id-2");
+            let (_, workers) = scrape(&series, || {
+                gauge!("health", "worker" => PLAIN).set(1.0);
+                gauge!("health", "worker" => TWIN).set(0.0);
+            });
+            let healths: Vec<&str> = workers
+                .lines()
+                .filter(|line| line.starts_with("health{"))
+                .collect();
+            assert_eq!(healths, expected, "the twin first: {twin_first}");
+            assert!(!workers.contains("s3cret"), "{workers}");
+        }
+    }
+
+    /// A worker replaced at a masked address keeps the address's one series.
+    #[test]
+    fn a_replacement_at_a_masked_address_keeps_one_series() {
+        const WITH_A_SECRET: &str = "http://user:s3cret@w:8000";
+        let series = store();
+        series.identify(WITH_A_SECRET, "id-1");
+        let replaced: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(WITH_A_SECRET).build());
+        let (_, workers) = scrape(&series, || {
+            counter!("requests_total", "worker" => WITH_A_SECRET, "model" => "m").increment(2);
+            series.replaced(WITH_A_SECRET, Arc::downgrade(&replaced));
+            series.identify(WITH_A_SECRET, "id-1");
+            counter!("requests_total", "worker" => WITH_A_SECRET, "model" => "m").increment(3);
+        });
+        assert_eq!(
+            workers
+                .lines()
+                .filter(|line| line.starts_with("requests_total{"))
+                .collect::<Vec<_>>(),
+            ["requests_total{worker=\"http://***@w:8000\",model=\"m\"} 5"]
         );
     }
 
@@ -666,12 +1257,142 @@ mod tests {
     fn label_values_are_escaped() {
         let series = store();
         let (_, workers) = scrape(&series, || {
-            gauge!("health", "worker" => "http://w\"1\\", "note" => "a\nb").set(1.0);
+            gauge!("health", "worker" => "http://w:1/a\"b\\", "note" => "a\nb").set(1.0);
         });
         assert_eq!(
             line(&workers, "health{"),
-            Some("health{worker=\"http://w\\\"1\\\\\",note=\"a\\nb\"} 1"),
+            Some("health{worker=\"http://w:1/a\\\"b\\\\\",note=\"a\\nb\"} 1"),
             "{workers}"
+        );
+    }
+
+    /// A removal that lands between a scrape's two writings leaves no
+    /// decision behind. An address retired by then is passed over, so the
+    /// next address of its masked form, undecided in the same scrape, takes
+    /// the masked form alone. And when the upkeep has let go of the retired
+    /// address before the second writing, the decision made for it is taken
+    /// back: nothing else would take it, and its label would stay held.
+    #[test]
+    fn a_removal_between_the_two_writings_leaves_no_decision() {
+        const GONE: &str = "http://first:s3cret@w:8000";
+        const NEXT: &str = "http://second:s3cret@w:8000";
+        const THIRD: &str = "http://third:s3cret@w:8000";
+        for let_go_by_the_upkeep in [false, true] {
+            let series = store();
+            let recorder = WorkerSeriesRecorder::new(
+                PrometheusBuilder::new().build_recorder(),
+                series.clone(),
+            );
+            metrics::with_local_recorder(&recorder, || {
+                gauge!("health", "worker" => GONE).set(1.0);
+                gauge!("health", "worker" => NEXT).set(1.0);
+            });
+            // The first writing, as `render_into` runs it.
+            let mut out = String::new();
+            let shown = series.labels.lock().shown();
+            let undecided = series.render_by(&mut out, &shown, None).undecided;
+            drop(shown);
+            assert_eq!(
+                undecided,
+                BTreeSet::from([GONE.to_owned(), NEXT.to_owned()])
+            );
+
+            // The removal lands here.
+            series.retire(GONE, Weak::<BasicWorker>::new());
+            if let_go_by_the_upkeep {
+                series.run_upkeep();
+                assert!(!series.is_retired(GONE));
+            }
+            series.render_decided(&mut out, 0, &undecided);
+
+            {
+                let labels = series.labels.lock();
+                assert!(
+                    !labels.shown.contains_key(GONE)
+                        && labels.holders.values().all(|address| address != GONE),
+                    "let go by the upkeep: {let_go_by_the_upkeep}; shown {:?}, holders {:?}",
+                    labels.shown,
+                    labels.holders
+                );
+            }
+            assert_eq!(out.matches("health{").count(), 1, "{out}");
+            assert!(!out.contains("s3cret"), "{out}");
+            if let_go_by_the_upkeep {
+                // Decided beside the address the upkeep let go of, the next
+                // one is numbered; the masked form alone is free again.
+                assert!(
+                    out.contains("health{worker=\"http://***@w:8000 #2\"} 1"),
+                    "{out}"
+                );
+                let (_, workers) = scrape(&series, || {
+                    gauge!("health", "worker" => THIRD).set(1.0);
+                });
+                assert!(
+                    workers.contains("health{worker=\"http://***@w:8000\"} 1"),
+                    "{workers}"
+                );
+            } else {
+                assert!(
+                    out.contains("health{worker=\"http://***@w:8000\"} 1"),
+                    "{out}"
+                );
+            }
+        }
+    }
+
+    /// A retired address gives back the worker id it had: a series written
+    /// for the address before it registers again reads a number, as any
+    /// address the registry has not named does, never the removed worker's
+    /// id.
+    #[test]
+    fn a_retired_address_gives_its_worker_id_back() {
+        const FIRST: &str = "http://first:s3cret@w:8000";
+        const SECOND: &str = "http://second:s3cret@w:8000";
+        let series = store();
+        series.identify(FIRST, "id-1");
+        series.identify(SECOND, "id-2");
+        let (_, workers) = scrape(&series, || {
+            gauge!("health", "worker" => FIRST).set(1.0);
+            gauge!("health", "worker" => SECOND).set(1.0);
+        });
+        assert!(
+            workers.contains("health{worker=\"http://***@w:8000 id-2\"} 1"),
+            "{workers}"
+        );
+
+        series.retire(SECOND, Weak::<BasicWorker>::new());
+        series.activate(SECOND);
+        let (_, workers) = scrape(&series, || {
+            gauge!("health", "worker" => SECOND).set(1.0);
+        });
+        assert!(
+            workers.contains("health{worker=\"http://***@w:8000 #2\"} 1"),
+            "{workers}"
+        );
+        assert!(!workers.contains("id-2"), "{workers}");
+    }
+
+    /// A scrape that is written again starts where the store's part began:
+    /// what the buffer held before it stays, once.
+    #[test]
+    fn a_scrape_written_again_keeps_what_the_buffer_held() {
+        let series = store();
+        let recorder =
+            WorkerSeriesRecorder::new(PrometheusBuilder::new().build_recorder(), series.clone());
+        metrics::with_local_recorder(&recorder, || {
+            gauge!("health", "worker" => "http://user:s3cret@w:8000").set(1.0);
+        });
+        let mut out = String::from("exporter_family 1\n");
+        series.render_into(&mut out);
+        assert!(
+            out.starts_with("exporter_family 1\n# TYPE health gauge\n"),
+            "{out}"
+        );
+        assert_eq!(out.matches("exporter_family").count(), 1, "{out}");
+        assert_eq!(
+            line(&out, "health{"),
+            Some("health{worker=\"http://***@w:8000\"} 1"),
+            "{out}"
         );
     }
 }
