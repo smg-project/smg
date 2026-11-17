@@ -8,9 +8,9 @@ use std::{fmt, sync::Arc};
 // The stream is named only by the doc links of this module.
 #[cfg(doc)]
 use crate::routers::common::stream::GuardedStream;
-use crate::{
-    observability::metrics::Metrics,
-    worker::identity::{basic::Worker, endpoint::Endpoint},
+use crate::worker::{
+    identity::{basic::Worker, endpoint::Endpoint},
+    metrics::Metrics,
 };
 
 pub struct WorkerRoutingKeyLoad {

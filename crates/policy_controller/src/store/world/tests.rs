@@ -1,8 +1,6 @@
 //! The cases of the world and of a decision's build from it, over
 //! [`MemoryStore`]: every instant is handed in, none is slept.
 
-mod pool_binding;
-
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -18,9 +16,9 @@ use super::{
 use crate::{
     spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
-        pairing::Refusal, GatewayId, HealthSink, LoadSink, LoadSource, MembershipTail, MemoryStore,
-        Overload, PairingDescriptor, Reachability, WorkerFacts, WorkerPatch, WorkerRow,
-        WorkerStatus, WorkersStore,
+        pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MembershipTail,
+        MemoryStore, Overload, PairingDescriptor, Reachability, VetoWrite, WorkerFacts,
+        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
@@ -31,6 +29,7 @@ use crate::{
 
 mod list_room;
 mod mode_and_overload;
+mod pool_binding;
 mod repeated_models;
 mod written;
 
@@ -1158,6 +1157,32 @@ fn a_gateways_veto_masks_the_worker_for_that_gateway_until_its_end_or_its_clear(
     let again = member(&store, "http://b:8000");
     assert_eq!(again, other, "the same key and incarnation is the same id");
     assert_eq!(stalled(ASKER, t0), []);
+}
+
+/// The noted write shows the world what the plain one shows: a veto set
+/// with no note behind it masks the worker for its gateway alone, a later
+/// end behind a note that stands is the end shown, and a noted clear lifts
+/// the mask.
+#[test]
+fn a_noted_veto_is_shown_and_lifted_in_the_published_world() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let vetoed = member(&store, "http://a:8000");
+    let until = t0 + Duration::from_secs(1);
+    let written = store.gateway_veto_noted(ASKER, vetoed, Some(until), false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(stalled(&store, ASKER, t0), [vetoed]);
+    assert_eq!(stalled(&store, GatewayId(2), t0), []);
+    assert_eq!(stalled(&store, ASKER, until), []);
+
+    let later = until + Duration::from_secs(1);
+    let written = store.gateway_veto_noted(ASKER, vetoed, Some(later), true, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(stalled(&store, ASKER, until), [vetoed]);
+
+    let written = store.gateway_veto_noted(ASKER, vetoed, None, true, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(stalled(&store, ASKER, t0), []);
 }
 
 #[test]
@@ -3304,11 +3329,16 @@ fn overloaded(store: &MemoryStore, now: Instant) -> Vec<WorkerId> {
 
 /// One rank of the two-rank engine `engine`.
 fn rank_of(store: &MemoryStore, engine: &str, rank: u16) -> WorkerId {
+    rank_among(store, engine, rank, 2)
+}
+
+/// One rank of the engine `engine`, which says it has `size` ranks.
+fn rank_among(store: &MemoryStore, engine: &str, rank: u16, size: u16) -> WorkerId {
     store
         .upsert(WorkerFacts {
             engine: engine.to_string(),
             dp_rank: rank,
-            dp_size: 2,
+            dp_size: size,
             ..facts(&format!("{engine}#{rank}"), Role::Single, &[MODEL])
         })
         .id()
@@ -4002,9 +4032,9 @@ fn a_rank_exactly_three_periods_behind_is_counted_and_a_microsecond_past_it_ends
 fn a_rank_at_the_bound_is_counted_beside_one_past_it() {
     let store = MemoryStore::with_publish_window(Duration::ZERO);
     let t0 = Instant::now();
-    let zero = rank_of(&store, "grpc://e:9000", 0);
-    let one = rank_of(&store, "grpc://e:9000", 1);
-    let two = rank_of(&store, "grpc://e:9000", 2);
+    let zero = rank_among(&store, "grpc://e:9000", 0, 3);
+    let one = rank_among(&store, "grpc://e:9000", 1, 3);
+    let two = rank_among(&store, "grpc://e:9000", 2, 3);
     store
         .apply(generation_with(1, block(8, 1.0)))
         .expect("applied");
@@ -4363,4 +4393,38 @@ fn a_lent_view_hands_its_own_gateways_standing_vetoes_in_the_rows_order() {
     // No other gateway's run is read.
     assert_eq!(masked(GatewayId(2), t0), [0]);
     assert!(masked(GatewayId(3), t0).is_empty());
+}
+
+#[test]
+fn a_dropped_gateways_vetoes_leave_in_one_publication_and_every_other_stands() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(60);
+    let one = member(&store, "http://a:8000");
+    let two = member(&store, "http://b:8000");
+    let other = GatewayId(2);
+    store.gateway_veto(ASKER, one, Some(until));
+    store.gateway_veto(ASKER, two, Some(until));
+    store.gateway_veto(other, two, Some(until));
+    let mut both = [one, two];
+    both.sort_unstable();
+    assert_eq!(stalled(&store, ASKER, t0), both);
+
+    let before = store.world();
+    store.drop_gateway(ASKER);
+    assert_eq!(stalled(&store, ASKER, t0), []);
+    assert_eq!(
+        stalled(&store, other, t0),
+        [two],
+        "another gateway's stands"
+    );
+    // Dropped again, and a gateway that never vetoed: no world is made.
+    let lifted = store.world();
+    assert!(
+        !Arc::ptr_eq(&before, &lifted),
+        "the lifting is a publication"
+    );
+    store.drop_gateway(ASKER);
+    store.drop_gateway(GatewayId(3));
+    assert!(Arc::ptr_eq(&lifted, &store.world()));
 }

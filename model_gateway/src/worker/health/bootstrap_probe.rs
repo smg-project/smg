@@ -19,13 +19,11 @@ use openai_protocol::worker::{RuntimeType, WorkerType};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        identity::{basic::WorkerTypeExt, endpoint::Endpoint},
-        pd::pairing::KvTransferProfile,
-        Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
-    },
+use crate::worker::{
+    identity::{basic::WorkerTypeExt, endpoint::Endpoint},
+    metrics::Metrics,
+    pd::pairing::KvTransferProfile,
+    Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
 };
 
 /// How long the probe waits for the connection: long enough for a far host,
@@ -265,7 +263,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        observability::metrics::metrics_labels,
         routers::common::kv_transfer::{kv_connector_mode, KvConnectorMode},
         worker::{test_support::RefusedAddress, BasicWorkerBuilder},
     };
@@ -455,7 +452,7 @@ mod tests {
             let _guard = metrics::set_default_local_recorder(&recorder);
             report_bootstrap_port_probe(
                 "http://127.0.0.1:8000",
-                metrics_labels::WORKER_PREFILL,
+                WorkerType::Prefill.as_str(),
                 "127.0.0.1",
                 port,
                 BootstrapPortSource::Registered,
@@ -622,7 +619,7 @@ mod tests {
             let _guard = metrics::set_default_local_recorder(&recorder);
             report_bootstrap_port_probe(
                 "http://127.0.0.1:8000",
-                metrics_labels::WORKER_PREFILL,
+                WorkerType::Prefill.as_str(),
                 "127.0.0.1",
                 port,
                 BootstrapPortSource::Default,

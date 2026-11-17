@@ -26,30 +26,27 @@ use tokio::{
 
 pub use super::metadata::WorkerMetadata;
 pub(crate) use crate::worker::runtime::COLD_PREFILL_TOKENS_PER_SEC;
+use crate::worker::{
+    connection::{
+        engine::{EngineConnection, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR},
+        engine_admin::{
+            admin_backend_client, admin_grpc_result, admin_http_post, failed, FLUSH_HTTP_TIMEOUT,
+            PROFILE_HTTP_TIMEOUT,
+        },
+        http_client::LazyHttpClient,
+    },
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    metrics::Metrics,
+    pd::pairing::PdPairing,
+    registry::event::WorkerConnected,
+    runtime::{
+        routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES, STALE_BIT,
+    },
+    CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
+};
 pub use crate::worker::{
     load::inflight::{WorkerLoadGuard, WorkerRoutingKeyLoad},
     runtime::{RoutingState, StallReason, WorkerRuntime},
-};
-use crate::{
-    observability::metrics::{metrics_labels, Metrics},
-    worker::{
-        connection::{
-            engine::{EngineConnection, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR},
-            engine_admin::{
-                admin_backend_client, admin_grpc_result, admin_http_post, failed,
-                FLUSH_HTTP_TIMEOUT, PROFILE_HTTP_TIMEOUT,
-            },
-            http_client::LazyHttpClient,
-        },
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        pd::pairing::PdPairing,
-        registry::event::WorkerConnected,
-        runtime::{
-            routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES,
-            STALE_BIT,
-        },
-        CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
-    },
 };
 
 /// Connect the ZMQ backend for this worker. All connect mechanics — address
@@ -960,11 +957,7 @@ pub(crate) trait ConnectionModeExt {
 
 impl ConnectionModeExt for ConnectionMode {
     fn as_metric_label(&self) -> &'static str {
-        match self {
-            ConnectionMode::Http => metrics_labels::CONNECTION_HTTP,
-            ConnectionMode::Grpc => metrics_labels::CONNECTION_GRPC,
-            ConnectionMode::Zmq => metrics_labels::CONNECTION_ZMQ,
-        }
+        self.as_str()
     }
 }
 
@@ -975,12 +968,7 @@ pub(crate) trait WorkerTypeExt {
 
 impl WorkerTypeExt for WorkerType {
     fn as_metric_label(&self) -> &'static str {
-        match self {
-            WorkerType::Regular => metrics_labels::WORKER_REGULAR,
-            WorkerType::Prefill => metrics_labels::WORKER_PREFILL,
-            WorkerType::Decode => metrics_labels::WORKER_DECODE,
-            WorkerType::Encode => metrics_labels::WORKER_ENCODE,
-        }
+        self.as_str()
     }
 }
 

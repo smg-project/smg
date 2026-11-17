@@ -81,7 +81,7 @@ pub mod world;
 #[cfg(test)]
 mod tests;
 
-pub use health::HealthSink;
+pub use health::{HealthSink, VetoWrite};
 pub use index::{ContentHash, KvEvent, LaneCounts, SequenceHash, StoredBlock, INDEX_WORKERS};
 pub use journal::{Journal, Kinds, Position};
 pub use kv_events::{

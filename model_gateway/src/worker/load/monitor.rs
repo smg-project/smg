@@ -69,15 +69,13 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        health::liveness,
-        identity::endpoint::Endpoint,
-        load::state::{LoadReceiver, LoadSnapshot, LoadState},
-        registry::event::WorkerEvent,
-        ConnectionMode, Worker, WorkerRegistry,
-    },
+use crate::worker::{
+    health::liveness,
+    identity::endpoint::Endpoint,
+    load::state::{LoadReceiver, LoadSnapshot, LoadState},
+    metrics::Metrics,
+    registry::event::WorkerEvent,
+    ConnectionMode, Worker, WorkerRegistry,
 };
 
 mod scrape;

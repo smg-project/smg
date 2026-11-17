@@ -488,9 +488,10 @@ fn with_veto(
 
 /// The gateways' vetoes as the writer keeps them: per gateway its vetoed
 /// workers by id, each until an instant. Replaced whole at each of the
-/// three writes that change them, all rare: a veto's write, a membership
-/// write that takes a departed worker's vetoes with its row, and a window's
-/// publication that drops a veto past its end. A world carries what is
+/// four writes that change them, all rare: a veto's write, a gateway's
+/// leaving that takes its whole list, a membership write that takes a
+/// departed worker's vetoes with its row, and a window's publication that
+/// drops a veto past its end. A world carries what is
 /// derived from them: each pool's runs by gateway ([`PoolVetoes`]).
 #[derive(Debug, Default)]
 struct Vetoes {
@@ -1696,8 +1697,8 @@ impl Writer {
             return;
         };
         // A member's later place holds no receipt: its row is no rank's.
-        let rank = self.engine_rows.get(slot as usize);
-        if !rank.is_some_and(|row| row.rank) {
+        let row = self.engine_rows.get(slot as usize);
+        if !row.is_some_and(|row| row.rank) {
             return;
         }
         if let Some(heard) = self.heard.get_mut(slot as usize) {
@@ -1823,11 +1824,10 @@ impl Writer {
         // with no veto standing neither collects nor sorts them.
         let standing = !self.vetoes.by_gateway.is_empty();
         let mut ids = Vec::new();
-        // The members in id order, by a sort of their ids, each beside its
-        // row: an id is one member, so every pool's entries are pushed in
-        // their own order, and the pool's sort below finds them so in one
-        // pass. Sorted where they stood, a pool's entries moved whole at
-        // every step of its sort.
+        // The members in id order, by this write's one sort, each id beside
+        // its row: an id is one member, so every pool's entries, the ranks
+        // and the ids are pushed in order and nothing below sorts them. The
+        // sort moves an id and a reference, never a whole entry.
         let mut members: Vec<(WorkerId, &'a WorkerRow)> =
             members.map(|member| (member.id, member)).collect();
         members.sort_unstable_by_key(|&(id, _)| id);
@@ -1895,11 +1895,12 @@ impl Writer {
         let mut by_model = FxHashMap::default();
         let mut pools = Vec::new();
         for (model, mut sides) in groups {
-            // Every side in id order before a class is derived: the classes
-            // are numbered in it, and each row is built with its class.
-            for entries in &mut sides {
-                entries.sort_unstable_by_key(|entry| (entry.row.id, entry.row.dp_rank));
-            }
+            // Every side stands in id order, as the walk above pushed it,
+            // before a class is derived: the classes are numbered in it, and
+            // each row is built with its class.
+            debug_assert!(sides
+                .iter()
+                .all(|entries| entries.is_sorted_by(|a, b| a.row.id < b.row.id)));
             // The model's classes go on its prefill pool's shape: a model
             // that has classes has that pool.
             let carried = last.as_deref().and_then(|last| last.pairs(&model));
@@ -2011,9 +2012,10 @@ impl Writer {
             // Ranks that share an engine do not stand together: each place
             // takes its engine, the engines' rows are counted and given
             // their room, then written in the places' order. The places
-            // and the ranks both stand by id, so a cursor finds a place's
-            // rank as the places pass.
-            ranked.sort_unstable_by_key(|&(id, ..)| id);
+            // and the ranks both stand by id, the ranks as the walk above
+            // pushed them, so a cursor finds a place's rank as the places
+            // pass.
+            debug_assert!(ranked.is_sorted_by(|a, b| a.0 < b.0));
             let mut of_group = vec![u32::MAX; by_key.len()];
             let mut engine = 0_u32;
             let mut next = 0;
@@ -2064,10 +2066,11 @@ impl Writer {
                 let Some(engine) = engines.get_mut(engine as usize) else {
                     continue;
                 };
-                let at = (engine.at + engine.len) as usize;
-                if let Some(slot) = self.place_slots.get_mut(index) {
-                    *slot = at as u32;
+                let slot = engine.at + engine.len;
+                if let Some(of_place) = self.place_slots.get_mut(index) {
+                    *of_place = slot;
                 }
+                let at = slot as usize;
                 let rank = last != Some(place.id);
                 if let Some(row) = self.engine_rows.get_mut(at) {
                     *row = EngineRow {
@@ -2095,9 +2098,10 @@ impl Writer {
             pools: pools.into_boxed_slice(),
         });
         // A worker's vetoes leave with its row, in this write's own hold:
-        // no publication shows the row without them.
+        // no publication shows the row without them. The ids stand in
+        // order as the walk above pushed them.
         if standing {
-            ids.sort_unstable();
+            debug_assert!(ids.is_sorted_by(|a, b| a < b));
             if let Some(vetoes) = self.vetoes.of_members(&ids) {
                 self.vetoes = Arc::new(vetoes);
             }
@@ -2308,6 +2312,21 @@ impl Writer {
         let vetoes = self.vetoes.with(gateway, id, until)?;
         self.vetoes = Arc::new(vetoes);
         self.write_veto(gateway, id, until);
+        Some(self.publish())
+    }
+
+    /// Lift every veto of `gateway` and publish at once: the gateway is
+    /// gone past its grace period. Every pool's runs are built again, as
+    /// for a membership write. `None` when the gateway held no veto.
+    #[must_use]
+    pub(super) fn drop_gateway(&mut self, gateway: GatewayId) -> Option<Arc<World>> {
+        if !self.vetoes.by_gateway.contains_key(&gateway) {
+            return None;
+        }
+        let mut by_gateway = self.vetoes.by_gateway.clone();
+        by_gateway.remove(&gateway);
+        self.vetoes = Arc::new(Vetoes { by_gateway });
+        self.derive_vetoes();
         Some(self.publish())
     }
 
