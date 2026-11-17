@@ -556,8 +556,9 @@ fn shed(reason: ShedReason, emptied_by: &'static str, seed: u64, generation: u64
 /// them at the decision's instant, less what the gateway states of itself
 /// takes ([`narrow`]), with the affinity column where the request's
 /// profile declares it. The rows its wires take are counted in `undialed`,
-/// the decider's own part, and the request's block hashes are cut at that
-/// generation's cap.
+/// the decider's own part, and the list they leave takes a name of its own
+/// ([`cut_reach`]). The request's block hashes are cut at that generation's
+/// cap.
 fn hand<R>(
     world: &World,
     taken: &Taken<'_>,
@@ -599,12 +600,18 @@ fn hand<R>(
     let (pool, now_micros) = match world.build(model, role, &ask, view) {
         Some(built) => {
             // The pool's facts are of the rows before the request's own
-            // narrowing.
-            let took = narrow(view, request.wires(), request.subset());
+            // narrowing, all but the list's name: the rows the wires left
+            // are another list of the pool.
+            let mut pool = built.pool_facts();
+            let wires = request.wires();
+            let took = narrow(view, wires, request.subset());
             if took > 0 {
                 undialed.fetch_add(took, Ordering::Relaxed);
+                if let Some(wires) = wires {
+                    pool.reach = cut_reach(pool.reach, wires);
+                }
             }
-            (built.pool_facts(), built.now_micros)
+            (pool, built.now_micros)
         }
         // No member serves the model in the role: the engine answers over
         // no candidate, as it answers any host that hands it none.
@@ -660,6 +667,15 @@ fn narrow(view: &mut ViewBuffers, wires: Option<WireModes>, subset: Option<u32>)
     took as u64
 }
 
+/// The name of the list a gateway's wires cut out of a build's
+/// ([`PoolFacts::reach`]): the build's word turned by the wires. Each of the
+/// eight sets of wires turns it by its own multiple of one odd word, eight
+/// words that differ and none of them zero: no cut reads as its build's
+/// whole list, and no two cuts of one build read alike.
+fn cut_reach(built: u64, wires: WireModes) -> u64 {
+    built ^ (u64::from(wires.bits()) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -681,8 +697,8 @@ mod tests {
     };
 
     use super::{
-        hand, narrow, watched, Buffers, Clock, Counts, Decider, Deciders, Job, Reads, Refused,
-        Taken, PARTS,
+        cut_reach, hand, narrow, watched, Buffers, Clock, Counts, Decider, Deciders, Job, Reads,
+        Refused, Taken, PARTS,
     };
     use crate::{
         controller::{
@@ -1782,6 +1798,16 @@ mod tests {
         }
     }
 
+    /// How many times each worker of `picked` stands in it, in the
+    /// workers' order.
+    fn turns(mut picked: Vec<WorkerId>) -> Vec<usize> {
+        picked.sort_unstable();
+        picked
+            .chunk_by(|one, next| one == next)
+            .map(<[WorkerId]>::len)
+            .collect()
+    }
+
     /// `frame` with what its gateway alone knows.
     fn constrained(
         mut frame: proto::DecideRequest,
@@ -1896,6 +1922,64 @@ mod tests {
         assert_eq!(bed.counts.undialed(), 3 + 32);
     }
 
+    /// The rows a gateway's wires leave are a list of their own and turn a
+    /// rotation of their own. Sixteen members speak HTTP alone and sixteen
+    /// gRPC alone under `round_robin`, and the asks alternate between the
+    /// two wires: each list is sixteen rows cut out of one build, and every
+    /// member is the pick once in its list's sixteen asks. Under one
+    /// rotation between the two each list was drawn at every other row.
+    /// Wires that take no row leave the build's own list and its rotation:
+    /// asks that state the one wire a pool speaks, in turn with asks that
+    /// state none, walk its sixteen rows once.
+    #[tokio::test]
+    async fn the_rows_a_gateways_wires_leave_turn_a_rotation_of_their_own() {
+        const TWO: &str = "model-two-wires";
+        const ONE: &str = "model-one-wire";
+        let mut bed = bed(Some(preset("round_robin", 1)), true, (2, 8), []);
+        let store = Arc::clone(&bed.store);
+        for row in 0..16 {
+            ready(
+                &store,
+                &format!("h{row}"),
+                TWO,
+                Role::Single,
+                WireModes::HTTP,
+            );
+            ready(
+                &store,
+                &format!("g{row}"),
+                TWO,
+                Role::Single,
+                WireModes::GRPC,
+            );
+            ready(
+                &store,
+                &format!("o{row}"),
+                ONE,
+                Role::Single,
+                WireModes::HTTP,
+            );
+        }
+        let mut picked = Vec::new();
+        for ask in 0..64_u8 {
+            let wires = if ask.is_multiple_of(2) { 0b001 } else { 0b010 };
+            let frame = constrained(frame_for(TWO, ask, u64::from(ask)), wires, None);
+            picked.push(targets(&bed.ask(frame).await)[0]);
+        }
+        assert_eq!(turns(picked), [2; 32], "two wires over one pool");
+        let mut picked = Vec::new();
+        for ask in 64..80_u8 {
+            let frame = frame_for(ONE, ask, u64::from(ask));
+            let frame = if ask.is_multiple_of(2) {
+                constrained(frame, 0b001, None)
+            } else {
+                frame
+            };
+            picked.push(targets(&bed.ask(frame).await)[0]);
+        }
+        assert_eq!(turns(picked), [1; 16], "wires that take no row");
+    }
+
     /// The budget is judged again where the answer is handed over, at the
     /// read the fence takes there and with no clock read more. A decision
     /// with a microsecond left leaves. One whose budget ended while it was
@@ -1977,6 +2061,21 @@ mod tests {
         assert_eq!(part(&counts, 0), 1 + (1 << PARTS));
         assert_eq!(part(&counts, PARTS + 1), 2 + (2 << PARTS));
         assert_eq!(counts.undialed(), (1 << (PARTS + 2)) - 1);
+    }
+
+    /// The name of a cut list. Over three builds' words, the pool's whole
+    /// list and two gateways' own, cut by each of the eight sets of wires:
+    /// no two cuts read alike, and none reads as a build's word.
+    #[test]
+    fn no_two_cuts_read_alike_and_none_as_a_builds_word() {
+        let builds = [0, GATEWAY.0, OTHER.0];
+        let mut words = BTreeSet::from(builds);
+        for built in builds {
+            for bits in 0..8 {
+                let cut = cut_reach(built, WireModes::from_bits(bits));
+                assert!(words.insert(cut), "{built} cut by {bits:#b}");
+            }
+        }
     }
 
     /// The pass over a view. The rows a gateway's wires keep hold their
