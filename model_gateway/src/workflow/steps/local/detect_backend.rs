@@ -392,10 +392,6 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
         context.data.detected_runtime_type = Some(detected);
         Ok(StepResult::Success)
     }
-
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]

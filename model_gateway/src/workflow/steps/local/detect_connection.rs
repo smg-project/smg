@@ -203,10 +203,6 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
         context.data.connection_mode = Some(connection_mode);
         Ok(StepResult::Success)
     }
-
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]
