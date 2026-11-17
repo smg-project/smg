@@ -1205,8 +1205,9 @@ pub const OVERLOAD_WAITING_REQUESTS: u32 = 8;
 /// vetoed where a binding's overload block names no usage.
 pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 
-/// The overload veto's defaults for the binding's workers: evaluated per
-/// load report by the host and latched, never per request; a worker's own
+/// The overload veto's defaults for the workers of the pools decided under
+/// the binding, as the binding's `overload` field says: evaluated per load
+/// report by the host and latched, never per request; a worker's own
 /// registration thresholds resolve over these.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
