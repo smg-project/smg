@@ -238,7 +238,9 @@ impl Door {
         // The conversion reads the standing row once the URL holds its own
         // rules: a URL past its bound is never looked up. What a new row
         // names is no rule of a call that makes none: a REPLACE of a URL
-        // that does not stand is not found, whatever it leaves unsaid.
+        // that does not stand is not found, whatever it leaves unsaid. The
+        // conversion tells a new row's names after every field's own rule,
+        // so a field past its bound is refused as itself here too.
         let read = worker_wire::registration(spec, |url| self.store.by_key(url));
         let (mut facts, standing) = match read {
             Err(unnamed) if mode == Mode::Replace && worker_wire::of_a_new_row(&unnamed) => {
@@ -634,15 +636,36 @@ mod tests {
                 (Code::NotFound, "no worker is registered under the URL")
             );
         }
-        // A field past its bounds is refused as itself, found or not.
-        let wide = proto::WorkerSpec {
+        // A field past its bounds is refused as itself, found or not, and
+        // whatever the call leaves unsaid: a field read ahead of the wire
+        // (the models) and one read after it (the labels), each with the
+        // wire and the role stated and with both left unsaid.
+        let wide = |over: proto::WorkerSpec| proto::WorkerSpec {
             models: (0..129).map(|n| format!("model-{n}")).collect(),
-            ..spec(URL)
+            ..over
         };
-        let refused = door
-            .register(&operator(), under(TERM), &ask(wide, Mode::Replace))
-            .expect_err("past a bound");
-        assert_eq!(refused.code(), Code::InvalidArgument);
+        let labelled = |over: proto::WorkerSpec| proto::WorkerSpec {
+            labels: (0..129)
+                .map(|n| (format!("label-{n}"), String::new()))
+                .collect(),
+            ..over
+        };
+        let models = "spec.models: a row names at most 128 model ids";
+        let labels = "spec.labels: a row holds at most 128 labels";
+        for (past, field) in [
+            (wide(spec(URL)), models),
+            (wide(bare.clone()), models),
+            (labelled(spec(URL)), labels),
+            (labelled(bare.clone()), labels),
+        ] {
+            let refused = door
+                .register(&operator(), under(TERM), &ask(past, Mode::Replace))
+                .expect_err("past a bound");
+            assert_eq!(
+                (refused.code(), refused.message()),
+                (Code::InvalidArgument, field)
+            );
+        }
         // An UPSERT of the same would make a row, and is held to its names.
         let unnamed = door
             .register(&operator(), under(TERM), &ask(bare, Mode::Upsert))

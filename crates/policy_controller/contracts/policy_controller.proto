@@ -688,7 +688,8 @@ message RegisterWorkerRequest {
     // The URL must be absent: ALREADY_EXISTS otherwise.
     MODE_ADD = 1;
     // The URL must stand: its next incarnation, NOT_FOUND otherwise, whatever
-    // the registration leaves unset.
+    // the registration leaves unset. A field past its own rule or bound is
+    // INVALID_ARGUMENT first, whether the URL stands or not.
     MODE_REPLACE = 2;
     // Registers an absent URL. Over a standing row: equal facts write nothing
     // and answer the row unmoved, a change of role, wire or models is a new

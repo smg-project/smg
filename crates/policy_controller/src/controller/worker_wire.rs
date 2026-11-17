@@ -564,9 +564,12 @@ fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<Work
             "a model id is not empty and holds no blank and no control character",
         ));
     }
+    // A wire or a role left unsaid is the standing row's. A new row names
+    // both, and is told so after every field's own rule: a field past its
+    // bound is refused as itself, whether a row stands or not.
     let wire_modes = match proto::WireMode::try_from(spec.wire) {
-        Ok(proto::WireMode::Http) => WireModes::HTTP,
-        Ok(proto::WireMode::Grpc) => WireModes::GRPC,
+        Ok(proto::WireMode::Http) => Some(WireModes::HTTP),
+        Ok(proto::WireMode::Grpc) => Some(WireModes::GRPC),
         // A host-local wire is reachable from the one gateway that holds its
         // socket, and no field of a registration names a gateway.
         Ok(proto::WireMode::Zmq) => {
@@ -575,23 +578,15 @@ fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<Work
                 "a host-local wire is one gateway's and a registration names none: not served by this build",
             ));
         }
-        // Left unsaid, the wire is the standing row's.
-        Ok(proto::WireMode::Unspecified) => match standing {
-            Some(row) => row.wire_modes,
-            None => return Err(NEW_WIRE),
-        },
+        Ok(proto::WireMode::Unspecified) => standing.map(|row| row.wire_modes),
         Err(_) => return Err(refused("spec.wire", "a wire this build does not know")),
     };
     let role = match proto::Role::try_from(spec.role) {
-        Ok(proto::Role::Single) => Role::Single,
-        Ok(proto::Role::Prefill) => Role::Prefill,
-        Ok(proto::Role::Decode) => Role::Decode,
-        Ok(proto::Role::Encode) => Role::Encode,
-        // And so is the role.
-        Ok(proto::Role::Unspecified) => match standing {
-            Some(row) => row.role,
-            None => return Err(NEW_ROLE),
-        },
+        Ok(proto::Role::Single) => Some(Role::Single),
+        Ok(proto::Role::Prefill) => Some(Role::Prefill),
+        Ok(proto::Role::Decode) => Some(Role::Decode),
+        Ok(proto::Role::Encode) => Some(Role::Encode),
+        Ok(proto::Role::Unspecified) => standing.map(|row| row.role),
         Err(_) => return Err(refused("spec.role", "a role this build does not know")),
     };
     if spec.dp_size > 1 {
@@ -625,8 +620,6 @@ fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<Work
         facts.engine.clone_from(&spec.url);
         facts.dp_size = 1;
     }
-    facts.role = role;
-    facts.wire_modes = wire_modes;
     if !spec.runtime.is_empty() {
         facts.engine_kind.clone_from(&spec.runtime);
     }
@@ -689,7 +682,11 @@ fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<Work
             scrape_interval_ms: signals.scrape_interval_ms,
         };
     }
-    // The row whole, last: each field is within its own bound here.
+    // Each field is within its own bound here. What a new row leaves
+    // unnamed is told next, and the row whole last: only a row that can be
+    // made has a size.
+    facts.wire_modes = wire_modes.ok_or(NEW_WIRE)?;
+    facts.role = role.ok_or(NEW_ROLE)?;
     fits(&facts, &facts.labels, "spec")?;
     Ok(facts)
 }

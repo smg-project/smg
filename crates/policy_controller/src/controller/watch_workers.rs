@@ -9,7 +9,9 @@
 //! a watched write landed or the role changed, never for a load row, and
 //! hands its events to a bounded channel the transport drains. A watcher
 //! that takes nothing fills its own channel and is ended at [`STALL`]; one
-//! the log's ring let go is told to start again.
+//! the log's ring let go is told to start again. A stream ends when its
+//! replica stops leading under the watch's term: the fence is read before
+//! the cut is taken and before each page and each entry is handed over.
 //!
 //! A watch of some models is told a write when a row it names serves one of
 //! them: the row the write left in the table, or the row it took out. A
@@ -19,8 +21,10 @@
 //! No peer sets a size here. A principal holds at most [`WATCHES_MAX`]
 //! watches open at a replica, and as many principals watch a replica as may
 //! be present at a leader: an open past either bound is refused by name. A
-//! watch's seat is its task's, so it is given back when the stream ends, by
-//! any path.
+//! watch's seat is its stream's and its task's, given back when the
+//! transport has let the stream go and the task has ended: a watcher that
+//! takes nothing keeps what its stream held, and its seat with it, so the
+//! ceiling of watches bounds what a principal leaves unread.
 
 use std::{
     pin::Pin,
@@ -100,9 +104,14 @@ impl Feed {
     }
 
     /// Lets the kept cut go once a write has moved the log past its place:
-    /// no watch that starts now shares it.
+    /// no watch that starts now shares it. The lock is tried and never
+    /// waited on: a watch that holds it is taking or sharing a cut, and a
+    /// tail parks no thread of the runtime behind that copy of the rows. A
+    /// stale cut it leaves goes at the next write, or with the last seat.
     fn let_go(&self) {
-        let mut kept = self.rows.lock();
+        let Some(mut kept) = self.rows.try_lock() else {
+            return;
+        };
         if kept
             .as_ref()
             .is_some_and(|cut| cut.at != self.log.head(Kinds::Watched))
@@ -148,15 +157,22 @@ pub(crate) struct Source {
     pub(crate) store: Arc<MemoryStore>,
     pub(crate) feed: Feed,
     pub(crate) fence: Arc<Fence>,
-    /// Whether this replica leads, told at a change of role alone. A
-    /// stream ends at the word that it does not; the word it found at its
-    /// start may be the one before the take the stream was admitted under.
+    /// Whether this replica leads. That it does is told at the change; that
+    /// it does not is told again at every move of the serve, since the word
+    /// a stream found at its start may be the one before the lead it was
+    /// admitted under. A stream ends at the word that this replica does not
+    /// lead, whatever the word before it was.
     pub(crate) role: watch::Receiver<bool>,
     /// The term the watch was admitted under.
     pub(crate) term: u64,
 }
 
 impl Source {
+    /// Whether this replica leads under the watch's term at this instant.
+    fn leads(&self) -> bool {
+        self.fence.leader_term(Instant::now()) == Some(self.term)
+    }
+
     /// The rows at the log's last watched write. A cut is a write's, not a
     /// watcher's: the first watch that starts at a place takes it, under
     /// the membership lock for the copy, and every watch that starts there
@@ -185,6 +201,9 @@ pub(crate) struct Watching {
     events: mpsc::Receiver<Told>,
     /// The stream's one task, aborted when the stream is dropped.
     _task: JoinSet<()>,
+    /// The watch's seat, which the task shares: a stream whose task ended
+    /// still holds what its watcher has not taken.
+    _seat: Arc<Seat>,
 }
 
 impl Stream for Watching {
@@ -207,8 +226,9 @@ pub(crate) struct Watchers {
     principals: usize,
 }
 
-/// One open watch's seat in the table, given back when it is dropped. The
-/// last seat given back lets the feed's kept cut go: no watch shares it.
+/// One open watch's seat in the table, held by its stream and by its task
+/// and given back when both are gone. The last seat given back lets the
+/// feed's kept cut go: no watch shares it.
 #[derive(Debug)]
 struct Seat {
     watchers: Arc<Watchers>,
@@ -297,7 +317,7 @@ pub(crate) fn open(
     start: Start,
     models: Vec<String>,
 ) -> Result<Watching, Status> {
-    let seat = watchers.seat(by, &source.feed)?;
+    let seat = Arc::new(watchers.seat(by, &source.feed)?);
     info!(
         by = %by.subject,
         ?start,
@@ -307,10 +327,17 @@ pub(crate) fn open(
     );
     let (hand, events) = mpsc::channel(HELD);
     let mut task = JoinSet::new();
-    task.spawn(run(source, start, Asked { models }, hand, seat));
+    task.spawn(run(
+        source,
+        start,
+        Asked { models },
+        hand,
+        Arc::clone(&seat),
+    ));
     Ok(Watching {
         events,
         _task: task,
+        _seat: seat,
     })
 }
 
@@ -341,27 +368,58 @@ impl Asked {
     }
 }
 
-/// Hands `told` to the watcher. `false` when the watcher left, or took
-/// nothing for [`STALL`].
-async fn hand_over(hand: &mpsc::Sender<Told>, told: Told) -> bool {
-    hand.send_timeout(told, STALL).await.is_ok()
+/// Hands `event` to the watcher while this replica leads under the watch's
+/// term. The fence is read before each hand-over, and a hand-over that
+/// waits on the watcher ends at the word that this replica left: a watcher
+/// that lags learns it ahead of the next page or entry, not after the
+/// snapshot or the batch. `false` when the stream has ended: the watcher
+/// left or took nothing for [`STALL`], or it was told that its replica
+/// stopped leading.
+async fn hand_over(
+    source: &mut Source,
+    hand: &mpsc::Sender<Told>,
+    event: proto::WorkerEvent,
+) -> bool {
+    if !source.leads() {
+        fenced(hand).await;
+        return false;
+    }
+    tokio::select! {
+        biased;
+        () = left(&mut source.role) => {
+            fenced(hand).await;
+            false
+        }
+        handed = hand.send_timeout(Ok(event), STALL) => handed.is_ok(),
+    }
+}
+
+/// Comes back at the word that this replica does not lead, or when nobody
+/// is left to say it.
+async fn left(role: &mut watch::Receiver<bool>) {
+    loop {
+        if role.changed().await.is_err() || !*role.borrow_and_update() {
+            return;
+        }
+    }
 }
 
 /// The word to a watcher that cannot continue from its place, the stream's
 /// last.
-async fn start_again(source: &Source, hand: &mpsc::Sender<Told>) {
+async fn start_again(source: &mut Source, hand: &mpsc::Sender<Told>) {
     let floor = source.feed.log.floor(Kinds::Watched);
-    hand_over(hand, Ok(worker_wire::start_again(floor))).await;
+    hand_over(source, hand, worker_wire::start_again(floor)).await;
 }
 
 /// The status of a stream whose replica stopped leading under its term, the
-/// stream's last: the watcher finds the leader through `Leader`.
+/// stream's last: the watcher finds the leader through `Leader`. It waits
+/// on the watcher as an event does, and no longer.
 async fn fenced(hand: &mpsc::Sender<Told>) {
     let status = Status::aborted("this replica no longer leads under the watch's term");
-    hand_over(hand, Err(status)).await;
+    hand.send_timeout(Err(status), STALL).await.ok();
 }
 
-/// The page that starts `rows`: fewer than [`PAGE`] of them while they take
+/// The page that starts `rows`: at most [`PAGE`] of them while they take
 /// at most [`PAGE_BYTES`] on the wire. A page takes its first row whatever
 /// it weighs: a row past a page's bytes goes alone.
 fn fill(rows: &[&WorkerRow]) -> Vec<proto::WorkerRow> {
@@ -383,27 +441,33 @@ fn fill(rows: &[&WorkerRow]) -> Vec<proto::WorkerRow> {
 
 /// A stream's task: the start, then the tail until the watcher leaves, the
 /// log lets its place go or this replica stops leading under the term. It
-/// holds the watch's seat to its end.
+/// holds the watch's seat to its end, as the stream does to its own.
 async fn run(
     mut source: Source,
     start: Start,
     asked: Asked,
     hand: mpsc::Sender<Told>,
-    _seat: Seat,
+    _seat: Arc<Seat>,
 ) {
-    // Seen from here: a write or a change of role after this line wakes the
-    // tail, whether it landed before the cut or after it.
+    // Seen from here: a write after this line wakes the tail, whether it
+    // landed before the cut or after it. The role's word is seen from the
+    // watch's open: one told before this task's first turn ends the stream.
     source.feed.wake.mark_unchanged();
-    source.role.mark_unchanged();
     let mut place = match start {
         Start::After(place) => {
             if !source.feed.log.holds(Kinds::Watched, place) {
-                start_again(&source, &hand).await;
+                start_again(&mut source, &hand).await;
                 return;
             }
             place
         }
         Start::Snapshot => {
+            // The term the watch was admitted under may have ended before
+            // this turn: no cut is taken for a watcher the fence refuses.
+            if !source.leads() {
+                fenced(&hand).await;
+                return;
+            }
             let cut = source.rows();
             let rows: Vec<&WorkerRow> = cut.rows.iter().filter(|row| asked.serves(row)).collect();
             let mut told = 0;
@@ -413,7 +477,8 @@ async fn run(
                 let page = fill(&rows[told..]);
                 told += page.len();
                 let last = told == rows.len();
-                if !hand_over(&hand, Ok(worker_wire::page(page, last, cut.at, cut.epoch))).await {
+                let page = worker_wire::page(page, last, cut.at, cut.epoch);
+                if !hand_over(&mut source, &hand, page).await {
                     return;
                 }
                 if last {
@@ -425,7 +490,7 @@ async fn run(
     };
     let mut entries = Vec::with_capacity(BATCH);
     loop {
-        if source.fence.leader_term(Instant::now()) != Some(source.term) {
+        if !source.leads() {
             fenced(&hand).await;
             return;
         }
@@ -435,7 +500,7 @@ async fn run(
             .read(Kinds::Watched, place, BATCH, &mut entries)
             .is_err()
         {
-            start_again(&source, &hand).await;
+            start_again(&mut source, &hand).await;
             return;
         }
         if entries.is_empty() {
@@ -467,7 +532,7 @@ async fn run(
                 continue;
             }
             if let Some(told) = worker_wire::member(&entry) {
-                if !hand_over(&hand, Ok(told)).await {
+                if !hand_over(&mut source, &hand, told).await {
                     return;
                 }
             }
@@ -479,7 +544,8 @@ async fn run(
 mod tests {
     use std::{
         collections::BTreeMap,
-        sync::Arc,
+        sync::{mpsc, Arc},
+        thread,
         time::{Duration, Instant},
     };
 
@@ -494,11 +560,12 @@ mod tests {
     use crate::{
         controller::{
             election::LeasePlace,
+            gateways::tests::PATIENT,
             principal::tests::told,
             replication::{journaled, journaled_from, FIRST_PLACES, WATCHED_EVENTS},
             worker_wire,
         },
-        elector::{ElectionSettings, Elector, Tick},
+        elector::{Elector, Tick},
         proto::{self, worker_event::Event},
         store::{
             Kinds, LeasesStore, LoadSink, LoadSource, MemoryStore, Position, WorkerFacts,
@@ -525,8 +592,10 @@ mod tests {
     /// term 1 after whatever was written to it before. The candidate is
     /// alone over its lease, so each take of the kit leads at once.
     fn leading((store, feed): (Arc<MemoryStore>, Feed)) -> Leader {
-        let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
-            .expect("the default settings are in order");
+        // A lease no case outlasts: the fence closes when a case lets the
+        // lease go, never by the clock of a held host.
+        let mut elector =
+            Elector::alone("controller-0@127.0.0.1:1", PATIENT).expect("the settings are in order");
         assert_eq!(
             elector.tick(Instant::now()).expect("a tick"),
             Tick::Acquired { term: 1 }
@@ -585,6 +654,22 @@ mod tests {
                     engine: key(n),
                     incarnation,
                     models: vec![model.to_owned()],
+                    dp_size: 1,
+                    ..WorkerFacts::default()
+                })
+                .id()
+        }
+
+        /// A row whose URL alone passes half a page's bytes: it goes alone
+        /// in a snapshot's page.
+        fn register_wide(&self, n: usize) -> WorkerId {
+            let url = format!("grpc://{n:03}.{}:8000", "u".repeat(PAGE_BYTES / 4));
+            self.store
+                .upsert(WorkerFacts {
+                    key: url.clone(),
+                    engine: url,
+                    incarnation: 1,
+                    models: vec!["model-a".to_owned()],
                     dp_size: 1,
                     ..WorkerFacts::default()
                 })
@@ -1272,9 +1357,10 @@ mod tests {
             1 + 2 * u64::try_from(HELD).expect("a count")
         );
         tokio::time::sleep(STALL + Duration::from_secs(1)).await;
-        // The stream ended at its bound and its seat is given back, with the
-        // watcher still holding its end.
-        leader.holds("gateway-a", 0).await;
+        // The task ended at its bound. The watcher holds its end still, and
+        // the seat with it.
+        assert!(stream.events.is_closed(), "the task ended at its bound");
+        leader.holds("gateway-a", 1).await;
         // What its channel held is still the watcher's; then the stream has
         // ended, and the watcher resumes by its place.
         let taken = tokio::time::timeout(Duration::from_secs(60), async {
@@ -1288,6 +1374,176 @@ mod tests {
         .await
         .expect("the stream ended at its bound");
         assert_eq!(taken, HELD);
+        // The stream let go gives the seat back.
+        drop(stream);
+        leader.holds("gateway-a", 0).await;
+    }
+
+    /// Turns of the runtime until `stream` holds `want` messages its
+    /// watcher has not taken: its task stands at a hand-over then, or has
+    /// ended. Turns and no clock, as in [`Leader::holds`].
+    async fn holding(stream: &Watching, want: usize) {
+        for _ in 0..10_000 {
+            if stream.events.len() == want {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(stream.events.len(), want, "the messages the stream holds");
+    }
+
+    /// The events `stream` tells ahead of its last word, counted, and the
+    /// word. A stream that tells more than `most` events fails here.
+    async fn to_the_last_word(stream: &mut Watching, most: usize) -> (usize, Status) {
+        for taken in 0..=most {
+            let told = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("an answer within five seconds")
+                .expect("the stream is open");
+            if let Err(status) = told {
+                return (taken, status);
+            }
+        }
+        panic!("more than {most} events ahead of the last word");
+    }
+
+    /// A watcher that takes nothing keeps what its stream held for as long
+    /// as it keeps the stream, so it keeps the seat as long: a principal's
+    /// ceiling of watches is the ceiling of the streams it leaves unread.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_left_unread_holds_its_seat_until_its_watcher_lets_it_go() {
+        let leader = leader();
+        let mut streams: Vec<Watching> = (0..WATCHES_MAX)
+            .map(|_| leader.watch(Start::Snapshot, &[]))
+            .collect();
+        // Each stream holds its snapshot, one page; then twice what a stream
+        // holds is written, and no watcher takes anything.
+        for stream in &streams {
+            holding(stream, 1).await;
+        }
+        for n in 0..2 * HELD {
+            leader.register(n, 1, "model-a");
+        }
+        tokio::time::sleep(STALL + Duration::from_secs(1)).await;
+        // Each task ended at its bound, and each stream holds a full
+        // channel still.
+        for stream in &streams {
+            assert!(stream.events.is_closed(), "the task ended at its bound");
+            assert_eq!(stream.events.len(), HELD);
+        }
+        let refused = leader
+            .watch_as("gateway-a", Start::Snapshot, &[])
+            .expect_err("a watch past four streams left unread");
+        assert_eq!(refused.code(), Code::ResourceExhausted);
+        // A stream let go gives its seat back.
+        drop(streams.pop());
+        leader.holds("gateway-a", WATCHES_MAX - 1).await;
+        leader
+            .watch_as("gateway-a", Start::Snapshot, &[])
+            .expect("the seat given back");
+    }
+
+    /// The fence is read before each hand-over. A watcher that lags inside
+    /// a batch is told that its replica stopped leading ahead of the
+    /// batch's next entry: it takes what its stream held and the entry in
+    /// hand, each written under the stream's term before the fence closed.
+    #[tokio::test]
+    async fn a_batchs_next_entry_is_not_told_after_the_fence_closed() {
+        let mut leader = leader();
+        let mut stream = leader.watch(Start::Snapshot, &[]);
+        next(&mut stream).await;
+        // One read of the log takes more than the stream holds while the
+        // watcher takes nothing: the task stands at a hand-over inside the
+        // batch.
+        let written = HELD + 8;
+        for n in 0..written {
+            leader.register(n, 1, "model-a");
+        }
+        holding(&stream, HELD).await;
+        // The fence closes and nobody says so.
+        assert!(leader.elector.release().expect("a release"));
+        let (taken, word) = to_the_last_word(&mut stream, written).await;
+        assert_eq!(word.code(), Code::Aborted);
+        assert_eq!(
+            taken,
+            HELD + 1,
+            "what the stream held and the entry in hand"
+        );
+        assert!(stream.next().await.is_none(), "the end");
+    }
+
+    /// And before each page of a snapshot. A row past half a page of bytes
+    /// goes alone, so a few rows make more pages than a stream holds.
+    #[tokio::test]
+    async fn a_snapshots_next_page_is_not_handed_after_the_fence_closed() {
+        let mut leader = leader();
+        let pages = HELD + 2;
+        for n in 0..pages {
+            leader.register_wide(n);
+        }
+        let mut stream = leader.watch(Start::Snapshot, &[]);
+        holding(&stream, HELD).await;
+        assert!(leader.elector.release().expect("a release"));
+        let (taken, word) = to_the_last_word(&mut stream, pages).await;
+        assert_eq!(word.code(), Code::Aborted);
+        assert_eq!(
+            taken,
+            HELD + 1,
+            "the pages the stream held and the page in hand"
+        );
+        assert!(stream.next().await.is_none(), "the end");
+    }
+
+    /// A watch whose term ended between its admission and its task's first
+    /// turn is sent no snapshot, and no cut is taken for it.
+    #[tokio::test]
+    async fn a_watch_whose_term_ended_before_its_start_is_sent_no_snapshot() {
+        let mut leader = leader();
+        leader.register(0, 1, "model-a");
+        assert!(leader.elector.release().expect("a release"));
+        let mut stream = leader.watch(Start::Snapshot, &[]);
+        assert_eq!(last_word(&mut stream).await.code(), Code::Aborted);
+        assert!(stream.next().await.is_none(), "the end");
+        assert!(leader.feed.rows.lock().is_none(), "no cut was taken for it");
+    }
+
+    /// The word that its replica left ends a hand-over that waits on the
+    /// watcher: the entry in hand is not told.
+    #[tokio::test]
+    async fn the_word_that_its_replica_left_ends_a_hand_over_that_waits() {
+        let leader = leader();
+        let mut stream = leader.watch(Start::Snapshot, &[]);
+        next(&mut stream).await;
+        let written = HELD + 8;
+        for n in 0..written {
+            leader.register(n, 1, "model-a");
+        }
+        holding(&stream, HELD).await;
+        // The fence is open still: the word alone ends the hand-over.
+        leader.role.send_replace(false);
+        let (taken, word) = to_the_last_word(&mut stream, written).await;
+        assert_eq!(word.code(), Code::Aborted);
+        assert_eq!(taken, HELD, "what the stream held");
+        assert!(stream.next().await.is_none(), "the end");
+    }
+
+    /// A tail that lets the kept cut go waits behind no watch that holds
+    /// the lock for its cut: the lock is tried.
+    #[test]
+    fn a_tail_waits_behind_no_watch_that_takes_its_cut() {
+        let leader = leader();
+        let cutting = leader.feed.rows.lock();
+        let (done, came_back) = mpsc::channel();
+        let feed = leader.feed.clone();
+        let tail = thread::spawn(move || {
+            feed.let_go();
+            done.send(()).ok();
+        });
+        came_back
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the tail came back while a watch held the lock");
+        drop(cutting);
+        tail.join().expect("the tail's thread");
     }
 
     /// The draw is made where the lease lives in the process, whose log no
@@ -1303,5 +1559,74 @@ mod tests {
         );
         let shared = journaled(&LeasePlace::File("lease".into())).1;
         assert_eq!(shared.log.head(Kinds::Watched), Position::default());
+    }
+
+    /// The fence is read at each turn of the tail, before the log: once it
+    /// closed, a write that is none of the watcher's ends its stream too.
+    #[tokio::test]
+    async fn a_write_of_another_model_ends_a_stream_after_the_fence_closed() {
+        let mut leader = leader();
+        let mut stream = leader.watch(Start::Snapshot, &["model-b"]);
+        next(&mut stream).await;
+        assert!(leader.elector.release().expect("a release"));
+        leader.register(0, 1, "model-a");
+        assert_eq!(last_word(&mut stream).await.code(), Code::Aborted);
+        assert!(stream.next().await.is_none(), "the end");
+    }
+
+    /// The word that its replica left, told between a watch's open and its
+    /// task's first turn, is not lost: the stream ends at it.
+    #[tokio::test]
+    async fn the_word_told_before_a_streams_first_turn_ends_it() {
+        let leader = leader();
+        let mut stream = leader.watch(Start::Snapshot, &[]);
+        // The task has not run yet, and the fence is open still.
+        leader.role.send_replace(false);
+        assert_eq!(last_word(&mut stream).await.code(), Code::Aborted);
+        assert!(stream.next().await.is_none(), "the end");
+    }
+
+    /// A stream may find at its start the word of the time before the lead
+    /// it was admitted under: that its replica does not lead. That word told
+    /// again ends the stream, though it changes nothing.
+    #[tokio::test]
+    async fn the_word_told_again_ends_a_stream_that_started_under_it() {
+        let leader = leader();
+        leader.role.send_replace(false);
+        let mut stream = leader.watch(Start::Snapshot, &[]);
+        // The fence is open: the stream is served under the word it found.
+        let page = next(&mut stream).await;
+        assert!(matches!(page.event, Some(Event::Snapshot(_))), "{page:?}");
+        leader.role.send_replace(false);
+        assert_eq!(last_word(&mut stream).await.code(), Code::Aborted);
+        assert!(stream.next().await.is_none(), "the end");
+    }
+
+    /// The tail starts at the snapshot's place, not where the log stands
+    /// when the last page is handed over: a write that lands while the
+    /// pages wait on the watcher is told after them.
+    #[tokio::test]
+    async fn a_write_that_lands_while_a_snapshot_is_handed_over_is_told_after_it() {
+        let leader = leader();
+        let pages = HELD + 2;
+        for n in 0..pages {
+            leader.register_wide(n);
+        }
+        let mut stream = leader.watch(Start::Snapshot, &[]);
+        holding(&stream, HELD).await;
+        // The task stands inside its snapshot, past its cut.
+        let id = leader.register(0, 1, "model-a");
+        for _ in 0..pages {
+            let page = next(&mut stream).await;
+            assert!(
+                matches!(page.event, Some(Event::Snapshot(_))),
+                "a page of the snapshot"
+            );
+        }
+        let told = next(&mut stream).await;
+        let Some(Event::Registered(row)) = &told.event else {
+            panic!("the write after the cut: {told:?}");
+        };
+        assert_eq!(row.id, id.0);
     }
 }
