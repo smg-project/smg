@@ -794,13 +794,16 @@ impl RouterTrait for Gateway {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        mut body: ChatCompletionRequest,
+        mut body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
+        // The handler's `Arc` is the only handle at this point, so this
+        // borrows the request in place.
+        let request = Arc::make_mut(&mut body);
         let lora_model = match lora::normalize_model(
             &self.worker_registry,
-            &mut body.model,
-            &mut body.lora_path,
+            &mut request.model,
+            &mut request.lora_path,
         ) {
             Ok(model) => model,
             Err(response) => return response,
@@ -1550,9 +1553,9 @@ mod tests {
                     .route_chat(
                         None,
                         &meta,
-                        body(
+                        Arc::new(body(
                             json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
-                        ),
+                        )),
                         "m",
                     )
                     .await,

@@ -73,7 +73,6 @@ rand.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
 tonic.workspace = true
-tonic-prost.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zeromq.workspace = true
@@ -308,6 +307,11 @@ path = "benches/stream_state_machines.rs"
 name = "forced_call_stream"
 harness = false
 path = "benches/forced_call_stream.rs"
+
+[[bench]]
+name = "symphony_messages_stream"
+harness = false
+path = "benches/symphony_messages_stream.rs"
 
 [lints]
 workspace = true

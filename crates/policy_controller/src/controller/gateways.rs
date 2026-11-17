@@ -1,6 +1,7 @@
 //! Who is present (design 4.3, the stream rule): a gateway is present from
-//! its `Welcome` until its grace period ends with no new `Hello`, and its
-//! lease records live exactly that long.
+//! its `Welcome` until its grace period ends with no new `Hello`, and what
+//! the store holds under its key lives exactly that long: its lease
+//! records and its completions.
 //!
 //! Presence is read from the clock at the instant of the question, as the
 //! fence is: a gateway is present while a session of it stands and for the
@@ -21,6 +22,16 @@
 //! it held, or let go and welcomed with nothing, never welcomed and then
 //! let go. The table's lock is taken before any lock of the store.
 //!
+//! A session that was replaced applies no frame from the instant it is
+//! told: the session asks its seat before each frame, under no lock. A
+//! frame already past that question may still be written, so a gateway is
+//! not let go while a session it replaced still runs: what that frame
+//! writes lands under the row it was read for and leaves with it. A
+//! replaced session ends at its next turn; one that never ends holds the
+//! row for one period more and no longer. What it writes after that
+//! lands under a key no row holds, and stands until the gateway is
+//! welcomed and let go again.
+//!
 //! The table holds two bounds of its own. A ceiling of rows: a `Hello` that
 //! would make a new row past it is refused, so the names a listener lets in
 //! never grow the table without end; a present gateway's `Hello` makes no
@@ -29,7 +40,10 @@
 //! present gateway's key is refused, never merged into that gateway's row.
 
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Weak,
+    },
     time::{Duration, Instant},
 };
 
@@ -93,17 +107,23 @@ struct Row {
     /// When the last session ended; `None` while one stands.
     gone: Option<Instant>,
     /// Wakes the standing session when a newer one takes its place.
-    superseded: Arc<Notify>,
+    superseded: Arc<Replaced>,
+    /// The sessions a newer one replaced that have not ended yet. The
+    /// gateway is not let go under one: a frame past its question of the
+    /// seat may still be written.
+    replaced: Vec<Weak<Replaced>>,
     /// Held for as long as this presence lasts: a [`Presence`] waits for
     /// its drop.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "a decide stream subscribes to it; the Decide call is the step's next PR"
-        )
-    )]
     ended: watch::Sender<()>,
+}
+
+/// What a session is told when a newer one of its gateway takes its place.
+/// The flag is asked before every frame, under no lock; the wake ends a
+/// stream that waits.
+#[derive(Default)]
+struct Replaced {
+    told: AtomicBool,
+    wake: Notify,
 }
 
 /// A standing session's place in the table. Its drop is the session's end.
@@ -111,13 +131,19 @@ pub(crate) struct Seat {
     gateways: Arc<Gateways>,
     gateway: GatewayId,
     session: u64,
-    superseded: Arc<Notify>,
+    superseded: Arc<Replaced>,
 }
 
 impl Seat {
     /// Resolves when a newer session of the gateway took this one's place.
     pub(crate) async fn superseded(&self) {
-        self.superseded.notified().await;
+        self.superseded.wake.notified().await;
+    }
+
+    /// Whether a newer session of the gateway took this one's place: asked
+    /// before a frame is applied, under no lock.
+    pub(crate) fn replaced(&self) -> bool {
+        self.superseded.told.load(Ordering::Acquire)
     }
 
     /// The session ended at `now`, where a case names the instant.
@@ -136,23 +162,9 @@ impl Drop for Seat {
 }
 
 /// A gateway's presence as a decide stream holds it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Decide call holds one a decide stream; that call is the step's next PR"
-    )
-)]
 #[derive(Clone)]
 pub(crate) struct Presence(watch::Receiver<()>);
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Decide call ends a decide stream on it; that call is the step's next PR"
-    )
-)]
 impl Presence {
     /// Resolves when the presence ended.
     pub(crate) async fn ended(&mut self) {
@@ -182,6 +194,16 @@ impl Gateways {
     #[cfg(test)]
     pub(crate) fn ceiling(&self) -> usize {
         self.ceiling
+    }
+
+    /// How many replaced sessions the row of `gateway` notes.
+    #[cfg(test)]
+    pub(crate) fn noted(&self, gateway: GatewayId) -> usize {
+        self.table
+            .lock()
+            .rows
+            .get(&gateway)
+            .map_or(0, |row| row.replaced.len())
     }
 
     /// The grace period, as a `Welcome` tells it.
@@ -260,15 +282,21 @@ impl Gateways {
             subject: subject.to_owned(),
             session: 0,
             gone: None,
-            superseded: Arc::new(Notify::new()),
+            superseded: Arc::new(Replaced::default()),
+            replaced: Vec::new(),
             ended: watch::channel(()).0,
         });
         if row.session > 0 && row.gone.is_none() {
-            row.superseded.notify_one();
+            row.superseded.told.store(true, Ordering::Release);
+            row.superseded.wake.notify_one();
+            // The replaced session runs until it reads the word: the row
+            // waits for its end.
+            row.replaced.retain(|session| session.strong_count() > 0);
+            row.replaced.push(Arc::downgrade(&row.superseded));
         }
         row.session = session;
         row.gone = None;
-        row.superseded = Arc::new(Notify::new());
+        row.superseded = Arc::new(Replaced::default());
         Ok(Seat {
             gateways: Arc::clone(self),
             gateway,
@@ -279,13 +307,6 @@ impl Gateways {
 
     /// The gateway's presence at `now` for a decide stream's open: `None`
     /// when it is not present. No decision asks: a stream's open and end do.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Decide call asks it at a decide stream's open; that call is the step's next PR"
-        )
-    )]
     pub(crate) fn presence(&self, gateway: GatewayId, now: Instant) -> Option<Presence> {
         let mut table = self.table.lock();
         Self::observe(&mut table, self.fence.leader_term(now), now);
@@ -294,8 +315,8 @@ impl Gateways {
     }
 
     /// One pass of the sweep at `now`: every gateway whose period is over
-    /// is let go. Returns how many. A replica that does not lead at `now`
-    /// lets nothing go.
+    /// is let go. Returns how many were let go. A replica that does not
+    /// lead at `now` lets nothing go.
     pub(crate) fn sweep(&self, now: Instant) -> usize {
         let mut table = self.table.lock();
         if !Self::observe(&mut table, self.fence.leader_term(now), now) {
@@ -353,15 +374,27 @@ impl Gateways {
         term.is_some()
     }
 
-    /// Whether the row's grace period is over at `now`.
+    /// Whether the row is over at `now`: its grace period past with no
+    /// session a newer one replaced still running, or twice the period
+    /// past whatever runs. A replaced session is told at its replacement
+    /// and ends at its next turn; one that never ends holds its gateway's
+    /// row for one period more and no longer.
     fn over(&self, row: &Row, now: Instant) -> bool {
-        row.gone
-            .is_some_and(|gone| now.saturating_duration_since(gone) >= self.grace)
+        row.gone.is_some_and(|gone| {
+            let silent = now.saturating_duration_since(gone);
+            let runs = || {
+                row.replaced
+                    .iter()
+                    .any(|session| session.strong_count() > 0)
+            };
+            silent >= self.grace.saturating_mul(2) || (silent >= self.grace && !runs())
+        })
     }
 
-    /// The end of a presence, under the table's lock: the gateway's lease
-    /// records are released, then the row goes and its decide streams are
-    /// told.
+    /// The end of a presence, under the table's lock: the store lets go
+    /// what it holds under the gateway's key through its one door for a
+    /// gone gateway (its lease records and its completions), then the row
+    /// goes and its decide streams are told.
     fn end(&self, gateway: GatewayId, row: Row) {
         let leases = self.store.drop_gateway(gateway);
         info!(
@@ -395,9 +428,13 @@ pub(crate) mod tests {
 
     use super::{Gateways, Refused, Seat};
     use crate::{
-        elector::{ElectionSettings, Elector, MemoryLease, Tick},
+        controller::lifecycle::{
+            self,
+            tests::{a_completed, worker},
+        },
+        elector::{ElectionSettings, Elector, Tick},
         lease::{Lease, LeaseId},
-        store::{GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore},
+        store::{GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore},
         view::WorkerId,
     };
 
@@ -419,8 +456,8 @@ pub(crate) mod tests {
         renew_deadline: Duration::from_secs(1800),
     };
 
-    /// A candidate that took its own lease at the returned instant, a store,
-    /// and the table over that candidate's fence and that store.
+    /// A candidate that leads under its own lease from the returned instant,
+    /// a store, and the table over that candidate's fence and that store.
     pub(crate) fn leading(grace: Duration) -> (Elector, Arc<MemoryStore>, Arc<Gateways>, Instant) {
         ceiled(grace, 1_024)
     }
@@ -430,17 +467,11 @@ pub(crate) mod tests {
         grace: Duration,
         ceiling: usize,
     ) -> (Elector, Arc<MemoryStore>, Arc<Gateways>, Instant) {
-        let mut elector = Elector::new(
-            Box::new(MemoryLease::new()),
-            "controller-0@10.0.0.7:30100",
-            PATIENT,
-        )
-        .expect("the settings are in order");
+        let mut elector = Elector::alone("controller-0@10.0.0.7:30100", PATIENT)
+            .expect("the settings are in order");
         let taken = Instant::now();
-        assert_eq!(
-            elector.tick(taken).expect("the take"),
-            Tick::Acquired { term: 1 }
-        );
+        elector.lead_at(taken);
+        assert_eq!(elector.fence().leader_term(taken), Some(1));
         let store = Arc::new(MemoryStore::new());
         let gateways = Arc::new(Gateways::new(
             grace,
@@ -546,6 +577,140 @@ pub(crate) mod tests {
                 .is_err(),
             "a presence that stands resolves no handle"
         );
+    }
+
+    /// What the store holds under a gateway's key ends with its presence:
+    /// its completions with its lease records, and no other gateway's.
+    #[test]
+    fn a_gateway_let_go_leaves_no_completion_in_the_store() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let served = worker(&store, "http://a:8000");
+        let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let _stands = welcomed(&gateways, B, "gateway-b", TERM, t0);
+        for gateway in [A, B] {
+            lifecycle::completed(&store, gateway, &a_completed(1, served), t0)
+                .expect("the frame reads");
+        }
+        gone.end(t0);
+
+        assert_eq!(gateways.sweep(t0 + GRACE - MS), 0);
+        assert!(
+            store.completed_ok_since(A, served, t0),
+            "inside the period nothing is let go"
+        );
+        assert_eq!(gateways.sweep(t0 + GRACE), 1);
+        assert!(
+            !store.completed_ok_since(A, served, t0),
+            "the gateway's completion went with it"
+        );
+        assert!(
+            store.completed_ok_since(B, served, t0),
+            "another gateway's stands"
+        );
+    }
+
+    /// A `Hello` past the grace period lets the gateway go before it is
+    /// welcomed anew, with no pass of the sweep between: the new presence
+    /// starts with no completion of the one that ended.
+    #[test]
+    fn a_gateway_welcomed_anew_past_its_grace_period_starts_with_no_completion() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let served = worker(&store, "http://a:8000");
+        let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        lifecycle::completed(&store, A, &a_completed(1, served), t0).expect("the frame reads");
+        gone.end(t0);
+
+        let _anew = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE);
+        assert!(
+            !store.completed_ok_since(A, served, t0),
+            "the completion ended with the presence that wrote it"
+        );
+        assert_eq!(store.health_entries(), 0);
+    }
+
+    /// A frame of a replaced session that is past the seat's question may
+    /// still be written. The gateway is not let go while that session
+    /// runs: what the frame writes lands under the row it was read for and
+    /// leaves with it.
+    #[test]
+    fn a_gateway_is_not_let_go_while_a_session_it_replaced_still_runs() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let served = worker(&store, "http://a:8000");
+        let first = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let second = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
+        assert!(first.replaced() && second.replaced());
+        assert_eq!(gateways.sweep(t0 + GRACE), 0, "two replaced sessions run");
+        assert!(gateways.presence(A, t0 + GRACE).is_some());
+
+        // The later of the two ends first: the earlier one holds the row.
+        drop(second);
+        assert_eq!(gateways.sweep(t0 + GRACE), 0, "a replaced session runs");
+        // Its late frame, then its end.
+        lifecycle::completed(&store, A, &a_completed(1, served), t0 + GRACE)
+            .expect("the frame reads");
+        drop(first);
+        assert_eq!(gateways.sweep(t0 + GRACE), 1);
+        assert!(
+            !store.completed_ok_since(A, served, t0),
+            "the late frame's completion left with the row"
+        );
+        assert_eq!(store.health_entries(), 0);
+    }
+
+    /// A replaced session that never ends holds its gateway's row for one
+    /// period more and no longer: the gateway is let go two periods after
+    /// its last session ended, whatever still runs.
+    #[test]
+    fn a_replaced_session_that_never_ends_holds_its_gateway_one_period_more() {
+        let (_elector, _store, gateways, t0) = leading(GRACE);
+        let never_ends = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        welcomed(&gateways, A, "gateway-a", TERM, t0).end(t0);
+        assert_eq!(gateways.sweep(t0 + 2 * GRACE - MS), 0, "one period more");
+        assert!(gateways.presence(A, t0 + 2 * GRACE - MS).is_some());
+        assert_eq!(gateways.sweep(t0 + 2 * GRACE), 1, "and no longer");
+        assert!(gateways.presence(A, t0 + 2 * GRACE).is_none());
+        drop(never_ends);
+    }
+
+    /// A row notes only the replaced sessions that still run: a gateway
+    /// that says Hello again and again grows no row.
+    #[test]
+    fn a_row_keeps_no_note_of_a_replaced_session_that_ended() {
+        let (_elector, _store, gateways, t0) = leading(GRACE);
+        let mut stands = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        for _ in 0..8 {
+            let newer = welcomed(&gateways, A, "gateway-a", TERM, t0);
+            // The replaced session ends on the word.
+            drop(stands);
+            stands = newer;
+        }
+        assert_eq!(gateways.noted(A), 1, "the session the last Hello replaced");
+        drop(stands);
+    }
+
+    /// The completions on file are bounded by who is present, never by who
+    /// was ever welcomed: waves of gateways under the table's ceiling, each
+    /// reporting a completion and let go, leave nothing behind.
+    #[test]
+    fn the_completions_on_file_do_not_grow_with_the_gateways_ever_welcomed() {
+        let (_elector, store, gateways, t0) = ceiled(GRACE, 8);
+        let served = worker(&store, "http://a:8000");
+        let mut now = t0;
+        for wave in 0..5_u64 {
+            for n in 0..8_u64 {
+                let gateway = GatewayId(100 + wave * 8 + n);
+                let subject = format!("gateway-{wave}-{n}");
+                let seat = welcomed(&gateways, gateway, &subject, TERM, now);
+                lifecycle::completed(&store, gateway, &a_completed(1, served), now)
+                    .expect("the frame reads");
+                seat.end(now);
+            }
+            assert_eq!(store.health_entries(), 8, "a completion a gateway");
+            now += GRACE;
+            assert_eq!(gateways.sweep(now), 8);
+            assert_eq!(store.health_entries(), 0, "wave {wave}");
+        }
     }
 
     /// A welcome and a letting-go of one gateway at one instant are
@@ -703,19 +868,20 @@ pub(crate) mod tests {
 
     /// A session's number is its alone for the table's life: the late end
     /// of a session that an earlier presence replaced is no end of the
-    /// session that stands now.
+    /// session that stands now. A replaced session reaches a later
+    /// presence only by outliving two periods.
     #[test]
     fn a_replaced_sessions_late_end_is_no_end_of_a_later_presences_session() {
         let (_elector, _store, gateways, t0) = leading(GRACE);
         let first = welcomed(&gateways, A, "gateway-a", TERM, t0);
         let second = welcomed(&gateways, A, "gateway-a", TERM, t0 + MS);
         second.end(t0 + 2 * MS);
-        assert_eq!(gateways.sweep(t0 + 2 * MS + GRACE), 1);
+        assert_eq!(gateways.sweep(t0 + 2 * MS + 2 * GRACE), 1);
 
         // A new presence, and only then the end of the replaced session.
-        let third = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE + 3 * MS);
-        first.end(t0 + GRACE + 4 * MS);
-        let later = t0 + 3 * GRACE;
+        let third = welcomed(&gateways, A, "gateway-a", TERM, t0 + 2 * GRACE + 3 * MS);
+        first.end(t0 + 2 * GRACE + 4 * MS);
+        let later = t0 + 5 * GRACE;
         assert!(gateways.presence(A, later).is_some(), "its session stands");
         assert_eq!(gateways.sweep(later), 0);
         drop(third);

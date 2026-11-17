@@ -33,14 +33,17 @@ use axum::{
     Json,
 };
 #[cfg(feature = "axum")]
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 #[cfg(feature = "axum")]
 use serde_json::{json, Value};
 #[cfg(feature = "axum")]
 use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
 #[cfg(feature = "axum")]
-use crate::common::FIELD_PARAM;
+use crate::{
+    common::FIELD_PARAM,
+    strict_value::{entries_with, StrictValue},
+};
 
 /// A JSON extractor that automatically validates and normalizes the request body
 ///
@@ -64,10 +67,73 @@ pub struct ValidatedJson<T>(pub T);
 /// A body a route reads as a JSON value and checks itself (the Conversations
 /// routes): it rides the validated extractor for the envelope its refusals
 /// take, with nothing to validate or normalize before the handler sees it.
+/// A repeated key is refused as a typed body's is, at the body's own keys
+/// and at any depth below them; the keys of `metadata` keep the last value,
+/// as that map's do in a typed body.
 #[cfg(feature = "axum")]
-#[derive(Debug, serde::Deserialize)]
-#[serde(transparent)]
+#[derive(Debug)]
 pub struct ValueBody(pub Value);
+
+#[cfg(feature = "axum")]
+impl<'de> serde::Deserialize<'de> for ValueBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(BodyVisitor).map(ValueBody)
+    }
+}
+
+/// [`ValueBody`]'s reader. The `metadata` member of the body's own object is
+/// left to [`Value`]'s own reader, as a typed body's `metadata` map is read:
+/// a repeated key of that map answers the same on every route.
+#[cfg(feature = "axum")]
+struct BodyVisitor;
+
+#[cfg(feature = "axum")]
+impl<'de> Visitor<'de> for BodyVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        StrictValue.expecting(formatter)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+        StrictValue.visit_bool(value)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+        StrictValue.visit_i64(value)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+        StrictValue.visit_u64(value)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+        StrictValue.visit_f64(value)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+        StrictValue.visit_str(value)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+        StrictValue.visit_unit()
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, elements: A) -> Result<Value, A::Error> {
+        StrictValue.visit_seq(elements)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Value, A::Error> {
+        entries_with(&mut entries, |key, entries| {
+            if key == "metadata" {
+                entries.next_value()
+            } else {
+                entries.next_value_seed(StrictValue)
+            }
+        })
+        .map(Value::Object)
+    }
+}
 
 #[cfg(feature = "axum")]
 impl Validate for ValueBody {
@@ -615,20 +681,31 @@ pub fn undecodable_content_encoding(req: &Request) -> Option<String> {
         .find(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
 }
 
-/// The most of a refused coding the 415 message echoes: a header value is
-/// the client's own text, cut here so that the message stays one line.
+/// The most of a client's header value a refusal's message echoes: the
+/// value is the client's own text, cut here so that the message stays one
+/// line.
 #[cfg(feature = "axum")]
-const CONTENT_ENCODING_ECHO_CHARS: usize = 64;
+const HEADER_ECHO_CHARS: usize = 64;
+
+/// A header value as a refusal's message echoes it: a value longer than the
+/// echo bound, counted in characters, is cut there and the cut marked.
+#[cfg(feature = "axum")]
+pub fn header_echo(value: &str) -> String {
+    let mut chars = value.chars();
+    let mut shown: String = chars.by_ref().take(HEADER_ECHO_CHARS).collect();
+    if chars.next().is_some() {
+        shown.push_str("...");
+    }
+    shown
+}
 
 /// The message of the 415 a JSON body under an encoding the gateway does
-/// not decode is answered with; a coding longer than the echo bound is cut
-/// there and the cut marked.
+/// not decode is answered with; the coding is echoed as [`header_echo`]
+/// shows it.
 #[cfg(feature = "axum")]
 pub fn content_encoding_message(encoding: &str) -> String {
-    let mut chars = encoding.chars();
-    let shown: String = chars.by_ref().take(CONTENT_ENCODING_ECHO_CHARS).collect();
-    let cut = if chars.next().is_some() { "..." } else { "" };
-    format!("Content-Encoding `{shown}{cut}` is not decoded: send the JSON body unencoded")
+    let echo = header_echo(encoding);
+    format!("Content-Encoding `{echo}` is not decoded: send the JSON body unencoded")
 }
 
 /// The 415 with its `Accept-Encoding: identity`, the header by which a
@@ -1139,27 +1216,27 @@ mod tests {
             content_encoding_message("gzip"),
             "Content-Encoding `gzip` is not decoded: send the JSON body unencoded"
         );
-        let at_the_bound = "y".repeat(CONTENT_ENCODING_ECHO_CHARS);
+        let at_the_bound = "y".repeat(HEADER_ECHO_CHARS);
         assert!(
             content_encoding_message(&at_the_bound).contains(&format!("`{at_the_bound}`")),
             "a coding at the bound is echoed whole"
         );
-        let long = "x".repeat(CONTENT_ENCODING_ECHO_CHARS + 1);
+        let long = "x".repeat(HEADER_ECHO_CHARS + 1);
         assert_eq!(
             content_encoding_message(&long),
             format!(
                 "Content-Encoding `{}...` is not decoded: send the JSON body unencoded",
-                "x".repeat(CONTENT_ENCODING_ECHO_CHARS)
+                "x".repeat(HEADER_ECHO_CHARS)
             )
         );
         // The bound counts characters, not bytes: an obs-text byte of the header
         // reaches the helper as the three-byte replacement character.
-        let accented = "é".repeat(CONTENT_ENCODING_ECHO_CHARS + 1);
+        let accented = "é".repeat(HEADER_ECHO_CHARS + 1);
         assert_eq!(
             content_encoding_message(&accented),
             format!(
                 "Content-Encoding `{}...` is not decoded: send the JSON body unencoded",
-                "é".repeat(CONTENT_ENCODING_ECHO_CHARS)
+                "é".repeat(HEADER_ECHO_CHARS)
             ),
             "the cut is counted in characters"
         );
@@ -1673,6 +1750,44 @@ mod tests {
         }
     }
 
+    /// A key repeated inside a chat content part is refused with serde's
+    /// words: the param is the message serde's path stops at and the part's
+    /// place is in the words, as for any part refusal that is no missing
+    /// field; the legacy `function_call` object answers at its own path. The
+    /// code is `json_parse_error`: the reason table names no duplicate field.
+    #[tokio::test]
+    async fn a_repeated_key_inside_a_chat_content_part_is_refused() {
+        use crate::chat::ChatCompletionRequest;
+
+        for (body, param, message) in [
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a","text":"b"}]}]}"#,
+                "messages[0]",
+                "messages[0]: duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"a"},{"type":"text","text":"a","text":"b"}]}]}"#,
+                "messages[1]",
+                "messages[1]: duplicate field `text`, in `content[1]`",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"function_call":{"name":"f","name":"g"}}"#,
+                "function_call",
+                "function_call: duplicate field `name`",
+            ),
+        ] {
+            let (status, json) = rejected::<ChatCompletionRequest>(body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], "json_parse_error", "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+    }
+
     /// A repeated key below an input item's own keys is refused at its
     /// place: serde's words, the path the extractor's tracker recorded
     /// through the nested read; the item's own keys answer `input[0]`. The
@@ -1709,6 +1824,62 @@ mod tests {
             assert!(
                 text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
                 "{text}"
+            );
+        }
+    }
+
+    /// A Conversations body refuses a repeated key as the Responses door
+    /// refuses one: at the body's own keys (no place to name, as for a typed
+    /// body's own), at an item's keys and at any depth below them (the place
+    /// the extractor's tracker recorded). The keys of `metadata` keep the
+    /// last value, as that map's do on every door, and a body that is no
+    /// object is read whole for the handler to refuse.
+    #[tokio::test]
+    async fn a_value_body_refuses_a_repeated_key_outside_metadata_at_its_place() {
+        for (body, param, message) in [
+            (
+                r#"{"metadata":{"a":"1"},"metadata":{"a":"2"}}"#,
+                Value::Null,
+                "duplicate field `metadata`",
+            ),
+            (
+                r#"{"items":[{"type":"message","role":"user","content":"hi","role":"system"}]}"#,
+                json!("items[0]"),
+                "items[0]: duplicate field `role`",
+            ),
+            (
+                r#"{"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}]}"#,
+                json!("items[0].content[0]"),
+                "items[0].content[0]: duplicate field `text`",
+            ),
+        ] {
+            let (status, json) = rejected::<ValueBody>(body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], "json_parse_error", "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+        for (body, read) in [
+            (
+                r#"{"metadata":{"a":"1","a":"2"}}"#,
+                json!({"metadata": {"a": "2"}}),
+            ),
+            ("[1]", json!([1])),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_default();
+            let accepted = ValidatedJson::<ValueBody>::from_request(request, &()).await;
+            assert!(
+                matches!(&accepted, Ok(ValidatedJson(ValueBody(value))) if *value == read),
+                "{body}"
             );
         }
     }

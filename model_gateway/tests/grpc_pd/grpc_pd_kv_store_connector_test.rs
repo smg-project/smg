@@ -157,7 +157,9 @@ async fn one_streaming_chat(router: &dyn RouterTrait) -> (http::StatusCode, Stri
         "stream": true,
     }))
     .unwrap();
-    let response = router.route_chat(None, &tenant(), request, MODEL).await;
+    let response = router
+        .route_chat(None, &tenant(), Arc::new(request), MODEL)
+        .await;
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await

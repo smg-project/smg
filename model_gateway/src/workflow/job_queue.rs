@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap, DashSet};
 use openai_protocol::worker::{
     ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
@@ -19,12 +20,12 @@ use openai_protocol::worker::{
 use smg_mcp::McpConfig;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
-use wfaas::{StateStore, WorkflowError, WorkflowId, WorkflowStatus};
+use wfaas::{StateStore, WorkflowData, WorkflowEngine, WorkflowError, WorkflowId, WorkflowStatus};
 
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
-    worker::{identity::endpoint::Endpoint, registry::WorkerId},
+    worker::{health::manager::WorkerJobs, identity::endpoint::Endpoint, registry::WorkerId},
     workflow::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
@@ -1149,6 +1150,27 @@ impl JobQueue {
         own_id.is_some_and(|id| marks.remove(id).is_some())
     }
 
+    /// Start the `workflow` definition on `engine` with `data`, log the
+    /// instance under `label`, and wait for it to end within `timeout`.
+    /// `what` names the workflow in the start failure and in the log line.
+    async fn run_workflow<D: WorkflowData, S: StateStore<D> + 'static>(
+        engine: &WorkflowEngine<D, S>,
+        workflow: &'static str,
+        what: &str,
+        label: &str,
+        data: D,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let instance_id = engine
+            .start_workflow(WorkflowId::new(workflow), data)
+            .await
+            .map_err(|e| format!("Failed to start {what} workflow: {e:?}"))?;
+        debug!("Started {what} workflow for {label} (instance: {instance_id})");
+        engine
+            .wait_for_completion(instance_id, label, timeout)
+            .await
+    }
+
     /// Execute a specific job
     async fn execute_job(
         job: &Job,
@@ -1269,24 +1291,15 @@ impl JobQueue {
                     Arc::clone(context),
                 );
 
-                let instance_id = engines
-                    .worker_update
-                    .start_workflow(WorkflowId::new("worker_update"), workflow_data)
-                    .await
-                    .map_err(|e| format!("Failed to start worker update workflow: {e:?}"))?;
-
-                debug!(
-                    "Started worker update workflow for {} (instance: {})",
-                    Endpoint::redacted_str(url),
-                    instance_id
-                );
-
-                let timeout_duration = Duration::from_secs(30);
-
-                engines
-                    .worker_update
-                    .wait_for_completion(instance_id, &Job::workflow_label(url), timeout_duration)
-                    .await
+                Self::run_workflow(
+                    &engines.worker_update,
+                    "worker_update",
+                    "worker update",
+                    &Job::workflow_label(url),
+                    workflow_data,
+                    Duration::from_secs(30),
+                )
+                .await
             }
             Job::RefreshWorkerLabels { url } => {
                 let engines = context
@@ -1307,26 +1320,15 @@ impl JobQueue {
                 );
                 workflow_data.refresh_discovered_labels = true;
 
-                let instance_id = engines
-                    .worker_update
-                    .start_workflow(WorkflowId::new("worker_update"), workflow_data)
-                    .await
-                    .map_err(|e| format!("Failed to start worker label refresh workflow: {e:?}"))?;
-
-                debug!(
-                    "Started worker label refresh workflow for {} (instance: {})",
-                    Endpoint::redacted_str(url),
-                    instance_id
-                );
-
-                engines
-                    .worker_update
-                    .wait_for_completion(
-                        instance_id,
-                        &Job::workflow_label(url),
-                        Duration::from_secs(30),
-                    )
-                    .await
+                Self::run_workflow(
+                    &engines.worker_update,
+                    "worker_update",
+                    "worker label refresh",
+                    &Job::workflow_label(url),
+                    workflow_data,
+                    Duration::from_secs(30),
+                )
+                .await
             }
             Job::RemoveWorker {
                 url,
@@ -1391,25 +1393,15 @@ impl JobQueue {
                 let workflow_data =
                     create_wasm_registration_workflow_data(*config.clone(), Arc::clone(context));
 
-                let instance_id = engines
-                    .wasm_registration
-                    .start_workflow(WorkflowId::new("wasm_module_registration"), workflow_data)
-                    .await
-                    .map_err(|e| {
-                        format!("Failed to start WASM module registration workflow: {e:?}")
-                    })?;
-
-                debug!(
-                    "Started WASM module registration workflow for {} (instance: {})",
-                    config.descriptor.name, instance_id
-                );
-
-                let timeout_duration = Duration::from_secs(300); // 5 minutes
-
-                engines
-                    .wasm_registration
-                    .wait_for_completion(instance_id, &config.descriptor.name, timeout_duration)
-                    .await
+                Self::run_workflow(
+                    &engines.wasm_registration,
+                    "wasm_module_registration",
+                    "WASM module registration",
+                    &config.descriptor.name,
+                    workflow_data,
+                    Duration::from_secs(300), // 5 minutes
+                )
+                .await
             }
             Job::RemoveWasmModule { request } => {
                 let engines = context
@@ -1420,27 +1412,15 @@ impl JobQueue {
                 let workflow_data =
                     create_wasm_removal_workflow_data(*request.clone(), Arc::clone(context));
 
-                let instance_id = engines
-                    .wasm_removal
-                    .start_workflow(WorkflowId::new("wasm_module_removal"), workflow_data)
-                    .await
-                    .map_err(|e| format!("Failed to start WASM module removal workflow: {e:?}"))?;
-
-                debug!(
-                    "Started WASM module removal workflow for {} (instance: {})",
-                    request.module_uuid, instance_id
-                );
-
-                let timeout_duration = Duration::from_secs(60); // 1 minute
-
-                engines
-                    .wasm_removal
-                    .wait_for_completion(
-                        instance_id,
-                        &request.module_uuid.to_string(),
-                        timeout_duration,
-                    )
-                    .await
+                Self::run_workflow(
+                    &engines.wasm_removal,
+                    "wasm_module_removal",
+                    "WASM module removal",
+                    &request.module_uuid.to_string(),
+                    workflow_data,
+                    Duration::from_secs(60), // 1 minute
+                )
+                .await
             }
             Job::InitializeWorkersFromConfig { router_config } => {
                 let api_key = router_config.api_key.clone();
@@ -1584,23 +1564,15 @@ impl JobQueue {
                 let workflow_data =
                     create_mcp_workflow_data((**config).clone(), Arc::clone(context));
 
-                let instance_id = engines
-                    .mcp
-                    .start_workflow(WorkflowId::new("mcp_registration"), workflow_data)
-                    .await
-                    .map_err(|e| format!("Failed to start MCP registration workflow: {e:?}"))?;
-
-                debug!(
-                    "Started MCP registration workflow for {} (instance: {})",
-                    config.name, instance_id
-                );
-
-                let timeout_duration = Duration::from_secs(7200 + 30); // 2hr + margin
-
-                engines
-                    .mcp
-                    .wait_for_completion(instance_id, &config.name, timeout_duration)
-                    .await
+                Self::run_workflow(
+                    &engines.mcp,
+                    "mcp_registration",
+                    "MCP registration",
+                    &config.name,
+                    workflow_data,
+                    Duration::from_secs(7200 + 30), // 2hr + margin
+                )
+                .await
             }
             Job::AddTokenizer { config } => {
                 // The load was counted in flight at submission; its end is
@@ -1792,6 +1764,30 @@ impl JobQueue {
                 status_map.len()
             );
         }
+    }
+}
+
+#[async_trait]
+impl WorkerJobs for JobQueue {
+    async fn remove_worker(
+        &self,
+        url: String,
+        worker_id: &WorkerId,
+        revision: u64,
+    ) -> Result<(), String> {
+        // Guard the failed worker by its own id. The url is a DP base, so the
+        // removal step matches the whole rank group; a bare revision would take
+        // out every sibling that happens to sit at the same revision.
+        let expected_revisions = HashMap::from([(worker_id.as_str().to_string(), Some(revision))]);
+        self.submit(Job::RemoveWorker {
+            url,
+            expected_revisions: Some(expected_revisions),
+        })
+        .await
+    }
+
+    async fn refresh_worker_labels(&self, url: String) -> Result<bool, String> {
+        self.submit_or_defer(Job::RefreshWorkerLabels { url }).await
     }
 }
 
@@ -3894,5 +3890,48 @@ mod tests {
             kept_removal_pins(&kept, url),
             Some(pins(&[("a", Some(1)), ("b", Some(2))]))
         );
+    }
+
+    /// The health manager's removal reaches the removal workflow under the
+    /// revisions it names: a worker named at another revision stays
+    /// registered, and it goes once it is named at its own.
+    #[tokio::test]
+    async fn a_health_removal_runs_under_the_revisions_it_names() {
+        use crate::{
+            service_discovery::testing::live_app_context,
+            worker::{BasicWorkerBuilder, Worker},
+        };
+
+        async fn ended(queue: &JobQueue, url: &str) {
+            while queue
+                .get_status(url)
+                .is_some_and(|status| matches!(status.status.as_str(), "pending" | "processing"))
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        let context = live_app_context();
+        let registry = &context.worker_registry;
+        let queue = context.worker_job_queue.get().expect("the live queue");
+        let url = "http://w:8000";
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+        let id = registry
+            .register(Arc::clone(&worker))
+            .expect("the worker registers");
+        for (revision, stays) in [(worker.revision() + 1, true), (worker.revision(), false)] {
+            queue
+                .remove_worker(url.to_string(), &id, revision)
+                .await
+                .expect("the removal is queued");
+            tokio::time::timeout(Duration::from_secs(30), ended(queue, url))
+                .await
+                .expect("the removal ends");
+            assert_eq!(
+                registry.get_by_url(url).is_some(),
+                stays,
+                "named at revision {revision}"
+            );
+        }
     }
 }

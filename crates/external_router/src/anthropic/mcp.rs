@@ -698,6 +698,7 @@ fn build_assistant_content_blocks(
                     block_type: "tool_reference".to_string(),
                     tool_name: tool_name.clone(),
                     description: description.clone(),
+                    cache_control: None,
                 }));
             }
             // MCP blocks are handled separately by rebuild_response_with_mcp_blocks

@@ -8,8 +8,10 @@ name: PR Policy Controller Image
 # under the security context the Helm chart gives it, its probes read, a
 # clean stop and a log with no escape byte. The chart's controller cases then
 # run on the binary copied out of the image: every argument the chart renders
-# is parsed by the binary the image ships. Nothing is pushed and no cache is
-# saved.
+# is parsed by the binary the image ships. The example controller's image
+# (examples/policy-controller) is then built by the same file, as its guide
+# builds it, and started: its log names the scorer the example adds. Nothing
+# is pushed and no cache is saved.
 on:
   pull_request:
     paths:
@@ -17,11 +19,15 @@ on:
       - 'crates/policy_controller/Cargo.toml'
       - 'crates/policy_controller/build.rs'
       - 'crates/policy_controller/src/**'
+      # The index crate the binary links.
+      - 'crates/kv_index/**'
       # The contracts: the binary's protocol and plugin bindings are compiled
       # from them, the protocol's with the engine wire's messages it imports.
       - 'crates/policy_controller/contracts/**'
       - 'crates/grpc_client/proto/common.proto'
       - 'rust-toolchain.toml'
+      # The example controller, whose image the last steps build.
+      - 'examples/policy-controller/**'
       # What the chart's controller cases read: the cases, what configures
       # their run and what a render reads. The chart's alert rule tests are
       # read by no case and start nothing here. Its README is read by one
@@ -52,6 +58,7 @@ jobs:
     timeout-minutes: 45
     env:
       IMAGE: smg-policy-controller:pr
+      EXAMPLE_IMAGE: policy-controller-example:pr
     steps:
       - uses: actions/checkout@v7
         with:
@@ -149,6 +156,48 @@ jobs:
             exit 1
           fi
 
+      # The example controller's image, by its guide's own line: the same
+      # file with PACKAGE naming the example's package. The layers up to the
+      # source are the stock build's, and the example is compiled. It starts
+      # under the same security context, and its start-up line names the
+      # scorer the example adds, which the stock binary does not hold.
+      - name: Build the example controller's image
+        run: >-
+          docker build --progress plain --file docker/policy-controller.Dockerfile
+          --build-arg PACKAGE=policy-controller-example --tag "$EXAMPLE_IMAGE" .
+
+      - name: Start the example controller, read its stages and stop it
+        run: |
+          docker run --detach --name example \
+            --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --publish 127.0.0.1:30113:30103 "$EXAMPLE_IMAGE"
+          for _ in $(seq 1 30); do
+            if curl -fs --max-time 2 -o /dev/null http://127.0.0.1:30113/liveness; then
+              break
+            fi
+            [ "$(docker inspect --format '{{.State.Running}}' example)" = "true" ] || break
+            sleep 1
+          done
+          for path in liveness readiness; do
+            curl -fsS --max-time 5 "http://127.0.0.1:30113/${path}"
+            echo
+          done
+          docker stop -t 60 example
+          code="$(docker inspect --format '{{.State.ExitCode}}' example)"
+          if [ "$code" != "0" ]; then
+            echo "::error::the example controller exited ${code} after SIGTERM"
+            exit 1
+          fi
+          docker logs example > "${RUNNER_TEMP}/example.log" 2>&1
+          if ! grep -q 'stages held.*"pack"' "${RUNNER_TEMP}/example.log"; then
+            echo "::error::the example controller's start-up line names no pack scorer"
+            exit 1
+          fi
+
       - name: The controller's log
         if: always()
         run: docker logs controller || true
+
+      - name: The example controller's log
+        if: always()
+        run: docker logs example || true

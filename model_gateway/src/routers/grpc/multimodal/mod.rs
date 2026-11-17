@@ -93,7 +93,7 @@ pub(crate) use inflight::{
 pub(crate) use item_limits::engine_item_limits;
 pub(crate) use plan::{
     anchor_rendered_markers, prepare_placeholder_tokens, resolve_media_part_order,
-    validate_rendered_media_anchors, MediaPlan, PlaceholderTokens,
+    validate_rendered_media_anchors, MediaPlan, PlaceholderTokens, RequestRefusal,
 };
 pub(crate) use process::process_multimodal_plan;
 pub(crate) use refs::{
@@ -132,8 +132,8 @@ pub(crate) fn assembly_error_response(error: &anyhow::Error) -> Response {
 /// failure with no connector verdict reads that error's own text when the
 /// chain carries one, and the whole chain otherwise: the frames that say what
 /// failed (the config read, the replacement index, the panic) stay in the
-/// client's sentence. The whole chain, stage frames included, is the ERROR
-/// log line's at the call site.
+/// client's sentence. The whole chain, stage frames included, is the log
+/// line's at the call site.
 pub(crate) fn processing_failed_message(error: &anyhow::Error) -> String {
     let cause = if let Some(media) = media_verdict(error) {
         media.to_string()
@@ -219,6 +219,19 @@ pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
     } else {
         error::bad_request(PIPELINE_CODE, message)
     }
+}
+
+/// Whether `error` carries an explicit verdict that the request's own media
+/// is at fault: the connector's client verdict, an item over the encoder's
+/// budget, or a video part on a process that cannot decode video. A failure
+/// with no verdict in its chain does not, though [`processing_failed_response`]
+/// answers it 400 too: that class also holds a model configuration this host
+/// could not load and a processor's own fault, which the client cannot fix.
+pub(crate) fn is_request_media_fault(error: &anyhow::Error) -> bool {
+    encoder_budget::ItemOverEncoderBudget::is(error)
+        || process::VideoDecoderUnavailable::is(error)
+        || (!HubFetchError::is(error)
+            && media_verdict(error).is_some_and(|media| media.fault() == MediaFault::Client))
 }
 
 /// The client's answer when the model's hub failed to serve a configuration
@@ -907,5 +920,32 @@ mod tests {
                 "{gauge} is set by the second report:\n{rendered}"
             );
         }
+    }
+
+    /// The verdict the processing arm writes its WARN on: the connector's
+    /// client verdict (also under a context), an item over the encoder's
+    /// budget and a video part without a decoder are the request's own
+    /// media; a failure with no verdict in its chain is not.
+    #[test]
+    fn only_an_explicit_verdict_makes_a_failure_the_requests_media() {
+        let refused = anyhow::Error::new(MediaConnectorError::InvalidUrl("x".to_string()))
+            .context("Failed to finalize multimodal tracker");
+        assert!(super::is_request_media_fault(&refused));
+        assert!(super::is_request_media_fault(&anyhow::Error::new(
+            super::process::VideoDecoderUnavailable { why: "no decoder" }
+        )));
+        assert!(super::is_request_media_fault(&anyhow::Error::new(
+            ItemOverEncoderBudget {
+                modality: Modality::Image,
+                position: 1,
+                count: 1,
+                feature_tokens: 2,
+                sampled_frames: None,
+                budget: 1,
+            }
+        )));
+        assert!(!super::is_request_media_fault(&anyhow::anyhow!(
+            "Image preprocessing failed"
+        )));
     }
 }

@@ -1178,6 +1178,44 @@ mod tests {
         Inkling2ImageProcessor::validate_config(&loaded.preprocessor_config).unwrap();
     }
 
+    #[tokio::test]
+    async fn registry_loads_released_processor_config_section() {
+        use llm_multimodal::vision::processors::Inkling2ImageProcessor;
+
+        // The released checkpoint ships only processor_config.json.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("config.json"),
+            r#"{"model_type":"inkling2"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            serde_json::json!({
+                "image_processor": {
+                    "do_convert_rgb": true,
+                    "do_normalize": true,
+                    "do_rescale": true,
+                    "image_mean": [0.5, 0.5, 0.5],
+                    "image_processor_type": "Inkling2ImageProcessor",
+                    "image_std": [0.5, 0.5, 0.5],
+                    "rescale_factor": 0.00392156862745098,
+                    "size": {"height": 40, "width": 40}
+                },
+                "image_token": "<|unused_200054|>",
+                "processor_class": "Inkling2Processor"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let registry = MultimodalConfigRegistry::new();
+        let loaded = registry
+            .get_or_load("released-policy", tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        Inkling2ImageProcessor::validate_config(&loaded.preprocessor_config).unwrap();
+    }
+
     #[test]
     fn missing_or_malformed_native_policy_cannot_use_generic_defaults() {
         use llm_multimodal::vision::processors::Inkling2ImageProcessor;
