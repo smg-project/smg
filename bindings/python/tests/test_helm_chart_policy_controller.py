@@ -1377,6 +1377,10 @@ def test_the_image_job_starts_on_what_these_cases_read():
         # The engine wire's messages the controller's protocol imports: the
         # build script reads them beside the contract.
         REPO / "crates" / "grpc_client" / "proto" / "common.proto",
+        # The example controller, whose image the job builds beside the
+        # stock one: its package and what the package compiles.
+        REPO / "examples" / "policy-controller" / "Cargo.toml",
+        REPO / "examples" / "policy-controller" / "src" / "main.rs",
     ] + [
         path
         for path in sorted(CHART.rglob("*"))

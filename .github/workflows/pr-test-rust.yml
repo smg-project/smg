@@ -512,6 +512,22 @@ jobs:
           source "$HOME/.cargo/env"
           bash scripts/ci_rust_tests.sh run ${{ matrix.shard }}
 
+      # The example controller where a user stands: its own script writes it
+      # outside the workspace as a repository of its own, with the crate
+      # named by git as the guide's line names it and the repository's lock.
+      # The git source is a snapshot of this checkout, which the script
+      # makes: a hosted checkout is a shallow clone, and git fetches from
+      # none. The copy's cases are built and run there, so a change that
+      # breaks the crate for a package that imports it fails here.
+      - name: Build the example controller outside the workspace
+        if: contains(matrix.needs, 'policy-import')
+        timeout-minutes: 20
+        run: |
+          source "$HOME/.cargo/env"
+          bash examples/policy-controller/own-repository.sh "${RUNNER_TEMP}/own-controller" --snapshot
+          cd "${RUNNER_TEMP}/own-controller"
+          cargo test
+
       - name: Fail if vision golden fixtures did not generate
         if: steps.vision-golden.outcome == 'failure'
         run: |
