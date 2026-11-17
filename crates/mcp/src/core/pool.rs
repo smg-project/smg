@@ -228,7 +228,14 @@ impl McpConnectionPool {
             match connections.push(key, cached) {
                 Some((evicted_key, _)) => {
                     // Eviction: count stays the same (replaced one entry).
-                    if let Some(callback) = &self.eviction_callback {
+                    // The callback clears what stands under the URL, and another
+                    // pooled connection may still hold that URL.
+                    let callback = self.eviction_callback.as_ref().filter(|_| {
+                        !connections
+                            .iter()
+                            .any(|(pooled, _)| pooled.url == evicted_key.url)
+                    });
+                    if let Some(callback) = callback {
                         callback(&evicted_key);
                     }
                 }

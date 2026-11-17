@@ -586,6 +586,75 @@ async fn test_connection_without_server() {
     assert_eq!(servers.len(), 0, "Should have no connected servers");
 }
 
+#[tokio::test]
+async fn an_eviction_keeps_the_tools_of_a_server_that_is_still_pooled() {
+    let shared = create_mock_server().await;
+    let other = create_mock_server().await;
+    let mut config = McpConfig {
+        servers: vec![],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
+        policy: Default::default(),
+    };
+    // Room for two connections.
+    config.pool.max_connections = 2;
+    let manager = McpOrchestrator::new(config).await.unwrap();
+    let connection = |server: &MockMCPServer, header: &str| McpServerConfig {
+        name: "dynamic".to_string(),
+        transport: McpTransport::Streamable {
+            url: server.url(),
+            token: None,
+            headers: HashMap::from([("x-connection".to_string(), header.to_string())]),
+        },
+        proxy: None,
+        required: false,
+        tools: None,
+        builtin_type: None,
+        builtin_tool_name: None,
+        internal: false,
+    };
+
+    // Two pooled connections to one server.
+    let first = manager
+        .connect_dynamic_server(connection(&shared, "one"))
+        .await
+        .unwrap();
+    let second = manager
+        .connect_dynamic_server(connection(&shared, "two"))
+        .await
+        .unwrap();
+    assert_eq!(first.server_key, second.server_key);
+    let key = second.server_key;
+    let listed = manager
+        .list_tools_for_servers(std::slice::from_ref(&key))
+        .len();
+    assert!(listed > 0, "the server's tools are listed");
+
+    // A third connection, to another server: the pool is full, and the least
+    // recently used connection leaves.
+    manager
+        .connect_dynamic_server(connection(&other, "one"))
+        .await
+        .unwrap();
+
+    // The connection that stays is still pooled with its tools listed.
+    let again = manager
+        .connect_dynamic_server(connection(&shared, "two"))
+        .await
+        .unwrap();
+    assert_eq!(again.list_error, None);
+    assert_eq!(
+        manager
+            .list_tools_for_servers(std::slice::from_ref(&key))
+            .len(),
+        listed,
+        "the tools of a server that a pooled connection still serves"
+    );
+    manager.shutdown().await;
+}
+
 // Schema Validation Tests
 
 #[tokio::test]
