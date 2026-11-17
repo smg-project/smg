@@ -60,6 +60,10 @@ use tonic::transport::{server::TcpIncoming, Server};
 use tonic_health::ServingStatus;
 use tracing::{error, info, warn};
 
+// The Decide call's two bounds, for the reference client: it holds them at
+// its own door and reads no second copy.
+#[cfg(feature = "client")]
+pub(crate) use self::wire::{MAX_FRAME, MAX_REQUEST_ID};
 pub use self::{
     admin::{Version, VERSION},
     config::{Config, ConfigError, Listener, Scope, Tls},
