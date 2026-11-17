@@ -29,7 +29,7 @@
 //! - `policy_decide_stream/count/<mode>/<members>`, one cell a run, named by
 //!   `DECIDE_STREAM_COUNT=<mode>:<members>:<decisions>`: the whole process's
 //!   allocator calls a decision, `in_process` (the store's deciding door, a
-//!   view build and the engine's decide on this thread) or `stream` (the
+//!   lent view and the engine's decide on this thread) or `stream` (the
 //!   same decision asked over one stream, one at a time so every decision
 //!   wakes the same threads whatever its fleet, the client's own calls
 //!   included). A run's instructions are read from outside it
@@ -788,8 +788,8 @@ fn read<T>(reading: Option<T>, print: impl FnOnce(T) -> String) -> String {
     reading.map_or_else(|| "n/a".to_owned(), print)
 }
 
-/// The engine's own decision, in process: the store's deciding door, a view
-/// build and the engine's decide on this thread, over buffers kept across
+/// The engine's own decision, in process: the store's deciding door, a lent
+/// view and the engine's decide on this thread, over buffers kept across
 /// decisions. Returns the allocator's calls over `decisions` of them.
 fn in_process(store: &MemoryStore, decisions: u64) -> u64 {
     let name = model(0);
@@ -803,7 +803,9 @@ fn in_process(store: &MemoryStore, decisions: u64) -> u64 {
             affinity: false,
         };
         let decision = store.deciding(|world| {
-            let built = world.build(&name, Role::Single, &ask, &mut view);
+            // The door a decider reads a plain request's pool by: the
+            // publication's own rows, the asking gateway's vetoes beside them.
+            let read = world.view(&name, Role::Single, &ask, false, &mut view);
             let facts = RequestFacts {
                 model: &name,
                 seed,
@@ -811,18 +813,24 @@ fn in_process(store: &MemoryStore, decisions: u64) -> u64 {
                 now_micros: world.micros(ask.now),
                 ..RequestFacts::default()
             };
-            let pool = built.map_or_else(
+            let pool = read.map_or_else(
                 || PoolFacts {
                     generation: world.spec().generation(),
                     ..PoolFacts::default()
                 },
-                |built| built.pool_facts(),
+                |read| read.built.pool_facts(),
             );
+            let (candidates, stalled) = read
+                .map(|read| (read.candidates, read.stalled))
+                .unwrap_or_default();
             world.spec().engine().decide(
                 &facts,
                 &pool,
-                &view.candidates,
-                &Constraints::default(),
+                candidates,
+                &Constraints {
+                    stalled,
+                    ..Constraints::default()
+                },
                 &mut scratch,
             )
         });

@@ -4288,6 +4288,13 @@ fn a_pool_every_gateway_reaches_whole_is_lent_where_it_stands_and_copied_when_as
         assert!(none.is_none());
     });
     assert!(out.candidates.is_empty() && out.stalled.is_empty());
+    // A build that finds no pool clears the mask a lent view left too.
+    out.stalled.push(7);
+    store.with_world(|world| {
+        let none = world.build("another", Role::Single, &asked, &mut out);
+        assert!(none.is_none());
+    });
+    assert!(out.candidates.is_empty() && out.stalled.is_empty());
 }
 
 #[test]

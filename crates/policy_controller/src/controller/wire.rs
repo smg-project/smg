@@ -289,8 +289,7 @@ impl Checked {
                 // The wire carries the name: each read of the request's
                 // session fingerprints it.
                 model_fingerprint: ModelFingerprint::NONE,
-                // The decision's rows are written for it: none is pinned
-                // beside its own session bit.
+                // No decider asks its view for a pinned worker's row.
                 pinned_at: 0,
             },
             &Constraints {
@@ -298,8 +297,9 @@ impl Checked {
                 wire_modes: self.wires().unwrap_or_default(),
                 overload_lifted: constraints.overload_lifted,
                 subset_hint: constraints.subset_hint,
-                // And each carries its own stalled bit.
-                stalled: &[],
+                // The asking gateway's standing vetoes beside lent rows,
+                // and nothing where each row carries its own bit.
+                stalled: view.stalled,
             },
         );
         lists.headers = emptied(headers);
@@ -317,6 +317,10 @@ pub(crate) struct Viewed<'a> {
     pub(crate) budget_micros: u32,
     /// The candidates' affinity column, as the view's build filled it.
     pub(crate) affinity: &'a [AffinityFacts],
+    /// The rows a veto of the asking gateway masks, by position, where the
+    /// candidates are a publication's own rows; empty where they were
+    /// written for the decision and carry their own stalled bits.
+    pub(crate) stalled: &'a [u32],
     /// How many of the request's block hashes the deciding generation
     /// reads.
     pub(crate) max_block_hashes: usize,
@@ -552,6 +556,7 @@ mod tests {
             now_micros: 77,
             budget_micros: 1_500,
             affinity: &affinity,
+            stalled: &[],
             max_block_hashes: 256,
         };
         checked.read(lists, view, check)
@@ -872,6 +877,7 @@ mod tests {
                 now_micros: 0,
                 budget_micros: 1,
                 affinity: &[],
+                stalled: &[],
                 max_block_hashes,
             };
             checked.read(&mut Lists::default(), view, |facts, _| {

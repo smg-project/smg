@@ -128,7 +128,10 @@ pub struct Health {
     pub healthy: bool,
     /// The pool's circuit breaker refuses execution.
     pub breaker_open: bool,
-    /// The liveness veto: unreachable or wedged.
+    /// The liveness veto: unreachable or wedged. A host writes it into a
+    /// row it copies for the decision. Over a publication's own rows the
+    /// asking host's vetoes stand beside the rows instead, and a reader of
+    /// this bit asks both ([`Constraints::masks`]).
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
@@ -137,12 +140,15 @@ pub struct Health {
 }
 
 impl Health {
-    /// Every routing veto but the overload one.
+    /// Every routing veto but the overload one, as the row carries them: a
+    /// veto that stands beside lent rows is asked of the decision's
+    /// constraints ([`Constraints::masks`]).
     pub const fn routable_ignoring_overload(self) -> bool {
         self.healthy && !self.breaker_open && !self.stalled && !self.draining
     }
 
-    /// Every routing veto.
+    /// Every routing veto the row carries
+    /// ([`Self::routable_ignoring_overload`]).
     pub const fn routable(self) -> bool {
         self.routable_ignoring_overload() && !self.overloaded
     }
@@ -641,7 +647,10 @@ pub struct Candidate {
     /// now and leave a load scorer's credit. In-process only; the wire carries
     /// the row's age.
     pub load_sampled_at_micros: u64,
-    /// The session key of the request is pinned to this worker.
+    /// The session key of the request is pinned to this worker. A host
+    /// writes it into a row it copies for the decision. Over a publication's
+    /// own rows the pin stands beside the rows instead
+    /// ([`RequestFacts::pinned_at`]).
     pub session_hit: bool,
     /// Requests of the request's session key in flight on this worker.
     pub session_in_flight: u16,
@@ -770,10 +779,12 @@ pub struct RequestFacts<'a> {
     pub now_micros: u64,
     /// One more than the position of the row the request's session key is
     /// pinned to, where the host did not write the session bit into the
-    /// row: a view of a publication's own rows hands the pin here, and a
-    /// reader of a row's session bit asks both ([`RequestFacts::pins`]).
-    /// Zero for no pin, and where the rows were written for the decision.
-    /// In-process only.
+    /// row: a view of a publication's own rows hands the pin here. A reader
+    /// of one row's session bit asks both ([`RequestFacts::pins`]), and a
+    /// pass over the rows looks for the pinned position once, as the
+    /// session scorer does. Zero for no pin, and where the rows were written
+    /// for the decision. A pair takes none: a pin is a position in one
+    /// pool, and neither side reads it. In-process only.
     pub pinned_at: u32,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
@@ -876,7 +887,7 @@ impl<'a> RequestFacts<'a> {
     /// `position`, beside the row's own session bit.
     #[inline]
     pub fn pins(&self, position: u32) -> bool {
-        self.pinned_at.wrapping_sub(1) == position
+        self.pinned_at != 0 && self.pinned_at - 1 == position
     }
 
     /// The affinity facts of the candidate at `index` of the slice the

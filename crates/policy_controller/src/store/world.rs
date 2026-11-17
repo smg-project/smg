@@ -713,6 +713,7 @@ impl World {
         let Some(index) = self.index(model, role) else {
             out.candidates.clear();
             out.affinity.clear();
+            out.stalled.clear();
             return None;
         };
         self.build_at(index, ask, out)

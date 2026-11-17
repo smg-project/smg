@@ -20,6 +20,7 @@ use std::{
 
 use smg_policy_controller::{
     catalog::Catalog,
+    spec::{BindingSpec, OverloadSpec},
     store::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts,
         WorkerStatus, WorkersStore, PUBLISH_WINDOW,
@@ -376,4 +377,93 @@ fn a_decision_that_straddles_a_write_frees_nothing() {
             );
         }
     }
+}
+
+/// A generation whose one binding judges every pool by its token usage.
+fn generation_over(number: u64, token_usage: f32) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    let profile = document
+        .profiles
+        .keys()
+        .next()
+        .expect("the preset's profile")
+        .clone();
+    document.bindings = vec![BindingSpec {
+        profile: Some(profile),
+        overload: Some(OverloadSpec {
+            token_usage: Some(token_usage),
+            ..OverloadSpec::default()
+        }),
+        ..BindingSpec::default()
+    }];
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
+#[test]
+fn a_period_told_before_any_window_shows_its_judgment_and_frees_nothing() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    store.apply(generation_over(1, 0.6)).expect("applied");
+    // Two ranks of one engine register before they name a model: their
+    // records go on file, no row takes them and no window opens.
+    let rank = |rank: u16, models: Vec<String>| {
+        store
+            .upsert(WorkerFacts {
+                key: format!("grpc://e:9000#{rank}"),
+                engine: "grpc://e:9000".to_string(),
+                incarnation: 1,
+                models,
+                dp_rank: rank,
+                dp_size: 2,
+                ..WorkerFacts::default()
+            })
+            .id()
+    };
+    let (cool, hot) = (rank(0, Vec::new()), rank(1, Vec::new()));
+    let usage = |active_kv_permille: u16| LoadRow {
+        active_kv_permille,
+        ..LoadRow::default()
+    };
+    store.record(cool, 0, usage(100), t0, LoadSource::Stream);
+    let late = t0 + Duration::from_secs(1_000);
+    store.record(hot, 1, usage(900), late, LoadSource::Stream);
+    // The model is named: the rows take what is on file.
+    let named = (
+        rank(0, vec![MODEL.to_string()]),
+        rank(1, vec![MODEL.to_string()]),
+    );
+    assert_eq!(named, (cool, hot));
+    let ask = Ask {
+        gateway: ASKER,
+        now: late,
+        pinned: None,
+        affinity: false,
+    };
+    let (mut out, mut after) = (ViewBuffers::default(), ViewBuffers::default());
+    let freed = store.with_world(|world| {
+        // Under no period the cool rank's old sample counts: the mean of
+        // the two is under the threshold.
+        let view = world
+            .view(MODEL, Role::Single, &ask, false, &mut out)
+            .expect("the pool");
+        assert_eq!(view.candidates.len(), 2);
+        assert!(view.candidates.iter().all(|row| !row.health.overloaded));
+        // The telling ends that sample and the hot rank is judged alone.
+        // No window ever opened, so the judgment is shown at once.
+        assert!(store.heard_every(Duration::from_secs(10)));
+        let standing = store.world();
+        assert!(!std::ptr::eq(world, &*standing), "the telling published");
+        let judged = standing
+            .view(MODEL, Role::Single, &ask, false, &mut after)
+            .expect("the pool");
+        assert!(judged.candidates.iter().all(|row| row.health.overloaded));
+        drop(standing);
+        frees()
+    });
+    assert_eq!(
+        frees() - freed,
+        0,
+        "a decision that straddled the telling freed on its thread"
+    );
 }
