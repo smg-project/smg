@@ -4,17 +4,29 @@
 //! its source wrote it.
 //!
 //! One invariant: **the writer that applies mints the number.** A source
-//! hands over a document; the number it runs under is decided here, under
-//! one lock, against the generation the store holds. A document that writes
+//! hands over a document; the number it runs under is decided here, one
+//! apply at a time, against the generation the store holds. A document that writes
 //! no `generation` line takes the standing number plus one. A line is a
 //! claim the store's entry checks: it admits a number above the standing
 //! one and refuses any other by naming the standing one. A document whose
 //! digest is the standing one's, under no line or under the standing line,
-//! is no change: nothing is applied. A changed document under the standing
-//! line is refused by name, so on one replica a number never names two
-//! documents. The validator's word comes before either: a document it
-//! refuses is refused whatever its digest, which reads no line the
-//! canonical form leaves out.
+//! is no change: nothing is applied and nothing counted. A changed document
+//! under the standing line is refused by name, so on one replica a number
+//! never names two documents. The validator's word comes before either: a
+//! document it refuses is refused whatever its digest, which reads no line
+//! the canonical form leaves out.
+//!
+//! A document's own pass (the bound, the form, the digest, the validator
+//! and the line) is one function, [`check`], which takes no lock a reader
+//! takes: the read call waits on no validation. A fault of that pass is
+//! held here: a document that panics its parse, its digest, its validator or
+//! its engine's build is a document that does not run, refused by name with
+//! the running generation kept. A fault past the pass, in the store's
+//! entry, is not held: the store may be half written.
+//!
+//! A source that keeps running hands a refusal back here
+//! ([`Generations::reject`]): it is one event and one count, and the
+//! running generation stays.
 //!
 //! The number and the digest have one holder, the store's
 //! ([`World::spec`](crate::store::World::spec)). What lives here is the
@@ -31,17 +43,22 @@
 //! and a reader of another build does not recompute it to compare.
 
 use std::{
+    any::Any,
     cell::Cell,
     fmt,
+    panic::{self, AssertUnwindSafe},
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::Mutex;
 use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{map::Entry, Map, Number, Value};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     catalog::Catalog,
@@ -408,6 +425,10 @@ pub enum SpecRejected {
     /// The store's entry refused its number.
     #[error("generation: {0}")]
     Stale(#[from] StaleGeneration),
+    /// Its own pass panicked, by the panic's message: a defect of this
+    /// build that the document reaches, held at the door.
+    #[error("the document's own pass faulted: {0}")]
+    Faulted(String),
 }
 
 /// Why `GetPolicySpec` has no document for a generation.
@@ -437,6 +458,15 @@ impl fmt::Display for NotHeld {
     }
 }
 
+/// The apply counter by result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Counts {
+    /// Documents applied as a new generation.
+    pub(crate) applied: u64,
+    /// Documents a running source handed back as rejected.
+    pub(crate) rejected: u64,
+}
+
 /// The standing generation's document as its source wrote it.
 struct Held {
     generation: u64,
@@ -446,6 +476,76 @@ struct Held {
     applied: SystemTime,
 }
 
+/// What a document's pass found it to be.
+struct Checked {
+    /// The document's digest.
+    digest: Digest,
+    /// The generation the document validated into; `None` where it is the
+    /// standing generation's document again, or in another form.
+    next: Option<AppliedSpec>,
+}
+
+/// The validator of a document's pass, over the stages a document may
+/// name.
+pub(crate) type Validate = fn(&PolicySpec, Digest, &Catalog) -> Result<AppliedSpec, SpecError>;
+
+/// A document's own pass, in its one order: the bound, the form, the
+/// digest, the validator, then the line against the standing generation.
+/// Nothing is applied, nothing held and no lock taken.
+fn check(
+    (validate, catalog): (Validate, &Catalog),
+    (standing, standing_digest): (u64, Option<Digest>),
+    document: &[u8],
+    format: Format,
+) -> Result<Checked, SpecRejected> {
+    let len = u64::try_from(document.len()).unwrap_or(u64::MAX);
+    if len > MAX_DOCUMENT_BYTES {
+        return Err(SpecRejected::TooLarge(len));
+    }
+    let mut spec = format
+        .parse(document)
+        .map_err(|message| SpecRejected::Unparsed {
+            format: format.as_str(),
+            message,
+        })?;
+    let digest = spec.digest()?;
+    let line = spec.generation;
+    if line == 0 {
+        // The mint. At the last number the entry refuses it by name.
+        spec.generation = standing.saturating_add(1);
+    }
+    // The validator's word comes first: the digest reads no line the
+    // canonical form leaves out, so equal digests admit nothing. The digest
+    // is taken once, above, and handed on.
+    let next = validate(&spec, digest, catalog)?;
+    if line == 0 || line == standing {
+        if standing_digest == Some(digest) {
+            // The standing generation's document again, or in another form.
+            return Ok(Checked { digest, next: None });
+        }
+        if let (true, Some(standing_digest)) = (line != 0, standing_digest) {
+            return Err(SpecRejected::ChangedUnderItsLine {
+                generation: standing,
+                offered: digest,
+                standing: standing_digest,
+            });
+        }
+    }
+    Ok(Checked {
+        digest,
+        next: Some(next),
+    })
+}
+
+/// A panic's message, where it has one.
+fn fault_text(fault: &(dyn Any + Send)) -> String {
+    fault
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| fault.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".to_owned())
+}
+
 /// The controller's generations: the door a source applies through and the
 /// standing document.
 pub(crate) struct Generations {
@@ -453,51 +553,53 @@ pub(crate) struct Generations {
     /// The stages a document may name: the ones the bind was handed, the
     /// host's own among them.
     catalog: Arc<Catalog>,
-    /// One apply at a time: the standing number is read, the next one minted
-    /// and the store's entry called under this lock. `None` until a source
-    /// has applied its first document.
+    validate: Validate,
+    /// One apply at a time: the standing number is read, the document's
+    /// pass run and the store's entry called under this lock. No reader
+    /// takes it.
+    applying: Mutex<()>,
+    /// The standing generation's document. An apply swaps it under this
+    /// lock with its call of the store's entry, so a reader sees the number
+    /// and the document move together and waits on no validation. `None`
+    /// until a source has applied its first document.
     held: Mutex<Option<Held>>,
+    applied: AtomicU64,
+    rejected: AtomicU64,
 }
 
 impl Generations {
     pub(crate) fn new(store: Arc<MemoryStore>, catalog: Arc<Catalog>) -> Self {
+        Self::validating(store, catalog, AppliedSpec::validate_digested)
+    }
+
+    /// [`Generations::new`] with the validator as its argument: a case
+    /// hands in one that faults, or one that stalls.
+    pub(crate) fn validating(
+        store: Arc<MemoryStore>,
+        catalog: Arc<Catalog>,
+        validate: Validate,
+    ) -> Self {
         Self {
             store,
             catalog,
+            validate,
+            applying: Mutex::new(()),
             held: Mutex::new(None),
+            applied: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
         }
     }
 
     /// Applies `document`, as its source wrote it in `format`. A refusal
     /// applies nothing and the running generation stays; what a refusal
-    /// means is its source's to say (a start refuses to start).
+    /// means is its source's to say: a start refuses to start, and a source
+    /// that keeps running counts it ([`Generations::reject`]).
     pub(crate) fn apply(&self, document: Vec<u8>, format: Format) -> Result<Applied, SpecRejected> {
-        let len = u64::try_from(document.len()).unwrap_or(u64::MAX);
-        if len > MAX_DOCUMENT_BYTES {
-            return Err(SpecRejected::TooLarge(len));
-        }
-        let mut spec = format
-            .parse(&document)
-            .map_err(|message| SpecRejected::Unparsed {
-                format: format.as_str(),
-                message,
-            })?;
-        let digest = spec.digest()?;
-
-        let mut held = self.held.lock();
-        let (standing, standing_digest) = {
-            let world = self.store.world();
-            (world.spec().generation(), world.spec().digest())
-        };
-        let line = spec.generation;
-        if line == 0 {
-            // The mint. At the last number the entry refuses it by name.
-            spec.generation = standing.saturating_add(1);
-        }
-        // The validator's word comes first: the digest reads no line the
-        // canonical form leaves out, so equal digests admit nothing. The
-        // digest is taken once, above, and handed on.
-        let applied = AppliedSpec::validate_digested(&spec, digest, &self.catalog)?;
+        let applying = self.applying.lock();
+        let standing = self.standing();
+        let Checked { digest, next } = self.pass(standing, &document, format)?;
+        let (standing, _) = standing;
+        let bytes = document.len();
         let hold = |generation| Held {
             generation,
             digest,
@@ -505,37 +607,80 @@ impl Generations {
             format,
             applied: SystemTime::now(),
         };
-        if line == 0 || line == standing {
-            if standing_digest == Some(digest) {
-                // The standing generation's document again, or in another
-                // form: it runs already. Where no bytes of it are held,
-                // these are kept, so the read call has the standing one.
-                if held.as_ref().is_none_or(|held| held.generation != standing) {
-                    *held = Some(hold(standing));
-                }
-                return Ok(Applied::Unchanged(standing));
+        let Some(next) = next else {
+            // It runs already. Where no bytes of it are held, these are
+            // kept, so the read call has the standing one.
+            let mut held = self.held.lock();
+            if held.as_ref().is_none_or(|held| held.generation != standing) {
+                *held = Some(hold(standing));
             }
-            if let (true, Some(standing_digest)) = (line != 0, standing_digest) {
-                return Err(SpecRejected::ChangedUnderItsLine {
-                    generation: standing,
-                    offered: digest,
-                    standing: standing_digest,
-                });
-            }
+            return Ok(Applied::Unchanged(standing));
+        };
+        let generation = next.generation();
+        {
+            let mut held = self.held.lock();
+            self.store.apply(next)?;
+            *held = Some(hold(generation));
         }
-        let generation = applied.generation();
-        self.store.apply(applied)?;
-        *held = Some(hold(generation));
-        drop(held);
+        drop(applying);
 
+        self.applied.fetch_add(1, Ordering::Relaxed);
         info!(
             generation,
             %digest,
             format = format.as_str(),
-            bytes = len,
+            bytes,
             "policy spec applied"
         );
         Ok(Applied::Generation(generation))
+    }
+
+    /// A document's pass against the generation that stands, with its fault
+    /// held: a panic of the pass is a refusal by name.
+    fn pass(
+        &self,
+        standing: (u64, Option<Digest>),
+        document: &[u8],
+        format: Format,
+    ) -> Result<Checked, SpecRejected> {
+        let validator = (self.validate, self.catalog.as_ref());
+        let passed = panic::catch_unwind(AssertUnwindSafe(|| {
+            check(validator, standing, document, format)
+        }));
+        passed.unwrap_or_else(|fault| {
+            // The text first: a payload's own drop can panic, and it is
+            // freed under a catch of its own.
+            let told = fault_text(fault.as_ref());
+            crate::framework::release(fault);
+            Err(SpecRejected::Faulted(told))
+        })
+    }
+
+    /// The number and the digest the store runs.
+    fn standing(&self) -> (u64, Option<Digest>) {
+        let world = self.store.world();
+        (world.spec().generation(), world.spec().digest())
+    }
+
+    /// Counts and logs a document a running source did not apply, its own
+    /// finding included (a file it could not read): one event and one count
+    /// a document, and the running generation stays.
+    pub(crate) fn reject(&self, rejected: SpecRejected) -> SpecRejected {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            generation = self.generation(),
+            error = %rejected,
+            "policy spec rejected: the running generation stays"
+        );
+        rejected
+    }
+
+    /// The apply counter by result, as it stands.
+    pub(crate) fn counts(&self) -> Counts {
+        Counts {
+            applied: self.applied.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+        }
     }
 
     /// Whether a source has applied a document: the spec calls are served
@@ -586,7 +731,13 @@ fn unix_micros(at: SystemTime) -> i64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{fmt::Write as _, io::Write as _, thread, time::Instant};
+    use std::{
+        fmt::Write as _,
+        io::Write as _,
+        sync::atomic::AtomicBool,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use super::*;
 
@@ -598,10 +749,7 @@ pub(crate) mod tests {
 
     fn generations() -> (Arc<MemoryStore>, Generations) {
         let store = Arc::new(MemoryStore::new());
-        (
-            Arc::clone(&store),
-            Generations::new(store, Arc::new(Catalog::builtin())),
-        )
+        (Arc::clone(&store), Generations::new(store, stock()))
     }
 
     /// `document` applied as YAML.
@@ -631,7 +779,7 @@ pub(crate) mod tests {
     /// A document whose view's first header is one text of `text` bytes
     /// under an anchor, with `aliases` aliases of it after it: four bytes
     /// an alias in the file, the text's bytes an alias in what it reads as.
-    fn long_text_under_aliases(text: usize, aliases: usize) -> String {
+    pub(crate) fn long_text_under_aliases(text: usize, aliases: usize) -> String {
         let mut document = String::with_capacity(text + 4 * aliases + 256);
         document.push_str(LEAST_LOAD);
         document.push_str("view:\n  headers: [&h ");
@@ -664,6 +812,26 @@ pub(crate) mod tests {
     const PAST_BUILT: &str = "builds more than 80 bytes for each byte of the size bound (131072)";
     const PAST_TEXT: &str =
         "reads as more than 2 bytes of text for each byte of the size bound (131072)";
+
+    /// The stock build's stages.
+    fn stock() -> Arc<Catalog> {
+        Arc::new(Catalog::builtin())
+    }
+
+    /// A validator that panics on a document that picks at random, and
+    /// validates any other.
+    pub(crate) fn faulting(
+        document: &PolicySpec,
+        digest: Digest,
+        catalog: &Catalog,
+    ) -> Result<AppliedSpec, SpecError> {
+        let random = document
+            .profiles
+            .values()
+            .any(|profile| profile.pick == "random".into());
+        assert!(!random, "a fault of the validator");
+        AppliedSpec::validate_digested(document, digest, catalog)
+    }
 
     /// The number and the digest the store runs.
     fn standing(store: &MemoryStore) -> (u64, Option<Digest>) {
@@ -799,6 +967,29 @@ pub(crate) mod tests {
         assert_eq!(answer.document, LEAST_LOAD.as_bytes());
     }
 
+    /// The apply counter by result: a new generation counts as applied, a
+    /// refusal a running source hands back counts as rejected, once, and the
+    /// standing document again counts as neither.
+    #[test]
+    fn the_counts_follow_the_outcomes() {
+        let (_store, generations) = generations();
+        let counts = |applied, rejected| Counts { applied, rejected };
+        assert_eq!(generations.counts(), counts(0, 0));
+        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Unchanged(1)));
+        assert_eq!(generations.counts(), counts(1, 0));
+
+        let refused = yaml(&generations, with_line(RANDOM, 1))
+            .map_err(|rejected| generations.reject(rejected));
+        assert!(matches!(
+            refused,
+            Err(SpecRejected::ChangedUnderItsLine { .. })
+        ));
+        assert_eq!(generations.counts(), counts(1, 1));
+        assert_eq!(yaml(&generations, RANDOM), Ok(Applied::Generation(2)));
+        assert_eq!(generations.counts(), counts(2, 1));
+    }
+
     /// A source that finds its document running already (a controller built
     /// in code handed it to the store) applies nothing and holds the
     /// document's bytes, so the read call answers the standing generation.
@@ -880,6 +1071,130 @@ pub(crate) mod tests {
             };
             assert_eq!(not_held, expected, "asked for {wanted}");
         }
+    }
+
+    /// A document that faults its own pass is a document that does not run:
+    /// the door holds the panic and refuses the document by the panic's
+    /// message, the running generation and its bytes stay, and the door
+    /// stands open for the next document.
+    #[test]
+    fn a_document_that_faults_its_pass_is_refused_by_name() {
+        let store = Arc::new(MemoryStore::new());
+        let generations = Generations::validating(Arc::clone(&store), stock(), faulting);
+        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+        let running = standing(&store);
+
+        assert_eq!(
+            yaml(&generations, RANDOM),
+            Err(SpecRejected::Faulted("a fault of the validator".to_owned()))
+        );
+        assert_eq!(standing(&store), running);
+        let answer = generations.document(0).expect("the standing document");
+        assert_eq!(answer.document, LEAST_LOAD.as_bytes());
+        assert_eq!(
+            yaml(&generations, with_line(LEAST_LOAD, 4)),
+            Ok(Applied::Generation(4))
+        );
+    }
+
+    /// A panic's payload is the document's too: one whose own drop panics
+    /// is freed under a catch of its own, once its text is read, and the
+    /// door refuses the document as it does any fault.
+    #[test]
+    fn a_fault_whose_payload_faults_at_its_drop_is_held() {
+        /// A payload that panics when it is dropped.
+        struct Bomb;
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                panic!("the payload's own drop");
+            }
+        }
+        fn dropping(
+            document: &PolicySpec,
+            digest: Digest,
+            catalog: &Catalog,
+        ) -> Result<AppliedSpec, SpecError> {
+            let random = document
+                .profiles
+                .values()
+                .any(|profile| profile.pick == "random".into());
+            if random {
+                panic::panic_any(Bomb);
+            }
+            AppliedSpec::validate_digested(document, digest, catalog)
+        }
+        let store = Arc::new(MemoryStore::new());
+        let generations = Generations::validating(Arc::clone(&store), stock(), dropping);
+        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+
+        assert_eq!(
+            yaml(&generations, RANDOM),
+            Err(SpecRejected::Faulted("a panic with no message".to_owned()))
+        );
+        assert_eq!(standing(&store).0, 1);
+        assert_eq!(
+            yaml(&generations, with_line(LEAST_LOAD, 4)),
+            Ok(Applied::Generation(4))
+        );
+    }
+
+    /// A fault is told by its panic's message, a literal or a formatted
+    /// one; a panic that carries no text is told as one.
+    #[test]
+    fn a_fault_is_told_by_its_message() {
+        let told = |fault: Box<dyn Any + Send>| fault_text(fault.as_ref());
+        assert_eq!(told(Box::new("a literal")), "a literal");
+        assert_eq!(
+            told(Box::new(String::from("a formatted one"))),
+            "a formatted one"
+        );
+        assert_eq!(told(Box::new(7_u8)), "a panic with no message");
+    }
+
+    /// A reader waits on no pass: while a document is validated the read
+    /// call answers the standing document.
+    #[test]
+    fn a_read_during_an_apply_waits_on_no_validation() {
+        static ENTERED: AtomicBool = AtomicBool::new(false);
+        static RELEASED: AtomicBool = AtomicBool::new(false);
+        /// Until `flag` turns, ten seconds at the most.
+        fn until(flag: &AtomicBool, never: &str) {
+            for _ in 0..10_000 {
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            panic!("{never}");
+        }
+        fn stalling(
+            document: &PolicySpec,
+            digest: Digest,
+            catalog: &Catalog,
+        ) -> Result<AppliedSpec, SpecError> {
+            if document.generation == 2 {
+                ENTERED.store(true, Ordering::SeqCst);
+                until(&RELEASED, "the validator was never released");
+            }
+            AppliedSpec::validate_digested(document, digest, catalog)
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        let generations = Arc::new(Generations::validating(store, stock(), stalling));
+        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+        let applying = {
+            let generations = Arc::clone(&generations);
+            thread::spawn(move || yaml(&generations, RANDOM))
+        };
+        until(&ENTERED, "the second document never reached the validator");
+        let answer = generations.document(0).expect("the standing document");
+        assert_eq!((answer.generation, answer.document), (1, LEAST_LOAD.into()));
+        assert!(generations.bound());
+        RELEASED.store(true, Ordering::SeqCst);
+        assert_eq!(
+            applying.join().expect("the apply's thread"),
+            Ok(Applied::Generation(2))
+        );
     }
 
     /// The validator's word comes before the digest's. A `kind` line is in

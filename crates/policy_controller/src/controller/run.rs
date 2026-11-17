@@ -170,8 +170,10 @@ struct Cli {
     /// The policy spec as a file, in YAML (JSON under a `.json` name): read
     /// and applied at the start, as generation 1 or under the number its
     /// `generation` line writes. A file that cannot be read, or a document
-    /// that is invalid, refuses the start. The file is read once: a change
-    /// to it takes a restart. With no file the controller runs no policy
+    /// that is invalid, refuses the start. The file is then watched: a
+    /// changed one is applied as the next generation, or under the number
+    /// it writes, and one that does not run is rejected whole and the
+    /// running generation stays. With no file the controller runs no policy
     /// spec.
     #[arg(long, value_name = "PATH", help_heading = "Policy Spec")]
     spec_file: Option<PathBuf>,

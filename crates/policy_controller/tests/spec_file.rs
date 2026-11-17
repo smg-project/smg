@@ -2,13 +2,17 @@
 //! binary started on a spec file laid out as a mounted ConfigMap, on
 //! ephemeral ports, asked for its document by the generated client on the
 //! control listener. A start on a valid file answers its bytes under
-//! generation 1, or under the number the file writes. A start on a document
-//! the validator refuses exits, naming the file and the field. A start with
-//! no spec file runs as it always did: no spec call is served and no spec
-//! series rendered.
+//! generation 1, or under the number the file writes. The mount is then
+//! updated as a ConfigMap's is, a link swapped to a new directory, and the
+//! read call answers the next generation; a changed document under the
+//! standing line is rejected, counted once, and the running generation keeps
+//! answering. A start on a document the validator refuses exits, naming the
+//! file and the field. A start with no spec file runs as it always did: no
+//! spec call is served and no spec series rendered.
 //!
-//! The cases wait on an answer, never on a clock: a wait that outlasts its
-//! room fails with the last answer it saw.
+//! The cases wait on an answer, never on a clock: the watch looks once a
+//! second, and a wait that outlasts its room fails with the last answer it
+//! saw.
 #![cfg(unix)]
 #![expect(
     clippy::expect_used,
@@ -58,19 +62,47 @@ const PACE: Duration = Duration::from_millis(50);
 
 /// A document in the form of the design's example: no `generation` line.
 const LEAST_LOAD: &str = "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    score: [least-load]\n    pick: best\n";
+/// Another one.
+const RANDOM: &str =
+    "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    pick: random\n";
 
-/// A directory laid out as a mounted ConfigMap, and the path a controller
-/// is given: `policy.yaml` is a link through `..data` into a version's
-/// directory.
-fn mounted(document: &str) -> (TempDir, PathBuf) {
-    let dir = tempfile::tempdir().expect("a directory");
-    let root = dir.path();
-    fs::create_dir(root.join("..version_1")).expect("the version's directory");
-    fs::write(root.join("..version_1/policy.yaml"), document).expect("the document");
-    symlink("..version_1", root.join("..data")).expect("the data link");
-    symlink("..data/policy.yaml", root.join("policy.yaml")).expect("the file's link");
-    let file = root.join("policy.yaml");
-    (dir, file)
+/// A directory laid out as a mounted ConfigMap: `policy.yaml` is a link
+/// through `..data` into a version's directory, and an update swaps `..data`
+/// to a new directory in one rename, then removes the old one.
+struct Mount {
+    dir: TempDir,
+    published: u32,
+}
+
+impl Mount {
+    fn new(document: &str) -> Self {
+        let dir = tempfile::tempdir().expect("a directory");
+        symlink("..data/policy.yaml", dir.path().join("policy.yaml")).expect("the file's link");
+        let mut mount = Self { dir, published: 0 };
+        mount.publish(document);
+        mount
+    }
+
+    /// The path a controller is given.
+    fn file(&self) -> PathBuf {
+        self.dir.path().join("policy.yaml")
+    }
+
+    /// One update: the document in a new version's directory, `..data`
+    /// swapped to it, the version before it removed.
+    fn publish(&mut self, document: &str) {
+        let root = self.dir.path();
+        let old = (self.published > 0).then(|| root.join(format!("..version_{}", self.published)));
+        self.published += 1;
+        let version = format!("..version_{}", self.published);
+        fs::create_dir(root.join(&version)).expect("the version's directory");
+        fs::write(root.join(&version).join("policy.yaml"), document).expect("the document");
+        symlink(&version, root.join("..data_tmp")).expect("the staged link");
+        fs::rename(root.join("..data_tmp"), root.join("..data")).expect("the swap");
+        if let Some(old) = old {
+            fs::remove_dir_all(old).expect("the version before it goes");
+        }
+    }
 }
 
 /// A replica that leads itself over a lease file of its own, its control
@@ -157,8 +189,8 @@ async fn page(replica: &Replica, path: &str, line: Option<&str>) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_started_on_a_spec_file_answers_its_document() {
     let lease = tempfile::tempdir().expect("a directory");
-    let (_mount, file) = mounted(LEAST_LOAD);
-    let replica = start("spec-0", &lease, Some(&file));
+    let mount = Mount::new(LEAST_LOAD);
+    let replica = start("spec-0", &lease, Some(&mount.file()));
 
     let first = answers(&replica, 1).await;
     assert_eq!(first.document, LEAST_LOAD.as_bytes());
@@ -173,8 +205,8 @@ async fn a_replica_started_on_a_spec_file_answers_its_document() {
 
     let lease = tempfile::tempdir().expect("a directory");
     let numbered = format!("generation: 41\n{LEAST_LOAD}");
-    let (_mount, file) = mounted(&numbered);
-    let replica = start("spec-1", &lease, Some(&file));
+    let numbered_mount = Mount::new(&numbered);
+    let replica = start("spec-1", &lease, Some(&numbered_mount.file()));
     let written = answers(&replica, 41).await;
     assert_eq!(written.document, numbered.as_bytes());
     assert_eq!(
@@ -183,12 +215,61 @@ async fn a_replica_started_on_a_spec_file_answers_its_document() {
     );
 }
 
+/// The mount updated as a ConfigMap's is, the read call answers the next
+/// generation with the new bytes, and the one before it is not retained. A
+/// changed document under the standing line is rejected: one count, one
+/// event, and the running generation keeps answering. A document under a
+/// higher line runs under that line, and the series follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_swapped_link_under_a_running_replica_is_the_next_generation() {
+    let lease = tempfile::tempdir().expect("a directory");
+    let mut mount = Mount::new(LEAST_LOAD);
+    let replica = start("spec-watch", &lease, Some(&mount.file()));
+    let first = answers(&replica, 1).await;
+
+    mount.publish(RANDOM);
+    let second = answers(&replica, 2).await;
+    assert_eq!(second.document, RANDOM.as_bytes());
+    assert_ne!(second.digest, first.digest);
+    let older = read(&replica, 1)
+        .await
+        .expect_err("generation 1 is not retained");
+    assert_eq!(older.code(), Code::NotFound, "{older:?}");
+
+    mount.publish(&format!("generation: 2\n{LEAST_LOAD}"));
+    let rejected = r#"smg_policy_spec_apply_total{result="rejected"} 1"#;
+    page(&replica, "/metrics", Some(rejected)).await;
+    let running = read(&replica, 0).await.expect("the running generation");
+    assert_eq!(
+        (running.generation, running.document.as_slice()),
+        (2, RANDOM.as_bytes())
+    );
+    let event = replica
+        .logs(|replica| replica.logged("policy spec rejected: the running generation stays"));
+    assert!(event.await, "{}", replica.log());
+
+    mount.publish(&format!("generation: 7\n{LEAST_LOAD}"));
+    let third = answers(&replica, 7).await;
+    assert_eq!(third.digest, first.digest, "one document, one digest");
+    let metrics = page(&replica, "/metrics", Some("smg_policy_spec_generation 7")).await;
+    for line in [
+        r#"smg_policy_spec_apply_total{result="applied"} 3"#,
+        rejected,
+    ] {
+        assert!(
+            metrics.lines().any(|rendered| rendered == line),
+            "no line {line:?} in {metrics}"
+        );
+    }
+}
+
 /// A start on a document the validator refuses exits with the refusal in
 /// its log: the file, and the field by its path. Nothing is served.
 #[test]
 fn a_start_on_a_document_the_validator_refuses_exits_naming_the_field() {
-    let (_mount, file) =
-        mounted(&LEAST_LOAD.replace("[least-load]", "[{ least-load: { weight: -1.0 } }]"));
+    let mount =
+        Mount::new(&LEAST_LOAD.replace("[least-load]", "[{ least-load: { weight: -1.0 } }]"));
+    let file = mount.file();
     let mut child = Command::new(BIN)
         .args(["--controller-id", "spec-refused"])
         .args(["--runtime-worker-threads", "1"])

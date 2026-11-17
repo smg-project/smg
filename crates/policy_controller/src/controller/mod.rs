@@ -7,8 +7,8 @@
 //! call bodies arrive with the gateway, ingestion and control scope PRs,
 //! the other ingestion drivers with their move out of the gateway. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
-//! controller given a spec file runs its document and answers
-//! `GetPolicySpec` ([`Controller::spec_file`]).
+//! controller given a spec file runs its document, watches the file and
+//! answers `GetPolicySpec` ([`Controller::spec_file`]).
 //!
 //! A controller is bound first and served second ([`Controller::bind`], then
 //! [`Controller::serve`]): the bind takes every address (port `0` for an
@@ -86,6 +86,7 @@ use self::{
     principal::Layer,
     readiness::Phase,
     service::{Service, Shared},
+    spec_file::SpecFile,
 };
 use crate::{
     catalog::Catalog,
@@ -133,6 +134,9 @@ pub struct Controller {
     /// What every listener's instance of the service reads; the store is
     /// its field, the run loop's drivers read the same one.
     shared: Arc<Shared>,
+    /// The spec's file source, once [`Controller::spec_file`] has read it:
+    /// the serve watches it.
+    spec_file: Option<SpecFile>,
     listeners: Vec<Bound>,
     admin: AdminSockets,
     admin_addr: SocketAddr,
@@ -411,6 +415,7 @@ impl Controller {
             elector,
             standing,
             shared,
+            spec_file: None,
             listeners,
             admin,
             admin_addr,
@@ -483,22 +488,25 @@ impl Controller {
     /// Takes the controller's policy spec from the file at `path` (design
     /// 4.6): the document is read and applied now, as generation 1 or under
     /// the number its `generation` line writes, and the control scope
-    /// answers `GetPolicySpec` with it. The file is read here and not again.
+    /// answers `GetPolicySpec` with it. [`Self::serve`] then watches the
+    /// file: a changed one is applied as the next generation, or under the
+    /// number it writes, and one that does not run is rejected whole, with
+    /// the running generation kept.
     ///
     /// A file that cannot be read, or a document the validator refuses, is
     /// refused here, before anything serves. The document names the stages
     /// the bind was handed ([`Controller::catalog`]), a host's own among
-    /// them. A controller that takes no spec file serves no spec call and
-    /// renders no spec series.
+    /// them. A controller that takes no spec file serves no spec call,
+    /// watches nothing and renders no spec series.
     pub async fn spec_file(&mut self, path: impl Into<PathBuf>) -> Result<(), Error> {
         let path = path.into();
         let generations = Arc::clone(&self.shared.generations);
         let read = {
             let path = path.clone();
-            tokio::task::spawn_blocking(move || spec_file::start(&path, &generations))
+            tokio::task::spawn_blocking(move || SpecFile::start(path, generations))
         };
         match read.await {
-            Ok(Ok(_applied)) => {}
+            Ok(Ok(file)) => self.spec_file = Some(file),
             Ok(Err(source)) => return Err(Error::SpecFile { path, source }),
             Err(join) => return Err(Error::Task(join.to_string())),
         }
@@ -576,6 +584,7 @@ impl Controller {
             elector,
             standing,
             shared,
+            spec_file,
             listeners,
             admin,
             ..
@@ -668,6 +677,14 @@ impl Controller {
             gateways.run(sweep_stop).await;
             Ok(())
         });
+        if let Some(file) = spec_file {
+            let file_stop = stop.subscribe();
+            tasks.spawn(async move {
+                file.run(file_stop)
+                    .await
+                    .map_err(|join| Error::Task(join.to_string()))
+            });
+        }
         let app = admin::router(admin::Admin {
             readiness: readiness.clone(),
             metrics: Arc::clone(&metrics),
