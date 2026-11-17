@@ -23,6 +23,18 @@ including nearest-grid frame alignment before normalization. This differs from t
 vLLM source-size policy, which remains unchanged. Engine support for the checkpoint's
 quantization and Python processor API is required independently of SMG.
 
+## DeepSeek-V4.1 image batches
+
+The router sends a DeepSeek-V4.1 image batch in the layout vLLM splits: one tensor
+of every image's patches, with each image's grid (`vit_grid`), patch count
+(`patches_per_image`) and token count (`types_per_image`) beside it. SGLang's V4.1
+model encodes one image per item and reads that image's grid as `n_vit_h` /
+`n_vit_w`, so both SGLang servicers cut the batch into one item per image, the
+shape SGLang's own processor builds: the image's patch rows, its placeholder
+range and its grid. A batch whose grids, patch counts, token counts and
+placeholders disagree is refused with `INVALID_ARGUMENT` before the scheduler.
+Other families keep one item per batch.
+
 ## Mixed images and videos
 
 The native worker processor accepts mixed images and videos in either order.

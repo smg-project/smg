@@ -92,6 +92,65 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 PROFILE_COMM_TIMEOUT = 600.0
 
 
+# The grids the Router's DeepSeek-V4.1 preprocessor sends with an image batch.
+V41_GRID_KEYS = ("vit_grid", "patches_per_image")
+
+
+def _deepseek_v41_items(feature, tensors: dict, offsets: list) -> list:
+    """One item per image, the shape SGLang's own DeepSeek-V4.1 processor builds.
+
+    The Router sends every image's patches in one tensor, with each image's
+    patch grid (``vit_grid``), patch count and token count alongside. SGLang's
+    V4.1 model encodes one image per item and reads its grid as ``n_vit_h`` /
+    ``n_vit_w``; a batch whose counts disagree is refused here, before the
+    scheduler, where it would stop the engine.
+    """
+    grids = tensors["vit_grid"].reshape(-1, 2).tolist()
+    patches = tensors["patches_per_image"].reshape(-1).tolist()
+    tokens = tensors.get("types_per_image")
+    tokens = None if tokens is None else tokens.reshape(-1).tolist()
+    images = len(grids)
+    prefix = "DeepSeek-V4.1 image batch:"
+    for name, count in (
+        ("placeholders", len(offsets)),
+        ("patch counts", len(patches)),
+        ("token counts", images if tokens is None else len(tokens)),
+    ):
+        if count != images:
+            raise ValueError(f"{prefix} {images} images but {count} {name}")
+    if len(feature.shape) == 0:
+        raise ValueError(f"{prefix} pixel_values is a scalar, not a tensor of patch rows")
+    rows = feature.shape[0]
+    if sum(patches) != rows:
+        raise ValueError(f"{prefix} {sum(patches)} patches but the pixel tensor has {rows} rows")
+    items = []
+    start = 0
+    for index, ((height, width), count, (first, last)) in enumerate(zip(grids, patches, offsets)):
+        if height < 1 or width < 1 or height * width != count:
+            raise ValueError(
+                f"{prefix} image {index} has a {height}x{width} grid but {count} patches"
+            )
+        span = last - first + 1
+        if tokens is not None and span != tokens[index]:
+            raise ValueError(
+                f"{prefix} image {index} fills {span} prompt positions but has "
+                f"{tokens[index]} tokens"
+            )
+        pixels = feature[start : start + count]
+        items.append(
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                # The scheduler receives the item pickled, and a view would
+                # carry every image's patches with it.
+                feature=pixels if images == 1 else pixels.clone(),
+                model_specific_data={"n_vit_h": int(height), "n_vit_w": int(width)},
+                offsets=[(first, last)],
+            )
+        )
+        start += count
+    return items
+
+
 def _aggregate_communicator_results(results: list, ok_message: str) -> tuple[bool, str]:
     """Aggregate per-DP-rank communicator outputs into (success, message)."""
     if not results:
@@ -1084,14 +1143,19 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     "failed to find the placeholder token in input_ids. "
                     "Check that placeholder_token_id matches the tokenized image token."
                 )
+            feature = self._decode_tensor_data(batch.pixel_values)
+            tensors = {
+                key: self._decode_tensor_data(value)
+                for key, value in batch.model_specific_tensors.items()
+            }
+            if modality == Modality.IMAGE and all(key in tensors for key in V41_GRID_KEYS):
+                mm_items.extend(_deepseek_v41_items(feature, tensors, offsets))
+                continue
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
-                    feature=self._decode_tensor_data(batch.pixel_values),
-                    model_specific_data={
-                        key: self._decode_tensor_data(value)
-                        for key, value in batch.model_specific_tensors.items()
-                    },
+                    feature=feature,
+                    model_specific_data=tensors,
                     offsets=offsets or None,
                 )
             )
