@@ -185,7 +185,7 @@ impl ProcessStage for ClassifyResponseProcessingStage {
         }
 
         // Get dispatch metadata
-        let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
+        let dispatch = ctx.dispatch.take().ok_or_else(|| {
             error!(
                 function = "ClassifyResponseProcessingStage::process",
                 "Dispatch metadata missing"
@@ -204,8 +204,8 @@ impl ProcessStage for ClassifyResponseProcessingStage {
 
         // Build response
         let response = ClassifyResponse::new(
-            dispatch.request_id.clone(),
-            dispatch.model.clone(),
+            dispatch.request_id,
+            dispatch.model,
             dispatch.created,
             data,
             usage,

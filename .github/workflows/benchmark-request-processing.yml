@@ -11,12 +11,16 @@ on:
       - 'model_gateway/src/routers/**'
       - 'model_gateway/src/worker/**'
       - 'crates/protocols/**'
+      - 'crates/worker/**'
       - '!model_gateway/src/**/tests/**'
       - '!model_gateway/src/**/*_test.rs'
       - '!model_gateway/src/**/test_*.rs'
       - '!crates/protocols/**/tests/**'
       - '!crates/protocols/**/*_test.rs'
       - '!crates/protocols/**/test_*.rs'
+      - '!crates/worker/**/tests/**'
+      - '!crates/worker/**/*_test.rs'
+      - '!crates/worker/**/test_*.rs'
   pull_request:
     branches: [ main, release/** ]
     paths:
@@ -27,12 +31,16 @@ on:
       - 'model_gateway/src/routers/**'
       - 'model_gateway/src/worker/**'
       - 'crates/protocols/**'
+      - 'crates/worker/**'
       - '!model_gateway/src/**/tests/**'
       - '!model_gateway/src/**/*_test.rs'
       - '!model_gateway/src/**/test_*.rs'
       - '!crates/protocols/**/tests/**'
       - '!crates/protocols/**/*_test.rs'
       - '!crates/protocols/**/test_*.rs'
+      - '!crates/worker/**/tests/**'
+      - '!crates/worker/**/*_test.rs'
+      - '!crates/worker/**/test_*.rs'
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * 0'

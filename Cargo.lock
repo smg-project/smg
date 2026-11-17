@@ -5119,7 +5119,6 @@ name = "openai-protocol"
 version = "1.18.0"
 dependencies = [
  "axum",
- "bitflags 2.13.2",
  "bytes",
  "chrono",
  "indexmap 2.14.2",
@@ -5128,6 +5127,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "smg-worker",
  "tokio",
  "tracing",
  "url",
@@ -5796,9 +5796,13 @@ dependencies = [
 name = "policy-controller-example"
 version = "0.1.0"
 dependencies = [
+ "mock-worker",
  "serde_yaml",
+ "smg-grpc-client",
  "smg-policy-controller",
+ "tikv-jemallocator",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -7854,6 +7858,7 @@ dependencies = [
  "smg-symphony",
  "smg-test-harness",
  "smg-wasm",
+ "smg-worker",
  "tempfile",
  "thiserror 2.0.21",
  "tikv-jemalloc-ctl",
@@ -7956,6 +7961,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smg-mcp",
+ "smg-worker",
  "str0m",
  "thiserror 2.0.21",
  "tokio",
@@ -8095,6 +8101,7 @@ dependencies = [
  "clap",
  "criterion",
  "http",
+ "hyper-util",
  "k8s-openapi",
  "kube",
  "kv-index",
@@ -8114,12 +8121,16 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "serde_yaml",
+ "sha2 0.11.0",
  "smg-grpc-client",
  "tempfile",
  "thiserror 2.0.21",
  "thread_local",
+ "tikv-jemallocator",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-health",
  "tonic-prost",
@@ -8280,6 +8291,25 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "smg-worker"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bitflags 2.13.2",
+ "http",
+ "openssl",
+ "reqwest 0.13.4",
+ "rustls",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

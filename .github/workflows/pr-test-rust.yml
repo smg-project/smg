@@ -273,9 +273,7 @@ jobs:
       # runner's image ships no build tools (go-unit-tests installs its own too).
       - name: Install the tools the tooling tests drive
         run: |
-          bash scripts/ci_apt_mirror.sh
-          bash scripts/ci_apt_update.sh sudo
-          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends make
+          bash scripts/ci_apt_install.sh sudo -y --no-install-recommends make
 
       # Every test under scripts/tests runs: the Python files as one pytest run, the
       # shell tests one by one. The tools the step above can install come from there; a
@@ -364,8 +362,8 @@ jobs:
         if: matrix.fmt
         run: |
           source "$HOME/.cargo/env"
-          bash scripts/ci_retry.sh 3 10 rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
-          bash scripts/ci_retry.sh 3 10 rustup toolchain install nightly --profile minimal
+          bash scripts/ci_retry.sh 5 10 timeout 180 rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+          bash scripts/ci_retry.sh 5 10 timeout 180 rustup toolchain install nightly --profile minimal
           cargo +nightly fmt -- --check
           # The Symphony fuzz crate is a workspace of its own; the root's fmt does not reach it.
           cargo +nightly fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all -- --check
@@ -373,7 +371,7 @@ jobs:
       - name: Lint
         run: |
           source "$HOME/.cargo/env"
-          rustup component add clippy
+          bash scripts/ci_retry.sh 5 10 timeout 180 rustup component add clippy
           bash scripts/ci_rust_tests.sh lint ${{ matrix.leg }}
 
       # The shard table is a partition of the workspace: every package, every
@@ -441,10 +439,10 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           # build.sh adds a missing target by one attempt; added here first,
           # behind the retry helper, it is not missing.
-          bash scripts/ci_retry.sh 3 10 rustup target add wasm32-unknown-unknown
+          bash scripts/ci_retry.sh 5 10 timeout 180 rustup target add wasm32-unknown-unknown
           bash examples/wasm/wasm-guest-policy/build.sh
           cd examples/wasm/wasm-guest-policy
-          bash "$GITHUB_WORKSPACE/scripts/ci_retry.sh" 3 10 rustup toolchain install nightly --profile minimal --component rustfmt
+          bash "$GITHUB_WORKSPACE/scripts/ci_retry.sh" 5 10 timeout 180 rustup toolchain install nightly --profile minimal --component rustfmt
           cargo +nightly fmt -- --check
           cargo clippy --locked --target wasm32-unknown-unknown --target-dir target -- -D warnings
 
@@ -478,8 +476,7 @@ jobs:
         run: |
           sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
           export DEBIAN_FRONTEND=noninteractive
-          bash scripts/ci_apt_update.sh $sudo
-          bash scripts/ci_retry.sh 3 10 $sudo apt-get install -y --no-install-recommends ffmpeg
+          bash scripts/ci_apt_install.sh $sudo -y --no-install-recommends ffmpeg
 
       # libjpeg-turbo lets the TurboJPEG decode tests run instead of returning early.
       - name: Install libjpeg-turbo
@@ -487,8 +484,7 @@ jobs:
         run: |
           sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
           export DEBIAN_FRONTEND=noninteractive
-          bash scripts/ci_apt_update.sh $sudo
-          bash scripts/ci_retry.sh 3 10 $sudo apt-get install -y --no-install-recommends libturbojpeg
+          bash scripts/ci_apt_install.sh $sudo -y --no-install-recommends libturbojpeg
 
       - name: Build the Rust tests
         timeout-minutes: 40
@@ -511,6 +507,22 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           bash scripts/ci_rust_tests.sh run ${{ matrix.shard }}
+
+      # The example controller where a user stands: its own script writes it
+      # outside the workspace as a repository of its own, with the crate
+      # named by git as the guide's line names it and the repository's lock.
+      # The git source is a snapshot of this checkout, which the script
+      # makes: a hosted checkout is a shallow clone, and git fetches from
+      # none. The copy's cases are built and run there, so a change that
+      # breaks the crate for a package that imports it fails here.
+      - name: Build the example controller outside the workspace
+        if: contains(matrix.needs, 'policy-import')
+        timeout-minutes: 20
+        run: |
+          source "$HOME/.cargo/env"
+          bash examples/policy-controller/own-repository.sh "${RUNNER_TEMP}/own-controller" --snapshot
+          cd "${RUNNER_TEMP}/own-controller"
+          cargo test
 
       - name: Fail if vision golden fixtures did not generate
         if: steps.vision-golden.outcome == 'failure'
@@ -602,15 +614,14 @@ jobs:
       - name: Lint the crates with AArch64-only code
         run: |
           source "$HOME/.cargo/env"
-          rustup component add clippy
+          bash scripts/ci_retry.sh 5 10 timeout 180 rustup component add clippy
           cargo clippy -p llm-multimodal -p kv-index --all-targets -- -D warnings
 
       # libjpeg-turbo lets the TurboJPEG decode tests run instead of returning early.
       - name: Install libjpeg-turbo
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          bash scripts/ci_apt_update.sh sudo
-          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends libturbojpeg
+          bash scripts/ci_apt_install.sh sudo -y --no-install-recommends libturbojpeg
 
       - name: Test the crates with AArch64-only code
         env:
@@ -878,6 +889,7 @@ jobs:
               - '.github/actions/setup-rust/**'
               - 'scripts/ci_install_rust.sh'
               - 'scripts/ci_apt_mirror.sh'
+              - 'scripts/ci_apt_install.sh'
               - 'scripts/ci_apt_update.sh'
               - 'scripts/ci_retry.sh'
               - 'scripts/ci_install_build_deps.sh'
@@ -903,6 +915,7 @@ jobs:
               - 'scripts/ci_rust_tests.sh'
               - 'scripts/ci_install_rust.sh'
               - 'scripts/ci_apt_mirror.sh'
+              - 'scripts/ci_apt_install.sh'
               - 'scripts/ci_apt_update.sh'
               - 'scripts/ci_retry.sh'
               - 'scripts/ci_install_build_deps.sh'
@@ -937,6 +950,7 @@ jobs:
               - *rust-infra
               - 'crates/tokenizer/**'
               - 'crates/protocols/**'
+              - 'crates/worker/**'
             rust-multimodal:
               - *rust-infra
               - 'crates/multimodal/**'
@@ -947,6 +961,7 @@ jobs:
               - 'crates/reasoning_parser/**'
               - 'crates/response_template/**'
               - 'crates/protocols/**'
+              - 'crates/worker/**'
             rust-agentic:
               - *rust-infra
               - 'crates/data_connector/**'
@@ -959,6 +974,7 @@ jobs:
             rust-protocols:
               - *rust-infra
               - 'crates/protocols/**'
+              - 'crates/worker/**'
               - 'crates/external_router/**'
               - 'crates/auth/**'
               - 'crates/rl/**'
@@ -975,6 +991,7 @@ jobs:
               - 'crates/mock_worker/**'
               - 'crates/gateway_perf/**'
               - 'crates/protocols/**'
+              - 'crates/worker/**'
               - 'crates/tokenizer/**'
               - 'crates/kv_index/**'
             rust-kv:
@@ -983,6 +1000,9 @@ jobs:
               - 'crates/mesh/**'
               - 'crates/mm_rdma/**'
               - 'crates/policy_controller/**'
+              # The controller binary's allocator settings are held to the
+              # gateway's constant, which the crate's test reads from this file.
+              - 'model_gateway/src/observability/metrics.rs'
               - 'examples/policy-controller/**'
               - 'examples/wasm/wasm-guest-policy/**'
               - 'scripts/ci_install_wasm_tools.sh'
@@ -993,6 +1013,7 @@ jobs:
               - 'crates/engine_servicer/**'
               - 'crates/mock_worker/**'
               - 'crates/protocols/**'
+              - 'crates/worker/**'
               - 'crates/tokenizer/**'
             rust-radix:
               - *rust-infra
@@ -2400,9 +2421,7 @@ jobs:
 
       - name: Install build tools
         run: |
-          bash scripts/ci_apt_mirror.sh
-          bash scripts/ci_apt_update.sh sudo
-          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y build-essential
+          bash scripts/ci_apt_install.sh sudo -y build-essential
 
       - name: Download build artifacts
         uses: ./.github/actions/download-build-artifacts

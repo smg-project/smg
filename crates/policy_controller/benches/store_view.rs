@@ -46,6 +46,18 @@
 //! this binary is built on the base branch with the pull request's bench
 //! sources, so a row here calls nothing the base's store lacks.
 //!
+//! `policy_store_pairs/kept/<n>` and `policy_store_pairs/moved/<n>` are
+//! one membership write of a fleet of pairs, `n` prefills and `n` decodes
+//! of one model that name no runtime: one prefill's registration written
+//! again as it stands, which moves no offer, and its runtime named and
+//! unnamed in turn, which moves its offer at every write. The gate reads
+//! both at 512 a side.
+//!
+//! `policy_store_models/member_write/<ids>` is one membership write beside
+//! a worker that lists `ids` models: one small worker's registration
+//! written again as it stands, in a store of eight workers of one model and
+//! one worker of `ids` models of its own. The gate reads it at 1,024.
+//!
 //! `policy_store_cadence/*` reads the build beside a writer on another
 //! core, for a run pinned to two cores (both threads spin, so each keeps
 //! its core): `quiet/<n>` with the writer idle, `busy/<n>` with it writing
@@ -173,17 +185,14 @@ fn ask_at(opened: Instant, affinity: bool) -> Ask {
 }
 
 impl Fixture {
-    fn new(n: usize) -> Self {
+    fn new(n: usize, out: ViewBuffers) -> Self {
         let (store, ids, opened) = pool_of(n);
         Self {
             n,
             store,
             ids,
             window: Cell::new(opened),
-            out: ViewBuffers {
-                candidates: page_start_buffer(n),
-                affinity: page_start_buffer(n),
-            },
+            out,
         }
     }
 
@@ -748,8 +757,142 @@ fn cadence(c: &mut Criterion, fixtures: &mut [Fixture]) {
     group.finish();
 }
 
+/// One membership write of a fleet of pairs: `n` prefills and `n` decodes
+/// of one model, every one ready with a record on file and published, none
+/// naming a runtime. `policy_store_pairs/kept/<n>` writes one prefill's
+/// registration again as it stands, which moves no offer;
+/// `policy_store_pairs/moved/<n>` names its runtime and unnames it in turn,
+/// which moves its offer at every write. A store of its own a size: the
+/// other cells' pools hold one role.
+fn pair_writes(c: &mut Criterion) {
+    for n in SIZES {
+        let facts_of = |index: usize| {
+            let (role, key) = if index < n {
+                (Role::Prefill, format!("http://p{index}:8000"))
+            } else {
+                (Role::Decode, format!("http://d{}:8000", index - n))
+            };
+            WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                role,
+                models: vec![MODEL.to_string()],
+                dp_size: 1,
+                max_running: Some(4),
+                ..WorkerFacts::default()
+            }
+        };
+        let store = MemoryStore::new();
+        let opened = Instant::now();
+        for index in 0..2 * n {
+            let id = store.upsert(facts_of(index)).id();
+            let revision = WorkersStore::get(&store, id).expect("the row").revision;
+            store
+                .set_status(id, WorkerStatus::Ready, revision)
+                .expect("ready");
+            store.record(id, 0, record_of(index, 0), opened, LoadSource::Stream);
+        }
+        store.publish(opened + PUBLISH_WINDOW);
+        assert_eq!(store.publish_due(), None);
+        let written = facts_of(n / 2);
+        let named = WorkerFacts {
+            engine_kind: "rt-b".to_string(),
+            ..written.clone()
+        };
+        let mut group = c.benchmark_group("policy_store_pairs");
+        group.bench_with_input(BenchmarkId::new("kept", n), &n, |b, _| {
+            b.iter_batched(
+                || written.clone(),
+                |facts| store.upsert(black_box(facts)),
+                BatchSize::SmallInput,
+            );
+        });
+        // The writes come in the order their facts were made: named,
+        // unnamed, named, so each moves the offer the one before left.
+        let mut name = false;
+        group.bench_with_input(BenchmarkId::new("moved", n), &n, |b, _| {
+            b.iter_batched(
+                || {
+                    name = !name;
+                    if name {
+                        named.clone()
+                    } else {
+                        written.clone()
+                    }
+                },
+                |facts| store.upsert(black_box(facts)),
+                BatchSize::SmallInput,
+            );
+        });
+        group.finish();
+    }
+}
+
+/// One membership write beside a worker that lists many models, in a store
+/// of its own a size: eight workers of one model and one worker that lists
+/// `ids` models of its own, every one ready with a record on file and
+/// published. `policy_store_models/member_write/<ids>` writes one of the
+/// eight's registration again as it stands. The write reads every row's
+/// models into their pools: the row fails when that read looks back over
+/// the models a row listed before.
+fn member_write_beside_many_models(c: &mut Criterion) {
+    let facts_of = |key: String, models: Vec<String>| WorkerFacts {
+        engine: key.clone(),
+        key,
+        incarnation: 1,
+        models,
+        dp_size: 1,
+        max_running: Some(4),
+        ..WorkerFacts::default()
+    };
+    let small = |index: usize| facts_of(format!("http://w{index}:8000"), vec![MODEL.to_string()]);
+    let mut group = c.benchmark_group("policy_store_models");
+    for ids in [128_usize, 1_024, 4_096] {
+        let listed = (0..ids).map(|model| format!("model-{model}")).collect();
+        let wide = facts_of("http://wide:8000".to_string(), listed);
+        let store = MemoryStore::new();
+        let opened = Instant::now();
+        for (index, facts) in (0..8).map(&small).chain([wide]).enumerate() {
+            let id = store.upsert(facts).id();
+            let revision = WorkersStore::get(&store, id).expect("the row").revision;
+            store
+                .set_status(id, WorkerStatus::Ready, revision)
+                .expect("ready");
+            store.record(id, 0, record_of(index, 0), opened, LoadSource::Stream);
+        }
+        store.publish(opened + PUBLISH_WINDOW);
+        assert_eq!(store.publish_due(), None);
+        let written = small(3);
+        group.bench_with_input(BenchmarkId::new("member_write", ids), &ids, |b, _| {
+            b.iter_batched(
+                || written.clone(),
+                |facts| store.upsert(black_box(facts)),
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 fn store_view(c: &mut Criterion) {
-    let mut fixtures: Vec<Fixture> = SIZES.iter().map(|&n| Fixture::new(n)).collect();
+    // Every size's buffers are placed before the first store is built. A
+    // count's runner bounds the program break, and the stores cross that
+    // bound: a buffer asked for after them is mapped on its own and never
+    // starts a page.
+    let placed: Vec<ViewBuffers> = SIZES
+        .iter()
+        .map(|&n| ViewBuffers {
+            candidates: page_start_buffer(n),
+            affinity: page_start_buffer(n),
+            stalled: Vec::new(),
+        })
+        .collect();
+    let mut fixtures: Vec<Fixture> = SIZES
+        .iter()
+        .zip(placed)
+        .map(|(&n, out)| Fixture::new(n, out))
+        .collect();
     floor(c, &mut fixtures);
     view_build(c, &mut fixtures);
     load_write(c, &mut fixtures);
@@ -758,6 +901,8 @@ fn store_view(c: &mut Criterion) {
     vetoed(c, &mut fixtures);
     writes_beside_vetoes(c, &mut fixtures);
     member_write_beside_spread_vetoes(c);
+    pair_writes(c);
+    member_write_beside_many_models(c);
 }
 
 criterion_group!(benches, store_view);

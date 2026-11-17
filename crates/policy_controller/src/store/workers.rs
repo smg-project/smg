@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, time::Instant};
 
 use crate::{
     lease::Membership,
-    store::GatewayId,
+    store::{pairing::PairingDescriptor, GatewayId},
     view::{fingerprint, Role, WireModes, WorkerId},
 };
 
@@ -133,11 +133,14 @@ pub struct WorkerFacts {
     /// descriptor's fields).
     pub labels: BTreeMap<String, String>,
     pub zone: Option<String>,
-    /// The prefill-decode pairing descriptor, when the worker has one.
-    pub pairing: Option<String>,
-    /// The pairing class, derived by the store at each membership change;
-    /// `0` outside any pairing.
-    pub pair_class: u32,
+    /// What the worker offers a prefill-decode partner, when the handshake
+    /// learned any of it. The store derives the pair classes from it, with
+    /// the engine kind as the runtime, where a membership write moves a
+    /// member or an offer and where a generation moves the pairing mode
+    /// ([`pairing`](super::pairing)): a registration hands no class in. The
+    /// door drops a blank value and reads a name past its blanks. Behind a
+    /// pointer: a worker that reports none holds one word for it.
+    pub pairing: Option<Box<PairingDescriptor>>,
     /// The engine's admission window (maximum running requests); `None`
     /// when it reports none.
     pub max_running: Option<u32>,
@@ -150,13 +153,31 @@ pub struct WorkerFacts {
     pub overload: Overload,
 }
 
+impl WorkerFacts {
+    /// Whether these facts name the models `other` names, in any order and
+    /// however often. The order is a fact of its own (a row's events are
+    /// indexed under its first model), and a reorder alone is no other
+    /// worker.
+    pub(crate) fn same_models(&self, other: &Self) -> bool {
+        fn named(models: &[String]) -> Vec<&str> {
+            let mut ids: Vec<&str> = models.iter().map(String::as_str).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        }
+        self.models == other.models || named(&self.models) == named(&other.models)
+    }
+}
+
 /// One worker as the store holds it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkerRow {
     pub id: WorkerId,
     pub facts: WorkerFacts,
     pub status: WorkerStatus,
-    /// Moves on every write to the row; the guard a racing write names.
+    /// Counts the row's stated facts: it moves on every write of them (a
+    /// registration's refresh, a patch) and on no status change. The guard
+    /// a racing write names.
     pub revision: u64,
     /// When the row was created on the host's clock.
     pub admitted_at: Instant,
@@ -243,7 +264,8 @@ pub enum MembershipTail {
 
 /// The membership store's write side and its watch.
 ///
-/// Every write moves the store's epoch and the row's revision. A watcher
+/// Every write moves the store's epoch; a write of a row's facts moves the
+/// row's revision, a status change does not. A watcher
 /// reads a snapshot with its epoch, then the changes since it; past the
 /// store's buffer it is told to snapshot again. The snapshot carries the
 /// facts the gateways' pools derive from (role, wire modes, engine kind,

@@ -114,13 +114,6 @@ struct Row {
     replaced: Vec<Weak<Replaced>>,
     /// Held for as long as this presence lasts: a [`Presence`] waits for
     /// its drop.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "a decide stream subscribes to it; the Decide call is the step's next PR"
-        )
-    )]
     ended: watch::Sender<()>,
 }
 
@@ -169,24 +162,16 @@ impl Drop for Seat {
 }
 
 /// A gateway's presence as a decide stream holds it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Decide call holds one a decide stream; that call is the step's next PR"
-    )
-)]
 #[derive(Clone)]
 pub(crate) struct Presence(watch::Receiver<()>);
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Decide call ends a decide stream on it; that call is the step's next PR"
-    )
-)]
 impl Presence {
+    /// Whether the presence ended: one load, where a poll of
+    /// [`Presence::ended`] takes the watch's lock.
+    pub(crate) fn is_ended(&self) -> bool {
+        self.0.is_closed()
+    }
+
     /// Resolves when the presence ended.
     pub(crate) async fn ended(&mut self) {
         // No value is ever sent: the row holds the sender and goes with
@@ -328,13 +313,6 @@ impl Gateways {
 
     /// The gateway's presence at `now` for a decide stream's open: `None`
     /// when it is not present. No decision asks: a stream's open and end do.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Decide call asks it at a decide stream's open; that call is the step's next PR"
-        )
-    )]
     pub(crate) fn presence(&self, gateway: GatewayId, now: Instant) -> Option<Presence> {
         let mut table = self.table.lock();
         Self::observe(&mut table, self.fence.leader_term(now), now);
@@ -460,7 +438,7 @@ pub(crate) mod tests {
             self,
             tests::{a_completed, worker},
         },
-        elector::{ElectionSettings, Elector, MemoryLease, Tick},
+        elector::{ElectionSettings, Elector, Tick},
         lease::{Lease, LeaseId},
         store::{GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore},
         view::WorkerId,
@@ -484,8 +462,8 @@ pub(crate) mod tests {
         renew_deadline: Duration::from_secs(1800),
     };
 
-    /// A candidate that took its own lease at the returned instant, a store,
-    /// and the table over that candidate's fence and that store.
+    /// A candidate that leads under its own lease from the returned instant,
+    /// a store, and the table over that candidate's fence and that store.
     pub(crate) fn leading(grace: Duration) -> (Elector, Arc<MemoryStore>, Arc<Gateways>, Instant) {
         ceiled(grace, 1_024)
     }
@@ -495,17 +473,11 @@ pub(crate) mod tests {
         grace: Duration,
         ceiling: usize,
     ) -> (Elector, Arc<MemoryStore>, Arc<Gateways>, Instant) {
-        let mut elector = Elector::new(
-            Box::new(MemoryLease::new()),
-            "controller-0@10.0.0.7:30100",
-            PATIENT,
-        )
-        .expect("the settings are in order");
+        let mut elector = Elector::alone("controller-0@10.0.0.7:30100", PATIENT)
+            .expect("the settings are in order");
         let taken = Instant::now();
-        assert_eq!(
-            elector.tick(taken).expect("the take"),
-            Tick::Acquired { term: 1 }
-        );
+        elector.lead_at(taken);
+        assert_eq!(elector.fence().leader_term(taken), Some(1));
         let store = Arc::new(MemoryStore::new());
         let gateways = Arc::new(Gateways::new(
             grace,

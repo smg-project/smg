@@ -70,7 +70,9 @@ pub struct LoadSample {
 ///
 /// Every write that changes what is on file for an engine judges the
 /// engine's overload verdict once, when the write is whole: a record, a
-/// report, the word that no report came, an eviction.
+/// report, the word that no report came, an eviction. Once the caller
+/// told how often it hears a rank ([`LoadSink::heard_every`]), a judgment
+/// counts a rank's sample only while its engine still says it.
 ///
 /// A worker's rows live exactly as long as its membership row: the write
 /// that removes or replaces the worker deletes them, and a record or a
@@ -111,6 +113,21 @@ pub trait LoadSink: Send + Sync {
 
     /// The poll decision for the worker at `now` under the poll `interval`.
     fn poll_mode(&self, id: WorkerId, now: Instant, interval: Duration) -> PollMode;
+
+    /// The caller hears every ready rank once a `period`: by its stream's
+    /// records, or by the poll it falls back to. From this call on a
+    /// sample is a fact while its engine still says it: a judgment counts
+    /// the row of a data-parallel engine's rank only where its receipt
+    /// lies no further behind the engine's newest than three periods,
+    /// which keep a rank through one lost report at the least. Both
+    /// instants are the sink's own receipts (a record's arrival, a poll's
+    /// start), so no clock crosses, and no timer runs: the age is read at
+    /// the write that judges, and an engine none of whose ranks is heard
+    /// keeps its verdict until the word that no report came. Every engine
+    /// is judged again at the call. Until a period is told no sample ends
+    /// by its age. A period is told once: a call with another period
+    /// changes nothing and answers `false`.
+    fn heard_every(&self, period: Duration) -> bool;
 
     /// The row of one rank, when one is on file.
     fn load(&self, id: WorkerId, rank: u16) -> Option<LoadSample>;

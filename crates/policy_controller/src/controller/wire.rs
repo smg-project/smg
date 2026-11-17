@@ -16,7 +16,9 @@
 //! value of it is refused. A count the wire carries wider than the record
 //! (the attempt, the media counts) saturates at the record's width. A
 //! header's name is a position, so one past the record's 256 is refused:
-//! saturated, it would read as another header's.
+//! saturated, it would read as another header's. A frame's headers are as
+//! many as those positions at most ([`MAX_HEADERS`]): a longer list repeats
+//! a name, and is refused by its count.
 //!
 //! A key is read in the form its frame carries, and the two keys' hash
 //! forms are two things (the contract's `Identity`). A tenant's is its
@@ -28,6 +30,19 @@
 //! in either form, and a stage that reads the key itself reads one key.
 //! The one value that would give the fingerprint no key has is refused.
 //!
+//! A range the contract fixes refuses a frame, its id's length among
+//! them, and the transport refuses one over its size as received; a
+//! bound a generation's document sets never does,
+//! since the gateway may be a generation behind. The block hashes past what
+//! the deciding generation reads of the request are cut at the read, the
+//! first ones kept: a prefix cut short is still a prefix.
+//!
+//! A request that carries its prompt as text is checked like any other and
+//! says so ([`Checked::has_text`]): the controller is to hash the text into
+//! block hashes before any stage reads the view, and its decider has no
+//! decision for it until a step does. Until one reads the text it is
+//! dropped at the check, so a frame that waits in a queue holds none.
+//!
 //! An answer carries no lease here: a decision is written as the engine
 //! made it, and the call that issues leases adds them.
 
@@ -36,6 +51,7 @@ use std::{mem, time::Duration};
 use crate::{
     decision::{Decision, ShedReason, Target, Trace},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
+    spec::{AppliedSpec, MAX_HEADERS},
     view::{
         fingerprint, key_of_session, AffinityFacts, Constraints, HashKind, Header, Identity,
         MediaCounts, ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
@@ -43,16 +59,31 @@ use crate::{
 };
 
 /// Why a frame is refused before any decision: the field, by its path in
-/// the contract.
+/// the contract. A frame's size is the transport's to refuse
+/// ([`MAX_FRAME`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum Refusal {
     /// The field holds a number its record has no place for.
     #[error("{0} is out of its range in this protocol version")]
     OutOfRange(&'static str),
-    /// The field asks for what no step of this build serves.
-    #[error("{0} is not served by this build")]
-    Unserved(&'static str),
 }
+
+/// The longest `request_id` a frame carries, in bytes; the shortest is one.
+/// The id is its request's key and rides back on every answer, so its
+/// length is a range of the contract.
+pub(crate) const MAX_REQUEST_ID: usize = 256;
+
+/// The largest `DecideRequest`, in bytes as received: the transport refuses
+/// a longer one on the `Decide` call at its length, before it reads it, so
+/// a field this build does not know counts too. A stream's window and a
+/// decider's queue hold frames by the place, so the frame's size is what
+/// bounds their bytes: as read, a frame holds no more than it was received
+/// as and one record for each of its headers, [`MAX_HEADERS`] of them at
+/// most. A frame over the bound is refused whole, whatever its lists hold:
+/// a sender cuts its hashes at the tail until its frame fits, and the
+/// spec's range for their cap ends at what one frame carries
+/// ([`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES)).
+pub(crate) const MAX_FRAME: usize = 64 * 1024;
 
 /// A `DecideRequest` the engine's record holds whole.
 #[derive(Debug)]
@@ -66,14 +97,23 @@ pub(crate) struct Checked {
     /// the session's value; `0` for one that carries it plain or carries
     /// none.
     session_key: u64,
+    /// Whether the frame carried its prompt as text.
+    text: bool,
 }
 
 impl Checked {
     /// Checks `request`, or refuses it by the first field the record cannot
-    /// hold. A frame with no facts, or with no constraints, reads as one
-    /// that leaves every field of them unset.
+    /// hold. Its size is not asked here: the transport held the frame to
+    /// [`MAX_FRAME`] as received, and a frame reads to no more than that.
+    /// A frame with no facts, or with no constraints, reads as one that
+    /// leaves every field of them unset.
     pub(crate) fn new(request: proto::DecideRequest) -> Result<Self, Refusal> {
-        let facts = request.facts.unwrap_or_default();
+        if !(1..=MAX_REQUEST_ID).contains(&request.request_id.len()) {
+            return Err(Refusal::OutOfRange("request_id"));
+        }
+        let mut facts = request.facts.unwrap_or_default();
+        // The prompt as text is said and not kept: no step reads it yet.
+        let text = !mem::take(&mut facts.prompt_text).is_empty();
         let phase = match proto::Phase::try_from(facts.phase) {
             Ok(proto::Phase::Unspecified | proto::Phase::Single) => Phase::Single,
             Ok(proto::Phase::Prefill) => Phase::Prefill,
@@ -86,18 +126,19 @@ impl Checked {
             Ok(proto::HashKind::Text) => HashKind::Text,
             Err(_) => return Err(Refusal::OutOfRange("facts.hash_kind")),
         };
+        // The headers by their count first: an empty one is two bytes as
+        // encoded and a record of its own as read, so the frame's size
+        // does not bound them, and a list longer than a view's names
+        // repeats one.
+        if facts.headers.len() > MAX_HEADERS {
+            return Err(Refusal::OutOfRange("facts.headers"));
+        }
         if facts
             .headers
             .iter()
             .any(|header| u8::try_from(header.name).is_err())
         {
             return Err(Refusal::OutOfRange("facts.headers.name"));
-        }
-        // The controller is to hash the text into block hashes before any
-        // stage reads the view; no step does yet, and a decision made as if
-        // the request carried no prefix would be another request's.
-        if !facts.prompt_text.is_empty() {
-            return Err(Refusal::Unserved("facts.prompt_text"));
         }
         // A session key's hash form is the session's value: the key's
         // fingerprint is read back from it within the request's model and
@@ -120,6 +161,7 @@ impl Checked {
             phase,
             hash_kind,
             session_key,
+            text,
         })
     }
 
@@ -132,15 +174,29 @@ impl Checked {
         self.phase
     }
 
-    /// The decision's seed, which its trace carries.
-    pub(crate) const fn seed(&self) -> u64 {
-        self.facts.seed
-    }
-
     /// The time the request gives its decision, counted from its frame's
     /// receipt.
     pub(crate) fn budget(&self) -> Duration {
         Duration::from_micros(u64::from(self.facts.budget_micros))
+    }
+
+    /// Whether the request carried its prompt as text, for the controller
+    /// to hash.
+    pub(crate) const fn has_text(&self) -> bool {
+        self.text
+    }
+
+    /// How many block hashes the frame carries: a read hands the engine
+    /// as many as its generation reads of them ([`Self::hashes_read`]).
+    pub(crate) fn hashes(&self) -> usize {
+        self.facts.block_hashes.len()
+    }
+
+    /// How many of the frame's block hashes a decision under `spec` reads:
+    /// the depth of the generation's stages, in blocks as the frame's host
+    /// hashed them ([`AppliedSpec::block_hashes_read`]).
+    pub(crate) fn hashes_read(&self, spec: &AppliedSpec) -> usize {
+        spec.block_hashes_read(self.hash_kind, self.facts.block_size)
     }
 
     /// The request's id, for its answer.
@@ -207,7 +263,11 @@ impl Checked {
                 streaming: facts.streaming,
                 max_output_tokens: facts.max_output_tokens,
                 prompt_tokens: facts.prompt_tokens,
-                block_hashes: &facts.block_hashes,
+                // The first hashes, as deep as the generation reads.
+                block_hashes: facts
+                    .block_hashes
+                    .get(..view.max_block_hashes)
+                    .unwrap_or(&facts.block_hashes),
                 hash_kind: self.hash_kind,
                 session_key: match facts.session_key.as_ref().and_then(|key| key.form.as_ref()) {
                     Some(Form::Plain(key)) if !key.is_empty() => Identity::plain(key),
@@ -229,12 +289,17 @@ impl Checked {
                 // The wire carries the name: each read of the request's
                 // session fingerprints it.
                 model_fingerprint: ModelFingerprint::NONE,
+                // The decision's rows are written for it: none is pinned
+                // beside its own session bit.
+                pinned_at: 0,
             },
             &Constraints {
                 excluded: &lists.excluded,
                 wire_modes: self.wires().unwrap_or_default(),
                 overload_lifted: constraints.overload_lifted,
                 subset_hint: constraints.subset_hint,
+                // And each carries its own stalled bit.
+                stalled: &[],
             },
         );
         lists.headers = emptied(headers);
@@ -252,6 +317,9 @@ pub(crate) struct Viewed<'a> {
     pub(crate) budget_micros: u32,
     /// The candidates' affinity column, as the view's build filled it.
     pub(crate) affinity: &'a [AffinityFacts],
+    /// How many of the request's block hashes the deciding generation
+    /// reads.
+    pub(crate) max_block_hashes: usize,
 }
 
 /// The lists of one request in the engine's form, on buffers their decider
@@ -317,6 +385,15 @@ pub(crate) fn busy(id: Vec<u8>, term: u64, reason: Reason) -> proto::DecideAnswe
     }
 }
 
+/// The frame that grants its stream `window` more requests.
+pub(crate) fn credit(term: u64, window: u32) -> proto::DecideAnswer {
+    proto::DecideAnswer {
+        request_id: Vec::new(),
+        term,
+        answer: Some(Answer::Credit(proto::Credit { window })),
+    }
+}
+
 /// A decision as the wire carries it, with no lease.
 fn decision(decision: &Decision) -> proto::Decision {
     let outcome = match decision {
@@ -362,12 +439,15 @@ const fn shed_reason(reason: ShedReason) -> proto::ShedReason {
     }
 }
 
-/// The record's trace: the five facts it holds. The observability contract
-/// fills the wire's other fields; they stay unset until then.
+/// The record's trace: the five facts it holds. Its count fills two of the
+/// wire's fields: `survivors` where a pass counted, and `drew_first` where
+/// the decision drew and counted none. The observability contract fills
+/// the wire's other fields; they stay unset until then.
 fn trace(trace: &Trace) -> proto::Trace {
     proto::Trace {
         profile: u32::from(trace.profile),
-        survivors: trace.survivors,
+        survivors: trace.survivors.get(),
+        drew_first: trace.drew_first(),
         top: trace
             .top
             .iter()
@@ -386,10 +466,13 @@ fn trace(trace: &Trace) -> proto::Trace {
 
 #[cfg(test)]
 mod tests {
-    use super::{busy, decided, emptied, Checked, Lists, Refusal, Viewed};
+    use super::{busy, credit, decided, emptied, Checked, Lists, Refusal, Viewed, MAX_FRAME};
     use crate::{
-        decision::{Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace},
+        decision::{
+            Decision, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
+        },
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
+        spec::MAX_BLOCK_HASHES,
         view::{
             fingerprint, AffinityFacts, Constraints, HashKind, Header, Identity, MediaCounts,
             ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
@@ -469,6 +552,7 @@ mod tests {
             now_micros: 77,
             budget_micros: 1_500,
             affinity: &affinity,
+            max_block_hashes: 256,
         };
         checked.read(lists, view, check)
     }
@@ -477,7 +561,7 @@ mod tests {
     fn every_field_of_a_frame_reaches_the_engines_request() {
         let checked = Checked::new(full()).expect("a frame the record holds");
         assert_eq!(
-            (checked.model(), checked.phase(), checked.seed()),
+            (checked.model(), checked.phase(), checked.facts.seed),
             ("model-a", Phase::Decode, 24)
         );
         assert_eq!(checked.budget().as_micros(), 2_000);
@@ -545,14 +629,18 @@ mod tests {
 
     #[test]
     fn a_frame_with_nothing_set_reads_as_the_records_defaults() {
-        let checked = Checked::new(proto::DecideRequest::default()).expect("an empty frame");
+        // Nothing but its id, which the contract's range asks of every frame.
+        let bare = || proto::DecideRequest {
+            request_id: vec![1],
+            ..proto::DecideRequest::default()
+        };
+        let checked = Checked::new(bare()).expect("a frame of its id alone");
         assert_eq!(
-            (checked.model(), checked.phase(), checked.seed()),
+            (checked.model(), checked.phase(), checked.facts.seed),
             ("", Phase::Single, 0)
         );
         assert!(checked.budget().is_zero());
-        let empty = proto::DecideRequest::default();
-        reading(empty, &mut Lists::default(), |facts, constraints| {
+        reading(bare(), &mut Lists::default(), |facts, constraints| {
             assert_eq!(
                 (facts.phase, facts.hash_kind),
                 (Phase::Single, HashKind::Token)
@@ -715,6 +803,23 @@ mod tests {
             Checked::new(frame).expect_err("a name past the record's"),
             Refusal::OutOfRange("facts.headers.name")
         );
+        // A frame's headers by their count: 256 are read, each a record of
+        // its own, and one more is refused by the list's path. An empty
+        // header is two bytes as encoded.
+        let headers = |count| with(|facts| facts.headers = vec![proto::Header::default(); count]);
+        let read = reading(headers(256), &mut Lists::default(), |facts, _| {
+            facts.headers.len()
+        });
+        assert_eq!(read, 256);
+        assert_eq!(
+            Checked::new(headers(257)).expect_err("a header past a view's names"),
+            Refusal::OutOfRange("facts.headers")
+        );
+        let size = |count| {
+            let facts = headers(count).facts.expect("the full frame has facts");
+            prost::Message::encoded_len(&facts)
+        };
+        assert_eq!(size(257) - size(0), 2 * 257);
         // A wire-mode bit this build does not know is dropped, wherever in
         // the wire's 32 it stands. A gateway that states such bits alone
         // still states wires: none this build knows, and the record reads
@@ -745,15 +850,58 @@ mod tests {
         assert_eq!(stating(0), (None, WireModes::NONE));
     }
 
+    /// The text is said and dropped at the check: the frame a queue holds
+    /// keeps none of it, its buffer neither.
     #[test]
-    fn a_frame_that_carries_its_prompt_as_text_is_refused_as_unserved() {
-        let refused = Checked::new(with(|facts| facts.prompt_text = b"hello".to_vec()))
-            .expect_err("no step hashes the text yet");
-        assert_eq!(refused, Refusal::Unserved("facts.prompt_text"));
-        assert_eq!(
-            refused.to_string(),
-            "facts.prompt_text is not served by this build"
-        );
+    fn a_frame_that_carries_its_prompt_as_text_is_checked_and_says_so() {
+        let plain = Checked::new(full()).expect("a frame the record holds");
+        assert!(!plain.has_text());
+        let text = Checked::new(with(|facts| facts.prompt_text = b"hello".to_vec()))
+            .expect("text is no field out of its range");
+        assert!(text.has_text());
+        assert_eq!(text.facts.prompt_text.capacity(), 0);
+    }
+
+    #[test]
+    fn the_hashes_past_what_the_generation_reads_are_cut_at_the_read_and_the_first_ones_kept() {
+        let frame = with(|facts| facts.block_hashes = (1..=6).collect());
+        let checked = Checked::new(frame).expect("a frame the record holds");
+        assert_eq!(checked.hashes(), 6);
+        let read = |max_block_hashes| {
+            let view = Viewed {
+                now_micros: 0,
+                budget_micros: 1,
+                affinity: &[],
+                max_block_hashes,
+            };
+            checked.read(&mut Lists::default(), view, |facts, _| {
+                facts.block_hashes.to_vec()
+            })
+        };
+        assert_eq!(read(4), [1, 2, 3, 4]);
+        assert_eq!(read(6), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(read(7), [1, 2, 3, 4, 5, 6]);
+    }
+
+    /// The spec's range for `view.max_block_hashes` ends where the frame's
+    /// bound does. A frame of that many hashes and an id of one byte is
+    /// read, five bytes under the bound, and one hash more carries it over.
+    #[test]
+    fn the_specs_highest_cap_of_hashes_is_what_one_frame_carries() {
+        let frame = |hashes: u32| proto::DecideRequest {
+            request_id: vec![1],
+            facts: Some(proto::RequestFacts {
+                block_hashes: (0..u64::from(hashes)).collect(),
+                ..proto::RequestFacts::default()
+            }),
+            constraints: None,
+        };
+        let at = frame(MAX_BLOCK_HASHES);
+        assert_eq!(prost::Message::encoded_len(&at), MAX_FRAME - 5);
+        let read = Checked::new(at).expect("a frame under the bound");
+        assert_eq!(u32::try_from(read.hashes()), Ok(MAX_BLOCK_HASHES));
+        let over = frame(MAX_BLOCK_HASHES + 1);
+        assert_eq!(prost::Message::encoded_len(&over), MAX_FRAME + 3);
     }
 
     #[test]
@@ -809,7 +957,7 @@ mod tests {
     fn traced() -> Trace {
         Trace {
             profile: 3,
-            survivors: 5,
+            survivors: Survivors::counted(5),
             // The third entry is past the trace's length: not a part of it.
             top: [
                 (WorkerId(31), 0.5),
@@ -825,7 +973,7 @@ mod tests {
     fn wire_trace() -> proto::Trace {
         proto::Trace {
             profile: 3,
-            survivors: 5,
+            survivors: Some(5),
             top: vec![
                 proto::Scored {
                     worker_id: 31,
@@ -911,6 +1059,36 @@ mod tests {
         assert_eq!(leases, 0);
     }
 
+    /// A decision that drew counted no survivor, and the wire says so in
+    /// the contract's two words: `survivors` stays unset, which is no
+    /// count and no zero, and `drew_first` is set. The trace's other facts
+    /// leave as a counted trace's do.
+    #[test]
+    fn a_drawn_decisions_trace_says_drew_first_and_carries_no_count() {
+        let mut targets = Targets::new();
+        targets.push(Target {
+            position: 0,
+            id: WorkerId(53),
+            dp_rank: 0,
+            pair: None,
+        });
+        let pick = Decision::Pick(Pick {
+            targets,
+            trace: Trace {
+                survivors: Survivors::NOT_COUNTED,
+                ..traced()
+            },
+            ..Pick::default()
+        });
+        let (_, trace, _) = carried(decided(Vec::new(), 1, &pick));
+        let drawn = proto::Trace {
+            survivors: None,
+            drew_first: true,
+            ..wire_trace()
+        };
+        assert_eq!(trace, Some(drawn));
+    }
+
     #[test]
     fn a_shed_names_its_reason_and_its_stage_and_a_ticket_its_wait() {
         for (record, wire) in [
@@ -957,6 +1135,18 @@ mod tests {
             })
         );
         assert_eq!((trace, leases), (Some(wire_trace()), 0));
+    }
+
+    #[test]
+    fn a_credit_frame_carries_its_term_and_its_grant_and_no_requests_id() {
+        assert_eq!(
+            credit(3, 64),
+            proto::DecideAnswer {
+                request_id: Vec::new(),
+                term: 3,
+                answer: Some(Answer::Credit(proto::Credit { window: 64 })),
+            }
+        );
     }
 
     #[test]

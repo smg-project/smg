@@ -1315,6 +1315,7 @@ mod tests {
             seed: 9,
             block_size: 16,
             now_micros: 0,
+            pinned_at: 0,
             // Host-only: the request block carries no affinity column and
             // no rows named in its place.
             affinity: &[],
@@ -1510,6 +1511,7 @@ mod tests {
             regime: OverloadRegime::Partial,
             generation: 7,
             zones: &zones,
+            reach: 0,
         };
         let mut packed = Packed::default();
         packed.fill_pool(&pool);

@@ -9,7 +9,7 @@
 //! same. Every batch is `load_only`, numbered 0 (there is no sequence to
 //! repeat and the subscriber admits nothing), stamped with its rank, and
 //! carries the record with its telemetry. A rank's record goes out when it
-//! changed ([`load_changed`], checked every `load_tick`) or when its
+//! changed ([`RankClock::due`], checked every `load_tick`) or when its
 //! heartbeat is due (`heartbeat_interval`, `heartbeat_backoff` after two
 //! unchanged heartbeats), each rank on its own clock, so a quiet rank keeps
 //! reporting while another is busy: the gateway prices each rank worker by
@@ -25,8 +25,8 @@ use tonic::Status;
 
 use crate::{
     kv_events::{
-        load_changed, unix_seconds, LoadFromState, LoadSource, RankLoads,
-        DEFAULT_HEARTBEAT_BACKOFF, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LOAD_TICK,
+        unix_seconds, LoadFromState, LoadSource, RankClock, RankLoads, DEFAULT_HEARTBEAT_BACKOFF,
+        DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LOAD_TICK,
     },
     BoxStream,
 };
@@ -64,23 +64,6 @@ impl<S: RankLoads> RankedLoads for LoadFromState<S> {
 
     fn rank_record(&self, rank: i32) -> Option<common::EngineLoad> {
         LoadSource::load(self, Some(rank))
-    }
-}
-
-/// One rank's clock: what it last sent and when.
-struct RankClock {
-    last_record: Option<common::EngineLoad>,
-    last_sent_at: Option<Instant>,
-    idle_heartbeats: u32,
-}
-
-impl RankClock {
-    const fn new() -> Self {
-        Self {
-            last_record: None,
-            last_sent_at: None,
-            idle_heartbeats: 0,
-        }
     }
 }
 
@@ -122,31 +105,18 @@ impl LoadRecordStream {
             let Some(mut record) = self.source.rank_record(rank) else {
                 continue;
             };
-            let changed = clock
-                .last_record
-                .as_ref()
-                .is_none_or(|last| load_changed(last, &record));
-            let due_after = if clock.idle_heartbeats >= 2 {
-                self.cadence.heartbeat_backoff
-            } else {
-                self.cadence.heartbeat_interval
-            };
-            let silent_for = clock
-                .last_sent_at
-                .map_or(Duration::MAX, |at| now.saturating_duration_since(at));
-            if !changed && silent_for < due_after {
+            if !clock.due(
+                &record,
+                now,
+                self.cadence.heartbeat_interval,
+                self.cadence.heartbeat_backoff,
+            ) {
                 continue;
             }
             self.sample += 1;
             record.sample = self.sample;
             record.load_only = true;
-            clock.idle_heartbeats = if changed {
-                0
-            } else {
-                clock.idle_heartbeats.saturating_add(1)
-            };
-            clock.last_sent_at = Some(now);
-            clock.last_record = Some(record.clone());
+            clock.sent(&record, now);
             self.pending.push_back(common::KvEventBatch {
                 sequence_number: 0,
                 timestamp: unix_seconds(),

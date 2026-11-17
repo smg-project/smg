@@ -6,10 +6,12 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -837,7 +839,7 @@ def test_a_results_file_that_names_its_unit_prints_plain_values(mod, gates):
 
 # ---------------------------------------------------------------- count
 
-COUNT_TOML = GATE_TOML.replace("repeats = 3\n", "repeats = 3\ncount = true\n")
+COUNT_TOML = GATE_TOML.replace("repeats = 3\n", "repeats = 3\ncount = true\nrun_budget = 3600\n")
 # The pull request's four runs of `encode/a` against a base of 100 to 102, on a 10 % threshold:
 # SLOW is +14.9 %, within twice the threshold; OVER is +29.7 %, beyond it.
 SLOW = (115, 116, 117, 118)
@@ -900,17 +902,22 @@ print("fake valgrind", bench_id)
 """
 
 
-def count_run(mod, tmp_path, monkeypatch, counts, gate_text=COUNT_TOML, name="out", slow=SLOW):
+def count_run(
+    mod, tmp_path, monkeypatch, counts, gate_text=COUNT_TOML, name="out", slow=SLOW, more=None
+):
     """One gate run whose `encode/a` fails by time (`slow`: the pull request's four runs), under
     a valgrind on PATH that writes the listed batch counts per side directory (base, head).
+    `more`: further ids, each with its base's runs and its pull request's.
     Returns the exit code, the output directory and the file that lists the fake tool's calls."""
     gate_file = tmp_path / "gates.toml"
     gate_file.write_text(gate_text)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
-    base = fake_bench(
-        tmp_path / "base.py", {"encode/a": [100, 101, 102, 101], "decode/x": [1, 1, 1]}
-    )
-    pr = fake_bench(tmp_path / "pr.py", {"encode/a": list(slow), "decode/x": [1, 1, 1]})
+    base_runs = {"encode/a": [100, 101, 102, 101], "decode/x": [1, 1, 1]}
+    pr_runs = {"encode/a": list(slow), "decode/x": [1, 1, 1]}
+    for bench_id, (base_side, pr_side) in (more or {}).items():
+        base_runs[bench_id], pr_runs[bench_id] = list(base_side), list(pr_side)
+    base = fake_bench(tmp_path / "base.py", base_runs)
+    pr = fake_bench(tmp_path / "pr.py", pr_runs)
     tools = tmp_path / "tools"
     if not tools.exists():
         tools.mkdir()
@@ -933,6 +940,30 @@ def test_gate_file_names_the_count_switch(mod, tmp_path, gates):
     path = tmp_path / "count.toml"
     path.write_text(COUNT_TOML)
     assert mod.load_gates(path).count is True
+
+
+def test_gate_file_names_the_run_budget(mod, tmp_path, gates):
+    # A gate file that does not count needs none; one that counts names the run's budget.
+    assert gates.run_budget is None
+    path = tmp_path / "budget.toml"
+    path.write_text(COUNT_TOML)
+    assert mod.load_gates(path).run_budget == 3600.0
+    path.write_text(COUNT_TOML.replace("run_budget = 3600\n", ""))
+    with pytest.raises(ValueError, match="count = true needs run_budget"):
+        mod.load_gates(path)
+    # 1e400 reads as inf, and an integer of 401 digits is past a float's range.
+    for value in ("0", "-5", '"long"', "true", "nan", "inf", "1e400", "1" + "0" * 400):
+        path.write_text(COUNT_TOML.replace("run_budget = 3600\n", f"run_budget = {value}\n"))
+        with pytest.raises(ValueError, match="run_budget must be"):
+            mod.load_gates(path)
+
+
+def test_the_repository_gate_files_load(mod):
+    # Every gate file loads as the workflows read it: one that counts names its run's budget.
+    root = Path(__file__).resolve().parents[2]
+    files = sorted((root / ".github" / "bench-gates").glob("*.toml"))
+    counting = [path.name for path in files if mod.load_gates(path).count]
+    assert "policy-engine.toml" in counting
 
 
 def test_a_profile_is_read_for_the_harness_timed_calls(mod, tmp_path):
@@ -1226,10 +1257,17 @@ def test_the_same_count_keeps_the_failure_unmoved_or_beyond_twice_the_threshold(
         "head": {"encode/a": [5680, 8268, 16270, 32274], "address": 0x3BE240},
     }
     # +29.7 % on a 10 % threshold: the function moved, and a placement does not excuse that much.
-    rc, out, calls = count_run(mod, tmp_path, monkeypatch, counts, name="over", slow=OVER)
-    assert rc == 1
-    assert calls.read_text().splitlines() == ["base encode/a", "head encode/a"]
-    text = (out / "gate.md").read_text()
+    # A run counts no such id; results saved with its count still read so.
+    rc, out, _ = count_run(mod, tmp_path, monkeypatch, counts, name="over")
+    assert rc == 0
+    saved = json.loads((out / "results.json").read_text())
+    for run, value in zip(saved["pr"]["runs"], OVER):
+        run["encode/a"] = value
+    (out / "results.json").write_text(json.dumps(saved))
+    summary, gate_file = tmp_path / "over.md", str(tmp_path / "gates.toml")
+    args = ["compare", "--gates", gate_file, "--summary", str(summary), str(out / "results.json")]
+    assert mod.main(args) == 1
+    text = summary.read_text()
     assert "### Benchmark gate: FAIL" in text and "1 failed" in text
     assert "FAIL regression" in text and " 1 placement (" not in text
     assert (
@@ -1249,6 +1287,180 @@ def test_the_same_count_keeps_the_failure_unmoved_or_beyond_twice_the_threshold(
         f"{same}, and `{unit}` starts at 0x3be0c0 in both: where the code sits does not explain "
         "the time, and the failure stands."
     ) in text
+
+
+def test_an_id_beyond_twice_its_threshold_is_not_counted(mod, tmp_path, monkeypatch):
+    # +29.7 % on a 10 % threshold: no count makes it a placement, so none is taken.
+    counts = {"base": {"encode/a": [1, 2]}, "head": {"encode/a": [1, 2]}}
+    rc, out, calls = count_run(mod, tmp_path, monkeypatch, counts, slow=OVER)
+    assert rc == 1 and not calls.exists()
+    saved = json.loads((out / "results.json").read_text())
+    assert saved["count"] == {"encode/a": {"skipped": "beyond"}}
+    text = (out / "gate.md").read_text()
+    assert "### Benchmark gate: FAIL" in text and "FAIL regression" in text
+    assert "Counted before the verdict" not in text
+    said = "a change beyond 2 times the threshold, which no placement excuses."
+    assert f"Not counted, `encode/a`: {said}" in text
+    assert f"pull request 133 ns (+31.7%). Not counted: {said}" in text
+    # the saved results carry the reason: re-evaluated, the verdict is the same
+    gate_file = str(tmp_path / "gates.toml")
+    assert mod.main(["compare", "--gates", gate_file, str(out / "results.json")]) == 1
+
+
+def test_an_id_whose_base_median_is_zero_is_not_counted_and_says_so(mod, tmp_path, monkeypatch):
+    # No change can be told against a base of zero, so no placement excuses it: its own reason.
+    counts = {
+        side: {"encode/a": [5414, 8268, 16270], "address": address}
+        for side, address in (("base", 0x3BE0C0), ("head", 0x3BE240))
+    }
+    more = {"encode/z": ((0, 0, 0, 0), (5, 5, 5, 5))}
+    rc, out, calls = count_run(mod, tmp_path, monkeypatch, counts, more=more)
+    assert rc == 1 and "encode/z" not in calls.read_text()
+    saved = json.loads((out / "results.json").read_text())
+    # the saved results hold both kinds: the id not counted beside the counted one
+    assert saved["count"]["encode/z"] == {"skipped": "no_base"}
+    assert "batches" in saved["count"]["encode/a"]["base"]
+    said = "a base median of zero, which leaves no change for a placement to excuse."
+    assert f"Not counted, `encode/z`: {said}" in (out / "gate.md").read_text()
+
+
+def test_a_change_of_exactly_twice_the_threshold_is_within_the_ceiling(mod, tmp_path, monkeypatch):
+    # 100 to 120 on a 10 % threshold is twice the threshold to the bit: a placement can still
+    # excuse it, so it is counted.
+    counts = {side: {"encode/a": [1, 2], "encode/e": [1, 2]} for side in ("base", "head")}
+    more = {"encode/e": ((100, 100, 100, 100), (120, 120, 120, 120))}
+    rc, out, calls = count_run(mod, tmp_path, monkeypatch, counts, more=more)
+    assert rc == 1 and "base encode/e" in calls.read_text().splitlines()
+    saved = json.loads((out / "results.json").read_text())
+    assert "batches" in saved["count"]["encode/e"]["base"]
+
+
+def test_a_run_past_its_budget_counts_nothing_and_writes_the_report(mod, tmp_path, monkeypatch):
+    # Two ids fail by time within twice the threshold. The budget runs from the run's start,
+    # and here the timed rounds take it whole (a clock that moves 10 s at each read): no count
+    # starts, both ids keep the time's verdict, and the report is written.
+    ticks = iter(range(0, 10**9, 10))
+    clock = types.SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda seconds: None)
+    monkeypatch.setattr(mod, "time", clock)
+    counts = {side: {"encode/a": [1, 2], "encode/b": [1, 2]} for side in ("base", "head")}
+    spent = COUNT_TOML.replace("run_budget = 3600\n", "run_budget = 100\n")
+    more = {"encode/b": ((100, 101, 102, 101), SLOW)}
+    rc, out, calls = count_run(mod, tmp_path, monkeypatch, counts, gate_text=spent, more=more)
+    assert rc == 1 and not calls.exists()
+    saved = json.loads((out / "results.json").read_text())
+    assert saved["count"] == {
+        bench_id: {"skipped": "budget"} for bench_id in ("encode/a", "encode/b")
+    }
+    text = (out / "gate.md").read_text()
+    assert "### Benchmark gate: FAIL" in text and "2 failed" in text
+    assert "Counted before the verdict" not in text
+    said = "the run's budget left no room for its count, and the time alone decides."
+    assert f"Not counted, `encode/a`, `encode/b`: {said}" in text
+    assert f"pull request 118 ns (+16.8%). Not counted: {said}" in text
+
+
+def budget_count(mod, tmp_path, monkeypatch, reads, seconds, budget):
+    """`count_ids` over `encode/a` and `encode/b` under a clock that only the stand-in count
+    moves: a count takes `seconds` and returns the next of `reads` (a text there is the error
+    it fails with), or, where its bound is shorter, takes the bound and fails as a count the
+    bound ended. The run's budget ends `budget` seconds after the first count starts. Returns
+    the counts and each count's bound."""
+    clock, bounds = [1000.0], []
+
+    def count_once(binary, work, cwd, gates, extra_args, bench_id, cpu, bound):
+        bounds.append(bound)
+        if seconds > bound:
+            clock[0] += bound
+            raise RuntimeError(f"the count ran over {bound:g} s")
+        clock[0] += seconds
+        read = reads.pop(0)
+        if isinstance(read, str):
+            raise RuntimeError(read)
+        return {"batches": list(read), "unit": "decide", "address": "0x5000"}
+
+    monkeypatch.setattr(mod, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(mod, "count_once", count_once)
+    gates = mod.Gates(count=True, run_budget=budget)
+    binaries = {"base": tmp_path / "base", "pr": tmp_path / "pr"}
+    ids = ["encode/a", "encode/b"]
+    counts = mod.count_ids(ids, binaries, tmp_path, tmp_path, gates, [], None, clock[0] + budget)
+    return counts, bounds
+
+
+def test_the_run_budget_is_read_before_each_count_and_caps_it(mod, tmp_path, monkeypatch):
+    # 100 s are left and a count takes 40: the first id's two counts fit, each capped by what
+    # was left at its start, and 20 s are under the floor: the second id's turn never starts.
+    reads = [[1, 2], [1, 2]]
+    counts, bounds = budget_count(mod, tmp_path, monkeypatch, reads, seconds=40, budget=100)
+    assert bounds == [100, 60] and mod.COUNT_FLOOR_S == 30
+    assert counts["encode/a"]["base"]["batches"] == [1, 2] == counts["encode/a"]["pr"]["batches"]
+    assert counts["encode/b"] == {"skipped": "budget"}
+
+
+def test_an_id_whose_turn_the_run_budget_cuts_is_not_counted(mod, tmp_path, monkeypatch):
+    # The first id's two counts differ, so each side is owed one more: the budget has room for
+    # the third count and none for the fourth. A turn cut short tells nothing: not counted.
+    reads = [[1, 2, 3], [1, 2, 4], [1, 2, 3]]
+    counts, bounds = budget_count(mod, tmp_path, monkeypatch, reads, seconds=40, budget=130)
+    assert bounds == [120, 90, 50]
+    assert counts == {bench_id: {"skipped": "budget"} for bench_id in ("encode/a", "encode/b")}
+
+
+def test_a_count_the_run_budget_ends_is_not_a_count_that_was_not_read(mod, tmp_path, monkeypatch):
+    # The second count starts with 30 s left and would take 70: the budget's cap ends it, which
+    # is the budget's reason and not an error of the count.
+    counts, bounds = budget_count(mod, tmp_path, monkeypatch, [[1, 2]], seconds=70, budget=100)
+    assert bounds == [100, 30]
+    assert counts == {bench_id: {"skipped": "budget"} for bench_id in ("encode/a", "encode/b")}
+
+
+def test_a_count_that_fails_by_itself_under_the_cap_is_a_count_not_read(mod, tmp_path, monkeypatch):
+    # The second count runs under the budget's cap of 60 s and fails by itself after 40: the
+    # count's own error, on its side. The budget cut nothing of this id; it leaves the next.
+    reads = [[1, 2], "the count exited with 3"]
+    counts, bounds = budget_count(mod, tmp_path, monkeypatch, reads, seconds=40, budget=100)
+    assert bounds == [100, 60]
+    assert counts["encode/a"]["pr"] == {"error": "the count exited with 3"}
+    assert counts["encode/b"] == {"skipped": "budget"}
+
+
+def test_a_counting_gate_ends_its_count_before_its_gate_step_does(mod):
+    # The run's budget and the gate step's bound stand in two files: every workflow's gate step
+    # outlasts the budget of each counting gate file it names, by a minute for the report.
+    root = Path(__file__).resolve().parents[2]
+    step = re.compile(r"- name: Run the benchmark gate\n(?:.*\n)*?\s+timeout-minutes: (\d+)\n")
+    checked = []
+    for workflow in sorted((root / ".github" / "workflows").glob("*.yml")):
+        text = workflow.read_text()
+        found = step.search(text)
+        if found is None:
+            continue
+        for name in sorted(set(re.findall(r"[\w-]+\.toml", text))):
+            path = root / ".github" / "bench-gates" / name
+            if path.exists() and mod.load_gates(path).count:
+                budget = mod.load_gates(path).run_budget
+                assert budget <= int(found.group(1)) * 60 - 60, f"{workflow.name}: {name}"
+                checked.append(name)
+    # Every gate file that counts is held: one whose workflow's step went by another name
+    # would leave this check in silence.
+    counting = sorted(
+        path.name
+        for path in (root / ".github" / "bench-gates").glob("*.toml")
+        if mod.load_gates(path).count
+    )
+    assert sorted(set(checked)) == counting
+    assert "policy-engine.toml" in checked
+
+
+def test_the_ids_are_counted_in_name_order(mod, tmp_path, monkeypatch):
+    # The run's budget cuts the id whose turn it ends and the ids behind it: behind by name.
+    same = [5414, 8268, 16270]
+    ids = ("encode/a", "encode/b", "encode/0")
+    counts = {side: dict.fromkeys(ids, same) for side in ("base", "head")}
+    more = {bench_id: ([100, 101, 102, 101], SLOW) for bench_id in ("encode/b", "encode/0")}
+    count_run(mod, tmp_path, monkeypatch, counts, more=more)
+    calls = (tmp_path / "counts.calls").read_text().splitlines()
+    assert calls == [f"{side} {bench_id}" for bench_id in sorted(ids) for side in ("base", "head")]
 
 
 def test_the_timed_rounds_are_saved_before_the_count(mod, tmp_path, monkeypatch):
@@ -1274,3 +1486,333 @@ def test_a_count_that_hangs_is_ended_by_its_bound(mod, tmp_path, monkeypatch):
     text = (out / "gate.md").read_text()
     assert rc == 1 and "FAIL regression" in text
     assert "The count was not read (base: the count ran over 0.5 s; see " in text
+
+
+# ---------------------------------------------------------------- a whole pass
+
+# The counting gate file with its `encode/` ids marked as ones that time a whole pass.
+WHOLE_TOML = COUNT_TOML.replace(
+    'pattern = "^encode/"\nthreshold = 0.10\n',
+    'pattern = "^encode/"\nthreshold = 0.10\nwhole_pass = true\n',
+)
+LEVEL = "the 0.5% that reads as level for an id that times a whole pass"
+NOT_WORK = (
+    "The time is where the pass's code sits in the bench executable, not work the pull request "
+    "adds."
+)
+
+
+def gates_of(mod, tmp_path, text):
+    path = tmp_path / "marked.toml"
+    path.write_text(text)
+    return mod.load_gates(path)
+
+
+def doubling(total, last):
+    """The counts of batches of 1, 2, 4, ... iterations whose batch `last` counts `total`."""
+    return [total * 2**n // 2**last for n in range(last + 1)]
+
+
+def counted_twice(base, pr, last=2):
+    """A saved count of two executables that differ, each counted the same a second time."""
+    return {
+        "base": {"batches": doubling(base, last), "again": doubling(base, last)},
+        "pr": {"batches": doubling(pr, last), "again": doubling(pr, last)},
+    }
+
+
+def test_a_gate_entry_marks_an_id_that_times_a_whole_pass(mod, tmp_path):
+    gates = gates_of(mod, tmp_path, WHOLE_TOML)
+    assert gates.threshold_for("encode/a").whole_pass is True
+    assert gates.threshold_for("decode/slow").whole_pass is False
+    assert WHOLE_TOML != COUNT_TOML
+    with pytest.raises(ValueError, match="whole_pass must be true or false, got 1"):
+        gates_of(mod, tmp_path, WHOLE_TOML.replace("whole_pass = true", "whole_pass = 1"))
+    # The mark is read at the count: a gate file that does not count refuses it.
+    with pytest.raises(ValueError, match="whole_pass = true needs count = true"):
+        gates_of(mod, tmp_path, WHOLE_TOML.replace("count = true\nrun_budget = 3600\n", ""))
+
+
+def test_two_decide_ids_slower_on_a_level_count_are_placements(mod, tmp_path):
+    # The figures of two decide ids a pull request read slower in the gate's build and faster
+    # in a build of the same two sources without the alignment (2026-11-16): 6 and 2
+    # instructions more an iteration, on counts of 21,676 and 4,631.
+    res = results(
+        {"encode/64": [1382.67, 1318.22, 1402.19], "encode/8": [301.34, 331.485, 327.946]},
+        {"encode/64": [1556.38, 1498.28, 1547.46], "encode/8": [381.983, 353.995, 377.878]},
+    )
+    res["count"] = {
+        "encode/64": counted_twice(177_570_058, 177_619_210, last=13),
+        "encode/8": counted_twice(151_748_874, 151_814_410, last=15),
+    }
+    marked = mod.compare(res, gates_of(mod, tmp_path, WHOLE_TOML))
+    assert [(row.bench_id, row.verdict) for row in marked] == [
+        ("encode/64", "placement"),
+        ("encode/8", "placement"),
+    ]
+    assert mod.fmt_count(marked[0]) == (
+        " The count is level: 177,570,058 instructions on the base and 177,619,210 on the pull "
+        "request over a batch of 8,192 iterations (+0.028%, 6.0 instructions an iteration more), "
+        f"the same in two counts of each, within {LEVEL}. {NOT_WORK}"
+    )
+    assert "(+0.043%, 2.0 instructions an iteration more)" in mod.fmt_count(marked[1])
+    text = mod.markdown(res, marked)
+    assert "0 failed" in text and "FAIL" not in text
+    assert (
+        "2 placement (beyond the threshold within twice of it: on the same instruction count "
+        "with the measured function moved, or for an id that times a whole pass on a level "
+        "count; not failed)."
+    ) in text
+    assert (
+        "An id that times a whole pass (`encode/64`, `encode/8`) is a placement on a level "
+        "count instead: its two counts within 0.5% of each other, each executable's own two "
+        "the same, and the change within twice its threshold."
+    ) in text
+    # The mark is the gate file's: the same results under an entry without it fail as before.
+    plain = mod.compare(res, gates_of(mod, tmp_path, COUNT_TOML))
+    assert [row.verdict for row in plain] == ["regression", "regression"]
+    assert mod.fmt_count(plain[0]).startswith(" The count moved too: 177,570,058 instructions")
+    assert "whole pass" not in mod.markdown(res, plain)
+
+
+def whole_row(mod, tmp_path, count, pr_runs=(115, 116, 117)):
+    """The `encode/a` row of saved results under the marked gate file, with its count."""
+    res = results({"encode/a": [100, 101, 102]}, {"encode/a": list(pr_runs)})
+    res["count"] = {"encode/a": count}
+    row = mod.compare(res, gates_of(mod, tmp_path, WHOLE_TOML))[0]
+    return row.verdict, mod.fmt_count(row)
+
+
+def test_a_whole_pass_count_that_moved_beyond_the_level_keeps_the_failure(mod, tmp_path):
+    verdict, said = whole_row(mod, tmp_path, counted_twice(400_000, 412_000))
+    assert verdict == "regression"
+    assert said == (
+        " The count moved too: 400,000 instructions on the base and 412,000 on the pull request "
+        "over a batch of 4 iterations (+3.000%, 3,000.0 instructions an iteration more), the "
+        f"same in two counts of each, beyond {LEVEL}."
+    )
+
+
+def test_the_level_ends_at_half_a_percent_of_the_base_count(mod, tmp_path):
+    assert mod.LEVEL_COUNT == 0.005
+    for pr, verdict in [
+        (402_000, "placement"),
+        (402_004, "regression"),
+        (398_000, "placement"),
+        (397_996, "regression"),
+    ]:
+        assert whole_row(mod, tmp_path, counted_twice(400_000, pr))[0] == verdict, pr
+
+
+def test_a_level_count_is_two_counts_of_each_executable_that_agree(mod, tmp_path):
+    once = counted_twice(400_000, 400_024)
+    del once["pr"]["again"]
+    verdict, said = whole_row(mod, tmp_path, once)
+    assert verdict == "regression"
+    assert said.endswith(
+        "(+0.006%, 6.0 instructions an iteration more). A level count is two counts of each "
+        "executable that agree, and a second one was not read: the failure stands."
+    )
+    unsteady = counted_twice(400_000, 400_024)
+    unsteady["pr"]["again"] = doubling(400_040, 2)
+    verdict, said = whole_row(mod, tmp_path, unsteady)
+    assert verdict == "regression"
+    assert "it is not steady on one executable alone" in said and "level" not in said
+
+
+def test_two_counts_that_differ_are_decided_at_a_batch_all_four_counts_ran(mod, tmp_path):
+    # A second count that ended one batch early: the row is decided one batch earlier, where
+    # every count ran, and its line names that batch.
+    short = counted_twice(400_000, 400_024)
+    short["pr"]["again"] = doubling(400_024, 2)[:2]
+    verdict, said = whole_row(mod, tmp_path, short)
+    assert verdict == "placement"
+    assert (
+        "200,000 instructions on the base and 200,012 on the pull request over a batch of 2 "
+        "iterations (+0.006%, 6.0 instructions an iteration more), the same in two counts of each"
+    ) in said
+    # The base's second count one batch short bounds the row the same way.
+    mirror = counted_twice(400_000, 400_024)
+    mirror["base"]["again"] = doubling(400_000, 2)[:2]
+    verdict, said = whole_row(mod, tmp_path, mirror)
+    assert verdict == "placement" and "over a batch of 2 iterations" in said
+    # The batch that decides is the last that differs, not the last every count ran: four
+    # counts 1 % apart at the second batch and the same at the third keep the failure.
+    early = counted_twice(400_000, 400_000)
+    for key in ("batches", "again"):
+        early["pr"][key][1] = 202_000
+    verdict, said = whole_row(mod, tmp_path, early)
+    assert verdict == "regression" and "over a batch of 2 iterations (+1.000%" in said
+    # A second count of its first batch alone leaves no batch all four ran: the time decides.
+    alone = counted_twice(400_000, 400_024)
+    for side in ("base", "pr"):
+        alone[side]["again"] = alone[side]["again"][:1]
+    verdict, said = whole_row(mod, tmp_path, alone)
+    assert verdict == "regression"
+    assert said == (
+        " The count was not read (a second count ended before the batches that differ): the "
+        "time alone decides."
+    )
+    # First counts of two batches say the same: one ran past the first, and no second count.
+    two = counted_twice(400_000, 400_024, last=1)
+    for side in ("base", "pr"):
+        two[side]["again"] = two[side]["again"][:1]
+    assert whole_row(mod, tmp_path, two) == ("regression", said)
+
+
+def test_a_batch_counted_once_grants_no_level_count_and_refuses_one(mod, tmp_path):
+    def read_once(pr_last, short="pr"):
+        """Four counts 12 instructions apart at the last batch all of them ran, a level count,
+        and the pull request's `pr_last` at the batch the `short` side's second count left."""
+        count = counted_twice(400_000, 400_024)
+        for key in ("batches", "again"):
+            count["pr"][key][2] = pr_last
+        count[short]["again"].pop()
+        return whole_row(mod, tmp_path, count)
+
+    # Within the level, the batch all four ran decides as it did.
+    for pr_last in (400_024, 402_000, 398_000):
+        verdict, said = read_once(pr_last)
+        assert verdict == "placement" and "over a batch of 2 iterations (+0.006%" in said, pr_last
+    # Beyond it the placement is refused, whichever second count ended early.
+    for pr_last in (402_004, 397_996):
+        assert read_once(pr_last)[0] == "regression", pr_last
+        assert read_once(pr_last, short="base")[0] == "regression", pr_last
+    verdict, said = read_once(404_000)
+    assert verdict == "regression"
+    assert said == (
+        " The count is level where all four counts ran: 200,000 instructions on the base and "
+        "200,012 on the pull request over a batch of 2 iterations (+0.006%, 6.0 instructions an "
+        f"iteration more), the same in two counts of each, within {LEVEL}. Past it the first "
+        "counts read 400,000 and 404,000 over a batch of 4 iterations (+1.000%), beyond the "
+        "level, and a second count did not run that batch: the failure stands."
+    )
+    # Work that grows with the iterations, +0.2, +0.4 and +0.8 % of a batch: the last batch
+    # fails it with the second counts whole, and refuses the placement with one a batch short.
+    grown = counted_twice(800_000, 800_000, last=3)
+    for key in ("batches", "again"):
+        grown["pr"][key] = [100_100, 200_400, 401_600, 806_400]
+    assert whole_row(mod, tmp_path, grown)[0] == "regression"
+    grown["pr"]["again"] = grown["pr"]["again"][:3]
+    verdict, said = whole_row(mod, tmp_path, grown)
+    assert verdict == "regression" and "over a batch of 8 iterations (+0.800%)" in said
+    # The batch read is the last of the first counts that differs, so a row reads the same
+    # whether a second count ran it or not: 1 % apart at the third batch, and beyond the level,
+    # within it or the same at the fourth.
+    for fourth, verdict in [
+        (816_000, "regression"),
+        (800_800, "placement"),
+        (800_000, "regression"),
+    ]:
+        grown["pr"]["batches"][2:] = [404_000, fourth]
+        grown["pr"]["again"] = [100_100, 200_400]
+        short = whole_row(mod, tmp_path, grown)
+        grown["pr"]["again"] = list(grown["pr"]["batches"])
+        assert short[0] == whole_row(mod, tmp_path, grown)[0] == verdict, fourth
+    # A batch one first count alone ran has no pair, and nothing is read there.
+    longer = counted_twice(400_000, 400_024)
+    longer["base"]["batches"].append(900_000)
+    assert whole_row(mod, tmp_path, longer)[0] == "placement"
+
+
+def test_a_whole_pass_id_on_the_same_count_asks_no_moved_function(mod, tmp_path):
+    same = {"base": {"batches": [9, 20, 40]}, "pr": {"batches": [7, 20, 40]}}
+    verdict, said = whole_row(mod, tmp_path, same)
+    assert verdict == "placement"
+    assert said == (
+        " The two executables run it in the same instruction count in every batch after the "
+        "first, 40 over the 4 iterations of the last (10.0 an iteration): the id times a whole "
+        "pass, and the time is where the pass's code sits in the bench executable, not work "
+        "the pull request adds."
+    )
+    res = results({"encode/a": [100, 101, 102]}, {"encode/a": [115, 116, 117]})
+    res["count"] = {"encode/a": same}
+    plain = mod.compare(res, gates_of(mod, tmp_path, COUNT_TOML))[0]
+    assert plain.verdict == "regression"
+    assert "names no one function with a place on both sides" in mod.fmt_count(plain)
+
+
+def test_a_level_count_does_not_lift_the_ceiling(mod, tmp_path, monkeypatch):
+    # Saved results can hold a count for an id beyond twice its threshold: the failure stands.
+    verdict, said = whole_row(mod, tmp_path, counted_twice(400_000, 400_024), pr_runs=OVER)
+    assert verdict == "regression"
+    assert said.endswith(
+        f"the same in two counts of each, within {LEVEL}. A placement excuses a change up to "
+        "2 times the threshold, 20.0%: the failure stands."
+    )
+    same = {"base": {"batches": [9, 20, 40]}, "pr": {"batches": [7, 20, 40]}}
+    verdict, said = whole_row(mod, tmp_path, same, pr_runs=OVER)
+    assert verdict == "regression"
+    assert said.endswith(
+        "(10.0 an iteration). A placement excuses a change up to 2 times the "
+        "threshold, 20.0%: the failure stands."
+    )
+    # A run counts no such id, marked or not.
+    rc, out, calls = count_run(
+        mod, tmp_path, monkeypatch, {}, gate_text=WHOLE_TOML, name="over", slow=OVER
+    )
+    assert rc == 1 and not calls.exists()
+    assert "Not counted: a change beyond 2 times the threshold" in (out / "gate.md").read_text()
+
+
+def test_a_run_places_a_marked_id_on_a_level_count_and_fails_one_that_moved(
+    mod, tmp_path, monkeypatch
+):
+    level = {"base": {"encode/a": [5414, 8268, 16270]}, "head": {"encode/a": [5414, 8270, 16274]}}
+    rc, out, calls = count_run(mod, tmp_path, monkeypatch, level, gate_text=WHOLE_TOML)
+    assert rc == 0
+    # two counts that differ are each taken once more, and the level is read on both
+    assert calls.read_text().splitlines() == ["base encode/a", "head encode/a"] * 2
+    text = (out / "gate.md").read_text()
+    assert "1 placement" in text and "0 failed" in text
+    assert (
+        "The count is level: 16,270 instructions on the base and 16,274 on the pull request "
+        "over a batch of 4 iterations (+0.025%, 1.0 instructions an iteration more), the same "
+        f"in two counts of each, within {LEVEL}. {NOT_WORK}"
+    ) in text
+    moved = {"base": {"encode/a": [5414, 8268, 16270]}, "head": {"encode/a": [5414, 8468, 16670]}}
+    rc, out, _ = count_run(mod, tmp_path, monkeypatch, moved, gate_text=WHOLE_TOML, name="moved")
+    assert rc == 1
+    text = (out / "gate.md").read_text()
+    assert "FAIL regression" in text and "1 failed" in text and "1 placement" not in text
+    assert f"the same in two counts of each, beyond {LEVEL}." in text
+
+
+def test_the_repository_gate_files_mark_the_rows_that_time_a_whole_decision(mod):
+    root = Path(__file__).resolve().parents[2] / ".github" / "bench-gates"
+    marked = {
+        "policy-engine.toml": {
+            "policy_engine/decide/cache_aware/8": True,
+            "policy_engine/decide/least_load_credited/8": True,
+            "policy_engine/decide/cache_aware/512": True,
+            "policy_engine/decide/passthrough/8": True,
+            "policy_engine/decide/manual_keyed_miss/8": True,
+            "policy_engine/decide/manual_keyed_hit/8": False,
+            "policy_engine/decide/passthrough/64": False,
+            "policy_engine/decide/power_of_two/512": False,
+            "policy_engine/decide/random/64": False,
+            "policy_engine/decide/round_robin/512": False,
+            "policy_engine/decide/passthrough/512": False,
+            "policy_engine/decide/power_of_two/64": False,
+            "policy_engine/decide/random/512": False,
+            "policy_engine/decide/round_robin/64": False,
+            "policy_engine/view_build/64": False,
+            "policy_engine/spec/parse_validate": False,
+        },
+        "policy-engine-affinity.toml": {
+            "policy_affinity/decide/cache_aware/8": True,
+            "policy_affinity/decide/cache_aware/512": True,
+            "policy_affinity/view_build/64": False,
+        },
+    }
+    for name, ids in marked.items():
+        gates = mod.load_gates(root / name)
+        for bench_id, whole in ids.items():
+            assert gates.threshold_for(bench_id).whole_pass is whole, f"{name}: {bench_id}"
+    # The thresholds of the marked ids are the ones they had.
+    engine = mod.load_gates(root / "policy-engine.toml")
+    assert engine.threshold_for("policy_engine/decide/least_load_credited/8").threshold == 0.15
+    assert engine.threshold_for("policy_engine/decide/cache_aware/8").threshold == 0.10
+    assert engine.threshold_for("policy_engine/decide/random/64").threshold == 0.10
+    for name in ("policy-engine-power-of-two.toml", "policy-store.toml"):
+        assert not any(gate.whole_pass for gate in mod.load_gates(root / name).gates), name

@@ -12,10 +12,9 @@ use std::{
 };
 
 use clap::Parser;
-use tokio::{
-    runtime::{Builder, Runtime},
-    signal::unix::{signal, SignalKind},
-};
+use tokio::runtime::{Builder, Runtime};
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -167,6 +166,21 @@ struct Cli {
     #[arg(long, default_value_t = Config::DEFAULT_LOAD_POLL_INTERVAL.as_secs(), help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
 
+    /// The policy spec as a file, in YAML (JSON under a `.json` name): read
+    /// and applied at the start, as generation 1 or under the number its
+    /// `generation` line writes. A file that cannot be read, or a document
+    /// that is invalid, refuses the start. The file is then watched: a
+    /// changed one is applied as the next generation, or under the number
+    /// it writes, and one that does not run is rejected whole and the
+    /// running generation stays. With no file the controller runs no policy
+    /// spec.
+    ///
+    /// YAML reads as JSON does: text that looks like a number or a boolean
+    /// is quoted where a field takes text, and a key with no value is null,
+    /// which no list or map is: write `[]` or `{}`, or leave the key out.
+    #[arg(long, value_name = "PATH", help_heading = "Policy Spec")]
+    spec_file: Option<PathBuf>,
+
     // ==================== Shutdown ====================
     /// Seconds the listeners keep accepting after readiness fails, so the
     /// probes see the change first; at most half the grace period
@@ -186,6 +200,13 @@ struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=4096), help_heading = "Runtime")]
     runtime_worker_threads: Option<u16>,
 
+    /// Deciding threads, from 1 to 256, each behind a queue of 128
+    /// requests. A model's decisions all run on one of them, so a fleet
+    /// that serves one model decides on one thread. Default: one a CPU
+    /// available to the process, eight at most
+    #[arg(long, default_value_t = default_decide_shards(), value_parser = clap::value_parser!(u16).range(1..=256), help_heading = "Runtime")]
+    decide_shards: u16,
+
     // ==================== Logging ====================
     /// Set the logging level of this binary's own crates; RUST_LOG, when
     /// set, replaces it whole
@@ -200,6 +221,10 @@ struct Cli {
 /// A duration in whole milliseconds, as the election's flags take it.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn default_decide_shards() -> u16 {
+    u16::try_from(Config::default_decide_shards()).unwrap_or(1)
 }
 
 impl Cli {
@@ -320,6 +345,7 @@ impl Cli {
             shutdown_settle: Duration::from_secs(self.shutdown_settle_secs),
             shutdown_grace: Duration::from_secs(self.shutdown_grace_period_secs),
             load_poll_interval: Duration::from_secs(self.load_monitor_interval),
+            decide_shards: usize::from(self.decide_shards),
             election: Election {
                 lease: self.lease(),
                 settings: ElectionSettings {
@@ -388,8 +414,10 @@ fn truthy(value: Option<&OsStr>) -> bool {
 /// Resolves on SIGTERM (the orchestrator's stop) or SIGINT (a terminal's).
 /// A handler that cannot be installed is logged and its signal waits
 /// forever, so the other one still stops the process; a failure of both
-/// leaves the controller serving until it is killed.
+/// leaves the controller serving until it is killed. A host that is not
+/// Unix has no SIGTERM: the terminal's interrupt alone stops it there.
 async fn signals() {
+    #[cfg(unix)]
     let mut term = match signal(SignalKind::terminate()) {
         Ok(term) => Some(term),
         Err(error) => {
@@ -397,6 +425,7 @@ async fn signals() {
             None
         }
     };
+    #[cfg(unix)]
     let term = async {
         match term.as_mut() {
             Some(term) => {
@@ -405,9 +434,14 @@ async fn signals() {
             None => pending::<()>().await,
         }
     };
+    #[cfg(not(unix))]
+    let term = pending::<()>();
     let interrupt = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
+            #[cfg(unix)]
             warn!(%error, "no SIGINT handler; SIGTERM alone stops the controller");
+            #[cfg(not(unix))]
+            warn!(%error, "no interrupt handler; the controller serves until it is killed");
             pending::<()>().await;
         }
     };
@@ -442,13 +476,37 @@ fn runtime(worker_threads: Option<u16>) -> std::io::Result<Runtime> {
     }
 }
 
-/// Binds the controller over `catalog`, then names the listeners that take
-/// identities as told: a refusal of either arrives before anything is
-/// served.
-async fn bind(config: Config, catalog: Catalog, as_told: &[String]) -> Result<Controller, Error> {
+/// How long the process's end waits on a blocking call that has not
+/// returned. A look at a spec file answers in well under a millisecond on a
+/// file system that answers at all.
+const END_WAIT: Duration = Duration::from_secs(1);
+
+/// Runs `serve` on `runtime`, then ends the runtime. A dropped runtime
+/// waits without end on a blocking call that has not returned, as a look at
+/// a file system that stopped answering: the end waits [`END_WAIT`] on one
+/// and leaves it, so the process ends at its own stop and not at its
+/// supervisor's kill.
+fn served<F: std::future::Future>(runtime: Runtime, serve: F) -> F::Output {
+    let answer = runtime.block_on(serve);
+    runtime.shutdown_timeout(END_WAIT);
+    answer
+}
+
+/// Binds the controller over `catalog`, names the listeners that take
+/// identities as told, then takes the spec file where one is given: a
+/// refusal of any arrives before anything is served.
+async fn bind(
+    config: Config,
+    catalog: Catalog,
+    as_told: &[String],
+    spec_file: Option<PathBuf>,
+) -> Result<Controller, Error> {
     let mut controller = Controller::bind_with(config, catalog).await?;
     for listener in as_told {
         controller.identity_as_told(listener)?;
+    }
+    if let Some(path) = spec_file {
+        controller.spec_file(path).await?;
     }
     Ok(controller)
 }
@@ -472,6 +530,13 @@ async fn bind(config: Config, catalog: Catalog, as_told: &[String]) -> Result<Co
 pub fn run(catalog: Catalog) -> ExitCode {
     let cli = Cli::parse();
     init_logging(&cli.log_level, cli.log_json);
+    run_with(cli, catalog)
+}
+
+/// [`run`] from its parsed command line on, the log set: configure, then
+/// the runtime, bind and serve on it. Apart from the parse, which reads the
+/// process's own arguments, and from the log, which a process sets once.
+fn run_with(cli: Cli, catalog: Catalog) -> ExitCode {
     let config = match cli.config() {
         Ok(config) => config,
         Err(error) => {
@@ -486,8 +551,14 @@ pub fn run(catalog: Catalog) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(async {
-        let controller = match bind(config, catalog, &cli.identity_as_told).await {
+    served(runtime, async {
+        let bound = bind(
+            config,
+            catalog,
+            &cli.identity_as_told,
+            cli.spec_file.clone(),
+        );
+        let controller = match bound.await {
             Ok(controller) => controller,
             Err(error) => {
                 error!(%error, "start refused");
@@ -509,16 +580,21 @@ mod tests {
     use std::{
         ffi::OsStr,
         path::{Path, PathBuf},
+        process::ExitCode,
+        sync::{mpsc, Arc, Mutex},
+        thread,
         time::Duration,
     };
 
     use clap::Parser;
+    use tokio::{runtime::Handle, sync::oneshot};
 
     use super::{bind, color_for, set, truthy, Cli};
     use crate::{
         catalog::Catalog,
-        controller::{Config, ConfigError, Election, Error, LeasePlace, Scope},
+        controller::{Config, ConfigError, Election, Error, LeasePlace, Scope, SpecRejected},
         elector::ElectionSettings,
+        spec::SpecError,
         Candidate, Constraints, Filter, RequestFacts,
     };
 
@@ -935,10 +1011,108 @@ mod tests {
         let config = parse(&EPHEMERAL).config().expect("the flags are in order");
         let mut stages = Catalog::builtin();
         stages.filter("any", || Box::new(Any)).expect("a free name");
-        let controller = bind(config, stages, &[]).await.expect("binds");
+        let controller = bind(config, stages, &[], None).await.expect("binds");
         assert!(controller.catalog().filters().any(|name| name == "any"));
         // The stock build holds no such stage.
         assert!(Catalog::builtin().filters().all(|name| name != "any"));
+    }
+
+    /// A spec file's document names the stages the run is handed: a stage
+    /// of a host's own starts the controller on it, and the stock build
+    /// refuses the same file by the stage's name.
+    #[tokio::test]
+    async fn a_spec_file_names_the_stages_the_run_is_handed() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("policy.yaml");
+        let document =
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [any]\n    pick: random\n";
+        std::fs::write(&path, document).expect("the file");
+        let start = |stages: Catalog| {
+            let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+            bind(config, stages, &[], Some(path.clone()))
+        };
+
+        let mut stages = Catalog::builtin();
+        stages.filter("any", || Box::new(Any)).expect("a free name");
+        let controller = start(stages).await.expect("a host's stage starts");
+        assert_eq!(controller.store().world().spec().generation(), 1);
+        drop(controller);
+
+        match start(Catalog::builtin()).await {
+            Err(Error::SpecFile {
+                source: SpecRejected::Invalid(SpecError::UnknownFilter { profile, name }),
+                ..
+            }) => assert_eq!((profile.as_str(), name.as_str()), ("default", "any")),
+            Err(other) => panic!("the stock build refused it as {other}"),
+            Ok(_) => panic!("the stock build holds no such stage"),
+        }
+    }
+
+    /// Scores every worker alike, and says whether the lifecycle's calls
+    /// keep its state: a stage of a host's own.
+    #[derive(Debug)]
+    struct Level(bool);
+
+    impl crate::Lifecycle for Level {
+        fn needs_lifecycle(&self) -> bool {
+            self.0
+        }
+    }
+
+    impl crate::Scorer for Level {
+        fn name(&self) -> &'static str {
+            "level"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> crate::TieBand {
+            out.fill(1.0);
+            crate::TieBand::NORMALIZED
+        }
+    }
+
+    /// The controller makes no lifecycle call yet: a spec file that names
+    /// a stage in need of them refuses the start by the stage's field, and
+    /// the same stage with no such need starts.
+    #[tokio::test]
+    async fn a_spec_file_that_names_a_stage_in_need_of_the_lifecycle_refuses_the_start() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("policy.yaml");
+        let document =
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    score: [level]\n    pick: best\n";
+        std::fs::write(&path, document).expect("the file");
+        let start = |needs: bool| {
+            let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+            let mut stages = Catalog::builtin();
+            stages
+                .scorer("level", move || Box::new(Level(needs)))
+                .expect("a free name");
+            bind(config, stages, &[], Some(path.clone()))
+        };
+
+        let controller = start(false).await.expect("no need of the calls starts");
+        assert_eq!(controller.store().world().spec().generation(), 1);
+        drop(controller);
+
+        match start(true).await {
+            Err(Error::SpecFile {
+                source: SpecRejected::Invalid(SpecError::NotInBuild { path: field, what }),
+                ..
+            }) => assert_eq!(
+                (field.as_str(), what),
+                (
+                    "profiles.default.score[0].level",
+                    "the lifecycle this stage needs"
+                )
+            ),
+            Err(other) => panic!("the start was refused as {other}"),
+            Ok(_) => panic!("no served line makes the calls the stage needs"),
+        }
     }
 
     /// The flag's names reach the bound controller: a name the flags mount
@@ -951,9 +1125,14 @@ mod tests {
             let cli = parse(&args);
             let config = cli.config().expect("the flags are in order");
             async move {
-                bind(config, Catalog::builtin(), &cli.identity_as_told)
-                    .await
-                    .map(drop)
+                bind(
+                    config,
+                    Catalog::builtin(),
+                    &cli.identity_as_told,
+                    cli.spec_file.clone(),
+                )
+                .await
+                .map(drop)
             }
         };
         // The relays' calls ride the gateways' listener unless they get
@@ -994,6 +1173,106 @@ mod tests {
             "loud"
         ])
         .is_err());
+    }
+
+    /// A blocking call that has not returned does not hold the run's end:
+    /// the serve's answer is back inside five seconds, where a dropped
+    /// runtime waits on the call without end.
+    #[test]
+    fn the_runs_end_waits_on_no_blocked_call() {
+        let runtime = super::runtime(Some(1)).expect("a runtime");
+        let (release, blocked) = mpsc::channel::<()>();
+        let (ended, end) = mpsc::channel();
+        thread::spawn(move || {
+            let answer = super::served(runtime, async move {
+                let (started, start) = oneshot::channel::<()>();
+                tokio::task::spawn_blocking(move || {
+                    let _ = started.send(());
+                    // Returns when `release` goes, at the case's end.
+                    let _ = blocked.recv();
+                });
+                start.await.expect("the blocking call starts");
+                7
+            });
+            let _ = ended.send(answer);
+        });
+        let waited = end.recv_timeout(Duration::from_secs(5));
+        drop(release);
+        assert_eq!(waited, Ok(7), "the end returns with a call still blocked");
+    }
+
+    /// The run's own call ends it so: a start refused after a stage of the
+    /// host's left a blocking call gives its code inside five seconds.
+    #[test]
+    fn a_refused_start_ends_the_run_with_a_call_still_blocked() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("policy.yaml");
+        // The first filter is built, then the second is refused by name.
+        let document =
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [any, nowhere]\n    pick: random\n";
+        std::fs::write(&path, document).expect("the file");
+        let (release, blocked) = mpsc::channel::<()>();
+        let blocked = Arc::new(Mutex::new(blocked));
+        let (left, leaves) = mpsc::channel::<()>();
+        let mut stages = Catalog::builtin();
+        stages
+            .filter("any", move || {
+                // On the run's runtime alone: a registration builds the
+                // stage once too, for its name.
+                if let Ok(runtime) = Handle::try_current() {
+                    let (begun, begin) = mpsc::channel::<()>();
+                    let blocked = Arc::clone(&blocked);
+                    runtime.spawn_blocking(move || {
+                        let _ = begun.send(());
+                        // Returns when `release` goes, at the case's end.
+                        if let Ok(blocked) = blocked.lock() {
+                            let _ = blocked.recv();
+                        }
+                    });
+                    // The call is on its thread before the stage is handed
+                    // out: an end leaves a call that has not begun unrun.
+                    if begin.recv().is_ok() {
+                        let _ = left.send(());
+                    }
+                }
+                Box::new(Any)
+            })
+            .expect("a free name");
+        let mut args: Vec<&str> = EPHEMERAL.to_vec();
+        args.extend(["--spec-file", path.to_str().expect("a path in UTF-8")]);
+        let cli = parse(&args);
+
+        let (ended, end) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = ended.send(super::run_with(cli, stages));
+        });
+        let waited = end.recv_timeout(Duration::from_secs(5));
+        drop(release);
+        leaves.try_recv().expect("the stage left a blocking call");
+        assert_eq!(
+            waited,
+            Ok(ExitCode::FAILURE),
+            "the run returns with a call still blocked"
+        );
+    }
+
+    #[test]
+    fn the_deciding_threads_take_the_operators_count_inside_their_range() {
+        let default = config(&[]).expect("parsed");
+        assert_eq!(default.decide_shards, Config::default_decide_shards());
+        assert_eq!(default.validate(), Ok(()));
+        let three = config(&["--decide-shards", "3"]).expect("parsed");
+        assert_eq!(three.decide_shards, 3);
+        for bad in ["0", "257", "many"] {
+            let flags = [
+                "smg-policy-controller",
+                "--controller-id",
+                "c",
+                "--decide-shards",
+                bad,
+            ];
+            assert!(Cli::try_parse_from(flags).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -1047,5 +1326,31 @@ mod tests {
         assert!(truthy(one));
         assert!(!set(None));
         assert!(!truthy(None));
+    }
+
+    /// The flag's long help says how YAML reads: an operator meets the rule
+    /// before a start refuses a number where a field takes text.
+    #[test]
+    fn the_spec_files_help_says_how_yaml_reads() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        // The help wraps where the terminal does.
+        let words = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("quoted where a field takes text"), "{help}");
+        assert!(words.contains("a key with no value is null"), "{help}");
+    }
+
+    #[test]
+    fn the_spec_file_is_a_flag_with_no_default() {
+        assert_eq!(parse(&with_identity(&[])).spec_file, None);
+        assert_eq!(
+            parse(&with_identity(&[
+                "--spec-file",
+                "/etc/smg/policy/policy.yaml"
+            ]))
+            .spec_file,
+            Some(PathBuf::from("/etc/smg/policy/policy.yaml"))
+        );
     }
 }

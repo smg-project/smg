@@ -145,6 +145,88 @@ impl std::error::Error for TransportError {
     }
 }
 
+/// A dial's failure with the peer it came from. Its text names the peer: the
+/// log line of a failed call on a gateway with many workers says which one
+/// refused. [`DialFailure::without_peer`] is the same failure for a reader
+/// that is not to learn the address, an answer to a client.
+#[derive(Debug, Clone)]
+pub(super) struct DialFailure {
+    with_peer: String,
+    without_peer: String,
+}
+
+impl DialFailure {
+    /// `error` met on the way to `peer`.
+    fn at(peer: &dyn fmt::Display, error: &io::Error) -> io::Error {
+        io::Error::new(
+            error.kind(),
+            Self {
+                with_peer: format!("{peer}: {error}"),
+                without_peer: error.to_string(),
+            },
+        )
+    }
+
+    /// No connection to `peer` within `within`.
+    fn timed_out(peer: &dyn fmt::Display, within: Duration) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            Self {
+                with_peer: format!("no connection to {peer} within {within:?}"),
+                without_peer: format!("no connection within {within:?}"),
+            },
+        )
+    }
+
+    /// `host` resolves, to no address.
+    fn no_address(host: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            Self {
+                with_peer: format!("{host} resolves to no address"),
+                without_peer: "the host resolves to no address".to_owned(),
+            },
+        )
+    }
+
+    /// The dial's failure `error` is, or carries as an I/O error's payload.
+    pub(super) fn of<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a Self> {
+        error.downcast_ref::<Self>().or_else(|| {
+            error
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::get_ref)
+                .and_then(|payload| payload.downcast_ref::<Self>())
+        })
+    }
+
+    /// A failed dial's error as the callers that queued behind the dial get
+    /// it again: the dial's own failure when it is one, the peer kept apart
+    /// from its words; any other failure (the handshake's) by its text, which
+    /// names no peer.
+    pub(super) fn replay_of(error: &(dyn std::error::Error + 'static)) -> Self {
+        Self::of(error).cloned().unwrap_or_else(|| {
+            let text = error.to_string();
+            Self {
+                with_peer: text.clone(),
+                without_peer: text,
+            }
+        })
+    }
+
+    /// The failure as the dial worded it, less the peer's address.
+    pub(super) fn without_peer(&self) -> &str {
+        &self.without_peer
+    }
+}
+
+impl fmt::Display for DialFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.with_peer)
+    }
+}
+
+impl std::error::Error for DialFailure {}
+
 /// A connection to `origin`, dialled under `connect_timeout`: the TCP
 /// connect, the handshake, the connection's task started.
 pub(super) async fn connect(
@@ -163,12 +245,7 @@ pub(super) async fn connect(
     let peer = super::peer_of(origin);
     let socket = tokio::time::timeout(connect_timeout, connect_tcp(host, port, connect_timeout))
         .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("no connection to {peer} within {connect_timeout:?}"),
-            )
-        })??;
+        .map_err(|_| DialFailure::timed_out(&peer, connect_timeout))??;
     connect_io(socket, peer).await
 }
 
@@ -198,32 +275,24 @@ async fn connect_tcp(host: &str, port: u16, within: Duration) -> io::Result<TcpS
     }
     let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|e| io::Error::new(e.kind(), format!("{host}:{port}: {e}")))?
+        .map_err(|e| DialFailure::at(&format_args!("{host}:{port}"), &e))?
         .collect();
     let each = within / u32::try_from(addresses.len()).unwrap_or(u32::MAX).max(1);
-    let mut last = io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("{host} resolves to no address"),
-    );
+    let mut last = DialFailure::no_address(host);
     for address in addresses {
         // No socket for this address (a family the host lacks) is this
         // address's failure, as a refused connection is: the next is tried.
         let socket = match socket_for(address) {
             Ok(socket) => socket,
             Err(e) => {
-                last = io::Error::new(e.kind(), format!("{address}: {e}"));
+                last = DialFailure::at(&address, &e);
                 continue;
             }
         };
         match tokio::time::timeout(each, socket.connect(address)).await {
             Ok(Ok(socket)) => return Ok(socket),
-            Ok(Err(e)) => last = io::Error::new(e.kind(), format!("{address}: {e}")),
-            Err(_) => {
-                last = io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("no connection to {address} within {each:?}"),
-                );
-            }
+            Ok(Err(e)) => last = DialFailure::at(&address, &e),
+            Err(_) => last = DialFailure::timed_out(&address, each),
         }
     }
     Err(last)

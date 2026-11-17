@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Duration};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use openai_protocol::{
@@ -8,6 +8,7 @@ use openai_protocol::{
         WorkerStatus,
     },
 };
+use smg_worker::settings::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS;
 use tokio::sync::mpsc;
 
 use super::{
@@ -16,11 +17,12 @@ use super::{
     metadata::DecodingLabels,
 };
 use crate::{
-    config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     observability::metrics::Metrics,
-    routers::grpc::backend_client::BackendClient,
     worker::{
-        connection::http_client::LazyHttpClient,
+        connection::{
+            engine::{ConnectorDefault, EngineConnection, EngineConnector, NoConnector},
+            http_client::LazyHttpClient,
+        },
         health::{
             circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
             overload::OverloadThresholds,
@@ -36,7 +38,11 @@ use crate::{
 ///
 /// Internally stores a [`WorkerSpec`] for identity/config fields.
 /// Callers with a pre-built `WorkerSpec` can use [`from_spec()`](Self::from_spec).
-pub struct BasicWorkerBuilder {
+///
+/// `D` names the connector of a worker the builder is handed none for, as a
+/// map's type names its hasher: none here, and a host names the builder with
+/// its own ([`ConnectorDefault`]).
+pub struct BasicWorkerBuilder<D = NoConnector> {
     spec: WorkerSpec,
     /// Resolved health config (router defaults + per-worker overrides).
     /// If not set, falls back to `HealthCheckConfig::default()`.
@@ -51,7 +57,14 @@ pub struct BasicWorkerBuilder {
     /// resolves it); the link's streams are unbounded when not set.
     zmq_request_timeout: Option<Duration>,
     circuit_breaker_config: CircuitBreakerConfig,
-    backend_client: Option<BackendClient>,
+    /// An engine connection that is already made (if not set, the worker
+    /// connects on first use).
+    engine_connection: Option<Arc<dyn EngineConnection>>,
+    /// What makes the worker's engine connection (if not set, the default
+    /// `D` names).
+    engine_connector: Option<Arc<dyn EngineConnector>>,
+    /// The type that names the default; no value is held.
+    default_connector: PhantomData<fn() -> D>,
     /// Pre-built worker-directed HTTP client (if not set, a default is created).
     http_client: Option<Arc<reqwest::Client>>,
     /// Whether `http_client` speaks HTTP/2 prior knowledge.
@@ -74,7 +87,7 @@ pub struct BasicWorkerBuilder {
     discovered_labels: HashMap<String, String>,
 }
 
-impl BasicWorkerBuilder {
+impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
     /// Create a new builder with only the URL (uses default WorkerSpec)
     pub fn new(url: impl Into<String>) -> Self {
         Self::from_spec(WorkerSpec::new(url))
@@ -91,7 +104,9 @@ impl BasicWorkerBuilder {
             zmq_startup_timeout: None,
             zmq_request_timeout: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            backend_client: None,
+            engine_connection: None,
+            engine_connector: None,
+            default_connector: PhantomData,
             http_client: None,
             http2: false,
             resilience: None,
@@ -104,7 +119,7 @@ impl BasicWorkerBuilder {
 
     /// A builder over a live worker's resolved state: the spec, HTTP/2, the
     /// discovered labels, the health config and endpoint, the resilience,
-    /// the breaker config, the ZMQ bounds, the overload block, a
+    /// the breaker config, the connector, the ZMQ bounds, the overload block, a
     /// materialized HTTP client and the current status, so a rebuild keeps
     /// what registration resolved. The caller applies its own changes, the
     /// gateway's overload defaults and the connect signal, then shares the
@@ -132,6 +147,10 @@ impl BasicWorkerBuilder {
             .map(BasicWorker::circuit_breaker_config)
         {
             builder = builder.circuit_breaker_config(config);
+        }
+        // The rebuild connects the way the live worker does.
+        if let Some(connector) = worker.engine_connector() {
+            builder = builder.engine_connector(connector);
         }
         if let Some(timeout) = metadata.zmq_request_timeout {
             builder = builder.zmq_request_timeout(timeout);
@@ -254,9 +273,17 @@ impl BasicWorkerBuilder {
         self
     }
 
-    /// Set the backend client (gRPC or ZMQ) for a local worker.
-    pub fn backend_client(mut self, client: BackendClient) -> Self {
-        self.backend_client = Some(client);
+    /// Hand the worker an engine connection that is already made (gRPC or
+    /// ZMQ), so its first use needs no connect.
+    pub fn engine_connection(mut self, connection: impl EngineConnection) -> Self {
+        self.engine_connection = Some(Arc::new(connection));
+        self
+    }
+
+    /// Set what makes the worker's engine connection, in place of the default
+    /// `D` names. A gRPC or ZMQ worker with neither refuses its connect.
+    pub fn engine_connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
+        self.engine_connector = Some(connector);
         self
     }
 
@@ -410,11 +437,11 @@ impl BasicWorkerBuilder {
 
         // OnceCell for lock-free client access after initialization; ArcSwap so
         // the ZMQ health probe can evict a dead client (see BasicWorker docs).
-        let backend_client = {
+        let engine_connection = {
             let cell = OnceCell::new();
-            if let Some(client) = self.backend_client {
-                // Pre-set the client if provided (set on a fresh cell cannot fail)
-                cell.set(Arc::new(client)).ok();
+            if let Some(connection) = self.engine_connection {
+                // Pre-set the connection if provided (set on a fresh cell cannot fail)
+                cell.set(connection).ok();
             }
             Arc::new(ArcSwap::from_pointee(cell))
         };
@@ -452,7 +479,8 @@ impl BasicWorkerBuilder {
                 metadata.spec.url.clone(),
             )),
             metadata,
-            backend_client,
+            engine_connection,
+            engine_connector: self.engine_connector.or_else(D::default_connector),
             zmq_connect_started: Arc::new(AtomicBool::new(false)),
             zmq_connect_abort: Arc::new(ArcSwapOption::empty()),
             superseded: AtomicBool::new(false),
@@ -513,6 +541,9 @@ mod tests {
 
     use super::*;
     use crate::{server::http_client, worker::identity::basic::Worker};
+
+    /// The builder without a default connector, as this module has it.
+    type BasicWorkerBuilder = super::BasicWorkerBuilder;
 
     /// `new(url)` is `from_spec` of the default spec for `url`: the two constructors give the same
     /// worker, every default written once.

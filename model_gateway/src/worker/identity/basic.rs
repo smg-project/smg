@@ -32,9 +32,9 @@ pub use crate::worker::{
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
-    routers::grpc::{backend_client::BackendClient, client::GrpcClient, zmq_client},
     worker::{
         connection::{
+            engine::{EngineConnection, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR},
             engine_admin::{
                 admin_backend_client, admin_grpc_result, admin_http_post, failed,
                 FLUSH_HTTP_TIMEOUT, PROFILE_HTTP_TIMEOUT,
@@ -52,40 +52,21 @@ use crate::{
     },
 };
 
-/// Connect the ZMQ backend for this worker URL. All connect mechanics —
-/// address derivation, socket-dir prep, EOS resolution, handshake — live in
-/// the client layer ([`zmq_client::connect_for_worker`]); the worker layer
-/// wraps the client into its slot and error type, after checking the role
-/// each engine declared at the handshake against `worker_type`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the worker's connection inputs, captured by the detached connect driver"
-)]
+/// Connect the ZMQ backend for this worker. All connect mechanics — address
+/// derivation, socket-dir prep, EOS resolution, handshake, and the check of
+/// the role each engine declared against the worker's — live behind the
+/// host's connector ([`EngineConnector::connect_zmq`]); the worker layer
+/// keeps the connection in its slot and maps the error.
 async fn connect_zmq_backend(
-    base_url: String,
-    model_id: String,
-    runtime: RuntimeType,
-    worker_type: WorkerType,
-    handshake_override: Option<String>,
-    engine_count: zmq_client::EngineCount,
-    startup: Duration,
-    request_timeout: Option<Duration>,
-) -> WorkerResult<Arc<BackendClient>> {
-    zmq_client::connect_for_worker(
-        &base_url,
-        model_id,
-        runtime,
-        handshake_override.as_deref(),
-        engine_count,
-        startup,
-        request_timeout,
-    )
-    .await
-    .and_then(|client| {
-        client.check_declared_role(worker_type)?;
-        Ok(Arc::new(BackendClient::Zmq(client)))
-    })
-    .map_err(|reason| WorkerError::ConnectionFailed {
+    connector: Option<Arc<dyn EngineConnector>>,
+    link: ZmqLink,
+) -> WorkerResult<Arc<dyn EngineConnection>> {
+    let base_url = link.base_url.clone();
+    let connected = match connector {
+        Some(connector) => connector.connect_zmq(link).await,
+        None => Err(NO_ENGINE_CONNECTOR.to_string()),
+    };
+    connected.map_err(|reason| WorkerError::ConnectionFailed {
         url: base_url,
         reason,
     })
@@ -655,10 +636,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// entry alive.
     fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>>;
 
-    /// Strong handle to the worker's backend client (gRPC or ZMQ), if its
+    /// Strong handle to the worker's engine connection (gRPC or ZMQ), if its
     /// lazy connect landed. Never drives the connect: a worker still
     /// connecting, or an HTTP worker, has none.
-    fn backend_client_if_initialized(&self) -> Option<Arc<BackendClient>> {
+    fn engine_connection_if_initialized(&self) -> Option<Arc<dyn EngineConnection>> {
+        None
+    }
+
+    /// What makes this worker's engine connection: the connector it was
+    /// built with, when it holds one. A caller that needs a connection of
+    /// its own to the worker's engine connects through it.
+    fn engine_connector(&self) -> Option<Arc<dyn EngineConnector>> {
         None
     }
 
@@ -834,9 +822,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         // Default: no-op. BasicWorker overrides this.
     }
 
-    /// Get or create a gRPC client for this worker
-    /// Returns None for HTTP workers, Some(client) for gRPC workers
-    async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>>;
+    /// Get or create this worker's engine connection
+    /// Returns None for HTTP workers, Some(connection) for gRPC and ZMQ workers
+    async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>>;
 
     /// Release background work owned by this worker instance.
     ///
@@ -875,7 +863,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                 let client = admin_backend_client(
                     self.url(),
                     "flush_cache",
-                    self.get_backend_client().await?,
+                    self.engine_connection().await?,
                 )?;
                 let result = client.flush_cache(0.0).await;
                 admin_grpc_result(
@@ -912,7 +900,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                 let client = admin_backend_client(
                     self.url(),
                     "start_profile",
-                    self.get_backend_client().await?,
+                    self.engine_connection().await?,
                 )?;
                 let req = common_proto::StartProfileRequest {
                     output_dir: options.output_dir.clone(),
@@ -952,7 +940,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                 let client = admin_backend_client(
                     self.url(),
                     "stop_profile",
-                    self.get_backend_client().await?,
+                    self.engine_connection().await?,
                 )?;
                 let result = client.stop_profile().await;
                 admin_grpc_result(
@@ -1011,12 +999,15 @@ pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub runtime: ArcSwap<WorkerRuntime>,
     pub circuit_breaker: ArcSwap<CircuitBreaker>,
-    /// Lazily initialized backend client (gRPC or ZMQ) for local workers.
+    /// Lazily initialized engine connection (gRPC or ZMQ) for local workers.
     /// The inner `OnceCell` keeps reads lock-free after initialization and
     /// dedupes concurrent connects; the outer `ArcSwap` lets the ZMQ health
     /// probe evict a dead client by swapping in a fresh cell (gRPC never
     /// swaps — a failed gRPC worker is removed and re-added instead).
-    pub backend_client: Arc<ArcSwap<OnceCell<Arc<BackendClient>>>>,
+    pub engine_connection: Arc<ArcSwap<OnceCell<Arc<dyn EngineConnection>>>>,
+    /// What makes the engine connection: the host's connector, as the
+    /// builder resolved it. Without one a gRPC or ZMQ connect is refused.
+    pub engine_connector: Option<Arc<dyn EngineConnector>>,
     /// Guards the one-shot background ZMQ handshake driver so the health probe
     /// never cancels a long (model-load) handshake. Self-clears on failure to
     /// allow a retry. Unused for HTTP/gRPC.
@@ -1067,7 +1058,8 @@ impl Clone for BasicWorker {
             completion_sink: Arc::clone(&self.completion_sink),
             runtime: ArcSwap::from(self.runtime.load_full()),
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
-            backend_client: Arc::clone(&self.backend_client),
+            engine_connection: Arc::clone(&self.engine_connection),
+            engine_connector: self.engine_connector.clone(),
             zmq_connect_started: Arc::clone(&self.zmq_connect_started),
             zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
@@ -1125,24 +1117,24 @@ impl BasicWorker {
     /// load, so any caller awaiting it (request pipeline, load monitor, health
     /// probe) would block far past its own deadline. Callers peek the cell and
     /// report unavailable until the driver lands.
-    fn spawn_zmq_connect_driver(&self, cell: &Arc<OnceCell<Arc<BackendClient>>>) {
+    fn spawn_zmq_connect_driver(&self, cell: &Arc<OnceCell<Arc<dyn EngineConnection>>>) {
         if self.zmq_connect_started.swap(true, Ordering::SeqCst) {
             return;
         }
         let cell = Arc::clone(cell);
         let started = Arc::clone(&self.zmq_connect_started);
-        let base_url = self.metadata.base_url().to_string();
-        let model_id = self.metadata.model_id().to_string();
+        let connector = self.engine_connector.clone();
+        let link = ZmqLink {
+            base_url: self.metadata.base_url().to_string(),
+            model_id: self.metadata.model_id().to_string(),
+            runtime: self.metadata.spec.runtime_type,
+            worker_type: self.metadata.spec.worker_type,
+            handshake_address: self.metadata.spec.zmq_handshake_address.clone(),
+            engine_count: self.metadata.zmq_engine_count(),
+            startup: self.metadata.zmq_startup_timeout,
+            request_timeout: self.metadata.zmq_request_timeout,
+        };
         let url = self.metadata.spec.url.clone();
-        let runtime = self.metadata.spec.runtime_type;
-        let worker_type = self.metadata.spec.worker_type;
-        let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
-        let engine_count = self.metadata.zmq_engine_count().map_or(
-            zmq_client::EngineCount::Declared,
-            zmq_client::EngineCount::Exactly,
-        );
-        let startup = self.metadata.zmq_startup_timeout;
-        let request_timeout = self.metadata.zmq_request_timeout;
         // Capture the readiness signal and the revision at hand-off. The
         // manager only promotes if this revision still matches, so a
         // same-URL replacement racing the handshake is discarded.
@@ -1156,18 +1148,7 @@ impl BasicWorker {
         // until it completes or the worker leaves the registry.
         let handle = tokio::spawn(async move {
             match cell
-                .get_or_try_init(|| {
-                    connect_zmq_backend(
-                        base_url,
-                        model_id,
-                        runtime,
-                        worker_type,
-                        handshake_override,
-                        engine_count,
-                        startup,
-                        request_timeout,
-                    )
-                })
+                .get_or_try_init(|| connect_zmq_backend(connector, link))
                 .await
             {
                 Ok(_) => {
@@ -1283,11 +1264,12 @@ impl BasicWorker {
         // replacement that arrived with its own client keeps it.
         if self.metadata.spec.connection_mode != other.metadata.spec.connection_mode
             || self.metadata.spec.runtime_type != other.metadata.spec.runtime_type
-            || self.backend_client.load().get().is_some()
+            || self.engine_connection.load().get().is_some()
         {
             return;
         }
-        self.backend_client.store(other.backend_client.load_full());
+        self.engine_connection
+            .store(other.engine_connection.load_full());
     }
 }
 
@@ -1316,7 +1298,7 @@ impl BasicWorker {
 
     async fn grpc_health_check(&self) -> WorkerResult<bool> {
         let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-        let maybe = self.get_backend_client().await?;
+        let maybe = self.engine_connection().await?;
         let Some(backend_client) = maybe else {
             tracing::error!(
                 "Worker {} is not a gRPC worker but connection mode is gRPC",
@@ -1326,13 +1308,13 @@ impl BasicWorker {
         };
 
         match time::timeout(timeout, backend_client.health_check()).await {
-            Ok(Ok(resp)) => {
+            Ok(Ok(healthy)) => {
                 tracing::debug!(
                     "gRPC health OK for {}: healthy={}",
                     self.metadata.redacted_url,
-                    resp.healthy
+                    healthy
                 );
-                Ok(resp.healthy)
+                Ok(healthy)
             }
             Ok(Err(err)) => {
                 tracing::warn!(
@@ -1364,7 +1346,7 @@ impl BasicWorker {
         // liveness is local (the connector marks the client closed on
         // ENGINE_CORE_DEAD or a transport failure); there is no health RPC on
         // the raw ZMQ wire.
-        let cell = self.backend_client.load_full();
+        let cell = self.engine_connection.load_full();
         if let Some(backend_client) = cell.get() {
             if backend_client.is_alive() {
                 return true;
@@ -1381,7 +1363,7 @@ impl BasicWorker {
                 "ZMQ engine for {} is no longer alive; evicting the dead client and rebinding on a later probe",
                 self.metadata.redacted_url
             );
-            self.backend_client
+            self.engine_connection
                 .compare_and_swap(&cell, Arc::new(OnceCell::new()));
             self.zmq_connect_started.store(false, Ordering::SeqCst);
             return false;
@@ -1828,8 +1810,12 @@ impl Worker for BasicWorker {
         self.http_client.handle_if_initialized()
     }
 
-    fn backend_client_if_initialized(&self) -> Option<Arc<BackendClient>> {
-        self.backend_client.load_full().get().cloned()
+    fn engine_connection_if_initialized(&self) -> Option<Arc<dyn EngineConnection>> {
+        self.engine_connection.load_full().get().cloned()
+    }
+
+    fn engine_connector(&self) -> Option<Arc<dyn EngineConnector>> {
+        self.engine_connector.clone()
     }
 
     fn supports_model(&self, model_id: &str) -> bool {
@@ -1867,7 +1853,7 @@ impl Worker for BasicWorker {
             .store(Arc::new(WorkerModels::from(models)));
     }
 
-    async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
+    async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {
         match self.metadata.spec.connection_mode {
             ConnectionMode::Http => Ok(None),
             ConnectionMode::Grpc => {
@@ -1879,7 +1865,7 @@ impl Worker for BasicWorker {
                 // only the first call per worker runs it. The cold path pays
                 // its allocation once; every later call's future holds a
                 // pointer where it held kilobytes.
-                let cell = self.backend_client.load_full();
+                let cell = self.engine_connection.load_full();
                 let client = cell
                     .get_or_try_init(|| {
                         Box::pin(async {
@@ -1890,15 +1876,25 @@ impl Worker for BasicWorker {
                                 self.metadata.redacted_url
                             );
                             // DP-expanded workers carry a `{base}@{rank}` URL; connect to the base
-                            match GrpcClient::connect(self.metadata.base_url(), &runtime_str).await
-                            {
+                            let connected = match &self.engine_connector {
+                                Some(connector) => {
+                                    connector
+                                        .connect_grpc(
+                                            self.metadata.base_url(),
+                                            self.metadata.spec.runtime_type,
+                                        )
+                                        .await
+                                }
+                                None => Err(NO_ENGINE_CONNECTOR.to_string()),
+                            };
+                            match connected {
                                 Ok(client) => {
                                     tracing::info!(
                                         "Successfully connected gRPC client ({}) for worker: {}",
                                         runtime_str,
                                         self.metadata.redacted_url
                                     );
-                                    Ok(Arc::new(BackendClient::Grpc(client)))
+                                    Ok(client)
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -1925,7 +1921,7 @@ impl Worker for BasicWorker {
                 // fast instead of blocking a request or a load poll behind it.
                 // Kicking the driver off here also covers workers whose health
                 // checks are disabled, where no probe ever runs.
-                let cell = self.backend_client.load_full();
+                let cell = self.engine_connection.load_full();
                 if let Some(client) = cell.get() {
                     return Ok(Some(Arc::clone(client)));
                 }

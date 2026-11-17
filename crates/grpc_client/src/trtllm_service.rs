@@ -303,6 +303,10 @@ impl TrtllmServiceClient {
     /// - temperature: 1.0 (neutral sampling)
     /// - top_p: 1.0 (no nucleus filtering)
     /// - repetition_penalty: 1.0 (no penalty)
+    #[expect(
+        deprecated,
+        reason = "ChatCompletionRequest.seed is marked Legacy by openai-protocol, but the engine still honors it"
+    )]
     fn build_sampling_config_from_chat(request: &ChatCompletionRequest) -> proto::SamplingConfig {
         proto::SamplingConfig {
             beam_width: 1,
@@ -312,7 +316,9 @@ impl TrtllmServiceClient {
             top_p_min: None,
             top_p_reset_ids: None,
             top_p_decay: None,
-            seed: None,
+            seed: request
+                .sampling_seed
+                .or_else(|| request.seed.map(seed_bits)),
             temperature: Some(request.temperature.unwrap_or(1.0)),
             min_tokens: request.min_tokens,
             beam_search_diversity_rate: None,
@@ -583,7 +589,9 @@ impl TrtllmServiceClient {
             top_p_min: None,
             top_p_reset_ids: None,
             top_p_decay: None,
-            seed: request.seed.map(seed_bits),
+            seed: request
+                .sampling_seed
+                .or_else(|| request.seed.map(seed_bits)),
             temperature: Some(request.temperature.unwrap_or(1.0)),
             min_tokens: request.min_tokens,
             beam_search_diversity_rate: None,
@@ -797,6 +805,72 @@ mod tests {
             (loads.loads[1].dp_rank, loads.loads[1].prefill_throughput),
             (1, None)
         );
+    }
+
+    /// A chat request's `seed` reaches the sampling config, as a completion
+    /// request's does and with the same bits; a request without one sends none.
+    #[test]
+    fn chat_and_completion_sampling_configs_carry_the_seed() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "seed": 7
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&chat).seed,
+            Some(7)
+        );
+        let negative: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "seed": -1
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&negative).seed,
+            Some(u64::MAX)
+        );
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "seed": 7
+        }))
+        .expect("a completion request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_completion(&completion).seed,
+            Some(7)
+        );
+        let unset: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&unset).seed,
+            None
+        );
+    }
+
+    /// A chat or completion request's `sampling_seed` reaches the sampling config whole, as on the
+    /// plain route, and wins over `seed` when a request sets both; `seed` alone still arrives.
+    #[test]
+    fn chat_and_completion_sampling_seed_reaches_the_engine_request() {
+        let chat = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a chat request");
+            TrtllmServiceClient::build_sampling_config_from_chat(&request).seed
+        };
+        let completion = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "prompt": "hi", "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a completion request");
+            TrtllmServiceClient::build_sampling_config_from_completion(&request).seed
+        };
+        let both =
+            |sampling_seed, seed| (chat(sampling_seed, seed), completion(sampling_seed, seed));
+        assert_eq!(both(Some(7), None), (Some(7), Some(7)));
+        assert_eq!(both(Some(7), Some(42)), (Some(7), Some(7)));
+        assert_eq!(both(Some(u64::MAX), None), (Some(u64::MAX), Some(u64::MAX)));
+        assert_eq!(both(None, Some(42)), (Some(42), Some(42)));
+        assert_eq!(both(None, None), (None, None));
     }
 
     #[test]

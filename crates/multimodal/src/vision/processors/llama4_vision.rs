@@ -415,9 +415,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
         let mut all_outputs = Vec::new();
         let mut all_aspect_ratios = Vec::new();

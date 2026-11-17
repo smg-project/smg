@@ -65,6 +65,13 @@ pub enum ModelRegistryError {
     },
 }
 
+impl ModelRegistryError {
+    /// The error for a modality that the spec named `spec` does not serve.
+    pub(crate) fn unsupported(spec: &'static str, modality: Modality) -> Self {
+        Self::UnsupportedModality { spec, modality }
+    }
+}
+
 pub type RegistryResult<T> = Result<T, ModelRegistryError>;
 
 static IMAGE_MAX_COUNT_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
@@ -338,10 +345,7 @@ pub trait ModelProcessorSpec: Send + Sync {
         match (self.hooks(modality), modality) {
             (Some(hooks), _) => (hooks.placeholder)(metadata),
             (None, Modality::Image) => self.placeholder_token(metadata),
-            (None, _) => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            (None, _) => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
     fn placeholder_token_id_for(
@@ -352,10 +356,7 @@ pub trait ModelProcessorSpec: Send + Sync {
         match (self.hooks(modality), modality) {
             (Some(hooks), _) => (hooks.placeholder_id)(metadata),
             (None, Modality::Image) => self.placeholder_token_id(metadata),
-            (None, _) => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            (None, _) => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
     /// The text the model's chat template writes for one item of `modality`
@@ -417,10 +418,7 @@ pub trait ModelProcessorSpec: Send + Sync {
         _preprocessor_config: &PreProcessorConfig,
         modality: Modality,
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
-        Err(ModelRegistryError::UnsupportedModality {
-            spec: self.name(),
-            modality,
-        })
+        Err(ModelRegistryError::unsupported(self.name(), modality))
     }
 
     /// Build the audio preprocessor for this model, if it supports audio.
@@ -466,10 +464,7 @@ pub trait ModelProcessorSpec: Send + Sync {
                 (hooks.replacements)(metadata, preprocessed, &[], &PreProcessorConfig::default())
             }
             (None, Modality::Image) => self.prompt_replacements(metadata, preprocessed),
-            (None, _) => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            (None, _) => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

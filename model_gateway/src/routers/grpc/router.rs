@@ -337,7 +337,7 @@ impl GrpcRouter {
     /// their state machines, not a copy of the 1 KiB request per hop.
     fn chat_request_for_pipeline(
         &self,
-        body: ChatCompletionRequest,
+        mut body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Result<(Arc<ChatCompletionRequest>, String, &RequestPipeline), Response> {
         if let Err(response) = super::validate_text_only_output(&body) {
@@ -367,9 +367,10 @@ impl GrpcRouter {
         // would no-op and otherwise leave the alias sitting in the body for
         // response metadata and parser selection to read.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
-        let mut canonical_body = body;
-        canonical_body.model.clone_from(&model_id_cloned);
-        Ok((Arc::new(canonical_body), model_id_cloned, pipeline))
+        if body.model != model_id_cloned {
+            Arc::make_mut(&mut body).model.clone_from(&model_id_cloned);
+        }
+        Ok((body, model_id_cloned, pipeline))
     }
 
     /// Main route_chat implementation, over the request
@@ -738,7 +739,7 @@ impl GrpcRouter {
     /// per hop.
     fn messages_request_for_pipeline(
         &self,
-        body: CreateMessageRequest,
+        mut body: Arc<CreateMessageRequest>,
         model_id: &str,
     ) -> (Arc<CreateMessageRequest>, String, MessagesTools) {
         debug!("Processing messages request for model: {}", model_id);
@@ -747,14 +748,16 @@ impl GrpcRouter {
         // doc comment. Rewrite the body's `model` field to match; see
         // `chat_request_for_pipeline`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
-        let mut canonical_body = body;
+        // The handler's `Arc` is the only handle at this point, so this
+        // borrows the request in place.
+        let canonical_body = Arc::make_mut(&mut body);
         canonical_body.model.clone_from(&model_id_cloned);
-        // The tools leave the request here, while it is still owned: converted
-        // once, by value, into the chat tools the pipeline carries beside the
-        // request; the request's own `tools` reads `None` from here on, and
-        // whether it was set travels with them.
-        let tools = MessagesTools::take_from(&mut canonical_body);
-        (Arc::new(canonical_body), model_id_cloned, tools)
+        // The tools leave the request here, before the pipeline shares it:
+        // converted once, by value, into the chat tools the pipeline carries
+        // beside the request; the request's own `tools` reads `None` from
+        // here on, and whether it was set travels with them.
+        let tools = MessagesTools::take_from(canonical_body);
+        (body, model_id_cloned, tools)
     }
 
     /// Main route_messages implementation, over the request
@@ -1184,7 +1187,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
         match self.chat_request_for_pipeline(body, model_id) {
@@ -1308,7 +1311,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: CreateMessageRequest,
+        body: Arc<CreateMessageRequest>,
         model_id: &str,
     ) -> Response {
         let (body, model_id, tools) = self.messages_request_for_pipeline(body, model_id);

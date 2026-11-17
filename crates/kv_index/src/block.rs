@@ -114,23 +114,37 @@ pub struct OverlapScores {
 /// One-shot over a stack buffer for blocks up to 256 tokens: the streaming
 /// hasher derives a seeded secret per instance before it sees a byte, which
 /// outweighs hashing a 16-token block. Same digest either way (the test
-/// below pins that).
+/// below pins that). The buffer is the smallest of three sizes that holds
+/// the block: zeroing one sized for 256 tokens costs as much as hashing a
+/// 16-token block.
 pub fn compute_content_hash(token_ids: &[u32]) -> ContentHash {
     const STACK_BYTES: usize = 1024;
     let len = token_ids.len() * 4;
     if len <= STACK_BYTES {
-        let mut bytes = [0u8; STACK_BYTES];
-        let (slots, _) = bytes[..len].as_chunks_mut::<4>();
-        for (slot, token) in slots.iter_mut().zip(token_ids) {
-            *slot = token.to_le_bytes();
-        }
-        return ContentHash(xxhash_rust::xxh3::xxh3_64_with_seed(
-            &bytes[..len],
-            XXH3_SEED,
-        ));
+        return match len {
+            0..=128 => hash_on_stack::<128>(token_ids),
+            129..=256 => hash_on_stack::<256>(token_ids),
+            _ => hash_on_stack::<STACK_BYTES>(token_ids),
+        };
     }
     let bytes: Vec<u8> = token_ids.iter().flat_map(|t| t.to_le_bytes()).collect();
     ContentHash(xxhash_rust::xxh3::xxh3_64_with_seed(&bytes, XXH3_SEED))
+}
+
+/// [`compute_content_hash`] over a zeroed stack buffer of `N` bytes, which
+/// holds the block.
+#[inline]
+fn hash_on_stack<const N: usize>(token_ids: &[u32]) -> ContentHash {
+    let mut bytes = [0u8; N];
+    let len = token_ids.len() * 4;
+    let (slots, _) = bytes[..len].as_chunks_mut::<4>();
+    for (slot, token) in slots.iter_mut().zip(token_ids) {
+        *slot = token.to_le_bytes();
+    }
+    ContentHash(xxhash_rust::xxh3::xxh3_64_with_seed(
+        &bytes[..len],
+        XXH3_SEED,
+    ))
 }
 
 /// Rolling prefix hash over content hashes: `XXH3(prev || current)`, the

@@ -92,6 +92,130 @@ async fn a_hanging_engine_id_read_expires_and_keeps_the_previous_id() {
     hold.abort();
 }
 
+/// The re-read makes a connection of its own through the worker's connector,
+/// one a read, and leaves the worker's slot alone. A read the engine does not
+/// answer and a worker without a connector are each an error that says which.
+#[tokio::test]
+async fn the_engine_id_read_connects_through_the_workers_connector() {
+    let connector = Arc::new(CountingConnector::default());
+    let worker = BasicWorkerBuilder::new("grpc://p:1")
+        .worker_type(WorkerType::Prefill)
+        .connection_mode(ConnectionMode::Grpc)
+        .engine_connector(Arc::clone(&connector) as Arc<dyn EngineConnector>)
+        .build();
+
+    let unanswered = read_kv_engine_id(&worker).await.unwrap_err();
+    assert_eq!(connector.connects(), 1);
+    assert!(
+        unanswered.starts_with("Failed to fetch gRPC server info: "),
+        "{unanswered}"
+    );
+    assert!(worker.engine_connection_if_initialized().is_none());
+
+    let bare = <builder::BasicWorkerBuilder>::new("grpc://p:1")
+        .worker_type(WorkerType::Prefill)
+        .connection_mode(ConnectionMode::Grpc)
+        .build();
+    let refused = read_kv_engine_id(&bare).await.unwrap_err();
+    assert_eq!(
+        refused,
+        format!("Failed to connect to gRPC: {NO_ENGINE_CONNECTOR}")
+    );
+}
+
+/// A connector that refuses every connect with the address it was asked to
+/// dial, so a case reads that address in its caller's error.
+#[derive(Debug)]
+struct EchoingConnector;
+
+#[async_trait]
+impl EngineConnector for EchoingConnector {
+    async fn connect_grpc(
+        &self,
+        base_url: &str,
+        _runtime: RuntimeType,
+    ) -> Result<Arc<dyn EngineConnection>, String> {
+        Err(base_url.to_string())
+    }
+
+    async fn connect_zmq(&self, link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+        Err(link.base_url)
+    }
+}
+
+/// The read dials the gRPC base of the worker's address. A data-parallel
+/// rank row carries its rank after the base, and its read reaches the engine
+/// the row's own connection reaches. A worker registered under an HTTP
+/// scheme is dialed as gRPC.
+#[tokio::test]
+async fn the_engine_id_read_dials_the_base_address_of_a_rank_row() {
+    let connector = || Arc::new(EchoingConnector) as Arc<dyn EngineConnector>;
+    let rank_row = BasicWorkerBuilder::new("grpc://p:1")
+        .worker_type(WorkerType::Prefill)
+        .connection_mode(ConnectionMode::Grpc)
+        .dp_config(1, 2)
+        .engine_connector(connector())
+        .build();
+    assert_eq!(rank_row.url(), "grpc://p:1@1");
+    assert_eq!(
+        read_kv_engine_id(&rank_row).await.unwrap_err(),
+        "Failed to connect to gRPC: grpc://p:1"
+    );
+
+    let http_named = BasicWorkerBuilder::new("http://p:1")
+        .worker_type(WorkerType::Prefill)
+        .connection_mode(ConnectionMode::Grpc)
+        .engine_connector(connector())
+        .build();
+    assert_eq!(
+        read_kv_engine_id(&http_named).await.unwrap_err(),
+        "Failed to connect to gRPC: grpc://p:1"
+    );
+}
+
+/// The read end to end, through the gateway's own connector, over a mock
+/// engine that reports an id: a plain row, a rank row and a worker registered
+/// under an HTTP scheme each read the reported id, and an id reported empty
+/// reads as none.
+#[tokio::test]
+async fn the_engine_id_read_answers_the_id_an_engine_reports() {
+    let (url, engine) = mock_engine_on_wire("m", mock_worker::config::SchedulerWire::Vllm).await;
+    let port: u16 = url
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse().ok())
+        .expect("the mock engine's port");
+    let report = |id: &str| {
+        let mut patch = serde_json::Map::new();
+        patch.insert("kv_engine_id".to_string(), id.into());
+        mock_worker::overrides::for_port(port).patch_info(&patch);
+    };
+    let row = |address: &str, rank: Option<(usize, usize)>| {
+        let mut builder = BasicWorkerBuilder::new(address)
+            .worker_type(WorkerType::Prefill)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Vllm);
+        if let Some((rank, size)) = rank {
+            builder = builder.dp_config(rank, size);
+        }
+        builder.build()
+    };
+    let grpc = url.replacen("http://", "grpc://", 1);
+    let reported = || Ok::<_, String>(Some("eng".to_string()));
+
+    report("eng");
+    assert_eq!(read_kv_engine_id(&row(&grpc, None)).await, reported());
+    assert_eq!(
+        read_kv_engine_id(&row(&grpc, Some((1, 2)))).await,
+        reported()
+    );
+    assert_eq!(read_kv_engine_id(&row(&url, None)).await, reported());
+
+    report("");
+    assert_eq!(read_kv_engine_id(&row(&grpc, None)).await, Ok(None));
+    engine.abort();
+}
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use http::{header::AUTHORIZATION, HeaderMap};
 use openai_protocol::{
@@ -100,9 +224,16 @@ use openai_protocol::{
 };
 
 use super::*;
-use crate::worker::{
-    health::circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
-    ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry, WorkerType,
+use crate::{
+    routers::grpc::test_engine::mock_engine_on_wire,
+    worker::{
+        connection::engine::{EngineConnection, EngineConnector, ZmqLink},
+        health::circuit_breaker::CircuitState,
+        identity::builder,
+        test_support::{CountingConnector, RefusedAddress},
+        BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry,
+        WorkerType,
+    },
 };
 
 fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
@@ -295,7 +426,10 @@ fn labels_follow_the_engine_for_local_self_hosted_workers_only() {
 /// with no removal queue (the shape of `remove_unhealthy = false`).
 #[tokio::test]
 async fn a_transition_into_ready_submits_a_label_refresh() {
-    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    use crate::{
+        service_discovery::testing::create_test_app_context,
+        workflow::{JobQueue, JobQueueConfig},
+    };
     let app_context = create_test_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
     let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -304,7 +438,7 @@ async fn a_transition_into_ready_submits_a_label_refresh() {
     worker.set_status(WorkerStatus::NotReady);
     let worker_id = registry.register(worker.clone()).unwrap();
     let completion = passing_probe(worker_id, &worker);
-    let applied = apply_probe_completion(&registry, completion, None, Some(&job_queue)).await;
+    let applied = apply_probe_completion(&registry, completion, None, Some(&*job_queue)).await;
     assert!(matches!(
         applied,
         ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
@@ -325,7 +459,10 @@ async fn a_transition_into_ready_submits_a_label_refresh() {
 /// transition into service is then what fills them in.
 #[tokio::test]
 async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_service() {
-    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    use crate::{
+        service_discovery::testing::create_test_app_context,
+        workflow::{JobQueue, JobQueueConfig},
+    };
     let app_context = create_test_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
     let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -335,7 +472,7 @@ async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_serv
     worker.set_status(WorkerStatus::NotReady);
     let worker_id = registry.register(worker.clone()).unwrap();
     let completion = passing_probe(worker_id, &worker);
-    let applied = apply_probe_completion(&registry, completion, None, Some(&job_queue)).await;
+    let applied = apply_probe_completion(&registry, completion, None, Some(&*job_queue)).await;
     assert!(matches!(
         applied,
         ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
@@ -343,6 +480,79 @@ async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_serv
     assert!(
         job_queue.get_status("http://local:8").is_some(),
         "a worker whose registration discovered nothing is refreshed all the same"
+    );
+}
+
+/// What a recorded removal names: the address, the worker's id and its revision.
+type Removal = (String, String, u64);
+
+/// A `WorkerJobs` that keeps the removals it is asked for.
+#[derive(Default)]
+struct RecordedJobs(parking_lot::Mutex<Vec<Removal>>);
+
+#[async_trait]
+impl WorkerJobs for RecordedJobs {
+    async fn remove_worker(
+        &self,
+        url: String,
+        worker_id: &WorkerId,
+        revision: u64,
+    ) -> Result<(), String> {
+        self.0
+            .lock()
+            .push((url, worker_id.as_str().to_string(), revision));
+        Ok(())
+    }
+
+    async fn refresh_worker_labels(&self, _url: String) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
+/// A worker that fails under a removal scope is handed over for removal
+/// once: at its address, named by its own id at the revision its probe saw.
+#[tokio::test]
+async fn a_worker_that_fails_under_a_removal_scope_is_handed_over_by_id_and_revision() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = make_worker("http://w:1", 2, 1);
+    let worker_id = registry.register(worker.clone()).unwrap();
+    let revision = worker.revision();
+    let recorded = RecordedJobs::default();
+    let jobs: &dyn WorkerJobs = &recorded;
+    let removal = Some((jobs, UnhealthyRemovalScope::AllLocal));
+    let failed_probe = || ProbeCompletion {
+        worker_id: worker_id.clone(),
+        worker: worker.clone(),
+        expected_revision: revision,
+        launched_status: WorkerStatus::Pending,
+        probe_result: Err(WorkerError::HealthCheckFailed {
+            url: worker.url().to_string(),
+            reason: "refused".to_string(),
+        }),
+    };
+
+    // A failure threshold of one: the tenth failed probe of a pending worker
+    // fails it.
+    for _ in 1..10 {
+        let applied = apply_probe_completion(&registry, failed_probe(), removal, None).await;
+        assert!(matches!(applied, ProbeApplyResult::Applied(None)));
+    }
+    assert!(
+        recorded.0.lock().is_empty(),
+        "a pending worker is not removed"
+    );
+    let applied = apply_probe_completion(&registry, failed_probe(), removal, None).await;
+    assert!(matches!(
+        applied,
+        ProbeApplyResult::Applied(Some((WorkerStatus::Pending, WorkerStatus::Failed)))
+    ));
+    assert_eq!(
+        *recorded.0.lock(),
+        vec![(
+            worker.base_url().to_string(),
+            worker_id.as_str().to_string(),
+            revision,
+        )]
     );
 }
 
@@ -1047,6 +1257,116 @@ async fn a_brought_forward_read_never_lands_after_the_scheduled_one() {
     manager.shutdown().await;
 }
 
+/// A worker whose probe interval is past what the clock can hold does not
+/// stop the loop: its registration probe reads, and a worker registered
+/// after it is probed on its own interval.
+#[tokio::test]
+async fn an_interval_past_the_clock_leaves_the_other_workers_probed() {
+    let serving = Arc::new(AtomicBool::new(true));
+    let far_hits = Arc::new(AtomicUsize::new(0));
+    let near_hits = Arc::new(AtomicUsize::new(0));
+    let far_url = start_health_stub(serving.clone(), far_hits.clone()).await;
+    let near_url = start_health_stub(serving.clone(), near_hits.clone()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut manager = manager_over(&registry);
+    let start = tokio::time::Instant::now();
+
+    registry
+        .register(probed_worker_with(
+            &far_url,
+            ConnectionMode::Http,
+            1,
+            u64::MAX,
+        ))
+        .unwrap();
+    wait_until(
+        start + Duration::from_secs(5),
+        "the registration probe of the worker with the longest interval did not read",
+        || far_hits.load(Ordering::SeqCst) > 0,
+    )
+    .await;
+    registry
+        .register(probed_worker_with(&near_url, ConnectionMode::Http, 1, 1))
+        .unwrap();
+
+    wait_until(
+        start + Duration::from_secs(10),
+        "the worker registered after it was not probed on its interval",
+        || near_hits.load(Ordering::SeqCst) >= 2,
+    )
+    .await;
+
+    manager.shutdown().await;
+}
+
+/// A demoted worker whose probe timeout is past what the clock can hold does
+/// not stop the loop either: its pass short of the success threshold brings
+/// its next read forward by that timeout, and a worker registered after it
+/// is probed on its own interval.
+#[tokio::test]
+async fn a_timeout_past_the_clock_leaves_the_other_workers_probed() {
+    let serving = Arc::new(AtomicBool::new(true));
+    let far_hits = Arc::new(AtomicUsize::new(0));
+    let near_hits = Arc::new(AtomicUsize::new(0));
+    let far_url = start_health_stub(serving.clone(), far_hits.clone()).await;
+    let near_url = start_health_stub(serving.clone(), near_hits.clone()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut manager = manager_over(&registry);
+    let start = tokio::time::Instant::now();
+
+    let far = probed_worker_with_timeout(&far_url, ConnectionMode::Http, 2, 1, u64::MAX);
+    far.set_status(WorkerStatus::NotReady);
+    registry.register(far).unwrap();
+    wait_until(
+        start + Duration::from_secs(5),
+        "the first probe of the worker with the longest timeout did not read",
+        || far_hits.load(Ordering::SeqCst) > 0,
+    )
+    .await;
+    registry
+        .register(probed_worker_with(&near_url, ConnectionMode::Http, 1, 1))
+        .unwrap();
+
+    wait_until(
+        start + Duration::from_secs(10),
+        "the worker registered after it was not probed on its interval",
+        || near_hits.load(Ordering::SeqCst) >= 2,
+    )
+    .await;
+
+    manager.shutdown().await;
+}
+
+/// A deadline whose sum the clock cannot hold is put thirty years out: the
+/// worker keeps its slot, and the slot is never due.
+#[test]
+fn a_deadline_past_the_clock_is_put_at_the_schedules_bound() {
+    let registry = WorkerRegistry::new();
+    let worker_id = registry
+        .register(probed_worker_with(
+            "http://w:1",
+            ConnectionMode::Http,
+            1,
+            u64::MAX,
+        ))
+        .unwrap();
+    let now = tokio::time::Instant::now();
+    let mut next_check = HashMap::new();
+
+    schedule_at(
+        &mut next_check,
+        worker_id.clone(),
+        ProbeSlot::Probe(Duration::from_secs(u64::MAX)),
+        now,
+        false,
+    );
+
+    assert_eq!(
+        next_check.get(&worker_id),
+        Some(&(now + Duration::from_secs(946_080_000)))
+    );
+}
+
 #[test]
 fn apply_connect_signal_reschedules_a_promoted_worker() {
     // A worker that hit the Pending cap is dropped from the schedule. A
@@ -1120,7 +1440,10 @@ fn apply_connect_signal_reports_the_promoted_worker() {
 /// the label refresh is submitted for a locally registered worker.
 #[tokio::test]
 async fn a_connect_signal_promotion_submits_a_label_refresh() {
-    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    use crate::{
+        service_discovery::testing::create_test_app_context,
+        workflow::{JobQueue, JobQueueConfig},
+    };
     let app_context = create_test_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
     let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -1144,7 +1467,7 @@ async fn a_connect_signal_promotion_submits_a_label_refresh() {
         },
         &mut next_check,
         &test_config(),
-        Some(&job_queue),
+        Some(&*job_queue),
     )
     .await;
 
@@ -1163,7 +1486,10 @@ async fn a_connect_signal_promotion_submits_a_label_refresh() {
 /// transition to retry on. The registration's status stays its own.
 #[tokio::test]
 async fn a_connect_signal_during_the_registration_job_keeps_the_refresh() {
-    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    use crate::{
+        service_discovery::testing::create_test_app_context,
+        workflow::{JobQueue, JobQueueConfig},
+    };
     let app_context = create_test_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
     let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -1188,7 +1514,7 @@ async fn a_connect_signal_during_the_registration_job_keeps_the_refresh() {
         },
         &mut HashMap::new(),
         &test_config(),
-        Some(&job_queue),
+        Some(&*job_queue),
     )
     .await;
 

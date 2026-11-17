@@ -25,9 +25,9 @@
 //! with none.
 //!
 //! One arm a kind of frame. `Hello` is served here, and the lifecycle's
-//! three frames in [`lifecycle`](super::lifecycle). The other kinds are
-//! refused by name until the step that serves each adds its arm, as the
-//! service refuses an unserved call.
+//! three frames in [`lifecycle`]. The other kinds are refused by name
+//! until the step that serves each adds its arm, as the service refuses an
+//! unserved call.
 //!
 //! The session's loop is polled with the stream it answers on, so no task
 //! outlives its stream: a gateway that stops reading its stream stops its
@@ -46,6 +46,7 @@ use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
 use tracing::{debug, info};
 
 use super::{
+    decide,
     gateways::{Refused, Seat},
     lifecycle,
     principal::Principal,
@@ -189,14 +190,14 @@ fn refusal(refused: Refused) -> Status {
     }
 }
 
-/// The status of a frame the stream could not read. The transport's own
-/// stands, but for a message over the transport's limit: the contract
-/// never raises the transport's code for that one, and the code alone
-/// tells the case.
-fn unread(status: Status) -> Status {
+/// The status of a frame a stream could not read, `frame` naming the
+/// stream's kind of frame. The transport's own stands, but for a message
+/// over the transport's limit: the contract never raises the transport's
+/// code for that one, and the code alone tells the case.
+pub(crate) fn unread(frame: &str, status: Status) -> Status {
     if status.code() == Code::OutOfRange {
         Status::resource_exhausted(format!(
-            "a Session frame is over the transport's limit: {}",
+            "{frame} is over the transport's limit: {}",
             status.message()
         ))
     } else {
@@ -265,7 +266,7 @@ async fn session(
                 first = inbound.message() => match first {
                     Ok(Some(first)) => break first,
                     Ok(None) => return None,
-                    Err(status) => return Some(unread(status)),
+                    Err(status) => return Some(unread("a Session frame", status)),
                 },
                 () = &mut deadline => {
                     return Some(Status::deadline_exceeded(format!(
@@ -338,10 +339,11 @@ async fn session(
         }),
         needs,
         hashing,
-        // No call decides yet: with no credit a gateway decides locally.
-        // The call that issues leases sets these three.
-        decide_window: 0,
-        max_decide_streams: 0,
+        // A decide stream's credit at its open, and the streams a gateway
+        // holds at most. No lease is issued yet: the call that issues one
+        // sets the dispatch TTL.
+        decide_window: decide::WINDOW,
+        max_decide_streams: decide::MAX_STREAMS,
         dispatch_ttl_ms: 0,
         grace_period_ms: millis(shared.gateways.grace()),
         leader_poll_ms: millis(LEADER_POLL),
@@ -365,7 +367,7 @@ async fn session(
                 let frame = match frame {
                     Ok(Some(frame)) => frame,
                     Ok(None) => break None,
-                    Err(status) => break Some(unread(status)),
+                    Err(status) => break Some(unread("a Session frame", status)),
                 };
                 if let Some(status) = judge(shared, gateway, term, &seat, &frame, answers).await {
                     break Some(status);
@@ -497,23 +499,24 @@ mod tests {
     use crate::{
         controller::{
             config::Scope,
-            election::Standing,
+            election::{LeasePlace, Standing},
             gateways::{
                 tests::{lease, PATIENT},
                 Gateways, Refused,
             },
             lifecycle::tests::{a_completed, a_dispatched, a_released, worker},
             principal::{tests::told, Layer, ENTRY},
+            replication::journaled_from,
             service::{Service, Shared},
             PROTOCOL_VERSION,
         },
-        elector::{ElectionSettings, Elector, MemoryLease, Tick},
+        elector::{ElectionSettings, Elector, Tick},
         lease::LeaseId,
         proto::{
             self, controller_frame, gateway_frame::Frame,
             policy_controller_client::PolicyControllerClient,
         },
-        store::{HealthSink, LeaseState, LeasesStore, MemoryStore},
+        store::{HealthSink, LeaseState, LeasesStore},
     };
 
     const ID: &str = "controller-0";
@@ -543,16 +546,18 @@ mod tests {
         ceiling: Option<usize>,
         hello_deadline: Option<Duration>,
     ) -> Bed {
-        let elector = Elector::new(Box::new(MemoryLease::new()), IDENTITY, settings)
-            .expect("the settings are in order");
+        let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
         let mut shared = Shared::new(
             ID.to_owned(),
             ADDRESS.to_owned(),
             &elector,
             stood,
-            Arc::new(MemoryStore::new()),
-        );
+            journaled_from(&LeasePlace::Process, 0),
+            Arc::new(crate::Catalog::builtin()),
+            2,
+        )
+        .expect("the deciders start");
         if let Some(ceiling) = ceiling {
             shared.gateways = Arc::new(Gateways::new(
                 GRACE_PERIOD,
@@ -586,14 +591,21 @@ mod tests {
     }
 
     impl Bed {
-        /// The candidate takes or renews its lease now, under `term`, and
-        /// the election publishes the look.
+        /// The candidate leads now under `term`, by a take or a renewal, and
+        /// the election publishes the look. The bed's candidate is alone
+        /// over its own lease: its first take leads at once.
         fn leads(&mut self, term: u64) {
-            let tick = self.elector.tick(Instant::now()).expect("a step");
-            assert!(
-                tick == Tick::Acquired { term } || tick == Tick::Renewed { term },
-                "{tick:?}"
-            );
+            let now = Instant::now();
+            if self.elector.is_holder() || self.elector.observed().is_some() {
+                let tick = self.elector.tick(now).expect("a step");
+                assert!(
+                    tick == Tick::Acquired { term } || tick == Tick::Renewed { term },
+                    "{tick:?}"
+                );
+            } else {
+                self.elector.lead_at(now);
+                assert_eq!(self.elector.fence().leader_term(now), Some(term));
+            }
             self.step(IDENTITY, term);
         }
 
@@ -784,8 +796,8 @@ mod tests {
                     }),
                     needs: None,
                     hashing: Vec::new(),
-                    decide_window: 0,
-                    max_decide_streams: 0,
+                    decide_window: 128,
+                    max_decide_streams: 256,
                     grace_period_ms: 10_000,
                     dispatch_ttl_ms: 0,
                     leader_poll_ms: 1_000,

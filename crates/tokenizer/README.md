@@ -214,14 +214,16 @@ The caching subsystem provides multi-level caching for tokenizer results:
 `cargo bench -p llm-tokenizer --bench <name>` runs one of the crate's criterion groups: `stop_decoder` (a stream's stop
 rules built from the configuration and from a copy, the per-token cost with and without stop strings),
 `incremental_decode` (a full decode, one decode step, `Sequence::append_token_into`, the stop decoder's step),
-`stop_sequence_search` and `byte_fallback_invalid_run`. The table benches that need model files read them from the
+`stop_sequence_search`, `byte_fallback_invalid_run` and `encode_blocks` (one row: a 10 KB text of long words through
+the native encoder, where its block pass is most of the work). The table benches that need model files read them from the
 environment: `encode_volume` (`VOLUME_BENCH_TOKENIZERS`) and `parallel_encode` (`PARALLEL_BENCH_TOKENIZERS`) print one
 line and exit without them; `encode_cost` (`ENCODE_BENCH_TOKENIZERS`, `ENCODE_BENCH_PROMPTS`), `prefix_cache`
 (`PREFIX_BENCH_TOKENIZERS`) and `v1_compare` (`SMG_BENCH_MODEL_ROOT`) panic without them, and `decode_compare` takes a model root and a duration in milliseconds as positional arguments (`cargo bench -p llm-tokenizer --bench decode_compare -- <root> <ms>`; `cargo bench` appends `--bench` behind them, so the duration is not optional there) or runs through `benches/decode/run.py`, which builds it with `--no-run` and runs the binary itself. Each file's header documents its variables.
 `benches/v1/README.md` and `benches/decode/README.md` describe the two runners that compare the default and the
-`tokenizers-v1` build on pinned model revisions. None of these gates a pull request: the gate is the gateway's
-`tokenizer_benchmark` (`model_gateway/benches/tokenizer_benchmark.rs`), run by `.github/workflows/benchmark-tokenizer.yml`
-against the thresholds in `.github/bench-gates/tokenizer.toml`; every binary that job builds has
+`tokenizers-v1` build on pinned model revisions. One of these gates a pull request: `encode_blocks`, against
+`.github/bench-gates/tokenizer-blocks.toml`, which says what the row pins. The other gate is the gateway's
+`tokenizer_benchmark` (`model_gateway/benches/tokenizer_benchmark.rs`), against the thresholds in
+`.github/bench-gates/tokenizer.toml`. `.github/workflows/benchmark-tokenizer.yml` runs both, a row of its matrix each; every binary that job builds has
 `RUSTFLAGS="-C llvm-args=-enable-machine-outliner=never -C llvm-args=-align-all-functions=6"` (every function on a 64-byte
 boundary, the placement rule the gate file describes), so a pair built without them can read differently. On a pull request
 the workflow builds the pull request's bench binary and the base branch's (the merge commit's first parent) with

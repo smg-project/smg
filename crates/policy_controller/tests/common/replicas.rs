@@ -10,6 +10,7 @@
 //! share, included by path.
 
 use std::{
+    ffi::OsStr,
     io::{BufRead, BufReader, Write},
     net::SocketAddr,
     path::Path,
@@ -20,13 +21,51 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use prost::Message as _;
 use smg_policy_controller::{
     elector::ElectionSettings,
-    proto::{policy_controller_client::PolicyControllerClient, LeaderInfo, LeaderRequest},
+    proto::{
+        controller_frame, gateway_frame, policy_controller_client::PolicyControllerClient,
+        GatewayFrame, Hello, LeaderInfo, LeaderRequest, NotLeader,
+    },
 };
-use tonic::transport::Channel;
+use tokio::sync::mpsc;
+use tonic::{
+    codegen::tokio_stream::wrappers::ReceiverStream, metadata::AsciiMetadataValue,
+    transport::Channel, Request, Status,
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_smg-policy-controller");
+
+/// `google.rpc.Status`, as a client of any gRPC stack decodes a status's
+/// details.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<prost_types::Any>,
+}
+
+/// The `NotLeader` in a refusal's details, read the way every gRPC client
+/// reads them: a `google.rpc.Status` that says the refusal's code and
+/// message again and holds the one message under its type's URL.
+pub fn not_leader(refused: &Status) -> NotLeader {
+    let details = RpcStatus::decode(refused.details()).expect("a google.rpc.Status");
+    assert_eq!(
+        (details.code, details.message.as_str()),
+        (refused.code() as i32, refused.message())
+    );
+    assert_eq!(details.details.len(), 1, "one detail: {details:?}");
+    let detail = details.details.first().expect("one detail");
+    assert_eq!(
+        detail.type_url,
+        "type.googleapis.com/smg.policy.v1.NotLeader"
+    );
+    NotLeader::decode(detail.value.as_slice()).expect("a NotLeader")
+}
 
 /// How long a start may take before its listeners are in its log.
 const START: Duration = Duration::from_secs(30);
@@ -70,6 +109,9 @@ pub enum Lease<'a> {
         /// The client configuration.
         kubeconfig: &'a Path,
     },
+    /// The lease in the replica's own process, as a controller alone runs
+    /// by default: no place is passed.
+    Own,
 }
 
 /// A measurement's timings: `default`, or the three of
@@ -152,7 +194,7 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
     ) -> Result<Self, String> {
-        Self::start_as(id, None, lease, settings, settle_secs)
+        Self::start_as(id, None, lease, settings, settle_secs, &[])
     }
 
     /// Starts the binary as [`Replica::start`] does, under an advertised
@@ -166,7 +208,18 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
     ) -> Result<Self, String> {
-        Self::start_as(id, Some(advertise), lease, settings, settle_secs)
+        Self::start_as(id, Some(advertise), lease, settings, settle_secs, &[])
+    }
+
+    /// [`Replica::start`] with `flags` after its own on the command line.
+    pub fn start_with(
+        id: &str,
+        lease: Lease<'_>,
+        settings: ElectionSettings,
+        settle_secs: u64,
+        flags: &[&OsStr],
+    ) -> Result<Self, String> {
+        Self::start_as(id, None, lease, settings, settle_secs, flags)
     }
 
     fn start_as(
@@ -175,6 +228,7 @@ impl Replica {
         lease: Lease<'_>,
         settings: ElectionSettings,
         settle_secs: u64,
+        flags: &[&OsStr],
     ) -> Result<Self, String> {
         let millis = |duration: Duration| duration.as_millis().to_string();
         let grace_secs = (2 * settle_secs).max(5);
@@ -191,6 +245,7 @@ impl Replica {
                     .args(["--lease-name", name])
                     .env("KUBECONFIG", kubeconfig);
             }
+            Lease::Own => {}
         }
         if let Some(address) = advertise {
             command.args(["--advertise-address", address]);
@@ -210,7 +265,11 @@ impl Replica {
             .args(["--shutdown-settle-secs", &settle_secs.to_string()])
             .args(["--shutdown-grace-period-secs", &grace_secs.to_string()])
             .args(["--runtime-worker-threads", "2"])
+            // A `Session` needs a principal and a replica here has no
+            // certificate: its gateway listener takes the name as told.
+            .args(["--identity-as-told", "gateway"])
             .args(["--log-level", "info", "--log-json"])
+            .args(flags)
             .env_remove("RUST_LOG")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -391,6 +450,53 @@ impl Replica {
                 self.client = None;
                 None
             }
+        }
+    }
+
+    /// One `Hello` as `gateway` on a `Session` of its own over the gateway
+    /// listener: the term of the `Welcome` that answers it, or the name of
+    /// what answered in its place.
+    pub async fn hello(&self, gateway: &str) -> Result<u64, String> {
+        let endpoint = Channel::from_shared(format!("http://{}", self.gateway))
+            .map_err(|error| error.to_string())?
+            .connect_timeout(CALL);
+        let channel = tokio::time::timeout(CALL, endpoint.connect())
+            .await
+            .map_err(|_| "no connection".to_owned())?
+            .map_err(|_| "no connection".to_owned())?;
+        let (frames, sent) = mpsc::channel(1);
+        let mut request = Request::new(ReceiverStream::new(sent));
+        let name = AsciiMetadataValue::try_from(gateway).map_err(|error| error.to_string())?;
+        request.metadata_mut().insert("x-smg-principal", name);
+        let mut answers =
+            tokio::time::timeout(CALL, PolicyControllerClient::new(channel).session(request))
+                .await
+                .map_err(|_| "no answer".to_owned())?
+                .map_err(|status| format!("{:?}", status.code()))?
+                .into_inner();
+        let hello = Hello {
+            gateway_id: gateway.to_owned(),
+            protocol_min: 1,
+            protocol_max: 1,
+            ..Hello::default()
+        };
+        frames
+            .send(GatewayFrame {
+                seq: 0,
+                term_floor: 0,
+                frame: Some(gateway_frame::Frame::Hello(hello)),
+            })
+            .await
+            .map_err(|_| "the stream closed".to_owned())?;
+        let answer = tokio::time::timeout(CALL, answers.message())
+            .await
+            .map_err(|_| "no answer".to_owned())?
+            .map_err(|status| format!("{:?}", status.code()))?
+            .ok_or_else(|| "the stream's end".to_owned())?;
+        match answer.frame {
+            Some(controller_frame::Frame::Welcome(_)) => Ok(answer.term),
+            Some(controller_frame::Frame::NotLeader(_)) => Err("NotLeader".to_owned()),
+            _ => Err("another frame".to_owned()),
         }
     }
 

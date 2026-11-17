@@ -1,0 +1,47 @@
+[package]
+name = "smg-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Worker wire types, settings and optional runtime for SMG"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+keywords = ["smg", "llm", "gateway", "worker", "types"]
+categories = ["data-structures"]
+# The default-layer case walks the workspace's manifests, which a published
+# package does not carry.
+exclude = ["tests/default_layer.rs"]
+
+[lib]
+name = "smg_worker"
+
+[features]
+default = []
+# The HTTP responses of the worker's admin types.
+axum = ["dep:axum"]
+# The worker's runtime, for the process that hosts the workers. Its first
+# part is the HTTP client factory and the cache of worker-directed clients.
+runtime = ["dep:reqwest", "dep:rustls", "dep:tracing"]
+# The runtime's test support, for the tests of a crate that hosts it.
+test-util = ["runtime"]
+
+[dependencies]
+axum = { workspace = true, optional = true }
+bitflags.workspace = true
+reqwest = { workspace = true, optional = true, features = ["blocking", "http2", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+schemars.workspace = true
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+serde_with.workspace = true
+tracing = { workspace = true, optional = true }
+url = "2.5"
+
+[dev-dependencies]
+# The test servers speak HTTP/2 to the prior-knowledge clients.
+axum = { workspace = true, features = ["http2"] }
+http.workspace = true
+openssl = "0.10.81"
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

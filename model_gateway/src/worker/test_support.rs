@@ -4,23 +4,32 @@
 //! worker and the registry holding a test's workers, the admission attempt
 //! that selects one worker, and the KV cache event that clears a worker's
 //! cache. [`RefusedAddress`] is the loopback address nothing answers at: a
-//! dead worker's port, held for as long as the test needs it.
+//! dead worker's port, held for as long as the test needs it. [`NoEngine`]
+//! is an engine connection with no engine behind it, and
+//! [`CountingConnector`] the connector that hands those out.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
+use async_trait::async_trait;
 use openai_protocol::{
     model_card::ModelCard,
-    worker::{HealthCheckConfig, RuntimeType, WorkerStatus, WorkerType},
+    worker::{HealthCheckConfig, RuntimeType, WorkerLoadResponse, WorkerStatus, WorkerType},
 };
-use smg_grpc_client::common_proto::{kv_cache_event, KvCacheCleared, KvCacheEvent};
+use smg_grpc_client::common_proto::{self, kv_cache_event, KvCacheCleared, KvCacheEvent};
 use tokio::net::{TcpListener, TcpSocket};
 
 use crate::{
     routers::common::prefill_admission::{PrefillAdmissionAttempt, PrefillSelectionContext},
-    worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry},
+    worker::{
+        connection::engine::{EngineConnection, EngineConnector, ZmqLink},
+        BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry,
+    },
 };
 
 /// The health checker disabled, everything else default: a test's worker
@@ -331,5 +340,102 @@ mod tests {
             reserved.len(),
             "two reservations hold one port"
         );
+    }
+}
+
+/// An engine connection with no engine behind it: alive, without admin
+/// calls, and every call refused as unavailable. What a test hands a worker
+/// whose connection only has to exist.
+#[derive(Debug, Default)]
+pub struct NoEngine;
+
+fn no_engine<T>() -> Result<T, tonic::Status> {
+    Err(tonic::Status::unavailable(
+        "no engine behind the test's connection",
+    ))
+}
+
+#[async_trait]
+impl EngineConnection for NoEngine {
+    fn carries_admin_calls(&self) -> bool {
+        false
+    }
+
+    fn is_alive(&self) -> bool {
+        true
+    }
+
+    async fn health_check(&self) -> Result<bool, tonic::Status> {
+        no_engine()
+    }
+
+    async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
+        no_engine()
+    }
+
+    async fn flush_cache(
+        &self,
+        _timeout_s: f32,
+    ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
+        no_engine()
+    }
+
+    async fn start_profile(
+        &self,
+        _req: common_proto::StartProfileRequest,
+    ) -> Result<common_proto::ProfileResponse, tonic::Status> {
+        no_engine()
+    }
+
+    async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status> {
+        no_engine()
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        _start_seq: u64,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        no_engine()
+    }
+
+    async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        no_engine()
+    }
+
+    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
+        no_engine()
+    }
+}
+
+/// A connector that hands out [`NoEngine`] connections and counts the
+/// connects it was asked for.
+#[derive(Debug, Default)]
+pub struct CountingConnector {
+    connects: AtomicUsize,
+}
+
+impl CountingConnector {
+    /// How many connects it was asked for.
+    pub fn connects(&self) -> usize {
+        self.connects.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl EngineConnector for CountingConnector {
+    async fn connect_grpc(
+        &self,
+        _base_url: &str,
+        _runtime: RuntimeType,
+    ) -> Result<Arc<dyn EngineConnection>, String> {
+        self.connects.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(NoEngine))
+    }
+
+    async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+        self.connects.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(NoEngine))
     }
 }

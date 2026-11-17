@@ -5,10 +5,8 @@
 
 use std::{sync::Arc, time::Duration};
 
-use crate::{
-    routers::grpc::backend_client::BackendClient,
-    worker::{WorkerError, WorkerResult},
-};
+use super::engine::EngineConnection;
+use crate::worker::{WorkerError, WorkerResult};
 
 /// Timeout for worker HTTP `flush_cache` requests. Matches the gRPC
 /// client's local flush deadline.
@@ -57,8 +55,8 @@ pub(in crate::worker) async fn admin_http_post(
 fn require_backend_client(
     url: &str,
     operation: &str,
-    client: Option<Arc<BackendClient>>,
-) -> WorkerResult<Arc<BackendClient>> {
+    client: Option<Arc<dyn EngineConnection>>,
+) -> WorkerResult<Arc<dyn EngineConnection>> {
     client.ok_or_else(|| failed(url, operation, "no backend client available".to_string()))
 }
 
@@ -78,8 +76,8 @@ fn zmq_admin_unsupported(url: &str, operation: &str) -> WorkerError {
 pub(in crate::worker) fn admin_backend_client(
     url: &str,
     operation: &str,
-    client: Option<Arc<BackendClient>>,
-) -> WorkerResult<Arc<BackendClient>> {
+    client: Option<Arc<dyn EngineConnection>>,
+) -> WorkerResult<Arc<dyn EngineConnection>> {
     let client = require_backend_client(url, operation, client)?;
     if !client.carries_admin_calls() {
         return Err(zmq_admin_unsupported(url, operation));

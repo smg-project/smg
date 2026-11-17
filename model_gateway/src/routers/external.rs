@@ -324,12 +324,12 @@ impl RouterTrait for ExternalRouterAdapter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
         self.route_reserved(
             tenant_meta,
-            body,
+            Arc::unwrap_or_clone(body),
             "/v1/chat/completions",
             model_id,
             |body| self.inner.route_chat(headers, tenant_meta, body, model_id),
@@ -355,7 +355,7 @@ impl RouterTrait for ExternalRouterAdapter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: CreateMessageRequest,
+        body: Arc<CreateMessageRequest>,
         model_id: &str,
     ) -> Response {
         // `rid` is this gateway's extension, forwarded to an engine for log
@@ -363,7 +363,7 @@ impl RouterTrait for ExternalRouterAdapter {
         // OpenAI-compatible providers drop the gateway-only fields from
         // their JSON payload (`strip_sglang_fields`); a Messages provider
         // posts the typed request, so the field is cleared here.
-        let mut body = body;
+        let mut body = Arc::unwrap_or_clone(body);
         body.rid = None;
         self.route_reserved(tenant_meta, body, "/v1/messages", model_id, |body| {
             self.inner
@@ -493,7 +493,7 @@ mod tests {
         .expect("a request");
         let tenant_meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
         let response = adapter
-            .route_messages(None, &tenant_meta, request, "m")
+            .route_messages(None, &tenant_meta, Arc::new(request), "m")
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let posted = provider

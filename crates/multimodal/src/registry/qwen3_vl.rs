@@ -263,10 +263,7 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
                 Self::video_pad_token_id(metadata)?,
                 "video_token_id",
             ),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -278,10 +275,7 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         match modality {
             Modality::Image => Self::image_pad_token_id(metadata),
             Modality::Video => Self::video_pad_token_id(metadata),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -328,10 +322,7 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
                 preprocessor_config,
                 modality,
             ))),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -361,10 +352,7 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         match modality {
             Modality::Image => self.prompt_replacements(metadata, preprocessed),
             Modality::Video => self.video_replacements(metadata, preprocessed, &[], None),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

@@ -591,9 +591,7 @@ impl VisionPreProcessor for MuseSparkVisionProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let settings = self.image;
         let do_resize = self.do_resize;
         let features = settings.patch_features();

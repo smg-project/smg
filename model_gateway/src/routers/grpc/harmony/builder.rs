@@ -472,32 +472,14 @@ impl HarmonyBuilder {
         let (instructions, messages) = split_instructions(&request.messages);
         let tools = chat_tools(request).filter(|tools| !tools.is_empty());
         if instructions.is_some() || tools.is_some() {
-            let dev_msg =
-                self.build_developer_message_from_chat(instructions.as_deref(), tools.as_ref());
+            let dev_msg = self.build_developer_message(tools.as_ref(), instructions.as_deref());
             all_messages.push(dev_msg);
         }
 
         let mut user_messages = self.convert_chat_messages(messages);
         all_messages.append(&mut user_messages);
 
-        let selection_text = self.extract_selection_text(&all_messages);
-        let conversation = Conversation::from_messages(all_messages);
-        let token_ids = encoding
-            .render_conversation_for_completion(&conversation, Role::Assistant, None)
-            .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
-
-        // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
-        let stop_token_ids: Vec<u32> = encoding
-            .stop_tokens_for_assistant_actions()
-            .into_iter()
-            .flat_map(|set| set.into_iter())
-            .collect();
-
-        Ok(HarmonyBuildOutput {
-            input_ids: token_ids,
-            stop_token_ids,
-            selection_text,
-        })
+        self.encode_prompt(encoding, all_messages)
     }
 
     /// Build Harmony request from Responses request
@@ -515,26 +497,15 @@ impl HarmonyBuilder {
     ) -> Result<HarmonyBuildOutput, String> {
         let encoding = try_harmony_encoding()?;
         let all_messages = self.construct_input_messages_with_harmony(request)?;
-
-        let selection_text = self.extract_selection_text(&all_messages);
-        let conversation = Conversation::from_messages(all_messages);
-        let token_ids = encoding
-            .render_conversation_for_completion(&conversation, Role::Assistant, None)
-            .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
-
-        // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
-        let stop_token_ids: Vec<u32> = encoding
-            .stop_tokens_for_assistant_actions()
-            .into_iter()
-            .flat_map(|set| set.into_iter())
-            .collect();
+        let output = self.encode_prompt(encoding, all_messages)?;
 
         // What the model receives, decoded back for the trace lines alone:
         // a pass over every prompt token, so it runs only when they print.
         if enabled!(Level::TRACE) {
+            let token_ids = &output.input_ids;
             let decoded_text = encoding
                 .tokenizer()
-                .decode_utf8(&token_ids)
+                .decode_utf8(token_ids)
                 .unwrap_or_else(|_| "<decode error>".to_string());
             trace!(
                 token_count = token_ids.len(),
@@ -545,8 +516,29 @@ impl HarmonyBuilder {
             trace!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
         }
 
+        Ok(output)
+    }
+
+    /// The prompt of the assistant's next turn over `all_messages`, with the
+    /// stop tokens of the assistant's actions (`<|return|>` and `<|call|>`)
+    /// and the messages' selection text.
+    fn encode_prompt(
+        &self,
+        encoding: &HarmonyEncoding,
+        all_messages: Vec<HarmonyMessage>,
+    ) -> Result<HarmonyBuildOutput, String> {
+        let selection_text = self.extract_selection_text(&all_messages);
+        let conversation = Conversation::from_messages(all_messages);
+        let input_ids = encoding
+            .render_conversation_for_completion(&conversation, Role::Assistant, None)
+            .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
+        let stop_token_ids = encoding
+            .stop_tokens_for_assistant_actions()
+            .into_iter()
+            .flat_map(|set| set.into_iter())
+            .collect();
         Ok(HarmonyBuildOutput {
-            input_ids: token_ids,
+            input_ids,
             stop_token_ids,
             selection_text,
         })
@@ -684,27 +676,6 @@ impl HarmonyBuilder {
         HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
     }
 
-    fn build_developer_message_from_chat(
-        &self,
-        instructions: Option<&str>,
-        tools: Option<&Vec<Tool>>,
-    ) -> HarmonyMessage {
-        self.build_developer_message(tools, instructions)
-    }
-
-    /// Build developer message from Responses request
-    ///
-    /// # Arguments
-    /// * `instructions` - Optional instructions (Responses API specific)
-    /// * `tools` - Optional list of tools
-    fn build_developer_message_from_responses(
-        &self,
-        instructions: Option<&str>,
-        tools: Option<&Vec<ResponseTool>>,
-    ) -> HarmonyMessage {
-        self.build_developer_message(tools, instructions)
-    }
-
     /// Construct input messages for Responses API with Harmony
     ///
     /// Handles both new conversations and continuations of previous responses.
@@ -742,9 +713,9 @@ impl HarmonyBuilder {
 
             // Add developer message if we have custom tools or instructions
             if with_custom_tools || request.instructions.is_some() {
-                let dev_msg = self.build_developer_message_from_responses(
-                    request.instructions.as_deref(),
+                let dev_msg = self.build_developer_message(
                     request.tools.as_ref(),
+                    request.instructions.as_deref(),
                 );
                 all_messages.push(dev_msg);
             }
@@ -1944,7 +1915,7 @@ mod tests {
             });
             assert_eq!(commentary, !expected.is_empty(), "{case}");
             // The developer message describes the same tools.
-            let developer = builder.build_developer_message_from_chat(None, tools.as_ref());
+            let developer = builder.build_developer_message(tools.as_ref(), None);
             assert_eq!(developer.content.len(), 1, "{case}");
             let described: Vec<String> = developer
                 .content

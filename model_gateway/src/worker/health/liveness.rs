@@ -625,7 +625,7 @@ const DEFAULT_WARMUP: Warmup = Warmup {
     divert_every: 8,
 };
 
-/// Set the warm-up slice from the gateway configuration; the first call wins.
+/// Set the warm-up slice from the host; the first call wins.
 pub(crate) fn configure_warmup(warmup: Warmup) {
     let _ = WARMUP.set(warmup);
 }
@@ -634,7 +634,7 @@ pub(crate) fn warmup() -> Warmup {
     WARMUP.get().copied().unwrap_or(DEFAULT_WARMUP)
 }
 
-/// Set the stall, wedge and stale thresholds from the gateway configuration.
+/// Set the stall, wedge and stale thresholds from the host.
 /// The first call wins; the defaults are two, three and fifteen seconds.
 pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
     let _ = THRESHOLDS.set((stall, wedge, stale));
@@ -664,8 +664,9 @@ fn thresholds() -> (Duration, Duration, Duration) {
         .unwrap_or((DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE))
 }
 
-/// The liveness budgets in force in this process: what a configuration set
-/// through `configure_from`, or the defaults.
+/// A set of liveness budgets: what a host hands `configure_from`, and what
+/// `budgets()` reports as in force in this process (the first set configured,
+/// or the defaults).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Budgets {
     /// A worker that has not answered a contact for this long is stalled.

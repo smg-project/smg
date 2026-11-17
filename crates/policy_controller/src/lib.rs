@@ -50,6 +50,14 @@
 //!   [`elector::LeaseBackend`] (the lease file and the in-process record
 //!   here, the Kubernetes `Lease` next), terms that only grow, and the
 //!   [`elector::Fence`] a shard thread reads before every decision it sends.
+//! - 5.4, replication ([`replication`]): the log of the store's replicated
+//!   writes (membership and status, load rows, a term's start), each at its
+//!   position under its term, told by the store through
+//!   [`store::Journal`], the watched kinds kept apart from the load
+//!   rows; the rejoin rule and the bounded read a standby or a watcher of
+//!   the rows is served by, and the store's cut at one position
+//!   ([`store::MemoryStore::cut`]). The stream, the standby and the watch
+//!   are later steps.
 //!
 //! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
 //!   feature): user policies as components of the committed `smg:policy`
@@ -71,8 +79,9 @@
 //!   later PRs.
 //! - Behind the `client` feature, the reference client of the controller's
 //!   protocol (`client`): one gateway's side of it (the dial, `Leader`,
-//!   and the session's `Hello` answered by a `Welcome`), with a blocking
-//!   form. No shipped binary builds it.
+//!   the session's `Hello` answered by a `Welcome`, and a request's
+//!   lifecycle reports on that session), with a blocking form. No shipped
+//!   binary builds it.
 //!
 //! What this step does not hold: the gRPC plugin service, the operator calls,
 //! the other ingestion drivers and the gRPC API; they arrive in later
@@ -90,13 +99,16 @@ pub mod controller;
 pub mod decision;
 pub mod elector;
 pub mod framework;
+#[cfg(feature = "controller")]
+pub mod grpc;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 pub mod lease;
-#[cfg(feature = "wasm")]
+#[cfg(any(feature = "wasm", feature = "controller"))]
 pub mod plugins;
 #[cfg(feature = "controller")]
 pub mod proto;
+pub mod replication;
 pub mod ring;
 pub mod sessions;
 pub mod spec;
@@ -108,11 +120,12 @@ pub mod wit;
 
 pub use catalog::{Catalog, CatalogError, StageKind};
 pub use decision::{
-    Decision, Pair, Pick, Queue, Shed, ShedReason, Target, Targets, Trace, MAX_TARGETS, TRACE_TOP,
+    Decision, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
+    TRACE_TOP,
 };
 pub use framework::{
     Binding, DecisionScope, Engine, Filter, Narrowed, PairPools, PairTable, PairTableError, Picker,
-    Plan, Profile, Scorer, Scratch, TieBand, Weighted,
+    Plan, Profile, Scorer, Scratch, TieBand, Weighted, DRAW_BOUND, DRAW_FROM,
 };
 pub use lease::{
     Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
@@ -135,7 +148,10 @@ pub use view::{
 /// The streams a decision opens are listed here, so that a new site derives
 /// one that none of them reads:
 ///
-/// - the seed's own stream: the profile's picker, and a plugin's draws;
+/// - the seed's own stream: the profile's picker, and a plugin's draws. A
+///   picker that draws first reads it too, and whatever follows that draw
+///   (the order of the rows drawn, or the whole pass behind a draw that kept
+///   nobody) reads it past those values;
 /// - the seed under the `warmup-slice` scorer's mask: that scorer's draws;
 /// - the seed under the alternates' mask: the order of equal counts among
 ///   the workers the count-first picker passed over;
@@ -167,6 +183,12 @@ impl Draw {
         // Rejection-free: the bias of a modulo over 64 bits is below 2^-32
         // for any pool a gateway holds.
         (self.next_u64() % n as u64) as usize
+    }
+
+    /// The stream's state: [`Draw::new`] of it continues the stream past
+    /// the values read.
+    pub(crate) const fn state(self) -> u64 {
+        self.0
     }
 }
 
