@@ -140,9 +140,7 @@ impl InklingAudioProcessor {
         &self,
         clips: &[&DecodedAudio],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if clips.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(clips)?;
         let frontend = self.frontend()?;
         let mut waveforms: Vec<Cow<'_, [f32]>> = Vec::with_capacity(clips.len());
         for clip in clips {

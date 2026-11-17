@@ -284,6 +284,23 @@ impl Roles {
             .fold(0u128, |members, (code, _)| members | (1 << code))
     }
 
+    /// Whether every character holds one of `bits`. The plane is asked a
+    /// character at a time through [`Self::at`] and not row by row, so the
+    /// answer does not lean on how the plane's table is laid out; it is
+    /// asked once per pattern. Above the plane the runs say it.
+    pub(super) fn every_char_holds(&self, bits: Bits) -> bool {
+        let mut utf8 = [0; 4];
+        let in_plane = (0..PLANE).filter_map(char::from_u32).all(|c| {
+            self.at(c.encode_utf8(&mut utf8), 0)
+                .is_some_and(|(held, _)| held & bits != 0)
+        });
+        let above = self
+            .above
+            .iter()
+            .all(|&(start, held)| held & bits != 0 || start > u32::from(char::MAX));
+        in_plane && above
+    }
+
     /// The role bits of the character at `pos`, a character boundary, and
     /// its length in bytes; `None` at the end of the text.
     #[inline(always)]

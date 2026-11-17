@@ -258,9 +258,9 @@ pub trait LeaseBackend: Send {
 /// readers keep a term in a narrower field than the record's, a membership
 /// life's number in twenty-four bits and a lease's id in thirty-one, and the
 /// narrower is the ceiling: a term a second lasts half a year under it. A
-/// word may not spend the last term: a caller refuses, at its wire, a term
-/// said whose next is not below the ceiling. A take that would reach the
-/// ceiling is an error.
+/// word may not spend the last term: a term said whose next is not below
+/// the ceiling is refused ([`term_said`]), by the elector and by every door
+/// in front of it. A take that would reach the ceiling is an error.
 pub const TERM_CEILING: u64 = 1 << 24;
 
 /// Why an election step failed.
@@ -671,8 +671,8 @@ impl Elector {
     /// Leave on a word from outside the election: a planned hand-over
     /// (`None`), or a term `above` that a caller says it saw. The term is
     /// counted among the terms this run saw, so its next take is above it;
-    /// a term said must leave one to take, so the caller refuses, at its
-    /// wire, a term whose next is not below [`TERM_CEILING`]. A term said
+    /// a term said must leave one to take, so one whose next is not below
+    /// [`TERM_CEILING`] is the term error, before it is counted. A term said
     /// while a take is in doubt, an attempt that reported an error and may
     /// have landed, stands: no step leads under a term below the highest
     /// its run saw, so the step that finds the attempt landed leaves the
@@ -690,6 +690,7 @@ impl Elector {
     /// closed, and every later [`Elector::tick`] tries the release again in
     /// place of a renewal, until it lands or the record moves.
     pub fn step_down(&mut self, above: Option<u64>, now: Instant) -> Result<bool, ElectError> {
+        term_said(above)?;
         self.stepped = Some(self.stepped.map_or(now, |at| at.max(now)));
         self.highest_term = self.highest_term.max(above.unwrap_or(0));
         let duration = match &self.held {
@@ -878,7 +879,7 @@ impl Elector {
         // A new term is the one after the highest this run saw, whatever the
         // record in front of it says: a record that vanished and came back
         // lower (a deleted object recreated, a lost file) never lowers it.
-        let next_term = self.highest_term + 1;
+        let next_term = self.highest_term.saturating_add(1);
         // A record that is gone after one was seen held: no release made it
         // so, and the holder of the record seen last may lead to its renew
         // deadline. This run waits that record's duration from its first
@@ -929,6 +930,14 @@ impl Elector {
             Some(record) if record.is_released() => {
                 let since = self.observed.as_ref().map_or(now, |o| o.since);
                 if now.saturating_duration_since(since) < record.duration() {
+                    // Inside its hold this run waits its turn: the record
+                    // is its own release inside a take's wait, or one a
+                    // later holder wrote, and neither is a record gone.
+                    if self.hold.is_some_and(|until| now < until) {
+                        return Ok(Tick::Waiting {
+                            term: self.highest_term,
+                        });
+                    }
                     return Ok(Tick::Gone { term: record.term });
                 }
                 (next_term, 0)
@@ -1039,6 +1048,16 @@ impl Elector {
     }
 }
 
+/// A term a caller says it saw must leave one to take: the term after it
+/// stays below [`TERM_CEILING`]. The elector refuses one that does not
+/// before it counts or writes it, and so does every door in front of it.
+pub fn term_said(above: Option<u64>) -> Result<(), ElectError> {
+    match above.map(|term| term.saturating_add(1)) {
+        Some(next) if next >= TERM_CEILING => Err(ElectError::Term(next)),
+        _ => Ok(()),
+    }
+}
+
 /// `at` plus `by`, or `at` plus the largest of `by`'s halves the clock can
 /// tell where the sum is past it: an instant that far never comes.
 fn later(at: Instant, by: Duration) -> Instant {
@@ -1124,17 +1143,15 @@ mod tests {
 
     use super::*;
 
-    /// One second. The tests' instants are `Instant::now() + S` and later:
-    /// the elector dates a first sight at the later of the caller's instant
-    /// and its own clock after the read, so synthetic instants stay one
-    /// second ahead of the real clock and are never overtaken by it.
+    /// One second: the step between the tests' instants.
     const S: Duration = Duration::from_secs(1);
 
-    /// A minute. The cases that write a lease file take their instants this
-    /// far ahead of the clock as well: a take's wait is dated at the later
-    /// of the caller's instant and the clock after the write, and a write
-    /// to a busy disk can take more than a second.
-    const SLOW_WRITE: Duration = Duration::from_secs(60);
+    /// How far ahead of the clock the tests' instants start. The elector
+    /// dates a first sight at the later of the caller's instant and its own
+    /// clock after the read, so a synthetic instant must never be overtaken
+    /// by the real clock. One second ahead was overtaken where a host held
+    /// the test or the lease file's writes for longer; an hour is not.
+    const AHEAD: Duration = S.saturating_mul(3_600);
 
     fn settings() -> ElectionSettings {
         ElectionSettings::default()
@@ -1198,7 +1215,7 @@ mod tests {
         // Nothing can hold a store that was handed to nobody: no holder
         // this run never saw may lead, and the fence opens at the take.
         let mut alone = Elector::alone("a@host:1", settings()).expect("valid settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(alone.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
         assert_eq!(alone.fence().leader_term(t0), Some(1));
         // A store that is handed in keeps the wait, a memory one included:
@@ -1212,7 +1229,7 @@ mod tests {
     fn a_candidate_takes_an_absent_lease_at_term_one_and_leads_a_renew_deadline_later() {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
         assert!(a.is_holder());
         let record = a.observed().expect("the record").clone();
@@ -1271,7 +1288,7 @@ mod tests {
         let empty = LeaseRecord::default();
         assert_eq!(lease.write(None, &empty).expect("a write"), Written::Done);
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("tick"), Tick::Acquired { term: 1 });
         let fence = a.fence();
         assert_eq!(fence.leader_term(t0), None);
@@ -1294,7 +1311,7 @@ mod tests {
         let held = held_by("x@host:8", 1, 3_000);
         assert_eq!(lease.write(None, &held).expect("a write"), Written::Done);
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert!(matches!(
             b.tick(t0).expect("follow"),
             Tick::Following { term: 1, .. }
@@ -1318,7 +1335,7 @@ mod tests {
     fn a_replica_started_while_a_live_holders_record_is_gone_leads_after_that_holders_fence() {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         // The record goes right after the holder's renewal, and the holder
         // stalls: its fence is open to its renew deadline. A replica that
@@ -1348,7 +1365,7 @@ mod tests {
         let held = held_by("a@host:1", 1, 3_000);
         assert_eq!(lease.write(None, &held).expect("a write"), Written::Done);
         let (mut b, mut c) = (candidate(&lease, "b@host:2"), candidate(&lease, "c@host:3"));
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         for waiter in [&mut b, &mut c] {
             assert!(matches!(
                 waiter.tick(t0).expect("follow"),
@@ -1392,7 +1409,7 @@ mod tests {
     fn a_renewal_reopens_the_fence_and_keeps_the_term() {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         let first = a.observed().expect("the record").clone();
         assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
@@ -1420,7 +1437,7 @@ mod tests {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         a.tick(t0).expect("acquire");
         // b first sees the record half a second after it was written; the
         // record's clock says nothing to b.
@@ -1452,7 +1469,7 @@ mod tests {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         a.tick(t0).expect("acquire");
         b.tick(t0).expect("follow");
         // a stalls past the duration; b takes the lease.
@@ -1492,7 +1509,7 @@ mod tests {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         for i in 1..=10u32 {
             let now = t0 + i * S;
@@ -1516,7 +1533,7 @@ mod tests {
         let lease = MemoryLease::new();
         let mut b = candidate(&lease, "b@host:2");
         let mut c = candidate(&lease, "c@host:3");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(b.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         assert!(matches!(
             c.tick(t0).expect("follow"),
@@ -1572,7 +1589,7 @@ mod tests {
         // release: the reader says no from then on.
         let mut lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         assert!(a.waits_to_lead());
         let own = a.observed().expect("the take's record").clone();
@@ -1600,7 +1617,7 @@ mod tests {
         let mut b = candidate(&lease, "b@host:2");
         // The holder leads before it releases: its release is a leader's
         // word, and the next candidate leads at its take.
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         assert!(matches!(
             b.tick(t0).expect("follow"),
@@ -1634,7 +1651,7 @@ mod tests {
     #[test]
     fn a_restart_under_the_same_identity_takes_the_term_above() {
         let lease = MemoryLease::new();
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         let acquired_at = {
             let mut a = candidate(&lease, "a@host:1");
             a.tick(t0).expect("acquire");
@@ -1679,7 +1696,7 @@ mod tests {
     #[test]
     fn a_restart_takes_only_once_the_stalled_earlier_runs_fence_is_closed() {
         let lease = MemoryLease::new();
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         let mut earlier = candidate(&lease, "a@host:1");
         earlier.lead_at(t0);
         assert_eq!(
@@ -1722,7 +1739,7 @@ mod tests {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
         let mut twin = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
         // The twin sees a live record under its own name: it waits for the
         // record's duration of stillness, and the holder's renewal turns the
@@ -1784,7 +1801,7 @@ mod tests {
         let mut a = candidate(&lease, "a@host:1");
         let mut b = candidate(&lease, "b@host:2");
         let mut c = candidate(&lease, "c@host:3");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         a.release().expect("release");
         assert_eq!(b.tick(t0 + S).expect("tick"), Tick::Acquired { term: 2 });
@@ -1974,7 +1991,7 @@ mod tests {
             rival: Some(rival.clone()),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("tick"), Tick::Raced);
         assert!(!a.is_holder());
         assert!(!a.waits_to_lead(), "a take a rival won waits for no lead");
@@ -2030,7 +2047,7 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         fails.store(1, Ordering::Relaxed);
         let err = a.tick(t0 + S).expect_err("the backend is away");
@@ -2081,7 +2098,7 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         fails.store(2, Ordering::Relaxed);
         a.tick(t0 + S).expect_err("the backend is away");
@@ -2113,7 +2130,7 @@ mod tests {
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         a.tick(t0).expect_err("the backend is away");
         assert!(!a.waits_to_lead(), "an attempt in doubt is no take");
         assert_eq!(b.tick(t0).expect("take"), Tick::Acquired { term: 1 });
@@ -2134,7 +2151,7 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         a.tick(t0).expect("acquire");
         fails.store(1, Ordering::Relaxed);
         a.release().expect_err("the backend is away");
@@ -2159,7 +2176,7 @@ mod tests {
         // next term.
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         let word = t0 + S / 2;
         assert!(a.step_down(None, word).expect("the release"));
@@ -2194,7 +2211,7 @@ mod tests {
     fn a_standby_takes_a_stepped_down_holders_lease_at_its_next_look() {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         let mut b = candidate(&lease, "b@host:2");
         assert!(matches!(
@@ -2230,7 +2247,7 @@ mod tests {
         // lowers the term, so no candidate reads this record as gone.
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         let mut b = candidate(&lease, "b@host:2");
         assert!(matches!(
@@ -2255,7 +2272,7 @@ mod tests {
         // word holds nothing back: the fence closes at the word, and the
         // next step takes the lease again above the term said and leads.
         let mut a = Elector::alone("a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         assert!(a.step_down(Some(5), t0 + S).expect("the word"));
         assert_eq!(a.fence().leader_term(t0 + S), None);
@@ -2270,7 +2287,7 @@ mod tests {
         // duration, as at a stop inside the wait.
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         assert!(a.waits_to_lead());
         assert!(a.step_down(None, t0 + S).expect("the word"));
@@ -2278,6 +2295,21 @@ mod tests {
         assert!(released.is_released());
         assert_eq!(released.duration_ms, 2_000);
         assert!(!a.waits_to_lead());
+        // Its own next steps wait their turn: the release it reads is its
+        // own, and no record is gone.
+        assert_eq!(
+            a.tick(t0 + S + Duration::from_millis(1)).expect("a step"),
+            Tick::Waiting { term: 1 }
+        );
+        // A term said while it waits is the term its wait says, the
+        // release's own term below it.
+        assert!(!a
+            .step_down(Some(5), t0 + S + Duration::from_millis(2))
+            .expect("a word"));
+        assert_eq!(
+            a.tick(t0 + S + Duration::from_millis(3)).expect("a step"),
+            Tick::Waiting { term: 5 }
+        );
         // A word once the opening has passed finds no wait to hand on: no
         // holder this run never saw leads by then, and the release says no
         // duration.
@@ -2301,7 +2333,7 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         a.tick(t0).expect_err("the answer was lost");
         assert!(!a.step_down(Some(7), t0).expect("no holder is known"));
         assert_eq!(
@@ -2333,7 +2365,7 @@ mod tests {
     fn a_term_at_or_under_a_holders_own_and_a_word_to_a_candidate_move_no_lease() {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         let mut b = candidate(&lease, "b@host:2");
         assert!(matches!(
@@ -2362,7 +2394,7 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         fails.store(2, Ordering::Relaxed);
         let word = t0 + S / 2;
@@ -2405,7 +2437,7 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         fails.store(1, Ordering::Relaxed);
         let word = t0 + S / 2;
@@ -2436,7 +2468,7 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         let mut b = candidate(&lease, "b@host:2");
         assert!(matches!(
@@ -2484,7 +2516,7 @@ mod tests {
         let mut lease = MemoryLease::new();
         assert_eq!(lease.write(None, &free).expect("a write"), Written::Done);
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(
             b.tick(t0).expect("the last term"),
             Tick::Acquired {
@@ -2508,11 +2540,51 @@ mod tests {
     }
 
     #[test]
+    fn a_take_over_the_largest_term_a_record_can_say_is_the_term_error() {
+        // A record no elector wrote says the largest term: the next term's
+        // sum stops there and never wraps to a term under the ceiling.
+        let free = LeaseRecord {
+            holder: String::new(),
+            ..held_by("x@host:9", u64::MAX, 0)
+        };
+        let mut lease = MemoryLease::new();
+        assert_eq!(lease.write(None, &free).expect("a write"), Written::Done);
+        let mut b = candidate(&lease, "b@host:2");
+        let refused = b
+            .tick(Instant::now() + S)
+            .expect_err("no term is left to take");
+        assert!(matches!(refused, ElectError::Term(u64::MAX)), "{refused}");
+        assert!(!b.is_holder());
+        let stored = lease.clone().read().expect("read").expect("the record");
+        assert!(stored.is_released(), "nothing was written");
+    }
+
+    #[test]
+    fn a_step_handed_an_earlier_instant_leaves_the_latest_one_standing() {
+        // The loop steps by the clock, which only grows. A caller that
+        // hands its own instants out of order takes nothing back: the
+        // wait's reader answers by the latest instant a step was handed.
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + S;
+        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
+        assert!(a.waits_to_lead());
+        assert_eq!(
+            a.tick(t0 + 2 * S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        assert!(!a.waits_to_lead());
+        assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
+        assert!(!a.waits_to_lead(), "the opening stays passed");
+    }
+
+    #[test]
     fn a_release_after_the_lease_moved_answers_false() {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         a.tick(t0).expect("acquire");
         assert!(a.waits_to_lead());
         b.tick(t0).expect("follow");
@@ -2754,7 +2826,7 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         // The take lands and the answer is lost.
         a.tick(t0).expect_err("the answer was lost");
         assert!(!a.is_holder());
@@ -2804,7 +2876,7 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         a.tick(t0).expect("acquire");
         fails.store(1, Ordering::Relaxed);
         a.release().expect_err("the answer was lost");
@@ -2832,7 +2904,7 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         fails.store(1, Ordering::Relaxed);
         a.release().expect_err("the answer was lost");
@@ -2877,7 +2949,7 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         fails.store(1, Ordering::Relaxed);
         a.tick(t0 + S).expect_err("the answer was lost");
@@ -2908,7 +2980,7 @@ mod tests {
             fails: Arc::clone(&fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         fails.store(1, Ordering::Relaxed);
         a.tick(t0 + S).expect_err("the answer was lost");
@@ -2983,7 +3055,7 @@ mod tests {
             write_fails: Arc::new(AtomicU32::new(0)),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         a.tick(t0).expect("acquire");
         // A renewal lands and its answer is lost.
         lost_answers.store(1, Ordering::Relaxed);
@@ -3015,7 +3087,7 @@ mod tests {
             write_fails: Arc::clone(&write_fails),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         // A renewal lands and its answer is lost; then the release's own
         // write fails before it lands. The landed renewal stays the record
@@ -3045,7 +3117,7 @@ mod tests {
             .expect("settings");
         let mut b = Elector::new(Box::new(FileLease::new(&path)), "b@host:2", settings())
             .expect("settings");
-        let t0 = Instant::now() + SLOW_WRITE + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         assert!(a.release().expect("release"));
         assert_eq!(b.tick(t0 + S).expect("take"), Tick::Acquired { term: 2 });
@@ -3100,7 +3172,7 @@ mod tests {
             .expect("settings");
         let mut b = Elector::new(Box::new(FileLease::new(&path)), "b@host:2", settings())
             .expect("settings");
-        let t0 = Instant::now() + SLOW_WRITE + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         assert!(matches!(
             b.tick(t0 + S / 2).expect("follow"),
@@ -3155,7 +3227,7 @@ mod tests {
         // out for the duration it says, from the first sight of it.
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         let mut b = candidate(&lease, "b@host:2");
         assert!(matches!(
@@ -3193,7 +3265,7 @@ mod tests {
     fn a_candidate_that_never_saw_the_lease_held_waits_out_a_record_cleared_in_place() {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         cleared(&lease, &a);
         // A replica that starts now never saw the lease held, and the holder
@@ -3228,7 +3300,7 @@ mod tests {
         let mut lease = MemoryLease::new();
         assert_eq!(lease.write(None, &held).expect("a write"), Written::Done);
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert!(matches!(
             b.tick(t0).expect("follow"),
             Tick::Following { term: 4, .. }
@@ -3271,7 +3343,7 @@ mod tests {
         let mut lease = MemoryLease::new();
         assert_eq!(lease.write(None, &held).expect("a write"), Written::Done);
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert!(matches!(
             b.tick(t0).expect("follow"),
             Tick::Following { term: 4, .. }
@@ -3331,7 +3403,7 @@ mod tests {
             Written::Done
         );
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
     }
 
@@ -3344,7 +3416,7 @@ mod tests {
         let (first, fallen) = (held_by("x@host:8", 5, 3_000), held_by("y@host:9", 3, 3_000));
         assert_eq!(lease.write(None, &first).expect("a write"), Written::Done);
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert!(matches!(
             b.tick(t0).expect("follow"),
             Tick::Following { term: 5, .. }
@@ -3383,7 +3455,7 @@ mod tests {
         let (first, fallen) = (held_by("x@host:8", 5, 3_000), held_by("y@host:9", 3, 3_000));
         assert_eq!(lease.write(None, &first).expect("a write"), Written::Done);
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert!(matches!(
             b.tick(t0).expect("follow"),
             Tick::Following { term: 5, .. }
@@ -3421,7 +3493,7 @@ mod tests {
         let long = held_by("x@host:8", 1, 6_000);
         assert_eq!(lease.write(None, &long).expect("a write"), Written::Done);
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert!(matches!(
             b.tick(t0).expect("follow"),
             Tick::Following { term: 1, .. }
@@ -3471,7 +3543,7 @@ mod tests {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
         assert!(matches!(
             b.tick(t0 + S / 2).expect("follow"),
@@ -3515,7 +3587,7 @@ mod tests {
             .expect("settings");
         let mut b = Elector::new(Box::new(FileLease::new(&path)), "b@host:2", settings())
             .expect("settings");
-        let t0 = Instant::now() + SLOW_WRITE + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         assert!(a.release().expect("release"));
         assert_eq!(b.tick(t0 + S).expect("take"), Tick::Acquired { term: 2 });
@@ -3616,7 +3688,7 @@ mod tests {
             pending: None,
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         // The first take reports an error and lands after the next read:
         // that read finds nothing, the retry's write is refused as moved,
         // and the tick after reads this run's own record and takes it.
@@ -3655,7 +3727,7 @@ mod tests {
             pending: None,
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
         delay.store(true, Ordering::Relaxed);
         a.tick(t0 + S).expect_err("the answer was lost");
@@ -3690,6 +3762,34 @@ mod tests {
     }
 
     #[test]
+    fn a_term_said_that_leaves_none_to_take_is_refused_before_it_is_counted() {
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + 3 * S;
+        a.lead_at(t0);
+        for said in [TERM_CEILING - 1, TERM_CEILING, u64::MAX] {
+            let refused = a
+                .step_down(Some(said), t0)
+                .expect_err("no term is left to take");
+            assert!(
+                matches!(refused, ElectError::Term(next) if next == said.saturating_add(1)),
+                "{refused}"
+            );
+        }
+        // Nothing was counted and nothing released: the holder leads on
+        // under its own term.
+        assert!(a.is_holder());
+        assert_eq!(a.fence().leader_term(t0), Some(1));
+        assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
+        // The highest term a word may say leaves the last one to take.
+        assert!(a
+            .step_down(Some(TERM_CEILING - 2), t0 + S)
+            .expect("the word"));
+        let released = a.observed().expect("the release").clone();
+        assert_eq!(released.term, TERM_CEILING - 2);
+    }
+
+    #[test]
     fn a_renew_deadline_past_the_clocks_reach_never_comes() {
         // Settings no clock outlasts are in order: the sums that date the
         // fence stay inside the clock, and a wait that long does not end.
@@ -3700,7 +3800,7 @@ mod tests {
         };
         let lease = MemoryLease::new();
         let mut a = Elector::new(Box::new(lease.clone()), "a@host:1", settings).expect("settings");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
         assert!(a.waits_to_lead());
@@ -3754,7 +3854,7 @@ mod tests {
     fn the_fence_is_read_from_other_threads_without_the_elector() {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         let fence = a.fence();
         let read = thread::spawn(move || fence.leader_term(t0 + S))
@@ -3774,7 +3874,7 @@ mod tests {
         let mut electors: Vec<Elector> = (0..4)
             .map(|i| candidate(&lease, &format!("c{i}@host:{i}")))
             .collect();
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         let mut last_term = 0;
         for round in 0..24u32 {
             let now = t0 + round * 4 * S;

@@ -126,10 +126,7 @@ impl ModelProcessorSpec for Llama4Spec {
             Modality::Image => Ok(Box::new(Llama4VisionProcessor::from_preprocessor_config(
                 preprocessor_config,
             ))),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

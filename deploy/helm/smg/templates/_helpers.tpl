@@ -1010,15 +1010,29 @@ elect a second leader beside the first.
 {{- end }}
 
 {{/*
+Policy controller replica count -- the count as a reader of the rendered
+manifest takes it, a whole number: a count given as text that reads there
+as a number (2e0, or a 2 after a blank) counts as that number. Zero for a
+null and for a text that reads as no number. Every place that judges the
+count asks here.
+*/}}
+{{- define "smg.policyControllerReplicaCount" -}}
+{{- int (fromYaml (printf "count: %v" .Values.policyController.replicas)).count -}}
+{{- end }}
+
+{{/*
 Policy controller replicas -- more than one only with the election on. With
 it off every replica is a controller of its own, and two would each lead
-alone: the render refuses them. The count is compared as a number and
-written as the values hold it: a null stays the API's default.
+alone: the render refuses them. The count is compared as a reader of the
+rendered manifest takes it: a text that reads there as a number above one
+(2e0, or a 2 after a blank) is refused as that number is. It is written as
+the values hold it: a null stays the API's default.
 */}}
 {{- define "smg.policyControllerReplicas" -}}
 {{- $replicas := .Values.policyController.replicas -}}
-{{- if and (gt (int $replicas) 1) (not (include "smg.policyControllerElection" .)) -}}
-{{- fail (printf "policyController.replicas is %d with policyController.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" (int $replicas)) -}}
+{{- $read := include "smg.policyControllerReplicaCount" . -}}
+{{- if and (gt (int $read) 1) (not (include "smg.policyControllerElection" .)) -}}
+{{- fail (printf "policyController.replicas is %v with policyController.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" $replicas) -}}
 {{- end -}}
 {{- $replicas -}}
 {{- end }}
@@ -1076,9 +1090,11 @@ start is refused at render: two listeners on one port, a settle window
 over half the grace period (the controller's own default of 5 seconds when
 shutdownSettleSeconds is null) and a listener named to take identities as
 told that is none of the three: the schema names it first, and the helper
-does where the schema's check is skipped. Those listeners are a set, said
-in the listeners' own order however the value was written: a reorder rolls
-no pod. With the election on the Lease is named,
+does where the schema's check is skipped. A value that is no list is
+refused there as written, also one that reads as empty (false, 0, an empty
+text or map): null alone is the value left out. Those listeners are a set,
+said in the listeners' own order however the value was written: a reorder
+rolls no pod. With the election on the Lease is named,
 and the pod's own address, which the kubelet writes in place of $(POD_IP):
 the holder of the Lease is named by an address the others can dial.
 */}}
@@ -1099,9 +1115,12 @@ the holder of the Lease is named by an address the others can dial.
 {{- end -}}
 {{- $elected := include "smg.policyControllerElection" . -}}
 {{- $told := list -}}
-{{- $named := $controller.identityAsTold | default list -}}
+{{- $named := list -}}
+{{- if not (kindIs "invalid" $controller.identityAsTold) -}}
+{{- $named = $controller.identityAsTold -}}
+{{- end -}}
 {{- if not (kindIs "slice" $named) -}}
-{{- fail (printf "policyController.identityAsTold is %v: a list of listeners' names (gateway, control, replication)" $named) -}}
+{{- fail (printf "policyController.identityAsTold is %s: a list of listeners' names (gateway, control, replication)" (toJson $named)) -}}
 {{- end -}}
 {{- range $name := $named -}}
 {{- if not (has $name (list "gateway" "control" "replication")) -}}

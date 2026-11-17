@@ -453,16 +453,17 @@ mod tests {
                 },
                 Clock, Counts, Deciders, Job, Reads,
             },
-            election::Standing,
+            election::{LeasePlace, Standing},
             gateways::{tests::PATIENT, Seat},
             principal::{tests::told, Layer, ENTRY},
+            replication::journaled,
             service::{Service, Shared},
             session::GRACE_PERIOD,
             wire::{Checked, MAX_FRAME},
         },
         elector::{Elector, Tick},
         proto::{self, busy::Reason, decide_answer::Answer, identity::Form},
-        store::{HealthSink, MemoryStore},
+        store::HealthSink,
         view::WorkerId,
     };
 
@@ -516,7 +517,7 @@ mod tests {
         cap: Option<u32>,
         steps: impl IntoIterator<Item = Step>,
     ) -> Bed {
-        let store = Arc::new(MemoryStore::new());
+        let (store, log) = journaled(&LeasePlace::Process);
         let (workers, _sides) = fleet(&store);
         store
             .apply(preset("random", 1))
@@ -556,7 +557,7 @@ mod tests {
             ADDRESS.to_owned(),
             &elector,
             stood.clone(),
-            Arc::clone(&store),
+            (Arc::clone(&store), log),
             Arc::new(crate::Catalog::builtin()),
             1,
         )

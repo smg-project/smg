@@ -24,6 +24,12 @@
 //! the running generation kept. A fault past the pass, in the store's
 //! entry, is not held: the store may be half written.
 //!
+//! A dry run ([`Generations::dry_run`]) runs a document's pass and applies
+//! nothing: it answers what an apply would do against the generation that
+//! stands at that instant, and it reserves no number. One dry run runs at
+//! a time ([`Generations::dry_run_in_turn`]): the size bound budgets one
+//! pass beside an apply's, and a second call waits its turn.
+//!
 //! A source that keeps running hands a refusal back here
 //! ([`Generations::reject`]): it is one event and one count, and the
 //! running generation stays.
@@ -58,6 +64,7 @@ use std::{
 use parking_lot::Mutex;
 use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{map::Entry, Map, Number, Value};
+use tokio::task::JoinError;
 use tracing::{info, warn};
 
 use crate::{
@@ -71,7 +78,8 @@ use crate::{
 /// the bound is what an apply may hold beside the document, 64 MiB: the
 /// budget of one apply in a controller whose container is a few hundred
 /// mebibytes. By run a YAML document of this size holds under 56 MiB
-/// ([`read_yaml`]). A fleet's document is far under the bound: 143 names
+/// ([`read_yaml`]). An apply runs one at a time, and a dry run one at a time
+/// beside it ([`Generations::dry_run_in_turn`]). A fleet's document is far under the bound: 143 names
 /// with a binding each write 11,523 bytes.
 pub(crate) const MAX_DOCUMENT_BYTES: u64 = 128 << 10;
 
@@ -141,21 +149,50 @@ impl Format {
     /// as JSON does: text that looks like a number or a boolean is quoted
     /// where a field takes text. A field the reader refuses is named by its
     /// path.
-    fn parse(self, document: &[u8]) -> Result<PolicySpec, String> {
+    fn parse(self, document: &[u8]) -> Result<PolicySpec, Refused> {
         match self {
-            Self::Yaml => {
-                let values = read_yaml(document)?;
-                serde_path_to_error::deserialize(values).map_err(|refused| {
-                    let path = refused.path().to_string();
-                    // The document itself has no name.
-                    if path == "." {
-                        refused.into_inner().to_string()
-                    } else {
-                        format!("{path}: {}", refused.inner())
-                    }
-                })
-            }
-            Self::Json => serde_json::from_slice(document).map_err(|error| error.to_string()),
+            Self::Yaml => placed(read_yaml(document).map_err(Refused::whole)?),
+            // A JSON document that reads is read once, by the typed read
+            // alone. A refused one is read again as values and placed as a
+            // YAML document's are, for the field of its refusal.
+            Self::Json => serde_json::from_slice(document).map_err(|refused| {
+                match serde_json::from_slice(document).map(placed) {
+                    Ok(Err(at_field)) => at_field,
+                    // No values, or values that read (a key written twice
+                    // keeps its last): the refusal is the typed read's own.
+                    Ok(Ok(_)) | Err(_) => Refused::whole(refused),
+                }
+            }),
+        }
+    }
+}
+
+/// The typed read of a document's values: a refusal carries the path of the
+/// field the read refused.
+fn placed(values: Value) -> Result<PolicySpec, Refused> {
+    serde_path_to_error::deserialize(values).map_err(|refused| {
+        let path = refused.path().to_string();
+        Refused {
+            // The document itself has no name.
+            path: if path == "." { String::new() } else { path },
+            message: refused.into_inner().to_string(),
+        }
+    })
+}
+
+/// Why a reader refused a document: the path of the field, where the
+/// refusal is about one, and the reader's message.
+struct Refused {
+    path: String,
+    message: String,
+}
+
+impl Refused {
+    /// A refusal of the document as a whole.
+    fn whole(message: impl fmt::Display) -> Self {
+        Self {
+            path: String::new(),
+            message: message.to_string(),
         }
     }
 }
@@ -399,11 +436,15 @@ pub enum SpecRejected {
     TooLarge(u64),
     /// It is not a document of its format, it writes a field the schema
     /// does not know, or its aliases read as more than its bytes bound.
-    #[error("not a policy spec in {format}: {message}")]
+    #[error("not a policy spec in {format}: {}", located(path, message))]
     Unparsed {
         /// `yaml` or `json`.
         format: &'static str,
-        /// The parser's message: the place, and an unknown field by name.
+        /// The field the reader refused, by its path; empty where the
+        /// refusal is about the document as a whole.
+        path: String,
+        /// The reader's message: the place in the file where it has one,
+        /// and an unknown field by name.
         message: String,
     },
     /// The validator refused it.
@@ -476,6 +517,46 @@ struct Held {
     applied: SystemTime,
 }
 
+/// A reader's message under the path of the field it refused, where it
+/// named one.
+fn located<'a>(path: &'a str, message: &'a str) -> impl fmt::Display + 'a {
+    struct Located<'a>(&'a str, &'a str);
+    impl fmt::Display for Located<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            if self.0.is_empty() {
+                f.write_str(self.1)
+            } else {
+                write!(f, "{}: {}", self.0, self.1)
+            }
+        }
+    }
+    Located(path, message)
+}
+
+impl SpecRejected {
+    /// The document's field the refusal is about, as a `SpecIssue` writes
+    /// it ([`SpecError::field_path`]); empty where it is about the document
+    /// as a whole.
+    pub(crate) fn field_path(&self) -> String {
+        match self {
+            Self::Unreadable(_) | Self::TooLarge(_) | Self::Faulted(_) => String::new(),
+            Self::Unparsed { path, .. } => path.clone(),
+            Self::Invalid(invalid) => invalid.field_path(),
+            Self::ChangedUnderItsLine { .. } | Self::Stale(_) => "generation".to_owned(),
+        }
+    }
+}
+
+/// What a dry run of a document answers.
+#[derive(Debug)]
+pub(crate) struct DryRun {
+    /// The number and the digest that stood when the document was checked.
+    pub(crate) standing: (u64, Option<Digest>),
+    /// The number an apply would have run the document under at that
+    /// instant, with the document's digest, or why it would not have run.
+    pub(crate) would_run: Result<(u64, Digest), SpecRejected>,
+}
+
 /// What a document's pass found it to be.
 struct Checked {
     /// The document's digest.
@@ -504,8 +585,9 @@ fn check(
     }
     let mut spec = format
         .parse(document)
-        .map_err(|message| SpecRejected::Unparsed {
+        .map_err(|Refused { path, message }| SpecRejected::Unparsed {
             format: format.as_str(),
+            path,
             message,
         })?;
     let digest = spec.digest()?;
@@ -558,6 +640,9 @@ pub(crate) struct Generations {
     /// pass run and the store's entry called under this lock. No reader
     /// takes it.
     applying: Mutex<()>,
+    /// One dry run at a time. A dry run takes neither lock of the door, and
+    /// its pass holds what an apply's does: the pass holds this turn.
+    dry_turn: Arc<tokio::sync::Mutex<()>>,
     /// The standing generation's document. An apply swaps it under this
     /// lock with its call of the store's entry, so a reader sees the number
     /// and the document move together and waits on no validation. `None`
@@ -584,6 +669,7 @@ impl Generations {
             catalog,
             validate,
             applying: Mutex::new(()),
+            dry_turn: Arc::default(),
             held: Mutex::new(None),
             applied: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
@@ -656,8 +742,57 @@ impl Generations {
         })
     }
 
-    /// The number and the digest the store runs.
-    fn standing(&self) -> (u64, Option<Digest>) {
+    /// What an apply of `document` would do at this instant, with nothing
+    /// applied, held or counted: the document's pass against the generation
+    /// that stands now, then the rule of the store's entry in its own words
+    /// (a number at or under the standing one is refused by naming it). The
+    /// number answered is the one an apply would run the document under
+    /// now. It reserves nothing: an apply that lands first takes it.
+    pub(crate) fn dry_run(&self, document: &[u8], format: Format) -> DryRun {
+        let standing = self.standing();
+        let would_run =
+            self.pass(standing, document, format)
+                .and_then(|Checked { digest, next }| {
+                    let Some(next) = next else {
+                        return Ok((standing.0, digest));
+                    };
+                    let offered = next.generation();
+                    if offered <= standing.0 {
+                        return Err(SpecRejected::Stale(StaleGeneration {
+                            standing: standing.0,
+                            offered,
+                        }));
+                    }
+                    Ok((offered, digest))
+                });
+        DryRun {
+            standing,
+            would_run,
+        }
+    }
+
+    /// [`Generations::dry_run`] off the runtime's workers, one at a time. A
+    /// document at the bound validates for tens of milliseconds and holds
+    /// tens of mebibytes, and the size bound budgets one pass beside an
+    /// apply's: a second call waits its turn, in the order the calls came.
+    /// The pass holds the turn, so a caller that leaves frees it no earlier
+    /// than its pass ends.
+    pub(crate) async fn dry_run_in_turn(
+        self: &Arc<Self>,
+        document: Vec<u8>,
+        format: Format,
+    ) -> Result<DryRun, JoinError> {
+        let turn = Arc::clone(&self.dry_turn).lock_owned().await;
+        let door = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _turn = turn;
+            door.dry_run(&document, format)
+        })
+        .await
+    }
+
+    /// The number and the digest the store runs, from one load.
+    pub(crate) fn standing(&self) -> (u64, Option<Digest>) {
         let world = self.store.world();
         (world.spec().generation(), world.spec().digest())
     }
@@ -1261,6 +1396,58 @@ pub(crate) mod tests {
         assert_eq!(*found.lock(), [true], "the first generation's end");
     }
 
+    /// One dry run at a time: while a pass stands in the validator a second
+    /// call's pass does not enter it, and both answer once the first ends.
+    #[tokio::test]
+    async fn a_second_dry_run_waits_its_turn() {
+        static ENTERED: AtomicU64 = AtomicU64::new(0);
+        static RELEASED: AtomicBool = AtomicBool::new(false);
+        /// Stands in the validator until the case releases it, ten seconds
+        /// at the most.
+        fn stalling(
+            document: &PolicySpec,
+            digest: Digest,
+            catalog: &Catalog,
+        ) -> Result<AppliedSpec, SpecError> {
+            ENTERED.fetch_add(1, Ordering::SeqCst);
+            for _ in 0..10_000 {
+                if RELEASED.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            AppliedSpec::validate_digested(document, digest, catalog)
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        let generations = Arc::new(Generations::validating(store, stock(), stalling));
+        let run = |document: &str| generations.dry_run_in_turn(document.into(), Format::Yaml);
+        // The first pass stands in the validator; a pace later the passes
+        // that entered are counted. The validator is released before the
+        // count is judged, so a count that fails ends the case.
+        let beside = async {
+            let started = Instant::now();
+            while ENTERED.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "no pass reached the validator"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let entered = ENTERED.load(Ordering::SeqCst);
+            RELEASED.store(true, Ordering::SeqCst);
+            entered
+        };
+        let (first, second, entered) = tokio::join!(run(LEAST_LOAD), run(RANDOM), beside);
+        assert_eq!(entered, 1, "a second dry run ran beside the first");
+        for answer in [first, second] {
+            let answer = answer.expect("the pass ends");
+            assert_eq!(answer.would_run.map(|(number, _)| number), Ok(1));
+        }
+        assert_eq!(ENTERED.load(Ordering::SeqCst), 2);
+    }
+
     /// The validator's word comes before the digest's. A `kind` line is in
     /// no digest and the validator refuses it: the standing document with
     /// one added is refused by name, under no line and under the standing
@@ -1313,6 +1500,7 @@ pub(crate) mod tests {
             Err(SpecRejected::Unparsed {
                 format: "yaml",
                 message,
+                ..
             }) => assert!(message.contains("colour"), "{message}"),
             other => panic!("applied as {other:?}"),
         }
@@ -1340,6 +1528,7 @@ pub(crate) mod tests {
                 Err(SpecRejected::Unparsed {
                     format: "yaml",
                     message,
+                    ..
                 }) => assert!(message.contains(bound), "{message}"),
                 other => panic!("{bytes} bytes applied as {other:?}"),
             }
@@ -1513,23 +1702,132 @@ pub(crate) mod tests {
         let unparsed = |document: String| match yaml(&generations, document) {
             Err(SpecRejected::Unparsed {
                 format: "yaml",
+                path,
                 message,
-            }) => message,
+            }) => (path, message),
             other => panic!("applied as {other:?}"),
         };
-        let unknown = unparsed(LEAST_LOAD.replace("    pick: best\n", "    colour: blue\n"));
-        assert!(
-            unknown.starts_with("profiles.default") && unknown.contains("colour"),
-            "{unknown}"
-        );
-        let number = unparsed(LEAST_LOAD.replace("pick: best", "pick: 1"));
-        assert!(number.starts_with("profiles.default.pick: "), "{number}");
+        let (path, message) =
+            unparsed(LEAST_LOAD.replace("    pick: best\n", "    colour: blue\n"));
+        assert!(path.starts_with("profiles.default"), "{path}");
+        assert!(message.contains("colour"), "{message}");
+        let (path, _) = unparsed(LEAST_LOAD.replace("pick: best", "pick: 1"));
+        assert_eq!(path, "profiles.default.pick");
         assert_eq!(
             yaml(
                 &generations,
                 LEAST_LOAD.replace("[healthy]", "[\"healthy\"]")
             ),
             Ok(Applied::Generation(1))
+        );
+    }
+
+    /// A reader's refusal names the field the typed read refused, in a YAML
+    /// document as in a JSON one, and no field where the refusal is about
+    /// the document as a whole.
+    #[test]
+    fn a_readers_refusal_names_the_field_it_refused() {
+        let (_store, generations) = generations();
+        let path = |document: &str, format| {
+            generations
+                .dry_run(document.as_bytes(), format)
+                .would_run
+                .expect_err("refused")
+                .field_path()
+        };
+        let yaml = LEAST_LOAD.replace("pick: best", "pick: [best]");
+        assert_eq!(path(&yaml, Format::Yaml), "profiles.default.pick");
+        let json = r#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"pick":["best"]}}}"#;
+        assert_eq!(path(json, Format::Json), "profiles.default.pick");
+        assert_eq!(path("profiles: [", Format::Yaml), "");
+        assert_eq!(path("7", Format::Json), "");
+        // No values, and values that read (a key written twice keeps its
+        // last): the refusal stays the typed read's, about the document.
+        assert_eq!(path("{", Format::Json), "");
+        let twice = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"random"},"p":{"pick":"random"}}}"#;
+        assert_eq!(path(twice, Format::Json), "");
+    }
+
+    /// A dry run answers what an apply would do at that instant and applies,
+    /// holds and counts nothing. The number is the one an apply would mint
+    /// now and it is not reserved: two dry runs answer one number, and an
+    /// apply that lands moves the next answer.
+    #[test]
+    fn a_dry_run_answers_what_an_apply_would_and_applies_nothing() {
+        let (store, generations) = generations();
+        let dry = |document: &[u8]| generations.dry_run(document, Format::Yaml);
+        let number = |run: DryRun| run.would_run.map(|(number, _)| number);
+        let counts = |applied| Counts {
+            applied,
+            rejected: 0,
+        };
+
+        let first = dry(LEAST_LOAD.as_bytes());
+        assert_eq!(first.standing, (0, None));
+        let (would, digest) = first.would_run.expect("it would run");
+        assert_eq!(would, 1);
+        assert_eq!(number(dry(LEAST_LOAD.as_bytes())), Ok(1), "not reserved");
+        assert_eq!(standing(&store), (0, None));
+        assert!(!generations.bound());
+        assert_eq!(generations.counts(), counts(0));
+
+        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+        let again = dry(LEAST_LOAD.as_bytes());
+        assert_eq!(again.standing, (1, Some(digest)));
+        assert_eq!(again.would_run, Ok((1, digest)), "the standing document");
+        assert_eq!(number(dry(RANDOM.as_bytes())), Ok(2));
+        assert_eq!(number(dry(&with_line(RANDOM, 9))), Ok(9));
+        assert_eq!(number(dry(&with_line(LEAST_LOAD, 9))), Ok(9));
+
+        assert_eq!(yaml(&generations, RANDOM), Ok(Applied::Generation(2)));
+        assert_eq!(number(dry(LEAST_LOAD.as_bytes())), Ok(3), "an apply landed");
+        assert_eq!(standing(&store).0, 2);
+        assert_eq!(generations.counts(), counts(2));
+    }
+
+    /// A dry run refuses what an apply would, by the same name: a changed
+    /// document under the standing line, a line under the standing one (the
+    /// refusal of the store's entry, in its words), a document the validator
+    /// refuses, one that is no document and one over the bound. Each names
+    /// its field.
+    #[test]
+    fn a_dry_run_refuses_what_an_apply_would_by_the_same_name() {
+        let (_store, generations) = generations();
+        assert_eq!(
+            yaml(&generations, with_line(LEAST_LOAD, 5)),
+            Ok(Applied::Generation(5))
+        );
+        let over = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits") + 1;
+        let rows = [
+            (with_line(RANDOM, 5), "generation"),
+            (with_line(RANDOM, 3), "generation"),
+            (
+                LEAST_LOAD.replace("[healthy]", "[nowhere]").into_bytes(),
+                "profiles.default.filter",
+            ),
+            (b"profiles: [".to_vec(), ""),
+            (vec![b'#'; over], ""),
+        ];
+        for (document, path) in rows {
+            let refused = generations
+                .dry_run(&document, Format::Yaml)
+                .would_run
+                .expect_err("refused");
+            assert_eq!(refused.field_path(), path, "{refused}");
+            assert_eq!(yaml(&generations, document), Err(refused));
+        }
+        let lower = generations.dry_run(&with_line(RANDOM, 3), Format::Yaml);
+        let stale = StaleGeneration {
+            standing: 5,
+            offered: 3,
+        };
+        assert_eq!(lower.would_run, Err(SpecRejected::Stale(stale)));
+        assert_eq!(
+            generations.counts(),
+            Counts {
+                applied: 1,
+                rejected: 0
+            }
         );
     }
 

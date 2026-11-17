@@ -29,19 +29,29 @@ fn expected_document(item: &str) -> Option<&str> {
 }
 
 /// The items whose document names a form this build lacks, each with the
-/// validator's words for it. The test fails when a listed item validates,
-/// so an entry leaves with the change that builds its form, and when an
-/// item is refused as not in this build in words this list does not give it.
+/// validator's words for it: the first such form, where a document lacks
+/// several. The test fails when a listed item validates, so an entry leaves
+/// with the change that builds the last form its document lacks, and when
+/// an item is refused as not in this build in words this list does not give
+/// it.
 const NOT_IN_BUILD: &[(&str, &str)] = &[
     (
         "27-cli-prefix-hash-boundaries.md",
         "the consistent-hash prefix key",
     ),
     (
+        // The document also names the prefix-affinity accounting, its
+        // uncached credit and the best-with-temperature picker: the change
+        // that builds the decay rewrites these words, and the entry leaves
+        // with the last of the four.
         "28-cli-cache-aware-hash-index-full.md",
         "the prefix-affinity decay",
     ),
 ];
+
+/// The corpus's size: an item that leaves the directory, or takes an
+/// extension the walk does not read, is a defect.
+const ITEMS: usize = 28;
 
 enum Verdict {
     NoDocument,
@@ -88,7 +98,7 @@ fn the_step_2_corpus_parses_and_every_item_names_its_verdict() {
         .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
         .collect();
     items.sort();
-    assert!(!items.is_empty(), "no items under {}", dir.display());
+    assert_eq!(items.len(), ITEMS, "the items under {}", dir.display());
 
     let (mut documents, mut accepted, mut not_in_build) = (0usize, 0usize, 0usize);
     let mut defects = Vec::new();

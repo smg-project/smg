@@ -140,3 +140,39 @@ fn the_built_binary_holds_the_stages_of_this_build() {
     // The stock build's line names no `pack`.
     assert!(started.stages.contains(r#""pack""#), "{}", started.stages);
 }
+
+/// The example runs on the allocator the stock controller's binary
+/// registers, with its settings. The allocator is asked for its statistics
+/// at the process's end, an ask the system allocator does not hear, and the
+/// statistics name the settings it runs on.
+#[cfg(all(
+    not(target_env = "msvc"),
+    not(target_env = "musl"),
+    not(target_vendor = "apple")
+))]
+#[test]
+fn the_built_binary_runs_on_the_stock_binarys_allocator() {
+    let output = Command::new(BIN)
+        .arg("--version")
+        .env("_RJEM_MALLOC_CONF", "stats_print:true")
+        .stdin(Stdio::null())
+        .output()
+        .expect("the example binary runs");
+    let written = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        written.contains("jemalloc statistics"),
+        "no statistics of the allocator at the end: {written:?}"
+    );
+    for setting in [
+        "opt.background_thread: true",
+        "opt.dirty_decay_ms: 10000 (",
+        "opt.muzzy_decay_ms: 0 (",
+        "opt.narenas: 16\n",
+        "opt.oversize_threshold: 33554432\n",
+    ] {
+        assert!(
+            written.contains(setting),
+            "the allocator does not run on {setting:?}: {written:?}"
+        );
+    }
+}

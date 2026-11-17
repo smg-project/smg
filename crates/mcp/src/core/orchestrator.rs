@@ -38,6 +38,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use parking_lot::RwLock;
 use rmcp::{
     model::{CallToolRequestParams, CallToolResult},
     service::{RunningService, ServiceError},
@@ -151,6 +152,22 @@ async fn resources_of<S: rmcp::service::Service<RoleClient>>(
             None
         }
     }
+}
+
+/// Puts a server's tool listing into the inventory in place: the listing
+/// goes in (a tool of the same name is overwritten), then what the server no
+/// longer lists goes out with the aliases that target it. A reader finds
+/// every tool both listings hold at every moment; an empty listing leaves
+/// the server without tools.
+fn swap_server_tools(inventory: &ToolInventory, server_key: &str, tools: Vec<ToolEntry>) {
+    let listed: HashSet<String> = tools
+        .iter()
+        .map(|entry| entry.tool_name().to_string())
+        .collect();
+    for entry in tools {
+        inventory.insert_entry(entry);
+    }
+    inventory.retain_server_tool_entries(server_key, &listed);
 }
 
 /// Puts a server's prompts into the inventory.
@@ -531,6 +548,11 @@ pub struct McpOrchestrator {
     /// handler, which must see a server's current client after a recovery
     /// re-inserts it.
     static_servers: Arc<DashMap<String, ServerEntry>>,
+    /// The connected server that answers each builtin tool type, with the tool it names: what
+    /// a walk of `static_servers` would find, kept by type so a lookup takes no walk (a walk
+    /// allocates once per shard). Written where an entry goes into `static_servers`, emptied
+    /// where that map is; the first server registered for a type keeps it.
+    builtin_servers: RwLock<Vec<(BuiltinToolType, String, String)>>,
     /// Tool inventory with qualified names.
     tool_inventory: Arc<ToolInventory>,
     /// Approval manager for interactive and policy-only modes.
@@ -592,6 +614,7 @@ impl McpOrchestrator {
 
         let orchestrator = Self {
             static_servers: Arc::new(DashMap::new()),
+            builtin_servers: RwLock::new(Vec::new()),
             tool_inventory,
             approval_manager,
             connection_pool,
@@ -646,6 +669,7 @@ impl McpOrchestrator {
 
         Self {
             static_servers: Arc::new(DashMap::new()),
+            builtin_servers: RwLock::new(Vec::new()),
             tool_inventory: Arc::new(ToolInventory::new()),
             approval_manager,
             connection_pool: Arc::new(McpConnectionPool::new()),
@@ -690,12 +714,19 @@ impl McpOrchestrator {
     }
 
     /// Connect a static server and put its entry in place: the connection,
-    /// the inventory load, the tool configurations, then the entry under the
-    /// server's name, replacing whatever entry the name held. A recovery runs
-    /// this beside the dropped entry, which stays in the map, settings and
-    /// visibility flags included, until the new connection replaces it (a
-    /// server registered after start-up has no other copy of them); an
-    /// attempt that fails changes nothing.
+    /// its three listings, then one write-back under the name's guard: the
+    /// tools swapped in place, the prompts and the resources replaced, the
+    /// tool configurations, and the entry, replacing whatever entry the name
+    /// held. Nothing of the server's changes while the listings are on their
+    /// way, so through a recovery a reader finds the tools both listings
+    /// hold; a tool listing that failed leaves the server without tools and
+    /// the failure on its entry. A refresh writes back under the same guard,
+    /// after checking the connection there, so a refresh that listed on the
+    /// dropped connection lands before this write-back or not at all. A
+    /// recovery runs this beside the dropped entry, which stays in the map,
+    /// settings and visibility flags included, until the new connection
+    /// replaces it (a server registered after start-up has no other copy of
+    /// them); an attempt that fails changes nothing.
     async fn establish_static_server(&self, config: &McpServerConfig) -> McpResult<()> {
         info!("Connecting to static server '{}'", config.name);
 
@@ -706,25 +737,37 @@ impl McpOrchestrator {
 
         let client = self.connect_server_impl(config, (*handler).clone()).await?;
         let client = Arc::new(client);
-        self.tool_inventory.clear_server_tools(&config.name);
 
-        // Load tools from server
-        let list_error = self.load_server_inventory(&config.name, &client).await;
+        let key = config.name.as_str();
+        let (tools, list_error) = match tools_of(client.as_ref(), key, ToolCategory::Static).await {
+            Ok(tools) => (tools, None),
+            Err(message) => (Vec::new(), Some(message)),
+        };
+        let prompts = prompts_of(client.as_ref(), key).await;
+        let resources = resources_of(client.as_ref(), key).await;
 
+        // The write-back: nothing awaits between the guard and the entry.
+        let slot = self.static_servers.entry(config.name.clone());
+        swap_server_tools(&self.tool_inventory, key, tools);
+        self.tool_inventory.clear_server_prompts(key);
+        if let Some(prompts) = prompts {
+            install_prompts(&self.tool_inventory, key, prompts);
+        }
+        self.tool_inventory.clear_server_resources(key);
+        if let Some(resources) = resources {
+            install_resources(&self.tool_inventory, key, resources);
+        }
         self.apply_tool_configs(config);
-
         // Store server entry with config for builtin lookups
-        self.static_servers.insert(
-            config.name.clone(),
-            ServerEntry {
-                client,
-                handler,
-                config: config.clone(),
-                list_error,
-            },
-        );
+        slot.insert(ServerEntry {
+            client,
+            handler,
+            config: config.clone(),
+            list_error,
+        });
 
         self.metrics.record_connection_opened();
+        self.index_builtin_server(config);
         info!("Connected to static server '{}'", config.name);
         Ok(())
     }
@@ -790,31 +833,6 @@ impl McpOrchestrator {
         }
     }
 
-    /// Load tools, prompts, and resources from a server into the inventory;
-    /// the tool listing's failure when it failed (the server's entry keeps it).
-    async fn load_server_inventory(
-        &self,
-        server_key: &str,
-        client: &Arc<McpClientWithHandler>,
-    ) -> Option<String> {
-        let list_error = match tools_of(client.as_ref(), server_key, ToolCategory::Static).await {
-            Ok(entries) => {
-                for entry in entries {
-                    self.tool_inventory.insert_entry(entry);
-                }
-                None
-            }
-            Err(message) => Some(message),
-        };
-        if let Some(prompts) = prompts_of(client.as_ref(), server_key).await {
-            install_prompts(&self.tool_inventory, server_key, prompts);
-        }
-        if let Some(resources) = resources_of(client.as_ref(), server_key).await {
-            install_resources(&self.tool_inventory, server_key, resources);
-        }
-        list_error
-    }
-
     /// Spawn background handler for inventory refresh requests.
     fn spawn_refresh_handler(&self, mut rx: mpsc::Receiver<RefreshRequest>) {
         let token = self.shutdown_token.clone();
@@ -849,12 +867,10 @@ impl McpOrchestrator {
                             // made. Prompts and resources are cleared only
                             // when their own listing succeeded, so one that
                             // fails keeps what the server had. The tools are
-                            // swapped in place: the listing goes in, then
-                            // what the server no longer lists goes out with
-                            // the aliases that target it, so a reader finds
-                            // every tool both listings hold. The config's
-                            // aliases and argument mappings go over the
-                            // result, as at a connect.
+                            // swapped in place, so a reader finds every tool
+                            // both listings hold. The config's aliases and
+                            // argument mappings go over the result, as at a
+                            // connect.
                             let key = request.server_key.as_str();
                             let Ok(tools) =
                                 tools_of(client.as_ref(), key, ToolCategory::Static).await
@@ -866,7 +882,9 @@ impl McpOrchestrator {
                             // The write-back is this connection's: a recovery
                             // during the listings replaced the entry (or a
                             // removal dropped it), and its own load's tools
-                            // and outcome stand, not a stale listing's. The
+                            // and outcome stand, not a stale listing's. A
+                            // recovery writes back under this guard too, so
+                            // the check holds until this listing is in. The
                             // entry stays held while the listing goes in and
                             // its error is cleared last: a reader that finds
                             // no listing error finds the tools.
@@ -874,14 +892,7 @@ impl McpOrchestrator {
                                 Some(entry) if Arc::ptr_eq(&entry.client, &client) => entry,
                                 _ => continue,
                             };
-                            let listed: HashSet<String> = tools
-                                .iter()
-                                .map(|entry| entry.tool_name().to_string())
-                                .collect();
-                            for entry in tools {
-                                tool_inventory.insert_entry(entry);
-                            }
-                            tool_inventory.retain_server_tool_entries(key, &listed);
+                            swap_server_tools(&tool_inventory, key, tools);
                             if let Some(prompts) = prompts {
                                 tool_inventory.clear_server_prompts(key);
                                 install_prompts(&tool_inventory, key, prompts);
@@ -929,12 +940,16 @@ impl McpOrchestrator {
             None
         };
 
-        // First, search connected static servers (dynamically registered via connect_static_server).
-        // This handles servers registered after orchestrator initialization.
-        for entry in self.static_servers.iter() {
-            if let Some(result) = extract_builtin(&entry.config) {
-                return Some(result);
-            }
+        // A connected server first, one registered after start-up included: read by type from
+        // the index its registration wrote, with no walk of the server map.
+        let connected = self
+            .builtin_servers
+            .read()
+            .iter()
+            .find(|(held, ..)| *held == builtin_type)
+            .map(|(_, server, tool)| (server.clone(), tool.clone()));
+        if connected.is_some() {
+            return connected;
         }
 
         // Fallback to initial config servers (handles edge cases where servers
@@ -946,6 +961,20 @@ impl McpOrchestrator {
         }
 
         None
+    }
+
+    /// Record a connected server as the answer for its builtin type, unless an earlier server
+    /// holds the type. A recovery puts a server's own settings back, so it changes nothing here.
+    fn index_builtin_server(&self, config: &McpServerConfig) {
+        let (Some(builtin_type), Some(tool_name)) =
+            (config.builtin_type, &config.builtin_tool_name)
+        else {
+            return;
+        };
+        let mut index = self.builtin_servers.write();
+        if !index.iter().any(|(held, ..)| *held == builtin_type) {
+            index.push((builtin_type, config.name.clone(), tool_name.clone()));
+        }
     }
 
     /// Returns the set of server names that have `builtin_type` configured.
@@ -2000,6 +2029,7 @@ impl McpOrchestrator {
             self.metrics.record_connection_closed();
         }
         self.static_servers.clear();
+        self.builtin_servers.write().clear();
         self.connection_pool.clear();
 
         self.tool_inventory.clear_all();
@@ -2970,6 +3000,37 @@ mod tests {
 
         // Should find 0 matches
         assert_eq!(matching.len(), 0);
+    }
+
+    /// The index of connected builtin servers: the first server registered for a type keeps it,
+    /// the same settings put back (what a recovery does) change nothing, a connected server
+    /// answers before a configured one, and a shutdown leaves the configured one.
+    #[tokio::test]
+    async fn the_first_connected_server_of_a_builtin_type_answers_until_shutdown() {
+        let search = |name: &str, tool: &str| McpServerConfig {
+            builtin_type: Some(BuiltinToolType::WebSearchPreview),
+            builtin_tool_name: Some(tool.to_string()),
+            ..sse_server(name, "http://localhost:1/sse")
+        };
+        let orchestrator = McpOrchestrator::new_test_with_config(McpConfig {
+            servers: vec![search("configured", "configured_search")],
+            ..Default::default()
+        });
+        let found = || orchestrator.find_builtin_server(BuiltinToolType::WebSearchPreview);
+        let answer = |server: &str, tool: &str| Some((server.to_string(), tool.to_string()));
+        assert_eq!(found(), answer("configured", "configured_search"));
+
+        orchestrator.index_builtin_server(&search("first", "search"));
+        orchestrator.index_builtin_server(&search("second", "other_search"));
+        orchestrator.index_builtin_server(&search("first", "search"));
+        assert_eq!(found(), answer("first", "search"));
+        assert_eq!(
+            orchestrator.find_builtin_server(BuiltinToolType::CodeInterpreter),
+            None
+        );
+
+        orchestrator.shutdown().await;
+        assert_eq!(found(), answer("configured", "configured_search"));
     }
 
     #[test]

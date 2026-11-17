@@ -79,7 +79,9 @@ async fn a_replayed_mcp_exchange_is_refused_before_the_engine() {
     }))
     .expect("a Messages request");
     let tenant = TenantRequestMeta::new(TenantKey::new("mcp-replay-test-tenant"));
-    let response = router.route_messages(None, &tenant, request, MODEL).await;
+    let response = router
+        .route_messages(None, &tenant, Arc::new(request), MODEL)
+        .await;
     let status = response.status();
     let body = to_bytes(response.into_body(), 1 << 20)
         .await

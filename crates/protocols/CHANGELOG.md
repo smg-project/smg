@@ -331,6 +331,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `null` metadata reads as the empty map (`deserialize_null_as_empty_map`, a map twin of
   `deserialize_null_as_empty_vec`), and `IncompleteReason`, `#[non_exhaustive]`, gains
   `MaxMessages` and `Steered`.
+- A Messages search result's text items are written with their `type`, which the public API
+  requires of them, in a message and in a tool result alike. They were read into untagged text
+  blocks, so a forwarded search result lost the `type` of each item. An item read without one
+  still reads, as text, and an item of another type is refused. Breaking:
+  `SearchResultBlock.content` holds the new `SearchResultTextBlock`, whose type is
+  `SearchResultTextType`.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
@@ -369,6 +375,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   So does a key of the generation and agent configs (`maxOutputTokens`, `stopSequences`,
   `thinkingSummaries`, ...), which goes upstream in snake_case with its value.
   Breaking: `InteractionsRequest` gains `other: Map<String, Value>`.
+- A Messages image or document whose source is a file uploaded through the Files API
+  (`{"type": "file", "file_id": ...}`) is accepted and forwarded as written, as the public API
+  takes it. The source was an unknown variant, which refused the whole request. The gRPC router,
+  which has no Files API to read the file from, refuses such an image naming the block wherever it
+  appears, and such a document at a message's top level; a document inside a tool result is left
+  out of its prompt, as every document there is today. Breaking: `ImageSource` and
+  `DocumentSource` gain `File`.
 - `GenerateRequest` runs the rules of its `sampling_params`, with the chat route's lower bound on
   `n`, and refuses an empty `input_ids` as the chat route refuses an empty `messages`, so the
   gateway's `/generate` reads its body through the validated extractor and answers a negative
@@ -378,13 +391,6 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `input_ids`, `input_embeds`), as `missing_required_parameter`; a body with both `text` and
   `input_ids` and an `input_embeds`-only body stay with the routers as today. The cross-field sampling rules (`min_new_tokens` above
   `max_new_tokens`, more than one structured-output constraint) name their field in `error.param`.
-- A Messages image or document whose source is a file uploaded through the Files API
-  (`{"type": "file", "file_id": ...}`) is accepted and forwarded as written, as the public API
-  takes it. The source was an unknown variant, which refused the whole request. The gRPC router,
-  which has no Files API to read the file from, refuses such an image naming the block wherever it
-  appears, and such a document at a message's top level; a document inside a tool result is left
-  out of its prompt, as every document there is today. Breaking: `ImageSource` and
-  `DocumentSource` gain `File`.
 - An assistant message in the chat history keeps its `refusal`, `audio` and `function_call` when
   the request is written back for an upstream, as the HTTP router and the provider routers write
   it. The crate dropped all three while reading the message, so a replayed refused turn reached a
@@ -409,9 +415,20 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   field (#5092). Two different texts are refused as a value (`invalid_value`; `param` names the
   message). Breaking: the `ChatMessage::Assistant` field `reasoning_content: Option<String>` is now
   `reasoning: AssistantReasoning`, whose `text` is that option.
+- A Messages answer with a content block of a kind this build does not read (a web fetch, code
+  execution, bash or text editor result, a container upload, or any block the public API adds)
+  parses, the block kept as written in `ContentBlock::Other`, as `ToolUseCaller::Other` keeps an
+  unknown caller. A whole answer with such a block failed: the provider route answered a 502, and
+  a streamed thread turn was left unstored. Breaking: `ContentBlock` gains `Other(Value)`.
 - `EmbeddingRequest` and `ClassifyRequest` keep the fields they do not model in a flattened
   `other` map, as `ChatCompletionRequest` and `CompletionRequest` do, so the HTTP relay forwards an
   embeddings or classify body as the client wrote it (`truncate_prompt_tokens`,
   `add_special_tokens`, `normalize`, `priority`, `extra_body`, ...). The relay re-serializes the
   typed body and dropped every key the types did not declare. Breaking: the two structs gain the
   field `other: serde_json::Map<String, Value>`.
+- A Messages conversation that replays the public API's server tool results (`web_fetch_tool_result`,
+  `code_execution_tool_result`, `bash_code_execution_tool_result`,
+  `text_editor_code_execution_tool_result`) or sends a `container_upload` block is accepted, and the
+  blocks are forwarded as written. Each was an unknown variant of `InputContentBlock`, which refused
+  the whole request, a token count included. Breaking: `InputContentBlock` gains the five variants,
+  and the crate gains `ServerToolResultBlock` and `ContainerUploadParam`.

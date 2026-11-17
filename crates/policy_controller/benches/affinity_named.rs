@@ -1,6 +1,7 @@
 //! The cost of one decision over the rows a host names in the affinity
 //! column's place: the `cache_aware` preset over `common`'s settled fleet,
-//! every holder of its column named and no column fed, at 8, 64 and 512
+//! the holders of its column named as a host names them (the deepest first,
+//! at most the picker's sample) and no column fed, at 8, 64 and 512
 //! candidates. Ids: `policy_affinity_named/decide/cache_aware/<n>`; the same
 //! decision over the column is `policy_affinity/decide/cache_aware/<n>` of
 //! the `affinity` target. The settled fleet warms nobody, so no warming row
@@ -22,7 +23,7 @@ use column::build_column;
 use common::{build_view, engine_of, fleet};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use smg_policy_controller::{
-    Constraints, NamedAffinity, NamedHolder, PoolFacts, RequestFacts, Scratch,
+    Constraints, NamedAffinity, NamedHolder, Phase, PoolFacts, RequestFacts, Scratch,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -37,6 +38,7 @@ fn facts(seed: u64, holders: &[NamedHolder]) -> RequestFacts<'_> {
             holders,
             warming: &[],
             thin: false,
+            mean_in_flight: None,
         }),
         ..RequestFacts::default()
     }
@@ -51,8 +53,9 @@ fn decide(c: &mut Criterion) {
         build_view(&fleet, &mut rows);
         let mut held = Vec::with_capacity(n);
         build_column(&fleet, &mut held);
-        // Every holder of the fleet's column, named in its place.
-        let holders: Vec<NamedHolder> = (0u32..)
+        // The holders of the fleet's column as a host names them: the deepest
+        // first, at most the sample of the profile that decides.
+        let mut holders: Vec<NamedHolder> = (0u32..)
             .zip(&held)
             .filter(|(_, entry)| entry.overlap_blocks > 0 || entry.predicted_blocks > 0)
             .map(|(row, entry)| NamedHolder {
@@ -61,6 +64,27 @@ fn decide(c: &mut Criterion) {
                 predicted_blocks: entry.predicted_blocks,
             })
             .collect();
+        let cap = engine.needs_for("m", Phase::Single).sample as usize;
+        if cap > 0 && holders.len() > cap {
+            holders.sort_by_key(|holder| std::cmp::Reverse(holder.overlap_blocks));
+            let edge = holders[cap].overlap_blocks;
+            let fit = holders
+                .iter()
+                .take_while(|holder| holder.overlap_blocks > edge)
+                .count();
+            let group: Vec<NamedHolder> = holders[fit..]
+                .iter()
+                .copied()
+                .take_while(|holder| holder.overlap_blocks == edge)
+                .collect();
+            // The group at the cap's edge: an even stride through it stands
+            // in for the host's draw; which of its rows are named moves no
+            // cost.
+            let left = cap - fit;
+            holders.truncate(fit);
+            holders.extend((0..left).map(|k| group[k * group.len() / left]));
+            holders.sort_by_key(|holder| holder.row);
+        }
         let mut scratch = Scratch::new();
         let pool = PoolFacts {
             pool_size: n as u32,

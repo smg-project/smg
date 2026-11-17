@@ -592,19 +592,126 @@ async fn two_binaries_elect_over_the_lease_object_and_hand_over_at_a_stop() {
     record.check().expect("the election's promise holds");
 }
 
+/// How many times a cell whose stand-in the host can hold is made. A try
+/// whose bound fails where its witness says the host held this process says
+/// so and is made again. No witness passes a run: the last try stands
+/// whatever its witness says, so a leader that fails by itself fails each
+/// try, and the cell.
+#[cfg(feature = "controller")]
+const TRIES: u32 = 3;
+
+/// A line that waits on the stand-in's answer inside the leader's own
+/// deadline, and did not hold: the one failure a hold of the stand-in
+/// explains, so the one a try is made again for.
+#[cfg(feature = "controller")]
+struct Late(String);
+
+/// `assert!` for such a line: the try unwinds as [`Late`] with no line of
+/// the panic hook's, and the cell says its words.
+#[cfg(feature = "controller")]
+macro_rules! bound {
+    ($met:expr, $($said:tt)+) => {
+        if !$met {
+            let said = format!("{}:{}: {}", file!(), line!(), format_args!($($said)+));
+            std::panic::resume_unwind(Box::new(Late(said)));
+        }
+    };
+}
+
+/// A witness of the host's holds beside such a cell: a thread that naps
+/// 5 ms at a time and keeps the longest it overslept. A host that holds
+/// this process, the stand-in with it, holds its witness too.
+#[cfg(feature = "controller")]
+struct Witness {
+    end: mpsc::Sender<()>,
+    naps: thread::JoinHandle<Duration>,
+}
+
+#[cfg(feature = "controller")]
+impl Witness {
+    fn start() -> Self {
+        let (end, ended) = mpsc::channel();
+        let naps = thread::spawn(move || {
+            let nap = Duration::from_millis(5);
+            let mut longest = Duration::ZERO;
+            loop {
+                let began = Instant::now();
+                let over = ended.recv_timeout(nap) != Err(mpsc::RecvTimeoutError::Timeout);
+                // The nap its end cut short counts too: a cell the host held
+                // can end before its witness wakes.
+                longest = longest.max(began.elapsed().saturating_sub(nap));
+                if over {
+                    return longest;
+                }
+            }
+        });
+        Self { end, naps }
+    }
+
+    /// Ends the witness: the longest hold it saw.
+    fn held(self) -> Duration {
+        drop(self.end);
+        self.naps.join().expect("the witness returns")
+    }
+}
+
 /// A release the stand-in refuses once (design 5.3): the stopped leader
 /// writes it again no sooner than a renew period after the first, the
 /// stand-in stores that one, and the other replica takes the object. The
-/// row of the Numbers table is printed: the signal to the stored release
-/// and to the take, at the cell's timings or the three of
+/// row of the Numbers table is printed for that stop: the signal to the
+/// stored release and to the take, at the cell's timings or the three of
 /// `SMG_REPLICAS_TIMINGS_MS`. A leader the host held back past the duration
 /// has lost the object by its second release: the other replica took it
-/// unreleased, and the replica left is stopped alone and refused once in
-/// its turn.
+/// unreleased, the replica left is stopped alone and refused once in its
+/// turn, and no row is printed, since no replica is left to take.
+///
+/// The stand-in lives in this process. A host that holds it for a renew
+/// period can lose the leader the answer to a release that was stored, with
+/// no fault of the leader's, and the leader then logs no release: a try
+/// that fails on that line ([`bound!`]) where the witness saw such a hold
+/// says so and is made again, [`TRIES`] at most. No hold explains any other
+/// failure, and none excuses the election's promise: it is checked over the
+/// answers of every try, made again or not.
 #[cfg(feature = "controller")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_release_is_written_again_a_renew_period_later() {
-    use replicas::{Lease as Place, Record, Replica, ROOM};
+#[test]
+fn a_refused_release_is_written_again_a_renew_period_later() {
+    // The renew period the try runs at, read without a second timings line.
+    let room = replicas::timings(settings(), &mut std::io::sink()).renew_period;
+    for tried in 1..=TRIES {
+        let witness = Witness::start();
+        let mut record = replicas::Record::default();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("a runtime")
+                .block_on(a_refused_release(&mut record));
+        }));
+        let held = witness.held();
+        record.check().expect("the election's promise holds");
+        let Err(failure) = failed else {
+            return;
+        };
+        let late = match failure.downcast::<Late>() {
+            Ok(late) => late,
+            Err(failure) => std::panic::resume_unwind(failure),
+        };
+        assert!(held >= room && tried < TRIES, "{}", late.0);
+        writeln!(
+            std::io::stdout(),
+            "a refused release: made again in this run: the host held the stand-in {held:?}: {}",
+            late.0
+        )
+        .expect("stdout");
+    }
+}
+
+/// One try of the cell above. Its answers go to `record`, which the cell
+/// checks.
+#[cfg(feature = "controller")]
+async fn a_refused_release(record: &mut replicas::Record) {
+    use replicas::{Lease as Place, Replica, ROOM};
 
     let mut out = std::io::stdout();
     let settings = replicas::timings(settings(), &mut out);
@@ -620,26 +727,31 @@ async fn a_refused_release_is_written_again_a_renew_period_later() {
     shared.lock().release_refusals = 1;
     let start = |id: &str| Replica::start(id, place, settings, 0).expect("the replica starts");
     let mut replicas = vec![start("replica-a"), start("replica-b")];
-    let mut record = Record::default();
     // What a stop the stand-in refused once leaves: the refusal in the
     // stopped leader's log, and two releases at the stand-in after the
     // `earlier` ones, the second no sooner than a renew period after the
     // signal: the first began after the signal and the second a period
     // after the first began. A hold of the host only makes the second
-    // later: the floor needs no room.
-    let refused_then_stored = |stopped: &Replica, earlier: usize, signalled: Instant| {
+    // later: the floor needs no room, so it is read by itself, before any
+    // line a hold explains.
+    let floor = |earlier: usize, signalled: Instant| {
+        let releases = shared.lock().releases[earlier..].to_vec();
+        if let Some(second) = releases.get(1) {
+            let again = second.duration_since(signalled);
+            assert!(
+                again >= settings.renew_period,
+                "the second release came {again:?} after the signal"
+            );
+        }
+    };
+    let refused_then_stored = |stopped: &Replica, earlier: usize| {
         assert!(
             stopped.logged("the release failed"),
             "the stand-in refused the first release:\n{}",
             stopped.log()
         );
-        let releases = shared.lock().releases[earlier..].to_vec();
-        assert_eq!(releases.len(), 2, "one refused, one stored");
-        let again = releases[1].duration_since(signalled);
-        assert!(
-            again >= settings.renew_period,
-            "the second release came {again:?} after the signal"
-        );
+        let releases = shared.lock().releases[earlier..].len();
+        assert_eq!(releases, 2, "one refused, one stored");
     };
     let (leader, term) = record
         .agreed(&mut replicas)
@@ -666,12 +778,13 @@ async fn a_refused_release_is_written_again_a_renew_period_later() {
     let taken = format!("{second}@{}", term + 1);
     let changes = shared.lock().changes.clone();
     if changes.ends_with(&[format!("{first}@{term}"), format!("@{term}"), taken.clone()]) {
-        assert!(
+        floor(0, signalled);
+        bound!(
             stopped.logged("the lease is released"),
             "a stored release the leader never logged:\n{}",
             stopped.log()
         );
-        refused_then_stored(&stopped, 0, signalled);
+        refused_then_stored(&stopped, 0);
 
         // The successor lives on: its take's line reaches the log a
         // moment after its answer turned.
@@ -735,9 +848,9 @@ async fn a_refused_release_is_written_again_a_renew_period_later() {
             "a leader stopped alone releases the object: {changes:?}\n{}",
             stopped.log()
         );
-        refused_then_stored(&stopped, earlier, signalled);
+        floor(earlier, signalled);
+        refused_then_stored(&stopped, earlier);
     }
-    record.check().expect("the election's promise holds");
 }
 
 /// A settle window longer than the cell below waits for anything: a stop

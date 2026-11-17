@@ -110,10 +110,6 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
         context.data.fresh_engine_labels = Some(fresh);
         Ok(StepResult::Success)
     }
-
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]

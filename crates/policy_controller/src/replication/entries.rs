@@ -58,6 +58,13 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     // first poll.
     ("LoadSink", "report", Fate::Journaled),
     ("LoadSink", "poll_mode", Fate::Read),
+    // The report period is the load driver's own setting, told where the
+    // driver is built: every replica builds its own.
+    (
+        "LoadSink",
+        "heard_every",
+        Fate::Rebuilt("each replica's load driver tells its own report period"),
+    ),
     ("LoadSink", "load", Fate::Read),
     ("LoadSink", "ranks", Fate::Read),
     (
@@ -107,6 +114,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("MemoryStore", "new", Fate::Read),
     ("MemoryStore", "with_publish_window", Fate::Read),
     ("MemoryStore", "journaled", Fate::Read),
+    ("MemoryStore", "followed", Fate::Read),
     ("MemoryStore", "cut", Fate::Read),
     ("MemoryStore", "apply", Fate::NotYet(GENERATION)),
     ("MemoryStore", "world", Fate::Read),
