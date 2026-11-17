@@ -7,10 +7,9 @@ use std::{
 };
 
 use axum::response::Response;
+use bytes::BytesMut;
 use openai_protocol::{
-    chat::{
-        ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
-    },
+    chat::{ChatCompletionRequest, ChatMessageDelta, ChatStreamChoice},
     common::{ChatLogProbs, FunctionCallDelta, ToolCall, ToolCallDelta},
     event_types::{FunctionCallEvent, McpEvent},
     responses::{
@@ -55,7 +54,7 @@ use crate::{
                 ProtoGenerateComplete, ProtoGenerateResponse, ProtoGenerateStreamChunk,
                 ProtoResponseVariant, ProtoStream,
             },
-            regular::streaming::ChatChunkWithUsage,
+            regular::streaming::frames::{assistant_choice, ChatChunkFrame},
             utils,
         },
     },
@@ -348,7 +347,7 @@ impl HarmonyStreamingProcessor {
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        let mut decode = ChatDecode::new(start_time, pd_timing);
+        let mut decode = ChatDecode::new(start_time, pd_timing, dispatch);
         while let Some(result) = decode_stream.next().await {
             let response = result.map_err(|e| {
                 utils::StreamFailure::upstream(e, decode.completion_tokens.delivered())
@@ -358,7 +357,6 @@ impl HarmonyStreamingProcessor {
                     decode
                         .chunk(
                             &chunk,
-                            dispatch,
                             original_request,
                             tx,
                             router_stop_strings,
@@ -371,7 +369,6 @@ impl HarmonyStreamingProcessor {
                     decode
                         .complete(
                             &complete,
-                            dispatch,
                             original_request,
                             tx,
                             prompt_tokens,
@@ -399,7 +396,6 @@ impl HarmonyStreamingProcessor {
                 prompt_tokens,
                 cached_tokens,
                 reservation,
-                dispatch,
                 original_request,
                 tx,
             )
@@ -412,15 +408,15 @@ impl HarmonyStreamingProcessor {
         delta: HarmonyChannelDelta,
         index: u32,
         is_first: bool,
-        dispatch: &context::DispatchMetadata,
+        frame: &ChatChunkFrame,
+        buffer: &mut BytesMut,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
-        encoder: &mut SseEncoder,
         logprobs: Option<ChatLogProbs>,
     ) -> Result<(), String> {
         // On first chunk, emit role announcement separately
         if is_first {
-            Self::emit_role_chunk(index, dispatch, original_request, tx, encoder).await?;
+            Self::emit_role_chunk(index, frame, buffer, original_request, tx).await?;
         }
 
         // Emit content delta (role is always None for content chunks); the
@@ -442,62 +438,44 @@ impl HarmonyStreamingProcessor {
             }),
             reasoning_content: delta.analysis_delta,
         };
-
-        // Build and emit chunk
-        let chunk = ChatCompletionStreamResponse::builder(&dispatch.request_id, &dispatch.model)
-            .created(dispatch.created)
-            .add_choice(ChatStreamChoice {
-                index,
-                delta: chat_delta,
-                logprobs,
-                finish_reason: None,
-                matched_stop: None,
-            })
-            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-            .build();
-
-        let sse_data = encoder
-            .encode_data(&ChatChunkWithUsage::new(
-                &chunk,
-                placeholder_usage(original_request),
-            ))
-            .map_err(|e| format!("JSON serialization error: {e}"))?;
-
-        tx.send(Ok(sse_data))
+        let choice = ChatStreamChoice {
+            index,
+            delta: chat_delta,
+            logprobs,
+            finish_reason: None,
+            matched_stop: None,
+        };
+        Self::send_choice(frame, buffer, &choice, original_request, tx)
             .await
-            .map_err(|_| "Failed to send chunk".to_string())?;
+            .map_err(|()| "Failed to send chunk".to_string())
+    }
 
-        Ok(())
+    /// One chunk carrying `choice`: written behind the stream's head and sent as a frame.
+    async fn send_choice(
+        frame: &ChatChunkFrame,
+        buffer: &mut BytesMut,
+        choice: &ChatStreamChoice,
+        original_request: &ChatCompletionRequest,
+        tx: &SseSender,
+    ) -> Result<(), ()> {
+        frame.write_chunk(buffer, choice, None, placeholder_usage(original_request));
+        tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())
     }
 
     /// The chunk that opens a choice: its role, as the engines' own servers
     /// send it before any content.
     async fn emit_role_chunk(
         index: u32,
-        dispatch: &context::DispatchMetadata,
+        frame: &ChatChunkFrame,
+        buffer: &mut BytesMut,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
-        encoder: &mut SseEncoder,
     ) -> Result<(), String> {
-        let role_chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &dispatch.model)
-                .created(dispatch.created)
-                .add_choice_role(index, "assistant")
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build();
-
-        let sse_data = encoder
-            .encode_data(&ChatChunkWithUsage::new(
-                &role_chunk,
-                placeholder_usage(original_request),
-            ))
-            .map_err(|e| format!("JSON serialization error: {e}"))?;
-
-        tx.send(Ok(sse_data))
+        let mut choice = assistant_choice(index, None, None, None);
+        choice.delta.role = Some("assistant".to_string());
+        Self::send_choice(frame, buffer, &choice, original_request, tx)
             .await
-            .map_err(|_| "Failed to send role chunk".to_string())?;
-
-        Ok(())
+            .map_err(|()| "Failed to send role chunk".to_string())
     }
 
     /// Emit final chunk with finish_reason
@@ -505,29 +483,19 @@ impl HarmonyStreamingProcessor {
         index: u32,
         finish_reason: &str,
         matched_stop: Option<&serde_json::Value>,
-        dispatch: &context::DispatchMetadata,
+        frame: &ChatChunkFrame,
+        buffer: &mut BytesMut,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
-        encoder: &mut SseEncoder,
     ) -> Result<(), String> {
-        let chunk = ChatCompletionStreamResponse::builder(&dispatch.request_id, &dispatch.model)
-            .created(dispatch.created)
-            .add_choice_finish_reason(index, finish_reason, matched_stop.cloned())
-            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-            .build();
-
-        let sse_data = encoder
-            .encode_data(&ChatChunkWithUsage::new(
-                &chunk,
-                placeholder_usage(original_request),
-            ))
-            .map_err(|e| format!("JSON serialization error: {e}"))?;
-
-        tx.send(Ok(sse_data))
+        let choice = ChatStreamChoice {
+            finish_reason: Some(finish_reason.to_string()),
+            matched_stop: matched_stop.cloned(),
+            ..assistant_choice(index, None, None, None)
+        };
+        Self::send_choice(frame, buffer, &choice, original_request, tx)
             .await
-            .map_err(|_| "Failed to send final chunk".to_string())?;
-
-        Ok(())
+            .map_err(|()| "Failed to send final chunk".to_string())
     }
 
     /// Emit the usage chunk at the end: the usage object the non-streamed
@@ -536,26 +504,14 @@ impl HarmonyStreamingProcessor {
     async fn emit_usage_chunk(
         counts: TokenCounts,
         parsed_reasoning_tokens: u32,
-        dispatch: &context::DispatchMetadata,
+        frame: &ChatChunkFrame,
+        buffer: &mut BytesMut,
         tx: &SseSender,
-        encoder: &mut SseEncoder,
     ) -> Result<(), String> {
-        let usage_chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &dispatch.model)
-                .created(dispatch.created)
-                .usage(chat_usage(counts, parsed_reasoning_tokens))
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build();
-
-        let sse_data = encoder
-            .encode_data(&usage_chunk)
-            .map_err(|e| format!("JSON serialization error: {e}"))?;
-
-        tx.send(Ok(sse_data))
+        frame.write_usage_chunk(buffer, &chat_usage(counts, parsed_reasoning_tokens));
+        tx.send(Ok(buffer.split().freeze()))
             .await
-            .map_err(|_| "Failed to send usage chunk".to_string())?;
-
-        Ok(())
+            .map_err(|_| "Failed to send usage chunk".to_string())
     }
 
     /// Process streaming chunks for Responses API iteration.
@@ -1430,8 +1386,8 @@ impl ResponsesDecode {
 }
 
 /// One Harmony chat decode stream as it is read: a parser and its state per choice index
-/// (`n>1`), the router-side stop scanners, the counters the terminal frames bring, and the SSE
-/// encoder every chunk goes through. Each frame goes through [`Self::chunk`] or
+/// (`n>1`), the router-side stop scanners, the counters the terminal frames bring, and the head
+/// every chunk is written behind. Each frame goes through [`Self::chunk`] or
 /// [`Self::complete`]; [`Self::finish`] settles the usage and writes the usage chunk and the
 /// metrics once the stream has ended.
 struct ChatDecode {
@@ -1476,12 +1432,18 @@ struct ChatDecode {
     /// Whether the client left during the read: the stream's verdict, taken before
     /// the finish so that no terminal router metric is recorded for a leaving client.
     client_left: bool,
-    // Reusable SSE encoder shared across every chunk emitted for this stream.
-    encoder: SseEncoder,
+    // The head every chunk of this stream repeats, serialized once, and the buffer the chunks
+    // are written into behind it.
+    frame: ChatChunkFrame,
+    buffer: BytesMut,
 }
 
 impl ChatDecode {
-    fn new(start_time: Instant, pd_timing: Option<context::PdTiming>) -> Self {
+    fn new(
+        start_time: Instant,
+        pd_timing: Option<context::PdTiming>,
+        dispatch: &context::DispatchMetadata,
+    ) -> Self {
         Self {
             start_time,
             first_token_time: None,
@@ -1502,7 +1464,13 @@ impl ChatDecode {
             engine_outlived: false,
             tail_tokens: 0,
             client_left: false,
-            encoder: SseEncoder::new(),
+            frame: ChatChunkFrame::new(
+                &dispatch.request_id,
+                &dispatch.model,
+                dispatch.created,
+                dispatch.weight_version.as_deref(),
+            ),
+            buffer: BytesMut::with_capacity(4096),
         }
     }
 
@@ -1573,11 +1541,9 @@ impl ChatDecode {
     /// a router-side stop emits the choice's final chunk, closes the choice with the chunk's
     /// counts and swallows the rest of its stream (the request is aborted once every choice has
     /// closed).
-    #[expect(clippy::too_many_arguments)]
     async fn chunk(
         &mut self,
         chunk: &ProtoGenerateStreamChunk,
-        dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
         router_stop_strings: &[String],
@@ -1682,10 +1648,10 @@ impl ChatDecode {
                 delta,
                 index,
                 is_first,
-                dispatch,
+                &self.frame,
+                &mut self.buffer,
                 original_request,
                 tx,
-                &mut self.encoder,
                 chunk_logprobs,
             )
             .await?;
@@ -1702,10 +1668,10 @@ impl ChatDecode {
                 index,
                 "stop",
                 Some(&serde_json::Value::String(stop)),
-                dispatch,
+                &self.frame,
+                &mut self.buffer,
                 original_request,
                 tx,
-                &mut self.encoder,
             )
             .await?;
             self.router_stopped.insert(index);
@@ -1739,7 +1705,6 @@ impl ChatDecode {
     async fn complete(
         &mut self,
         complete: &ProtoGenerateComplete,
-        dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
         prompt_tokens: &mut HashMap<u32, u32>,
@@ -1786,10 +1751,10 @@ impl ChatDecode {
             self.note_first_token(&original_request.model);
             HarmonyStreamingProcessor::emit_role_chunk(
                 index,
-                dispatch,
+                &self.frame,
+                &mut self.buffer,
                 original_request,
                 tx,
-                &mut self.encoder,
             )
             .await?;
             self.is_firsts.insert(index, false);
@@ -1804,10 +1769,10 @@ impl ChatDecode {
                 index,
                 complete.finish_reason(),
                 self.matched_stops.get(&index).and_then(|m| m.as_ref()),
-                dispatch,
+                &self.frame,
+                &mut self.buffer,
                 original_request,
                 tx,
-                &mut self.encoder,
             )
             .await?;
             return Ok(());
@@ -1836,10 +1801,10 @@ impl ChatDecode {
                 flushed,
                 index,
                 false,
-                dispatch,
+                &self.frame,
+                &mut self.buffer,
                 original_request,
                 tx,
-                &mut self.encoder,
                 None,
             )
             .await?;
@@ -1849,10 +1814,10 @@ impl ChatDecode {
             index,
             &final_output.finish_reason,
             matched_stop.as_ref(),
-            dispatch,
+            &self.frame,
+            &mut self.buffer,
             original_request,
             tx,
-            &mut self.encoder,
         )
         .await?;
         Ok(())
@@ -1865,7 +1830,6 @@ impl ChatDecode {
         prompt_tokens: &HashMap<u32, u32>,
         cached_tokens: &HashMap<u32, u32>,
         reservation: Option<Arc<SharedReservationHandle>>,
-        dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
     ) -> Result<(), utils::StreamFailure> {
@@ -1929,9 +1893,9 @@ impl ChatDecode {
             HarmonyStreamingProcessor::emit_usage_chunk(
                 counts,
                 self.parsed_reasoning_tokens,
-                dispatch,
+                &self.frame,
+                &mut self.buffer,
                 tx,
-                &mut self.encoder,
             )
             .await?;
         }

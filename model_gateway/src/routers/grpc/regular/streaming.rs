@@ -18,7 +18,7 @@ use llm_tokenizer::{
     traits::Tokenizer,
 };
 use openai_protocol::{
-    chat::{ChatCompletionStreamResponse, ChatStreamChoice},
+    chat::ChatStreamChoice,
     common::{
         ChatLogProbs, FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice,
         ToolChoiceValue, Usage,
@@ -75,7 +75,7 @@ use crate::{
 };
 
 mod completion;
-mod frames;
+pub(crate) mod frames;
 
 use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
@@ -3204,26 +3204,6 @@ impl StreamingProcessor {
             server_tool_use: None,
             output_tokens_details: thinking_tokens
                 .map(|thinking_tokens| messages::OutputTokensDetails { thinking_tokens }),
-        }
-    }
-}
-
-/// Add the wire's null placeholder without allocating a JSON value per
-/// token or changing the shared Chat response type. A populated usage field
-/// is serialized only by `chunk`, so there is never a duplicate JSON key.
-#[derive(Serialize)]
-pub(crate) struct ChatChunkWithUsage<'a> {
-    #[serde(flatten)]
-    chunk: &'a ChatCompletionStreamResponse,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<()>,
-}
-
-impl<'a> ChatChunkWithUsage<'a> {
-    pub(crate) fn new(chunk: &'a ChatCompletionStreamResponse, emit_usage_null: bool) -> Self {
-        Self {
-            chunk,
-            usage: (emit_usage_null && chunk.usage.is_none()).then_some(()),
         }
     }
 }
