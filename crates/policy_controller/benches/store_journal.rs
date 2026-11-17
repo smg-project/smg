@@ -293,28 +293,32 @@ fn load_write_drained(c: &mut Criterion) {
         let pool = pool_of(n, Some(LOADS));
         let log = Arc::clone(pool.log.as_ref().expect("the journaled pool's log"));
         let stop = Arc::new(AtomicBool::new(false));
+        // The reader's start, taken before the first write: whatever the
+        // run writes stands after it.
+        let mut place = log.head(Kinds::All);
         let reader = {
             let stop = Arc::clone(&stop);
             thread::spawn(move || {
-                let mut place = log.head(Kinds::All);
                 let mut out = Vec::with_capacity(Log::BATCH);
                 let mut read = 0u64;
-                while !stop.load(Ordering::Relaxed) {
+                loop {
+                    // Asked before the read: one read follows the last
+                    // write, so a run of one write is read too.
+                    let asked = stop.load(Ordering::Relaxed);
                     if log.read(Kinds::All, place, Log::BATCH, &mut out).is_err() {
                         // The ring passed the reader: it starts again at
                         // the head, as a standby does from a snapshot.
                         place = log.head(Kinds::All);
-                        continue;
+                    } else if let Some(last) = out.last() {
+                        place = last.at;
+                        read += out.len() as u64;
+                    } else {
+                        std::hint::spin_loop();
                     }
-                    match out.last() {
-                        Some(last) => {
-                            place = last.at;
-                            read += out.len() as u64;
-                        }
-                        None => std::hint::spin_loop(),
+                    if asked {
+                        break read;
                     }
                 }
-                read
             })
         };
         let at = pool.opened + Duration::from_millis(1);

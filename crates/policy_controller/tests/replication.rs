@@ -142,10 +142,22 @@ where
     served.expect("a clean drain");
 }
 
-/// A lease file of the case's own, which a leader released: a shared
-/// lease, so the store journals its load rows, and one the case's replica
-/// leads at its take. A take of a lease nobody held leads one renew
-/// deadline later.
+/// `google.rpc.Status`, as a client of any gRPC stack decodes a status's
+/// details.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<prost_types::Any>,
+}
+
+/// A lease file of the case's own, which a holder that led released: a
+/// shared lease, so the store journals its load rows, and one the case's
+/// replica leads at its take. A take of a record with no holder to wait
+/// for opens its fence one renew deadline later.
 fn shared(dir: &tempfile::TempDir) -> LeasePlace {
     let path = dir.path().join("lease");
     let lease = Box::new(FileLease::new(&path));
@@ -153,10 +165,9 @@ fn shared(dir: &tempfile::TempDir) -> LeasePlace {
         .expect("the settings are in order");
     let took = before.tick(Instant::now());
     assert!(matches!(took, Ok(Tick::Acquired { .. })), "{took:?}");
-    // A release inside the take's wait hands the wait on. The holder
-    // before leads first: its wait runs from the take's own read of the
-    // clock, and a renewal one renew deadline after the take returned
-    // opens the fence.
+    // A release inside the take's wait hands the wait on, so the holder
+    // before leads first: its take opens no fence until a renewal one
+    // renew deadline after it.
     let led = Instant::now() + settings().renew_deadline;
     let renewed = before.tick(led);
     assert!(matches!(renewed, Ok(Tick::Renewed { .. })), "{renewed:?}");
@@ -463,8 +474,20 @@ async fn a_standby_is_sent_the_log_from_its_place_and_told_to_resync_from_any_ot
             panic!("a standby that saw a later term is not served");
         };
         assert_eq!(deposed.code(), Code::FailedPrecondition);
-        let details = proto::NotLeader::decode(deposed.details()).expect("the details");
-        assert_eq!(details.leader_address, "", "this replica knows no leader");
+        // The details are a `google.rpc.Status`, the form every gRPC client
+        // decodes them as: the code again, and a NotLeader under its type's
+        // URL that names no leader, since this replica knows none.
+        let details = RpcStatus::decode(deposed.details()).expect("a google.rpc.Status");
+        assert_eq!(details.code, Code::FailedPrecondition as i32);
+        let [detail] = details.details.as_slice() else {
+            panic!("one detail: {details:?}");
+        };
+        assert_eq!(
+            detail.type_url,
+            "type.googleapis.com/smg.policy.v1.NotLeader"
+        );
+        let named = proto::NotLeader::decode(detail.value.as_slice()).expect("a NotLeader");
+        assert_eq!(named.leader_address, "", "this replica knows no leader");
 
         // So is one whose place stands under a later term, whatever floor
         // it states: a deposed leader restores no standby.
@@ -523,8 +546,9 @@ async fn a_standby_that_acknowledges_nothing_is_cut_at_its_backlog() {
                 .expect("the stream's own channel");
         }
 
-        // The same log to a standby that acknowledges nothing: cut once it
-        // holds more than 300 events, told to re-sync, then the status.
+        // The same log to a standby that acknowledges nothing: sent its 300
+        // events and no more, told to re-sync a second later, then the
+        // status.
         let mut slow = replicate(leader.replication, hello)
             .await
             .expect("a stream");
@@ -535,11 +559,61 @@ async fn a_standby_that_acknowledges_nothing_is_cut_at_its_backlog() {
                 break batch;
             }
             held += batch.events.len();
-            assert!(held <= 802, "{held} events and no cut");
+            assert!(held <= 300, "{held} events and no cut");
         };
-        assert!((301..=802).contains(&held), "{held} events before the cut");
+        assert_eq!(held, 300, "events before the cut");
         assert!(cut.events.is_empty());
         assert_eq!(slow.ended().await, Some(Code::ResourceExhausted));
+
+        // A bound under one batch: a standby that acknowledges each batch
+        // is sent the same log to its head, 64 events a batch at the most.
+        let small = proto::ReplicaHello {
+            max_backlog: 64,
+            ..place(0, 0)
+        };
+        let mut patient = replicate(leader.replication, small)
+            .await
+            .expect("a stream");
+        let mut at = 0;
+        while at < head {
+            let batch = patient.batch().await;
+            assert!(!batch.resync_required, "cut at {at}");
+            assert!(batch.events.len() <= 64, "{}", batch.events.len());
+            at = batch.first_seq + count(batch.events.len()) - 1;
+            patient
+                .frames
+                .send(ack(at))
+                .await
+                .expect("the stream's own channel");
+        }
+        assert_eq!(at, head);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_standby_behind_wide_replacements_catches_up_in_messages_the_transport_reads() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    with_leader(shared(&dir), |leader| async move {
+        // 257 registrations of one worker, each a later incarnation of a row
+        // that holds three labels at a value's bound: an event carries the
+        // row it replaced beside the row it wrote, and one batch's count of
+        // them weighs more than the 4 MiB a client reads.
+        for incarnation in 1..=257 {
+            leader.store.upsert(WorkerFacts {
+                labels: ["a", "b", "c"]
+                    .map(|key| (key.to_owned(), "v".repeat(4_096)))
+                    .into(),
+                ..facts("http://a:8000", incarnation, 0)
+            });
+        }
+        let mut standby = replicate(leader.replication, place(0, 0))
+            .await
+            .expect("a stream");
+        let events = standby.until(258).await;
+        assert_eq!(events.len(), 258);
+        let bytes: usize = events.iter().map(prost::Message::encoded_len).sum();
+        assert!(bytes > 4 * 1024 * 1024, "{bytes}");
     })
     .await;
 }
@@ -1041,6 +1115,24 @@ async fn a_frame_out_of_the_streams_order_is_refused_and_a_frame_of_no_kind_is_i
             .await
             .expect("the stream's own channel");
         assert_eq!(joined.ended().await, Some(Code::InvalidArgument));
+        // A frame the leader cannot read ends the stream under the
+        // transport's own status, never as a clean end: here a frame above
+        // the 4 MiB one message may be.
+        let mut joined = replicate(leader.replication, place(0, 0))
+            .await
+            .expect("a stream");
+        let wide = proto::ReplicaHello {
+            replica_id: "r".repeat(5 << 20),
+            ..place(0, 0)
+        };
+        joined
+            .frames
+            .send(proto::ReplicaFrame {
+                frame: Some(Frame::Hello(wide)),
+            })
+            .await
+            .expect("the stream's own channel");
+        assert_eq!(joined.ended().await, Some(Code::OutOfRange));
     })
     .await;
 }
@@ -1070,6 +1162,69 @@ async fn a_standby_that_closes_its_half_ends_the_stream() {
         .await
         .expect("the stream ends within 20 s");
         assert!(ended.is_ok(), "{ended:?}");
+    })
+    .await;
+}
+
+/// The fence at the wire. A leader whose lease is gone ends an open stream
+/// `ABORTED` at its next look of the lease. A hello it still waited for is
+/// refused the same way, though it names a place the log does not hold: a
+/// replica that lost the lead tells no standby to re-sync. Both calls are
+/// refused after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let lease = dir.path().join("lease");
+    with_leader(shared(&dir), |leader| async move {
+        writes(&leader.store, 3);
+        let base = snapshot(leader.replication).await.expect("a snapshot");
+        let held = place(base.replication_seq, base.replication_term);
+        let mut open = replicate(leader.replication, held.clone())
+            .await
+            .expect("a stream");
+        // A second call says no hello yet, from a task of its own. Nothing
+        // orders it ahead of the snapshot asked here: it has that round
+        // trip, and the leader's wait for its next look at the lease, to
+        // be admitted while the leader leads.
+        let mut waits = client(leader.replication).await;
+        let (late, sent) = mpsc::channel(1);
+        let mut waiting = JoinSet::new();
+        waiting.spawn({
+            let mut waits = waits.clone();
+            async move {
+                waits
+                    .replicate(stated(ReceiverStream::new(sent)))
+                    .await
+                    .map(|_| ())
+            }
+        });
+        waits
+            .get_snapshot(stated(proto::SnapshotRequest::default()))
+            .await
+            .expect("a snapshot while the leader leads");
+        std::fs::remove_file(&lease).expect("the lease file");
+        assert_eq!(open.ended().await, Some(Code::Aborted));
+        // The fence is closed, and the hello names a place past the head.
+        let lost = place(base.replication_seq + 1_000, base.replication_term);
+        late.send(proto::ReplicaFrame {
+            frame: Some(Frame::Hello(lost)),
+        })
+        .await
+        .expect("the call's own channel");
+        let refused = tokio::time::timeout(Duration::from_secs(20), waiting.join_next())
+            .await
+            .expect("the leader answers within 20 s")
+            .expect("the one call")
+            .expect("the call's task")
+            .expect_err("a replica that lost the lead joins no feed");
+        assert_eq!(refused.code(), Code::Aborted);
+        for after in [
+            replicate(leader.replication, held).await.map(|_| ()),
+            snapshot(leader.replication).await.map(|_| ()),
+        ] {
+            let refused = after.expect_err("no call is served past the lead");
+            assert_eq!(refused.code(), Code::FailedPrecondition);
+        }
     })
     .await;
 }
@@ -1233,6 +1388,28 @@ async fn the_streams_numbers() {
                 lines.push(format!(
                     "RESIDENT before_kb={before} after_70000_load_rows_kb={}",
                     resident_kb()
+                ));
+                // A catch-up: 60,000 load rows that stand in the log, read by
+                // one standby from the place before them.
+                let from = snapshot(leader.replication).await.expect("a snapshot");
+                for turn in 0..60_000usize {
+                    let id = ids[turn % ids.len()];
+                    leader
+                        .store
+                        .record(id, 0, running(5), now, LoadSource::Stream);
+                }
+                let (cpu, at) = (cpu_ms(), Instant::now());
+                let mut behind = replicate(
+                    leader.replication,
+                    place(from.replication_seq, from.replication_term),
+                )
+                .await
+                .expect("a stream");
+                let events = behind.until(from.replication_seq + 60_000).await.len();
+                lines.push(format!(
+                    "CATCHUP events={events} micros={} cpu_ms={}",
+                    at.elapsed().as_micros(),
+                    cpu_ms() - cpu
                 ));
             }
             let fleet = Arc::new(ids.clone());
