@@ -184,11 +184,10 @@ pub(crate) struct Shared {
     /// election.
     pub(crate) floors: Floors,
     /// How far behind its leader this replica is while it follows one: the
-    /// standby loop writes it.
+    /// standby loop writes it. It holds the bound a standby reads synced
+    /// under, the first of the three counts of design 5.4: made again
+    /// where the configuration is known.
     pub(crate) lag: Arc<Lag>,
-    /// The lag a standby reads synced under, the first of the three counts
-    /// of design 5.4: set where the configuration is known.
-    pub(crate) synced_within: Duration,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -255,8 +254,7 @@ impl Shared {
                 Arc::clone(&feed.log),
                 elector.fence(),
             ),
-            lag: Arc::new(Lag::new()),
-            synced_within: standby::synced_within(Duration::ZERO),
+            lag: Arc::new(Lag::new(standby::synced_within(Duration::ZERO))),
             store,
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
@@ -604,16 +602,17 @@ impl Service {
         } = shared.leader(shared.fence.leader_term(now));
         // A replica that follows says how far behind it is, by the age of
         // its stream's last applied frame; a leader follows nobody.
-        // `synced` reads that lag alone: the live ranks and the generation
-        // narrow the same bit with their steps.
-        let lag = shared.lag.age(now).filter(|_| !is_leader);
+        // `synced` is the same read of that lag, and reads it alone: the
+        // live ranks and the generation narrow the same bit with their
+        // steps.
+        let read = shared.lag.read(now).filter(|_| !is_leader);
         proto::LeaderInfo {
             controller_id,
             address,
             term,
             is_leader,
-            synced: lag.is_some_and(|lag| lag < shared.synced_within),
-            sync: lag.map(|lag| proto::SyncState {
+            synced: read.is_some_and(|(_, lapse)| lapse.is_some()),
+            sync: read.map(|(lag, _)| proto::SyncState {
                 replication_lag_ms: u32::try_from(lag.as_millis()).unwrap_or(u32::MAX),
                 ..proto::SyncState::default()
             }),
@@ -2146,7 +2145,7 @@ mod tests {
 
     #[test]
     fn a_follower_says_its_lag_and_reads_synced_under_the_bound() {
-        let (_elector, standing, service) = service(&[Scope::Replication]);
+        let (mut elector, standing, service) = service(&[Scope::Replication]);
         standing.send_replace(saw("controller-1@10.0.0.8:30100", 4));
         let at = Instant::now();
         // No frame applied yet: no sync state.
@@ -2156,7 +2155,7 @@ mod tests {
         // The lag holds the frame's instant at a whole microsecond: read
         // from that instant, the bound is met to the nanosecond.
         let at = at - service.shared.lag.age(at).expect("a frame applied");
-        let within = service.shared.synced_within;
+        let within = service.shared.lag.within();
         let lag = |info: &proto::LeaderInfo| info.sync.map(|sync| sync.replication_lag_ms);
         let under = service.leader_info(at + within - Duration::from_millis(1));
         assert!(under.synced);
@@ -2165,6 +2164,20 @@ mod tests {
         let at_it = service.leader_info(at + within);
         assert!(!at_it.synced);
         assert_eq!(lag(&at_it), u32::try_from(within.as_millis()).ok());
+
+        // A replica that leads follows nobody, whatever frame it applied
+        // before its take: it is not synced and says no sync state. A take
+        // of a lease nobody held leads from its first renewal one renew
+        // deadline later.
+        let took = Instant::now();
+        elector.tick(took).expect("the take");
+        // The wait runs from the take's own read, a moment after `took`.
+        let wait = ElectionSettings::default().renew_deadline + Duration::from_secs(1);
+        let now = took + wait;
+        elector.tick(now).expect("the renewal");
+        service.shared.lag.applied(now);
+        let led = service.leader_info(now);
+        assert!(led.is_leader && !led.synced && led.sync.is_none());
     }
 
     #[tokio::test]

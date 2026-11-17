@@ -55,7 +55,9 @@ mod watch_workers;
 mod wire;
 mod worker_wire;
 
-use std::{future::Future, io, net::SocketAddr, path::PathBuf, pin::pin, sync::Arc};
+use std::{
+    convert::Infallible, future::Future, io, net::SocketAddr, path::PathBuf, pin::pin, sync::Arc,
+};
 
 use axum::serve::{ListenerExt as _, TapIo};
 use tokio::{
@@ -90,7 +92,7 @@ use self::{
     service::{Service, Shared},
     spec_file::SpecFile,
     spec_store::SpecStore,
-    standby::Standby,
+    standby::{Lag, Standby},
 };
 use crate::{
     catalog::Catalog,
@@ -425,7 +427,7 @@ impl Controller {
             "election"
         );
         let (standing, stood) = watch::channel(Standing::default());
-        let (phase, readiness) = readiness::channel(elector.fence(), stood.clone());
+        let steps = stood.clone();
         let journal = replication::journaled(&config.election.lease);
         let mut shared = Shared::new(
             config.controller_id.clone(),
@@ -437,7 +439,9 @@ impl Controller {
             config.decide_shards,
         )
         .map_err(Error::Deciders)?;
-        shared.synced_within = standby::synced_within(config.load_poll_interval);
+        shared.lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
+        let (phase, readiness) =
+            readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
         let shared = Arc::new(shared);
         let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
         Ok(Self {
@@ -633,7 +637,10 @@ impl Controller {
     /// first tick (idle while the store has no rows); the election thread
     /// takes its first look at the lease, and the state turns
     /// [`State::Leader`] or [`State::Follower`] and the health service's
-    /// overall status `SERVING` once that look has landed. At the shutdown
+    /// overall status `SERVING` once that look has landed. A replica that
+    /// runs a standby turns [`State::Syncing`] where it does not lead, and
+    /// is [`State::Follower`] and `SERVING` only while its standby is
+    /// synced with its leader. At the shutdown
     /// the state turns [`State::Draining`] and the overall status
     /// `NOT_SERVING` at once, and a leader closes its fence and releases the
     /// lease before the settle window, so a follower takes it within one
@@ -778,6 +785,9 @@ impl Controller {
                 port,
                 "this replica follows its leader while it does not lead"
             );
+            // From here this replica is ready as a follower only while
+            // its standby is synced.
+            shared.lag.follow();
             let standby = Standby::new(Arc::clone(&shared), port);
             let standby_stop = stop.subscribe();
             tasks.spawn(async move {
@@ -852,23 +862,34 @@ impl Controller {
         let leave = match starting {
             Some(leave) => leave,
             None => {
-                for reporter in &reporters {
-                    reporter
-                        .set_service_status("", ServingStatus::Serving)
-                        .await;
+                // A replica that runs no standby is ready from here, and
+                // its word is told before the state moves. One that runs a
+                // standby is ready only while it is synced: its word is
+                // told at each turn.
+                let mut told = None;
+                if follows.is_none() {
+                    for reporter in &reporters {
+                        reporter
+                            .set_service_status("", ServingStatus::Serving)
+                            .await;
+                    }
+                    told = Some(true);
                 }
                 phase.send_replace(Phase::Serving);
-                info!(
-                    controller_id = %config.controller_id,
-                    role = readiness.state().as_str(),
-                    membership_epoch = store.epoch(),
-                    "ready"
-                );
+                let mut word = Box::pin(tell_readiness(
+                    readiness.clone(),
+                    &reporters,
+                    told,
+                    follows.is_some(),
+                    &config.controller_id,
+                    &store,
+                ));
                 tokio::select! {
                     () = &mut shutdown => Leave::Signal,
                     joined = tasks.join_next() => Leave::Task(joined),
                     () = election.ended() => Leave::Election,
                     error = &mut fault => Leave::Task(Some(Ok(Err(error)))),
+                    never = &mut word => match never {},
                 }
             }
         };
@@ -1058,6 +1079,57 @@ fn following(listeners: &[Bound]) -> Result<u16, NoFollow> {
     Err(why)
 }
 
+/// Tells every listener's overall word as the readiness turns and says each
+/// turn once in the log: the word's one writer while the controller serves.
+/// `told` is the word the listeners hold at the call. A replica that runs
+/// no standby (`follows` false) is ready from its first look to its drain,
+/// so its word is told once. Never resolves.
+async fn tell_readiness(
+    mut role: Readiness,
+    reporters: &[HealthReporter],
+    mut told: Option<bool>,
+    follows: bool,
+    controller_id: &str,
+    store: &MemoryStore,
+) -> Infallible {
+    let mut said = None;
+    loop {
+        let (state, lapse) = role.read();
+        let ready = state.is_ready();
+        if told != Some(ready) {
+            let word = if ready {
+                ServingStatus::Serving
+            } else {
+                ServingStatus::NotServing
+            };
+            for reporter in reporters {
+                reporter.set_service_status("", word).await;
+            }
+            told = Some(ready);
+        }
+        if said != Some(ready) {
+            if ready {
+                info!(
+                    controller_id,
+                    role = state.as_str(),
+                    membership_epoch = store.epoch(),
+                    "ready"
+                );
+            } else {
+                info!(
+                    controller_id,
+                    role = state.as_str(),
+                    "not ready: the standby is not synced with its leader"
+                );
+            }
+            said = Some(ready);
+        }
+        if !follows || role.moved_by(lapse).await.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! What no case outside the module reaches: a serve whose election
@@ -1089,8 +1161,9 @@ mod tests {
         election::{self, Standing},
         following,
         principal::Layer,
-        readiness::{self, Phase},
-        tell_role, Bound, Controller, Error, NoFollow, Scope,
+        readiness::{self, tests::fenced, Phase},
+        standby::Lag,
+        tell_readiness, tell_role, Bound, Controller, Error, NoFollow, Scope,
     };
     use crate::{
         elector::{
@@ -1460,7 +1533,8 @@ mod tests {
         let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
             .expect("the default settings are in order");
         let (steps, stepped) = watch::channel(Standing::default());
-        let (phase, readiness) = readiness::channel(elector.fence(), stepped);
+        let (phase, readiness) =
+            readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (stop, stopped) = watch::channel(false);
         let (told, mut role) = watch::channel(false);
         let mut teller = JoinSet::new();
@@ -1517,7 +1591,8 @@ mod tests {
         let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
             .expect("the default settings are in order");
         let (steps, stepped) = watch::channel(Standing::default());
-        let (phase, readiness) = readiness::channel(elector.fence(), stepped);
+        let (phase, readiness) =
+            readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (_stop, stopped) = watch::channel(false);
         let (told, mut role) = watch::channel(false);
         let mut teller = JoinSet::new();
@@ -1577,7 +1652,8 @@ mod tests {
             )
             .expect("the settings are in order");
             let (steps, stepped) = watch::channel(Standing::default());
-            let (phase, readiness) = readiness::channel(elector.fence(), stepped);
+            let (phase, readiness) =
+                readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
             let (stop, stopped) = watch::channel(false);
             let (told, role) = watch::channel(false);
             let mut teller = JoinSet::new();
@@ -1718,6 +1794,79 @@ mod tests {
             .map(|addr| addr.port());
         assert_eq!(replica.follows().ok(), port);
         // Synced reads the configured poll interval, not the stock one.
-        assert_eq!(replica.shared.synced_within, Duration::from_secs(30));
+        assert_eq!(replica.shared.lag.within(), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn a_standbys_word_follows_its_sync_with_no_step_of_the_election() {
+        use std::{convert::Infallible, future::Future};
+
+        use tonic_health::{
+            pb::{
+                health_check_response::ServingStatus as Word, health_server::Health as _,
+                HealthCheckRequest,
+            },
+            server::{health_reporter, HealthService},
+        };
+
+        use crate::store::MemoryStore;
+
+        /// Runs the teller until the overall word is `wanted`; fails after
+        /// ten seconds.
+        async fn told(
+            teller: &mut (impl Future<Output = Infallible> + Unpin),
+            service: &HealthService,
+            wanted: Word,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let overall = HealthCheckRequest {
+                    service: String::new(),
+                };
+                let answer = service.check(tonic::Request::new(overall)).await;
+                let word = answer.expect("the overall name is known").into_inner();
+                if word.status() == wanted {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the word is not {wanted:?} after ten seconds"
+                );
+                tokio::select! {
+                    never = &mut *teller => match never {},
+                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+        }
+
+        let (elector, _phase, _steps, _) = fenced();
+        // A standby under a bound short enough to wait out, and long
+        // beside a slow host's pauses.
+        let bound = Duration::from_secs(1);
+        let lag = Arc::new(Lag::new(bound));
+        lag.follow();
+        let (_standing, stepped) = watch::channel(Standing::default());
+        let (phase, role) = readiness::channel(elector.fence(), stepped, Arc::clone(&lag));
+        phase.send_replace(Phase::Serving);
+        let (reporter, _server) = health_reporter();
+        let service = HealthService::from_health_reporter(reporter.clone());
+        let store = MemoryStore::new();
+        let reporters = [reporter];
+        let teller = tell_readiness(role, &reporters, None, true, "controller-0", &store);
+        tokio::pin!(teller);
+
+        // No frame yet: the word is told NOT_SERVING.
+        told(&mut teller, &service, Word::NotServing).await;
+        // A frame: the lag tells the turn and the word follows.
+        let first = Instant::now();
+        lag.applied(first);
+        told(&mut teller, &service, Word::Serving).await;
+        // No further frame: the word lapses with the sync by the clock
+        // alone, with no step of the election and no move of the run loop.
+        told(&mut teller, &service, Word::NotServing).await;
+        // An apply that straddled the lapse: its frame is dated inside the
+        // bound and written after the word turned. The word follows it.
+        lag.applied(first + bound - Duration::from_millis(1));
+        told(&mut teller, &service, Word::Serving).await;
     }
 }

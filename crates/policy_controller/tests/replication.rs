@@ -50,6 +50,9 @@ use tonic::{
     codegen::tokio_stream::wrappers::ReceiverStream, metadata::AsciiMetadataValue,
     transport::Channel, Code, Request, Status, Streaming,
 };
+use tonic_health::pb::{
+    health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
+};
 
 /// Long against a loaded host: the leader of the case's start leads to its
 /// end.
@@ -1558,6 +1561,15 @@ impl Replica {
         );
     }
 
+    /// Resolves once the replica's state is `state`, within 30 s.
+    async fn reads(&mut self, state: State) {
+        let read = self.readiness.wait_for(state);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), read).await,
+            Ok(Some(state))
+        );
+    }
+
     /// The planned stop, which releases the lease, and its drain.
     async fn stop(mut self) {
         self.stop.send(()).expect("the serve still runs");
@@ -1875,6 +1887,92 @@ async fn a_following_standbys_numbers() {
         resident_kb()
     )
     .expect("stdout");
+    standby.stop().await;
+    leader.stop().await;
+}
+
+/// The listener's overall word: the health service's answer for no name.
+async fn overall(addr: SocketAddr) -> ServingStatus {
+    let channel = Channel::from_shared(format!("http://{addr}"))
+        .expect("a uri")
+        .connect()
+        .await
+        .expect("the listener accepts");
+    HealthClient::new(channel)
+        .check(HealthCheckRequest {
+            service: String::new(),
+        })
+        .await
+        .expect("the health service answers for no name")
+        .into_inner()
+        .status()
+}
+
+/// The sample of `series`, a series of no label, on the replica's metrics
+/// page.
+async fn sample(admin: SocketAddr, series: &str) -> String {
+    let (status, page) = http_get(admin, "/metrics").await.expect("the metrics page");
+    assert_eq!(status, 200);
+    let sample = page
+        .lines()
+        .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '));
+    sample.expect("the series").to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_standby_passes_its_probes_only_while_it_is_synced_with_its_leader() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
+    leader.leads().await;
+    let port = leader.replication.port();
+
+    // A standby that cannot reach its leader: it dials the leader's
+    // address at its own replication port, where no replication listener
+    // answers. It serves, and no probe of it passes.
+    let mut apart = Replica::serve("replication-1", FOLLOWER, 0, shared(&dir)).await;
+    assert_ne!(apart.replication.port(), port);
+    apart.reads(State::Syncing).await;
+    let (status, body) = http_get(apart.admin, "/readiness")
+        .await
+        .expect("the probe");
+    assert_eq!(
+        (status, body.as_str()),
+        (503, r#"{"status":"not ready","reason":"syncing"}"#)
+    );
+    assert_eq!(overall(apart.replication).await, ServingStatus::NotServing);
+    let state = "smg_policy_controller_state{state=\"syncing\"}";
+    assert_eq!(sample(apart.admin, state).await, "1");
+    assert_eq!(
+        sample(apart.admin, "smg_policy_controller_replication_synced").await,
+        "0"
+    );
+    apart.stop().await;
+
+    // One that follows its leader passes them once its first frame is
+    // applied, and says so on its metrics page.
+    let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
+    standby.reads(State::Follower).await;
+    let (status, body) = http_get(standby.admin, "/readiness")
+        .await
+        .expect("the probe");
+    assert_eq!(
+        (status, body.as_str()),
+        (200, r#"{"status":"ready","role":"follower"}"#)
+    );
+    // The word is told after the state turns.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while overall(standby.replication).await != ServingStatus::Serving {
+        assert!(
+            Instant::now() < deadline,
+            "a synced standby's word is not SERVING after 20 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        sample(standby.admin, "smg_policy_controller_replication_synced").await,
+        "1"
+    );
+    assert_eq!(sample(standby.admin, state).await, "0");
     standby.stop().await;
     leader.stop().await;
 }

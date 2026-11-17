@@ -156,36 +156,123 @@ impl Follower {
 }
 
 /// How far behind its leader a standby is, as its last applied frame says
-/// it: the loop writes it and `Leader` reads it.
+/// it: the loop writes it, and `Leader` and the readiness read it.
 #[derive(Debug)]
 pub(crate) struct Lag {
     origin: Instant,
+    /// The lag this replica reads synced under ([`synced_within`]).
+    within: Duration,
     /// The last applied frame, in microseconds past the origin plus one;
-    /// `0` before any.
+    /// `0` before any, and once this replica has led since.
     frame: AtomicU64,
+    /// Whether the serve runs a standby that writes this lag.
+    follows: AtomicBool,
+    /// The turns a reader may have missed, which looks again at each: a
+    /// frame written after no frame, or when the frame before was as old
+    /// as the bound by the clock of the write, and a frame forgotten.
+    turns: watch::Sender<u64>,
 }
 
 impl Lag {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(within: Duration) -> Self {
         Self {
             origin: Instant::now(),
+            within,
             frame: AtomicU64::new(0),
+            follows: AtomicBool::new(false),
+            turns: watch::Sender::new(0),
         }
     }
 
     /// A frame of the leader's stream, or its snapshot, was applied at
     /// `at`.
     pub(crate) fn applied(&self, at: Instant) {
-        let micros = at.saturating_duration_since(self.origin).as_micros();
-        let micros = u64::try_from(micros).unwrap_or(u64::MAX - 1);
-        self.frame.store(micros + 1, Ordering::Relaxed);
+        let before = self.store(at);
+        // The clock is read after the write: whoever read the frame before
+        // this one read it no later.
+        self.turn(before, Instant::now());
     }
 
-    /// The age at `now` of the last applied frame; `None` before any.
-    pub(crate) fn age(&self, now: Instant) -> Option<Duration> {
+    /// Forgets the last applied frame, and tells a turn where there was
+    /// one. The standby loop's call once this replica has held the lease:
+    /// a frame it applied before its own lead says nothing of the leader
+    /// it follows next.
+    pub(crate) fn forget(&self) {
+        if self.frame.swap(0, Ordering::Relaxed) != 0 {
+            self.turns.send_modify(|turns| *turns += 1);
+        }
+    }
+
+    /// Stores the frame's instant, and returns what the frame before left.
+    fn store(&self, at: Instant) -> u64 {
+        let micros = at.saturating_duration_since(self.origin).as_micros();
+        let micros = u64::try_from(micros).unwrap_or(u64::MAX - 1);
+        self.frame.swap(micros + 1, Ordering::Relaxed)
+    }
+
+    /// Tells a turn where the frame `before` left was none, or was as old
+    /// as the bound at `wrote`, the clock of the write that replaced it. A
+    /// reader judges the sync by the clock at its read, so one may have
+    /// read it gone whatever instant the new frame carries: an apply that
+    /// straddles the lapse writes a frame dated before it.
+    fn turn(&self, before: u64, wrote: Instant) {
+        let silent = before.checked_sub(1).is_none_or(|before| {
+            let last = self.origin + Duration::from_micros(before);
+            wrote.saturating_duration_since(last) >= self.within
+        });
+        if silent {
+            self.turns.send_modify(|turns| *turns += 1);
+        }
+    }
+
+    /// The last applied frame at `now`, by one read of it: its age, and the
+    /// instant the sync lapses with no further frame, none where the frame
+    /// is as old as the bound already. `None` where the lag holds no
+    /// frame. This replica is synced while there is such an instant: the
+    /// `Leader` call's `synced` and a follower's readiness are this read.
+    pub(crate) fn read(&self, now: Instant) -> Option<(Duration, Option<Instant>)> {
         let frame = self.frame.load(Ordering::Relaxed).checked_sub(1)?;
         let applied = self.origin + Duration::from_micros(frame);
-        Some(now.saturating_duration_since(applied))
+        let lapse = applied + self.within;
+        let age = now.saturating_duration_since(applied);
+        Some((age, (now < lapse).then_some(lapse)))
+    }
+
+    /// The age at `now` of the last applied frame; `None` where the lag
+    /// holds none.
+    #[cfg(test)]
+    pub(crate) fn age(&self, now: Instant) -> Option<Duration> {
+        self.read(now).map(|(age, _)| age)
+    }
+
+    /// Whether this replica is synced at `now`: its last applied frame is
+    /// younger than the bound.
+    #[cfg(test)]
+    pub(crate) fn synced(&self, now: Instant) -> bool {
+        self.read(now).is_some_and(|(_, lapse)| lapse.is_some())
+    }
+
+    /// The bound [`Lag::synced`] reads under.
+    #[cfg(test)]
+    pub(crate) fn within(&self) -> Duration {
+        self.within
+    }
+
+    /// The serve runs a standby from here: this replica is ready as a
+    /// follower only while it is synced.
+    pub(crate) fn follow(&self) {
+        self.follows.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the serve runs a standby that writes this lag.
+    pub(crate) fn follows(&self) -> bool {
+        self.follows.load(Ordering::Relaxed)
+    }
+
+    /// A reader's view of the turns: it changes when a frame ends a
+    /// silence that had ended the sync.
+    pub(crate) fn turns(&self) -> watch::Receiver<u64> {
+        self.turns.subscribe()
     }
 }
 
@@ -372,14 +459,23 @@ impl Standby {
     /// applied nothing is said once, by its reason, and waits longer a
     /// stream ([`backoff`]); the lease naming another holder ends the wait,
     /// and the stream wherever it stands, the leader's answer not waited
-    /// for.
+    /// for. A replica that has held the lease is synced again at the first
+    /// frame of the leader it follows next ([`Lag::forget`]).
     pub(crate) async fn run(self, mut stop: watch::Receiver<bool>) {
         let mut steps = self.shared.standing.clone();
         let mut joined = false;
         let mut streak = Streak::default();
+        let mut led = self.shared.fence.term();
         loop {
             let leading = self.shared.fence.leader_term(Instant::now());
             let leader = self.shared.leader(leading);
+            // The fence's term moves at a take alone: this replica has
+            // held the lease since the loop's last look.
+            let term = self.shared.fence.term();
+            if term != led {
+                self.shared.lag.forget();
+                led = term;
+            }
             let next = if leader.is_leader || leader.address.is_empty() {
                 Next::Lease
             } else {
@@ -953,7 +1049,7 @@ mod tests {
 
     #[test]
     fn the_lag_is_the_age_of_the_last_applied_frame() {
-        let lag = Lag::new();
+        let lag = Lag::new(Duration::from_secs(1));
         let at = Instant::now();
         let millis = |now| lag.age(now).map(|age| age.as_millis());
         assert_eq!(millis(at), None);
@@ -962,6 +1058,87 @@ mod tests {
         assert_eq!(millis(at + Duration::from_millis(250)), Some(250));
         lag.applied(at + Duration::from_millis(200));
         assert_eq!(millis(at + Duration::from_millis(250)), Some(50));
+    }
+
+    #[test]
+    fn the_sync_holds_under_the_bound_and_turns_by_the_clock_of_the_write() {
+        let bound = Duration::from_secs(1);
+        let lag = Lag::new(bound);
+        assert_eq!(lag.within(), bound);
+        let turns = lag.turns();
+        let turned = || *turns.borrow();
+        // A frame dated `at`, written when the clock reads `wrote`.
+        let write = |at, wrote| lag.turn(lag.store(at), wrote);
+        let start = Instant::now();
+        // Before any frame: not synced, nothing to lapse, no turn told.
+        assert!(!lag.synced(start));
+        assert_eq!((lag.read(start), turned()), (None, 0));
+
+        // The first frame turns the sync.
+        write(start, start);
+        // The lag holds the frame's instant at a whole microsecond.
+        let frame = start - lag.age(start).expect("a frame applied");
+        assert_eq!(turned(), 1);
+        let under = bound - Duration::from_micros(1);
+        assert!(lag.synced(frame + under));
+        assert_eq!(lag.read(frame + under), Some((under, Some(frame + bound))));
+        // At the bound it is gone, and there is nothing left to lapse.
+        assert!(!lag.synced(frame + bound));
+        assert_eq!(lag.read(frame + bound), Some((bound, None)));
+
+        // A frame written inside the bound keeps the sync and tells no
+        // turn.
+        let last = frame + under;
+        write(last, last);
+        assert_eq!(turned(), 1);
+        // An apply that straddles the lapse: its frame is dated inside the
+        // bound and written at it, after a reader read the sync gone.
+        write(last + under, last + bound);
+        assert_eq!(turned(), 2);
+        assert!(lag.synced(last + bound));
+
+        // A replica follows from the serve's word alone.
+        assert!(!lag.follows());
+        lag.follow();
+        assert!(lag.follows());
+    }
+
+    #[test]
+    fn an_applied_frame_dated_before_the_lapse_and_written_after_it_tells_a_turn() {
+        // The loop reads its instant, applies the batch, then writes the
+        // lag: the clock of that write says whether a reader saw the sync
+        // gone, not the instant the frame carries.
+        let bound = Duration::from_millis(50);
+        let lag = Lag::new(bound);
+        let turns = lag.turns();
+        let first = Instant::now();
+        lag.applied(first);
+        assert_eq!(*turns.borrow(), 1);
+        // The bound passes with no frame.
+        std::thread::sleep(bound + Duration::from_millis(10));
+        // A frame dated inside the bound, written now.
+        lag.applied(first + bound - Duration::from_millis(1));
+        assert_eq!(*turns.borrow(), 2);
+    }
+
+    #[test]
+    fn a_forgotten_frame_reads_as_none_and_tells_a_turn() {
+        let lag = Lag::new(Duration::from_secs(1));
+        let turns = lag.turns();
+        let now = Instant::now();
+        // Nothing to forget: no turn told.
+        lag.forget();
+        assert_eq!(*turns.borrow(), 0);
+        lag.applied(now);
+        assert!(lag.synced(now));
+        // The frame is gone, and a reader that read it looks again.
+        lag.forget();
+        assert_eq!((lag.read(now), *turns.borrow()), (None, 2));
+        lag.forget();
+        assert_eq!(*turns.borrow(), 2);
+        // The next frame is a first frame.
+        lag.applied(now);
+        assert_eq!(*turns.borrow(), 3);
     }
 
     #[test]
@@ -1583,6 +1760,69 @@ mod tests {
         standing.send_replace(own);
         let dialed = timeout(Duration::from_millis(300), bed.streams.recv()).await;
         assert!(dialed.is_err(), "a leader dials nobody");
+        stop.send_replace(true);
+        let ended = timeout(FIVE, running.join_next()).await;
+        assert!(matches!(ended, Ok(Some(Ok(())))), "the stop ends the loop");
+    }
+
+    #[tokio::test]
+    async fn a_replica_that_led_is_not_synced_before_a_frame_of_its_present_leader() {
+        let mut bed = Bed::new().await;
+        let (mut elector, standing, standby) = standing_by(&bed, FIVE);
+        let shared = Arc::clone(&standby.shared);
+        let held = || shared.lag.age(Instant::now()).is_some();
+        let hello = |frame: Option<Frame>| matches!(frame, Some(Frame::Hello(_)));
+        let (stop, stopped) = watch::channel(false);
+        let leader = led();
+        standing.send_replace(bed.holds("leader-1", 1));
+        let mut running = JoinSet::new();
+        running.spawn(standby.run(stopped));
+        // The leader's events, acknowledged: the lag holds a frame.
+        let mut first = bed.opened().await;
+        assert!(hello(first.frame().await));
+        let mut place = start(&leader.1);
+        for entry in entries(&leader.1, place) {
+            first.says(batch(&entry, Instant::now())).await;
+            place = entry.at;
+            let ack = Frame::Ack(proto::ReplicationAck { seq: place.seq });
+            assert_eq!(first.frame().await, Some(ack));
+        }
+        assert!(held());
+
+        // The lease names another leader: the replica held no lease
+        // between the two, and its frame stands.
+        standing.send_replace(bed.holds("leader-2", 2));
+        let mut second = bed.opened().await;
+        assert!(hello(second.frame().await));
+        assert_eq!(first.frame().await, None, "the first stream is left");
+        assert!(held(), "a follower's frame outlives a change of leader");
+
+        // This replica takes the lease: the frame it applied before its
+        // lead is forgotten.
+        let took = elector.tick(Instant::now());
+        assert!(matches!(took, Ok(Tick::Acquired { .. })), "{took:?}");
+        standing.send_replace(Standing {
+            holder: OWN.to_owned(),
+            term: 3,
+            looked: true,
+        });
+        assert_eq!(second.frame().await, None, "a leader follows nobody");
+        assert!(!held(), "a replica that led holds no frame");
+
+        // It leaves the lease and follows the next holder: not synced
+        // before a frame of that leader, synced at it.
+        assert!(elector.release().expect("the release"));
+        standing.send_replace(bed.holds("leader-3", 4));
+        let mut third = bed.opened().await;
+        assert!(hello(third.frame().await));
+        assert!(!held(), "no frame of its present leader yet");
+        leader.0.upsert(facts("http://b:8000", 1));
+        for entry in entries(&leader.1, place) {
+            third.says(batch(&entry, Instant::now())).await;
+            let ack = Frame::Ack(proto::ReplicationAck { seq: entry.at.seq });
+            assert_eq!(third.frame().await, Some(ack));
+        }
+        assert!(held());
         stop.send_replace(true);
         let ended = timeout(FIVE, running.join_next()).await;
         assert!(matches!(ended, Ok(Some(Ok(())))), "the stop ends the loop");
