@@ -609,8 +609,9 @@ impl Elector {
     /// A release while this run's own take still waits to lead hands on
     /// what that wait still owed: the record says the time left to the
     /// take's opening as its duration, rounded up, and the next candidate
-    /// waits it out before it takes. It leads no later than this run would
-    /// have, by one look.
+    /// waits it out before it takes. It leads no earlier than this run
+    /// would have, and within two looks after: one to see the release, one
+    /// past its wait.
     pub fn release(&mut self) -> Result<bool, ElectError> {
         let Some(mine) = self.held.clone() else {
             return Ok(false);
@@ -2228,6 +2229,39 @@ mod tests {
             a.tick(word + 4 * S).expect("renew"),
             Tick::Renewed { term: 2 }
         );
+    }
+
+    #[test]
+    fn a_replica_whose_hold_ended_over_a_release_that_still_says_a_duration_reads_it_gone() {
+        // The waiting answer ends with the hold. A release another replica
+        // wrote inside the hold says a duration that outlasts it: from the
+        // hold's end this replica is a candidate as any other, and a record
+        // with no holder and a duration is the gone record's answer again.
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + 3 * S;
+        a.lead_at(t0);
+        let word = t0 + S / 2;
+        assert!(a.step_down(None, word).expect("the release"));
+        let own = lease.clone().read().expect("read").expect("the record");
+        let later = LeaseRecord {
+            term: 2,
+            renewed_at_micros: own.renewed_at_micros + 1,
+            duration_ms: 60_000,
+            ..own.clone()
+        };
+        assert_eq!(
+            lease.clone().write(Some(&own), &later).expect("a write"),
+            Written::Done
+        );
+        assert_eq!(a.tick(word + S).expect("look"), Tick::Waiting { term: 2 });
+        assert_eq!(
+            a.tick(word + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Waiting { term: 2 }
+        );
+        assert_eq!(a.tick(word + 3 * S).expect("look"), Tick::Gone { term: 2 });
+        assert!(!a.is_holder());
     }
 
     #[test]
