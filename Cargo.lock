@@ -5798,6 +5798,7 @@ version = "0.1.0"
 dependencies = [
  "serde_yaml",
  "smg-policy-controller",
+ "tikv-jemallocator",
  "tokio",
 ]
 
