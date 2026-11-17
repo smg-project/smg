@@ -5488,12 +5488,18 @@ fn apply_max_long_side_pixel(
     // The same fit `encoded_image_size` promised from the header.
     match max_long_side_pixel.and_then(|cap| capped_dimensions(image.width(), image.height(), cap))
     {
-        Some((width, height)) => match image {
-            image::DynamicImage::ImageRgb8(rgb) => {
-                image::DynamicImage::ImageRgb8(resize_catmull_rom_rgb(&rgb, width, height))
-            }
-            other => other.resize_exact(width, height, image::imageops::FilterType::CatmullRom),
-        },
+        Some((width, height)) => {
+            let resized = match &image {
+                image::DynamicImage::ImageRgb8(rgb) => {
+                    image::DynamicImage::ImageRgb8(resize_catmull_rom_rgb(rgb, width, height))
+                }
+                other => other.resize_exact(width, height, image::imageops::FilterType::CatmullRom),
+            };
+            // The frame holds the resized image from here on, so nothing
+            // later would return the decoder's buffer to the pool.
+            buffer_pool::recycle_image(image);
+            resized
+        }
         None => image,
     }
 }
