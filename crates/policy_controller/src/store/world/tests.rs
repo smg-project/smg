@@ -27,6 +27,8 @@ use crate::{
     AppliedSpec, PairPools, PairTable, PolicySpec, Scratch,
 };
 
+mod mode_and_overload;
+
 const MODEL: &str = "m";
 const ASKER: GatewayId = GatewayId(1);
 

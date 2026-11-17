@@ -1149,7 +1149,7 @@ impl Writer {
     /// under them from what is on file.
     ///
     /// The pair classes are derived under the generation's pairing mode.
-    /// A generation of the standing mode publishes the rows as they are; one
+    /// A generation of the standing mode keeps the rows' classes; one
     /// of another mode derives `members`, the standing membership, again by
     /// the membership write's own door ([`Writer::rebuild`]) and publishes
     /// once, under the new generation at the standing epoch: the epoch is
