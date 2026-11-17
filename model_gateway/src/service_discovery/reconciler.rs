@@ -367,10 +367,36 @@ pub(super) async fn reconcile(
             .get_status(url)
             .is_some_and(|status| status.status == "pending" || status.status == "processing")
     };
-    let removals: Vec<&RemovalTarget> = actions
+    // A registration that stands alone at its endpoint is removed under its
+    // own URL, the key a `DELETE` of that worker queues its removal under,
+    // so the queue runs one of the two and holds the other back. Under two
+    // keys both ran, and the second, finding the worker draining, removed it
+    // without the drain wait. An endpoint this pass also registers a new
+    // instance at keeps the scheme-less form, like one with several
+    // registrations: the addition takes the status entry under the worker's
+    // URL (`submit_unless_registering`), and a removal's entry there would
+    // go with it.
+    let registering: HashSet<EndpointKey> = actions
+        .add
+        .iter()
+        .map(|worker| worker.endpoint.key())
+        .collect();
+    let removals: Vec<(&RemovalTarget, String, bool)> = actions
         .remove
         .iter()
-        .filter(|target| !in_flight(&target.endpoint.lookup_form()))
+        .map(|target| {
+            let own_url = match target.guards.as_slice() {
+                [(id, _)] if !registering.contains(&target.endpoint.key()) => {
+                    app_context.worker_registry.get_url_by_id(id)
+                }
+                _ => None,
+            };
+            match own_url {
+                Some(url) => (target, url, true),
+                None => (target, target.endpoint.lookup_form(), false),
+            }
+        })
+        .filter(|(_, url, _)| !in_flight(url))
         .collect();
     let additions: Vec<&DiscoveredWorker> = actions
         .add
@@ -390,7 +416,7 @@ pub(super) async fn reconcile(
         desired_count
     );
 
-    for target in removals {
+    for (target, url, alone) in removals {
         info!(
             "Removing worker {} ({} registration(s), {}): no longer published, a \
              different instance now holds the address, or it is a stale registration \
@@ -399,12 +425,13 @@ pub(super) async fn reconcile(
             target.guards.len(),
             target.discovery_id.as_deref().unwrap_or("no discovery id")
         );
-        // Scheme-less for a network address, so `find_workers_by_url` reaches
-        // every spelling the group was registered under. An IPC endpoint keeps
-        // its scheme, because its key is a bare socket path that would not
-        // parse back.
+        // Unless the registration stands alone (above), the URL is scheme-less
+        // for a network address, so `find_workers_by_url` reaches every
+        // spelling the group was registered under. An IPC endpoint keeps its
+        // scheme, because its key is a bare socket path that would not parse
+        // back.
         let job = Job::RemoveWorker {
-            url: target.endpoint.lookup_form(),
+            url,
             expected_revisions: Some(
                 target
                     .guards
@@ -413,10 +440,22 @@ pub(super) async fn reconcile(
                     .collect(),
             ),
         };
-        match job_queue.submit(job).await {
-            Ok(()) => Metrics::record_discovery_deregistration(
+        // A removal under the worker's own URL takes its claim with the
+        // check: the status read above and this submission are two steps,
+        // and a removal a `DELETE` queued between them keeps the URL.
+        let submitted = if alone {
+            job_queue.submit_unless_in_flight(job).await
+        } else {
+            job_queue.submit(job).await.map(|()| true)
+        };
+        match submitted {
+            Ok(true) => Metrics::record_discovery_deregistration(
                 kind.metric_label(),
                 metrics_labels::DEREGISTRATION_RECONCILED,
+            ),
+            Ok(false) => info!(
+                "Worker {} has a job in flight; its removal is left to the next pass",
+                target.endpoint.redacted()
             ),
             Err(e) => error!(
                 "Failed to submit worker removal for {}: {}",

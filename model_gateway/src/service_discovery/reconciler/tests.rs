@@ -556,6 +556,81 @@ async fn an_addition_waiting_for_a_queue_slot_holds_its_urls_claim() {
     );
 }
 
+/// A registration that stands alone at its endpoint is removed under the
+/// worker's own URL, the key a `DELETE` of that worker queues its removal
+/// under. The pass's removal holds that URL's claim, so a `DELETE`'s removal
+/// waits behind it, and while a `DELETE`'s removal is in flight the pass
+/// queues none of its own. The pass used to queue under the scheme-less form
+/// of the address, a key no `DELETE` reads: the two removals ran side by
+/// side, and the second, finding the worker draining, removed it without the
+/// drain wait. An endpoint the pass also registers a new instance at keeps
+/// the scheme-less form: the addition takes the entry under the URL, and
+/// the removal's stays under a key of its own.
+#[tokio::test]
+async fn a_lone_registrations_removal_holds_its_urls_claim() {
+    use crate::workflow::{JobQueue, JobQueueConfig};
+
+    let app_context = create_test_app_context();
+    // No runner: a queued job stays pending.
+    let queue = JobQueue::new(
+        JobQueueConfig {
+            queue_capacity: 8,
+            max_concurrent_jobs: 0,
+        },
+        Arc::downgrade(&app_context),
+    );
+    app_context.worker_job_queue.set(Arc::clone(&queue)).ok();
+    for (url, discovery_id) in [
+        ("http://10.0.9.1:8080", "gone"),
+        ("http://10.0.9.2:8080", "deleted"),
+        ("http://10.0.9.3:8080", "old"),
+    ] {
+        register_with_labels(
+            &app_context,
+            url,
+            &[
+                (DISCOVERY_PROVIDER_LABEL, "kubernetes"),
+                (DISCOVERY_ID_LABEL, discovery_id),
+            ],
+        );
+    }
+    // A `DELETE` of the second worker has its removal in flight.
+    queue.hold_url_for_tests("http://10.0.9.2:8080", "RemoveWorker");
+
+    // The first two are published no more; a new instance holds the third's
+    // address.
+    let desired = desired_state_of(&[published("http://10.0.9.3:8080", "new")]);
+    reconcile(
+        &desired,
+        DiscoveryKind::Kubernetes,
+        &app_context,
+        time::Instant::now(),
+    )
+    .await;
+
+    let a_deletes_removal = Job::RemoveWorker {
+        url: "http://10.0.9.1:8080".to_string(),
+        expected_revisions: None,
+    };
+    assert!(
+        !queue.claim_if_idle(&a_deletes_removal),
+        "the pass's removal holds the worker's own URL: a DELETE's removal waits behind it"
+    );
+    assert!(
+        queue.get_status("10.0.9.2:8080").is_none(),
+        "a DELETE's removal is in flight: the pass queues no second one beside it"
+    );
+    let queued = |key: &str| queue.get_status(key).map(|status| status.job_type);
+    assert_eq!(
+        (
+            queued("10.0.9.3:8080").as_deref(),
+            queued("http://10.0.9.3:8080").as_deref()
+        ),
+        (Some("RemoveWorker"), Some("AddWorker")),
+        "a replaced instance: its removal and the addition keep an entry each"
+    );
+}
+
 /// A prefill worker discovered without a bootstrap annotation carries no
 /// bootstrap port into its spec and is handed the default port on the
 /// request path (here a vLLM worker on the Mooncake connector, as the
