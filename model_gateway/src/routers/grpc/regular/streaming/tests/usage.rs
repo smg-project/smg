@@ -37,7 +37,10 @@ use super::{
     },
     symphony_chat::assigned_message,
 };
-use crate::{rate_limit::test_support::RecordingBackend, routers::grpc::pipeline::RequestPipeline};
+use crate::{
+    rate_limit::{test_support::RecordingBackend, UsageSettlement},
+    routers::grpc::pipeline::RequestPipeline,
+};
 
 /// A scripted worker stream and the mock server that owns its connection.
 type Scripted = (ProtoStream, JoinHandle<()>);

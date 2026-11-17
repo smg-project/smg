@@ -43,7 +43,7 @@ use super::symphony::{
 };
 use crate::{
     observability::metrics::{metrics_labels, LocalStopAbort, Metrics, StreamingMetricsParams},
-    rate_limit::{SharedReservationHandle, UsageSettlement},
+    rate_limit::SharedReservationHandle,
     routers::{
         common::{
             prefill_admission::PrefillLoadGuard,
@@ -2852,6 +2852,25 @@ impl StreamingProcessor {
                         };
                     }
 
+                    // The request's counts, read once: the settlement and the
+                    // usage chunk take the same reasoning count.
+                    let counts = TokenCounts {
+                        prompt: total_prompt,
+                        completion: total_completion,
+                        cached: total_cached,
+                        reasoning: total_reasoning,
+                        spec_accepted: total_spec_accepted,
+                        spec_drafted: if has_unknown_spec_draft_tokens
+                            && (total_spec_drafted > 0
+                                || total_spec_accepted > 0
+                                || has_unavailable_spec_draft_tokens)
+                        {
+                            None
+                        } else {
+                            Some(total_spec_drafted)
+                        },
+                    };
+
                     // All units succeeded (fail-fast `try_join_all` above), so
                     // this is the one settle point for every mode (Single/PD/Batch).
                     // But a unit that never saw a `Complete` message has no
@@ -2860,14 +2879,7 @@ impl StreamingProcessor {
                     // and incorrectly refund part of the reservation.
                     if let Some(handle) = &reservation {
                         if all_saw_complete {
-                            handle
-                                .settle_success(UsageSettlement {
-                                    actual_input_tokens: total_prompt,
-                                    completion_tokens: total_completion,
-                                    cached_input_tokens: total_cached,
-                                    reasoning_tokens: total_reasoning,
-                                })
-                                .await;
+                            handle.settle_success(counts.settlement()).await;
                         } else {
                             handle.close_reserved_only().await;
                         }
@@ -2882,25 +2894,7 @@ impl StreamingProcessor {
                             model: dispatch.model.clone(),
                             system_fingerprint: dispatch.weight_version.clone(),
                             // The usage object the non-streamed answer carries.
-                            usage: Some(
-                                TokenCounts {
-                                    prompt: total_prompt,
-                                    completion: total_completion,
-                                    cached: total_cached,
-                                    reasoning: total_reasoning,
-                                    spec_accepted: total_spec_accepted,
-                                    spec_drafted: if has_unknown_spec_draft_tokens
-                                        && (total_spec_drafted > 0
-                                            || total_spec_accepted > 0
-                                            || has_unavailable_spec_draft_tokens)
-                                    {
-                                        None
-                                    } else {
-                                        Some(total_spec_drafted)
-                                    },
-                                }
-                                .usage(),
-                            ),
+                            usage: Some(counts.usage()),
                         };
                         let mut sse_buffer = Vec::with_capacity(256);
                         Self::format_completion_sse_into(&mut sse_buffer, &usage_chunk);
@@ -3188,7 +3182,9 @@ impl StreamingProcessor {
     /// `cache_creation_input_tokens` stays zero, as the gateway writes no
     /// breakpoint-driven cache entries of its own. Cache counters follow the
     /// same integer-not-null contract as [`Self::initial_messages_usage`];
-    /// `thinking_tokens` is reported when the turn ran with thinking.
+    /// `thinking_tokens` is reported when the turn ran with thinking, no higher
+    /// than `output_tokens`: a part of the output, even when a count of
+    /// reasoning ran past the engine's count of its output.
     fn final_messages_delta_usage(
         output_tokens: u32,
         authoritative_prompt: Option<u32>,
@@ -3201,8 +3197,11 @@ impl StreamingProcessor {
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(cached_tokens),
             server_tool_use: None,
-            output_tokens_details: thinking_tokens
-                .map(|thinking_tokens| messages::OutputTokensDetails { thinking_tokens }),
+            output_tokens_details: thinking_tokens.map(|thinking_tokens| {
+                messages::OutputTokensDetails {
+                    thinking_tokens: thinking_tokens.min(output_tokens),
+                }
+            }),
         }
     }
 }
@@ -4757,7 +4756,7 @@ impl<'a> ChatStream<'a> {
     }
 
     /// The end: the reservation settled with what the stream used
-    /// ([`Self::counts`], the engine's counts as they are), and the
+    /// ([`Self::counts`] as [`TokenCounts::settlement`] takes them), and the
     /// streaming metrics recorded.
     /// `client_left` says the read ended with the client's leaving, not with the engine's end:
     /// the reservation is still settled, but no terminal router metric is recorded for it, as
@@ -6086,14 +6085,16 @@ impl<'a> MessagesStream<'a> {
             // The usage is settled by the engine's Complete, or by the
             // gateway's own stop with the counts of the chunk it matched in.
             if self.saw_complete || self.closed_by_stop {
-                handle
-                    .settle_success(UsageSettlement {
-                        actual_input_tokens: self.prompt_tokens,
-                        completion_tokens: self.completion_tokens.total(),
-                        cached_input_tokens: self.cached_tokens,
-                        reasoning_tokens: self.engine_thinking_tokens,
-                    })
-                    .await;
+                // Through the counts, as the collected message settles, so
+                // both take one read of the engine's thinking count.
+                let counts = TokenCounts {
+                    prompt: self.prompt_tokens,
+                    completion: self.completion_tokens.total(),
+                    cached: self.cached_tokens,
+                    reasoning: self.engine_thinking_tokens,
+                    ..TokenCounts::default()
+                };
+                handle.settle_success(counts.settlement()).await;
             } else {
                 handle.close_reserved_only().await;
             }
