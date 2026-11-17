@@ -4,10 +4,11 @@ The policy controller's replay runs the rows of a sheet it has a module for and 
 the others, so the table in the sheets' README is the only statement of what each sheet is. This
 holds the table to the files: every sheet has a row and every row a sheet and a recorder, and a
 row's commit, row counts and sha256 are the file's. The recording table's test filter for a sheet
-is a tail of the module path the layout places its recorder at: a filter that names no test runs
-none and writes no sheet. A sheet of picks states its sequence rows and its drawn rows; the pair
-sheet picks nothing and states its pair rows, each an outcome on both pair wires; the overload
-sheet picks nothing either and states its verdict rows, each a verdict after every step.
+is a tail of the module path the layout places its recorder at, and the recorder's parent module
+declares it: a filter that names no test, or a file no parent declares, runs none and writes no
+sheet. A sheet of picks states its sequence rows and its drawn rows; the pair sheet picks nothing
+and states its pair rows, each an outcome on both pair wires; the overload sheet picks nothing
+either and states its verdict rows, each a verdict after every step.
 """
 
 from __future__ import annotations
@@ -75,6 +76,14 @@ def test_the_recording_table_runs_the_recorder_the_layout_places():
         assert module.endswith("::" + at["test"]), (
             f"{at['sheet']}: the recording table runs {at['test']}, the layout says {module}"
         )
+        # The recorder is compiled where its parent module declares it, in `<parent>.rs` or in
+        # the directory's `mod.rs`: a file neither declares is in no test binary.
+        path = GATEWAY / placed[at["sheet"]]
+        parents = (path.parent.with_suffix(".rs"), path.parent / "mod.rs")
+        assert any(
+            parent.is_file() and re.search(rf"^mod {path.stem};$", parent.read_text(), re.M)
+            for parent in parents
+        ), f"{at['sheet']}: no parent module declares mod {path.stem}"
 
 
 def test_a_row_states_its_sheets_commit_row_counts_and_sha256():
