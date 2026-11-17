@@ -10,7 +10,8 @@
 //! the gateway. In the
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document, watches the file and
-//! answers `GetPolicySpec` ([`Controller::spec_file`]).
+//! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
+//! ([`Controller::spec_file`]).
 //!
 //! A controller is bound first and served second ([`Controller::bind`], then
 //! [`Controller::serve`]): the bind takes every address (port `0` for an

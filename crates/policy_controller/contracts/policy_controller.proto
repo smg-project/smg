@@ -86,7 +86,9 @@
 // ABORTED fenced mid-stream, reconnect through Leader, a Hello read
 // under a term the election left before its seat was taken, or a session
 // a newer one of its gateway replaced, or a worker row that moved under a
-// membership call (a second writer: read the row again); OUT_OF_RANGE and
+// membership call (a second writer: read the row again); UNIMPLEMENTED a
+// call, a frame kind or a mode this build does not serve, by its name;
+// OUT_OF_RANGE and
 // DATA_LOSS raised by no handler, forwarded as RelayResync. The
 // transport answers OUT_OF_RANGE itself to a request over its limit of
 // 4 MiB on a call of one request message; on a Session or Decide stream
@@ -950,6 +952,8 @@ message ApplyRequest {
   bytes document = 1;
   // `yaml` or `json`.
   string format = 2;
+  // A write states its mode: none, or a number that is no mode, is
+  // INVALID_ARGUMENT by the field's name.
   ApplyMode mode = 3;
   // The digest of the generation the caller edited; FAILED_PRECONDITION when
   // another apply landed first.
