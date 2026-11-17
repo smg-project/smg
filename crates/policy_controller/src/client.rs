@@ -25,10 +25,10 @@
 //! endpoint: the dial, each call from its send to its answer's end, the
 //! session's call with its first frame, a report's wait for room in the
 //! session's queue, the wait for the session's end, the decide stream's
-//! open and an ask's waits for room in its queue and for its answer. An
-//! endpoint's own
-//! time-outs end a wait sooner, and as the channel's error, not as the
-//! client's [`Error::NoAnswer`]: [`Error::Status`] for a call and
+//! open, an ask's waits for room in its queue and for its answer, and the
+//! wait for the decide stream's end. An endpoint's own time-outs end a
+//! wait sooner, and as the channel's error, not as the client's
+//! [`Error::NoAnswer`]: [`Error::Status`] for a call and
 //! [`Error::Connect`] for the dial.
 
 use std::{
@@ -131,9 +131,9 @@ pub enum Error {
     /// of it, never a cut: a cut key can be two requests'.
     #[error("a request id of {0} bytes is outside the call's range of 1 to {most} bytes", most = MAX_REQUEST_ID)]
     RequestId(usize),
-    /// An ask is over the call's bound on a frame as encoded and holds no
-    /// block hash to cut: the client drops no other field for size, and
-    /// sends nothing.
+    /// An ask is over the call's bound on a frame as encoded with every
+    /// block hash cut: the client drops no other field for size, and sends
+    /// nothing.
     #[error("a DecideRequest of {0} bytes is over the call's limit of {limit} bytes with no block hash to cut", limit = MAX_FRAME)]
     TooLarge(usize),
     /// The decide stream has no credit left: the gateway decides this
@@ -582,8 +582,10 @@ pub struct Client {
     wait: Duration,
     session: Session,
     /// The decide stream between asks: none before the first ask, during
-    /// one, and after one that ended with an error other than
-    /// [`Error::NoCredit`].
+    /// one, and after one that ended as [`Error::BelowFloor`],
+    /// [`Error::NoDecision`], [`Error::Status`] or [`Error::NoAnswer`]. An
+    /// ask the door refuses (an id outside its range, a frame with no hash
+    /// left to cut, no credit) leaves it where it stood.
     decide: Option<Decide>,
     /// The highest term an answer named.
     floor: u64,
@@ -707,13 +709,14 @@ impl Client {
     ///
     /// An answer under a term below the floor is [`Error::BelowFloor`];
     /// one that is no answer to the ask is [`Error::NoDecision`]; a stream
-    /// that ended tells its status ([`Error::Status`]); an open, a queue
-    /// or an answer that outlasts the client's bound is
-    /// [`Error::NoAnswer`]. Each of these drops the stream, as does a call
-    /// dropped before its end, and the next ask opens a new one at the
-    /// welcome's window: an answer that comes late is never read. An ask
-    /// given up may still be decided, and the lease it booked stands until
-    /// it expires.
+    /// that ended tells its status ([`Error::Status`]); an open, a queue,
+    /// an answer or a stream's end that outlasts the client's bound is
+    /// [`Error::NoAnswer`]. These waits run one after another, so an ask
+    /// whole can last three bounds. Each of these errors drops the stream,
+    /// as does a call dropped before its end, and the next ask opens a new
+    /// one at the welcome's window: an answer that comes late is never
+    /// read. An ask given up may still be decided, and the lease it booked
+    /// stands until it expires.
     pub async fn decide(&mut self, mut request: DecideRequest) -> Result<Answer, Error> {
         let cut = fit(&mut request)?;
         let wait = self.wait;
