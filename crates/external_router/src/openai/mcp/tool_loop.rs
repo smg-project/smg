@@ -3003,8 +3003,10 @@ mod tests {
     }
 
     /// A session that may route a builtin tool asks for the server of each builtin type, four
-    /// lookups. Each reads an index by type and none walks the server map, so the session's
-    /// allocation calls are the same on a host of any width.
+    /// lookups. The servers here are configured and not connected (the SSE transport is refused
+    /// at connect), so each lookup reads the index, finds nothing and answers from the
+    /// configured list. None walks the server map, where even an empty walk allocates once per
+    /// shard, so the session's allocation calls are the same on a host of any width.
     #[tokio::test]
     async fn a_session_that_routes_a_builtin_tool_walks_no_sharded_map() {
         let server = |name: &str, port: u16| McpServerConfig {
