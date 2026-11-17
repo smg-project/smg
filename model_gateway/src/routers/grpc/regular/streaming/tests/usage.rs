@@ -1069,7 +1069,9 @@ fn generate_finish_counts(events: &[Value]) -> Vec<(u64, u64, u64)> {
 /// than it generated reads its completion count. A stream shows its own
 /// count of the ids it delivered: where the terminal frame counts more
 /// tokens than the stream delivered, the reasoning count is shown no higher
-/// than the delivered count, and the settlement takes the same.
+/// than the delivered count, and the settlement takes the same, choice by
+/// choice: beside a second choice that count does not grow into the second
+/// choice's room.
 #[tokio::test]
 async fn a_generate_answers_reasoning_count_is_never_above_its_completion_count() {
     let generated: u32 = 2;
@@ -1120,11 +1122,22 @@ async fn a_generate_answers_reasoning_count_is_never_above_its_completion_count(
         }
         frames
     };
+    // The same choice beside a second one that delivers two ids and counts
+    // no reasoning.
+    let beside_a_second_choice = || {
+        let mut frames = counts_past_delivery();
+        frames.extend(scheduler_choice_frames(1, &["ok"], SETTLED, 0));
+        frames
+    };
     let expected = UsageSettlement {
         actual_input_tokens: SETTLED.prompt,
         completion_tokens: 2,
         cached_input_tokens: SETTLED.cached,
         reasoning_tokens: 2,
+    };
+    let expected_of_two = UsageSettlement {
+        completion_tokens: 4,
+        ..expected
     };
     for with_input_logprobs in [false, true] {
         let (handle, backend) = RecordingBackend::reservation();
@@ -1144,6 +1157,25 @@ async fn a_generate_answers_reasoning_count_is_never_above_its_completion_count(
             backend.settlements(),
             vec![expected],
             "input logprobs {with_input_logprobs}"
+        );
+
+        let (handle, backend) = RecordingBackend::reservation();
+        let events = streamed_generate(
+            scheduler_stream(beside_a_second_choice()).await,
+            with_input_logprobs,
+            2,
+            Some(handle),
+        )
+        .await;
+        assert_eq!(
+            generate_finish_counts(&events),
+            vec![(0, 2, 2), (1, 0, 2)],
+            "two choices, input logprobs {with_input_logprobs}"
+        );
+        assert_eq!(
+            backend.settlements(),
+            vec![expected_of_two],
+            "two choices, input logprobs {with_input_logprobs}"
         );
     }
 }
