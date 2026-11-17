@@ -208,14 +208,11 @@ async fn a_probe_that_never_answers_ends_its_wait_at_the_rooms_end() {
 
 /// A probe that answers and is never met ends its wait at the room's end by
 /// that name, with its last answer: a room that ran out between two probes
-/// is not told as a probe with no answer. The probe takes a pace, as a call
-/// does, and the clock is held.
+/// is not told as a probe with no answer. The probe answers at once, so the
+/// room ends between two probes and nowhere else, and the clock is held.
 #[tokio::test(start_paused = true)]
 async fn a_probe_never_met_ends_its_wait_by_its_last_answer() {
-    let probe = || async {
-        time::sleep(PACE).await;
-        7_u8
-    };
+    let probe = || std::future::ready(7_u8);
     let waited = time::timeout(2 * ROOM, until(probe, |_| false))
         .await
         .expect("the wait ends inside twice its room");

@@ -205,6 +205,10 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 # the same `GetLoads` answers the gateway's tests read.
 mock-worker = { path = "../mock_worker" }
 
+# The spec file's open is read on a terminal pair its test makes (`pty`).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1", default-features = false, features = ["pty"] }
+
 [[bin]]
 name = "smg-policy-controller"
 path = "src/bin/smg-policy-controller.rs"
