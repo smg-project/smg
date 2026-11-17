@@ -13,6 +13,15 @@
 //! replica stops leading under the watch's term: the fence is read before
 //! the cut is taken and before each page and each entry is handed over.
 //!
+//! No write wakes a watcher either. A watched write wakes one task of the
+//! feed, once its store has let its locks go, and that task wakes the
+//! streams: a write pays one wake however many watch, and none of it under
+//! the membership lock. The task is the feed's. It is started with the
+//! feed's first watch, on that watch's runtime, and ended with the last
+//! feed; the serve does not tell it the stop and the drain does not join
+//! it, since it holds nothing a drain waits on. A write on a feed whose
+//! watches have all left still wakes it once, outside the locks.
+//!
 //! A watch of some models is told a write when a row it names serves one of
 //! them: the row the write left in the table, or the row it took out. A
 //! row's models change with its incarnation at the door, so a row leaves a
@@ -37,7 +46,7 @@ use parking_lot::Mutex;
 use prost::encoding::message;
 use rustc_hash::FxHashMap;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{mpsc, watch, Notify},
     task::JoinSet,
 };
 use tonic::{codegen::tokio_stream::Stream, Status};
@@ -77,9 +86,16 @@ pub(crate) const WATCHES_MAX: usize = 4;
 #[derive(Clone, Debug)]
 pub(crate) struct Feed {
     pub(crate) log: Arc<Log>,
-    /// The place of the last watched write; a stream's task waits on its
+    /// The wake of the feed's one task: one a watched write, issued once
+    /// the store has let the write's locks go.
+    landed: Arc<Notify>,
+    /// Where that task tells the streams: the log's place as it saw it.
+    told: watch::Sender<Position>,
+    /// The place the feed's task told last; a stream's task waits on its
     /// change.
     wake: watch::Receiver<Position>,
+    /// The feed's one task ([`Feed::start`]), ended with the last feed.
+    teller: Arc<Mutex<JoinSet<()>>>,
     /// The rows at one place of the log: the cut the first watch took
     /// there, kept for every other that starts there. It is let go when a
     /// write moves the log past that place and when the last watch leaves:
@@ -88,19 +104,53 @@ pub(crate) struct Feed {
 }
 
 impl Feed {
-    /// The feed of `log`, which tells its wake at each watched write. The
-    /// store that journals to the log is built beside it
+    /// The feed of `log`, whose watched writes wake the feed's one task,
+    /// each once its store has let its locks go. The store that journals
+    /// to the log is built beside it
     /// ([`journaled`](super::replication::journaled)).
     pub(crate) fn of(log: Log) -> Self {
+        let landed = Arc::new(Notify::new());
         let (told, wake) = watch::channel(Position::default());
-        let log = Arc::new(log.on_watched(move |at| {
-            told.send_replace(at);
-        }));
+        let log = {
+            let landed = Arc::clone(&landed);
+            // One wake of one task, whatever the count of watches. While
+            // that task is busy or not started the wake is kept, once. The
+            // place told is not read here: the task reads the head itself.
+            Arc::new(log.on_watched(move |_| landed.notify_one()))
+        };
         Self {
             log,
+            landed,
+            told,
             wake,
+            teller: Arc::default(),
             rows: Arc::default(),
         }
+    }
+
+    /// Starts the feed's one task where none lives: with the feed's first
+    /// watch, on that watch's runtime, and again with the next watch where
+    /// the task has ended (its runtime went away). A watch that lives on
+    /// another runtime is woken by no write from that end until that next
+    /// watch. The task wakes the streams at each watched write, off the
+    /// writer and under no lock of the store: a write wakes this task
+    /// alone, however many watch.
+    fn start(&self) {
+        let mut teller = self.teller.lock();
+        // A live task alone counts. The set keeps one that ended until it
+        // is joined: those are taken out first.
+        while teller.try_join_next().is_some() {}
+        if !teller.is_empty() {
+            return;
+        }
+        let log = Arc::clone(&self.log);
+        let (landed, told) = (Arc::clone(&self.landed), self.told.clone());
+        teller.spawn(async move {
+            loop {
+                landed.notified().await;
+                told.send_replace(log.head(Kinds::Watched));
+            }
+        });
     }
 
     /// Lets the kept cut go once a write has moved the log past its place:
@@ -318,6 +368,7 @@ pub(crate) fn open(
     models: Vec<String>,
 ) -> Result<Watching, Status> {
     let seat = Arc::new(watchers.seat(by, &source.feed)?);
+    source.feed.start();
     info!(
         by = %by.subject,
         ?start,
@@ -550,7 +601,10 @@ mod tests {
     };
 
     use prost::encoding::message;
-    use tokio::sync::{mpsc::error::TryRecvError, watch};
+    use tokio::{
+        runtime::Builder,
+        sync::{mpsc::error::TryRecvError, watch},
+    };
     use tonic::{codegen::tokio_stream::StreamExt, Code, Status};
 
     use super::{
@@ -1188,12 +1242,89 @@ mod tests {
         assert!(!wakes.has_changed().expect("the log lives"));
         tokio::task::yield_now().await;
         assert_eq!(stream.events.try_recv().err(), Some(TryRecvError::Empty));
-        // A watched write is one wake.
+    }
+
+    /// A watched write wakes no watch itself. Once its store has let its
+    /// locks go it wakes the feed's one task, and that task wakes the
+    /// watches: a write pays one wake however many watch.
+    #[tokio::test]
+    async fn a_watched_write_wakes_the_feeds_one_task_and_that_task_the_watches() {
+        let leader = leader();
+        let id = leader.register(0, 1, "model-a");
+        let mut stream = leader.watch(Start::Snapshot, &[]);
+        next(&mut stream).await;
+        let mut wakes = leader.feed.wake.clone();
+        wakes.mark_unchanged();
         leader
             .store
             .set_status(id, WorkerStatus::Ready, 1)
             .expect("ready");
+        // The write is over, and on this one thread no task has had a turn
+        // since: the watches' wake has not moved.
+        assert!(
+            !wakes.has_changed().expect("the log lives"),
+            "the write woke the watches itself"
+        );
+        let told = next(&mut stream).await;
+        assert!(
+            matches!(told.event, Some(Event::Status(_))),
+            "the status write: {told:?}"
+        );
         assert!(wakes.has_changed().expect("the log lives"));
+    }
+
+    /// The watches of one feed share its one task, started with the first
+    /// of them, and the task ends with the last feed: what it held of the
+    /// log is given back.
+    #[tokio::test]
+    async fn a_feeds_watches_share_its_one_task_and_the_last_feed_ends_it() {
+        let leader = leader();
+        assert!(leader.feed.teller.lock().is_empty(), "before any watch");
+        let streams: Vec<Watching> = (0..3).map(|_| leader.watch(Start::Snapshot, &[])).collect();
+        assert_eq!(leader.feed.teller.lock().len(), 1);
+        let log = Arc::clone(&leader.feed.log);
+        drop((streams, leader));
+        // Turns and no clock: the streams' tasks end at the runtime's next
+        // turns, the last feed goes with them, and the feed's task after.
+        for _ in 0..10_000 {
+            if Arc::strong_count(&log) == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{} still hold the log", Arc::strong_count(&log) - 1);
+    }
+
+    /// A feed counts a live task alone. One whose runtime went away has
+    /// ended, though the feed's set still holds it: the feed's next watch
+    /// starts another and is told a write.
+    #[test]
+    fn a_feed_whose_task_ended_with_its_runtime_starts_another_at_its_next_watch() {
+        let leader = leader();
+        let runtime = || {
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime")
+        };
+        // The feed's first watch, and its task with it, on a runtime that
+        // goes away.
+        let first = runtime();
+        first.block_on(async {
+            let mut stream = leader.watch(Start::Snapshot, &[]);
+            next(&mut stream).await;
+        });
+        drop(first);
+        runtime().block_on(async {
+            let mut stream = leader.watch(Start::Snapshot, &[]);
+            next(&mut stream).await;
+            leader.register(0, 1, "model-a");
+            let told = next(&mut stream).await;
+            assert!(
+                matches!(told.event, Some(Event::Registered(_))),
+                "the registration: {told:?}"
+            );
+        });
     }
 
     #[tokio::test]

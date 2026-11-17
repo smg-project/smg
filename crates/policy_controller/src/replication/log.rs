@@ -6,7 +6,7 @@ use std::{
     collections::{vec_deque, VecDeque},
     fmt,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -174,8 +174,8 @@ impl Ring {
 /// The store writes through [`Journal`], under its own locks; a write is one
 /// push under the log's lock. A reader copies a batch of at most
 /// [`Log::BATCH`] entries out under the same lock and holds it across
-/// nothing else. A write of the membership
-/// kinds is told to one listener ([`Log::on_watched`]); a load row wakes
+/// nothing else. A write of the watched kinds is told to one listener once
+/// its store has let its locks go ([`Log::on_watched`]); a load row wakes
 /// nobody.
 ///
 /// The bound in bytes: a slot is at most 120 bytes whatever the event. A
@@ -194,8 +194,11 @@ pub struct Log {
     watched: usize,
     /// How many load rows are retained; `0` for a log that carries none.
     loads: usize,
-    /// Told the place of every write of the watched kinds.
+    /// Told the head of the watched kinds once a write of them is released.
     told: Option<Box<dyn Fn(Position) + Send + Sync>>,
+    /// Whether a write of the watched kinds landed that `told` has not
+    /// heard of: set under the log's lock, taken where the telling is made.
+    untold: AtomicBool,
 }
 
 impl fmt::Debug for Log {
@@ -233,16 +236,18 @@ impl Log {
             watched,
             loads,
             told: None,
+            untold: AtomicBool::new(false),
         }
     }
 
-    /// Calls `told` with the place of every write of the watched kinds, in
-    /// the log's order, and with the place of a restart: how a reader of
-    /// those kinds learns the log moved without polling it. `told` runs
-    /// under the log's lock, inside the store's write: it returns at once
-    /// (a watch's send: the last place replaces the one before and nothing
-    /// queues), never blocks, and calls nothing of the log or of the
-    /// store. A load row is told to nobody.
+    /// Calls `told` with the head of the watched kinds after a write of
+    /// them and after a restart: how a reader of those kinds learns the
+    /// log moved without polling it. `told` runs under no lock of the log
+    /// or of the store: a store's write is told once the store has let its
+    /// locks go ([`Journal::released`]), so what `told` wakes holds no
+    /// writer back. Writes that landed together may be told once: the
+    /// place told is the head at the telling, at or after each of them. A
+    /// load row is told to nobody.
     #[must_use]
     pub fn on_watched(mut self, told: impl Fn(Position) + Send + Sync + 'static) -> Self {
         self.told = Some(Box::new(told));
@@ -424,13 +429,21 @@ impl Log {
             ring.loads.push(self.loads, entry);
         } else {
             ring.watched.push(self.watched, entry);
-            self.tell(at);
+            // Held back: the listener is told under no lock.
+            self.untold.store(true, Ordering::Release);
         }
     }
 
-    fn tell(&self, at: Position) {
-        if let Some(told) = &self.told {
-            told(at);
+    /// Tells the listener that the watched kinds moved since its last
+    /// telling, if they did. Called under no lock of the log or of the
+    /// store: once a store has let a write's locks go, and at the end of a
+    /// restart and of a mark.
+    fn tell(&self) {
+        let Some(told) = &self.told else {
+            return;
+        };
+        if self.untold.swap(false, Ordering::AcqRel) {
+            told(self.head(Kinds::Watched));
         }
     }
 
@@ -484,7 +497,9 @@ impl Log {
         ring.head = at;
         ring.adopting = None;
         self.follow(&mut ring, at);
-        self.tell(at);
+        self.untold.store(true, Ordering::Release);
+        drop(ring);
+        self.tell();
     }
 }
 
@@ -508,13 +523,16 @@ impl Adopting<'_> {
 
     /// Applies a leader's event that writes nothing to this store, the
     /// first position of a term: the place alone is journaled, and the next
-    /// event follows it.
+    /// event follows it. The listener is told at its end, under no lock of
+    /// the log.
     pub fn mark(&self) {
         let mut ring = self.log.ring.lock();
         if let Some(at) = ring.adopting.take() {
             self.log.follow(&mut ring, at);
             self.log.append(&mut ring, at, Event::Term);
         }
+        drop(ring);
+        self.log.tell();
     }
 }
 
@@ -590,6 +608,10 @@ impl Journal for Log {
 
     fn followed(&self) -> Option<u64> {
         Log::followed(self)
+    }
+
+    fn released(&self) {
+        self.tell();
     }
 }
 
@@ -1050,22 +1072,36 @@ mod tests {
     }
 
     #[test]
-    fn the_log_tells_every_write_of_the_watched_kinds_and_no_load_row() {
+    fn the_log_tells_a_watched_write_once_it_is_released_and_no_load_row() {
         let told = Arc::new(Mutex::new(Vec::new()));
         let log = {
             let told = Arc::clone(&told);
             Log::new(8, 8).on_watched(move |at| told.lock().push(at))
         };
+        // Nothing is told inside a write: the store that wrote says when
+        // its locks are let go.
         load(&log, 1);
         member(&log, 1);
+        assert!(told.lock().is_empty(), "told inside the write");
+        log.released();
+        assert_eq!(*told.lock(), [at(2, 0)]);
+        // Writes that landed together are told once, at the head. A release
+        // after nothing new tells nothing, and a load row is told to nobody.
         log.term_rose(2);
+        member(&log, 2);
         load(&log, 2);
-        assert_eq!(*told.lock(), [at(2, 0), at(3, 2)]);
-        // A standby's log tells what it applies, and where it restarts.
-        log.adopt(at(5, 3)).expect("the next position").mark();
-        apply(&log, at(6, 3), 3);
-        log.restart(at(9, 4));
-        assert_eq!(told.lock()[2..], [at(5, 3), at(9, 4)]);
+        log.released();
+        log.released();
+        assert_eq!(told.lock()[1..], [at(4, 2)]);
+        load(&log, 3);
+        log.released();
+        assert_eq!(told.lock().len(), 2, "a load row was told");
+        // A standby's log tells what it marks and where it restarts, each
+        // at its own end.
+        log.adopt(at(7, 3)).expect("the next position").mark();
+        apply(&log, at(8, 3), 3);
+        log.restart(at(11, 4));
+        assert_eq!(told.lock()[2..], [at(7, 3), at(11, 4)]);
     }
 
     #[test]
