@@ -216,9 +216,10 @@ impl VllmEngineClient {
             n: request.n.unwrap_or(1),
             logprobs,
             logit_bias: logit_bias_by_token_id(request.logit_bias.as_ref()),
-            // The proto seed is a signed 32-bit word, the OpenAI-compatible seed an int64: itself
-            // when it fits, else its bits folded, and never -1, which the engine reads as "no seed";
-            // None stays None and the engine picks its own.
+            // The proto seed is a signed 32-bit word. `sampling_seed` (a u64) wins when a request
+            // sets it, with its bits folded; else the OpenAI-compatible `seed` (an int64) is
+            // itself when it fits, else its bits folded. Never -1, which the engine reads as
+            // "no seed"; None stays None and the engine picks its own.
             seed: request
                 .sampling_seed
                 .map(seeded_folded_i32)
