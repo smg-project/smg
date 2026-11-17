@@ -1,13 +1,18 @@
 //! The two-process lease-file cell (design 10; the step's gate for the lease
 //! file): two controllers on one host, each in its own process, over one
-//! lease file. The holder takes the lease and renews it twice, then stalls
-//! until the lease changed hands and tries once more; the taker follows,
-//! takes the lease when its sight of the record is a duration old, and
-//! renews. The parent reads both logs and checks what the fence promises:
-//! the holder's fence closed before the taker's first fenced instant, and
-//! the holder's late renewal was refused by the moved record. The children
-//! are this test binary run again with a role, so the lock and the rename
-//! cross real process boundaries.
+//! lease file. The holder takes the lease where no record stood and renews
+//! it four times: its fence opens at the third renewal, one renew deadline
+//! after such a take. Then it stalls until the lease changed hands and
+//! tries once more; the taker follows, takes the lease when its sight of
+//! the record is a duration old, and renews. The parent reads both logs and
+//! checks what the fence promises: a fenced instant under a term begins
+//! only when each fence under a lower term has closed, and a renewal is
+//! refused once the record moved. A loaded host may hold either child back
+//! for a record's duration, and the lease then changes hands once more: the
+//! parent reads each log as a walk the election allows and holds the
+//! promises over every pair of lines, never over a count of steps. The
+//! children are this test binary run again with a role, so the lock and the
+//! rename cross real process boundaries.
 #![expect(
     clippy::expect_used,
     reason = "the cell's helpers run inside the test and its child processes; a failure there is the test's failure"
@@ -49,6 +54,8 @@ fn word(tick: &Tick) -> String {
         Tick::Renewed { term } => format!("renewed:{term}"),
         Tick::Lost { term, .. } => format!("lost:{term}"),
         Tick::Following { term, .. } => format!("following:{term}"),
+        Tick::Gone { term } => format!("gone:{term}"),
+        Tick::Waiting { term } => format!("waiting:{term}"),
         Tick::Raced => "raced".to_string(),
     }
 }
@@ -89,7 +96,7 @@ fn run_child(role: &str, path: &Path) -> Vec<String> {
     let period = settings().renew_period;
     match role {
         "holder" => {
-            for _ in 0..3 {
+            for _ in 0..5 {
                 step(&mut elector, &mut lines);
                 thread::sleep(period);
             }
@@ -134,6 +141,28 @@ struct Line {
     closes: Option<u64>,
 }
 
+impl Line {
+    /// The word without its term: `renewed:2` reads `renewed`.
+    fn kind(&self) -> &str {
+        self.word
+            .split_once(':')
+            .map_or(self.word.as_str(), |(kind, _)| kind)
+    }
+
+    /// The term in the word: `renewed:2` reads 2.
+    fn term(&self) -> u64 {
+        self.word
+            .split_once(':')
+            .and_then(|(_, term)| term.parse().ok())
+            .expect("a word with its term")
+    }
+
+    /// Whether the tick holds the lease: a take or a renewal.
+    fn holds(&self) -> bool {
+        matches!(self.kind(), "acquired" | "renewed")
+    }
+}
+
 fn parse(log: &str) -> Vec<Line> {
     log.lines()
         .map(|line| {
@@ -151,6 +180,42 @@ fn parse(log: &str) -> Vec<Line> {
             }
         })
         .collect()
+}
+
+/// Holds one child's lines to a walk the election allows, whatever the host
+/// did to its schedule. A take opens a run under a new term: first of all,
+/// or after following or a loss, above the term read there. A renewal stays
+/// in its run and a loss ends it, both under the run's term. Following comes
+/// first of all, after a loss under a higher term, or after following under
+/// no lower one. A line that holds no lease holds no fence, and a fence that
+/// is open stays open at each later renewal of its run.
+fn walk(lines: &[Line], told: &str) {
+    for (at, line) in lines.iter().enumerate() {
+        let prior = at.checked_sub(1).and_then(|before| lines.get(before));
+        let allowed = match (line.kind(), prior) {
+            ("acquired" | "following", None) => true,
+            ("acquired", Some(prior)) => !prior.holds() && line.term() > prior.term(),
+            ("renewed" | "lost", Some(prior)) => prior.holds() && line.term() == prior.term(),
+            ("following", Some(prior)) if prior.kind() == "lost" => line.term() > prior.term(),
+            ("following", Some(prior)) => {
+                prior.kind() == "following" && line.term() >= prior.term()
+            }
+            _ => false,
+        };
+        assert!(allowed, "line {at} is no step of an election: {told}");
+        if line.holds() {
+            let open = prior.is_some_and(|prior| prior.holds() && prior.closes.is_some());
+            assert!(
+                line.closes.is_some() || !open,
+                "line {at} lets an open fence go at a renewal: {told}"
+            );
+        } else {
+            assert!(
+                line.closes.is_none(),
+                "line {at} holds a fence without the lease: {told}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -213,74 +278,132 @@ fn two_processes_over_one_lease_file_hand_over_without_an_overlap() {
     let holder = settled(&fs::read_to_string(dir.path().join("lease.holder.log")).expect("log"));
     let taker = settled(&fs::read_to_string(dir.path().join("lease.taker.log")).expect("log"));
     let words = |lines: &[Line]| lines.iter().map(|l| l.word.clone()).collect::<Vec<_>>();
+    let (holder_words, taker_words) = (words(&holder), words(&taker));
+    let told = format!("the holder {holder_words:?}, the taker {taker_words:?}");
 
-    let holder_words = words(&holder);
-    assert_eq!(
-        &holder_words[..4],
-        ["acquired:1", "renewed:1", "renewed:1", "lost:1"],
-        "the holder's run"
-    );
-    // After the loss the holder follows the taker. A holder descheduled past
-    // the taker's exit may take term 3 once the taker's fence is closed and
-    // renew under it from there; it never leads under term 2 again.
-    let retook = holder_words.iter().position(|w| w == "acquired:3");
-    let followed = retook.unwrap_or(holder_words.len());
+    // A child held back for a record's duration loses the lease to the
+    // other, at any step and more than once on a loaded host. So each log
+    // is read as a walk the election allows, the promises are held over
+    // every pair of lines, and a position is pinned only where the scripts
+    // make it certain.
+    walk(&holder, &told);
+    walk(&taker, &told);
+
+    // The holder takes, renews four times and reads its loss at the late
+    // step. A holder descheduled for the record's duration between two of
+    // its first five steps reads the loss at an earlier one, after fewer
+    // renewals.
+    let lost = holder_words
+        .iter()
+        .position(|w| w == "lost:1")
+        .expect("the holder read its loss");
     assert!(
-        holder_words[4..followed].iter().all(|w| w == "following:2"),
-        "{holder_words:?}"
+        (1..=5).contains(&lost)
+            && holder_words[0] == "acquired:1"
+            && holder_words[1..lost].iter().all(|w| w == "renewed:1"),
+        "the holder's run: {told}"
     );
-    if let Some(retook) = retook {
-        assert!(
-            holder_words[retook + 1..].iter().all(|w| w == "renewed:3"),
-            "{holder_words:?}"
-        );
-    }
-    let taker_words = words(&taker);
+    // The taker follows first, takes the term above and renews, and its
+    // script ends at its fifth renewal. A taker descheduled for its own
+    // record's duration between two of them reads its loss at the next
+    // step: the old holder took the term above once the taker's fence was
+    // closed. The taker follows again, takes once that record stood still,
+    // and its renewals count on.
     let took = taker_words
         .iter()
         .position(|w| w == "acquired:2")
         .expect("the taker took the lease");
-    assert!(took >= 1, "the taker followed first: {taker_words:?}");
     assert!(
-        taker_words[..took].iter().all(|w| w == "following:1"),
-        "{taker_words:?}"
-    );
-    assert_eq!(
-        &taker_words[took + 1..],
-        ["renewed:2"; 5],
-        "the taker renews under its term"
-    );
-
-    // The fence's promise across processes: the holder's fence had closed
-    // before the taker's take began.
-    let holder_closed = holder[..3]
-        .iter()
-        .filter_map(|l| l.closes)
-        .max()
-        .expect("the holder led");
-    let take_began = taker[took].before;
-    assert!(
-        take_began >= holder_closed,
-        "the taker took at {take_began} while the holder's fence was open until {holder_closed}"
+        took >= 1 && taker_words[..took].iter().all(|w| w == "following:1"),
+        "the taker followed first: {told}"
     );
     assert!(
-        holder[3..followed].iter().all(|l| l.closes.is_none()),
-        "the holder's fence stays closed after the loss"
+        taker.last().is_some_and(|l| l.kind() == "renewed")
+            && taker.iter().filter(|l| l.kind() == "renewed").count() == 5,
+        "the taker's script ends at its fifth renewal: {told}"
     );
-    if let Some(retook) = retook {
-        let taker_closed = taker
-            .iter()
-            .filter_map(|l| l.closes)
-            .max()
-            .expect("the taker led");
-        assert!(
-            holder[retook].before >= taker_closed,
-            "the holder retook at {} while the taker's fence was open until {taker_closed}",
-            holder[retook].before
-        );
+    // A loss is read only of a lease the other process took, and no term is
+    // held by both.
+    for (own, other) in [(&holder, &taker), (&taker, &holder)] {
+        for loss in own.iter().filter(|l| l.kind() == "lost") {
+            assert!(
+                other
+                    .iter()
+                    .any(|l| l.kind() == "acquired" && l.term() > loss.term()),
+                "a loss of a lease the other process never took: {told}"
+            );
+        }
     }
     assert!(
-        taker[took..].iter().all(|l| l.closes.is_some()),
-        "the taker's fence is open from its take"
+        holder.iter().filter(|l| l.holds()).all(|held| taker
+            .iter()
+            .filter(|l| l.holds())
+            .all(|other| other.term() != held.term())),
+        "one term held by both: {told}"
     );
+    // A followed term is a term the other process took, and the takes of
+    // the two logs are one a term: 1, 2, 3 and on, each once.
+    for (own, other) in [(&holder, &taker), (&taker, &holder)] {
+        for followed in own.iter().filter(|l| l.kind() == "following") {
+            assert!(
+                other
+                    .iter()
+                    .any(|l| l.kind() == "acquired" && l.term() == followed.term()),
+                "a followed term the other process never took: {told}"
+            );
+        }
+    }
+    let mut takes: Vec<u64> = holder
+        .iter()
+        .chain(&taker)
+        .filter(|l| l.kind() == "acquired")
+        .map(Line::term)
+        .collect();
+    takes.sort_unstable();
+    assert!(
+        (1..).zip(&takes).all(|(term, took)| term == *took),
+        "one take a term: {told}"
+    );
+
+    // The lease file was not there: the take opens no fence, and the third
+    // renewal, three periods after it, is past the renew deadline. A holder
+    // that read its loss before that renewal never led. Every later take
+    // found a record that stood still its duration and leads from the take.
+    assert!(
+        holder[0].closes.is_none(),
+        "the take of an absent record opens no fence"
+    );
+    assert!(
+        lost <= 3 || holder[3].closes.is_some(),
+        "the fence opens at the first renewal a renew deadline after the take"
+    );
+    assert!(
+        holder
+            .iter()
+            .chain(&taker)
+            .filter(|l| l.holds() && l.term() > 1)
+            .all(|l| l.closes.is_some()),
+        "a take of a record that stood still leads from the take: {told}"
+    );
+    // The fence's promise across processes: a fenced instant under a term
+    // begins only when each fence under a lower term has closed.
+    for (lower, higher) in [(&holder, &taker), (&taker, &holder)] {
+        for early in lower {
+            let Some(closed) = early.closes else {
+                continue;
+            };
+            for late in higher
+                .iter()
+                .filter(|l| l.closes.is_some() && l.term() > early.term())
+            {
+                assert!(
+                    late.before >= closed,
+                    "term {} was fenced at {} while term {} was open until {closed}: {told}",
+                    late.term(),
+                    late.before,
+                    early.term()
+                );
+            }
+        }
+    }
 }

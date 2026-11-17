@@ -2601,8 +2601,9 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
 /// runs of a mark beyond ASCII), one whose prefixes stand whole (every
 /// token shorter than the prefix length), one the library declines as it
 /// stands (one-byte tab and newline tokens among twenty-two prefixes: the
-/// tokens' five first bytes stand in), and two sets of added words whose
-/// prefixes would be under the floor (they keep the automaton's search).
+/// tokens' five first bytes stand in), two sets of added words whose
+/// prefixes would be under the floor (they keep the automaton's search),
+/// and one cut to thirteen-byte prefixes for the narrow searcher.
 #[test]
 fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
     let sets: [(&[&str], bool); 5] = [
@@ -2689,6 +2690,10 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
         "zaed",
         "ed",
         "qa",
+        "<\u{FF5C}call_07__a_tail\u{FF5C}>",
+        "<\u{FF5C}call_07__b_tail\u{FF5C}>",
+        "<\u{FF5C}call_07__",
+        "\u{FF5C}end\u{FF5C}",
     ];
     // Sets of added words: the prefixes that fit are one byte (70 words with
     // distinct two-byte prefixes) or two bytes (60 pairs sharing one), under
@@ -2713,6 +2718,9 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
         .into_iter()
         .chain(tags.iter().map(String::as_str))
         .collect();
+    // A set cut to thirteen-byte prefixes for the narrow searcher: a hit
+    // names its token less closely, and the anchored automaton still decides.
+    let calls = bar_fenced_calls();
     let mut all: Vec<(Vec<&str>, bool)> = sets
         .iter()
         .map(|(tokens, by_prefixes)| (tokens.to_vec(), *by_prefixes))
@@ -2720,6 +2728,7 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
     all.push((words_one.iter().map(String::as_str).collect(), false));
     all.push((words_two.iter().map(String::as_str).collect(), false));
     all.push((declined, true));
+    all.push((calls.iter().map(String::as_str).collect(), true));
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     for (tokens, by_prefixes) in &all {
         let list: Vec<Added> = tokens
@@ -2756,6 +2765,66 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
             );
         }
     }
+}
+
+/// Forty-one added tokens, most fenced in fullwidth bars: twenty-one
+/// distinct prefixes of thirteen bytes, forty-one of sixteen.
+fn bar_fenced_calls() -> Vec<String> {
+    let letter = |i: usize| (b'a' + i as u8) as char;
+    (0..40)
+        .map(|i| {
+            format!(
+                "<\u{FF5C}call_{:02}__{}_tail\u{FF5C}>",
+                i % 20,
+                letter(i / 20)
+            )
+        })
+        .chain(["\u{FF5C}end\u{FF5C}".to_owned()])
+        .collect()
+}
+
+/// The prefixes an added-token set is searched by: the longest of at most
+/// thirty-two when they keep eight bytes or more (the library then takes
+/// its narrow searcher), else the longest of at most sixty-four.
+#[test]
+fn the_added_tokens_prefixes_fit_the_narrow_searcher_where_they_stay_long() {
+    let chosen = |tokens: Vec<String>| {
+        let list: Vec<Added> = tokens
+            .into_iter()
+            .enumerate()
+            .map(|(i, token)| Added::plain(token, 1000 + i as u32))
+            .collect();
+        let picked = Prefixes::chosen(&list).map(|prefixes| {
+            let longest = prefixes.iter().map(|prefix| prefix.len()).max();
+            (prefixes.len(), longest.unwrap_or(0))
+        });
+        picked
+    };
+    let letter = |i: usize| (b'a' + i as u8) as char;
+    // Forty-one prefixes of sixteen bytes, twenty-one of thirteen: cut to
+    // the narrow searcher's count.
+    assert_eq!(chosen(bar_fenced_calls()), Some((21, 13)));
+    // Thirty-two prefixes of sixteen bytes fit as they stand; a
+    // thirty-third cuts them to the fifteen bytes that five share.
+    let reserved = |count: usize| -> Vec<String> {
+        (0..count)
+            .map(|i| format!("<|reserved_tok{}{}|>", letter(i / 8), i % 8))
+            .collect()
+    };
+    assert_eq!(chosen(reserved(32)), Some((32, 16)));
+    assert_eq!(chosen(reserved(33)), Some((5, 15)));
+    // Forty prefixes that only seven bytes would bring under thirty-two:
+    // too short to name a token, so the wide searcher keeps all sixteen.
+    let tools: Vec<String> = (0..40)
+        .map(|i| format!("<tool_{}{}_and_a_long_tail>", i % 10, letter(i / 10)))
+        .collect();
+    assert_eq!(chosen(tools), Some((40, 16)));
+    // Seventy words with distinct two-byte prefixes: nothing of three
+    // bytes fits, and the set keeps the automaton's own search.
+    let words: Vec<String> = (0..70)
+        .map(|i| format!("{}{}ing", letter(i % 26), letter(i / 26)))
+        .collect();
+    assert_eq!(chosen(words), None);
 }
 
 /// An added token matched after normalization whose inner space is the
@@ -3725,6 +3794,59 @@ fn an_entry_the_merges_do_not_reach_is_seeded_as_the_model_tokenizes_it() {
 }
 
 #[test]
+fn a_seeded_entry_of_more_ids_than_an_entry_holds_goes_through_the_insert() {
+    // The vocabulary has "abcdef" and no merge reaches it: the model
+    // tokenizes its own entry as six ids, more than a table's entry holds
+    // inline, so the seed keeps them in its spill. A thread's table cannot
+    // take that entry as a copy (the spill is the seed's own): the ids go
+    // through the insert into the thread's spill, and the second encode
+    // reads them from there.
+    let mut vocab = Vocab::default();
+    for (id, c) in bytes_char().iter().enumerate() {
+        vocab.insert(c.to_string(), id as u32);
+    }
+    let whole = vocab.len() as u32;
+    vocab.insert("abcdef".to_owned(), whole);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, Vec::<(String, String)>::new())
+        .build()
+        .expect("bpe");
+    let mut tokenizer = HfTokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    let mut native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let expected: Vec<u32> = "abcdef"
+        .chars()
+        .map(|c| model.token_to_id(&c.to_string()).expect("a byte's token"))
+        .collect();
+    let mut ids = Vec::new();
+    assert!(native
+        .seed
+        .ids_into(ShortPieceKey::of(b"abcdef").expect("key"), &mut ids));
+    assert_eq!(ids, expected, "the seed holds what the model gives");
+    assert_eq!(
+        native.encode(Some(model), "abcdef", false),
+        Ok(expected.clone()),
+        "the seed answered"
+    );
+    assert_eq!(
+        native.encode(Some(model), "abcdef", false),
+        Ok(expected),
+        "the thread's table answered, from its own spill"
+    );
+    let caches: Vec<(usize, usize)> = native
+        .piece_cache
+        .iter_mut()
+        .map(|cache| {
+            let cache = cache.get_mut();
+            (cache.packed.len(), cache.short.len())
+        })
+        .collect();
+    assert_eq!(caches, [(1, 0)]);
+}
+
+#[test]
 fn a_vocabulary_with_gaps_in_its_ids_keeps_the_whole_piece_lookup() {
     // The seed reads the ids `0..vocab_size`: with "xy" at 300 and "xyz" at
     // 301 in a vocabulary of 258 entries both lie beyond it, so the seed does
@@ -4229,6 +4351,173 @@ fn letters(len: usize, i: u32) -> String {
 /// What the long tier accounts for one entry.
 fn long_entry_bytes(piece: &[u8], ids: &[u32]) -> usize {
     LONG_PIECE_ENTRY_BYTES + piece.len() + size_of_val(ids)
+}
+
+/// A piece of 16 to 32 bytes is kept in the wide table when its ids fit an
+/// entry and in the map when they do not: every first sight stores the piece
+/// in one of the two, and a second encode reads the same ids.
+#[test]
+fn pieces_of_sixteen_to_thirty_two_bytes_are_kept_by_their_id_count() {
+    // A model whose merges build `abcdefgh` whole: a piece of that word
+    // repeated has an id for every eight bytes.
+    let tokenizer = split_tokenizer(QWEN35, cluster_model("abcd", "efgh"));
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let (mut fit, mut over) = (0, 0);
+    let mut text = String::new();
+    // Pieces that fit an entry: the word two to four times over, and up to
+    // four letters no merge holds after it. Pieces that do not: letters
+    // with a padding no merge holds, an id a byte.
+    let mut pieces: Vec<String> = Vec::new();
+    for words in 2..=3 {
+        for extra in 0..=4 {
+            pieces.push("abcdefgh".repeat(words) + &"vwxy"[..extra]);
+        }
+    }
+    pieces.push("abcdefgh".repeat(4));
+    pieces.extend((0..100u32).map(|i| letters(16 + i as usize % 17, i)));
+    for piece in &pieces {
+        let alone = tokenizer.encode(piece.as_str(), false).expect("encode");
+        if alone.get_ids().len() <= 7 {
+            fit += 1;
+        } else {
+            over += 1;
+        }
+        // Newlines split the pieces.
+        text.push_str(piece);
+        text.push('\n');
+    }
+    assert!(
+        fit > 0 && over > 0,
+        "both tiers are exercised: {fit} fit, {over} over"
+    );
+    let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+    let first = native.encode(Some(model), &text, false).expect("ids");
+    assert_eq!(first, reference.get_ids());
+    {
+        let cache = native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow();
+        assert_eq!((cache.wide.len(), cache.short.len()), (fit, over));
+    }
+    assert_eq!(
+        native.encode(Some(model), &text, false).expect("ids"),
+        first
+    );
+}
+
+/// A thread's wide table grown for an earlier share keeps its slots through
+/// the clear of a share they still serve and gives them back at the
+/// thread's next encode once the share takes fewer (threads joined), as its
+/// packed table is cut back and its map made anew.
+#[test]
+fn a_thread_whose_wide_table_outgrew_its_share_gives_it_back_at_its_next_encode() {
+    let mut state = 0xFACE_B00C_0DD5_EED5u64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let mut native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let text = " a b c";
+    let before = native
+        .encode_with(Some(model), text, false, false)
+        .expect("ids");
+    // Sixteen thousand pieces of 20 bytes, stored as first sights store them.
+    for cache in &mut native.piece_cache {
+        let cache = cache.get_mut();
+        for i in 0..16_000u32 {
+            let key = WideKey::of(letters(20, i).as_bytes()).expect("a key");
+            assert!(cache.wide.insert(key, &[i, i + 1], cache.share));
+        }
+    }
+    let slots = |native: &mut NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .iter_mut()
+            .map(|cache| cache.get_mut().wide_slots())
+            .sum()
+    };
+    let entries = |native: &mut NativeEncoder| -> usize {
+        native
+            .piece_cache
+            .iter_mut()
+            .map(|cache| cache.get_mut().short_entries())
+            .sum()
+    };
+    let grown = slots(&mut native);
+    assert_eq!(grown, 32_768);
+    assert!(entries(&mut native) >= 16_000);
+    // Threads join: the entries pass the share, whose slots these still are;
+    // the clear at the start of the next call keeps them.
+    native.threads.store(300, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert!(
+        share < 16_000 && grown <= WidePieceTable::slots_for(share),
+        "{share}"
+    );
+    assert_eq!(
+        native
+            .encode_with(Some(model), text, false, false)
+            .expect("ids"),
+        before
+    );
+    assert!(entries(&mut native) <= share);
+    assert_eq!(slots(&mut native), grown);
+    // More threads join: the share takes fewer slots; the next call gives
+    // the table's back.
+    native.threads.store(1_024, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert!(grown > WidePieceTable::slots_for(share), "{share}");
+    assert_eq!(
+        native
+            .encode_with(Some(model), text, false, false)
+            .expect("ids"),
+        before
+    );
+    assert_eq!(slots(&mut native), 0);
+}
+
+/// A thread at a steady share keeps its pieces from one encode to the next
+/// while its wide table grows: the table stops at the share's slots, so the
+/// next call finds nothing to cut back (a table grown by four past them had
+/// every count-bounded tier cleared at each call).
+#[test]
+fn a_wide_table_grows_within_the_share_and_keeps_the_threads_pieces() {
+    let mut state = 0x5EED_0F5E_A7ED_CAFEu64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let mut native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    // 4,095 threads counted before this one, whose first encode makes them
+    // 4,096: a share of 1,024 pieces, whose slots are 2,048.
+    native.threads.store(4_095, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert_eq!((share, WidePieceTable::slots_for(share)), (1_024, 2_048));
+    let text = " a b c";
+    let before = native
+        .encode_with(Some(model), text, false, false)
+        .expect("ids");
+    // Nine hundred pieces, stored as first sights store them: past the 768
+    // at which a table of 1,024 slots grows.
+    for cache in &mut native.piece_cache {
+        let cache = cache.get_mut();
+        for i in 0..900u32 {
+            let key = WideKey::of(letters(20, i).as_bytes()).expect("a key");
+            assert!(cache.wide.insert(key, &[i, i + 1], share));
+        }
+        assert_eq!((cache.wide.len(), cache.wide_slots()), (900, 2_048));
+    }
+    assert_eq!(
+        native
+            .encode_with(Some(model), text, false, false)
+            .expect("ids"),
+        before
+    );
+    for cache in &mut native.piece_cache {
+        let cache = cache.get_mut();
+        assert_eq!((cache.wide.len(), cache.wide_slots()), (900, 2_048));
+    }
 }
 
 #[test]
@@ -5716,7 +6005,8 @@ fn staged(stages: &[Stage], text: &str) -> Vec<(usize, usize)> {
 }
 
 /// Holds the scanner of each of `patterns` against the pattern's program:
-/// the same match ranges on every fixture text and on the fuzz inputs.
+/// the same match ranges on every fixture text, on the fuzz inputs and on
+/// two all-ASCII forms of each fuzz input.
 fn scanner_differential(patterns: &[&str]) {
     let fixtures = fixture_texts();
     let rounds = fuzz_rounds();
@@ -5734,10 +6024,19 @@ fn scanner_differential(patterns: &[&str]) {
             );
             for words in [false, true] {
                 let mut each = Vec::new();
-                parsed.for_each_match(text, words, |start, end| each.push((start, end)));
+                parsed
+                    .for_each_match::<false, _>(text, words, |start, end| each.push((start, end)));
                 assert_eq!(
                     each, expected,
                     "for_each_match words={words}: pattern {pattern:?} text {text:?}"
+                );
+            }
+            if text.is_ascii() {
+                let mut each = Vec::new();
+                parsed.for_each_match::<true, _>(text, false, |start, end| each.push((start, end)));
+                assert_eq!(
+                    each, expected,
+                    "for_each_match of an all-ASCII text: pattern {pattern:?} text {text:?}"
                 );
             }
         };
@@ -5745,7 +6044,20 @@ fn scanner_differential(patterns: &[&str]) {
             check(text);
         }
         for _ in 0..rounds {
-            check(&fuzz_text(&mut state, &fixtures));
+            let text = fuzz_text(&mut state, &fixtures);
+            check(&text);
+            // Nearly every fuzz text holds a character beyond ASCII, so the
+            // all-ASCII walk gets texts of its own: the text's ASCII
+            // characters, and those with each one repeated up to twelve
+            // times, which makes letter runs and space runs longer than the
+            // eight bytes the lean scan tests in line.
+            let ascii: String = text.chars().filter(char::is_ascii).collect();
+            check(&ascii);
+            let runs: String = ascii
+                .chars()
+                .flat_map(|c| std::iter::repeat_n(c, 1 + pseudo_random(&mut state) as usize % 12))
+                .collect();
+            check(&runs);
         }
     }
 }
@@ -6422,5 +6734,147 @@ fn a_merged_with_next_stage_over_the_image_is_declined() {
                 .to_vec()),
             "{text:?} through the merged pieces over the raw text"
         );
+    }
+}
+
+#[test]
+fn a_unit_opens_as_ascii_up_to_one_byte_in_eight_of_its_head() {
+    let ascii = "a".repeat(ASCII_HEAD_BYTES);
+    // 32 bytes beyond ASCII in a full head: one in eight.
+    let cyrillic = "\u{436}".repeat(ASCII_HEAD_BYTES / 16);
+    assert!(NativeEncoder::opens_as_ascii(""));
+    assert!(NativeEncoder::opens_as_ascii(&ascii));
+    assert!(NativeEncoder::opens_as_ascii(&format!("{cyrillic}{ascii}")));
+    assert!(!NativeEncoder::opens_as_ascii(&format!(
+        "\u{436}{cyrillic}{ascii}"
+    )));
+    // Only the head is read, and by bytes: it may end inside a character.
+    assert!(NativeEncoder::opens_as_ascii(&format!(
+        "{ascii}{cyrillic}{cyrillic}"
+    )));
+    assert!(NativeEncoder::opens_as_ascii(&format!(
+        "{}\u{436}",
+        "a".repeat(ASCII_HEAD_BYTES - 1)
+    )));
+    // Under eight bytes, and in the bytes after the last whole word, a byte
+    // beyond ASCII counts as any other.
+    assert!(NativeEncoder::opens_as_ascii("abcdefg"));
+    assert!(!NativeEncoder::opens_as_ascii("abcde\u{e9}"));
+    assert!(!NativeEncoder::opens_as_ascii("abcdefgh\u{e9}"));
+}
+
+/// A piece that holds no byte whose image a stage over the image can begin
+/// a match with is final before its image is built (`image_opens`). Its
+/// pieces are the full walk's and the reference's: on the two listed shapes
+/// with digit stages over the image and on one with two opening classes
+/// there (digit runs, then runs of `!`, the whole unit one piece). The
+/// texts: words without an opening byte, with one at either end and inside,
+/// with the bytes beyond ASCII whose image is numeric, and random ones over
+/// such an alphabet.
+#[test]
+fn a_piece_without_an_opening_byte_is_final_before_its_image() {
+    let mut state = 0x494D_4147_4546_494Cu64;
+    let random = |state: &mut u64| {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    };
+    let table = bytes_char();
+    let listed = [
+        "punctuation-then-byte-level-regex-then-digits",
+        "punctuation-then-byte-level-regex-then-digit-runs-then-threes",
+    ];
+    let mut cases: Vec<Shape> = shapes()
+        .into_iter()
+        .filter(|shape| listed.contains(&shape.name))
+        .collect();
+    assert_eq!(cases.len(), listed.len());
+    cases.push(Shape {
+        name: "byte-level-then-digit-runs-then-bangs",
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            byte_level(false),
+            PreTokenizerWrapper::Digits(Digits::new(false)),
+            split("!+", SplitDelimiterBehavior::Isolated, false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    });
+    let alphabet: Vec<char> = "ab z0189!,.\u{B2}\u{BC}\u{E9}\u{4E32}\u{4E39}\u{E52} \n"
+        .chars()
+        .collect();
+    let fixed = [
+        "word",
+        "two words",
+        "a1",
+        "1a",
+        "a1b",
+        "12345",
+        "a!b",
+        "!!1!!",
+        "x\u{B2}",
+        "caf\u{E9}",
+        "\u{4E32}\u{4E39}",
+        "price 1234 units!",
+        "tab\there 7\n",
+    ];
+    for shape in &cases {
+        let name = shape.name;
+        let tokenizer = tokenizer_of(shape, &mut state);
+        let native = seeded(&tokenizer);
+        let from = native.mapped_from.expect("the map");
+        let opens = native.image_opens.as_deref().expect("the opening bytes");
+        for byte in [b'0', b'7', 0xB2, 0xBC] {
+            assert!(opens[usize::from(byte)], "{name}: {byte:#x}");
+        }
+        for byte in [b'a', b' ', 0xA9, 0xC3, 0xE4] {
+            assert!(!opens[usize::from(byte)], "{name}: {byte:#x}");
+        }
+        assert_eq!(opens[usize::from(b'!')], name.ends_with("bangs"), "{name}");
+        let mut full = seeded(&tokenizer);
+        full.image_opens = None;
+        let pre_tokenizer = tokenizer.get_pre_tokenizer().expect("the pre-tokenizer");
+        let mut image = String::new();
+        let mut texts: Vec<String> = fixed.iter().map(|text| (*text).to_owned()).collect();
+        for _ in 0..300 {
+            let len = 1 + (random(&mut state) % 24) as usize;
+            texts.push(
+                (0..len)
+                    .map(|_| alphabet[(random(&mut state) % alphabet.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        for text in &texts {
+            let mut split = PreTokenizedString::from(text.as_str());
+            pre_tokenizer
+                .pre_tokenize(&mut split)
+                .expect("the reference");
+            let theirs: Vec<String> = split
+                .get_splits(OffsetReferential::Original, OffsetType::Byte)
+                .into_iter()
+                .map(|(piece, _, _)| piece.to_owned())
+                .collect();
+            let mut ours = Vec::new();
+            native.pieces_mapping(0, from, text, &mut image, &mut |raw: &[u8]| {
+                ours.push(
+                    raw.iter()
+                        .map(|&b| table[usize::from(b)])
+                        .collect::<String>(),
+                );
+            });
+            let mut walked = Vec::new();
+            full.pieces_mapping(0, from, text, &mut image, &mut |raw: &[u8]| {
+                walked.push(
+                    raw.iter()
+                        .map(|&b| table[usize::from(b)])
+                        .collect::<String>(),
+                );
+            });
+            assert_eq!(ours, walked, "{name}: the full walk's pieces of {text:?}");
+            assert_eq!(ours, theirs, "{name}: the reference's pieces of {text:?}");
+        }
     }
 }

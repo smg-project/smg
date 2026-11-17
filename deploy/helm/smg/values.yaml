@@ -7,7 +7,7 @@ global:
   image:
     registry: docker.io
     repository: lightseekorg/smg
-    tag: ""  # defaults to Chart.appVersion
+    tag: ""  # defaults to Chart.appVersion; text: quote a tag of digits alone ("1.16")
     pullPolicy: IfNotPresent
   imagePullSecrets: []
 
@@ -426,9 +426,32 @@ policyController:
     repository: ""
     tag: ""
 
-  # -- Replicas. The controller does not elect a leader yet: every replica is
-  #    a controller of its own. Keep one.
+  # -- Replicas. With the election off every replica is a controller of its
+  #    own: keep one. With it on, run two or more: one leads and the others
+  #    stand by.
   replicas: 1
+
+  # -- Leader election among the replicas, over one coordination.k8s.io Lease
+  #    in the release's namespace. On renders that Lease, a ServiceAccount of
+  #    the controller's own with its token mounted in the controller's pods
+  #    alone, and a Role and RoleBinding that grant get and update on that one
+  #    Lease; the controller is passed --lease-name, and its pod's address as
+  #    --advertise-address. The Deployment then rolls one pod more at a time
+  #    with none unavailable. Off, none of this is rendered.
+  #    leaseName "" is the controller's full name. A name of your own is
+  #    unique to one controller: two controllers handed one name in one
+  #    namespace elect one leader between two stores.
+  #    The Lease carries the election's term: a deleted or replaced Lease
+  #    restarts the term once no running controller remembers the last one,
+  #    and turning the election off deletes the Lease. Turning it on beside
+  #    a running controller starts an elected pod while the lone one still
+  #    leads: scale the controller to zero first.
+  #    A changed leaseName on a running release is such a change as well: a
+  #    pod elected over the new Lease may lead while the old Lease's leader
+  #    still leads, until its renew deadline, and the term starts again.
+  election:
+    enabled: false
+    leaseName: ""
 
   # -- The listeners' container ports, each passed as its --*-listen flag: the
   #    gateways and the relays (gateway), the operators (control), the standbys
@@ -440,6 +463,17 @@ policyController:
     control: 30101
     replication: 30102
     admin: 30103
+
+  # -- Nothing is verified on a listener named here: whoever reaches its
+  #    port acts as any principal of its scopes. The listeners that take a
+  #    caller's stated name as its identity, passed as --identity-as-told:
+  #    any of gateway, control and replication, each once, in any order.
+  #    None by default: the controller then refuses every call but Leader as
+  #    unauthenticated. Name one only behind a mesh that verifies its
+  #    callers, or a network policy that admits them alone: the Service
+  #    carries the gateways' and the operators' ports, and a pod's address
+  #    reaches all three listeners.
+  identityAsTold: []
 
   # -- The Service <fullname>-policy-controller, three ports on the listeners'
   #    own numbers: `grpc` for the gateways' listener, `control` for the

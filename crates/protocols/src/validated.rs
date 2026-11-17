@@ -33,14 +33,17 @@ use axum::{
     Json,
 };
 #[cfg(feature = "axum")]
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 #[cfg(feature = "axum")]
 use serde_json::{json, Value};
 #[cfg(feature = "axum")]
 use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
 #[cfg(feature = "axum")]
-use crate::common::FIELD_PARAM;
+use crate::{
+    common::FIELD_PARAM,
+    strict_value::{entries_with, StrictValue},
+};
 
 /// A JSON extractor that automatically validates and normalizes the request body
 ///
@@ -64,10 +67,73 @@ pub struct ValidatedJson<T>(pub T);
 /// A body a route reads as a JSON value and checks itself (the Conversations
 /// routes): it rides the validated extractor for the envelope its refusals
 /// take, with nothing to validate or normalize before the handler sees it.
+/// A repeated key is refused as a typed body's is, at the body's own keys
+/// and at any depth below them; the keys of `metadata` keep the last value,
+/// as that map's do in a typed body.
 #[cfg(feature = "axum")]
-#[derive(Debug, serde::Deserialize)]
-#[serde(transparent)]
+#[derive(Debug)]
 pub struct ValueBody(pub Value);
+
+#[cfg(feature = "axum")]
+impl<'de> serde::Deserialize<'de> for ValueBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(BodyVisitor).map(ValueBody)
+    }
+}
+
+/// [`ValueBody`]'s reader. The `metadata` member of the body's own object is
+/// left to [`Value`]'s own reader, as a typed body's `metadata` map is read:
+/// a repeated key of that map answers the same on every route.
+#[cfg(feature = "axum")]
+struct BodyVisitor;
+
+#[cfg(feature = "axum")]
+impl<'de> Visitor<'de> for BodyVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        StrictValue.expecting(formatter)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+        StrictValue.visit_bool(value)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+        StrictValue.visit_i64(value)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+        StrictValue.visit_u64(value)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+        StrictValue.visit_f64(value)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+        StrictValue.visit_str(value)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+        StrictValue.visit_unit()
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, elements: A) -> Result<Value, A::Error> {
+        StrictValue.visit_seq(elements)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Value, A::Error> {
+        entries_with(&mut entries, |key, entries| {
+            if key == "metadata" {
+                entries.next_value()
+            } else {
+                entries.next_value_seed(StrictValue)
+            }
+        })
+        .map(Value::Object)
+    }
+}
 
 #[cfg(feature = "axum")]
 impl Validate for ValueBody {
@@ -1673,6 +1739,140 @@ mod tests {
         }
     }
 
+    /// A key repeated inside a chat content part is refused with serde's
+    /// words: the param is the message serde's path stops at and the part's
+    /// place is in the words, as for any part refusal that is no missing
+    /// field; the legacy `function_call` object answers at its own path. The
+    /// code is `json_parse_error`: the reason table names no duplicate field.
+    #[tokio::test]
+    async fn a_repeated_key_inside_a_chat_content_part_is_refused() {
+        use crate::chat::ChatCompletionRequest;
+
+        for (body, param, message) in [
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a","text":"b"}]}]}"#,
+                "messages[0]",
+                "messages[0]: duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"a"},{"type":"text","text":"a","text":"b"}]}]}"#,
+                "messages[1]",
+                "messages[1]: duplicate field `text`, in `content[1]`",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"function_call":{"name":"f","name":"g"}}"#,
+                "function_call",
+                "function_call: duplicate field `name`",
+            ),
+        ] {
+            let (status, json) = rejected::<ChatCompletionRequest>(body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], "json_parse_error", "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+    }
+
+    /// A repeated key below an input item's own keys is refused at its
+    /// place: serde's words, the path the extractor's tracker recorded
+    /// through the nested read; the item's own keys answer `input[0]`. The
+    /// code is `json_parse_error`: the reason table names no duplicate field.
+    #[tokio::test]
+    async fn a_repeated_key_below_an_input_items_own_keys_is_refused_at_its_place() {
+        for (body, param, message) in [
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}],"max_output_tokens":2}"#,
+                "input[0].content[0]",
+                "input[0].content[0]: duplicate field `text`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"t","annotations":[{"type":"file_citation","file_id":"f","filename":"n","index":0,"index":1}]}]}],"max_output_tokens":2}"#,
+                "input[0].content[0].annotations[0]",
+                "input[0].content[0].annotations[0]: duplicate field `index`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"apply_patch_call","id":"ap_1","call_id":"c","operation":{"type":"create_file","path":"a","diff":"d","path":"b"},"status":"completed"}],"max_output_tokens":2}"#,
+                "input[0].operation",
+                "input[0].operation: duplicate field `path`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":"hi","role":"system"}],"max_output_tokens":2}"#,
+                "input[0]",
+                "input[0]: duplicate field `role`",
+            ),
+        ] {
+            let (status, json) = rejected::<ResponsesRequest>(body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], "json_parse_error", "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+    }
+
+    /// A Conversations body refuses a repeated key as the Responses door
+    /// refuses one: at the body's own keys (no place to name, as for a typed
+    /// body's own), at an item's keys and at any depth below them (the place
+    /// the extractor's tracker recorded). The keys of `metadata` keep the
+    /// last value, as that map's do on every door, and a body that is no
+    /// object is read whole for the handler to refuse.
+    #[tokio::test]
+    async fn a_value_body_refuses_a_repeated_key_outside_metadata_at_its_place() {
+        for (body, param, message) in [
+            (
+                r#"{"metadata":{"a":"1"},"metadata":{"a":"2"}}"#,
+                Value::Null,
+                "duplicate field `metadata`",
+            ),
+            (
+                r#"{"items":[{"type":"message","role":"user","content":"hi","role":"system"}]}"#,
+                json!("items[0]"),
+                "items[0]: duplicate field `role`",
+            ),
+            (
+                r#"{"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}]}"#,
+                json!("items[0].content[0]"),
+                "items[0].content[0]: duplicate field `text`",
+            ),
+        ] {
+            let (status, json) = rejected::<ValueBody>(body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], "json_parse_error", "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+        for (body, read) in [
+            (
+                r#"{"metadata":{"a":"1","a":"2"}}"#,
+                json!({"metadata": {"a": "2"}}),
+            ),
+            ("[1]", json!([1])),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_default();
+            let accepted = ValidatedJson::<ValueBody>::from_request(request, &()).await;
+            assert!(
+                matches!(&accepted, Ok(ValidatedJson(ValueBody(value))) if *value == read),
+                "{body}"
+            );
+        }
+    }
+
     /// The Chat Completions rules checked across fields name their field;
     /// a provider profile's rule keeps its code and message with nothing in
     /// front; the Messages rules print the public API's words alone.
@@ -1785,13 +1985,31 @@ mod tests {
                 "{surface}: {json}"
             );
         }
+
+        // A namespace member whose parameters are no object, on Responses: the refusal is the
+        // `tools` field's, and its message says which member.
+        let body = r#"{"model":"m","input":"hi","tools":[{"type":"namespace","name":"ns","description":"d","tools":[{"type":"function","name":"f","parameters":[]}]}]}"#;
+        let (status, json) = rejected::<ResponsesRequest>(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"]["code"], "invalid_type", "{json}");
+        assert_eq!(json["error"]["param"], "tools", "{json}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(
+                "Invalid type for 'tools[0].tools[0].parameters': expected an object, but got an array instead."
+            ),
+            "{json}"
+        );
     }
 
     /// A refusal inside a Responses `input` item names the item, the part
     /// and the field under the route's own code, as every other field's
     /// refusal on this door does: a message with or without its `type` or
     /// its `id`, a part inside a typed item, a field inside a part's own
-    /// array; the accepted shapes are unchanged.
+    /// array, a typed item's own field or the element of one of its arrays,
+    /// a field sent an array it does not take (the field, not the array's
+    /// first element), the kind of a typed item; the accepted shapes are
+    /// unchanged.
     #[tokio::test]
     async fn a_responses_input_part_refusal_names_the_part_and_its_field() {
         let image = |part: &str| {
@@ -1817,6 +2035,14 @@ mod tests {
                 "invalid_type",
                 "input[0].content[1].image_url",
                 "input[0].content[1].image_url: invalid type: map, expected a string",
+            ),
+            // A part's field that takes no array, sent one, is refused
+            // itself, not at the array's first element.
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":["describe"]}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].content[0].text",
+                "input[0].content[0].text: invalid type: sequence, expected a string",
             ),
             (
                 r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_video","video_url":"http://127.0.0.1/clip.mp4"}]}],"max_output_tokens":2}"#.to_string(),
@@ -1866,14 +2092,79 @@ mod tests {
                 "input[0].output[0].text",
                 "input[0].output[0]: missing field `text`",
             ),
-            // A typed item's own missing field keeps the derived reader's
-            // words: its fallback to the untagged shapes drops the tagged
-            // reading's reason (the limit of the reader).
+            // A typed item's own field: a missing one by serde's words at the
+            // item, an invalid one at the field, a kind the door has no
+            // variant for at `type`, a field inside one of the item's arrays
+            // at the element.
             (
                 r#"{"model":"m","input":[{"type":"function_call","id":"fc_1","name":"lookup","arguments":"{}"}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].call_id",
+                "input[0]: missing field `call_id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":7}],"max_output_tokens":2}"#.to_string(),
                 "invalid_type",
-                "input[0]",
-                "input[0]: data did not match any variant of untagged enum ResponseInputOutputItem",
+                "input[0].arguments",
+                "input[0].arguments: invalid type: integer `7`, expected a string",
+            ),
+            // The same for an item's field: `arguments` takes a string, so
+            // an array there is the field's refusal.
+            (
+                r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":["{}"]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].arguments",
+                "input[0].arguments: invalid type: sequence, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":7,"content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].role",
+                "input[0].role: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"web_search_results","id":"ws_1"}],"max_output_tokens":2}"#.to_string(),
+                "invalid_value",
+                "input[0].type",
+                "input[0].type: unknown variant `web_search_results`, expected one of `message`, `reasoning`, `function_call`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[{"name":"search"}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].tools[0].input_schema",
+                "input[0].tools[0]: missing field `input_schema`",
+            ),
+            // A field missing inside an array element whose name is an
+            // optional field of the item too (the safety check's `id`, the
+            // output's own `id`) is named at the element.
+            (
+                r#"{"model":"m","input":[{"type":"computer_call_output","call_id":"call_1","output":{"type":"computer_screenshot"},"acknowledged_safety_checks":[{}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].acknowledged_safety_checks[0].id",
+                "input[0].acknowledged_safety_checks[0]: missing field `id`",
+            ),
+            // An item reference is refused for its `id` alone, never for its
+            // kind, which the door takes.
+            (
+                r#"{"model":"m","input":[{"type":"item_reference"}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].id",
+                "input[0]: missing field `id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"item_reference","id":7}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].id",
+                "input[0].id: invalid type: integer `7`, expected a string",
+            ),
+            // A `message` with an `id` and a string `content` is the untagged
+            // shape (the `id` dropped); a refused field beside them is named,
+            // not the `content` the shape takes.
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","content":"hi","role":7}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].role",
+                "input[0].role: invalid type: integer `7`, expected a string",
             ),
             (
                 r#"{"model":"m","input":[{"content":"hi"}],"max_output_tokens":2}"#.to_string(),
@@ -1906,6 +2197,9 @@ mod tests {
             r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":2}"#.to_string(),
             r#"{"model":"m","input":[{"id":"msg_1"}],"max_output_tokens":2}"#.to_string(),
             r#"{"model":"m","input":[{"id":"msg_1","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"id":"msg_1","type":"item_reference"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"user","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"found"}],"max_output_tokens":2}"#.to_string(),
         ] {
             let (status, json) = rejected::<ResponsesRequest>(&body).await;
             assert_eq!(status, StatusCode::OK, "{body}: {json}");

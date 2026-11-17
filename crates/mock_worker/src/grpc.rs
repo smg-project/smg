@@ -318,7 +318,8 @@ struct Rank {
 }
 
 impl Rank {
-    /// The worker's ranks: `--grpc-dp-size` realistic engines, rank `r` named
+    /// The worker's ranks: `--grpc-dp-size` realistic engines with the
+    /// worker's parameters ([`Config::engine_for`]), rank `r` named
     /// `<worker>:r<r>` in the process fleet (a single rank keeps the worker's
     /// name) and stamping `r` on its KV-event batches; none for a canned
     /// worker.
@@ -327,9 +328,10 @@ impl Rank {
             return Vec::new();
         }
         let size = usize::from(cfg.grpc_dp_size.max(1));
+        let engine = cfg.engine_for(worker);
         (0..size)
             .map(|rank| {
-                let mut params = cfg.engine.clone();
+                let mut params = engine.clone();
                 params.dp_rank = i32::try_from(rank).unwrap_or(i32::MAX);
                 let name = if size > 1 {
                     format!("{worker}:r{rank}")
@@ -1100,7 +1102,7 @@ impl MockScheduler {
     /// events on one stream, each batch stamped with its rank and carrying
     /// the load record a servicer attaches for that rank; one record state
     /// over the merged stream, as the Rust relay keeps one per subscription
-    /// (its heartbeat names the last batch's rank).
+    /// (every rank's heartbeat on the rank's own clock).
     pub(crate) fn kv_events(
         &self,
         request: common::SubscribeKvEventsRequest,
@@ -1158,6 +1160,7 @@ impl MockScheduler {
             self.cfg.loads_like,
             self.cfg.step_reports,
             request.load_records_before_first_batch,
+            request.start_sequence_number,
             Box::pin(stream::select_all(streams)),
         );
         // A subscription ends with the worker's stop, as a serving engine's
@@ -1804,11 +1807,57 @@ impl RankLoadSource {
     }
 }
 
-/// One rank's clock on a records-only stream: what it last sent and when.
+/// One rank's clock on a stream of load records: what it last sent and when,
+/// as the Rust servicer's (`RankClock` in
+/// `crates/engine_servicer/src/kv_events.rs`).
 struct RankClock {
     last_record: Option<common::EngineLoad>,
     last_sent_at: Option<Instant>,
     idle_heartbeats: u32,
+}
+
+impl RankClock {
+    const fn new() -> Self {
+        Self {
+            last_record: None,
+            last_sent_at: None,
+            idle_heartbeats: 0,
+        }
+    }
+
+    /// Whether `record` goes out on a `load_only` batch at `now`: it moved
+    /// since the rank's last one sent, or the rank has been silent for the
+    /// heartbeat interval (the backoff interval after two unchanged
+    /// heartbeats). Counts the heartbeat.
+    fn due(&mut self, record: &common::EngineLoad, now: Instant) -> bool {
+        let changed = self
+            .last_record
+            .as_ref()
+            .is_none_or(|last| load_changed(last, record));
+        let due_after = if self.idle_heartbeats >= 2 {
+            HEARTBEAT_BACKOFF
+        } else {
+            HEARTBEAT_INTERVAL
+        };
+        let silent_for = self
+            .last_sent_at
+            .map_or(Duration::MAX, |at| now.saturating_duration_since(at));
+        if !changed && silent_for < due_after {
+            return false;
+        }
+        self.idle_heartbeats = if changed {
+            0
+        } else {
+            self.idle_heartbeats.saturating_add(1)
+        };
+        true
+    }
+
+    /// `record` went out at `now`, on a `load_only` batch or with events.
+    fn sent(&mut self, record: &common::EngineLoad, now: Instant) {
+        self.last_record = Some(record.clone());
+        self.last_sent_at = Some(now);
+    }
 }
 
 /// The records-only stream a `loads_only` subscriber gets, as the Rust
@@ -1829,33 +1878,14 @@ struct LoadRecordsOnly {
 impl LoadRecordsOnly {
     fn collect_due(&mut self, now: Instant) {
         for (index, (source, clock)) in self.ranks.iter().zip(&mut self.clocks).enumerate() {
-            let current = source.record(self.like, self.step_reports, 0);
-            let changed = clock
-                .last_record
-                .as_ref()
-                .is_none_or(|last| load_changed(last, &current));
-            let due_after = if clock.idle_heartbeats >= 2 {
-                HEARTBEAT_BACKOFF
-            } else {
-                HEARTBEAT_INTERVAL
-            };
-            let silent_for = clock
-                .last_sent_at
-                .map_or(Duration::MAX, |at| now.saturating_duration_since(at));
-            if !changed && silent_for < due_after {
+            let mut record = source.record(self.like, self.step_reports, 0);
+            if !clock.due(&record, now) {
                 continue;
             }
             self.sample += 1;
-            let mut record = current;
             record.sample = self.sample;
             record.load_only = true;
-            clock.idle_heartbeats = if changed {
-                0
-            } else {
-                clock.idle_heartbeats.saturating_add(1)
-            };
-            clock.last_sent_at = Some(now);
-            clock.last_record = Some(record.clone());
+            clock.sent(&record, now);
             self.pending.push_back(common::KvEventBatch {
                 sequence_number: 0,
                 timestamp: engine::unix_seconds(),
@@ -1886,14 +1916,7 @@ fn load_records_only(
     step_reports: bool,
 ) -> KvEventStream {
     let records = LoadRecordsOnly {
-        clocks: ranks
-            .iter()
-            .map(|_| RankClock {
-                last_record: None,
-                last_sent_at: None,
-                idle_heartbeats: 0,
-            })
-            .collect(),
+        clocks: ranks.iter().map(|_| RankClock::new()).collect(),
         ranks,
         like,
         step_reports,
@@ -1918,13 +1941,15 @@ struct LoadRecords {
     /// batch, numbered 0 (`SubscribeKvEventsRequest.
     /// load_records_before_first_batch`); unset, it waits for that batch.
     records_before_first_batch: bool,
-    /// The last sequence sent, which a `load_only` batch repeats; `None`
-    /// before the stream's first batch.
-    last_seq: Option<u64>,
-    last_rank: Option<i32>,
-    last_record: Option<common::EngineLoad>,
-    last_sent_at: Instant,
-    idle_heartbeats: u32,
+    /// Per rank: the last sequence of it sent, which the rank's `load_only`
+    /// batches repeat (`None` before the rank's first batch; a stream that
+    /// resumed starts at its cursor), and the rank's record clock.
+    beats: Vec<(Option<u64>, RankClock)>,
+    /// The `load_only` batches a tick found due, sent one per poll.
+    due: VecDeque<common::KvEventBatch>,
+    /// When the records are looked at next: a deadline kept across batches,
+    /// as the Rust relay's.
+    next_tick: Instant,
     sample: u64,
 }
 
@@ -1960,52 +1985,63 @@ impl LoadRecords {
         if !load_only && self.sample > 1 {
             smg_grpc_client::engine_load::core_only(&mut record);
         }
-        self.last_record = Some(record.clone());
         record
     }
 
-    /// A `load_only` batch when the record moved since the last one sent, or
-    /// after the heartbeat interval of silence (the backoff interval after two
-    /// unchanged heartbeats); it repeats the last sequence sent, as the
-    /// gateway expects. Before the stream's first batch there is none to
-    /// repeat: as the Rust relay, the mock sends one numbered 0 only to a
-    /// subscriber that asked for records before the first batch, and keeps
-    /// an older subscriber waiting for that batch.
-    fn load_only_batch(&mut self) -> Option<common::KvEventBatch> {
-        let sequence_number = match self.last_seq {
-            Some(sequence) => sequence,
-            None if self.records_before_first_batch => 0,
-            None => return None,
-        };
-        // The heartbeat is the last batch's rank's, as the relay's.
-        let current = self.current(self.last_rank, 0);
-        let changed = self
-            .last_record
-            .as_ref()
-            .is_none_or(|last| load_changed(last, &current));
-        let due_after = if self.idle_heartbeats >= 2 {
-            HEARTBEAT_BACKOFF
-        } else {
-            HEARTBEAT_INTERVAL
-        };
-        if !changed && self.last_sent_at.elapsed() < due_after {
-            return None;
+    /// A batch of `rank`'s events goes out numbered `sequence` with `record`
+    /// on it: the rank's silence starts over. As [`source`](Self::source),
+    /// a batch that names no rank or one past the ranks counts for rank 0.
+    fn published(&mut self, rank: Option<i32>, sequence: u64, record: &common::EngineLoad) {
+        let index = rank
+            .and_then(|rank| usize::try_from(rank).ok())
+            .filter(|&index| index < self.beats.len())
+            .unwrap_or(0);
+        if let Some((last, clock)) = self.beats.get_mut(index) {
+            *last = Some(sequence);
+            clock.idle_heartbeats = 0;
+            clock.sent(record, Instant::now());
         }
-        let record = self.record(self.last_rank, true);
-        self.last_sent_at = Instant::now();
-        self.idle_heartbeats = if changed {
-            0
-        } else {
-            self.idle_heartbeats.saturating_add(1)
-        };
-        Some(common::KvEventBatch {
-            sequence_number,
-            timestamp: engine::unix_seconds(),
-            events: Vec::new(),
-            dp_rank: self.last_rank,
-            snapshot: None,
-            load: Some(record),
-        })
+    }
+
+    /// Queue a `load_only` batch for every rank whose record moved since the
+    /// rank's last one sent, or after the heartbeat interval of the rank's
+    /// silence (the backoff interval after two unchanged heartbeats): each
+    /// rank on its own clock, as the Rust relay. A batch repeats the rank's
+    /// last sequence sent, or the cursor the stream resumed at, as the
+    /// gateway expects. With neither there is none to repeat: as the Rust
+    /// relay, the mock sends one numbered 0 only to a subscriber that asked
+    /// for records before the first batch, and keeps an older subscriber
+    /// waiting for that batch.
+    fn queue_due_records(&mut self) {
+        let now = Instant::now();
+        for index in 0..self.beats.len() {
+            let rank = i32::try_from(index).ok();
+            let Some(sequence_number) = self.beats.get(index).and_then(|(last, _)| {
+                last.or_else(|| self.records_before_first_batch.then_some(0))
+            }) else {
+                continue;
+            };
+            let current = self.current(rank, 0);
+            let due = self
+                .beats
+                .get_mut(index)
+                .is_some_and(|(_, clock)| clock.due(&current, now));
+            if !due {
+                continue;
+            }
+            let record = self.record(rank, true);
+            if let Some((_, clock)) = self.beats.get_mut(index) {
+                clock.sent(&record, now);
+            }
+            self.due.push_back(common::KvEventBatch {
+                sequence_number,
+                timestamp: engine::unix_seconds(),
+                events: Vec::new(),
+                dp_rank: rank,
+                snapshot: None,
+                load: Some(record),
+            });
+        }
     }
 }
 
@@ -2013,53 +2049,62 @@ impl LoadRecords {
 /// rank's load record on every batch and `load_only` batches while the
 /// stream is quiet, as the Rust servicer's relay sends them
 /// (`crates/engine_servicer/src/kv_events.rs`): one record state per
-/// subscription, the heartbeat naming the last batch's rank (so a quiet
-/// rank's records stop while another rank is active, as on the servicer);
-/// from the subscription on for a subscriber that takes records before the
-/// first batch (`records_before_first_batch`, rank 0's record then), from
-/// the stream's first batch otherwise.
+/// subscription, every rank's heartbeat on the rank's own clock (so a quiet
+/// rank's records keep coming while another rank is active, as on the
+/// servicer); from the subscription on for a subscriber that takes records
+/// before the first batch (`records_before_first_batch`) and for a one-rank
+/// stream that resumed at `cursor` (not 0), which its `load_only` batches
+/// repeat; from the rank's first batch otherwise.
 fn with_load_records(
     ranks: Vec<RankLoadSource>,
     like: LoadsLike,
     step_reports: bool,
     records_before_first_batch: bool,
+    cursor: u64,
     stream: KvEventStream,
 ) -> KvEventStream {
     assert!(!ranks.is_empty(), "a load record needs a rank's source");
     let records = LoadRecords {
+        // A cursor names rank 0's sequence (several ranks refuse one): its
+        // heartbeats start there, as the relay's map of sent sequences does.
+        beats: ranks
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let resumed_at = (index == 0 && cursor != 0).then_some(cursor);
+                (resumed_at, RankClock::new())
+            })
+            .collect(),
         stream,
         ranks,
         like,
         step_reports,
         records_before_first_batch,
-        last_seq: None,
-        last_rank: Some(0),
-        last_record: None,
-        last_sent_at: Instant::now(),
-        idle_heartbeats: 0,
+        due: VecDeque::new(),
+        next_tick: Instant::now() + LOAD_TICK,
         sample: 0,
     };
     Box::pin(stream::unfold(records, |mut records| async move {
         loop {
+            if let Some(batch) = records.due.pop_front() {
+                return Some((Ok(batch), records));
+            }
             let waited = tokio::select! {
                 item = records.stream.next() => Waited::Item(item),
-                () = tokio::time::sleep(LOAD_TICK) => Waited::Tick,
+                () = tokio::time::sleep_until(records.next_tick.into()) => Waited::Tick,
             };
             match waited {
                 Waited::Item(None) => return None,
                 Waited::Item(Some(Err(status))) => return Some((Err(status), records)),
                 Waited::Item(Some(Ok(mut batch))) => {
-                    records.last_seq = Some(batch.sequence_number);
-                    records.last_rank = batch.dp_rank;
-                    records.last_sent_at = Instant::now();
-                    records.idle_heartbeats = 0;
-                    batch.load = Some(records.record(batch.dp_rank, false));
+                    let record = records.record(batch.dp_rank, false);
+                    records.published(batch.dp_rank, batch.sequence_number, &record);
+                    batch.load = Some(record);
                     return Some((Ok(batch), records));
                 }
                 Waited::Tick => {
-                    if let Some(batch) = records.load_only_batch() {
-                        return Some((Ok(batch), records));
-                    }
+                    records.next_tick = Instant::now() + LOAD_TICK;
+                    records.queue_due_records();
                 }
             }
         }
@@ -2826,6 +2871,38 @@ mod tests {
         assert_eq!(counts, vec![0, 0, 0]);
     }
 
+    /// Every rank of the worker `--worker-kv-tokens` names reports the
+    /// worker's own pool in `GetLoads`; a worker it does not name reports the
+    /// fleet's.
+    #[tokio::test]
+    async fn the_worker_an_override_names_reports_its_own_pool_on_every_rank() {
+        let cfg = Config {
+            realistic: true,
+            grpc_dp_size: 2,
+            engine: engine::EngineParams {
+                kv_capacity_tokens: 131_072,
+                ..Default::default()
+            },
+            worker_kv_tokens: [("grpc:65121".to_string(), 65_536)].into(),
+            ..Default::default()
+        };
+        let (named, _stop) = MockScheduler::for_tests(cfg.clone(), 65_121);
+        let (other, _stop_other) = MockScheduler::for_tests(cfg, 65_122);
+        for (service, tokens) in [(named, 65_536), (other, 131_072)] {
+            let loads = service
+                .get_loads(Request::new(ts::GetLoadsRequest::default()))
+                .await
+                .expect("loads")
+                .into_inner();
+            let pools: Vec<i32> = loads
+                .loads
+                .iter()
+                .map(|load| load.max_total_num_tokens)
+                .collect();
+            assert_eq!(pools, vec![tokens, tokens], "{}", service.name);
+        }
+    }
+
     /// `GetLoads` lists one entry per rank, the request's `dp_rank` keeping
     /// one; `GetServerInfo` advertises the width.
     #[tokio::test]
@@ -2959,8 +3036,9 @@ mod tests {
 
     /// One subscription carries every rank's stream with one record state,
     /// as the relay's: the first record (before any batch) is rank 0's, a
-    /// batch carries its own rank's record, and the heartbeat that follows
-    /// names the last batch's rank.
+    /// batch carries its own rank's record, and after it every rank's
+    /// heartbeat keeps coming on the rank's own clock: the publishing rank's
+    /// repeats its last sequence, a rank that sent no batch stays numbered 0.
     #[tokio::test]
     async fn one_subscription_carries_every_ranks_batches_with_their_ranks_records() {
         let (service, _stop) = scheduler_with_ranks(3, 65_104);
@@ -3007,20 +3085,32 @@ mod tests {
         };
         assert_eq!(batch.dp_rank, Some(2));
         assert!(batch.load.as_ref().is_some_and(|load| !load.load_only));
-        let beat = loop {
+        let mut last_of_rank_2 = batch.sequence_number;
+        let mut beats = std::collections::BTreeMap::new();
+        while beats.len() < 3 {
             let batch = tokio::time::timeout(Duration::from_secs(5), events.next())
                 .await
                 .expect("a heartbeat in time")
                 .expect("an item")
                 .expect("a batch");
             if batch.events.is_empty() {
-                break batch;
+                assert!(batch.load.as_ref().is_some_and(|load| load.load_only));
+                beats.insert(batch.dp_rank, batch.sequence_number);
+            } else {
+                // A later block of the request: rank 2's heartbeat is owed
+                // its sequence from here.
+                last_of_rank_2 = batch.sequence_number;
+                beats.remove(&Some(2));
             }
-        };
+        }
         assert_eq!(
-            beat.dp_rank,
-            Some(2),
-            "the heartbeat names the last batch's rank"
+            beats,
+            std::collections::BTreeMap::from([
+                (Some(0), 0),
+                (Some(1), 0),
+                (Some(2), last_of_rank_2)
+            ]),
+            "every rank's heartbeat, each with the rank's own last sequence"
         );
     }
 
@@ -3073,6 +3163,7 @@ mod tests {
                 LoadsLike::Mock,
                 false,
                 asked,
+                0,
                 kv,
             )
         };
@@ -3122,6 +3213,41 @@ mod tests {
         .expect("a batch");
         assert!(load_only(&beat));
         assert_eq!(beat.sequence_number, 7, "repeats the last sequence sent");
+    }
+
+    /// As the Rust relay: a stream that resumed at a cursor repeats the
+    /// cursor in its `load_only` batches from its first tick, whether or not
+    /// the subscriber asked for records before the first batch.
+    #[tokio::test]
+    async fn a_resumed_quiet_stream_repeats_its_cursor() {
+        let engine = Engine::spawn(engine::EngineParams::default());
+        for asked in [true, false] {
+            let mut resumed = with_load_records(
+                vec![RankLoadSource {
+                    engine: engine.clone(),
+                    prefill_pending: Arc::new(AtomicU64::new(0)),
+                }],
+                LoadsLike::Mock,
+                false,
+                asked,
+                5,
+                Box::pin(stream::pending()) as KvEventStream,
+            );
+            let beat = tokio::time::timeout(Duration::from_millis(500), resumed.next())
+                .await
+                .expect("a heartbeat on the resumed stream")
+                .expect("an item")
+                .expect("a batch");
+            assert!(
+                beat.load.as_ref().is_some_and(|load| load.load_only),
+                "{beat:?}"
+            );
+            assert_eq!(
+                (beat.sequence_number, beat.events.len()),
+                (5, 0),
+                "asked: {asked}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -257,16 +257,11 @@ impl ApprovalManager {
             }
         };
 
-        // Log the decision
-        let result = if approved {
-            DecisionResult::Approved
-        } else {
-            DecisionResult::Denied {
-                reason: match &decision {
-                    ApprovalDecision::Denied { reason } => reason.clone(),
-                    ApprovalDecision::Approved => "User denied".to_string(),
-                },
-            }
+        let result = match &decision {
+            ApprovalDecision::Approved => DecisionResult::Approved,
+            ApprovalDecision::Denied { reason } => DecisionResult::Denied {
+                reason: reason.clone(),
+            },
         };
 
         self.audit_log.record_decision(

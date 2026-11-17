@@ -5,8 +5,9 @@
 //! read a header beside the body ([`validate_with_betas`]). The handlers keep
 //! the raw [`HeaderMap`] they forward: nothing here changes what the backend
 //! receives. The extractor runs where the handlers run, on the buffered body
-//! path; a request the stream layer forwards whole reaches no handler and
-//! none of these checks, as before this module.
+//! path. A request the stream layer forwards whole reaches no handler: the
+//! layer makes the version check itself (`MessagesHeaders::check_version`),
+//! and the rules that read the body stay with the handler.
 
 use std::borrow::Cow;
 
@@ -35,9 +36,10 @@ pub(crate) struct MessagesHeaders {
 }
 
 impl MessagesHeaders {
-    /// The typed headers of `headers`, or the public API's 400 for an
-    /// `anthropic-version` that is not a calendar date of 2023 or later.
-    pub(crate) fn parse(headers: &HeaderMap) -> Result<Self, Response> {
+    /// The public API's 400 for an `anthropic-version` that is not a calendar
+    /// date of 2023 or later. The stream layer makes this check on a request
+    /// it forwards whole, which reaches no handler.
+    pub(crate) fn check_version(headers: &HeaderMap) -> Result<(), Response> {
         if let Some(value) = headers.get("anthropic-version") {
             let version = value.to_str().unwrap_or_default();
             if parse_version(version).is_none() {
@@ -47,6 +49,13 @@ impl MessagesHeaders {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// The typed headers of `headers`, or the refusal of
+    /// [`Self::check_version`].
+    pub(crate) fn parse(headers: &HeaderMap) -> Result<Self, Response> {
+        Self::check_version(headers)?;
         let betas = MessagesBetas::from_header_values(
             headers
                 .get_all("anthropic-beta")

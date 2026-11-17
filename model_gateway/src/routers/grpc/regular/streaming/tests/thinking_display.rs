@@ -49,6 +49,7 @@ fn spec(display: Option<&str>, with_symphony: bool) -> MessagesResponseSpec {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         });

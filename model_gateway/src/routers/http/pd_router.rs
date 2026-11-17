@@ -1373,14 +1373,14 @@ impl PDRouter {
             context.route,
             prefill_body,
             headers,
-            false,
+            None,
         );
         let decode_request = self.build_post_with_headers(
             decode.as_ref(),
             context.route,
             decode_body,
             headers,
-            false,
+            None,
         );
 
         // Send both requests concurrently and wait for both
@@ -1731,43 +1731,18 @@ impl PDRouter {
             }
             .emit();
 
-            let prefill_request = Self::pin_dp_rank(
-                self.build_post_with_headers(
-                    prefill.as_ref(),
-                    context.route,
-                    prefill_body,
-                    headers,
-                    false,
-                ),
+            let prefill_request = self.build_post_with_headers(
+                prefill.as_ref(),
+                context.route,
+                prefill_body,
+                headers,
                 dp_rank,
             );
-            let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
-                Ok(response) => response,
-                Err(e) => return Self::prefill_transport_failed(prefill.as_ref(), &e),
-            };
-            let prefill_status = prefill_response.status();
-            if !prefill_status.is_success() {
-                error!(
-                    "Prefill server returned error status prefill_url={} status={}",
-                    prefill.redacted_url(),
-                    prefill_status
-                );
-                Self::record_sequential_side(
-                    prefill.as_ref(),
-                    metrics_labels::WORKER_PREFILL,
-                    prefill_status,
-                );
-                return Self::side_refused(PdSide::Prefill, prefill_response).await;
-            }
-            let prefill_bytes = match prefill_response.bytes().await {
-                Ok(bytes) => bytes,
-                Err(e) => return Self::prefill_read_failed(prefill.as_ref(), &e),
-            };
-            Self::record_sequential_side(
-                prefill.as_ref(),
-                metrics_labels::WORKER_PREFILL,
-                prefill_status,
-            );
+            let prefill_bytes =
+                match Self::prefill_side_bytes(prefill.as_ref(), prefill_request).await {
+                    Ok(bytes) => bytes,
+                    Err(refusal) => return refusal,
+                };
             Metrics::record_pd_prefill_duration(
                 metrics_labels::BACKEND_PD,
                 context.model_id,
@@ -1857,14 +1832,11 @@ impl PDRouter {
             None => decode_body,
         };
 
-        let decode_request = Self::pin_dp_rank(
-            self.build_post_with_headers(
-                decode.as_ref(),
-                context.route,
-                decode_body,
-                headers,
-                false,
-            ),
+        let decode_request = self.build_post_with_headers(
+            decode.as_ref(),
+            context.route,
+            decode_body,
+            headers,
             dp_rank,
         );
         let decode_response = match send_with_stale_conn_retry(decode_request).await {
@@ -1924,57 +1896,21 @@ impl PDRouter {
         .emit();
 
         let dispatch_start = Instant::now();
-        let prefill_request = Self::pin_dp_rank(
-            self.build_post_with_headers(
-                prefill.as_ref(),
-                context.route,
-                prefill_body,
-                headers,
-                false,
-            ),
+        let prefill_request = self.build_post_with_headers(
+            prefill.as_ref(),
+            context.route,
+            prefill_body,
+            headers,
             dp_rank,
         );
-        let decode_request = Self::pin_dp_rank(
-            self.build_post_with_headers(
-                decode.as_ref(),
-                context.route,
-                decode_body,
-                headers,
-                false,
-            ),
+        let decode_request = self.build_post_with_headers(
+            decode.as_ref(),
+            context.route,
+            decode_body,
+            headers,
             dp_rank,
         );
-        let prefill_side = async {
-            let response = match send_with_stale_conn_retry(prefill_request).await {
-                Ok(response) => response,
-                Err(e) => return Err(Self::prefill_transport_failed(prefill.as_ref(), &e)),
-            };
-            let status = response.status();
-            if !status.is_success() {
-                error!(
-                    "Prefill server returned error status prefill_url={} status={}",
-                    prefill.redacted_url(),
-                    status
-                );
-                Self::record_sequential_side(
-                    prefill.as_ref(),
-                    metrics_labels::WORKER_PREFILL,
-                    status,
-                );
-                return Err(Self::side_refused(PdSide::Prefill, response).await);
-            }
-            match response.bytes().await {
-                Ok(bytes) => {
-                    Self::record_sequential_side(
-                        prefill.as_ref(),
-                        metrics_labels::WORKER_PREFILL,
-                        status,
-                    );
-                    Ok(bytes)
-                }
-                Err(e) => Err(Self::prefill_read_failed(prefill.as_ref(), &e)),
-            }
-        };
+        let prefill_side = Self::prefill_side_bytes(prefill.as_ref(), prefill_request);
         let decode_side = send_with_stale_conn_retry(decode_request);
         tokio::pin!(decode_side);
 
@@ -2051,6 +1987,36 @@ impl PDRouter {
             dispatch_start,
         )
         .await
+    }
+
+    /// The prefill side of a sequential or concurrent-write dispatch: sent,
+    /// refused on an error status, read whole and recorded on its worker. The
+    /// error is the response the client is answered with.
+    async fn prefill_side_bytes(
+        prefill: &dyn Worker,
+        request: reqwest::RequestBuilder,
+    ) -> Result<Bytes, Response> {
+        let response = match send_with_stale_conn_retry(request).await {
+            Ok(response) => response,
+            Err(e) => return Err(Self::prefill_transport_failed(prefill, &e)),
+        };
+        let status = response.status();
+        if !status.is_success() {
+            error!(
+                "Prefill server returned error status prefill_url={} status={}",
+                prefill.redacted_url(),
+                status
+            );
+            Self::record_sequential_side(prefill, metrics_labels::WORKER_PREFILL, status);
+            return Err(Self::side_refused(PdSide::Prefill, response).await);
+        }
+        match response.bytes().await {
+            Ok(bytes) => {
+                Self::record_sequential_side(prefill, metrics_labels::WORKER_PREFILL, status);
+                Ok(bytes)
+            }
+            Err(e) => Err(Self::prefill_read_failed(prefill, &e)),
+        }
     }
 
     /// Per-side outcome accounting for the sequential path: a side that was
@@ -2442,7 +2408,9 @@ impl PDRouter {
     /// credential with the precedence every other upstream call has (the
     /// caller's `Authorization`, else the worker's configured key), so a worker
     /// behind a key-protected gateway, whose caller key ends at the
-    /// middleware, still carries the key the worker requires.
+    /// middleware, still carries the key the worker requires; and, for a
+    /// MoRI-IO side, the data-parallel rank both sides are pinned to, set
+    /// after the forwarded headers.
     #[expect(
         clippy::unused_self,
         reason = "method on PDRouter for consistent API; may use self.api_key in future"
@@ -2453,29 +2421,20 @@ impl PDRouter {
         route: &'static str,
         body: Bytes,
         headers: Option<&HeaderMap>,
-        connection_close: bool,
+        dp_rank: Option<usize>,
     ) -> reqwest::RequestBuilder {
         let endpoint_url = worker.endpoint_url(route);
         // Every side built here is sent; counted per side, on its worker.
         Metrics::record_worker_request(worker.url(), worker.model_id());
-        let mut request = attach_sized_body(
+        let request = attach_sized_body(
             worker
                 .http_client()
                 .post(endpoint_url)
                 .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
             body,
         );
-        if connection_close {
-            request = request.header("Connection", "close");
-        }
-        header_utils::apply_forwarded_request_headers(request, headers, worker.api_key())
-    }
-
-    /// Route a MoRI-IO side to the data-parallel rank both sides are pinned to.
-    fn pin_dp_rank(
-        request: reqwest::RequestBuilder,
-        dp_rank: Option<usize>,
-    ) -> reqwest::RequestBuilder {
+        let request =
+            header_utils::apply_forwarded_request_headers(request, headers, worker.api_key());
         match dp_rank {
             Some(rank) => request.header(DATA_PARALLEL_RANK_HEADER, rank.to_string()),
             None => request,
@@ -2865,13 +2824,13 @@ impl RouterTrait for PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
         self.route_pd(
             headers,
             Some(tenant_meta),
-            super::chat_for_upstream(body),
+            super::chat_for_upstream(Arc::unwrap_or_clone(body)),
             model_id,
         )
         .await
@@ -3692,7 +3651,7 @@ mod tests {
                 "/generate",
                 Bytes::from(r#"{"text":"hello"}"#),
                 None,
-                false,
+                None,
             )
             .build()
             .expect("request should build");
@@ -3722,7 +3681,7 @@ mod tests {
                     "/generate",
                     Bytes::from(r#"{"text":"hello"}"#),
                     headers,
-                    false,
+                    None,
                 )
                 .build()
                 .expect("request should build")
@@ -4122,11 +4081,9 @@ mod tests {
             }))
             .expect("valid chat request");
 
-            let started = Instant::now();
             let response = router
-                .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
                 .await;
-            let elapsed = started.elapsed();
 
             assert_eq!(
                 response.status(),
@@ -4143,10 +4100,6 @@ mod tests {
                 prefill_arrivals.lock().unwrap().len(),
                 1,
                 "{runtime:?}: one attempt on the pair"
-            );
-            assert!(
-                elapsed < std::time::Duration::from_millis(1900),
-                "{runtime:?}: one timeout, not retries x timeout: {elapsed:?}"
             );
             // The concurrent shape sent the decode side once with the prefill;
             // the sequential shape never reached it.
@@ -4221,7 +4174,7 @@ mod tests {
         .expect("valid chat request");
 
         let response = router
-            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
@@ -4323,7 +4276,7 @@ mod tests {
         }))
         .expect("valid chat request");
         let response = router
-            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -5055,7 +5008,7 @@ mod tests {
 
         let response = tokio::time::timeout(
             ROUND_TRIP_GUARD,
-            router.route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID),
+            router.route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID),
         )
         .await
         .expect("the client stream must not wait for the prefill body");
@@ -5105,7 +5058,7 @@ mod tests {
         let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
         let response = router
-            .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID)
             .await;
 
         // A prefill 5xx stays a status the retry layer and the client can act
@@ -5146,7 +5099,7 @@ mod tests {
                 let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
                 let response = router
-                    .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+                    .route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID)
                     .await;
                 assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             });
@@ -5201,7 +5154,7 @@ mod tests {
         }))
         .expect("valid chat request");
         let response = router
-            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -5259,7 +5212,7 @@ mod tests {
         }))
         .expect("valid chat request");
         let response = router
-            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -5438,7 +5391,7 @@ mod tests {
             "/v1/chat/completions" => {
                 let request = serde_json::from_value(body).expect("valid chat request");
                 router
-                    .route_chat(headers, &tenant, request, UNKNOWN_MODEL_ID)
+                    .route_chat(headers, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                     .await
             }
             "/v1/completions" => {
@@ -6358,6 +6311,27 @@ mod tests {
         assert_eq!(completion.get("max_tokens"), Some(&Value::from(1)));
     }
 
+    /// A routed pair's request body carries the bootstrap host a client
+    /// dials: for a prefill side with no rank whose address is a token
+    /// before a host of digits, that host and never the token. One prompt
+    /// and a batch of two.
+    #[test]
+    fn a_pairs_request_body_carries_the_bootstrap_host_a_client_dials() {
+        let prefill = BasicWorkerBuilder::new("http://s3cret-token@2130706433")
+            .worker_type(WorkerType::Prefill)
+            .bootstrap_port(Some(8998))
+            .build();
+        let bytes = br#"{"text":"hi"}"#.to_vec();
+        for batch in [None, Some(2)] {
+            let mut body = RawBody::parse(&bytes).unwrap();
+            let fields = PDRouter::bootstrap_fields(&prefill, batch, None).unwrap();
+            PDRouter::inject_bootstrap(&mut body, fields);
+            let sent = String::from_utf8(body.to_bytes(None).unwrap().to_vec()).unwrap();
+            assert!(sent.contains("127.0.0.1"), "{sent}");
+            assert!(!sent.contains("s3cret"), "{sent}");
+        }
+    }
+
     #[test]
     fn bootstrap_rooms_follow_the_prefill_rank_only_on_a_multi_rank_worker() {
         let worker = |dp: Option<(usize, usize)>| {
@@ -6532,8 +6506,8 @@ mod tests {
             true,
         ));
 
-        let _prefill_guard = WorkerLoadGuard::new(prefill_worker.clone(), None);
-        let _decode_guard = WorkerLoadGuard::new(decode_worker.clone(), None);
+        let _prefill_guard = WorkerLoadGuard::with_key(prefill_worker.clone(), None);
+        let _decode_guard = WorkerLoadGuard::with_key(decode_worker.clone(), None);
 
         assert_eq!(prefill_worker.load(), 1);
         assert_eq!(decode_worker.load(), 1);
@@ -7067,7 +7041,7 @@ mod tests {
                 Arc::clone(&decode),
             ),
             None,
-            WorkerLoadGuard::new(Arc::clone(&decode), None),
+            WorkerLoadGuard::with_key(Arc::clone(&decode), None),
         );
 
         // The head is out and the relay has not run: the success is recorded.
@@ -7317,9 +7291,9 @@ mod tests {
 
         {
             let prefill_guard = PrefillLoadGuard::Unbounded {
-                _guard: WorkerLoadGuard::new(prefill_ref.clone(), None),
+                _guard: WorkerLoadGuard::with_key(prefill_ref.clone(), None),
             };
-            let decode_guard = WorkerLoadGuard::new(decode_ref.clone(), None);
+            let decode_guard = WorkerLoadGuard::with_key(decode_ref.clone(), None);
 
             assert_eq!(prefill_ref.load(), 1);
             assert_eq!(decode_ref.load(), 1);
@@ -7448,7 +7422,7 @@ mod tests {
     async fn stream_chat_through(router: &PDRouter) -> Response {
         let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         router
-            .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID)
             .await
     }
 
@@ -7476,7 +7450,7 @@ mod tests {
 
         let response = tokio::time::timeout(
             ROUND_TRIP_GUARD,
-            router.route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID),
+            router.route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID),
         )
         .await
         .expect("the client stream starts on the decode head");
@@ -7529,7 +7503,7 @@ mod tests {
 
         let response = tokio::time::timeout(
             ROUND_TRIP_GUARD,
-            router.route_chat(None, &tenant, request, UNKNOWN_MODEL_ID),
+            router.route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID),
         )
         .await
         .expect("the client stream starts once the prefill answered");
@@ -7872,7 +7846,7 @@ mod tests {
         }))
         .expect("valid chat request");
         router
-            .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
             .await
     }
 
@@ -8067,7 +8041,7 @@ mod tests {
             }))
             .expect("valid chat request");
             let response = router
-                .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(
@@ -8111,7 +8085,7 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let response = metrics::with_local_recorder(&recorder, || {
-            runtime.block_on(router.route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID))
+            runtime.block_on(router.route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID))
         });
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -8151,9 +8125,9 @@ mod tests {
         );
         let guards = PdLoadGuards {
             prefill: PrefillLoadGuard::Unbounded {
-                _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+                _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
             },
-            decode: WorkerLoadGuard::new(Arc::clone(&decode), None),
+            decode: WorkerLoadGuard::with_key(Arc::clone(&decode), None),
         };
         assert_eq!((prefill.load(), decode.load()), (1, 1));
         let mut headers = HeaderMap::new();

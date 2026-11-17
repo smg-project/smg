@@ -143,7 +143,6 @@ use openai_protocol::worker::WorkerStatus;
 use tracing::{info, warn};
 
 use crate::{
-    config::RouterConfig,
     observability::metrics::Metrics,
     worker::{
         identity::basic::{StallReason, COLD_PREFILL_TOKENS_PER_SEC},
@@ -181,10 +180,11 @@ const WEDGE_BOUND_CAP: Duration = Duration::from_secs(120);
 /// wedge met there is caught at the cap, once per new longest prompt.
 const COLD_SHAPE_GRACE: Duration = WEDGE_BOUND_CAP;
 
-/// The wedge bound for `worker` now: the configured threshold, or the time
-/// the engine may still need before the first token of its in-flight prompts
-/// is due, or the cold-shape grace while one of them is longer than any the
-/// worker has answered, whichever is longest.
+/// The wedge bound for the worker whose `state` this is, now: the configured
+/// threshold, or the time the engine may still need before the first token
+/// of its in-flight prompts is due, or the cold-shape grace while one of them
+/// is longer than any the worker has answered, whichever is longest. A worker
+/// that keeps no state (`None`) has the configured threshold.
 fn wedge_bound(state: Option<&WorkerRuntime>, wedge: Duration) -> Duration {
     wedge_bound_given(state, wedge, cold_shape_grace(state, 0))
 }
@@ -199,9 +199,10 @@ fn wedge_bound_given(state: Option<&WorkerRuntime>, wedge: Duration, grace: Dura
     )
 }
 
-/// The cold-shape grace for `worker` with `extra` more prompt tokens about
-/// to be dispatched: [`COLD_SHAPE_GRACE`] while the worker is on a prompt
-/// longer than any it has answered, zero otherwise.
+/// The cold-shape grace for the worker whose `state` this is, with `extra`
+/// more prompt tokens about to be dispatched: [`COLD_SHAPE_GRACE`] while the
+/// worker is on a prompt longer than any it has answered, zero otherwise. A
+/// worker that keeps no state (`None`) has none.
 fn cold_shape_grace(state: Option<&WorkerRuntime>, extra: u64) -> Duration {
     if state.is_some_and(|state| state.prefill_cold_shape(extra)) {
         COLD_SHAPE_GRACE
@@ -624,7 +625,7 @@ const DEFAULT_WARMUP: Warmup = Warmup {
     divert_every: 8,
 };
 
-/// Set the warm-up slice from the gateway configuration; the first call wins.
+/// Set the warm-up slice from the host; the first call wins.
 pub(crate) fn configure_warmup(warmup: Warmup) {
     let _ = WARMUP.set(warmup);
 }
@@ -633,30 +634,26 @@ pub(crate) fn warmup() -> Warmup {
     WARMUP.get().copied().unwrap_or(DEFAULT_WARMUP)
 }
 
-/// Set the stall, wedge and stale thresholds from the gateway configuration.
+/// Set the stall, wedge and stale thresholds from the host.
 /// The first call wins; the defaults are two, three and fifteen seconds.
 pub(crate) fn configure(stall: Duration, wedge: Duration, stale: Duration) {
     let _ = THRESHOLDS.set((stall, wedge, stale));
 }
 
-/// Apply every liveness budget the configuration carries: the stall, wedge
-/// and stale thresholds and the warm-up slice. The one place the budgets
-/// are read from a configuration, for the server's start-up and, as
+/// Apply every liveness budget the host hands in: the stall, wedge and
+/// stale thresholds and the warm-up slice. The one place the budgets are
+/// set from outside, for the server's start-up and, as
 /// `worker::configure_liveness`, for a host that builds the context without
 /// the builder (the test harness today); the first call in a process wins,
 /// as for the thresholds' own setter.
-pub fn configure_from(config: &RouterConfig) {
-    configure(
-        Duration::from_secs(config.worker_stall_secs),
-        Duration::from_secs(config.worker_wedge_secs),
-        Duration::from_secs(config.worker_stale_secs),
-    );
+pub fn configure_from(budgets: Budgets) {
+    configure(budgets.stall, budgets.wedge, budgets.stale);
     configure_warmup(Warmup {
-        secs: Duration::from_secs(config.worker_warmup_secs),
-        share: config.worker_warmup_share,
-        blocks: config.worker_warmup_blocks,
-        thin_ratio: config.worker_warmup_thin_ratio,
-        divert_every: config.worker_warmup_divert_every,
+        secs: budgets.warmup_secs,
+        share: budgets.warmup_share,
+        blocks: budgets.warmup_blocks,
+        thin_ratio: budgets.warmup_thin_ratio,
+        divert_every: budgets.warmup_divert_every,
     });
 }
 
@@ -667,8 +664,9 @@ fn thresholds() -> (Duration, Duration, Duration) {
         .unwrap_or((DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE))
 }
 
-/// The liveness budgets in force in this process: what a configuration set
-/// through `configure_from`, or the defaults.
+/// A set of liveness budgets: what a host hands `configure_from`, and what
+/// `budgets()` reports as in force in this process (the first set configured,
+/// or the defaults).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Budgets {
     /// A worker that has not answered a contact for this long is stalled.
@@ -1242,6 +1240,16 @@ mod tests {
         Arc::new(BasicWorkerBuilder::new("http://w1:8000").build())
     }
 
+    /// Whether `age` counts from a stamp noted at or after `since` on the
+    /// gateway clock: such an age is within the time elapsed since then,
+    /// and an older stamp's is longer by the wait the test put before
+    /// `since`. The caller passes the age it read, so the clock is read
+    /// here after it and a scheduling stall only widens the bound; a fixed
+    /// margin (`age < 10 ms`) would race it.
+    fn noted_since(since: u64, age: Duration) -> bool {
+        age <= Duration::from_millis(now_ms() - since)
+    }
+
     /// A worker whose prompt was given up on by the silence verdict (a run
     /// the whole cold-shape grace long, released without an answer) is
     /// judged by its own rate once it answers: the wait it was given up on
@@ -1250,10 +1258,18 @@ mod tests {
     fn a_worker_given_up_on_is_judged_by_its_own_rate_once_it_answers() {
         let w = worker();
         let t0 = now_ms().max(1);
-        w.note_prefill_started_at(95, true, t0);
-        w.note_prefill_ended_at(95, true, None, t0 + 120_000);
-        w.note_prefill_started_at(95, true, t0 + 120_000);
-        w.note_prefill_ended_at(95, true, Some(0), t0 + 121_000);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started_at(95, true, t0);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended_at(95, true, None, t0 + 120_000);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started_at(95, true, t0 + 120_000);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended_at(95, true, Some(0), t0 + 121_000);
         assert_eq!(
             w.runtime_state().unwrap().prefill_rate_tps(),
             95,
@@ -1424,13 +1440,14 @@ mod tests {
         // counted from registration. It counts from the dispatch now.
         let w = worker();
         thread::sleep(Duration::from_millis(15));
+        let dispatched_at = now_ms();
         for _ in 0..3 {
             w.increment_load();
             w.runtime_state().unwrap().note_tracked_started();
         }
         let age = w.runtime_state().unwrap().token_progress_age();
         assert!(
-            age < Duration::from_millis(10),
+            noted_since(dispatched_at, age),
             "clock started at the dispatch"
         );
         sweep(&w);
@@ -1474,7 +1491,9 @@ mod tests {
         );
         // The first tokens arrive: the backlog is gone and the bound is the
         // configured threshold again.
-        w.note_prefill_ended(128 * 1_152, true, Some(0));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended(128 * 1_152, true, Some(0));
         assert_eq!(
             wedge_bound(w.runtime_state().as_deref(), DEFAULT_WEDGE),
             DEFAULT_WEDGE
@@ -1542,7 +1561,9 @@ mod tests {
             Some(Duration::from_millis(58_982)),
             "behind eight pending 32k prompts"
         );
-        w.note_prefill_ended(8 * 32_768, true, Some(0));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended(8 * 32_768, true, Some(0));
         assert_eq!(
             prefill_side_bound_with(&w, 100_000_000, DEFAULT_WEDGE),
             Some(WEDGE_BOUND_CAP),
@@ -1682,7 +1703,9 @@ mod tests {
             "a fresh worker has answered nothing"
         );
         w.runtime_state().unwrap().note_prefill_started(256, true);
-        w.note_prefill_ended(256, true, Some(0));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended(256, true, Some(0));
         let standing = prefill_side_reprieve(&w, bound, Duration::ZERO, &OnceLock::new());
         assert!(
             matches!(standing, SideReprieve::WithinBound(left) if left > Duration::from_secs(2)),
@@ -1990,7 +2013,9 @@ mod tests {
         // behind it.
         let w = worker();
         w.runtime_state().unwrap().note_prefill_started(1_024, true);
-        w.note_prefill_ended(1_024, true, Some(0));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended(1_024, true, Some(0));
         w.runtime_state().unwrap().note_prefill_started(512, true);
         assert!(!w.runtime_state().unwrap().prefill_cold_shape(0));
         w.runtime_state().unwrap().note_prefill_started(8_192, true);
@@ -2002,7 +2027,9 @@ mod tests {
             "the short side, dispatched before the longer prompt, waits out the grace"
         );
         // The shape shown: the side is judged by the worker's answers again.
-        w.note_prefill_ended(8_192, true, Some(0));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended(8_192, true, Some(0));
         assert!(!w.runtime_state().unwrap().prefill_cold_shape(0));
         let standing = prefill_side_reprieve(&w, bound, late, &OnceLock::new());
         assert!(
@@ -2039,9 +2066,12 @@ mod tests {
         assert!(w.stall_reason().is_none(), "never pushed");
         // The stream delivers a record: from here on silence counts.
         w.runtime_state().unwrap().note_load_record();
+        let heard_at = now_ms();
         on_contact(&w);
-        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
-        assert!(w.stall_reason().is_none(), "just heard from");
+        assert!(
+            noted_since(heard_at, w.runtime_state().unwrap().contact_age()),
+            "just heard from"
+        );
         thread::sleep(Duration::from_millis(30));
         sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
         assert_eq!(w.stall_reason(), Some(StallReason::Unreachable));
@@ -2052,9 +2082,12 @@ mod tests {
         assert!(!w.routing_state().stalled);
         // A worker that still streams tokens is heard from: never stale.
         thread::sleep(Duration::from_millis(30));
+        let streamed_at = now_ms();
         on_token_progress(&w);
-        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
-        assert!(w.stall_reason().is_none(), "tokens are contact");
+        assert!(
+            noted_since(streamed_at, w.runtime_state().unwrap().contact_age()),
+            "tokens are contact"
+        );
         // Off at zero.
         thread::sleep(Duration::from_millis(30));
         sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, Duration::ZERO);
@@ -2074,7 +2107,7 @@ mod tests {
             Some(StallReason::Wedged),
             "test",
         );
-        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, stale);
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE);
         assert_eq!(
             w.stall_reason(),
             Some(StallReason::Wedged),
@@ -2178,7 +2211,7 @@ mod tests {
         on_token_progress(&w);
         assert!(w.stall_reason().is_none(), "a response clears it");
         for _ in 0..4 {
-            w.note_tracked_ended();
+            w.runtime_state().unwrap().note_tracked_ended();
             w.decrement_load();
         }
         assert_eq!(w.runtime_state().unwrap().tracked_load(), 0);
@@ -2212,12 +2245,17 @@ mod tests {
         let w = worker();
         tracked_pile(&w, 4);
         thread::sleep(Duration::from_millis(5));
+        let progressed_at = now_ms();
         on_token_progress(&w);
-        sweep_with(&w, DEFAULT_STALL, Duration::from_millis(50), DEFAULT_STALE);
+        sweep_with(&w, DEFAULT_STALL, DEFAULT_WEDGE, DEFAULT_STALE);
         assert!(
-            w.stall_reason().is_none(),
+            noted_since(
+                progressed_at,
+                w.runtime_state().unwrap().token_progress_age()
+            ),
             "finishing work is progress, whatever the request's shape"
         );
+        assert!(w.stall_reason().is_none(), "and the pile stays routable");
         thread::sleep(Duration::from_millis(55));
         sweep_with(&w, DEFAULT_STALL, Duration::from_millis(50), DEFAULT_STALE);
         assert_eq!(
@@ -2243,10 +2281,11 @@ mod tests {
         w.increment_load();
         thread::sleep(Duration::from_millis(15));
         assert!(w.runtime_state().unwrap().token_progress_age() >= Duration::from_millis(15));
+        let tracked_at = now_ms();
         w.increment_load();
         w.runtime_state().unwrap().note_tracked_started();
         assert!(
-            w.runtime_state().unwrap().token_progress_age() < Duration::from_millis(10),
+            noted_since(tracked_at, w.runtime_state().unwrap().token_progress_age()),
             "the clock restarted with the tracked run"
         );
     }
@@ -2340,7 +2379,7 @@ mod tests {
         sweep(&w);
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged), "still piled");
         for _ in 0..4 {
-            w.note_tracked_ended();
+            w.runtime_state().unwrap().note_tracked_ended();
             w.decrement_load();
         }
         assert!(!w.runtime_state().unwrap().transport_failure_pending());
@@ -2466,16 +2505,16 @@ mod tests {
     fn re_admission_restarts_the_warm_up_clock() {
         let w = worker();
         thread::sleep(Duration::from_millis(20));
-        let before = w.admitted_age();
         set(
             &w,
             w.runtime_state().as_deref(),
             Some(StallReason::Unreachable),
             "test",
         );
+        let cleared_at = now_ms();
         on_contact(&w);
         assert!(
-            w.admitted_age() < before,
+            noted_since(cleared_at, w.admitted_age()),
             "cleared veto counts as an admission"
         );
     }
@@ -2764,7 +2803,9 @@ mod tests {
         w.runtime_state()
             .unwrap()
             .note_prefill_started(156_752, false);
-        w.note_prefill_ended(156_752, false, Some(0));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended(156_752, false, Some(0));
         assert_eq!(
             w.runtime_state().unwrap().prefill_rate_tps(),
             0,
@@ -2977,7 +3018,10 @@ mod tests {
         // threshold again, so a frozen engine on such a wire is vetoed at the
         // threshold like any other, on both gateways.
         for _ in 0..16 {
-            with_backlog.note_prefill_ended(1_152, true, Some(0));
+            with_backlog
+                .runtime_state()
+                .unwrap()
+                .note_prefill_ended(1_152, true, Some(0));
         }
         for w in [&with_backlog, &idle] {
             on_token_progress(w);
@@ -3081,7 +3125,9 @@ mod tests {
     fn a_prompt_longer_than_any_answered_is_given_the_cap_once() {
         let w = worker();
         w.runtime_state().unwrap().note_prefill_started(1_024, true);
-        w.note_prefill_ended(1_024, true, Some(0));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended(1_024, true, Some(0));
         assert_eq!(
             wedge_bound(w.runtime_state().as_deref(), DEFAULT_WEDGE),
             DEFAULT_WEDGE,
@@ -3129,7 +3175,9 @@ mod tests {
         // The first token: progress, and the shape shown; the next 8k prompt
         // is judged at the threshold.
         on_token_progress(&w);
-        w.note_prefill_ended(8_192, true, Some(0));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended(8_192, true, Some(0));
         assert!(w.stall_reason().is_none());
         w.runtime_state().unwrap().note_prefill_started(8_192, true);
         assert!(!w.runtime_state().unwrap().prefill_cold_shape(0));
@@ -3168,7 +3216,9 @@ mod tests {
         long.runtime_state()
             .unwrap()
             .note_prefill_started(1_024, true);
-        long.note_prefill_ended(1_024, true, Some(0));
+        long.runtime_state()
+            .unwrap()
+            .note_prefill_ended(1_024, true, Some(0));
         long.runtime_state()
             .unwrap()
             .note_prefill_started(8_192, true);
@@ -3239,22 +3289,32 @@ mod tests {
         // a run that went 100 s unanswered leaves 20 s of the grace to the
         // next side; 20 s more leave none, until the worker answers.
         let t0 = now_ms().max(1);
-        w.note_prefill_started_at(95, false, t0);
-        w.note_prefill_ended_at(95, false, None, t0 + 100_000);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started_at(95, false, t0);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended_at(95, false, None, t0 + 100_000);
         assert_eq!(
             prefill_side_bound_behind_encode_with(&w, 95, DEFAULT_WEDGE),
             Some(Duration::from_secs(20)),
             "what is left of the grace after a run that went 100 s unanswered"
         );
-        w.note_prefill_started_at(95, false, t0 + 100_000);
-        w.note_prefill_ended_at(95, false, None, t0 + 120_000);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_started_at(95, false, t0 + 100_000);
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended_at(95, false, None, t0 + 120_000);
         assert_eq!(
             prefill_side_bound_behind_encode_with(&w, 95, DEFAULT_WEDGE),
             Some(DEFAULT_WEDGE),
             "given up on without an answer for the whole grace: the threshold until the worker answers"
         );
         w.runtime_state().unwrap().note_prefill_started(95, true);
-        w.note_prefill_ended(95, true, Some(0));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended(95, true, Some(0));
         assert_eq!(
             prefill_side_bound_behind_encode_with(&w, 95, DEFAULT_WEDGE),
             Some(DEFAULT_WEDGE),
@@ -3290,7 +3350,9 @@ mod tests {
     fn the_grace_lifts_no_standing_veto() {
         let w = worker();
         w.runtime_state().unwrap().note_prefill_started(1_024, true);
-        w.note_prefill_ended(1_024, true, Some(0));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended(1_024, true, Some(0));
         tracked_pile(&w, 1);
         w.runtime_state().unwrap().note_prefill_started(1_024, true);
         on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, None, DEFAULT_WEDGE);
@@ -3329,7 +3391,9 @@ mod tests {
         w.runtime_state()
             .unwrap()
             .note_prefill_started(1_024, false);
-        w.note_prefill_ended(1_024, false, Some(0));
+        w.runtime_state()
+            .unwrap()
+            .note_prefill_ended(1_024, false, Some(0));
         on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, Some(0), DEFAULT_WEDGE);
         assert_eq!(
             w.stall_reason(),

@@ -65,6 +65,7 @@ use crate::{
                 symphony::template::Templates,
             },
             test_engine::serve_on_loopback,
+            testing::unreadable_model_dir,
             tokenizer_cache,
             utils::tonic_ext::TonicStatusExt,
         },
@@ -548,7 +549,7 @@ fn register_worker_with_breaker(
 }
 
 async fn components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
-    components_with_multimodal(worker_registry, false).await
+    components_with_multimodal(worker_registry, None).await
 }
 
 /// Components over `tokenizer_registry` and `worker_registry` with the
@@ -587,31 +588,34 @@ fn shared_components(
     })
 }
 
-/// [`shared_components`] over the mock tokenizer (no model directory).
+/// [`shared_components`] over the mock tokenizer. `model_dir` adds the
+/// multimodal bundle and is the tokenizer's source, so the bundle's config
+/// lookup stays on this disk; without it the source is no model directory.
 async fn components_with_multimodal(
     worker_registry: Arc<WorkerRegistry>,
-    with_multimodal: bool,
+    model_dir: Option<&Path>,
 ) -> Arc<SharedComponents> {
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+    let source = model_dir.map_or("test", |dir| dir.to_str().expect("utf-8 path"));
     tokenizer_registry
         .load(
             "tokenizer-id",
             MODEL,
-            "test",
+            source,
             || async move { Ok(tokenizer) },
         )
         .await
         .expect("load mock tokenizer");
-    shared_components(tokenizer_registry, worker_registry, with_multimodal)
+    shared_components(tokenizer_registry, worker_registry, model_dir.is_some())
 }
 
 /// A worker whose servicer left `supports_vision` unset (the SGLang and
 /// TokenSpeed protos carry the field; only vLLM's servicer sets it on
 /// purpose) is not a language-model-only worker: its labels carry no
 /// vision verdict, and an image request goes on past the refusal into
-/// multimodal processing (here, to the config lookup the mock tokenizer
-/// cannot satisfy) instead of a `multimodal_not_supported`.
+/// multimodal processing (here, to the config lookup the test's model
+/// directory cannot satisfy) instead of a `multimodal_not_supported`.
 #[tokio::test]
 async fn image_to_a_worker_without_a_vision_verdict_is_not_refused() {
     let labels = labels_of(&ModelInfo::Sglang(Box::default()));
@@ -619,8 +623,13 @@ async fn image_to_a_worker_without_a_vision_verdict_is_not_refused() {
         labels.iter().all(|(key, _)| key != SUPPORTS_VISION_LABEL),
         "{labels:?}"
     );
-    let (pipeline, components, _) =
-        chat_pipeline_over(RuntimeType::TokenSpeed, &label_pairs(&labels)).await;
+    let model_dir = unreadable_model_dir();
+    let (pipeline, components, _) = chat_pipeline_over(
+        RuntimeType::TokenSpeed,
+        &label_pairs(&labels),
+        model_dir.path(),
+    )
+    .await;
     let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
     assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
     assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
@@ -667,8 +676,13 @@ async fn image_to_an_sglang_worker_that_carries_no_media_is_refused_before_dispa
             .any(|(key, value)| key == SUPPORTS_VISION_LABEL && value == "false"),
         "{labels:?}"
     );
-    let (pipeline, components, seen_ids) =
-        chat_pipeline_over(RuntimeType::TokenSpeed, &label_pairs(&labels)).await;
+    let model_dir = unreadable_model_dir();
+    let (pipeline, components, seen_ids) = chat_pipeline_over(
+        RuntimeType::TokenSpeed,
+        &label_pairs(&labels),
+        model_dir.path(),
+    )
+    .await;
     let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
     assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
@@ -685,8 +699,13 @@ async fn image_to_an_sglang_worker_that_carries_no_media_is_refused_before_dispa
 /// schedules it, which the client saw as a hang).
 #[tokio::test]
 async fn image_to_a_language_model_only_pool_is_refused_before_dispatch() {
-    let (pipeline, components, seen_ids) =
-        chat_pipeline_over(RuntimeType::TokenSpeed, LANGUAGE_MODEL_ONLY).await;
+    let model_dir = unreadable_model_dir();
+    let (pipeline, components, seen_ids) = chat_pipeline_over(
+        RuntimeType::TokenSpeed,
+        LANGUAGE_MODEL_ONLY,
+        model_dir.path(),
+    )
+    .await;
     let started = Instant::now();
     let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
     assert!(
@@ -728,10 +747,12 @@ fn one_pixel_image_chat() -> serde_json::Value {
 }
 
 /// The chat pipeline over one stub worker typed as `runtime` that carries
-/// `labels`, and the ids the stub saw.
+/// `labels`, and the ids the stub saw. The mock tokenizer's source is
+/// `model_dir`.
 async fn chat_pipeline_over(
     runtime: RuntimeType,
     labels: &[(&str, &str)],
+    model_dir: &Path,
 ) -> (
     RequestPipeline,
     Arc<SharedComponents>,
@@ -754,7 +775,7 @@ async fn chat_pipeline_over(
     );
     let pipeline =
         RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
-    let components = components_with_multimodal(worker_registry, true).await;
+    let components = components_with_multimodal(worker_registry, Some(model_dir)).await;
     (pipeline, components, seen_ids)
 }
 
@@ -806,7 +827,9 @@ async fn video_to_a_pool_whose_engine_takes_no_video_is_refused_before_any_media
         serde_json::json!({"url": "data:video/mp4;base64,invalid", "fps": 0.5}),
         serde_json::json!({"url": "data:video/mp4;base64,invalid"}),
     ] {
-        let (pipeline, components, seen_ids) = chat_pipeline_over(RuntimeType::Trtllm, &[]).await;
+        let model_dir = unreadable_model_dir();
+        let (pipeline, components, seen_ids) =
+            chat_pipeline_over(RuntimeType::Trtllm, &[], model_dir.path()).await;
         let started = Instant::now();
         let (status, body) = chat_error_body(
             &pipeline,
@@ -846,11 +869,14 @@ async fn video_to_a_pool_whose_engine_takes_no_video_is_refused_before_any_media
 }
 
 /// An image to the same worker is not the matrix's refusal: it goes on
-/// into multimodal processing (here, to the config lookup the mock
-/// tokenizer cannot satisfy, as for the worker without a vision verdict).
+/// into multimodal processing (here, to the config lookup the test's
+/// model directory cannot satisfy, as for the worker without a vision
+/// verdict).
 #[tokio::test]
 async fn image_to_a_pool_whose_engine_takes_images_goes_on_into_media_processing() {
-    let (pipeline, components, _) = chat_pipeline_over(RuntimeType::Sglang, &[]).await;
+    let model_dir = unreadable_model_dir();
+    let (pipeline, components, _) =
+        chat_pipeline_over(RuntimeType::Sglang, &[], model_dir.path()).await;
     let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
     assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
     assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
@@ -883,6 +909,7 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
             ]
         }],
     });
+    let model_dir = unreadable_model_dir();
     for (runtime, refused) in [(RuntimeType::Mlx, true), (RuntimeType::Sglang, false)] {
         let seen_ids = Arc::new(Mutex::new(Vec::new()));
         let port = spawn_stub(GatedScheduler {
@@ -901,7 +928,7 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
         );
         let pipeline = RequestPipeline::build(Endpoint::Messages, Mode::Regular, &deps)
             .expect("messages pipeline");
-        let components = components_with_multimodal(worker_registry, true).await;
+        let components = components_with_multimodal(worker_registry, Some(model_dir.path())).await;
         let request: Arc<CreateMessageRequest> =
             Arc::new(serde_json::from_value(request.clone()).expect("messages request"));
         let tools = MessagesTools::from(&*request);
@@ -3747,7 +3774,8 @@ fn a_refusal_for_a_drained_pool_is_counted_as_unavailable_not_as_a_backend_error
 /// The gateway's request timeout on a gRPC worker, in the shapes the
 /// issue's reproduction had: a streamed completion whose engine takes
 /// the request and says nothing ends at the deadline with the HTTP
-/// path's `stream_error` event under the timeout's message and `[DONE]`,
+/// path's `stream_error` event under the timeout's code and message and
+/// `[DONE]`,
 /// the engine receives the abort for that request before the client
 /// reads the event, and the worker's load goes with the body.
 #[tokio::test]
@@ -3781,6 +3809,10 @@ async fn a_streamed_request_to_a_silent_worker_ends_at_the_request_timeout_and_i
         "ended after {elapsed:?}: {body}"
     );
     assert!(body.contains("\"type\":\"stream_error\""), "{body}");
+    assert!(
+        body.contains("\"code\":\"call_upstream_timeout\""),
+        "the event names the timeout as the 504 does: {body}"
+    );
     assert!(body.contains("request timed out after 300ms"), "{body}");
     assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
     assert_aborted_and_released(&scheduler, &worker).await;

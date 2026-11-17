@@ -32,7 +32,7 @@ use crate::{
 /// Initial reconnection delay after stream failure.
 const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
 
-/// Resolves when the worker is heard from (see `Worker::contact_wake`), or
+/// Resolves when the worker is heard from (see `WorkerRuntime::contact_wake`), or
 /// never for a worker without a notifier.
 async fn woken(wake: Option<&Arc<tokio::sync::Notify>>) {
     match wake {
@@ -420,7 +420,7 @@ impl KvEventMonitor {
         // A contact with the worker (a poll answered, a probe passed) ends the
         // reconnect backoff early: a worker that is back gets its stream back
         // at once instead of after the remaining delay.
-        let wake = worker.contact_wake();
+        let wake = worker.runtime_state().map(|state| state.contact_wake());
         let subscription = WorkerSubscription {
             worker: &worker,
             worker_url: &worker_url,
@@ -1114,7 +1114,7 @@ mod tests {
     async fn the_subscribe_call_ends_at_its_deadline_a_contact_or_the_removal() {
         let (addr, server) = serve(Subscribe::Hang).await;
         let (worker, client) = connected(addr).await;
-        let wake = worker.contact_wake();
+        let wake = worker.runtime_state().map(|state| state.contact_wake());
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
 
         let Subscribed::Refused(status) = subscribe_with_deadline(
@@ -1219,7 +1219,7 @@ mod tests {
             let indexer = KvIndex::chain();
             let worker_id = indexer.intern_worker(worker.url()).unwrap();
             let block_sizes = DashMap::new();
-            let wake = worker.contact_wake();
+            let wake = worker.runtime_state().map(|state| state.contact_wake());
             let sub = WorkerSubscription {
                 worker: &worker,
                 worker_url: worker.url(),
@@ -1344,7 +1344,7 @@ mod tests {
             false,
         ));
         let sink = Arc::downgrade(&monitor);
-        let wake = worker.contact_wake();
+        let wake = worker.runtime_state().map(|state| state.contact_wake());
         let sub = WorkerSubscription {
             worker: &worker,
             worker_url: worker.url(),
@@ -1729,26 +1729,26 @@ mod tests {
                 monitor
                     .on_worker_added(&worker, SubscriptionKind::Events)
                     .await;
-                tokio::time::sleep(Duration::from_millis(1_900)).await;
+                // Four connects are three failed streams, each with its
+                // delay slept before the next connect.
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while calls.lock().unwrap().len() < 4 {
+                    assert!(Instant::now() < deadline, "no fourth subscribe call");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
                 monitor.on_worker_removed(worker.url()).await;
                 server.abort();
                 addr
             })
         });
 
-        // Attempts at about 0, 100, 300, 700 and 1,500 ms: five in 1.9 s,
-        // where a backoff reset on every connect made nineteen.
         let calls = calls.lock().unwrap().clone();
-        assert!(
-            (3..=6).contains(&calls.len()),
-            "{} subscribe calls in 1.9 s",
-            calls.len()
-        );
         // The delay scheduled after each failed stream doubles up to the cap,
         // and each was slept: the gap before a connect is at least the delay
         // the retry line before it scheduled. A loaded host only stretches a
-        // gap, and a connect it pushes past the window takes its delay with
-        // it, so the floor reads the retry lines rather than a fixed value.
+        // gap, so the floor reads the retry lines rather than a fixed value.
+        // A backoff that restarted on every connect would schedule the
+        // initial delay each time, and fail here.
         let gaps: Vec<Duration> = calls.windows(2).map(|pair| pair[1] - pair[0]).collect();
         logs_assert(|lines: &[&str]| {
             let delays = lines
@@ -1803,6 +1803,48 @@ mod tests {
             errors >= 3.0 && errors as usize <= calls.len(),
             "{errors} errors for {} calls",
             calls.len()
+        );
+    }
+
+    /// The subscription takes the contact wake from its worker's own state:
+    /// a worker heard from on another path while its stream is in backoff
+    /// is retried at the floor, not after the delay. Without the wake a
+    /// connect never comes sooner after the one before it than the delay
+    /// slept between them, however loaded the host, so one that does is the
+    /// wake's doing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_contact_with_the_worker_ends_its_subscriptions_backoff_early() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (addr, server) = serve(Subscribe::FailFirstMessage(Arc::clone(&calls))).await;
+        let worker = grpc_worker(addr);
+        let monitor = KvEventMonitor::new();
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        // The worker is heard from on another path until six connects are in.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while calls.lock().unwrap().len() < 6 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            worker.runtime_state().unwrap().note_contact();
+        }
+        monitor.on_worker_removed(worker.url()).await;
+        server.abort();
+
+        let calls = calls.lock().unwrap().clone();
+        let gaps: Vec<Duration> = calls.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        // The delay scheduled before each connect after the first, in the
+        // loop's own order: no stream here delivers a batch, so none resets.
+        let mut backoff = Backoff::new();
+        let delays: Vec<Duration> = std::iter::repeat_with(|| {
+            let delay = backoff.delay();
+            backoff.grow();
+            delay
+        })
+        .take(gaps.len())
+        .collect();
+        assert!(
+            gaps.iter().zip(&delays).any(|(gap, delay)| gap < delay),
+            "no connect came before its scheduled delay: gaps {gaps:?}, delays {delays:?}"
         );
     }
 

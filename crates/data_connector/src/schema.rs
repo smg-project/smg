@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::common::RESPONSE_COLUMNS;
+
 // ────────────────────────────────────────────────────────────────────────────
 // Types
 // ────────────────────────────────────────────────────────────────────────────
@@ -300,17 +302,7 @@ fn primary_key_columns_for(label: &str) -> &'static [&'static str] {
 fn core_columns_for(label: &str) -> &'static [&'static str] {
     match label {
         "conversations" => &["id", "created_at", "metadata", "tenant"],
-        "responses" => &[
-            "id",
-            "conversation_id",
-            "previous_response_id",
-            "input",
-            "created_at",
-            "safety_identifier",
-            "model",
-            "raw_response",
-            "tenant",
-        ],
+        "responses" => RESPONSE_COLUMNS,
         "conversation_items" => &[
             "id",
             "response_id",

@@ -9,14 +9,14 @@ use std::io;
 use bytes::BytesMut;
 use openai_protocol::{
     chat::{ChatMessageDelta, ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef},
-    common::{ChatLogProbs, ChatLogProbsContent, ToolCallDelta, ToolChoice, TopLogProb, Usage},
+    common::{ToolCallDelta, ToolChoice, Usage},
     completion::CompletionStreamChoice,
 };
 use serde::Serialize;
 use serde_json::json;
 use tracing::error;
 
-use crate::routers::grpc::spec::ChatResponseSpec;
+use crate::routers::grpc::{proto_wrapper::ProtoOutputLogProbs, spec::ChatResponseSpec};
 
 /// The frame buffer as serde's sink: every write is one `extend_from_slice`,
 /// the shape a `Vec<u8>` gives serde. The `bytes` writer adapter instead slices
@@ -62,6 +62,24 @@ pub(super) const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 /// buffer grown against a frame in flight grows by exact-size allocations,
 /// not by doubling).
 pub(super) const FRAME_ROOM: usize = 2 * CHUNK_FLUSH_BYTES;
+
+/// The unsent bytes at which a chat burst's frame takes [`CHAT_BURST_ROOM`]
+/// (`ChatStream::read_engine`): an eighth of a frame, half the stream's first
+/// room, so a paced engine's frames, one event each, stay under it and keep
+/// the room they have.
+pub(super) const CHAT_BURST_MARK: usize = CHUNK_FLUSH_BYTES / 8;
+
+/// The room the chat loop's frame buffer takes once a burst's unsent bytes
+/// reach [`CHAT_BURST_MARK`] (`ChatStream::read_engine`): one frame and two
+/// such marks. The frame leaves at the flush bound plus the event that
+/// crossed it, and what it leaves behind still holds the next burst up to
+/// its own mark, so each frame of a burst costs one reservation: taken back
+/// in place when the connection has dropped the sent frame, a fresh
+/// allocation while it is in flight. One frame's room and not [`FRAME_ROOM`]:
+/// the chat loop reserves at every frame's mark, before it knows the frame
+/// will fill, so a second frame's room would never be written, and a frame
+/// in flight pins its whole allocation.
+pub(super) const CHAT_BURST_ROOM: usize = CHUNK_FLUSH_BYTES + 2 * CHAT_BURST_MARK;
 
 /// The SSE frame of the per-token chat chunks of one stream.
 ///
@@ -138,29 +156,34 @@ impl ChatChunkFrame {
     }
 
     /// [`Self::write_text_delta`] for a bare text delta that carries the
-    /// token's logprobs ([`text_delta`] with `Some` logprobs): the choice's
-    /// constant text and the logprobs object's structure (its keys, brackets
-    /// and `refusal` null) are written as literals, and serde writes the
-    /// index, the text and each entry's token and logprob alone, through the
-    /// calls it makes for them inside the struct, so each is the bytes it
-    /// writes there; an entry's byte list is written in decimal as serde
-    /// writes a `Vec<u8>`. Walked as a struct, the object cost an escape scan
-    /// and three writes per key (22 keys a token at five candidates) and
-    /// serde's dispatch per byte of the lists: about a quarter of a logprobs
-    /// stream request's user instructions were its serialization. The bytes
-    /// are those [`Self::write_chunk`] writes for the same choice (pinned by
-    /// test); a raw logprobs value stays serde's.
+    /// token's logprobs ([`text_delta`] with the engine message's logprobs
+    /// view): the choice's constant text and the logprobs object's structure
+    /// (its keys, brackets and `refusal` null) are written as literals; serde
+    /// writes the index, the text and each entry's token and logprob alone,
+    /// through the calls it makes for them inside the struct, so each is the
+    /// bytes it writes there; the entries are written straight from the view,
+    /// each token decoded once (through `decode`, the conversion's own) and its
+    /// byte list written in decimal from that text, the candidates cut to
+    /// `requested` before any is decoded. Walked as a struct, the converted
+    /// object costs its construction (six strings, six byte copies and two
+    /// lists for a one-token delta with five candidates), an escape scan and
+    /// three writes per key (22 keys a token at five candidates) and serde's
+    /// dispatch per byte of the lists: about a quarter of a logprobs stream
+    /// request's user instructions. The bytes are those [`Self::write_chunk`]
+    /// writes for the same choice carrying the converted view (pinned by test).
     #[expect(
         clippy::too_many_arguments,
-        reason = "the delta writer's inputs plus the logprobs, not state"
+        reason = "the delta writer's inputs plus the logprobs view, its cut and its decode, not state"
     )]
-    pub(super) fn write_text_delta_logprobs(
+    pub(super) fn write_text_delta_logprobs_view(
         &self,
         buffer: &mut BytesMut,
         index: u32,
         field: TextDelta,
         text: &str,
-        logprobs: &ChatLogProbs,
+        view: ProtoOutputLogProbs<'_>,
+        requested: usize,
+        decode: impl Fn(u32) -> String,
         usage: Option<&Usage>,
         emit_usage_null: bool,
     ) {
@@ -171,9 +194,16 @@ impl ChatChunkFrame {
         buffer.extend_from_slice(field.opener());
         push_json(FrameSink(buffer), text);
         buffer.extend_from_slice(b"},\"logprobs\":");
-        push_logprobs(buffer, logprobs);
+        push_logprobs_view(buffer, view, requested, &decode);
         buffer.extend_from_slice(b",\"finish_reason\":null}");
         Self::close_chunk(buffer, start, Ok(()), usage, emit_usage_null);
+    }
+
+    /// Append the chunk that closes a stream with its usage and no choice.
+    pub(super) fn write_usage_chunk(&self, buffer: &mut BytesMut, usage: &Usage) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head);
+        Self::close_chunk(buffer, start, Ok(()), Some(usage), false);
     }
 
     /// The chunk's end after its choice: `]`, the usage or its `null`
@@ -225,21 +255,20 @@ impl TextDelta {
     }
 }
 
-/// The field, the text and the logprobs of `choice` when it is a bare
-/// per-token delta: one text field and nothing else (no role, no tool calls,
-/// not finished, no matched stop), the shape [`ChatChunkFrame::write_text_delta`]
-/// writes and, when the token's logprobs ride along,
-/// [`ChatChunkFrame::write_text_delta_logprobs`]; `None` for every other
-/// choice, which stays serde's. Both structs are matched field by field with
-/// no rest pattern, so a field added to either is a compile error here until
-/// this read says what it does.
-pub(super) fn text_delta<'a>(
-    choice: &'a ChatStreamChoiceRef<'_>,
-) -> Option<(TextDelta, &'a str, Option<&'a ChatLogProbs>)> {
+/// The field and the text of `choice` when it is a bare per-token delta: one
+/// text field and nothing else (no role, no tool calls, not finished, no
+/// matched stop), the shape [`ChatChunkFrame::write_text_delta`] writes and,
+/// when the token's logprobs ride along,
+/// [`ChatChunkFrame::write_text_delta_logprobs_view`]; `None` for every other
+/// choice, which stays serde's. The choice's own logprobs are not read: the
+/// caller writes the token's from the engine message's view. Both structs are
+/// matched field by field with no rest pattern, so a field added to either is
+/// a compile error here until this read says what it does.
+pub(super) fn text_delta<'a>(choice: &'a ChatStreamChoiceRef<'_>) -> Option<(TextDelta, &'a str)> {
     let ChatStreamChoiceRef {
         index: _,
         delta,
-        logprobs,
+        logprobs: _,
         finish_reason: None,
         matched_stop: None,
     } = choice
@@ -261,63 +290,49 @@ pub(super) fn text_delta<'a>(
         } => (TextDelta::Reasoning, text.as_ref()),
         _ => return None,
     };
-    Some((field, text, logprobs.as_ref()))
+    Some((field, text))
 }
 
-/// The logprobs object of a chat choice as serde writes a [`ChatLogProbs`]:
-/// `{"content":<entries or null>,"refusal":<entries or null>}` for the
-/// detailed object, its structure as literals and its values through serde;
-/// a raw value is serde's whole.
-fn push_logprobs(buffer: &mut BytesMut, logprobs: &ChatLogProbs) {
-    let ChatLogProbs::Detailed { content, refusal } = logprobs else {
-        push_json(FrameSink(buffer), logprobs);
-        return;
-    };
+/// The logprobs object of a chat choice written from the engine message's
+/// view, byte for byte as serde writes the converted
+/// [`ChatLogProbs`](openai_protocol::common::ChatLogProbs):
+/// `{"content":<entries or null>,"refusal":null}`, each entry's token decoded
+/// once and its byte list the bytes of that text (what the conversion copies
+/// into the entry), the candidates in the engine's order cut to `requested`
+/// before any is decoded; a view without a position is `"content":null`, as
+/// the conversion leaves the content list out.
+fn push_logprobs_view(
+    buffer: &mut BytesMut,
+    view: ProtoOutputLogProbs<'_>,
+    requested: usize,
+    decode: &impl Fn(u32) -> String,
+) {
     buffer.extend_from_slice(b"{\"content\":");
-    push_logprob_entries(buffer, content.as_deref());
-    buffer.extend_from_slice(b",\"refusal\":");
-    push_logprob_entries(buffer, refusal.as_deref());
-    buffer.extend_from_slice(b"}");
-}
-
-/// A list of token entries as serde writes an `Option<Vec<ChatLogProbsContent>>`:
-/// `null`, or each token's entry with its candidates under `top_logprobs`.
-/// Both structs are matched field by field with no rest pattern, so a field
-/// added to either is a compile error here until this writer says where it
-/// goes.
-fn push_logprob_entries(buffer: &mut BytesMut, entries: Option<&[ChatLogProbsContent]>) {
-    let Some(entries) = entries else {
+    if view.is_empty() {
         buffer.extend_from_slice(b"null");
-        return;
-    };
-    buffer.extend_from_slice(b"[");
-    for (at, entry) in entries.iter().enumerate() {
-        if at > 0 {
-            buffer.extend_from_slice(b",");
-        }
-        let ChatLogProbsContent {
-            token,
-            logprob,
-            bytes,
-            top_logprobs,
-        } = entry;
-        push_logprob_token(buffer, token, *logprob, bytes.as_deref());
-        buffer.extend_from_slice(b",\"top_logprobs\":[");
-        for (at, candidate) in top_logprobs.iter().enumerate() {
+    } else {
+        buffer.extend_from_slice(b"[");
+        for (at, position) in view.positions().enumerate() {
             if at > 0 {
                 buffer.extend_from_slice(b",");
             }
-            let TopLogProb {
-                token,
-                logprob,
-                bytes,
-            } = candidate;
-            push_logprob_token(buffer, token, *logprob, bytes.as_deref());
-            buffer.extend_from_slice(b"}");
+            let token = decode(position.token_id);
+            push_logprob_token(buffer, &token, position.logprob, Some(token.as_bytes()));
+            buffer.extend_from_slice(b",\"top_logprobs\":[");
+            let candidates = position.top_logprobs.iter().take(requested);
+            for (at, (token_id, logprob)) in candidates.enumerate() {
+                if at > 0 {
+                    buffer.extend_from_slice(b",");
+                }
+                let text = decode(token_id);
+                push_logprob_token(buffer, &text, logprob, Some(text.as_bytes()));
+                buffer.extend_from_slice(b"}");
+            }
+            buffer.extend_from_slice(b"]}");
         }
-        buffer.extend_from_slice(b"]}");
+        buffer.extend_from_slice(b"]");
     }
-    buffer.extend_from_slice(b"]");
+    buffer.extend_from_slice(b",\"refusal\":null}");
 }
 
 /// The opening of a token's entry, `{"token":…,"logprob":…,"bytes":…`: the

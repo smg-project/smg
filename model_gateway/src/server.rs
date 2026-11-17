@@ -59,10 +59,11 @@ mod rate_limit_document;
 pub(crate) mod tls;
 
 // The HTTP client constructors and the process crypto provider they install
-// first live beside the private-key-file check in `tls`; callers read them as
-// `server::http_client()` and its siblings.
-pub use tls::{blocking_http_client, http_client, http_client_builder, install_crypto_provider};
-
+// first live in the worker tree, which builds the worker-directed clients
+// with them; callers read them as `server::http_client()` and its siblings.
+pub use crate::worker::connection::client_factory::{
+    blocking_http_client, http_client, http_client_builder, install_crypto_provider,
+};
 use crate::{
     admin::{
         json::AdminJson,
@@ -108,7 +109,7 @@ use crate::{
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
-        health::manager::{WorkerManager, WorkerManagerConfig},
+        health::manager::{WorkerJobs, WorkerManager, WorkerManagerConfig},
         identity::endpoint::Endpoint,
         ConnectionMode,
     },
@@ -255,6 +256,9 @@ async fn v1_chat_completions(
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     let model = body.model.clone();
+    // One allocation holds the parsed request from here on: the router
+    // layers below move its pointer, not the 1 KiB request.
+    let body = Arc::new(body);
     cancel
         .guard(
             state
@@ -2442,7 +2446,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             default_check_interval_secs: config.router_config.health_check.check_interval_secs,
             remove_unhealthy: config.router_config.unhealthy_removal_scope(),
         },
-        app_context.worker_job_queue.get().cloned(),
+        app_context
+            .worker_job_queue
+            .get()
+            .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>),
         !config.router_config.health_check.disable_health_check,
         config.router_config.connection_mode == ConnectionMode::Zmq,
     );
@@ -2837,8 +2844,10 @@ async fn graceful_shutdown(
         "Beginning graceful shutdown: readiness draining"
     );
     // Everything below shares the grace: the drain takes what the settle
-    // window and the leave of the mesh leave of it.
-    let deadline = tokio::time::Instant::now() + budget.grace;
+    // window and the leave of the mesh leave of it. A grace the clock cannot
+    // hold ends at the far future: the plain sum would panic here, in the
+    // signal's task, before readiness drains.
+    let deadline = middleware::body_timeout::deadline_from_now(budget.grace);
     inflight_tracker.begin_drain();
     let left_in_time = if budget.settle.is_zero() {
         tokio::time::timeout(budget.grace, leave_mesh).await.is_ok()
@@ -3249,6 +3258,71 @@ mod graceful_shutdown_tests {
             1,
             "the stuck request is reported, not waited for"
         );
+    }
+
+    /// A grace the clock cannot hold (an operator's "never", written as the
+    /// largest number) still drains: its end is the far future, thirty years
+    /// on. Readiness drains at once, the listeners are gated after the settle
+    /// window with what is left to that end, and a request in flight is
+    /// waited for. The plain sum of such a grace and the clock panics before
+    /// readiness drains. A grace the clock holds ends where it always did,
+    /// one past the far future too.
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_past_the_clocks_range_still_drains() {
+        const YEAR: u64 = 86400 * 365;
+        let far_future = Duration::from_secs(30 * YEAR);
+        for (grace_secs, end) in [
+            (u64::MAX, far_future),
+            // The clock counts seconds in a signed 64-bit number: 2^63 does
+            // not fit, and neither does one second less once added to now.
+            (1 << 63, far_future),
+            ((1 << 63) - 1, far_future),
+            (10 * YEAR, Duration::from_secs(10 * YEAR)),
+            (40 * YEAR, Duration::from_secs(40 * YEAR)),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let request = tracker.track();
+            let start = tokio::time::Instant::now();
+            let gated = Arc::new(Mutex::new(None));
+            let stop_listeners = {
+                let gated = Arc::clone(&gated);
+                let tracker = Arc::clone(&tracker);
+                move |drain_timeout| {
+                    *gated.lock().expect("no poison") =
+                        Some((start.elapsed(), drain_timeout, tracker.is_draining()));
+                }
+            };
+            // The request ends an hour in, during the drain.
+            let release = async {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                drop(request);
+            };
+            let shutdown = graceful_shutdown(
+                &tracker,
+                ShutdownBudget::from_grace_secs(grace_secs, None),
+                async {},
+                || panic!("a completed mesh leave must not be stopped again"),
+                stop_listeners,
+            );
+            let (deadline, ()) = tokio::join!(shutdown, release);
+            assert_eq!(
+                gated.lock().expect("no poison").take(),
+                Some((Duration::from_secs(5), end - Duration::from_secs(5), true)),
+                "{grace_secs}: gated after the settle window, with what is left of the grace, \
+                 while draining"
+            );
+            assert_eq!(
+                start.elapsed(),
+                Duration::from_secs(3600),
+                "{grace_secs}: the drain ended with the request"
+            );
+            assert_eq!(
+                deadline,
+                Some(start + end),
+                "{grace_secs}: the end of the grace the caller waits to"
+            );
+            assert!(tracker.is_empty());
+        }
     }
 
     /// With no grace there is no settle window: the leave gets no time (a

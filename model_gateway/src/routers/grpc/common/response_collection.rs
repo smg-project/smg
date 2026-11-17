@@ -352,10 +352,6 @@ mod tests {
 
         fn mark_completed(&mut self) {}
 
-        fn defer_abort_until_first_item(self) -> Self {
-            self
-        }
-
         fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
@@ -370,10 +366,6 @@ mod tests {
         }
 
         fn mark_completed(&mut self) {}
-
-        fn defer_abort_until_first_item(self) -> Self {
-            self
-        }
 
         fn defer_abort_within(self, _bound: Duration) -> Self {
             self
@@ -402,10 +394,6 @@ mod tests {
 
         fn mark_completed(&mut self) {}
 
-        fn defer_abort_until_first_item(self) -> Self {
-            self
-        }
-
         fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
@@ -431,10 +419,6 @@ mod tests {
         }
 
         fn mark_completed(&mut self) {}
-
-        fn defer_abort_until_first_item(self) -> Self {
-            self
-        }
 
         fn defer_abort_within(self, _bound: Duration) -> Self {
             self

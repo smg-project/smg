@@ -116,7 +116,9 @@ The prompt decides where the output starts: its terminals are replayed over the 
 initial state, and the output begins in the state they leave. The replay starts at the last turn
 opener the table names (`<|im_start|>assistant` for ChatML), so a marker quoted in an earlier turn,
 a `<tool_call>` in the user's question or a `<think>` inside an earlier call's arguments, moves
-nothing; a table that names no opener is replayed from the prompt's start. Qwen 3.5's template opens
+nothing; a table that names no opener is replayed from the prompt's start, and one whose opener the
+model writes at every message (Inkling's `<|message_model|>`) from the opener of the message the
+prompt left open. Qwen 3.5's template opens
 `<think>` in the generation prompt, so the output starts inside the thought, with `ReasoningStart`
 pushed for the prompt, and its first `</think>` closes it; Qwen3 writes its own `<think>`; and a
 prompt that disables thinking ends with `<think>\n\n</think>\n\n`, which leaves the engine in

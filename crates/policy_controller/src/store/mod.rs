@@ -3,7 +3,7 @@
 //! embedded mode feeds the same store from its own process.
 //!
 //! The store holds what a decision reads and nothing a request path writes:
-//! membership, health, loads, the KV event cursors beside the index,
+//! membership, health, loads, the KV index behind its event cursors,
 //! reservations, session pins and leases. Every path that writes it today
 //! ends in one of these sinks (the step-3 inventory counted thirteen paths
 //! into six writes), so the drivers that move into the controller (discovery,
@@ -47,7 +47,9 @@
 //!   in process: a load record enters as the view's [`LoadRow`] (the record's
 //!   routing core in its own names) and a KV batch as the host's own message
 //!   behind [`KvEventSink::Batch`], with the header facts the cursor reads
-//!   beside it.
+//!   beside it. [`MemoryStore`] takes a batch as the events its collector
+//!   decoded ([`KvEvent`]) and applies them to the index of the worker's
+//!   model ([`index`]).
 //!
 //! [`MemoryStore`] is the one-process store behind every trait: the
 //! controller's own store once its drivers move in, and the double the
@@ -57,11 +59,15 @@
 //! A decision reads none of the tables behind those traits. The store
 //! derives a [`World`] from them (every pool as whole candidate rows) and
 //! publishes it by pointer swap: [`world`] holds the read side and the
-//! build of one decision's view.
+//! build of one decision's view. Every world is published under the
+//! generation the store holds, which [`MemoryStore::apply`] alone replaces:
+//! a decision reads its rows and its engine in one load.
 //!
 //! [`LoadRow`]: crate::view::LoadRow
 
 pub mod health;
+pub mod index;
+pub mod journal;
 pub mod kv_events;
 pub mod leases;
 pub mod loads;
@@ -75,20 +81,22 @@ pub mod world;
 mod tests;
 
 pub use health::HealthSink;
+pub use index::{ContentHash, KvEvent, LaneCounts, SequenceHash, StoredBlock, INDEX_WORKERS};
+pub use journal::{Journal, Kinds, Position};
 pub use kv_events::{
     Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
     SnapshotChunk,
 };
-pub use leases::{LeaseRecord, LeaseRefused, LeaseState, LeasesStore};
+pub use leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore};
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
-pub use memory::MemoryStore;
+pub use memory::{Cut, MemoryStore};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
 pub use workers::{
     identity, identity_of, HealthPolicy, MembershipChange, MembershipTail, Overload, Reachability,
     Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
-pub use world::{Ask, Built, ViewBuffers, World, PUBLISH_WINDOW};
+pub use world::{Ask, Built, StaleGeneration, ViewBuffers, World, PUBLISH_WINDOW};
 
 /// The verified identity of a gateway: the fingerprint of the subject its
 /// session was authenticated as, never a message field. Leases, vetoes and

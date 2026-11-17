@@ -12,7 +12,7 @@ use axum::{
     Json,
 };
 use openai_protocol::worker::{
-    WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec, WorkerStatus,
+    HealthCheckUpdate, WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec, WorkerStatus,
     WorkerUpdateRequest,
 };
 use serde_json::json;
@@ -21,9 +21,11 @@ use tracing::warn;
 
 use crate::{
     config::{unused_credentials_warning, validate_worker_url, RouterConfig},
+    observability::log_format::has_control_character,
     routers::provider_support,
     service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL},
     worker::{
+        health::manager::MAX_PROBE_DELAY,
         identity::{
             basic::{merge_labels, worker_to_info},
             endpoint::Endpoint,
@@ -73,11 +75,13 @@ fn bad_request(message: String) -> WorkerServiceError {
 }
 
 /// The bounds a registration body must satisfy before any job is queued:
-/// the URL's length; the labels' count, charset and size, the shape of the
+/// the URL's length, and no control character in it, in a model's id or in
+/// a parser's name; the labels' count, charset and size, the shape of the
 /// labels the routers read as numbers or booleans and none under the prefix
 /// reserved for discovery; the fields the routers rely on (a positive,
 /// finite cost; a KV block size and a data-parallel size of at least 1; a
-/// rank only with a size and below it; a bootstrap port that is a port). A
+/// rank only with a size and below it; a bootstrap port that is a port); a
+/// probe interval and a probe timeout the health schedule can hold. A
 /// violation is a `400 Bad Request` naming the field.
 fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     if spec.url.len() > MAX_WORKER_URL_BYTES {
@@ -86,8 +90,28 @@ fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
             spec.url.len()
         )));
     }
+    // Log lines and a failed job's text write these as they came, so a line
+    // break in one would start a line of the caller's choosing.
+    let of_models = spec.models.iter().flat_map(|card| {
+        [
+            ("models[].id", Some(card.id.as_str())),
+            (
+                "models[].reasoning_parser",
+                card.reasoning_parser.as_deref(),
+            ),
+            ("models[].tool_parser", card.tool_parser.as_deref()),
+        ]
+    });
+    for (field, text) in std::iter::once(("url", Some(spec.url.as_str()))).chain(of_models) {
+        if text.is_some_and(has_control_character) {
+            return Err(bad_request(format!(
+                "{field} must not contain control characters"
+            )));
+        }
+    }
     validate_labels(&spec.labels)?;
     validate_cost(spec.cost)?;
+    validate_health(&spec.health)?;
     if spec.kv_block_size == Some(0) {
         return Err(bad_request(
             "kv_block_size must be at least 1 (tokens per KV block)".to_string(),
@@ -119,6 +143,9 @@ fn validate_update(update: &WorkerUpdateRequest) -> Result<(), WorkerServiceErro
     if let Some(labels) = &update.labels {
         validate_labels(labels)?;
     }
+    if let Some(health) = &update.health {
+        validate_health(health)?;
+    }
     Ok(())
 }
 
@@ -128,6 +155,24 @@ fn validate_cost(cost: f32) -> Result<(), WorkerServiceError> {
         return Err(bad_request(format!(
             "cost must be a finite number above 0 (baseline 1.0), not {cost}"
         )));
+    }
+    Ok(())
+}
+
+/// The health settings a caller sends: a probe interval and a probe timeout
+/// the schedule can hold. The schedule adds each to its clock.
+fn validate_health(health: &HealthCheckUpdate) -> Result<(), WorkerServiceError> {
+    let max = MAX_PROBE_DELAY.as_secs();
+    let delays = [
+        ("check_interval_secs", health.check_interval_secs),
+        ("timeout_secs", health.timeout_secs),
+    ];
+    for (field, secs) in delays {
+        if let Some(secs) = secs.filter(|secs| *secs > max) {
+            return Err(bad_request(format!(
+                "health.{field} is {secs}; at most {max} (thirty years) are accepted"
+            )));
+        }
     }
     Ok(())
 }
@@ -198,7 +243,7 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
                  worker discovery"
             )));
         }
-        if value.len() > MAX_LABEL_VALUE_BYTES || value.chars().any(char::is_control) {
+        if value.len() > MAX_LABEL_VALUE_BYTES || has_control_character(value) {
             return Err(bad_request(format!(
                 "label '{key}' must be at most {MAX_LABEL_VALUE_BYTES} bytes without control \
                  characters"
@@ -1541,6 +1586,63 @@ mod tests {
         );
     }
 
+    /// A control character in a string the log writes as it came is refused
+    /// at the door, on POST and PUT: the URL, a model's id, a parser's name.
+    #[tokio::test]
+    async fn a_control_character_in_a_string_the_log_writes_is_refused_on_post_and_put() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "grpc://10.0.0.8:8000", Some("m"));
+        let id = registry.reserve_id_for_url("grpc://10.0.0.8:8000");
+        let service = make_service(Arc::clone(&registry));
+        let url = "grpc://10.0.0.9:8000";
+        let refused = [
+            (
+                "url",
+                json!({"url": "grpc://10.0.0.9:8000/\nINJECTED level=ERROR forged"}),
+            ),
+            ("url", json!({"url": "grpc://10.0.0.9:8000/\rINJECTED"})),
+            (
+                "models[].id",
+                json!({"url": url, "models": [{"id": "m\nINJECTED"}]}),
+            ),
+            (
+                "models[].reasoning_parser",
+                json!({"url": url, "models": [{"id": "m", "reasoning_parser": "p\nINJECTED"}]}),
+            ),
+            (
+                "models[].tool_parser",
+                json!({"url": url, "models": [{"id": "m", "tool_parser": "p\nINJECTED"}]}),
+            ),
+        ];
+        for (field, body) in refused {
+            let wanted = format!("{field} must not contain control characters");
+            let spec = || serde_json::from_value::<WorkerSpec>(body.clone()).expect("a spec");
+            let post = service.create_worker(spec()).await.expect_err("POST");
+            let put = service
+                .replace_worker(id.as_str(), spec())
+                .await
+                .expect_err("PUT");
+            for (verb, err) in [("POST", post), ("PUT", put)] {
+                assert!(
+                    matches!(&err, WorkerServiceError::BadRequest { message } if *message == wanted),
+                    "{verb} {field}: {err}"
+                );
+            }
+        }
+        let taken: WorkerSpec = serde_json::from_value(json!({
+            "url": url,
+            "models": [{"id": "m", "reasoning_parser": "p", "tool_parser": "p"}]
+        }))
+        .expect("a spec");
+        assert!(matches!(
+            service
+                .create_worker(taken)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+    }
+
     /// A registration whose labels or fields the routers could not read is
     /// refused at the boundary with a 400 naming the field, before any job
     /// is queued; one they can read passes the boundary (and stops at the
@@ -1826,6 +1928,65 @@ mod tests {
                 .expect_err("queue is uninitialized"),
             WorkerServiceError::QueueNotInitialized
         ));
+    }
+
+    /// A probe interval or timeout the health schedule cannot hold is refused
+    /// at the door, on POST, PUT and PATCH; the longest it can hold is taken.
+    #[tokio::test]
+    async fn a_probe_delay_past_the_schedules_bound_is_refused_on_post_put_and_patch() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "grpc://10.0.0.8:8000", Some("m"));
+        let id = registry.reserve_id_for_url("grpc://10.0.0.8:8000");
+        let service = make_service(Arc::clone(&registry));
+        for field in ["check_interval_secs", "timeout_secs"] {
+            let refused = |err: WorkerServiceError, verb: &str| {
+                assert!(
+                    matches!(&err, WorkerServiceError::BadRequest { message }
+                        if message.contains(&format!("health.{field} is"))),
+                    "{verb} {field}: {err}"
+                );
+            };
+            for secs in [946_080_001, u64::MAX] {
+                let health = json!({ field: secs });
+                let post: WorkerSpec = serde_json::from_value(
+                    json!({"url": "grpc://10.0.0.9:8000", "health": health}),
+                )
+                .expect("a spec");
+                refused(service.create_worker(post).await.expect_err("POST"), "POST");
+                let put: WorkerSpec = serde_json::from_value(
+                    json!({"url": "grpc://10.0.0.8:8000", "health": health}),
+                )
+                .expect("a spec");
+                refused(
+                    service
+                        .replace_worker(id.as_str(), put)
+                        .await
+                        .expect_err("PUT"),
+                    "PUT",
+                );
+                let patch: WorkerUpdateRequest =
+                    serde_json::from_value(json!({ "health": health })).expect("an update");
+                refused(
+                    service
+                        .update_worker(id.as_str(), patch)
+                        .await
+                        .expect_err("PATCH"),
+                    "PATCH",
+                );
+            }
+            let longest: WorkerSpec = serde_json::from_value(json!({
+                "url": "grpc://10.0.0.9:8000",
+                "health": { field: 946_080_000_u64 }
+            }))
+            .expect("a spec");
+            assert!(matches!(
+                service
+                    .create_worker(longest)
+                    .await
+                    .expect_err("queue is uninitialized"),
+                WorkerServiceError::QueueNotInitialized
+            ));
+        }
     }
 
     /// A discovered worker's spec and labels are changed at its discovery

@@ -1,0 +1,32 @@
+[package]
+name = "smg-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Worker wire types and model cards for SMG"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+keywords = ["smg", "llm", "gateway", "worker", "types"]
+categories = ["data-structures"]
+# The default-layer case walks the workspace's manifests, which a published
+# package does not carry.
+exclude = ["tests/default_layer.rs"]
+
+[lib]
+name = "smg_worker"
+
+[features]
+default = []
+# The HTTP responses of the worker's admin types.
+axum = ["dep:axum"]
+
+[dependencies]
+axum = { workspace = true, optional = true }
+bitflags.workspace = true
+schemars.workspace = true
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+serde_with.workspace = true
+url = "2.5"
+
+[lints]
+workspace = true

@@ -417,15 +417,14 @@ def test_epd_roles_this_process_cannot_serve_are_refused_up_front(monkeypatch):
     roles with one scheduler rank (the wire carries the bootstrap fields)
     and a plain worker; a prefill/decode side with more than one rank passes
     too (the servicer places a prefill side's request on the rank of its room
-    and a decode side's on its pin) but for the one shape the engine cannot
-    serve: a prefill side of several plain data-parallel replicas, whose KV
-    sender fails every request of a non-zero room residue (every replica is
-    attention-DP rank 0). Attention DP passes (the newer releases'
+    and a decode side's on its pin): under attention DP (the newer releases'
     ``attn_dp_size`` beside ``dp_size=1``, the pinned release's ``dp_size``
-    under ``enable_dp_attention``); the plain shape is refused whatever its
-    load-balance method and whether the engine's force-query switch is set
-    (its sender registers rank 0 then and the decode side bootstraps against
-    replica 0)."""
+    under ``enable_dp_attention``), and as plain data-parallel replicas that
+    follow the room (each request names its replica to the engine's KV
+    sender, where every replica is attention-DP rank 0). Plain replicas under
+    any other load-balance method, or with the engine's force-query switch
+    on, are refused: the decode side would wait for a rank the sender never
+    registers for a named request."""
     rust.refuse_epd_disaggregation(_server_args())
     rust.refuse_epd_disaggregation(_server_args(disaggregation_mode="null"))
     rust.refuse_epd_disaggregation(_server_args(dp_size=2))
@@ -439,14 +438,25 @@ def test_epd_roles_this_process_cannot_serve_are_refused_up_front(monkeypatch):
         )
     rust.refuse_epd_disaggregation(_server_args(disaggregation_mode="decode", dp_size=2))
     monkeypatch.delenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK", raising=False)
-    for method in (None, "auto", "follow_bootstrap_room", "round_robin"):
+    following = _server_args(
+        disaggregation_mode="prefill", dp_size=2, load_balance_method="follow_bootstrap_room"
+    )
+    rust.refuse_epd_disaggregation(following)
+    rust.refuse_epd_disaggregation(
+        _server_args(disaggregation_mode="prefill", dp_size=2, load_balance_method="auto")
+    )
+    for method in (None, "round_robin"):
         with pytest.raises(rust_lifecycle.ServicerConfigError, match="2 plain data-parallel"):
             rust.refuse_epd_disaggregation(
                 _server_args(disaggregation_mode="prefill", dp_size=2, load_balance_method=method)
             )
-    monkeypatch.setenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK", "1")
-    with pytest.raises(rust_lifecycle.ServicerConfigError, match="2 plain data-parallel"):
-        rust.refuse_epd_disaggregation(_server_args(disaggregation_mode="prefill", dp_size=2))
+    for on in ("1", "true", "Yes"):
+        monkeypatch.setenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK", on)
+        with pytest.raises(rust_lifecycle.ServicerConfigError, match="2 plain data-parallel"):
+            rust.refuse_epd_disaggregation(following)
+    for off in ("0", "false", ""):
+        monkeypatch.setenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK", off)
+        rust.refuse_epd_disaggregation(following)
     monkeypatch.delenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK")
     for backend in ("zmq_to_scheduler", "mooncake"):
         rust.refuse_epd_disaggregation(

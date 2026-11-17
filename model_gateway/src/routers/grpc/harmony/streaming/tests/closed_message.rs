@@ -70,6 +70,7 @@ async fn streamed(frames: Vec<proto::GenerateResponse>) -> (Value, Value) {
             None,
             None,
             &[],
+            None,
         )
         .await;
         drop(tx);

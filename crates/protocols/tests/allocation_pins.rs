@@ -1,7 +1,8 @@
-//! What the Responses id generator allocates, pinned at today's count, so the
-//! next change that formats the id piece by piece fails a test rather than
-//! moving a number inside a benchmark's noise. A separate executable, so it
-//! can declare the counting allocator the pin needs.
+//! What the Responses id generator and the strict schema walk allocate, pinned
+//! at today's counts, so the next change that formats an id or a path piece by
+//! piece fails a test rather than moving a number inside a benchmark's noise.
+//! A separate executable, so it can declare the counting allocator the pins
+//! need.
 
 #![expect(
     clippy::print_stderr,
@@ -9,7 +10,7 @@
 )]
 #![expect(
     unsafe_code,
-    reason = "a counting global allocator is the only way to see what an id allocated"
+    reason = "a counting global allocator is the only way to see what a call allocated"
 )]
 
 use std::{
@@ -17,7 +18,10 @@ use std::{
     cell::Cell,
 };
 
-use openai_protocol::responses::generate_id;
+use openai_protocol::{
+    common::strict_schema_missing_additional_properties, responses::generate_id,
+};
+use serde_json::json;
 
 thread_local! {
     /// Allocation and reallocation calls this thread made.
@@ -72,4 +76,32 @@ fn generating_an_id_allocates_once() {
         "the digits after the underscore are lowercase hex: {id}"
     );
     assert_eq!(calls, 1, "one allocation per id");
+}
+
+/// A strict schema that pins every object node is the common request: the
+/// walk that looks for an unpinned node allocates nothing on it.
+#[test]
+fn walking_a_pinned_strict_schema_allocates_nothing() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "city": {"type": "string"},
+            "days": {"type": "array", "items": {"type": "integer"}},
+            "place": {
+                "type": "object",
+                "properties": {"lat": {"type": "number"}, "lon": {"type": "number"}},
+                "additionalProperties": false
+            },
+            "unit": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        },
+        "additionalProperties": false
+    });
+    let (missing, calls) =
+        allocations_during(|| strict_schema_missing_additional_properties(&schema));
+    eprintln!("allocation calls per walk of a pinned strict schema: {calls}");
+    assert_eq!(missing, None);
+    assert_eq!(
+        calls, 0,
+        "a schema that holds the rule is walked without an allocation"
+    );
 }

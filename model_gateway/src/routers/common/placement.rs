@@ -28,8 +28,9 @@ use crate::{
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        as_consistent_hashing, policy_filters_unavailable_workers, CacheNamespace,
-        LoadBalancingPolicy, NamedList, PolicyRegistry, SelectWorkerInfo, WorkerRole,
+        as_consistent_hashing, policy_filters_unavailable_workers, policy_reads_hash_ring,
+        CacheNamespace, LoadBalancingPolicy, NamedList, PolicyRegistry, SelectWorkerInfo,
+        WorkerRole,
     },
     routers::{
         common::{
@@ -436,8 +437,12 @@ fn select_among(
         routing_key: policies.sticky_header_key(inputs.headers),
         rid_key: inputs.rid_key,
         cache_namespace: inputs.cache_namespace,
-        // Cached hash ring for consistent hashing (O(log n) lookup).
-        hash_ring: registry.get_hash_ring(model_id),
+        // The cached hash ring (O(log n) lookup), for a policy that reads
+        // it: no other placement pays the registry's keyed read and the
+        // ring's shared count.
+        hash_ring: policy_reads_hash_ring(policy.as_ref())
+            .then(|| registry.get_hash_ring(model_id))
+            .flatten(),
         role: WorkerRole::Single,
         overload_lifted: false,
         named: None,
@@ -891,11 +896,13 @@ pub(crate) fn report_refusal_under(
         // The request's span carries the id too; the field is for a line
         // written outside it (a retry's re-selection) and is omitted when
         // the router has no id of its own to give.
+        // The model is the caller's text: as a string field it is written
+        // quoted, so a line break in it never starts a line of its own.
         warn!(
             function = site.function,
             request_id = request_id,
             mode = %site.mode,
-            model_id = %model_id,
+            model_id = model_id,
             reason = reason,
             workers = pool.workers(),
             available = pool.available(),
@@ -1450,8 +1457,8 @@ mod tests {
         },
         observability::logging::test_support::test_subscriber,
         policies::{
-            CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy,
-            PowerOfTwoPolicy, RoundRobinPolicy,
+            hash_ring::HashRing, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
+            LeastLoadPolicy, PowerOfTwoPolicy, RoundRobinPolicy,
         },
         worker::{
             load::state::{one_rank_load, TestFeed},
@@ -1929,7 +1936,7 @@ mod tests {
             let registry = gated_pd_registry(8);
             let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
             policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
-            let feed = TestFeed::attached_to(decode_policy.as_ref());
+            let feed = TestFeed::attached_to(|rx| decode_policy.as_ref().set_load_receiver(rx));
             policies.set_decode_policy(decode_policy);
             // d:1 runs its whole window of eight at 160 tokens/s and holds
             // every room; d:2 runs one request at 20 tokens/s.
@@ -3043,6 +3050,72 @@ mod tests {
         );
     }
 
+    /// A policy that places by the model's hash ring is handed it. Under
+    /// each of the two a keyed request lands where the policy itself puts it
+    /// with the registry's ring in hand, and some key lands elsewhere
+    /// without the ring (consistent hashing then counts the key over the
+    /// list, prefix hash takes the least loaded worker): a placement that
+    /// withheld the ring would move that key.
+    #[test]
+    fn a_policy_that_reads_the_hash_ring_is_handed_it() {
+        let urls: Vec<String> = (1..=8).map(|n| format!("http://h:{n}")).collect();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        let registry = http_registry(&urls);
+        let ring = registry.get_hash_ring(MODEL).expect("the model's ring");
+        let pool = candidates(&registry, MODEL, RoutingPool::HttpRegular, None);
+        let pool = pool.as_slice();
+        let prefix_hash = PolicyConfig::PrefixHash {
+            prefix_token_count: 256,
+            load_factor: 1.25,
+            balance_abs_threshold: 10,
+            cache_boundaries: Vec::new(),
+        };
+        for config in [PolicyConfig::ConsistentHashing, prefix_hash] {
+            let policies = PolicyRegistry::new(config);
+            let policy = policies.get_policy_or_default(MODEL);
+            let mut moved_without_the_ring = 0;
+            for session in 0..32 {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "x-smg-routing-key",
+                    format!("session-{session}").parse().unwrap(),
+                );
+                let own_pick = |hash_ring: Option<Arc<HashRing>>| {
+                    let info = SelectWorkerInfo {
+                        headers: Some(&headers),
+                        routing_key: policies.sticky_header_key(Some(&headers)),
+                        hash_ring,
+                        ..Default::default()
+                    };
+                    policy
+                        .select_worker(pool, &info)
+                        .map(|idx| pool[idx].url().to_string())
+                };
+                let with_the_ring = own_pick(Some(Arc::clone(&ring)));
+                let placed = pick(
+                    &registry,
+                    &policies,
+                    PlacementInputs {
+                        headers: Some(&headers),
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(
+                    Some(placed.url().to_string()),
+                    with_the_ring,
+                    "{} places session {session} by the ring",
+                    policy.name()
+                );
+                moved_without_the_ring += usize::from(own_pick(None) != with_the_ring);
+            }
+            assert!(
+                moved_without_the_ring > 0,
+                "{}: no key of the 32 tells a withheld ring",
+                policy.name()
+            );
+        }
+    }
+
     /// Cache-aware routing pins a prompt to the worker holding its prefix;
     /// a retry moves to the next-best worker and comes back only when no
     /// other worker is left.
@@ -3341,6 +3414,42 @@ mod tests {
         }
     }
 
+    /// The model in the line is the caller's own text, so it is written as a
+    /// string field: quoted, a line break in it spelled out, the line one
+    /// line.
+    #[test]
+    fn the_refusal_line_writes_the_callers_model_name_quoted() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
+        let registry = WorkerRegistry::new();
+        let site = RefusalSite {
+            function: "Router::route_typed_request",
+            mode: "Regular",
+            pools: &[("regular", RoutingPool::HttpRegular)],
+        };
+        let throttle = KeyedLogThrottle::new(2, Duration::from_millis(100), REFUSAL_LOG_MODELS);
+        let model = "nope\n2026-01-01 00:00:00  WARN forged";
+
+        let refused = report_refusal_under(
+            &throttle,
+            &registry,
+            site,
+            None,
+            model,
+            error::model_not_found(model),
+        );
+
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!lines[0].contains('\n'), "{:?}", lines[0]);
+        assert!(
+            lines[0].contains(r#"model_id="nope\n2026-01-01 00:00:00  WARN forged""#),
+            "{:?}",
+            lines[0]
+        );
+    }
+
     /// A refusal the gateway answers on its own is marked for the loggers
     /// downstream and written once, at WARN, with the refusing router, the
     /// request id, the model, its reason and the pool's state; past the cap
@@ -3390,7 +3499,7 @@ mod tests {
             "function=\"Router::route_typed_request\"",
             "request_id=\"req-1\"",
             "mode=Regular",
-            "model_id=m1",
+            "model_id=\"m1\"",
             "reason=\"every worker is down\"",
             "workers=1",
             "available=0",
@@ -3422,7 +3531,7 @@ mod tests {
             "{:?}",
             line(2)
         );
-        assert!(line(2).contains("model_id=m2"), "{:?}", line(2));
+        assert!(line(2).contains("model_id=\"m2\""), "{:?}", line(2));
         assert!(
             !line(2).contains("request_id="),
             "no id of its own, no field: {:?}",
@@ -3451,7 +3560,7 @@ mod tests {
         refuse("m1", no_available_workers("every worker is down"));
         assert!(line(4).contains("suppressed=3"), "{:?}", line(4));
         refuse("m5", error::model_not_found("m5"));
-        assert!(line(5).contains("model_id=m5"), "{:?}", line(5));
+        assert!(line(5).contains("model_id=\"m5\""), "{:?}", line(5));
         assert!(line(5).contains("suppressed=1"), "{:?}", line(5));
 
         // Already reported: no second line, whatever the throttle says.
@@ -3524,8 +3633,8 @@ mod tests {
             "a new name opens no fresh allowance: {:?}",
             line(1)
         );
-        assert!(line(0).contains("model_id=x1"), "{:?}", line(0));
-        assert!(line(1).contains("model_id=x2"), "{:?}", line(1));
+        assert!(line(0).contains("model_id=\"x1\""), "{:?}", line(0));
+        assert!(line(1).contains("model_id=\"x2\""), "{:?}", line(1));
         assert!(
             line(0).contains("pool=regular 0/0 available (0 healthy)"),
             "{:?}",
@@ -3535,7 +3644,7 @@ mod tests {
         // The model with a worker registered keeps an allowance of its own.
         refuse("m1");
         assert_eq!(count(), 3, "{:?}", line(2));
-        assert!(line(2).contains("model_id=m1"), "{:?}", line(2));
+        assert!(line(2).contains("model_id=\"m1\""), "{:?}", line(2));
         assert!(
             line(2).contains("pool=regular 0/1 available (0 healthy)"),
             "{:?}",
@@ -3545,7 +3654,7 @@ mod tests {
         // The next window: the unknown names' line carries the one counted.
         std::thread::sleep(window + Duration::from_millis(10));
         refuse("x4");
-        assert!(line(3).contains("model_id=x4"), "{:?}", line(3));
+        assert!(line(3).contains("model_id=\"x4\""), "{:?}", line(3));
         assert!(line(3).contains("suppressed=1"), "{:?}", line(3));
     }
 

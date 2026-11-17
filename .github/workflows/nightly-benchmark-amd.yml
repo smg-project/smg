@@ -11,7 +11,7 @@ name: Nightly Benchmark (AMD)
 
 on:
   schedule:
-    - cron: '0 7 * * 0' # Sundays 07:00 UTC, as nightly-benchmark.yml ran
+    - cron: '0 7 * * 1' # Mondays 07:00 UTC, outside the Sunday PD deferral
   workflow_dispatch:
     inputs:
       models:
@@ -92,13 +92,127 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Single-worker: one model per job, one TP1 worker. The same models, images
-  # and runner as the multi-worker job.
+  # and runner as the multi-worker jobs.
   # ---------------------------------------------------------------------------
 
-  single-worker:
+  # Bound GPU fan-out to two original rows per wave. Keep each row's full
+  # benchmark steps; the host guard still decides resource admission.
+  # This does not reserve a runner or extend GitHub's queue timeout.
+  single-vllm:
     name: "${{ matrix.model.id }} / single-${{ matrix.variant.id }}"
     needs: build-wheel
-    if: ${{ !cancelled() && needs.build-wheel.result == 'success' }}
+    if: ${{ !cancelled() && needs.build-wheel.result == 'success' && contains(fromJSON('["all","vllm"]'), github.event.inputs.runtime || 'all') }}
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
+    container:
+      image: ${{ matrix.variant.image }}
+      options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    # Three retained Sunday runs peaked at 4h09m11s per GPU job. Bound the
+    # job to six hours; host admission must also budget preparation/cleanup
+    # and wait if the whole occupancy would cross Router's 05:00 UTC start.
+    timeout-minutes: 360
+    env:
+      # Each job starts in a fresh container, so an engine's first start
+      # compiles its kernels: SGLang's first Qwen3-30B-A3B worker takes about
+      # 300 s on MI300X, the default startup wait. Raise the floor on every
+      # startup wait (effective_startup_timeout in e2e_test/infra).
+      E2E_STARTUP_TIMEOUT: "900"
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        model:
+          - { id: meta-llama/Llama-3.1-8B-Instruct, slug: meta-llama-Llama-3.1-8B-Instruct, test_class: TestNightlyLlama8bSingle }
+          - { id: Qwen/Qwen3-30B-A3B, slug: Qwen-Qwen3-30B-A3B, test_class: TestNightlyQwen30bSingle }
+        # vLLM runs in the ROCm image pinned by CI.
+        variant:
+          - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f", setup: ci_setup_vllm_rocm_image.sh }
+
+    steps:
+      - name: Check filters
+        id: filter
+        env:
+          MODELS: ${{ github.event.inputs.models || 'all' }}
+          RUNTIME: ${{ github.event.inputs.runtime || 'all' }}
+        run: |
+          SKIP="false"
+          if [ "$MODELS" != "all" ] && ! echo ",$MODELS," | grep -Fq ",${{ matrix.model.id }},"; then
+            SKIP="true"
+          fi
+          if [ "$RUNTIME" != "all" ] && [ "$RUNTIME" != "${{ matrix.variant.id }}" ]; then
+            SKIP="true"
+          fi
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout code
+        if: steps.filter.outputs.skip != 'true'
+        uses: actions/checkout@v7
+
+      - name: Setup ${{ matrix.variant.id }} backend (in its ROCm image)
+        if: steps.filter.outputs.skip != 'true'
+        run: bash scripts/${{ matrix.variant.setup }}
+
+      - name: Download build artifacts
+        if: steps.filter.outputs.skip != 'true'
+        uses: ./.github/actions/download-build-artifacts
+        with:
+          client-types: 'true'
+
+      - name: Install wheel and test dependencies
+        if: steps.filter.outputs.skip != 'true'
+        run: |
+          pip uninstall -y smg || true
+          pip install wheel/*.whl
+          bash scripts/ci_install_e2e_deps.sh
+
+      # The image has no Docker to run genai-bench's image, so genai-bench
+      # comes from PyPI, at that image's version, in a venv of its own.
+      # truststore 0.10.5 breaks TLS in a process gevent has patched, as
+      # genai-bench's locust does, so it is held below that.
+      - name: Install genai-bench
+        if: steps.filter.outputs.skip != 'true'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/genai-bench"
+          bash scripts/ci_retry.sh 3 10 "$RUNNER_TEMP/genai-bench/bin/pip" install "genai-bench==${GENAI_BENCH_IMAGE##*:}" "truststore<0.10.5"
+          echo "GENAI_BENCH_BIN=$RUNNER_TEMP/genai-bench/bin/genai-bench" >> "$GITHUB_ENV"
+
+      - name: Run benchmark
+        if: steps.filter.outputs.skip != 'true'
+        env:
+          # genai-bench's one AMD GPU type, for the MI300 series of the runner
+          GPU_TYPE: MI300
+          E2E_NIGHTLY: "1"
+          E2E_MODEL_TP_OVERRIDES: '{"meta-llama/Llama-3.1-8B-Instruct":1,"Qwen/Qwen3-30B-A3B":1}'
+          E2E_LOG_DIR: nightly_gateway_logs
+        run: |
+          mkdir -p nightly_gateway_logs
+          bash scripts/ci_killall_sglang.sh rocm  # the default mode reads nvidia-smi
+
+          E2E_RUNTIME=${{ matrix.variant.runtime }} \
+          ROUTER_LOCAL_MODEL_PATH="/models" \
+            pytest e2e_test/benchmarks/test_nightly_perf.py \
+              -k "${{ matrix.model.test_class }}" \
+              -s -vv -o log_cli=true --log-cli-level=INFO
+
+      - name: Upload benchmark results
+        if: always() && steps.filter.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-${{ matrix.model.slug }}-single-${{ matrix.variant.id }}-amd-${{ github.run_id }}
+          path: nightly_*/
+          retention-days: 90
+
+      - name: Cleanup
+        if: always() && steps.filter.outputs.skip != 'true'
+        run: bash scripts/ci_killall_sglang.sh rocm || true
+
+  # ---------------------------------------------------------------------------
+  # Single-worker SGLang: the second wave retains both original models.
+  # ---------------------------------------------------------------------------
+
+  single-sglang:
+    name: "${{ matrix.model.id }} / single-${{ matrix.variant.id }}"
+    needs: [build-wheel, single-vllm]
+    if: ${{ !cancelled() && needs.build-wheel.result == 'success' && contains(fromJSON('["all","sglang"]'), github.event.inputs.runtime || 'all') }}
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
     container:
       image: ${{ matrix.variant.image }}
@@ -116,7 +230,7 @@ jobs:
       E2E_STARTUP_TIMEOUT: "900"
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: 2
       matrix:
         model:
           - { id: meta-llama/Llama-3.1-8B-Instruct, slug: meta-llama-Llama-3.1-8B-Instruct, test_class: TestNightlyLlama8bSingle }
@@ -126,7 +240,6 @@ jobs:
         # architecture: mi30x for MI300X and MI325X, mi35x for MI355X.
         variant:
           - { id: sglang, runtime: sglang, image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d", setup: ci_setup_sglang_rocm_image.sh }
-          - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f", setup: ci_setup_vllm_rocm_image.sh }
 
     steps:
       - name: Check filters
@@ -238,10 +351,111 @@ jobs:
   # Multi-worker: one model per job, four TP1 workers on the runner's GPUs.
   # ---------------------------------------------------------------------------
 
-  multi-worker:
+  multi-vllm:
     name: "${{ matrix.model.id }} / multi-${{ matrix.variant.id }}"
-    needs: build-wheel
-    if: ${{ !cancelled() && needs.build-wheel.result == 'success' }}
+    needs: [build-wheel, single-sglang]
+    if: ${{ !cancelled() && needs.build-wheel.result == 'success' && contains(fromJSON('["all","vllm"]'), github.event.inputs.runtime || 'all') }}
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
+    container:
+      image: ${{ matrix.variant.image }}
+      options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    # Three retained Sunday runs peaked at 4h09m11s per GPU job. Bound the
+    # job to six hours; host admission must also budget preparation/cleanup
+    # and wait if the whole occupancy would cross Router's 05:00 UTC start.
+    timeout-minutes: 360
+    env:
+      E2E_STARTUP_TIMEOUT: "900" # as in the single-worker jobs
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        model:
+          - { id: meta-llama/Llama-3.1-8B-Instruct, slug: meta-llama-Llama-3.1-8B-Instruct, test_class: TestNightlyLlama8bMulti }
+          - { id: Qwen/Qwen3-30B-A3B, slug: Qwen-Qwen3-30B-A3B, test_class: TestNightlyQwen30bMulti }
+        variant:
+          - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f", setup: ci_setup_vllm_rocm_image.sh }
+
+    steps:
+      - name: Check filters
+        id: filter
+        env:
+          MODELS: ${{ github.event.inputs.models || 'all' }}
+          RUNTIME: ${{ github.event.inputs.runtime || 'all' }}
+        run: |
+          SKIP="false"
+          if [ "$MODELS" != "all" ] && ! echo ",$MODELS," | grep -Fq ",${{ matrix.model.id }},"; then
+            SKIP="true"
+          fi
+          if [ "$RUNTIME" != "all" ] && [ "$RUNTIME" != "${{ matrix.variant.id }}" ]; then
+            SKIP="true"
+          fi
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout code
+        if: steps.filter.outputs.skip != 'true'
+        uses: actions/checkout@v7
+
+      - name: Setup ${{ matrix.variant.id }} backend (in its ROCm image)
+        if: steps.filter.outputs.skip != 'true'
+        run: bash scripts/${{ matrix.variant.setup }}
+
+      - name: Download build artifacts
+        if: steps.filter.outputs.skip != 'true'
+        uses: ./.github/actions/download-build-artifacts
+        with:
+          client-types: 'true'
+
+      - name: Install wheel and test dependencies
+        if: steps.filter.outputs.skip != 'true'
+        run: |
+          pip uninstall -y smg || true
+          pip install wheel/*.whl
+          bash scripts/ci_install_e2e_deps.sh
+
+      - name: Install genai-bench
+        if: steps.filter.outputs.skip != 'true'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/genai-bench"
+          bash scripts/ci_retry.sh 3 10 "$RUNNER_TEMP/genai-bench/bin/pip" install "genai-bench==${GENAI_BENCH_IMAGE##*:}" "truststore<0.10.5"
+          echo "GENAI_BENCH_BIN=$RUNNER_TEMP/genai-bench/bin/genai-bench" >> "$GITHUB_ENV"
+
+      - name: Run benchmark
+        if: steps.filter.outputs.skip != 'true'
+        env:
+          GPU_TYPE: MI300 # as in the single-worker jobs
+          E2E_NIGHTLY: "1"
+          E2E_MODEL_TP_OVERRIDES: '{"meta-llama/Llama-3.1-8B-Instruct":1,"Qwen/Qwen3-30B-A3B":1}'
+          E2E_LOG_DIR: nightly_gateway_logs
+        run: |
+          mkdir -p nightly_gateway_logs
+          bash scripts/ci_killall_sglang.sh rocm  # the default mode reads nvidia-smi
+
+          E2E_RUNTIME=${{ matrix.variant.runtime }} \
+          ROUTER_LOCAL_MODEL_PATH="/models" \
+            pytest e2e_test/benchmarks/test_nightly_perf.py \
+              -k "${{ matrix.model.test_class }}" \
+              -s -vv -o log_cli=true --log-cli-level=INFO
+
+      - name: Upload benchmark results
+        if: always() && steps.filter.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-${{ matrix.model.slug }}-multi-${{ matrix.variant.id }}-amd-${{ github.run_id }}
+          path: nightly_*/
+          retention-days: 90
+
+      - name: Cleanup
+        if: always() && steps.filter.outputs.skip != 'true'
+        run: bash scripts/ci_killall_sglang.sh rocm || true
+
+  # ---------------------------------------------------------------------------
+  # Multi-worker SGLang: the final wave retains both original models.
+  # ---------------------------------------------------------------------------
+
+  multi-sglang:
+    name: "${{ matrix.model.id }} / multi-${{ matrix.variant.id }}"
+    needs: [build-wheel, multi-vllm]
+    if: ${{ !cancelled() && needs.build-wheel.result == 'success' && contains(fromJSON('["all","sglang"]'), github.event.inputs.runtime || 'all') }}
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
     container:
       image: ${{ matrix.variant.image }}
@@ -252,17 +466,16 @@ jobs:
     timeout-minutes: 360
     env:
       SMG_SGLANG_ROCM_IMAGE: ${{ matrix.variant.runtime == 'sglang' && matrix.variant.image || '' }}
-      E2E_STARTUP_TIMEOUT: "900" # as in single-worker
+      E2E_STARTUP_TIMEOUT: "900" # as in the single-worker jobs
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: 2
       matrix:
         model:
           - { id: meta-llama/Llama-3.1-8B-Instruct, slug: meta-llama-Llama-3.1-8B-Instruct, test_class: TestNightlyLlama8bMulti }
           - { id: Qwen/Qwen3-30B-A3B, slug: Qwen-Qwen3-30B-A3B, test_class: TestNightlyQwen30bMulti }
         variant:
           - { id: sglang, runtime: sglang, image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d", setup: ci_setup_sglang_rocm_image.sh }
-          - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f", setup: ci_setup_vllm_rocm_image.sh }
 
     steps:
       - name: Check filters
@@ -329,7 +542,7 @@ jobs:
       - name: Run benchmark
         if: steps.filter.outputs.skip != 'true'
         env:
-          GPU_TYPE: MI300 # as in single-worker
+          GPU_TYPE: MI300 # as in the single-worker jobs
           E2E_NIGHTLY: "1"
           E2E_MODEL_TP_OVERRIDES: '{"meta-llama/Llama-3.1-8B-Instruct":1,"Qwen/Qwen3-30B-A3B":1}'
           E2E_LOG_DIR: nightly_gateway_logs
@@ -370,7 +583,7 @@ jobs:
   # ---------------------------------------------------------------------------
 
   summarize-benchmarks:
-    needs: [build-wheel, single-worker, multi-worker]
+    needs: [build-wheel, single-vllm, single-sglang, multi-vllm, multi-sglang]
     if: ${{ always() && needs.build-wheel.result == 'success' }}
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:

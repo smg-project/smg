@@ -60,6 +60,11 @@ pub(crate) struct Assignment {
     /// from, so the reader gives each of its calls the family's id, as the older forced arm does.
     /// `None` for every other request: its ids are the table's.
     pub forced_ids: Option<(CallIdFamily, usize)>,
+    /// The request holds the answer to JSON (a `json_object` or `json_schema` response format, a
+    /// Messages request's output format, [`Asks::json_answer`]): the reader's engine reads it
+    /// under its JSON-answer option ([`Engine::reads_json_answer`]), so a marker the model spells
+    /// inside one of the answer's strings is the answer's text, not a frame of the table.
+    pub json_answer: bool,
     /// The request's span, current where the assignment is made ([`assignment`]), for the record
     /// a reading that was not clean leaves on it ([`Reader::end`], [`Reader::failed`]). A streamed
     /// response's reading runs outside the span (the response body drives it), so the span
@@ -99,6 +104,7 @@ pub(super) fn assignment(
         forcing,
         opener: None,
         forced_ids,
+        json_answer: false,
         span: Span::current(),
         marked: Arc::default(),
     }
@@ -285,10 +291,11 @@ pub(crate) fn assign(
 /// say, the output's first bytes decide ([`Assignment::opener`]). One forced call has no opener
 /// to name there: a named function's arguments the schema does not hold to an object
 /// ([`holds_to_an_object`]), with the reasoning kept in the content. That JSON may open with any
-/// byte, and read after the replay it would be content and no call, so it starts in the call.
-/// With the reasoning separated the opener is named whatever the schema: an output that opens
-/// otherwise is read where the replay leaves the reader, and JSON alone inside a thought the
-/// prompt opened is that thought. `pool_start` says which start, for the model's workers together
+/// byte, and read after the replay it would be content and no call, so it starts in the call;
+/// a thought written first is the call's text there. With the reasoning separated the opener
+/// is named whatever the schema: an output that opens otherwise is read where the replay
+/// leaves the reader, and JSON alone inside a thought the prompt opened is that thought.
+/// `pool_start` says which start, for the model's workers together
 /// ([`grammar_start_of`](super::constraint::grammar_start_of)); it is asked for a forced call
 /// alone, so no other request pays for the answer.
 ///
@@ -364,6 +371,7 @@ pub(crate) fn assign_for(
     };
     Some(Assignment {
         opener,
+        json_answer: asks.json_answer(),
         ..assignment(
             format,
             asks.model(),
@@ -393,10 +401,10 @@ enum ForcedStart {
     /// write after it, whitespace aside) is the call from the opener, with nothing of the prompt
     /// replayed ([`Reader::decide`]). What this start reads wrong, which no reader can tell
     /// apart while the workers do not say where they start a grammar: a thought that itself
-    /// opens as the JSON does, and a thought behind more whitespace than the output's deciding
-    /// bytes hold ([`DECIDING_BYTES`]), are read as the call; where the reasoning is separated,
-    /// a named call's JSON that opens with another byte than the brace is read as the thought
-    /// ([`assign_for`]).
+    /// opens as the JSON does, and a thought behind a run of whitespace that fills the output's
+    /// deciding bytes ([`DECIDING_BYTES`], the opener counted where one came), are read as the
+    /// call; where the reasoning is separated, a named call's JSON that opens with another byte
+    /// than the brace is read as the thought ([`assign_for`]).
     ByTheFirstBytes,
 }
 
@@ -613,9 +621,14 @@ impl Reader {
             Some(name) => Declared::shared(tools).forcing(name.clone()),
             None => Declared::shared(tools),
         };
+        let engine = Engine::shared(Arc::clone(&assignment.format), declared);
         let mut reader = Self {
             table: assignment.table(),
-            engine: Engine::shared(Arc::clone(&assignment.format), declared),
+            engine: if assignment.json_answer {
+                engine.reads_json_answer()
+            } else {
+                engine
+            },
             tally: Tally::new(assignment.past_the_end),
             last_token: None,
             read: 0,
@@ -686,10 +699,12 @@ impl Reader {
     /// thought that began with the opener's byte, read after the replay. Whitespace is the
     /// JSON's until a byte says otherwise: deciding bytes that run out on it, before the opener
     /// or after it, start the reader in the call, so the hold ends there however long the model
-    /// writes whitespace. The start's events and those of what was held before it go into `out`
-    /// ahead of the step's own, and the caller reads `delta` (`true`). A delta that decides
-    /// nothing (whitespace alone, or the opener with nothing after it, short of the deciding
-    /// bytes) is held with its tokens' spans, and the caller reads nothing (`false`).
+    /// writes whitespace. It is ASCII's whitespace, the form feed among it, which JSON does not
+    /// take: no grammar writes that byte, so none comes where the schema holds the output. The
+    /// start's events and those of what was held before it go into `out` ahead of the step's
+    /// own, and the caller reads `delta` (`true`). A delta that decides nothing (whitespace
+    /// alone, or the opener with nothing after it, short of the deciding bytes) is held with
+    /// its tokens' spans, and the caller reads nothing (`false`).
     fn decide(&mut self, delta: &Delta, out: &mut Events<'_>) -> Result<bool, SymphonyError> {
         let Some(mut undecided) = self.undecided.take() else {
             return Ok(true);
@@ -1188,6 +1203,7 @@ mod tests {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -2188,6 +2204,48 @@ mod tests {
         };
         assert!(messages(json!({"tools": []})).call_syntax().is_some());
         assert_eq!(messages(json!({})).call_syntax(), None);
+    }
+
+    /// A chat request's `json_object` or `json_schema` response format, and a Messages request's
+    /// output format, reach the assignment as `json_answer`; a text format and a request that
+    /// asks for none read as before.
+    #[test]
+    fn a_request_held_to_a_json_answer_assigns_a_reader_that_knows_it() {
+        let chat = |extra: Value| {
+            assign(
+                ParserChoice::Symphony,
+                &ModelNames::default(),
+                &request(extra),
+                None,
+                PROMPT,
+            )
+            .expect("assigned")
+            .json_answer
+        };
+        assert!(chat(json!({"response_format": {"type": "json_object"}})));
+        assert!(chat(json!({"response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "city", "schema": {"type": "object"}},
+        }})));
+        assert!(!chat(json!({"response_format": {"type": "text"}})));
+        assert!(!chat(json!({})));
+        let messages = |extra: Value| {
+            super::assign(
+                ParserChoice::Symphony,
+                &ModelNames::default(),
+                Asks::for_messages(&message_request(extra), false),
+                None,
+                PROMPT,
+                &templates(),
+            )
+            .expect("read")
+            .expect("assigned")
+            .json_answer
+        };
+        assert!(messages(json!({"output_config": {
+            "format": {"type": "json_schema", "schema": {"type": "object"}},
+        }})));
+        assert!(!messages(json!({})));
     }
 
     /// A chat request's `ignore_eos` reaches the assignment as `past_the_end`, so the reader's
@@ -3389,6 +3447,50 @@ mod tests {
         );
     }
 
+    /// The assignment's `json_answer` reaches the reader's engine: a JSON answer that spells the
+    /// table's message close inside a string comes back whole under it, with no malformed run,
+    /// where the table alone reads the spelling as the close.
+    #[test]
+    fn a_json_answers_quoted_marker_spelling_is_the_answers_text_under_the_assignment() {
+        let json = "{\"note\": \"the close is <|end_message|> here\", \"n\": 1}";
+        let output = format!("<|content_text|>{json}<|end_message|>");
+        let read = |json_answer: bool| {
+            let assignment = Assignment {
+                format: Arc::new(symphony::formats::inkling().without_calls()),
+                prompt: "<|message_model|>".to_string(),
+                forbids_calls: false,
+                past_the_end: false,
+                forcing: None,
+                opener: None,
+                forced_ids: None,
+                json_answer,
+                span: Span::none(),
+                marked: Arc::default(),
+            };
+            let mut events = Events::new();
+            let mut reader =
+                Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
+            let mut delta = Delta::default();
+            reader
+                .tail(output.clone(), &mut delta, &mut events)
+                .expect("read");
+            reader
+                .end(EngineFinish::Stop, who(), &mut events)
+                .expect("ended");
+            let events = events.as_slice();
+            let malformed = events
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. }));
+            (content_of(events), malformed)
+        };
+        assert_eq!(read(true), (json.to_string(), false));
+        assert_ne!(
+            read(false).0,
+            json,
+            "the table alone reads the spelling as the close"
+        );
+    }
+
     #[test]
     fn a_reader_gives_a_json_answer_bare_when_the_model_said_its_kind_again() {
         // The table whose messages say their kind after their opener, as a request without tools
@@ -3406,6 +3508,7 @@ mod tests {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -3483,6 +3586,7 @@ mod tests {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -3545,6 +3649,7 @@ mod tests {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -3691,6 +3796,7 @@ mod tests {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -3821,6 +3927,7 @@ mod tests {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -3857,6 +3964,7 @@ mod tests {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -3910,6 +4018,7 @@ mod tests {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -3949,6 +4058,7 @@ mod tests {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         };
@@ -4004,6 +4114,7 @@ mod tests {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
             ..assignment
@@ -4206,6 +4317,7 @@ mod tests {
                 forcing: None,
                 opener: None,
                 forced_ids: None,
+                json_answer: false,
                 span: Span::none(),
                 marked: Arc::default(),
             };

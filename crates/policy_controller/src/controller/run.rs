@@ -1,5 +1,7 @@
-//! The standalone policy controller (design 2: the `remote` mode of the
-//! policy engine). The command line is the operator's surface: the
+//! The standalone policy controller's command line and start-up (design 2:
+//! the `remote` mode of the policy engine), as one function: the stock
+//! binary calls [`run`] with the stock catalog, a host's own binary with
+//! the stages it added. The command line is the operator's surface: the
 //! controller's identity, its listeners, their TLS, the election, the
 //! shutdown bounds and the logging; the routing policy itself is the spec's
 //! and arrives over the control scope.
@@ -10,18 +12,17 @@ use std::{
 };
 
 use clap::Parser;
-use smg_policy_controller::{
-    controller::{
-        Config, ConfigError, Controller, Election, LeasePlace, Listener, Scope, Tls, VERSION,
-    },
-    elector::ElectionSettings,
-};
 use tokio::{
     runtime::{Builder, Runtime},
     signal::unix::{signal, SignalKind},
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+use super::{
+    Config, ConfigError, Controller, Election, Error, LeasePlace, Listener, Scope, Tls, VERSION,
+};
+use crate::{catalog::Catalog, elector::ElectionSettings};
 
 /// The controller's ports sit in one block, apart from the gateway's data
 /// (30000) and metrics (29000) ports.
@@ -66,6 +67,22 @@ struct Cli {
     /// and /metrics
     #[arg(long, default_value = DEFAULT_ADMIN_LISTEN, help_heading = "Listeners")]
     admin_listen: SocketAddr,
+
+    /// The listeners, by name (gateway, control, replication, and ingestion
+    /// where --ingestion-listen makes it a listener), that take a caller's
+    /// identity as told: the caller states its name in the x-smg-principal
+    /// metadata entry and nothing is verified, so whoever reaches such a
+    /// listener acts as any principal of its scopes. For a loopback, or a
+    /// mesh that verifies in front of the process; a listener with a client
+    /// CA takes none. A listener that is not named refuses the calls that
+    /// need a principal
+    #[arg(
+        long,
+        value_name = "LISTENER",
+        value_delimiter = ',',
+        help_heading = "Listeners"
+    )]
+    identity_as_told: Vec<String>,
 
     // ==================== TLS ====================
     /// The server certificate chain (PEM) of every gRPC listener; comes with
@@ -150,6 +167,17 @@ struct Cli {
     #[arg(long, default_value_t = Config::DEFAULT_LOAD_POLL_INTERVAL.as_secs(), help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
 
+    /// The policy spec as a file, in YAML (JSON under a `.json` name): read
+    /// and applied at the start, as generation 1 or under the number its
+    /// `generation` line writes. A file that cannot be read, or a document
+    /// that is invalid, refuses the start. The file is then watched: a
+    /// changed one is applied as the next generation, or under the number
+    /// it writes, and one that does not run is rejected whole and the
+    /// running generation stays. With no file the controller runs no policy
+    /// spec.
+    #[arg(long, value_name = "PATH", help_heading = "Policy Spec")]
+    spec_file: Option<PathBuf>,
+
     // ==================== Shutdown ====================
     /// Seconds the listeners keep accepting after readiness fails, so the
     /// probes see the change first; at most half the grace period
@@ -169,6 +197,13 @@ struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=4096), help_heading = "Runtime")]
     runtime_worker_threads: Option<u16>,
 
+    /// Deciding threads, from 1 to 256, each behind a queue of 128
+    /// requests. A model's decisions all run on one of them, so a fleet
+    /// that serves one model decides on one thread. Default: one a CPU
+    /// available to the process, eight at most
+    #[arg(long, default_value_t = default_decide_shards(), value_parser = clap::value_parser!(u16).range(1..=256), help_heading = "Runtime")]
+    decide_shards: u16,
+
     // ==================== Logging ====================
     /// Set the logging level of this binary's own crates; RUST_LOG, when
     /// set, replaces it whole
@@ -183,6 +218,10 @@ struct Cli {
 /// A duration in whole milliseconds, as the election's flags take it.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn default_decide_shards() -> u16 {
+    u16::try_from(Config::default_decide_shards()).unwrap_or(1)
 }
 
 impl Cli {
@@ -303,6 +342,7 @@ impl Cli {
             shutdown_settle: Duration::from_secs(self.shutdown_settle_secs),
             shutdown_grace: Duration::from_secs(self.shutdown_grace_period_secs),
             load_poll_interval: Duration::from_secs(self.load_monitor_interval),
+            decide_shards: usize::from(self.decide_shards),
             election: Election {
                 lease: self.lease(),
                 settings: ElectionSettings {
@@ -425,9 +465,42 @@ fn runtime(worker_threads: Option<u16>) -> std::io::Result<Runtime> {
     }
 }
 
-/// The start-up sequence: parse, log, configure, then the runtime, built
-/// only now so a refusal costs no threads; bind and serve on it.
-fn main() -> ExitCode {
+/// Binds the controller over `catalog`, names the listeners that take
+/// identities as told, then takes the spec file where one is given: a
+/// refusal of any arrives before anything is served.
+async fn bind(
+    config: Config,
+    catalog: Catalog,
+    as_told: &[String],
+    spec_file: Option<PathBuf>,
+) -> Result<Controller, Error> {
+    let mut controller = Controller::bind_with(config, catalog).await?;
+    for listener in as_told {
+        controller.identity_as_told(listener)?;
+    }
+    if let Some(path) = spec_file {
+        controller.spec_file(path).await?;
+    }
+    Ok(controller)
+}
+
+/// Runs a controller to its end and returns the process's exit code. The
+/// start-up sequence: parse, log, configure, then the runtime, built only
+/// now so a refusal costs no threads; bind and serve on it. A policy
+/// document names the stages `catalog` holds.
+///
+/// The command line is the process's own and this crate's: a flag it does
+/// not know is refused, so a host's settings come from its environment or a
+/// file. At `--help`, `--version` and a refused flag the parser ends the
+/// process itself and the call does not return.
+///
+/// # Panics
+///
+/// When a global log subscriber is already set: `run` installs its own, so
+/// the `main` that calls it installs none. When called inside an async
+/// runtime: `run` builds its own and blocks on it, so that `main` is a
+/// plain `fn main`.
+pub fn run(catalog: Catalog) -> ExitCode {
     let cli = Cli::parse();
     init_logging(&cli.log_level, cli.log_json);
     let config = match cli.config() {
@@ -445,7 +518,13 @@ fn main() -> ExitCode {
         }
     };
     runtime.block_on(async {
-        let controller = match Controller::bind(config).await {
+        let bound = bind(
+            config,
+            catalog,
+            &cli.identity_as_told,
+            cli.spec_file.clone(),
+        );
+        let controller = match bound.await {
             Ok(controller) => controller,
             Err(error) => {
                 error!(%error, "start refused");
@@ -471,12 +550,15 @@ mod tests {
     };
 
     use clap::Parser;
-    use smg_policy_controller::{
-        controller::{Config, ConfigError, Election, LeasePlace, Scope},
-        elector::ElectionSettings,
-    };
 
-    use super::{color_for, set, truthy, Cli};
+    use super::{bind, color_for, set, truthy, Cli};
+    use crate::{
+        catalog::Catalog,
+        controller::{Config, ConfigError, Election, Error, LeasePlace, Scope, SpecRejected},
+        elector::ElectionSettings,
+        spec::SpecError,
+        Candidate, Constraints, Filter, RequestFacts,
+    };
 
     fn parse(args: &[&str]) -> Cli {
         let mut argv = vec!["smg-policy-controller", "--controller-id", "controller-0"];
@@ -841,6 +923,134 @@ mod tests {
     }
 
     #[test]
+    fn no_listener_takes_identities_as_told_unless_it_is_named() {
+        assert!(parse(&[]).identity_as_told.is_empty());
+        assert_eq!(
+            parse(&["--identity-as-told", "gateway,control"]).identity_as_told,
+            ["gateway", "control"]
+        );
+        assert_eq!(
+            parse(&[
+                "--identity-as-told",
+                "gateway",
+                "--identity-as-told",
+                "replication"
+            ])
+            .identity_as_told,
+            ["gateway", "replication"]
+        );
+    }
+
+    /// Every listener on loopback, at a port the host picks.
+    const EPHEMERAL: [&str; 8] = [
+        "--gateway-listen",
+        "127.0.0.1:0",
+        "--control-listen",
+        "127.0.0.1:0",
+        "--replication-listen",
+        "127.0.0.1:0",
+        "--admin-listen",
+        "127.0.0.1:0",
+    ];
+
+    /// Keeps every worker: a stage of a host's own.
+    #[derive(Debug)]
+    struct Any;
+
+    impl Filter for Any {
+        fn name(&self) -> &'static str {
+            "any"
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            true
+        }
+    }
+
+    /// The stages the run is handed are the ones the bound controller holds.
+    #[tokio::test]
+    async fn the_bound_controller_holds_the_stages_the_run_is_handed() {
+        let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+        let mut stages = Catalog::builtin();
+        stages.filter("any", || Box::new(Any)).expect("a free name");
+        let controller = bind(config, stages, &[], None).await.expect("binds");
+        assert!(controller.catalog().filters().any(|name| name == "any"));
+        // The stock build holds no such stage.
+        assert!(Catalog::builtin().filters().all(|name| name != "any"));
+    }
+
+    /// A spec file's document names the stages the run is handed: a stage
+    /// of a host's own starts the controller on it, and the stock build
+    /// refuses the same file by the stage's name.
+    #[tokio::test]
+    async fn a_spec_file_names_the_stages_the_run_is_handed() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("policy.yaml");
+        let document =
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [any]\n    pick: random\n";
+        std::fs::write(&path, document).expect("the file");
+        let start = |stages: Catalog| {
+            let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+            bind(config, stages, &[], Some(path.clone()))
+        };
+
+        let mut stages = Catalog::builtin();
+        stages.filter("any", || Box::new(Any)).expect("a free name");
+        let controller = start(stages).await.expect("a host's stage starts");
+        assert_eq!(controller.store().world().spec().generation(), 1);
+        drop(controller);
+
+        match start(Catalog::builtin()).await {
+            Err(Error::SpecFile {
+                source: SpecRejected::Invalid(SpecError::UnknownFilter { profile, name }),
+                ..
+            }) => assert_eq!((profile.as_str(), name.as_str()), ("default", "any")),
+            Err(other) => panic!("the stock build refused it as {other}"),
+            Ok(_) => panic!("the stock build holds no such stage"),
+        }
+    }
+
+    /// The flag's names reach the bound controller: a name the flags mount
+    /// no listener under refuses the start, by that name.
+    #[tokio::test]
+    async fn a_listener_named_as_told_is_one_the_flags_mount() {
+        let start = |flags: &[&str]| {
+            let mut args = EPHEMERAL.to_vec();
+            args.extend_from_slice(flags);
+            let cli = parse(&args);
+            let config = cli.config().expect("the flags are in order");
+            async move {
+                bind(
+                    config,
+                    Catalog::builtin(),
+                    &cli.identity_as_told,
+                    cli.spec_file.clone(),
+                )
+                .await
+                .map(drop)
+            }
+        };
+        // The relays' calls ride the gateways' listener unless they get
+        // their own: there is none of that name to take them as told.
+        let refused = start(&["--identity-as-told", "ingestion"]).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(Error::Config(ConfigError::UnknownListener(name))) if name == "ingestion"
+            ),
+            "{refused:?}"
+        );
+        start(&[
+            "--identity-as-told",
+            "gateway,ingestion",
+            "--ingestion-listen",
+            "127.0.0.1:0",
+        ])
+        .await
+        .expect("both are listeners the flags mount");
+    }
+
+    #[test]
     fn the_command_line_refuses_what_it_cannot_read() {
         assert!(Cli::try_parse_from([
             "smg-policy-controller",
@@ -858,6 +1068,25 @@ mod tests {
             "loud"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn the_deciding_threads_take_the_operators_count_inside_their_range() {
+        let default = config(&[]).expect("parsed");
+        assert_eq!(default.decide_shards, Config::default_decide_shards());
+        assert_eq!(default.validate(), Ok(()));
+        let three = config(&["--decide-shards", "3"]).expect("parsed");
+        assert_eq!(three.decide_shards, 3);
+        for bad in ["0", "257", "many"] {
+            let flags = [
+                "smg-policy-controller",
+                "--controller-id",
+                "c",
+                "--decide-shards",
+                bad,
+            ];
+            assert!(Cli::try_parse_from(flags).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -911,5 +1140,18 @@ mod tests {
         assert!(truthy(one));
         assert!(!set(None));
         assert!(!truthy(None));
+    }
+
+    #[test]
+    fn the_spec_file_is_a_flag_with_no_default() {
+        assert_eq!(parse(&with_identity(&[])).spec_file, None);
+        assert_eq!(
+            parse(&with_identity(&[
+                "--spec-file",
+                "/etc/smg/policy/policy.yaml"
+            ]))
+            .spec_file,
+            Some(PathBuf::from("/etc/smg/policy/policy.yaml"))
+        );
     }
 }

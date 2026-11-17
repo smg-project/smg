@@ -1794,6 +1794,142 @@ fn thinking_filter_on_other_values_does_not_change_the_switch_default() {
     );
 }
 
+/// A template's thinking default is what it renders with the switch absent,
+/// whatever its source spells. A template that opens the thought, or asks
+/// for it, only where the switch is true defaults off: an undefined switch
+/// is not true. The text matcher knows two spellings of a default off and
+/// calls each of these three on.
+#[test]
+fn the_thinking_default_is_what_the_template_renders_with_the_switch_absent() {
+    let defined_and_true = "{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                            {%- if add_generation_prompt -%}<|assistant|>\
+                            {%- if enable_thinking is defined and enable_thinking is true -%}\
+                            {{- '<think>\\n' -}}{%- else -%}{{- '<think>\\n\\n</think>\\n\\n' -}}\
+                            {%- endif -%}{%- endif -%}";
+    let truthy = "{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                  {%- if add_generation_prompt -%}<|assistant|>\
+                  {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    let in_the_system_prompt = "{%- if thinking -%}<|system|>Think before you answer.\
+                                {%- else -%}<|system|>Answer.{%- endif -%}\
+                                {%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                                {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    for (template, key) in [
+        (defined_and_true, ThinkingKeyName::EnableThinking),
+        (truthy, ThinkingKeyName::EnableThinking),
+        (in_the_system_prompt, ThinkingKeyName::Thinking),
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::DefaultOn, Some(key)),
+            "the text matcher: {template}"
+        );
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(
+            state.thinking_toggle(),
+            ThinkingToggle::DefaultOff,
+            "{template}"
+        );
+        assert_eq!(state.thinking_key_name(), Some(key));
+    }
+
+    // A template that closes the thought only where the switch is false
+    // defaults on, and one the matcher reads as off renders off: both as
+    // before.
+    let defined_and_false = "{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                             {%- if add_generation_prompt -%}<|assistant|>\
+                             {%- if enable_thinking is defined and enable_thinking is false -%}\
+                             {{- '<think>\\n\\n</think>\\n\\n' -}}{%- else -%}{{- '<think>\\n' -}}\
+                             {%- endif -%}{%- endif -%}";
+    let set_false = "{%- if enable_thinking is not defined -%}\
+                     {%- set enable_thinking = false -%}{%- endif -%}\
+                     {%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                     {%- if add_generation_prompt -%}<|assistant|>\
+                     {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    for (template, default) in [
+        (defined_and_false, ThinkingToggle::DefaultOn),
+        (set_false, ThinkingToggle::DefaultOff),
+    ] {
+        assert_eq!(detect_thinking_toggle(template).0, default, "{template}");
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), default, "{template}");
+    }
+
+    // A replacement template answers for itself.
+    let mut state = ChatTemplateState::new(Some(defined_and_false.to_string())).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOn);
+    state.set(truthy.to_string()).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOff);
+}
+
+/// The three probe renders share one instant. A template that writes the
+/// time would otherwise separate them by the clock alone, and its default
+/// would fall back to the text matcher's answer: here the time is written to
+/// the nanosecond, so three reads of the clock never agree.
+#[test]
+fn the_probe_renders_share_one_instant() {
+    let writes_the_time = "{{- strftime_now('%H:%M:%S.%f') -}}\
+                           {%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                           {%- if add_generation_prompt -%}<|assistant|>\
+                           {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    assert_eq!(
+        detect_thinking_toggle(writes_the_time),
+        (
+            ThinkingToggle::DefaultOn,
+            Some(ThinkingKeyName::EnableThinking)
+        ),
+        "the text matcher"
+    );
+    let state = ChatTemplateState::new(Some(writes_the_time.to_string())).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOff);
+}
+
+/// Where the renders do not say, the text matcher's answer stands: a bare
+/// turn that does not render, a switch that moves nothing on a bare turn,
+/// and an absent render that equals neither the on nor the off render.
+#[test]
+fn the_text_matcher_answers_where_the_renders_do_not_say() {
+    // The template refuses a conversation with no system message.
+    let refuses = "{%- if messages[0].role != 'system' -%}\
+                   {{- raise_exception('a system message is required') -}}{%- endif -%}\
+                   {%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                   {%- if add_generation_prompt -%}<|assistant|>\
+                   {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    // The switch only shapes an assistant message of the history.
+    let history_only = "{%- for m in messages -%}\
+                        {%- if m.role == 'assistant' and enable_thinking -%}\
+                        <think>{{ m.reasoning_content }}</think>{%- endif -%}\
+                        {{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    // No thought marker with the switch absent; true opens the thought and
+    // false closes it.
+    let third = "{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                 {%- if add_generation_prompt -%}<|assistant|>\
+                 {%- if enable_thinking is defined and enable_thinking is true -%}\
+                 {{- '<think>\\n' -}}\
+                 {%- elif enable_thinking is defined and enable_thinking is false -%}\
+                 {{- '<think>\\n\\n</think>\\n\\n' -}}{%- endif -%}{%- endif -%}";
+    for template in [refuses, history_only, third] {
+        let matched = detect_thinking_toggle(template);
+        assert_eq!(
+            matched,
+            (
+                ThinkingToggle::DefaultOn,
+                Some(ThinkingKeyName::EnableThinking)
+            ),
+            "{template}"
+        );
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), matched.0, "{template}");
+    }
+    let bare = [serde_json::json!({"role": "user", "content": "probe"})];
+    let params = || ChatTemplateParams {
+        add_generation_prompt: true,
+        ..Default::default()
+    };
+    let state = ChatTemplateState::new(Some(refuses.to_string())).unwrap();
+    assert!(state.apply(&bare, params()).is_err(), "the bare turn");
+}
+
 #[test]
 fn thinking_mode_detects_tristate_and_injects_strings() {
     // MiniMax M3-style tri-state toggle.

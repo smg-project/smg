@@ -44,7 +44,7 @@ use crate::{
     kv_events,
     testing::{
         assert_bucket_edges, assert_golden, captured_logs, handshake_address, http_get, next_batch,
-        servicer_config, Bounded,
+        reported_alive, servicer_config, Bounded,
     },
     ServicerError,
 };
@@ -313,17 +313,17 @@ async fn a_slow_scheduler_stays_linked_while_the_launcher_reports_it_alive() {
     let silence = Duration::from_millis(300);
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
-    let server = TokenSpeedServicerServer::start(config).unwrap();
+    let server = Arc::new(TokenSpeedServicerServer::start(config).unwrap());
+    // The launcher reports through the whole start, as it polls the process
+    // it launched: the silence bound then meets the scheduler's quiet load
+    // alone, not the time this host takes over the dial-in or over READY.
+    let _alive = reported_alive(server.clone(), TokenSpeedServicerServer::note_engine_alive);
     // The scheduler dials in at once, then "loads" for four silences.
     let loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
         .expect("HELLO answered with INIT");
-    let load_time = Instant::now() + 4 * silence;
-    while Instant::now() < load_time {
-        server.note_engine_alive();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    tokio::time::sleep(4 * silence).await;
     assert_eq!(
         server.last_error().unwrap(),
         None,
@@ -351,13 +351,18 @@ async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound()
     let silence = Duration::from_millis(300);
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
-    let server = TokenSpeedServicerServer::start(config).unwrap();
+    let server = Arc::new(TokenSpeedServicerServer::start(config).unwrap());
+    // Reported alive until HELLO is answered: the silence under test starts
+    // there, whatever time this host takes over the dial-in, and counts
+    // from a sign of life no earlier than `before_hello`.
+    let alive = reported_alive(server.clone(), TokenSpeedServicerServer::note_engine_alive);
+    let before_hello = Instant::now();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
         .expect("HELLO answered with INIT");
-    let since_hello = Instant::now();
-    let deadline = since_hello + Duration::from_secs(10);
+    drop(alive);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let error = loop {
         if let Some(error) = server.last_error().unwrap() {
             break error;
@@ -365,7 +370,7 @@ async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound()
         assert!(Instant::now() < deadline, "no link failure reported");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert!(since_hello.elapsed() >= silence);
+    assert!(before_hello.elapsed() >= silence);
     assert!(
         error.contains("timed out while waiting for READY"),
         "{error}"
@@ -389,15 +394,14 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
     let mut config = config(dir.path(), &handshake, model_info());
     config.servicer.engine_startup_timeout = silence;
     config.servicer.engine_startup_ceiling = Some(ceiling);
-    let server = TokenSpeedServicerServer::start(config).unwrap();
+    // Read before the start, which the ceiling counts from.
     let started = Instant::now();
-    let _loading = hello(&handshake, EngineId::from_engine_index(0))
-        .bounded()
-        .await
-        .expect("HELLO answered with INIT");
+    let server = Arc::new(TokenSpeedServicerServer::start(config).unwrap());
+    // The scheduler does not dial in: a dial-in would race the ceiling at this
+    // host's pace, and the ceiling bounds every wait of the handshake alike.
+    let _alive = reported_alive(server.clone(), TokenSpeedServicerServer::note_engine_alive);
     let deadline = started + Duration::from_secs(10);
     let error = loop {
-        server.note_engine_alive();
         if let Some(error) = server.last_error().unwrap() {
             break error;
         }
@@ -1752,7 +1756,7 @@ async fn control_rpcs_report_what_the_wire_cannot_carry() {
         .await
         .expect_err("no publisher");
     assert_eq!(events.code(), Code::Unimplemented);
-    assert_eq!(events.message(), kv_events::TOKENSPEED_DISABLED_MESSAGE);
+    assert_eq!(events.message(), TOKENSPEED_DISABLED_MESSAGE);
     let bundle = h
         .client
         .get_tokenizer(common::GetTokenizerRequest::default())
@@ -1760,6 +1764,63 @@ async fn control_rpcs_report_what_the_wire_cannot_carry() {
         .expect_err("no tokenizer dir");
     assert_eq!(bundle.code(), Code::FailedPrecondition);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A launcher that left the publisher off for the model's sake wrote why
+/// into the server args (`kv_events_left_off`), and `SubscribeKvEvents` is
+/// refused in those words.
+#[tokio::test]
+async fn a_publisher_the_launcher_left_off_is_refused_in_the_launchers_words() {
+    let left_off = "KV event publishing left off: org/model keeps recurrent state in 3 of its \
+                    4 layers; pass --kv-events-config to turn the publisher on anyway";
+    let mut model = model_info();
+    let mut server_args: serde_json::Value =
+        serde_json::from_str(&model.server_args_json).expect("the fixture's server args");
+    server_args["kv_events_left_off"] = left_off.into();
+    model.server_args_json = server_args.to_string();
+    let mut h = harness(model, None).await;
+    let events = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await
+        .expect_err("no publisher");
+    assert_eq!(events.code(), Code::Unimplemented);
+    assert_eq!(events.message(), left_off);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Only a line the launcher wrote replaces the standing text: an entry that
+/// is absent, empty, blank or not a string leaves it, and so do server args
+/// that do not parse.
+#[test]
+fn the_kv_events_refusal_falls_back_to_the_standing_text() {
+    let refusal = |server_args_json: &str| {
+        kv_events_refusal(&TokenSpeedModelInfo {
+            server_args_json: server_args_json.to_string(),
+            ..model_info()
+        })
+    };
+    assert_eq!(
+        refusal(r#"{"kv_events_left_off":" left off: a reason "}"#),
+        "left off: a reason"
+    );
+    assert_eq!(
+        refusal(r#"{"model":"org/model"}"#),
+        TOKENSPEED_DISABLED_MESSAGE
+    );
+    assert_eq!(
+        refusal(r#"{"kv_events_left_off":""}"#),
+        TOKENSPEED_DISABLED_MESSAGE
+    );
+    assert_eq!(
+        refusal(r#"{"kv_events_left_off":"  "}"#),
+        TOKENSPEED_DISABLED_MESSAGE
+    );
+    assert_eq!(
+        refusal(r#"{"kv_events_left_off":7}"#),
+        TOKENSPEED_DISABLED_MESSAGE
+    );
+    assert_eq!(refusal(""), TOKENSPEED_DISABLED_MESSAGE);
 }
 
 /// The relay follows the publisher from the servicer's start, before any
@@ -1866,6 +1927,61 @@ async fn a_scheduler_that_never_dials_in_fails_the_link_at_the_startup_bound() {
 
     server.stop(Duration::from_secs(5)).unwrap();
     assert_handshake_released(&handshake).await;
+}
+
+/// A stop while the link is still waiting for its engine releases the
+/// handshake endpoint too: the connect that was waiting ends with the server,
+/// and its endpoint file does not outlive `stop`.
+#[tokio::test]
+async fn a_stop_during_the_handshake_wait_releases_the_handshake_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = TokenSpeedServicerServer::start(config).unwrap();
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    wait_until(|| std::fs::metadata(&endpoint).is_ok()).await;
+    assert!(
+        server.last_error().unwrap().is_none(),
+        "the link is still waiting for the engine"
+    );
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        std::fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
+    assert_handshake_released(&handshake).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_leftover_handshake_endpoint_does_not_fail_the_link() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let endpoint = handshake.trim_start_matches("ipc://").to_string();
+    // A bound-then-dropped listener leaves its socket file behind, as a
+    // process that died without cleanup does.
+    drop(UnixListener::bind(&endpoint).unwrap());
+    let config = config(dir.path(), &handshake, model_info());
+    let server = TokenSpeedServicerServer::start(config).unwrap();
+
+    // Only the link's own bind answers a connect: the leftover refuses it.
+    wait_until(|| {
+        assert_eq!(
+            server.last_error().unwrap(),
+            None,
+            "the link failed on the leftover"
+        );
+        UnixStream::connect(&endpoint).is_ok()
+    })
+    .await;
+
+    server.stop(Duration::from_secs(5)).unwrap();
+    assert!(
+        std::fs::metadata(&endpoint).is_err(),
+        "the handshake endpoint file outlived stop"
+    );
 }
 
 /// A shutdown with a stream still open is the engine side going away under

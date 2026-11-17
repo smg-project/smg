@@ -1,26 +1,48 @@
 # Regression gate for `cargo bench -p smg-policy-controller --bench store_view`, run by
 # .github/workflows/benchmark-policy-store.yml on pull requests through scripts/bench_gate.py.
 #
-# The gate runs the twenty-one single-threaded rows of the store's view at 8, 64 and 512 workers: a decision's
-# build from the published world without the affinity column (`policy_store/view_build/<n>`) and with it
-# (`policy_store/view_build_column/<n>`), the build with one and with eight standing vetoes of the asking gateway
-# (`policy_store/view_build_veto1/<n>`, `policy_store/view_build_veto8/<n>`), one load record's write inside the
-# publication window (`policy_store/load_write/<n>`), one publication (`policy_store/publish/<n>`) and the
-# reference cell (`policy_store/floor/<n>`): the decision benches' gated build, its rows written from facts in
+# The gate runs the twenty-eight single-threaded rows of the store's view. Twenty-one are at 8, 64 and 512 workers:
+# a decision's build from the published world without the affinity column (`policy_store/view_build/<n>`) and
+# with it (`policy_store/view_build_column/<n>`), the build with one and with eight standing vetoes of the asking
+# gateway (`policy_store/view_build_veto1/<n>`, `policy_store/view_build_veto8/<n>`), one load record's write
+# inside the publication window (`policy_store/load_write/<n>`), one publication (`policy_store/publish/<n>`) and
+# the reference cell (`policy_store/floor/<n>`): the decision benches' gated build, its rows written from facts in
 # hand, measured in this binary so that one job reads a build from the store beside it. No check holds a build to
 # the floor: the gate compares each id with its own base alone, and the design's bound (a build within twice the
 # floor) is for a reader of the two rows. The floor is no lower bound either: a build may read under it.
 #
+# Six rows read the store beside other gateways' vetoes, one size each: the build in the pool of eight beside
+# sixty-four of them (`policy_store/view_build_foreign64/8`), the build there with one member vetoed by the asking
+# gateway and by eight, by sixty-four and by 512 others, one veto each (`policy_store/view_build_gateways8/8`,
+# `policy_store/view_build_gateways64/8`, `policy_store/view_build_gateways512/8`), and, beside 512 of them in the
+# pool of 512, one veto's write (`policy_store/veto_write/512`) and one membership write
+# (`policy_store/member_write/512`). A build reads no other gateway's veto, it reaches its own gateway's run among
+# a few gateways' by a walk and among many by a search, and a veto's write builds its own gateway's entries alone:
+# these rows fail when one of those stops holding. The walk's two rows stand at its farthest place, the middle of
+# the others, and the third stands above the count a build walks under: no case holds either, since a walk and a
+# search answer alike. The smallest shape of that reach, the asking gateway's one veto with no other gateway's in
+# the store, is `policy_store/view_build_veto1/8`.
+#
+# One row reads a membership write where the vetoes are spread: 512 members over 64 pools and twelve other
+# gateways holding a veto on each member, 6,144 in all (`policy_store/member_write_spread/512`). A membership
+# write builds every pool's runs again, and a run holds one pool's share of its gateway's list: the row fails
+# when a run is reserved for the whole list, which no case can see. With that reserve put back the row read
+# 790.8 µs against 321.5 through this gate, and the gate failed it.
+#
 # The filter leaves out the binary's other rows. The nine `policy_store_vetoes/` rows are the veto cells outside
-# the gate: three vetoes of the asking gateway, and other gateways' vetoes, which a build passes over. The nine
+# the gate: three vetoes of the asking gateway, and other gateways' vetoes at every size. The nine
 # `policy_store_cadence/` rows run the build beside a writer thread on a second core: they are for a run pinned
 # to two cores.
 #
 # Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median of the
 # per-run criterion medians over six runs of one build pinned to one core, read through this gate as three base
 # and three pull-request runs (the base a copy of the binary with one byte appended, so the gate does not take
-# the two for one file), on a shared many-core build host. A reading is launched with the host's load under 48:
-# this one was launched at 47, and its six runs began at 28 to 47:
+# the two for one file), on a shared many-core build host. Two readings and a later pair stand in the table. The
+# first twenty-one rows are of a reading launched at a load of 47, its six runs begun at 28 to 47. The six rows
+# beside other gateways' vetoes are of a reading of the whole gate that did not wait for a quiet host: its six
+# runs began at a load of 43 to 81, with a second run of the gate on a core beside it. The last row, the spread
+# membership write, is of the later pair, five runs a side: the two write rows alone at a load of 78 to 161, and
+# the whole gate while the load rose from 9 to 113:
 #
 #   rows                                        identical build   threshold
 #   floor/{8,64,512}                            0.5 - 1.3 %       10 %
@@ -31,26 +53,55 @@
 #   load_write/{8,64,512}                       0.7 - 4.8 %       10 %
 #   publish/{8,64}                              2.3 - 4.1 %       10 %
 #   view_build/8, view_build_veto8/8            5.8 - 7.1 %       15 %
-#   publish/512                                 7.9 %             20 %
+#   publish/512                                 7.9 %             15 %
+#   view_build_foreign64/8                      3.2 %             10 %
+#   view_build_gateways{8,64,512}/8             2.3 - 3.8 %       10 %
+#   veto_write/512                              1.2 %             10 %
+#   member_write/512                            7.8 %             20 %
+#   member_write_spread/512                     12.9 - 17.6 %     40 %
 #
 # The threshold is the smallest multiple of 5 % that is at least twice the identical-build spread, never under
-# 10 % (the hosted runner is noisier than the build host). On top of the threshold the gate fails an id only when
-# every pull-request run is slower than every base run (scripts/bench_gate.py), so one slow run cannot fail the
-# job. The null case passed: 0 failed, 0 suspect of 21 ids, the largest change of medians -5.3 %. A reading with
-# two of its six runs begun at a load of 64 to 65 read up to 14.9 % in three build rows, one slow run of six each
-# (1.7 to 4.0 % without it), and passed as well; the table is not taken from it.
+# 10 % (the hosted runner is noisier than the build host). One row stands under that rule: `publish/512` at
+# 15 %, where the rule gives 20 %, since the hosted runner's own two jobs read its spread at 1.0 to 5.9 % a side
+# (three runs a side). On top of the threshold the gate fails an id only when every pull-request run is slower
+# than every base run (scripts/bench_gate.py), so one slow run cannot fail the job. The null case passed in both
+# readings: 0 failed, 0 suspect of 21 ids, the largest change of medians -5.3 %, and of 27 ids, -3.4 %. In the
+# later reading of 28 ids the spread membership write alone stood beyond 10 %, at +11.5 % with its runs
+# overlapping: its threshold is its own.
+#
+# The busier reading is not the table's for the first twenty-one rows. There they read 1.1 to 9.1 %, five of them
+# over 5 % (1.2 to 6.9 % without each one's slowest run), and `publish/512` read 36.4 %: two runs of six at
+# 1.75 µs beside four at 1.26 to 1.37. The publication's allocation of 512 rows takes one of two paths by the
+# allocator's state, and the rule that every pull-request run be slower than every base run is what holds that
+# row. An earlier reading with two of its six runs begun at a load of 64 to 65 read up to 14.9 % in three build
+# rows and passed as well.
 #
 # Placement, as policy-engine.toml records it: the workflow builds both binaries with every function on a 64-byte
 # boundary, and the build rows write into a buffer that starts on a page's start (benches/common/placed.rs). An
 # inserted regression in the build (20 dependent multiply-adds plus 2 per candidate before it returns, never
-# committed) is caught, read at a host load of 29 to 39: 12 of 21 ids failed and 0 were suspect, the twelve build
-# rows at +27 to +112 % (the eight-worker rows +27 to +35 %), each confirmed by the re-measure round; the floor,
-# write and publish rows, which the mutant does not touch, passed at -0.8 to +0.5 %.
+# committed) was caught when the gate ran its first twenty-one rows, read at a host load of 29 to 39: 12 of 21 ids
+# failed and 0 were suspect, the twelve build rows at +27 to +112 % (the eight-worker rows +27 to +35 %), each
+# confirmed by the re-measure round; the floor, write and publish rows, which the mutant does not touch, passed
+# at -0.8 to +0.5 %. The four build rows added since call the same build.
+#
+# Count: `count = true`, as policy-engine.toml records it. A pull request's job failed `policy_store/floor/8`
+# by time on a change that does not touch the cell: 26.2 against 29.0 ns, +10.6 % against 10 %, re-measured
+# +43.5 %. Its two binaries, built again, run the cell in the same count in every batch after the first, 290.0
+# instructions an iteration, with the cell's measured function at 0x180 of its page in the base's binary and at
+# 0xc40 in the pull request's: by that job's own timings the gate passes with the one placement, in four reads
+# of four. Read on this file's 28 ids, two copies of one binary of main: 21 count the same in every batch after
+# the first, four do not count steadily (`publish/8`, `publish/64`, `view_build/8`,
+# `member_write_spread/512`) and three were not read, the bench having stopped under the counter. A row that
+# does not count steadily, or whose count is not read, keeps the time's verdict.
 #
 # Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted runner's
 # own spread can be read from those and the thresholds tightened once it is known.
 
 repeats = 3
+count = true
+# The count ends 3,180 s into the run: the gate step's bound is 55 minutes, and the report is written
+# in the two minutes behind the count. No count starts in the budget's last 30 s.
+run_budget = 3180
 filter = "^policy_store/"
 
 # The files that feed this binary beyond the measured crate: the base side is built with them as the
@@ -67,8 +118,18 @@ sources = [
 # The first gate whose pattern matches an id decides its threshold.
 [[gate]]
 pattern = "^policy_store/publish/512$"
+threshold = 0.15
+note = "identical build 7.9 % on the build host, 1.0 - 5.9 % a side by the hosted runner's own two jobs"
+
+[[gate]]
+pattern = "^policy_store/member_write_spread/512$"
+threshold = 0.40
+note = "identical build 12.9 - 17.6 %, the second read while the host's load rose from 9 to 113"
+
+[[gate]]
+pattern = "^policy_store/member_write/512$"
 threshold = 0.20
-note = "identical build 7.9 %"
+note = "identical build 7.8 %, read on a busier host"
 
 [[gate]]
 pattern = "^policy_store/(view_build|view_build_veto8)/8$"

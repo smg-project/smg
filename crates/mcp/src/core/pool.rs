@@ -44,8 +44,8 @@ impl PoolKey {
                 url,
                 token,
                 headers,
-            } => (url.clone(), Self::hash_auth(token.as_ref(), headers)),
-            McpTransport::Sse {
+            }
+            | McpTransport::Sse {
                 url,
                 token,
                 headers,

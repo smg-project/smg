@@ -1,0 +1,23 @@
+[package]
+name = "policy-controller-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A policy controller of your own: the smg-policy-controller crate with one scorer added in code"
+license = "Apache-2.0"
+
+# The one dependency a controller of your own needs: the crate with the
+# listeners and the binary's run loop (`controller`). By path here, because
+# the example lives in the crate's repository; `kubernetes` adds the Lease
+# elector the Helm chart's election uses.
+[dependencies]
+smg-policy-controller = { path = "../../crates/policy_controller", features = ["controller"] }
+
+# The tests read the example's document as the controller reads one, and
+# bind a controller as the run loop does.
+[dev-dependencies]
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

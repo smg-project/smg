@@ -303,6 +303,10 @@ impl TrtllmServiceClient {
     /// - temperature: 1.0 (neutral sampling)
     /// - top_p: 1.0 (no nucleus filtering)
     /// - repetition_penalty: 1.0 (no penalty)
+    #[expect(
+        deprecated,
+        reason = "ChatCompletionRequest.seed is marked Legacy by openai-protocol, but the engine still honors it"
+    )]
     fn build_sampling_config_from_chat(request: &ChatCompletionRequest) -> proto::SamplingConfig {
         proto::SamplingConfig {
             beam_width: 1,
@@ -312,9 +316,9 @@ impl TrtllmServiceClient {
             top_p_min: None,
             top_p_reset_ids: None,
             top_p_decay: None,
-            seed: None,
+            seed: request.seed.map(seed_bits),
             temperature: Some(request.temperature.unwrap_or(1.0)),
-            min_tokens: None,
+            min_tokens: request.min_tokens,
             beam_search_diversity_rate: None,
             repetition_penalty: Some(request.repetition_penalty.unwrap_or(1.0)),
             presence_penalty: request.presence_penalty,
@@ -799,6 +803,44 @@ mod tests {
         );
     }
 
+    /// A chat request's `seed` reaches the sampling config, as a completion
+    /// request's does and with the same bits; a request without one sends none.
+    #[test]
+    fn chat_and_completion_sampling_configs_carry_the_seed() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "seed": 7
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&chat).seed,
+            Some(7)
+        );
+        let negative: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "seed": -1
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&negative).seed,
+            Some(u64::MAX)
+        );
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "seed": 7
+        }))
+        .expect("a completion request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_completion(&completion).seed,
+            Some(7)
+        );
+        let unset: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&unset).seed,
+            None
+        );
+    }
+
     #[test]
     fn plain_sampling_seed_and_stop_token_ids_reach_the_request() {
         let body: GenerateRequest = serde_json::from_value(serde_json::json!({
@@ -815,6 +857,36 @@ mod tests {
         .unwrap();
         assert_eq!(request.sampling_config.unwrap().seed, Some(7));
         assert_eq!(request.stop_token_ids, vec![1, 2]);
+    }
+
+    /// A chat request's `min_tokens` reaches the sampling config, as a
+    /// completion request's does; a request without one leaves it unset.
+    #[test]
+    fn chat_and_completion_sampling_configs_carry_min_tokens() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "min_tokens": 30
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&chat).min_tokens,
+            Some(30)
+        );
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "min_tokens": 30
+        }))
+        .expect("a completion request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_completion(&completion).min_tokens,
+            Some(30)
+        );
+        let unset: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&unset).min_tokens,
+            None
+        );
     }
 
     /// A `response_format` set aside for the builder reads as absent: the tag

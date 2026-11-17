@@ -340,10 +340,7 @@ pub(crate) async fn execute_plan(
     let prefill_guard = ctx.pd_prefill_guard.take();
 
     // Extract dispatch metadata for the tracing span and PD metric labels.
-    let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
-        error!(function = "execute_plan", "Dispatch metadata not set");
-        error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
-    })?;
+    let dispatch = stage_output(ctx.dispatch.as_ref(), "execute_plan")?;
     let request_id = dispatch.request_id.as_str();
     let model = dispatch.model.as_str();
     let request_type = execution_plan.request_type();
@@ -394,9 +391,13 @@ pub(crate) async fn execute_plan(
             ExecutionPlan::EmbedBatch { requests, .. } => {
                 execute_embed(requests, clients, workers, ledger).await
             }
+            // The two disaggregated arms are boxed: their futures are over ten
+            // times the single arm's, and by value they would size every
+            // attempt's dispatch future (and the run's one box) for a path the
+            // request does not take.
             ExecutionPlan::PrefillDecode(req) => {
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_pd_dispatch(
+                Box::pin(execute_pd_dispatch(
                     req,
                     clients,
                     workers,
@@ -405,7 +406,7 @@ pub(crate) async fn execute_plan(
                     ledger,
                     room_residue,
                     None,
-                )
+                ))
                 .await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
@@ -414,7 +415,7 @@ pub(crate) async fn execute_plan(
                 // request at request building and its encode jobs go with the
                 // prefill/decode pair; a push plan runs its encode call first.
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_epd_dispatch(
+                Box::pin(execute_epd_dispatch(
                     request,
                     clients,
                     workers,
@@ -423,7 +424,7 @@ pub(crate) async fn execute_plan(
                     encode_watch,
                     prefill_guard,
                     ledger,
-                )
+                ))
                 .await
                 .map_err(|mut response| {
                     // A push may already have reserved buffers on this
@@ -4090,10 +4091,19 @@ pub(crate) mod tests {
         // stream never ends here; the late failure would release it), so the
         // test releases it, then banks a run the grace long, stamped forward
         // (the gateway clock is young in a test).
-        prefill.note_prefill_ended(95, true, None);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended(95, true, None);
         let t0 = liveness::now_ms().max(1);
-        prefill.note_prefill_started_at(95, true, t0);
-        prefill.note_prefill_ended_at(95, true, None, t0 + 120_000);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_started_at(95, true, t0);
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended_at(95, true, None, t0 + 120_000);
         let spent =
             PrefillBound::behind_encode(&prefill, 95, Instant::now()).expect("the rule is on");
         assert_eq!(
@@ -4193,7 +4203,10 @@ pub(crate) mod tests {
                 .runtime_state()
                 .unwrap()
                 .note_prefill_started(256, true);
-            prefill.note_prefill_ended(256, true, Some(0));
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_ended(256, true, Some(0));
         };
         let started = Instant::now();
         let (result, ()) = tokio::join!(
@@ -4234,7 +4247,10 @@ pub(crate) mod tests {
             .runtime_state()
             .unwrap()
             .note_prefill_started(256, true);
-        prefill.note_prefill_ended(256, true, Some(0));
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended(256, true, Some(0));
         let bound = Duration::from_secs(1);
         let landed_at = Duration::from_millis(500);
         let shown_at = Duration::from_millis(2_500);
@@ -4245,7 +4261,10 @@ pub(crate) mod tests {
                 .unwrap()
                 .note_prefill_started(8_192, true);
             tokio::time::sleep(shown_at - landed_at).await;
-            prefill.note_prefill_ended(8_192, true, Some(0));
+            prefill
+                .runtime_state()
+                .unwrap()
+                .note_prefill_ended(8_192, true, Some(0));
         };
         let started = Instant::now();
         let (result, ()) = tokio::join!(
@@ -4291,7 +4310,10 @@ pub(crate) mod tests {
             .runtime_state()
             .unwrap()
             .note_prefill_started(10_000, true);
-        prefill.note_prefill_ended(10_000, true, Some(0));
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended(10_000, true, Some(0));
         tokio::time::sleep(Duration::from_millis(2_500)).await;
         for _ in 0..2 {
             prefill
@@ -4448,7 +4470,10 @@ pub(crate) mod tests {
             .unwrap()
             .note_prefill_started(2_000, true);
         tokio::time::sleep(Duration::from_millis(1_100)).await;
-        prefill.note_prefill_ended(20_000, true, Some(0));
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended(20_000, true, Some(0));
         let answered = Instant::now();
         let bound = Duration::from_secs(1);
         let arrivals = async {
@@ -4497,7 +4522,10 @@ pub(crate) mod tests {
             .unwrap()
             .note_prefill_started(20_000, true);
         tokio::time::sleep(Duration::from_millis(1_100)).await;
-        prefill.note_prefill_ended(20_000, true, Some(0));
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended(20_000, true, Some(0));
         prefill
             .runtime_state()
             .unwrap()
@@ -4550,8 +4578,11 @@ pub(crate) mod tests {
             .unwrap()
             .note_prefill_started(20_000, true);
         tokio::time::sleep(Duration::from_millis(1_100)).await;
-        prefill.note_prefill_ended(20_000, true, Some(0));
-        decode.note_output_started();
+        prefill
+            .runtime_state()
+            .unwrap()
+            .note_prefill_ended(20_000, true, Some(0));
+        decode.runtime_state().unwrap().note_output_started();
         decode.runtime_state().unwrap().note_token_progress();
         tokio::time::sleep(Duration::from_millis(200)).await;
         prefill
@@ -4588,7 +4619,7 @@ pub(crate) mod tests {
             elapsed >= bound && elapsed < 2 * bound,
             "the decode verdict comes at the prefill's bound: {elapsed:?}"
         );
-        decode.note_output_ended();
+        decode.runtime_state().unwrap().note_output_ended();
     }
 
     /// The partner is judged by a decode side's bound for the prompt, which
@@ -4601,7 +4632,7 @@ pub(crate) mod tests {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
         let decode = Arc::clone(workers.decode_worker().expect("a pair"));
-        decode.note_output_started();
+        decode.runtime_state().unwrap().note_output_started();
         decode.runtime_state().unwrap().note_token_progress();
         std::thread::sleep(Duration::from_millis(600));
         let dispatched = Instant::now()
@@ -4622,7 +4653,7 @@ pub(crate) mod tests {
         )
         .expect_err("its worker answered nothing within the side's bound");
         assert!(is_decode_silence(&status), "{status:?}");
-        decode.note_output_ended();
+        decode.runtime_state().unwrap().note_output_ended();
     }
 
     /// On the parallel shape a prefill side's first response waits for the
@@ -4653,7 +4684,7 @@ pub(crate) mod tests {
 
                 // The decode holds a stream it had been producing for, and
                 // has produced nothing since: stalled mid-stream.
-                decode.note_output_started();
+                decode.runtime_state().unwrap().note_output_started();
                 decode.runtime_state().unwrap().note_token_progress();
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let started = Instant::now();
@@ -4728,7 +4759,7 @@ pub(crate) mod tests {
                 // The decode's producing stream ended (quiet since, but with
                 // nothing in flight it had shown output on): the prefill's
                 // verdict.
-                decode.note_output_ended();
+                decode.runtime_state().unwrap().note_output_ended();
                 assert!(decode.output_silence().is_none());
                 let status = failure(
                     dispatch_prefill_within(

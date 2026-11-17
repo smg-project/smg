@@ -2435,7 +2435,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::types::PolicyConfig,
+        config::types::{GroupedDpSticky, PolicyConfig},
         mesh::adapters::tree_sync::RepairEntry,
         middleware::{ReportedRefusal, TenantRequestMeta},
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
@@ -2447,6 +2447,7 @@ mod tests {
                 retry::is_retryable_response,
             },
             grpc::{
+                common::stages::execute_plan,
                 context::{ExecutionPlanKind, PreparationOutput, SharedComponents},
                 proto_wrapper::{ProtoGenerateRequest, ProtoRequest},
                 regular::symphony::template::Templates,
@@ -7275,7 +7276,7 @@ mod tests {
         let ctx = prepared_ctx(Arc::clone(&registry), None);
         let accepted = Some(Instant::now() - Duration::from_millis(100));
         let guard = PrefillLoadGuard::Unbounded {
-            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
         };
         assert_eq!(prefill.load(), 1, "the admission holds its claim");
 
@@ -7604,4 +7605,28 @@ mod tests {
             "the stage's execute future is {future} bytes"
         );
     }
+
+    /// One attempt's dispatch future (`execute_plan`'s) stays in the
+    /// 2,048-byte class the selection stage's future is held to: 1,152 bytes
+    /// on 64-bit targets. The pipeline awaits it by value, so it sizes every
+    /// attempt's future: that one read 7,280 bytes while the two
+    /// disaggregated dispatches were awaited by value, and reads 1,528 with
+    /// both boxed at their call. A dispatch that grows the future past the
+    /// class is boxed at its call or needs its own read.
+    #[test]
+    fn the_dispatch_future_fits_its_class() {
+        let mut ctx = dispatch_ctx("test-model", grpc_wire(RuntimeType::Vllm));
+        let future = size_of_val(&execute_plan(
+            &mut ctx,
+            retained_plan(&[1]),
+            false,
+            None,
+            GroupedDpSticky::Off,
+        ));
+        assert!(future <= 2048, "the dispatch future is {future} bytes");
+    }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_encode_pair_rows;

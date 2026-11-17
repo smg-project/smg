@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import tracemalloc
 
 import pytest
 
@@ -103,6 +104,8 @@ def test_main_writes_one_json_row_per_request(tmp_path, capsys):
         (["--tenants", "1001"], "--tenants must be 1 to 1000"),
         (["--sys-blocks", "1001", "--max-blocks", "1100"], "--sys-blocks must be 0 to 1000"),
         (["--sys-blocks", "0", "--first-blocks", "0,4"], "must give a first turn a block"),
+        (["--output", "-1"], "--output must be 0 to 4294967295"),
+        (["--output", "4294967296"], "--output must be 0 to 4294967295"),
         (["--max-blocks", "39"], "under the shortest first turn"),
         (["--max-blocks", "10033"], "could hold 10001 of its own blocks"),
         (["--sys-blocks", "0", "--max-blocks", "10001"], "could hold 10001 of its own blocks"),
@@ -119,5 +122,27 @@ def test_the_widest_spans_the_hash_ids_hold_are_accepted():
         ["--tenants", "1000", "--sys-blocks", "1000", "--max-blocks", "1100"],
         ["--max-blocks", "10032"],
         ["--sys-blocks", "0", "--max-blocks", "10000"],
+        ["--output", "4294967295"],
     ):
         trace.parse_args(["--out", "unused", *flags])
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--first-blocks", "8,2000000"],
+        ["--turn-blocks", "2,2000000"],
+        ["--answer-blocks", "2000000"],
+    ],
+)
+def test_a_turn_past_the_cap_takes_no_blocks(flags):
+    # Two million block ids would take tens of MB; the rows of this trace take
+    # well under one.
+    tracemalloc.start()
+    try:
+        rows = rows_for("--duration-s", "20", "--sessions-per-s", "1", "--seed", "3", *flags)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert all(len(row["hash_ids"]) <= 400 for row in rows)
+    assert peak < 8_000_000

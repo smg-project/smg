@@ -22,13 +22,15 @@ pub type Result<T> = std::result::Result<T, TransformError>;
 
 /// Extract RGB pixel data from a DynamicImage, avoiding a copy when already RGB8.
 /// Returns (width, height, raw_bytes) where raw_bytes is interleaved R,G,B,R,G,B,...
+/// and exactly `3 * width * height` long: an RGB8 image's container may be
+/// longer than its pixels (`ImageBuffer::from_raw` takes any that is long
+/// enough), and the bytes behind them are not the image.
 pub fn rgb_bytes(image: &DynamicImage) -> (usize, usize, std::borrow::Cow<'_, [u8]>) {
     match image {
-        DynamicImage::ImageRgb8(rgb) => (
-            rgb.width() as usize,
-            rgb.height() as usize,
-            std::borrow::Cow::Borrowed(rgb.as_raw()),
-        ),
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+            (w, h, std::borrow::Cow::Borrowed(&rgb.as_raw()[..3 * w * h]))
+        }
         _ => {
             let rgb = image.to_rgb8();
             let w = rgb.width() as usize;
@@ -340,66 +342,34 @@ fn build_planar_tensor_by_table(
 /// the canvas is cropped at its right and bottom edges.
 pub fn paint_rgb_onto_planes(
     rgb: &[u8],
-    image: (usize, usize),
-    canvas: (usize, usize),
+    (image_w, image_h): (usize, usize),
+    (canvas_w, canvas_h): (usize, usize),
     scale: [f32; 3],
     bias: [f32; 3],
     planes: &mut [f32],
 ) {
-    paint_rows(rgb, image, canvas, bias, planes, |row, r, g, b| {
-        deinterleave_rgb_to_planes(row, r, g, b, scale, bias);
-    });
-}
-
-/// [`paint_rgb_onto_planes`] through a per-channel table: every painted byte
-/// maps through `table[c][byte]` and the canvas outside the image holds
-/// `table[c][0]`, what a zero byte of padding maps to under the same
-/// arithmetic.
-pub(crate) fn paint_rgb_onto_planes_by_table(
-    rgb: &[u8],
-    image: (usize, usize),
-    canvas: (usize, usize),
-    table: &[[f32; 256]; 3],
-    planes: &mut [f32],
-) {
-    let black = [table[0][0], table[1][0], table[2][0]];
-    paint_rows(rgb, image, canvas, black, planes, |row, r, g, b| {
-        deinterleave_rgb_to_planes_by_table(row, r, g, b, table);
-    });
-}
-
-/// The canvas fill and the row walk of the paints: `black` fills the canvas,
-/// then `paint_row` maps each image row's bytes onto its three plane slices.
-fn paint_rows<K>(
-    rgb: &[u8],
-    (image_w, image_h): (usize, usize),
-    (canvas_w, canvas_h): (usize, usize),
-    black: [f32; 3],
-    planes: &mut [f32],
-    paint_row: K,
-) where
-    K: Fn(&[u8], &mut [f32], &mut [f32], &mut [f32]),
-{
     let canvas_pixels = canvas_w * canvas_h;
     debug_assert_eq!(planes.len(), 3 * canvas_pixels);
     debug_assert!(rgb.len() >= image_w * image_h * 3);
     let (r_plane, rest) = planes.split_at_mut(canvas_pixels);
     let (g_plane, b_plane) = rest.split_at_mut(canvas_pixels);
 
-    r_plane.fill(black[0]);
-    g_plane.fill(black[1]);
-    b_plane.fill(black[2]);
+    r_plane.fill(bias[0]);
+    g_plane.fill(bias[1]);
+    b_plane.fill(bias[2]);
 
     let painted_w = image_w.min(canvas_w);
     let painted_h = image_h.min(canvas_h);
     for y in 0..painted_h {
         let src_row = &rgb[y * image_w * 3..(y * image_w + painted_w) * 3];
         let dst = y * canvas_w;
-        paint_row(
+        deinterleave_rgb_to_planes(
             src_row,
             &mut r_plane[dst..dst + painted_w],
             &mut g_plane[dst..dst + painted_w],
             &mut b_plane[dst..dst + painted_w],
+            scale,
+            bias,
         );
     }
 }
@@ -553,7 +523,7 @@ fn to_fir_algorithm(filter: FilterType) -> ResizeAlg {
     clippy::slow_vector_initialization,
     reason = "the zero-filled `vec!` is the calloc this helper exists to avoid; see its doc comment"
 )]
-fn plain_buffer(len: usize) -> Vec<u8> {
+pub(crate) fn plain_buffer(len: usize) -> Vec<u8> {
     let mut buffer = Vec::with_capacity(len);
     buffer.resize(len, 0);
     buffer
@@ -2679,12 +2649,11 @@ pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
 /// interpolation, and so what an image processor that resizes the decoded
 /// image before converting it to a tensor runs.
 pub fn resize_bilinear_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
+    let (in_w, in_h, rgb) = rgb_bytes(image);
     let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
+        &rgb,
+        in_w as u32,
+        in_h as u32,
         out_w,
         out_h,
         PilResizeFilter::Bilinear,
@@ -3397,6 +3366,14 @@ pub fn center_crop(image: &DynamicImage, crop_w: u32, crop_h: u32) -> DynamicIma
     }
 }
 
+/// The pixel bytes of `image`, exactly `3 * width * height` of them: a
+/// container may be longer than its image (`ImageBuffer::from_raw` takes any
+/// that is long enough), and the bytes behind the pixels are not the image.
+pub(crate) fn rgb_pixels(image: &RgbImage) -> &[u8] {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    &image.as_raw()[..3 * width * height]
+}
+
 /// The `width` x `height` crop of `image` at (`x`, `y`), clipped to the
 /// image as the generic crop clips it, as row copies out of the image's own
 /// bytes. The generic crop builds a zeroed image and copies pixel by pixel;
@@ -3423,6 +3400,40 @@ pub(crate) fn crop_rgb(image: &RgbImage, x: u32, y: u32, width: u32, height: u32
         reason = "data holds exactly width * height * 3 bytes by construction"
     )]
     RgbImage::from_raw(width, height, data).expect("crop buffer size")
+}
+
+/// The columns of the image that one pass of [`transpose_rgb`] moves: their
+/// pixels of an image row and the output rows they go to stay in the cache.
+const TRANSPOSE_BLOCK: usize = 32;
+
+/// `image` flipped over its main diagonal (PIL's `Image.TRANSPOSE`): the
+/// pixel at (`x`, `y`) goes to (`y`, `x`), so the result is `height` wide and
+/// `width` high. The generic way, a horizontal flip and then a quarter turn,
+/// copies the image twice, pixel by pixel. Here a block of columns at a time
+/// is gathered in a scratch block that stays in the cache, each image row
+/// giving one pixel to each of its output rows, and joins the output whole.
+pub(crate) fn transpose_rgb(image: &RgbImage) -> RgbImage {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    // A zero-sized image has no rows; a chunk size of 0 would panic.
+    let (stride, out_stride) = ((width * 3).max(1), (height * 3).max(1));
+    let mut data = Vec::with_capacity(width * height * 3);
+    let mut block = vec![0_u8; TRANSPOSE_BLOCK.min(width) * height * 3];
+    for first in (0..width).step_by(TRANSPOSE_BLOCK) {
+        let columns = TRANSPOSE_BLOCK.min(width - first);
+        let block = &mut block[..columns * height * 3];
+        for (y, row) in rgb_pixels(image).chunks_exact(stride).enumerate() {
+            let (pixels, _) = row[first * 3..(first + columns) * 3].as_chunks::<3>();
+            for (out_row, pixel) in block.chunks_exact_mut(out_stride).zip(pixels) {
+                out_row[y * 3..y * 3 + 3].copy_from_slice(pixel);
+            }
+        }
+        data.extend_from_slice(block);
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "data holds exactly height * width * 3 bytes by construction"
+    )]
+    RgbImage::from_raw(image.height(), image.width(), data).expect("transpose buffer size")
 }
 
 /// `image` pasted at (`x`, `y`) on a `width` x `height` canvas of
@@ -5341,6 +5352,48 @@ mod tests {
         );
     }
 
+    /// The one-pass transpose makes the image that the flip and the quarter
+    /// turn make, on sizes around its block of columns and over a container
+    /// longer than the pixels.
+    #[test]
+    fn transpose_rgb_is_the_flip_and_the_quarter_turn() {
+        let sizes = [
+            (1, 1),
+            (1, 7),
+            (7, 1),
+            (31, 5),
+            (32, 33),
+            (33, 32),
+            (65, 97),
+            (200, 130),
+        ];
+        for (width, height) in sizes {
+            let image = lcg_rgb_image(width, height, 11);
+            let rgb = image.to_rgb8();
+            let generic = image.fliph().rotate270().to_rgb8();
+            let fast = transpose_rgb(&rgb);
+            assert_eq!(fast.dimensions(), (height, width), "{width}x{height}");
+            assert_eq!(fast.as_raw(), generic.as_raw(), "{width}x{height}");
+
+            let mut container = rgb.into_raw();
+            container.extend_from_slice(&[0xAB; 7]);
+            let longer = RgbImage::from_raw(width, height, container).expect("longer container");
+            let fast_of_longer = transpose_rgb(&longer);
+            assert_eq!(fast_of_longer.as_raw(), fast.as_raw(), "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn transpose_rgb_stays_total_on_an_empty_image() {
+        // No row to chunk and no block to fill: the result is the empty
+        // image with its two sides swapped.
+        for (width, height) in [(0, 7), (7, 0), (0, 0)] {
+            let transposed = transpose_rgb(&RgbImage::new(width, height));
+            assert_eq!(transposed.dimensions(), (height, width), "{width}x{height}");
+            assert!(transposed.as_raw().is_empty(), "{width}x{height}");
+        }
+    }
+
     #[test]
     fn test_expand_to_square_horizontal() {
         let img = create_test_image(100, 50, Rgb([255, 0, 0]));
@@ -5565,34 +5618,6 @@ mod tests {
                     assert_eq!(
                         planes[c * 6 + y * 3 + x].to_bits(),
                         expected.to_bits(),
-                        "channel {c} at ({x}, {y})"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn paint_rgb_onto_planes_by_table_maps_through_the_table_and_fills_the_margin_with_its_zero() {
-        // A 2x2 image on a 3x2 canvas: the right column is margin. The table
-        // tells the channels and the levels apart, and no multiply-add
-        // produces it.
-        let rgb: [u8; 12] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
-        let table: [[f32; 256]; 3] = std::array::from_fn(|c| {
-            std::array::from_fn(|level| {
-                let sign = if level % 2 == 0 { 1.0 } else { -1.0 };
-                (level as f32 * 0.5 + 1.0) * sign + (c as f32 + 1.0) * 1000.0
-            })
-        });
-        let mut planes = vec![f32::NAN; 3 * 3 * 2];
-        paint_rgb_onto_planes_by_table(&rgb, (2, 2), (3, 2), &table, &mut planes);
-        for c in 0..3 {
-            for y in 0..2 {
-                for x in 0..3 {
-                    let level = if x < 2 { rgb[(y * 2 + x) * 3 + c] } else { 0 };
-                    assert_eq!(
-                        planes[c * 6 + y * 3 + x].to_bits(),
-                        table[c][usize::from(level)].to_bits(),
                         "channel {c} at ({x}, {y})"
                     );
                 }

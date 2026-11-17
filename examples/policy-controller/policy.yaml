@@ -1,0 +1,8 @@
+# The example's routing policy: the scorer this controller adds in code is
+# named as a built-in is.
+apiVersion: smg.policy/v1
+profiles:
+  default:
+    filter: [healthy]
+    score: [pack]
+    pick: best
