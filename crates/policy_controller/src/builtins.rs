@@ -1047,9 +1047,10 @@ fn below_band(score: f32, top: f32, band: TieBand) -> bool {
 }
 
 /// One slot of a ranked pick, over the rows `open` admits: the best score
-/// among them is found first, then one of the rows within the band of it is
-/// drawn. The band lies around the best score, so the rows of a tie are the
-/// same whatever order they are listed in.
+/// among them is found first, the rows within the band of it are counted,
+/// and one of them is drawn: one value of `draw` a slot, and none where a
+/// row stands alone in its band. The band lies around the best score, so
+/// the rows of a tie are the same whatever order they are listed in.
 fn draw_in_band(
     scores: &[f32],
     band: TieBand,
@@ -1062,18 +1063,81 @@ fn draw_in_band(
             top = s;
         }
     }
-    let mut best: Option<usize> = None;
-    let mut tied = 0usize;
-    for (i, &s) in scores.iter().enumerate() {
-        if !open(i) || below_band(s, top, band) {
+    let tied = |&(i, &s): &(usize, &f32)| open(i) && !below_band(s, top, band);
+    let rows = scores.iter().enumerate().filter(tied).count();
+    // Counted from the band's last row: of two tied rows a zero takes the
+    // later one.
+    let back = if rows > 1 { draw.below(rows) } else { 0 };
+    let at = rows.checked_sub(1 + back)?;
+    scores
+        .iter()
+        .enumerate()
+        .filter(tied)
+        .nth(at)
+        .map(|(i, _)| i)
+}
+
+/// The slots a flat band fills, by rank. Where every row within the band of
+/// `top`, the best score left, scores `top` itself, a row taken leaves the
+/// band's best where it was: the band is counted once, each slot draws its
+/// row among the band's rows left as [`draw_in_band`] would (one value of
+/// `draw` while two rows are left, none for the last), and one more pass
+/// finds the rows drawn. Returns how many of `picks` it filled, in slot
+/// order: none where the band is not flat, and the slots it leaves are drawn
+/// one by one.
+fn draw_flat(
+    draw: &mut Draw,
+    scores: &[f32],
+    top: f32,
+    band: TieBand,
+    picks: &mut [usize],
+) -> usize {
+    // No row scores above `top` but the rows taken before the band.
+    let mut rows = 0usize;
+    for &s in scores {
+        if s > top || below_band(s, top, band) {
             continue;
         }
-        tied += 1;
-        if best.is_none() || draw.below(tied) == 0 {
-            best = Some(i);
+        if s != top {
+            return 0;
+        }
+        rows += 1;
+    }
+    let fills = picks.len().min(rows);
+    // A slot's rank among the band's rows left, counted from the last as a
+    // slot's draw counts it, becomes its rank among all of them: past each
+    // row taken at or before it. `ranks` ascends, and `slots` names the slot
+    // of each.
+    let mut ranks = [usize::MAX; MAX_TARGETS];
+    let mut slots = [0usize; MAX_TARGETS];
+    for slot in 0..fills {
+        let left = rows - slot;
+        let back = if left > 1 { draw.below(left) } else { 0 };
+        let mut rank = left - 1 - back;
+        let mut at = 0;
+        while at < slot && ranks[at] <= rank {
+            rank += 1;
+            at += 1;
+        }
+        ranks.copy_within(at..slot, at + 1);
+        slots.copy_within(at..slot, at + 1);
+        ranks[at] = rank;
+        slots[at] = slot;
+    }
+    let (mut next, mut seen) = (0usize, 0usize);
+    for (i, &s) in scores.iter().enumerate() {
+        if next == fills {
+            break;
+        }
+        if s == top {
+            if seen == ranks[next] {
+                picks[slots[next]] = i;
+                next += 1;
+            }
+            seen += 1;
         }
     }
-    best
+    fills
 }
 
 /// Push the kept positions in descending score order, ties by draw: per slot
@@ -1082,7 +1146,9 @@ fn draw_in_band(
 /// scores (equal scores in scan order); while the next best is below the
 /// band of the best remaining, that row stands alone in its band and is the
 /// slot's pick with no draw spent. From the first band that holds several
-/// rows on, a slot costs the two passes of [`draw_in_band`]. The taken slots
+/// rows on, a slot costs the passes of [`draw_in_band`] and one value of the
+/// draw; where that band's rows score alike, its slots are drawn by rank in
+/// one count ([`draw_flat`]). The taken slots
 /// live in a fixed array: nothing is allocated.
 fn push_ranked(
     mut draw: Draw,
@@ -1121,6 +1187,16 @@ fn push_ranked(
         taken[filled] = i;
         out.push(target_of(&candidates[kept[i] as usize]));
         filled += 1;
+    }
+    if filled < slots {
+        let mut picks = [usize::MAX; MAX_TARGETS];
+        let top = best_five[filled].1;
+        let fills = draw_flat(&mut draw, scores, top, band, &mut picks[..slots - filled]);
+        for &i in &picks[..fills] {
+            taken[filled] = i;
+            out.push(target_of(&candidates[kept[i] as usize]));
+            filled += 1;
+        }
     }
     for slot in filled..slots {
         let left = |i: usize| !taken[..slot].contains(&i);
@@ -3116,6 +3192,100 @@ mod tests {
                     "{}, {order:?}: {leads:?}",
                     picker.name()
                 );
+            }
+        }
+    }
+
+    /// A slot's draw reads one value of the seed's stream for a band of
+    /// several rows, however many, and none for a row alone in its band. A
+    /// band of many is drawn evenly, and of two tied rows a zero takes the
+    /// later.
+    #[test]
+    fn a_band_is_drawn_with_one_value_of_the_stream_and_evenly() {
+        // The row drawn, and how many values of the stream the draw read:
+        // none, one, or more than one.
+        let drawn = |scores: &[f32], seed: u64| {
+            let mut draw = Draw::new(seed);
+            let row = draw_in_band(scores, TieBand::NORMALIZED, &mut draw, |_| true);
+            // Where the stream stands past its seed, by its next value: no
+            // value read, one, or none of the two.
+            let next = draw.next_u64();
+            let mut twin = Draw::new(seed);
+            (row, (0..=1usize).find(|_| twin.next_u64() == next))
+        };
+        assert_eq!(drawn(&[], 7), (None, Some(0)));
+        assert_eq!(drawn(&[0.2, 0.9, 0.4], 7), (Some(1), Some(0)));
+        let mut led = [0u32; 64];
+        for seed in 0..6_400u64 {
+            let (row, read) = drawn(&[0.5; 64], seed);
+            assert_eq!(read, Some(1), "seed {seed}");
+            led[row.expect("a band holds a row")] += 1;
+        }
+        assert!(led.iter().all(|n| (50..=150).contains(n)), "{led:?}");
+        // Two tied rows share the stream's first value below two: a zero is
+        // the later row.
+        for seed in 0..64u64 {
+            let later = Draw::new(seed).below(2) == 0;
+            assert_eq!(
+                drawn(&[0.1, 0.7, 0.7], seed),
+                (Some(1 + usize::from(later)), Some(1)),
+                "seed {seed}"
+            );
+        }
+    }
+
+    /// A band whose rows score alike is counted once and drawn by rank: the
+    /// targets are the ones the slots draw one by one, seed for seed,
+    /// whatever stands above the band and under it. A band whose rows differ
+    /// within it stays with the slots.
+    #[test]
+    fn a_flat_band_is_drawn_by_rank_as_the_slots_draw_it_one_by_one() {
+        let band = TieBand::NORMALIZED;
+        // The slots one by one: each draws in its band among the rows left.
+        let one_by_one = |scores: &[f32], seed: u64| {
+            let (mut draw, mut taken) = (Draw::new(seed), Vec::new());
+            while taken.len() < MAX_TARGETS.min(scores.len()) {
+                let open = |i: usize| !taken.contains(&i);
+                let Some(row) = draw_in_band(scores, band, &mut draw, open) else {
+                    break;
+                };
+                taken.push(row);
+            }
+            taken
+        };
+        // Rows above the band, the band's rows (alike, or two values within
+        // the band), and rows under it that tie again.
+        let near: f32 = 0.5 - 4e-7;
+        let shapes: [(&[f32], &[f32], &[f32]); 8] = [
+            (&[], &[0.5, 0.5], &[]),
+            (&[], &[0.5, 0.5, 0.5], &[0.3, 0.2]),
+            (&[0.9], &[0.5, 0.5], &[0.3, 0.3, 0.3]),
+            (&[0.9, 0.8], &[0.5; 5], &[0.1]),
+            (&[], &[0.5; 9], &[]),
+            (&[0.9, 0.8, 0.7], &[0.5; 4], &[0.2, 0.2]),
+            (&[], &[0.5, near, 0.5], &[0.3, 0.3]),
+            (&[0.9], &[near, 0.5, near, 0.5], &[]),
+        ];
+        for (above, tied, under) in shapes {
+            let mut scores: Vec<f32> = [above, tied, under].concat();
+            let pool: Vec<Candidate> = (0..scores.len() as u32).map(|i| candidate(i, 0)).collect();
+            let rows = kept(pool.len() as u32);
+            for turn in 0..scores.len() {
+                scores.rotate_left(1);
+                for seed in 0..100u64 {
+                    let facts = RequestFacts {
+                        seed,
+                        ..RequestFacts::default()
+                    };
+                    let mut out = Targets::new();
+                    Best.pick(&facts, &pool, &rows, &scores, band, &mut out);
+                    let got: Vec<usize> = out.iter().map(|t| t.position as usize).collect();
+                    assert_eq!(
+                        got,
+                        one_by_one(&scores, seed),
+                        "{scores:?} at turn {turn}, seed {seed}"
+                    );
+                }
             }
         }
     }
