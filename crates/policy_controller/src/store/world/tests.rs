@@ -3922,6 +3922,35 @@ fn a_rank_exactly_three_periods_behind_is_counted_and_a_microsecond_past_it_ends
     assert_eq!(overloaded(&store, past), []);
 }
 
+/// Beside a rank past the bound, a rank exactly at it is still counted: the
+/// walk that leaves the ended rank out keeps the one three periods behind.
+#[test]
+fn a_rank_at_the_bound_is_counted_beside_one_past_it() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    let two = rank_of(&store, "grpc://e:9000", 2);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    let bound = REPORT_PERIOD * 3;
+    let tick = Duration::from_micros(1);
+    // Rank two is heard a microsecond before rank one, which holds the queue
+    // that vetoes. Rank zero is heard three periods after rank one: rank two
+    // has ended, and rank one, exactly at the bound, still counts.
+    store.record(two, 2, pressure(0, 0), t0, LoadSource::Stream);
+    store.record(one, 1, pressure(9, 0), t0 + tick, LoadSource::Stream);
+    let now = t0 + tick + bound;
+    store.record(zero, 0, pressure(0, 0), now, LoadSource::Stream);
+    // The verdict is the engine's: every rank's row reads it, in the pool's
+    // order, the ended rank's too.
+    let mut ranks = [zero, one, two];
+    ranks.sort_unstable();
+    assert_eq!(overloaded(&store, now), ranks);
+}
+
 /// A membership write finds each rank's receipt among single-rank
 /// members: an engine's ranks do not stand together in the id order the
 /// write walks, and a single-rank member has no receipt.

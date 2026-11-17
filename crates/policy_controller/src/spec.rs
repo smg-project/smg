@@ -1424,10 +1424,13 @@ pub struct BindingSpec {
     pub profiles: BTreeMap<String, String>,
     /// The overload veto's defaults for the workers of the pools decided
     /// under the binding: the pools whose model and phase it is the first
-    /// to match. A decode pool of a model with a pair binding (`pd-pair`
-    /// or `epd`) is decided under that binding, so its block judges the
-    /// pool: a decode-phase binding's block is not read for it, and a pair
-    /// binding with its block switched off leaves the pool unjudged.
+    /// to match. A decode pool of a model whose prefill lookup resolves to
+    /// a pair binding (`pd-pair` or `epd`) is decided under that binding,
+    /// so its block judges the pool: a decode-phase binding's block is not
+    /// read for it, and a pair binding with its block switched off leaves
+    /// the pool unjudged. Where a binding of another plan takes the
+    /// model's prefill lookup first, no pair decision runs for the model
+    /// and its decode pool is the decode phase's own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overload: Option<OverloadSpec>,
     /// Sticky sessions.

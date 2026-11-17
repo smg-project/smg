@@ -1167,6 +1167,10 @@ pub(super) struct Writer {
     /// in them, so a write that judges no engine steps over them as it
     /// did.
     place_engines: Vec<u32>,
+    /// Each place's row among the engines' rows, in the places' order: a
+    /// rank's receipt stands at its first place's, found by no search.
+    /// Written with the receipts, and empty where none is kept.
+    place_slots: Vec<u32>,
     /// When each rank of a data-parallel engine was last heard: the
     /// receipt of its record on file, in microseconds from the origin,
     /// in the engine rows' order. Empty for a membership of single-rank
@@ -1216,6 +1220,7 @@ impl Writer {
             engines: Vec::new(),
             engine_rows: Vec::new(),
             place_engines: Vec::new(),
+            place_slots: Vec::new(),
             heard: Vec::new(),
             sample_bound: None,
             judging: false,
@@ -1513,31 +1518,30 @@ impl Writer {
         let Some(engine) = self.engine_at(place) else {
             return false;
         };
-        self.hear(engine, place, at);
+        self.hear(place, at);
         self.judged(engine, true)
     }
 
-    /// The member whose first place stands at `place`, a rank of
-    /// `engine`, was heard at `at`: the receipt its sample is aged from.
-    /// Kept for the ranks of a data-parallel engine, and only while an
-    /// engine has a threshold: a write that starts a judgment reads
-    /// every receipt again from the samples, a membership write in its
-    /// walk and an applied generation by [`Self::hear_again`].
-    pub(super) fn hear(&mut self, engine: u32, place: u32, at: Instant) {
+    /// The member whose first place stands at `place` was heard at `at`:
+    /// the receipt its sample is aged from, at the place's own row among
+    /// the engines' rows. Kept for the ranks of a data-parallel engine,
+    /// and only while an engine has a threshold: a write that starts a
+    /// judgment reads every receipt again from the samples, a membership
+    /// write in its walk and an applied generation by
+    /// [`Self::hear_again`].
+    pub(super) fn hear(&mut self, place: u32, at: Instant) {
         if self.heard.is_empty() || !self.judging {
             return;
         }
-        let (Some(rows), Some(place)) = (
-            self.engines.get(engine as usize),
-            self.places.get(place as usize),
-        ) else {
+        let Some(&slot) = self.place_slots.get(place as usize) else {
             return;
         };
-        let found = rows_of(&self.engine_rows, rows)
-            .iter()
-            .position(|row| row.rank && row.pool == place.pool && row.row == place.row);
-        let heard = found.and_then(|index| self.heard.get_mut(rows.at as usize + index));
-        if let Some(heard) = heard {
+        // A member's later place holds no receipt: its row is no rank's.
+        let rank = self.engine_rows.get(slot as usize);
+        if !rank.is_some_and(|row| row.rank) {
+            return;
+        }
+        if let Some(heard) = self.heard.get_mut(slot as usize) {
             *heard = micros(self.origin, at);
         }
     }
@@ -1660,7 +1664,15 @@ impl Writer {
         // with no veto standing neither collects nor sorts them.
         let standing = !self.vetoes.by_gateway.is_empty();
         let mut ids = Vec::new();
-        for member in members {
+        // The members in id order, by a sort of their ids, each beside its
+        // row: an id is one member, so every pool's entries are pushed in
+        // their own order, and the pool's sort below finds them so in one
+        // pass. Sorted where they stood, a pool's entries moved whole at
+        // every step of its sort.
+        let mut members: Vec<(WorkerId, &'a WorkerRow)> =
+            members.map(|member| (member.id, member)).collect();
+        members.sort_unstable_by_key(|&(id, _)| id);
+        for (_, member) in members {
             if standing {
                 ids.push(member.id);
             }
@@ -1790,6 +1802,7 @@ impl Writer {
         engines.clear();
         self.engine_rows.clear();
         self.place_engines.clear();
+        self.place_slots.clear();
         let carries = !silent.is_empty();
         let mut silenced = 0;
         let mut last = None;
@@ -1873,11 +1886,16 @@ impl Writer {
             self.heard.resize(rows as usize, 0);
             last = None;
             next = 0;
-            for (place, &engine) in self.places.iter().zip(&self.place_engines) {
+            self.place_slots.resize(self.places.len(), u32::MAX);
+            let placed = self.places.iter().zip(&self.place_engines);
+            for (index, (place, &engine)) in placed.enumerate() {
                 let Some(engine) = engines.get_mut(engine as usize) else {
                     continue;
                 };
                 let at = (engine.at + engine.len) as usize;
+                if let Some(slot) = self.place_slots.get_mut(index) {
+                    *slot = at as u32;
+                }
                 let rank = last != Some(place.id);
                 if let Some(row) = self.engine_rows.get_mut(at) {
                     *row = EngineRow {
