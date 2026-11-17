@@ -255,6 +255,9 @@ async fn v1_chat_completions(
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     let model = body.model.clone();
+    // One allocation holds the parsed request from here on: the router
+    // layers below move its pointer, not the 1 KiB request.
+    let body = Arc::new(body);
     cancel
         .guard(
             state

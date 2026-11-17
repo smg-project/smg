@@ -2585,13 +2585,13 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(
             headers,
             Some(tenant_meta),
-            super::chat_for_upstream(body),
+            super::chat_for_upstream(Arc::unwrap_or_clone(body)),
             "/v1/chat/completions",
             model_id,
         )
@@ -3199,7 +3199,9 @@ mod tests {
                     }))
                     .unwrap();
                     request.normalize();
-                    let response = router.route_chat(None, &tenant, request, model).await;
+                    let response = router
+                        .route_chat(None, &tenant, Arc::new(request), model)
+                        .await;
                     let expected = if model == "m1" {
                         StatusCode::OK
                     } else {
@@ -5216,7 +5218,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK);
         }
@@ -5290,7 +5292,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "{model}");
         }
@@ -6620,7 +6622,7 @@ mod tests {
         .unwrap();
         request.normalize();
         let response = router
-            .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK, "{model}");
         let mut body = response.into_body();
@@ -6918,7 +6920,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "{model}");
             assert!(
@@ -6966,7 +6968,7 @@ mod tests {
             .unwrap();
             request.normalize();
             let response = router
-                .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "{model}");
             assert_eq!(

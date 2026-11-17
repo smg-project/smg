@@ -1591,7 +1591,7 @@ async fn chat(
     }))
     .expect("chat request");
     let response = router
-        .route_chat(Some(headers), &tenant_meta, body, model)
+        .route_chat(Some(headers), &tenant_meta, Arc::new(body), model)
         .await;
     let status = response.status();
     let parser = response
