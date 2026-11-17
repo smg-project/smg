@@ -1209,6 +1209,20 @@ mod tests {
         let silent = ServerInfo::Vllm(Box::default()).to_labels();
         assert!(!silent.contains_key("engine_reasoning_parser"));
         assert!(!silent.contains_key("constrained_decoding_start"));
+
+        // The TensorRT-LLM server info names the start in a field of its own.
+        let trtllm = ServerInfo::Trtllm(trtllm_proto::GetServerInfoResponse {
+            constrained_decoding_start: "first_token".to_string(),
+            ..Default::default()
+        })
+        .to_labels();
+        assert_eq!(
+            trtllm.get("constrained_decoding_start").map(String::as_str),
+            Some("first_token")
+        );
+        assert!(!ServerInfo::Trtllm(Default::default())
+            .to_labels()
+            .contains_key("constrained_decoding_start"));
     }
 
     /// The vocabulary of structural-tag nodes a worker's grammar compiler

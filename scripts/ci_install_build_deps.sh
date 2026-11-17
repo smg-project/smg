@@ -62,14 +62,13 @@ fi
 # shellcheck disable=SC2086 # an empty SUDO must vanish, not become an argument
 ${SUDO} dpkg --configure -a --force-confnew 2>/dev/null || true
 
-# The index refresh survives a third-party source of the runner image that
-# does not answer (ci_apt_update.sh): the packages come from the Ubuntu
-# archive alone.
+# The install helper chooses the mirror, refreshes the indexes and installs
+# as one retried unit, and a retry reads another mirror (ci_apt_install.sh).
+# The refresh survives a third-party source of the runner image that does not
+# answer (ci_apt_update.sh): the packages come from the Ubuntu archive alone.
 installed=0
-bash "${here}/ci_apt_mirror.sh" || log "the mirror probe failed; the sources stay as they are"
 # shellcheck disable=SC2086
-if bash "${here}/ci_apt_update.sh" ${SUDO} \
-    && bash "${here}/ci_retry.sh" 3 "${CI_APT_INSTALL_RETRY_DELAY:-10}" ${SUDO} apt-get install -y "${missing[@]}"; then
+if bash "${here}/ci_apt_install.sh" ${SUDO} -y "${missing[@]}"; then
     installed=1
 fi
 

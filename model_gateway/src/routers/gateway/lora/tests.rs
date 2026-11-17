@@ -167,7 +167,7 @@ impl RouterTrait for Capture {
         &self,
         _: Option<&HeaderMap>,
         _: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        body: Arc<ChatCompletionRequest>,
         model: &str,
     ) -> Response {
         Json(json!({"family": self.0, "model": model, "body_model": body.model, "lora_path": body.lora_path, "stream": body.stream})).into_response()
@@ -240,7 +240,7 @@ async fn openai_chat_and_completion_suffixes_route_by_base_across_grpc_families(
                 )
                 .unwrap();
                     for response in [
-                        gateway.route_chat(None, &meta, chat, model).await,
+                        gateway.route_chat(None, &meta, Arc::new(chat), model).await,
                         gateway
                             .route_completion(None, &meta, completion, model)
                             .await,

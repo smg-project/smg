@@ -1030,12 +1030,15 @@ pub(super) fn handle_streaming_with_tool_interception(
 
         // Create session inside spawned task (borrows from orchestrator_clone which lives in closure)
         let session_request_id = format!("resp_{}", uuid::Uuid::now_v7());
-        let session = McpToolSession::new_with_headers(
+        let mut session = McpToolSession::new_with_headers(
             &orchestrator_clone,
             mcp_servers.clone(),
             &session_request_id,
             forwarded_headers.clone(),
         );
+        if let Some(tools) = original_request.tools.as_deref() {
+            openai_bridge::configure_response_tools_approval(&mut session, tools);
+        }
         let mut current_payload = payload;
         prepare_mcp_tools_as_functions(&mut current_payload, &session);
         let mut flags = RelayFlags {

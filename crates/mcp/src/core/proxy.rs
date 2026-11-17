@@ -13,15 +13,15 @@ use crate::error::{McpError, McpResult};
 /// * `global_proxy` - Global proxy configuration from McpConfig
 ///
 /// # Returns
-/// The resolved proxy configuration, or None for direct connection
+/// The resolved proxy configuration, or None when none is configured (the
+/// client then falls back to reqwest's environment proxies, if any)
 pub(crate) fn resolve_proxy_config<'a>(
     server_config: &'a McpServerConfig,
     global_proxy: Option<&'a McpProxyConfig>,
 ) -> Option<&'a McpProxyConfig> {
-    // Priority 1: Check if server has explicit proxy config
-    // Note: server.proxy = Some(config) uses that config
-    //       server.proxy = None (set explicitly in YAML as null) forces direct connection
-    //       server.proxy not set (field missing) falls back to global
+    // Priority 1: the server's own proxy mapping. A missing field and an
+    // explicit `null` are one state (`None`): both fall back to the global
+    // proxy.
     if server_config.proxy.is_some() {
         server_config.proxy.as_ref()
     } else {

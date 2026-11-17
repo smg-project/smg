@@ -6,7 +6,7 @@ use openai_protocol::{
     common::{ToolChoice, ToolChoiceValue},
     profile::ProviderProfile,
 };
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     routers::{
@@ -146,8 +146,23 @@ pub(crate) async fn prepare_chat_like(
             ) {
                 Ok(msgs) => msgs,
                 Err(e) => {
-                    error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                    return Err(error::bad_request("process_messages_failed", e));
+                    // Only a refusal typed as the request's own is the
+                    // client's to fix: one WARN with the cause, the answer
+                    // marked reported. Every other failure (a tokenizer with
+                    // no chat template, a render the template did not refuse
+                    // itself) keeps ERROR and stays unmarked.
+                    let refused = e.is_refusal();
+                    if refused {
+                        warn!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                    } else {
+                        error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                    }
+                    let answer = error::bad_request("process_messages_failed", String::from(e));
+                    return Err(if refused {
+                        utils::reported(answer)
+                    } else {
+                        answer
+                    });
                 }
             };
 
@@ -206,7 +221,7 @@ pub(crate) async fn prepare_chat_like(
             "ChatPreparationStage::execute",
         )?;
         ctx.state.parser_names = Some(parser_names);
-        ctx.state.prompt_thought = prompt_thought;
+        ctx.state.prompt_thought = Some(prompt_thought);
         ctx.state.reading = reading;
 
         let skip_special_tokens = skips_special_tokens(

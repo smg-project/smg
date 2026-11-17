@@ -1643,6 +1643,12 @@ impl CacheAwarePolicy {
     /// fleet mean) and for the holders the index names, never for the whole
     /// pool. A sample without one eligible worker defers to the scan, which
     /// finds any that remain.
+    ///
+    /// A pool is one model's workers (the router pre-filters by model), and
+    /// the scan names the model from its first healthy one. The first worker
+    /// names it here, before a worker is drawn: a model without an event
+    /// index is the scan's to decide, and no sample is drawn and read for a
+    /// decision that has no use for it.
     fn select_worker_sampled(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1657,6 +1663,10 @@ impl CacheAwarePolicy {
         {
             return Sampled::Scan;
         }
+        let pool_model = normalize_model_key(workers[0].model_id());
+        let Some(pool_index) = self.event_index_for(pool_model) else {
+            return Sampled::Scan;
+        };
         let mut sample = [0usize; FLEET_SAMPLE];
         let mut sampled = 0usize;
         let mut load_sum = 0usize;
@@ -1684,9 +1694,16 @@ impl CacheAwarePolicy {
         let sample = &mut sample[..sampled];
         sample.sort_unstable();
         let avg_load = load_sum as f64 / sampled as f64;
+        // The sample's first worker names the index the decision reads; on a
+        // pool of one model that is the pool's own.
         let model_id = normalize_model_key(workers[sample[0]].model_id());
-        let Some(index) = self.event_index_for(model_id) else {
-            return Sampled::Scan;
+        let index = if model_id == pool_model {
+            pool_index
+        } else {
+            let Some(index) = self.event_index_for(model_id) else {
+                return Sampled::Scan;
+            };
+            index
         };
         Sampled::Decided(
             self.select_worker_event_driven(workers, tokens, sample, avg_load, &index, info),

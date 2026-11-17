@@ -889,7 +889,7 @@ async fn responses_take_the_tenant_request_budget_as_chat_does() {
 
         for _ in 0..2 {
             let response = router
-                .route_chat(None, &fresh_tenant(), chat_request(), MODEL)
+                .route_chat(None, &fresh_tenant(), Arc::new(chat_request()), MODEL)
                 .await;
             assert_eq!(response.status(), http::StatusCode::OK);
         }

@@ -57,6 +57,8 @@ NAME = "smg-policy-controller"
 ON = ("policyController.enabled=true",)
 # The block with the election turned on.
 ELECTED = (*ON, "policyController.election.enabled=true")
+# The spellings of an election that is off.
+OFF = ((), ("policyController.election.enabled=false",), ("policyController.election=null",))
 # The variable the elected controller's address is read from: the kubelet
 # writes the pod's address in place of $(POD_IP).
 POD_IP = {"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}
@@ -79,10 +81,14 @@ def helm_template(
     files: tuple[Path, ...] = (),
     chart: Path = CHART,
     namespace: str = "default",
+    skip_schema: bool = False,
 ):
     command = ["helm", "template", "smg", str(chart), "--kube-version", KUBE_VERSION]
     # Pinned so the render never follows the kube context.
     command += ["--namespace", namespace]
+    if skip_schema:
+        # The helper's own refusals are read with the schema's check off.
+        command.append("--skip-schema-validation")
     for file in files:
         command += ["-f", str(file)]
     for setting in settings:
@@ -91,17 +97,23 @@ def helm_template(
 
 
 def render(
-    *settings: str, files: tuple[Path, ...] = (), chart: Path = CHART, namespace: str = "default"
+    *settings: str,
+    files: tuple[Path, ...] = (),
+    chart: Path = CHART,
+    namespace: str = "default",
+    skip_schema: bool = False,
 ) -> list[dict]:
     """The documents the chart renders with ``--set`` pairs."""
-    completed = helm_template(settings, files, chart, namespace)
+    completed = helm_template(settings, files, chart, namespace, skip_schema)
     assert completed.returncode == 0, completed.stderr
     return [document for document in yaml.safe_load_all(completed.stdout) if document]
 
 
-def render_error(*settings: str, files: tuple[Path, ...] = (), chart: Path = CHART) -> str:
+def render_error(
+    *settings: str, files: tuple[Path, ...] = (), chart: Path = CHART, skip_schema: bool = False
+) -> str:
     """Helm's error for ``--set`` pairs the chart must refuse."""
-    completed = helm_template(settings, files, chart)
+    completed = helm_template(settings, files, chart, skip_schema=skip_schema)
     assert completed.returncode != 0, "the chart rendered values it should refuse"
     return completed.stderr
 
@@ -584,6 +596,7 @@ def test_the_arguments_follow_the_values():
         "policyController.ports.control=31101",
         "policyController.ports.replication=31102",
         "policyController.ports.admin=31103",
+        "policyController.identityAsTold={gateway,control}",
         "policyController.shutdownGracePeriodSeconds=60",
         "policyController.shutdownSettleSeconds=20",
         "policyController.terminationGraceMarginSeconds=15",
@@ -601,6 +614,8 @@ def test_the_arguments_follow_the_values():
         "0.0.0.0:31102",
         "--admin-listen",
         "0.0.0.0:31103",
+        "--identity-as-told",
+        "gateway,control",
         "--shutdown-grace-period-secs",
         "60",
         "--shutdown-settle-secs",
@@ -629,6 +644,16 @@ def test_the_arguments_follow_the_values():
     # the controller's default.
     zero = controller_args("policyController.shutdownSettleSeconds=0")
     assert zero[zero.index("--shutdown-settle-secs") + 1] == "0"
+    # No listener takes a caller's stated name unless the values name it: an
+    # empty list and a null pass no flag, and the controller then names none.
+    assert "--identity-as-told" not in controller_args()
+    assert "--identity-as-told" not in controller_args("policyController.identityAsTold=null")
+    told = controller_args("policyController.identityAsTold={replication}")
+    assert told[told.index("--identity-as-told") + 1] == "replication"
+    # The value is a set: it renders in the listeners' own order however it
+    # was written, so a reorder rolls no pod.
+    reordered = controller_args("policyController.identityAsTold={replication,gateway}")
+    assert reordered[reordered.index("--identity-as-told") + 1] == "gateway,replication"
 
 
 @needs_helm
@@ -661,7 +686,8 @@ def test_the_values_the_chart_hands_on_reach_their_objects(tmp_path):
             }
         )
     )
-    documents = render(*ON, files=(values,))
+    # Three replicas render with the election on alone.
+    documents = render(*ELECTED, files=(values,))
     deployment = one(documents, "Deployment")["spec"]
     pod = deployment["template"]["spec"]
     found = container(documents)
@@ -672,7 +698,7 @@ def test_the_values_the_chart_hands_on_reach_their_objects(tmp_path):
     assert pod["tolerations"] == handed_on["tolerations"]
     assert deployment["template"]["metadata"]["annotations"] == handed_on["podAnnotations"]
     assert deployment["template"]["metadata"]["labels"]["team"] == "routing"
-    assert found["env"] == handed_on["extraEnv"]
+    assert found["env"] == [POD_IP, *handed_on["extraEnv"]]
     # A map of the values file joins the default's: the other keys stay.
     assert found["securityContext"]["runAsUser"] == 1000
     assert found["securityContext"]["readOnlyRootFilesystem"] is True
@@ -707,7 +733,7 @@ def test_replicas_prefer_a_node_each_unless_an_affinity_is_given():
     assert single["replicas"] == 1
     assert "affinity" not in single["template"]["spec"]
 
-    pair = one(render(*ON, "policyController.replicas=2"), "Deployment")["spec"]
+    pair = one(render(*ELECTED, "policyController.replicas=2"), "Deployment")["spec"]
     (term,) = pair["template"]["spec"]["affinity"]["podAntiAffinity"][
         "preferredDuringSchedulingIgnoredDuringExecution"
     ]
@@ -718,7 +744,7 @@ def test_replicas_prefer_a_node_each_unless_an_affinity_is_given():
 
     own = one(
         render(
-            *ON,
+            *ELECTED,
             "policyController.replicas=2",
             "policyController.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution"
             ".nodeSelectorTerms[0].matchExpressions[0].key=zone",
@@ -881,28 +907,51 @@ def test_the_rollout_follows_the_election():
 @needs_helm
 def test_with_the_election_off_nothing_of_it_is_rendered():
     """A release that does not turn the election on renders what it rendered
-    before the election, in each spelling of off and at any replica count:
-    no object of the election, and on the controller's Deployment no
-    strategy, no account, no variable and neither flag."""
-    for off in (
-        (),
-        ("policyController.election.enabled=false",),
-        ("policyController.election=null",),
-    ):
-        for replicas in (1, 2):
-            documents = render(*ON, f"policyController.replicas={replicas}", *off)
-            kinds = sorted(document["kind"] for document in of_the_controller(documents))
-            assert kinds == ["Deployment", "Service"], off
-            deployment = one(documents, "Deployment")["spec"]
-            assert deployment["replicas"] == replicas, off
-            assert "strategy" not in deployment, off
-            pod = deployment["template"]["spec"]
-            assert "serviceAccountName" not in pod, off
-            assert "serviceAccount" not in pod, off
-            assert pod["automountServiceAccountToken"] is False, off
-            lone = container(documents)
-            assert "env" not in lone, off
-            assert not {"--lease-name", "--advertise-address"} & set(lone["args"]), off
+    before the election, in each spelling of off: no object of the
+    election, and on the controller's Deployment of one replica no strategy,
+    no account, no variable and neither flag."""
+    for off in OFF:
+        documents = render(*ON, *off)
+        kinds = sorted(document["kind"] for document in of_the_controller(documents))
+        assert kinds == ["Deployment", "Service"], off
+        deployment = one(documents, "Deployment")["spec"]
+        assert deployment["replicas"] == 1, off
+        assert "strategy" not in deployment, off
+        pod = deployment["template"]["spec"]
+        assert "serviceAccountName" not in pod, off
+        assert "serviceAccount" not in pod, off
+        assert pod["automountServiceAccountToken"] is False, off
+        lone = container(documents)
+        assert "env" not in lone, off
+        assert not {"--lease-name", "--advertise-address"} & set(lone["args"]), off
+
+
+@needs_helm
+def test_more_than_one_replica_needs_the_election():
+    """With the election off every replica is a controller of its own: two
+    would each lead alone. The render refuses them in each spelling of off
+    and says the two ways out; with the election on they render."""
+    for off in OFF:
+        for replicas in (2, 3):
+            refused = render_error(*ON, f"policyController.replicas={replicas}", *off)
+            assert (
+                f"policyController.replicas is {replicas} with policyController.election.enabled"
+                " off: each replica would lead alone. Turn the election on, or keep one replica"
+            ) in refused, off
+    pair = one(render(*ELECTED, "policyController.replicas=2"), "Deployment")["spec"]
+    assert pair["replicas"] == 2
+
+
+@needs_helm
+def test_a_replica_count_the_schema_refuses_is_written_as_asked():
+    """With the schema's check skipped the helper compares the count and
+    writes the value as the values hold it. A null stays the API's default
+    of one replica and a fraction stays for the API to refuse: neither is
+    written as zero."""
+    unset = render(*ON, "policyController.replicas=null", skip_schema=True)
+    assert one(unset, "Deployment")["spec"]["replicas"] is None
+    fraction = render(*ON, "policyController.replicas=1.5", skip_schema=True)
+    assert one(fraction, "Deployment")["spec"]["replicas"] == 1.5
 
 
 @pytest.fixture
@@ -921,12 +970,11 @@ def chart_with_no_election(tmp_path) -> Path:
 @needs_helm
 def test_the_election_over_reused_values_renders_a_fresh_install(chart_with_no_election):
     """Over values that hold no election the controller renders what a fresh
-    install renders, byte for byte: off with nothing set, at one replica and
-    at two, and on, with the Lease under the controller's own name or a
+    install renders, byte for byte: off with nothing set, and on at one
+    replica and at two, with the Lease under the controller's own name or a
     given one."""
     cells = (
         ON,
-        (*ON, "policyController.replicas=2"),
         ELECTED,
         (*ELECTED, "policyController.replicas=2"),
         (*ELECTED, "policyController.election.leaseName=routing"),
@@ -965,6 +1013,21 @@ def test_the_chart_refuses_what_the_controller_refuses_at_start():
         "policyController.shutdownGracePeriodSeconds=1",
         "policyController.shutdownSettleSeconds=0",
     )
+    # A name that is none of the chart's three listeners is refused by the
+    # schema, and by the helper where the schema's check is skipped: it never
+    # renders as no flag at all.
+    for names in ("{admin}", "{ingestion}", "{gateway,admin}"):
+        unknown = render_error(*ON, f"policyController.identityAsTold={names}", skip_schema=True)
+        assert "policyController.identityAsTold names" in unknown
+        assert "none of the chart's listeners (gateway, control, replication)" in unknown
+    assert "policyController.identityAsTold is gateway" in render_error(
+        *ON, "policyController.identityAsTold=gateway", skip_schema=True
+    )
+    # The names the schema takes render the same with its check skipped.
+    told = container(
+        render(*ON, "policyController.identityAsTold={replication,gateway}", skip_schema=True)
+    )["args"]
+    assert told[told.index("--identity-as-told") + 1] == "gateway,replication"
 
 
 def schema_block() -> dict:
@@ -1013,6 +1076,12 @@ def test_the_schema_refuses_a_value_the_block_does_not_have():
             *ON, f"policyController.runtimeWorkerThreads={threads}"
         )
     assert "policyController.ports.admin" in render_error(*ON, "policyController.ports.admin=65536")
+    # A listener is named by one of the chart's three names, once, in a list:
+    # the controller refuses a name that is no listener at its start.
+    for names in ("{admin}", "{ingestion}", "{gateway,gateway}", "gateway"):
+        assert "policyController.identityAsTold" in render_error(
+            *ON, f"policyController.identityAsTold={names}"
+        )
     # An empty path is no path: the kubelet would ask the root.
     for probe in ("livenessProbe", "readinessProbe"):
         assert f"policyController.{probe}.path" in render_error(
@@ -1058,6 +1127,7 @@ SAME_AS_THE_DEFAULT = {
     "podLabels",
     "extraArgs",
     "extraEnv",
+    "identityAsTold",
     "shutdownSettleSeconds",
     # The election off, and the Lease under the controller's own name.
     "election",
@@ -1197,6 +1267,7 @@ ARGUMENT_SETS = {
         "policyController.ports.replication=31102",
         "policyController.ports.admin=31103",
     ),
+    "listeners-as-told": ("policyController.identityAsTold={gateway,control,replication}",),
     "extra-arguments": (
         "policyController.extraArgs={--ingestion-listen,0.0.0.0:30104,--load-monitor-interval,2}",
     ),
@@ -1301,11 +1372,15 @@ def test_the_image_job_starts_on_what_these_cases_read():
         REPO / "rust-toolchain.toml",
         crate / "Cargo.toml",
         crate / "build.rs",
-        crate / "src" / "main.rs",
+        crate / "src" / "bin" / "smg-policy-controller.rs",
         crate / "contracts" / "smg-policy.wit",
         # The engine wire's messages the controller's protocol imports: the
         # build script reads them beside the contract.
         REPO / "crates" / "grpc_client" / "proto" / "common.proto",
+        # The example controller, whose image the job builds beside the
+        # stock one: its package and what the package compiles.
+        REPO / "examples" / "policy-controller" / "Cargo.toml",
+        REPO / "examples" / "policy-controller" / "src" / "main.rs",
     ] + [
         path
         for path in sorted(CHART.rglob("*"))
@@ -1346,8 +1421,9 @@ def refusal(binary: str, args: list[str]) -> str:
 
 
 def test_the_binary_refuses_at_start_what_the_chart_refuses_at_render(binary):
-    """The two refusals of the chart, as the controller words them: the rule
-    and the default window are the controller's, not the chart's guess."""
+    """The refusals of the chart, as the controller words them: the rule, the
+    default window and the listeners' names are the controller's, not the
+    chart's guess."""
     port = free_ports(1)[0]
     shared = refusal(
         binary, ["--gateway-listen", f"127.0.0.1:{port}", "--control-listen", f"127.0.0.1:{port}"]
@@ -1356,14 +1432,36 @@ def test_the_binary_refuses_at_start_what_the_chart_refuses_at_render(binary):
     grace = 2 * DEFAULT_SETTLE_SECONDS - 1
     over = refusal(binary, ["--shutdown-grace-period-secs", str(grace)])
     assert f"settle window of {DEFAULT_SETTLE_SECONDS}s is over half the grace period" in over
+    # A name the schema refuses is no listener of the controller's. The
+    # controller binds its listeners before it reads the name, so they take
+    # ports of the case's own: a host that holds a default port reads the
+    # same refusal.
+    gateway, control, replication, admin = free_ports(4)
+    unknown = refusal(
+        binary,
+        [
+            "--gateway-listen",
+            f"127.0.0.1:{gateway}",
+            "--control-listen",
+            f"127.0.0.1:{control}",
+            "--replication-listen",
+            f"127.0.0.1:{replication}",
+            "--admin-listen",
+            f"127.0.0.1:{admin}",
+            "--identity-as-told",
+            "admin",
+        ],
+    )
+    assert 'no listener is named "admin"' in unknown
 
 
 @needs_helm
 def test_the_binary_starts_on_the_rendered_arguments(binary):
     """The controller started with exactly what the Deployment passes (on
-    ports free here, a short grace period) answers its readiness probe and
-    stops clean on SIGTERM."""
-    gateway, control, replication, admin = free_ports(4)
+    ports free here, a short grace period, each gRPC listener named to take
+    identities as told) answers its readiness probe and stops clean on
+    SIGTERM."""
+    gateway, control, replication, admin, ingestion = free_ports(5)
     documents = render(
         *ON,
         f"policyController.ports.gateway={gateway}",
@@ -1372,6 +1470,12 @@ def test_the_binary_starts_on_the_rendered_arguments(binary):
         f"policyController.ports.admin={admin}",
         "policyController.shutdownGracePeriodSeconds=4",
         "policyController.shutdownSettleSeconds=1",
+        "policyController.identityAsTold={gateway,control,replication}",
+        # A flag in extraArgs adds to the value's set: the ingestion listener
+        # is named where it is turned on, and a name said in both places
+        # names its listener once more.
+        "policyController.extraArgs={--ingestion-listen,"
+        f"127.0.0.1:{ingestion},--identity-as-told,ingestion,--identity-as-told,gateway}}",
         "router.metrics.serviceMonitor.enabled=true",
     )
     found = container(documents)
@@ -1426,6 +1530,13 @@ def test_the_binary_starts_on_the_rendered_arguments(binary):
         # The output is a pipe here, as it is under a container runtime: the
         # log is plain text, with no color escape.
         assert "smg_policy_controller" in output, "the controller logged nothing"
+        # Each of the chart's three names is a listener of the controller's,
+        # and so is the one extraArgs turns on: the controller says so once
+        # a naming, the gateways' listener named in both places twice.
+        told = [line for line in output.splitlines() if "identities are taken as told" in line]
+        assert len(told) == 5, output
+        for listener in ("gateway", "control", "replication", "ingestion"):
+            assert any(f"listener={listener}" in line for line in told), (listener, output)
         assert "\x1b" not in output, f"an escape byte with no terminal: {output!r}"
     finally:
         if process.poll() is None:

@@ -64,7 +64,7 @@ jobs:
       - name: Lint
         run: |
           source "$HOME/.cargo/env"
-          rustup component add clippy
+          bash scripts/ci_retry.sh 5 10 timeout 180 rustup component add clippy
           for leg in all-features self-hosted anthropic-only; do
             bash scripts/ci_rust_tests.sh lint "$leg"
           done

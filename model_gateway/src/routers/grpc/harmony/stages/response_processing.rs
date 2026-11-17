@@ -79,7 +79,7 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                     error::internal_error("no_execution_result", "No execution result")
                 })?;
 
-                let dispatch = ctx.dispatch.as_ref().cloned().ok_or_else(|| {
+                let dispatch = ctx.dispatch.take().ok_or_else(|| {
                     error!(
                         function = "HarmonyResponseProcessingStage::process",
                         request_type = "Chat",
@@ -156,7 +156,7 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                     error::internal_error("no_execution_result", "No execution result")
                 })?;
 
-                let dispatch = ctx.dispatch.as_ref().cloned().ok_or_else(|| {
+                let dispatch = ctx.dispatch.take().ok_or_else(|| {
                     error!(
                         function = "HarmonyResponseProcessingStage::process",
                         request_type = "Responses",

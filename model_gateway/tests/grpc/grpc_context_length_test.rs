@@ -329,7 +329,9 @@ async fn regular_over_long_chat_prompt_is_a_400() {
     }))
     .unwrap();
 
-    let response = router.route_chat(None, &tenant(), request, MODEL).await;
+    let response = router
+        .route_chat(None, &tenant(), Arc::new(request), MODEL)
+        .await;
 
     assert_context_length_rejection(response).await;
 }
@@ -430,7 +432,12 @@ async fn regular_budget_beyond_the_window_is_a_400_on_every_route() {
         }))
         .expect("a generate request");
         let answers = [
-            ("chat", router.route_chat(None, &tenant, chat, MODEL).await),
+            (
+                "chat",
+                router
+                    .route_chat(None, &tenant, Arc::new(chat), MODEL)
+                    .await,
+            ),
             (
                 "completions",
                 router
