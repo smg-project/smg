@@ -25,10 +25,13 @@ use smg::{
     config::{GroupedDpSticky, ParserChoice},
     middleware::{RouteRequestMeta, TenantKey},
     routers::{
-        grpc::backend_client::{get_backend_client, BackendClient},
+        grpc::backend_client::{get_backend_client, BackendClient, BackendConnector},
         RouterTrait,
     },
-    worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
+    worker::{
+        connection::engine::{EngineConnector, ZmqLink},
+        BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
+    },
 };
 
 use crate::common;
@@ -1103,4 +1106,58 @@ async fn usage_prompt_count_over_zmq_is_the_gateways_until_the_engine_reports_on
             );
         }
     }
+}
+
+/// What the gateway's connector is handed for a worker of `worker_type` on
+/// `fixture`'s sockets, as the worker's handshake driver fills it in.
+fn zmq_link(fixture: &ZmqFixture, worker_type: WorkerType, engines: Option<usize>) -> ZmqLink {
+    ZmqLink {
+        base_url: fixture.worker_url.clone(),
+        model_id: MODEL.to_string(),
+        runtime: RuntimeType::Vllm,
+        worker_type,
+        handshake_address: Some(fixture.handshake.clone()),
+        engine_count: engines,
+        startup: Duration::from_secs(60),
+        request_timeout: None,
+    }
+}
+
+/// The gateway's connector checks the role each engine declared against the
+/// worker's once the handshake has landed: an engine that takes whole
+/// requests is refused behind a worker registered as a decode worker.
+#[tokio::test]
+#[serial]
+async fn the_gateways_connector_refuses_an_engine_of_another_role() {
+    let fixture = zmq_fixture();
+    start_mock_zmq_engines(&fixture.handshake, 1);
+
+    let refusal = BackendConnector
+        .connect_zmq(zmq_link(&fixture, WorkerType::Decode, None))
+        .await
+        .err()
+        .expect("a whole-request engine behind a decode worker");
+    assert!(
+        refusal.contains("declared disaggregation role"),
+        "{refusal}"
+    );
+}
+
+/// The gateway's connector hands the worker's engine count to the handshake:
+/// a link told two engines connects both, where two engines that declare no
+/// group would each be taken alone.
+#[tokio::test]
+#[serial]
+async fn the_gateways_connector_hands_the_engine_count_to_the_handshake() {
+    let fixture = zmq_fixture();
+    start_mock_zmq_engines(&fixture.handshake, 2);
+
+    let connection = BackendConnector
+        .connect_zmq(zmq_link(&fixture, WorkerType::Regular, Some(2)))
+        .await
+        .expect("two engines behind a link told two");
+    let client = connection
+        .downcast_arc::<BackendClient>()
+        .expect("the gateway's own client");
+    assert_eq!(client.connected_engines(), Some(2));
 }

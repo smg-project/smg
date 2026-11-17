@@ -643,6 +643,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         None
     }
 
+    /// What makes this worker's engine connection: the connector it was
+    /// built with, when it holds one. A caller that needs a connection of
+    /// its own to the worker's engine connects through it.
+    fn engine_connector(&self) -> Option<Arc<dyn EngineConnector>> {
+        None
+    }
+
     // ── Metadata convenience delegates ──────────────────────────────
     //
     // These default impls forward to the canonical implementation on
@@ -1805,6 +1812,10 @@ impl Worker for BasicWorker {
 
     fn engine_connection_if_initialized(&self) -> Option<Arc<dyn EngineConnection>> {
         self.engine_connection.load_full().get().cloned()
+    }
+
+    fn engine_connector(&self) -> Option<Arc<dyn EngineConnector>> {
+        self.engine_connector.clone()
     }
 
     fn supports_model(&self, model_id: &str) -> bool {

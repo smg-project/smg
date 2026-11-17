@@ -149,11 +149,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
             builder = builder.circuit_breaker_config(config);
         }
         // The rebuild connects the way the live worker does.
-        if let Some(connector) = worker
-            .as_any()
-            .downcast_ref::<BasicWorker>()
-            .and_then(|basic| basic.engine_connector.clone())
-        {
+        if let Some(connector) = worker.engine_connector() {
             builder = builder.engine_connector(connector);
         }
         if let Some(timeout) = metadata.zmq_request_timeout {
