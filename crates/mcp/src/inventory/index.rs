@@ -371,8 +371,9 @@ impl ToolInventory {
     /// the aliases that target a dropped tool, index and entry alike. An
     /// alias that targets a kept tool takes that tool's definition as it is
     /// now: its entry is a copy, and the listing may have changed the tool.
-    /// A refresh installs its listing first and calls this after, so a
-    /// reader never finds the server without the tools both listings hold.
+    /// A refresh or a reconnect installs its listing first and calls this
+    /// after, so a reader never finds the server without the tools both
+    /// listings hold.
     pub fn retain_server_tool_entries(&self, server_key: &str, listed: &HashSet<String>) {
         let dropped: Vec<QualifiedToolName> = self
             .tools_by_server
