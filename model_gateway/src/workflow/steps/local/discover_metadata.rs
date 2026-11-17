@@ -108,6 +108,15 @@ impl TryFrom<serde_json::Value> for ModelsResponseEntry {
             max_model_len: Option<usize>,
         }
         let identity: Identity = serde_json::from_value(raw.clone())?;
+        if identity.id.is_none()
+            && identity.owned_by.is_none()
+            && identity.root.is_none()
+            && identity.max_model_len.is_none()
+        {
+            return Err(serde::de::Error::custom(
+                "model entry has no identity fields",
+            ));
+        }
         Ok(Self {
             owned_by: identity.owned_by,
             id: identity.id,
@@ -1397,6 +1406,9 @@ mod tests {
         let body = json!({"object": "list", "data": [
             {"id": 42},
             null,
+            {},
+            {"future_field": true},
+            {"id": null, "owned_by": null, "root": null, "max_model_len": null},
             ["vllm", "positional-model", "wrong/checkpoint", 1],
             expected.clone(),
             {"id": "malformed", "max_model_len": "invalid"},
@@ -1483,6 +1495,11 @@ mod tests {
             json!({"data": null}),
             json!({"data": {"id": "served"}}),
             json!({"data": [{"id": 42}, null, ["vllm", "positional", "root", 1]]}),
+            json!({"data": [null, {}]}),
+            json!({"data": [
+                {"future_field": true},
+                {"id": null, "owned_by": null, "root": null, "max_model_len": null}
+            ]}),
         ] {
             let base = serve_json_routes(vec![("/v1/models", StatusCode::OK, body)]).await;
             assert!(fetch_vllm_http_metadata(&client, &base, None)
@@ -1507,6 +1524,25 @@ mod tests {
             fetch_sglang_http_metadata_checked(&client, &base, None, true).await,
         ] {
             assert!(result.expect("an empty catalog is valid").is_empty());
+        }
+    }
+
+    /// Engines may supply only one identity field; filtering empty siblings
+    /// must preserve those partial objects without inventing missing fields.
+    #[test]
+    fn model_metadata_preserves_each_supported_partial_identity() {
+        use serde_json::json;
+
+        for entry in [
+            json!({"id": "served"}),
+            json!({"owned_by": "vllm"}),
+            json!({"root": "org/checkpoint"}),
+            json!({"max_model_len": 4096}),
+        ] {
+            let models: ModelsResponse =
+                serde_json::from_value(json!({"data": [{}, entry.clone(), {}]})).unwrap();
+            assert_eq!(models.data.len(), 1);
+            assert_eq!(models.data[0].model_object, entry);
         }
     }
 
