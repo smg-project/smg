@@ -3,7 +3,7 @@
 //! to its binding and decides. A scorer or picker allocates nothing per
 //! decision: scratch lives in the per-thread [`Scratch`] the host keeps.
 
-use std::fmt::Debug;
+use std::{collections::HashMap, fmt::Debug};
 
 use crate::{
     builtins::{target_of, Best, FewestSessions, LeastRequests, Random},
@@ -1917,6 +1917,55 @@ impl Engine {
     /// read the request text" and its kin, read at apply.
     pub fn needs_for_phase(&self, phase: Phase) -> Needs {
         self.phase_needs[slot(phase)]
+    }
+
+    /// What a host must feed, as rows: one for each model glob the bindings
+    /// write and each phase with something to feed, in the bindings' order
+    /// (design 5.1's needs summary). A row is an obligation and not the
+    /// lookup: a host that feeds, for a model and a phase, every row whose
+    /// glob matches the model feeds what any decision of that model and
+    /// phase reads ([`Self::needs_for`]), and copies neither the bindings'
+    /// order nor the pair's rule. The union feeds over where an earlier
+    /// binding with fewer needs shadows a later one.
+    ///
+    /// A binding's row is its profile's stages and its sessions rule, for
+    /// each phase it covers. A pair's decode profile is a decode row of the
+    /// pair binding's glob, whichever binding a decode lookup resolves to.
+    /// Two bindings of one glob write one row a phase.
+    pub fn needs_rows(&self) -> Vec<(&str, Phase, Needs)> {
+        let mut rows: Vec<(&str, Phase, Needs)> = Vec::new();
+        let mut held: HashMap<(&str, Phase), usize> = HashMap::new();
+        for entry in &self.bindings {
+            let binding = &entry.binding;
+            let covers = |phase| binding.phases.is_empty() || binding.phases.contains(&phase);
+            let profile = |phase| {
+                profile_index(binding, phase)
+                    .and_then(|index| self.profiles.get(usize::from(index)))
+            };
+            let pairs = matches!(binding.plan, Plan::PdPair | Plan::Epd { .. });
+            for phase in PHASES {
+                let mut needs = Needs::default();
+                if let Some(profile) = profile(phase).filter(|_| covers(phase)) {
+                    needs = profile.needs().or(session_needs(binding));
+                }
+                // The decode side of every pair this binding's prefill
+                // lookup starts.
+                if phase == Phase::Decode && pairs && covers(Phase::Prefill) {
+                    needs = needs.or(profile(phase).map(Profile::needs).unwrap_or_default());
+                }
+                if needs == Needs::default() {
+                    continue;
+                }
+                let key = (binding.model.as_str(), phase);
+                if let Some(&row) = held.get(&key) {
+                    rows[row].2 = rows[row].2.or(needs);
+                } else {
+                    held.insert(key, rows.len());
+                    rows.push((key.0, phase, needs));
+                }
+            }
+        }
+        rows
     }
 
     pub fn profiles(&self) -> &[Profile] {
@@ -3979,6 +4028,60 @@ mod tests {
             }
             other => panic!("an unbound model answered {other:?}"),
         }
+    }
+
+    /// A pair's decode profile is a decode row of the pair binding's glob,
+    /// whatever phases the binding covers: an engine built by hand may bind
+    /// a pair for the prefill phase alone, and a decode decision of that
+    /// model carries the pair's decode profile.
+    #[test]
+    fn a_pairs_decode_profile_is_a_needs_row_of_the_pairs_glob() {
+        #[derive(Debug)]
+        struct Fed;
+
+        impl Lifecycle for Fed {}
+
+        impl Filter for Fed {
+            fn name(&self) -> &'static str {
+                "fed"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn needs(&self) -> Needs {
+                Needs {
+                    loads: true,
+                    ..Needs::default()
+                }
+            }
+        }
+
+        let quiet = least_requests_profile();
+        let fed = Profile {
+            filters: vec![Box::new(Fed)],
+            ..least_requests_profile()
+        };
+        let decode = fed.needs();
+        assert_eq!(quiet.needs(), Needs::default());
+        assert!(decode.loads);
+        let engine = Engine::new(
+            vec![quiet, fed],
+            vec![Binding {
+                model: "pd/*".into(),
+                phases: vec![Phase::Prefill],
+                plan: Plan::PdPair,
+                profile: 0,
+                decode_profile: Some(1),
+                sessions: None,
+                overload: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        assert_eq!(engine.needs_for("pd/x", Phase::Decode), decode);
+        assert_eq!(engine.needs_rows(), [("pd/*", Phase::Decode, decode)]);
     }
 
     #[test]

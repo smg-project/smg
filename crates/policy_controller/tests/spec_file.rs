@@ -343,6 +343,15 @@ async fn a_dry_run_on_a_running_replica_answers_its_verdict_and_writes_nothing()
     let would = led.await.expect("the leader answers").expect("a verdict");
     assert!(would.accepted && would.read_only, "{would:?}");
     assert_eq!(would.generation, 2);
+    // The feed before and after: the standing document reads the loads, and
+    // the offered one reads nothing.
+    let feed = would.needs.expect("the needs diff");
+    let before = feed.before.expect("the feed before");
+    assert!(
+        !before.models.is_empty() && before.models.iter().all(|row| row.loads),
+        "{before:?}"
+    );
+    assert!(feed.after.expect("the feed after").models.is_empty());
 
     let unweighed = LEAST_LOAD.replace("[least-load]", "[{ least-load: { weight: -1.0 } }]");
     let refused = apply(&replica, ApplyMode::DryRun, &unweighed)
