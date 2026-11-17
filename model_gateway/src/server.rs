@@ -433,6 +433,9 @@ async fn v1_messages(
         return refused;
     }
     let model = body.model.clone();
+    // As for chat: the router layers below move this pointer, not the
+    // parsed request.
+    let body = Arc::new(body);
     cancel
         .guard(
             state
