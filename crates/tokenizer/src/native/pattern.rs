@@ -5218,10 +5218,13 @@ mod tests {
         // A text of more than `block::PLACES` steps is asked at that many
         // places, further apart: here every second place of the short
         // step. A stretch one of the others alone would begin is passed
-        // over, and the text keeps the scanner's loop.
+        // over, and the text keeps the scanner's loop. The stretch is the
+        // two blocks a place is asked for and no more, so it ends before
+        // the next place whatever the step.
         let step = 2 * block::SAMPLE;
-        let rest = "я".repeat((block::PLACES * step - text.len()) / 'я'.len_utf8());
-        let stretch_at = |at: usize| format!("{}{text}{}", &rest[..at], &rest[at..]);
+        let stretch = &text[..2 * block::BLOCK];
+        let rest = "я".repeat((block::PLACES * step - stretch.len()) / 'я'.len_utf8());
+        let stretch_at = |at: usize| format!("{}{stretch}{}", &rest[..at], &rest[at..]);
         assert!(template.by_blocks(&stretch_at(step)).is_some());
         assert!(template.by_blocks(&stretch_at(block::SAMPLE)).is_none());
         // A blank run behind a line break that runs through the whole next
