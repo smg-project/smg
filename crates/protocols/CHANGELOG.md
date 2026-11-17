@@ -413,3 +413,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `add_special_tokens`, `normalize`, `priority`, `extra_body`, ...). The relay re-serializes the
   typed body and dropped every key the types did not declare. Breaking: the two structs gain the
   field `other: serde_json::Map<String, Value>`.
+- A Messages conversation that replays the public API's server tool results (`web_fetch_tool_result`,
+  `code_execution_tool_result`, `bash_code_execution_tool_result`,
+  `text_editor_code_execution_tool_result`) or sends a `container_upload` block is accepted, and the
+  blocks are forwarded as written. Each was an unknown variant of `InputContentBlock`, which refused
+  the whole request, a token count included. Breaking: `InputContentBlock` gains the five variants,
+  and the crate gains `ServerToolResultBlock` and `ContainerUploadParam`.
