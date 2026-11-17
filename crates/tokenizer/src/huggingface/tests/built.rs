@@ -415,23 +415,27 @@ fn a_replaced_template_is_judged_anew() {
     assert_eq!(render(&tok, json!("a[/INST:x]b")).1, TYPED_AS_THE_CONTROL);
 }
 
+/// A checkpoint over `conversion`, a tokenizer file, with a named pair of
+/// templates: the default one builds its controls, `tool_use` is the other.
+fn named_pair(dir: &Path, conversion: &str, tool_use: &str) -> HuggingFaceTokenizer {
+    fs::write(dir.join("tokenizer.json"), conversion).unwrap();
+    fs::write(
+        dir.join("tokenizer_config.json"),
+        json!({"eos_token": "</s:x>", "unk_token": "<unk>", "chat_template": [
+            {"name": "default", "template": builds()},
+            {"name": "tool_use", "template": tool_use},
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    HuggingFaceTokenizer::from_file(dir.join("tokenizer.json").to_str().unwrap()).unwrap()
+}
+
 #[test]
 fn a_named_pair_of_templates_is_marked_together_or_not_at_all() {
     let pair = |tool_use: String| {
         let temp = TempDir::new().unwrap();
-        fs::write(temp.path().join("tokenizer.json"), TOKENIZER_JSON).unwrap();
-        fs::write(
-            temp.path().join("tokenizer_config.json"),
-            json!({"eos_token": "</s:x>", "unk_token": "<unk>", "chat_template": [
-                {"name": "default", "template": builds()},
-                {"name": "tool_use", "template": tool_use},
-            ]})
-            .to_string(),
-        )
-        .unwrap();
-        let tok =
-            HuggingFaceTokenizer::from_file(temp.path().join("tokenizer.json").to_str().unwrap())
-                .unwrap();
+        let tok = named_pair(temp.path(), TOKENIZER_JSON, &tool_use);
         let tools = [json!({"type": "function", "function": {"name": "f"}})];
         let with_tools = ChatTemplateParams {
             tools: Some(tools.as_slice()),
@@ -461,6 +465,31 @@ fn a_named_pair_of_templates_is_marked_together_or_not_at_all() {
         pair(spells()),
         (typed_as_the_control.clone(), typed_as_the_control)
     );
+}
+
+/// A control that only the second template of a named pair builds is read
+/// against the vocabulary with the default template's: where a longer added
+/// token begins with it, neither template is marked and no matcher is
+/// built; without that token both are marked.
+#[test]
+fn a_control_of_a_second_named_template_is_read_against_the_vocabulary() {
+    let tool_use =
+        builds() + "{% set call = '[CALL{}]'.format(suffix) %}{% if tools %}{{ call }}{% endif %}";
+    let call = with_added_token("[CALL:x]");
+    let longer = call
+        .replace(
+            r#""special": false}],"#,
+            r#""special": false},
+        {"id": 20, "content": "[CALL:x]a", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false}],"#,
+        )
+        .replace(r#""[CALL:x]": 19}"#, r#""[CALL:x]": 19, "[CALL:x]a": 20}"#);
+    assert!(longer.contains(r#""id": 20"#) && longer.contains(r#"": 20}"#));
+    for (conversion, marked) in [(&call, true), (&longer, false)] {
+        let temp = TempDir::new().unwrap();
+        let tok = named_pair(temp.path(), conversion, &tool_use);
+        assert_eq!(tok.chat_template.marked(), marked);
+        assert!(marked || tok.core.added.get().is_none());
+    }
 }
 
 #[test]
