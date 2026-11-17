@@ -162,11 +162,12 @@ impl Narrowed {
     }
 }
 
-/// The most rows a decision that draws first ([`Picker::draw_first`]) may see
-/// refused before it stops drawing: the one bound every picker that draws
-/// first counts against. A draw asks the filters about no more rows than
-/// the targets it hands out and these, and a decision about no more than
-/// those and the whole pass's.
+/// The most rows a decision that draws its one or two picks first
+/// ([`Picker::draw_first`]) may see refused before it stops drawing: the
+/// bound those pickers count against. Such a draw asks the filters about no
+/// more rows than the targets it hands out and these, and a decision about
+/// no more than those and the whole pass's. A picker that draws a sample
+/// counts none: its own draws, twice the sample, bound what it asks.
 pub const DRAW_BOUND: u32 = 8;
 
 /// The smallest pool at which a decision draws first, set by run. A draw
@@ -240,8 +241,9 @@ pub trait Picker: Lifecycle + Debug {
     /// it hands out, each one kept by `keep` and none twice: the scorers are
     /// handed them and [`Picker::order_drawn`] orders them. On `false`
     /// nothing is decided, what `kept` holds is dropped and the whole pass
-    /// runs: the picker does not draw first, or [`DRAW_BOUND`] rows were
-    /// refused before it held its pick. A draw that keeps nobody says
+    /// runs: the picker does not draw first, or its bound ran out before it
+    /// held its pick ([`DRAW_BOUND`] refused rows, or a sample's draws). A
+    /// draw that keeps nobody says
     /// nothing of the pool: the pass alone sheds. `draw` is the seed's stream: the
     /// picker takes its values from it and from nowhere else, and whatever
     /// follows the draw reads the stream past them.
@@ -356,7 +358,14 @@ impl Profile {
     pub fn needs(&self) -> Needs {
         let filters = self.filters.iter().map(|f| f.needs());
         let scorers = self.scorers.iter().map(|w| w.scorer.needs());
-        filters.chain(scorers).fold(self.picker.needs(), Needs::or)
+        let needs = filters.chain(scorers).fold(self.picker.needs(), Needs::or);
+        // A sample is the need of a profile that may draw. Under a stage
+        // that is not row-wise the pool is read whole, and lists capped at
+        // the sample would hide holders from that pass.
+        Needs {
+            sample: if draws_first(self) { needs.sample } else { 0 },
+            ..needs
+        }
     }
 
     /// Whether any stage holds a [`DecisionScope`].
@@ -815,27 +824,85 @@ fn trace_of(
     kept: &[u32],
     scores: &[f32],
 ) -> Trace {
+    trace_by::<false>(profile, facts, pool, candidates, kept, scores)
+}
+
+/// [`trace_of`] behind a draw. The rows stand in the draw's order, so
+/// their best are read as a draw's ([`top_drawn`]); and a draw reads a
+/// part of the pool, so its survivors are not counted.
+fn trace_drawn(
+    profile: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    candidates: &[Candidate],
+    kept: &[u32],
+    scores: &[f32],
+) -> Trace {
+    trace_by::<true>(profile, facts, pool, candidates, kept, scores)
+}
+
+/// The trace of a decision over the rows `kept` and their `scores`: a
+/// pool read whole, or the rows of a draw (`DRAWN`). One body, the read
+/// of the best scores chosen where it is entered.
+#[inline(always)]
+fn trace_by<const DRAWN: bool>(
+    profile: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    candidates: &[Candidate],
+    kept: &[u32],
+    scores: &[f32],
+) -> Trace {
     let mut trace = Trace {
         profile,
-        survivors: Survivors::counted(kept.len() as u32),
+        survivors: if DRAWN {
+            Survivors::NOT_COUNTED
+        } else {
+            Survivors::counted(kept.len() as u32)
+        },
         seed: facts.seed,
         generation: pool.generation,
         ..Trace::default()
     };
-    // One pass: a row enters the top when it beats the lowest row kept, and
-    // moves above a kept row only when strictly better, so equal scores keep
-    // the scan's order (the earlier row ahead).
-    let mut top: [(usize, f32); TRACE_TOP] = [(0, f32::NEG_INFINITY); TRACE_TOP];
+    let mut top = [(0, f32::NEG_INFINITY); TRACE_TOP];
+    let len = if DRAWN {
+        top_drawn(scores, &mut top)
+    } else {
+        top_pass(scores, &mut top)
+    };
+    for (slot, &(i, score)) in top.iter().enumerate().take(len) {
+        trace.top[slot] = (candidates[kept[i] as usize].id, score);
+    }
+    trace.top_len = len as u8;
+    trace
+}
+
+/// The `K` best of `scores` in descending order, each with its place in
+/// the scan, into the first slots of `top`; the answer is how many there
+/// are, and a slot past them is left as it was. A row enters when it
+/// beats the lowest row kept, and moves above a kept row only when
+/// strictly better, so equal scores keep the scan's order (the earlier
+/// row ahead).
+///
+/// This is the read of a pool read whole. Its rows come in the host's
+/// order decision after decision: a row that beats nobody kept is passed
+/// over by one test, which a processor predicts.
+///
+/// The slots are the caller's, not an array handed back: by count, the
+/// array by value cost a whole pass a copy a decision in the ranked push
+/// and four instructions a row in the trace.
+#[inline(always)]
+pub(crate) fn top_pass<const K: usize>(scores: &[f32], top: &mut [(usize, f32); K]) -> usize {
     let mut len = 0usize;
     for (i, &score) in scores.iter().enumerate() {
-        if len == TRACE_TOP && score <= top[TRACE_TOP - 1].1 {
+        if len == K && score <= top[K - 1].1 {
             continue;
         }
-        let mut slot = if len < TRACE_TOP {
+        let mut slot = if len < K {
             len += 1;
             len - 1
         } else {
-            TRACE_TOP - 1
+            K - 1
         };
         while slot > 0 && score > top[slot - 1].1 {
             top[slot] = top[slot - 1];
@@ -843,11 +910,67 @@ fn trace_of(
         }
         top[slot] = (i, score);
     }
-    for (slot, &(i, score)) in top.iter().enumerate().take(len) {
-        trace.top[slot] = (candidates[kept[i] as usize].id, score);
+    len
+}
+
+/// [`top_pass`] behind a draw: the same answer at another cost. The rows
+/// come in the draw's order and no test of a score is predicted, so each
+/// row is placed by its key ([`top_keyed`]), the same work whatever it
+/// scores. Three lists are read as the pass reads them: one under
+/// [`KEYED_FROM`] rows, one that holds a score without an order, and one
+/// past the keys' places.
+#[inline(always)]
+pub(crate) fn top_drawn<const K: usize>(scores: &[f32], top: &mut [(usize, f32); K]) -> usize {
+    if scores.len() >= KEYED_FROM
+        && scores.len() <= 1 << PLACE_BITS
+        && !scores.iter().fold(false, |nan, score| nan | score.is_nan())
+    {
+        return top_keyed(scores, top);
     }
-    trace.top_len = len as u8;
-    trace
+    top_pass(scores, top)
+}
+
+/// From how many rows a draw's best scores are read by keys. A shorter
+/// list holds few tests to mispredict, and the pass's form reads it in
+/// fewer instructions: by count the four rows another picker draws cost
+/// 92 more a decision by keys. Keys were measured over lists of sixteen
+/// rows and more.
+const KEYED_FROM: usize = 16;
+
+/// How many bits of a key name a row's place: a list of up to
+/// `1 << PLACE_BITS` rows is read by keys.
+const PLACE_BITS: u32 = 20;
+
+/// [`top_drawn`] over scores that order. Each row is one key: its score's
+/// bits in the scores' order, above its place counted from the end, so the
+/// greater key is the better score and, between equal scores, the earlier
+/// row. The best `K` keys are kept by a maximum and a minimum a slot, the
+/// same work whatever a row scores. A key is a whole number
+/// under 2^52 and exact as an `f64`: a processor takes the greater of two
+/// such numbers by one instruction, and of two integers by a conditional
+/// move, which a compiler turns back into a branch inside a loop.
+#[inline(always)]
+fn top_keyed<const K: usize>(scores: &[f32], top: &mut [(usize, f32); K]) -> usize {
+    let places = (1u64 << PLACE_BITS) - 1;
+    let mut keys = [0.0f64; K];
+    for (i, &score) in scores.iter().enumerate() {
+        // A negative zero reads as zero. The sign bit is turned, and under
+        // a set sign every other bit, so the bits order as the scores do.
+        let bits = (score + 0.0).to_bits();
+        let order = bits ^ (((bits as i32 >> 31) as u32) | 0x8000_0000);
+        let mut key = ((u64::from(order) << PLACE_BITS | (places - i as u64)) as i64) as f64;
+        for slot in &mut keys {
+            let held = *slot;
+            *slot = held.max(key);
+            key = held.min(key);
+        }
+    }
+    let len = scores.len().min(K);
+    for (slot, &key) in top.iter_mut().zip(&keys).take(len) {
+        let i = (places - (key as u64 & places)) as usize;
+        *slot = (i, scores[i]);
+    }
+    len
 }
 
 fn shed(reason: ShedReason, emptied_by: &'static str, trace: Trace) -> Decision {
@@ -987,10 +1110,7 @@ fn join_named(
     let mean = mean_in_flight(candidates, kept);
     let holders = named.holders.iter().map(|holder| holder.row);
     for row in holders.chain(named.warming.iter().copied()) {
-        let Some(candidate) = candidates.get(row as usize) else {
-            continue;
-        };
-        if !kept.contains(&row) && keep(candidate) {
+        if !kept.contains(&row) && candidates.get(row as usize).is_some_and(&mut *keep) {
             kept.push(row);
         }
     }
@@ -1128,10 +1248,7 @@ fn run_drawn(
             }
         }
         if !targets.is_empty() {
-            let trace = Trace {
-                survivors: Survivors::NOT_COUNTED,
-                ..trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores)
-            };
+            let trace = trace_drawn(index, facts, pool, candidates, &buf.kept, &buf.scores);
             return Decision::Pick(Pick {
                 targets,
                 trace,
@@ -1718,7 +1835,7 @@ fn column_fits(column: &[AffinityFacts], pool: &[Candidate]) -> bool {
 }
 
 /// A debug build asserts that the rows a host named in the column's place
-/// ([`NamedAffinity`](crate::NamedAffinity)) stand for `pool`, once where a
+/// ([`NamedAffinity`]) stand for `pool`, once where a
 /// decision takes its inputs: both lists ascending and under the pool's
 /// size, beside an empty column, and no mean in flight, which is the
 /// engine's to set behind a draw. A list out of order hides a holder from
@@ -1877,6 +1994,18 @@ impl Engine {
             Phase::Decode => own.or(self.pair_decode_needs(model)),
             _ => own,
         }
+    }
+
+    /// The sample of the profile that decides a request of `phase` for
+    /// `model`: the cap of each list of rows a host names for that decision
+    /// ([`Needs::sample`]), `0` where that profile never draws and where no
+    /// binding matches. [`Self::needs_for`] answers for a worker's stream,
+    /// where the larger of two needs is the safe one: for a decode decision
+    /// of a model that also pairs it carries the pair's decode side, whose
+    /// sample may be the larger. A cap's safe side is the smaller.
+    pub fn sample_for(&self, model: &str, phase: Phase) -> u32 {
+        self.resolve(model, phase)
+            .map_or(0, |(_, _, profile)| profile.needs().sample)
     }
 
     /// The needs of the decode profile of `model`'s pair binding
@@ -2045,6 +2174,12 @@ impl Engine {
         let _opened = if marks.asks_nothing_first() {
             None
         } else {
+            // A plugin is shown each row as a record of the row's own
+            // fields: its host hands rows written for the decision.
+            debug_assert!(
+                !marks.scoped() || (cx.stalled.is_empty() && facts.pinned_at == 0),
+                "a profile that shows its rows to a plugin is handed rows written for the decision"
+            );
             let opened = marks
                 .scoped()
                 .then(|| profile.open(facts, candidates, pool));
@@ -7668,6 +7803,8 @@ mod tests {
             1,
             Needs::default(),
         );
+        // It says no sample: a host feeds such a profile a column.
+        assert_eq!(engine.needs().sample, 0);
         let holders = [holding(3, 12)];
         let pool = pool_of(64, |_| false);
         for seed in 0..20u64 {
@@ -7733,27 +7870,33 @@ mod tests {
     /// Two profiles whose `best` takes a sample of four and of sixteen, for
     /// the models `narrow` and `wide`.
     fn two_samples() -> Engine {
+        let bound = |model: &str, profile| Binding {
+            model: model.into(),
+            profile,
+            ..single_binding()
+        };
+        sampled_under(vec![bound("narrow", 0), bound("wide", 1)])
+    }
+
+    /// Two profiles that draw, under `bindings`: a sample of four (profile
+    /// 0) and a sample of sixteen (profile 1).
+    fn sampled_under(bindings: Vec<Binding>) -> Engine {
         let sampled = |name: &str, sample| Profile {
             name: name.into(),
             filters: vec![Box::new(Healthy)],
             scorers: Vec::new(),
             picker: Box::new(crate::builtins::SampledBest::new(sample)),
         };
-        let bound = |model: &str, profile| Binding {
-            model: model.into(),
-            profile,
-            ..single_binding()
-        };
         Engine::new(
             vec![sampled("narrow", 4), sampled("wide", 16)],
-            vec![bound("narrow", 0), bound("wide", 1)],
+            bindings,
             1,
             Needs::default(),
         )
     }
 
     /// A host caps the rows it names by the sample of the profile that
-    /// decides, which [`Engine::needs_for`] says; the engine's summary
+    /// decides, which [`Engine::sample_for`] says; the engine's summary
     /// holds the largest sample of every profile. The cache-aware preset
     /// says sixteen for a model's single decision.
     #[test]
@@ -7763,7 +7906,7 @@ mod tests {
         let pool = pool_of(64, |_| false);
         let holders: Vec<crate::NamedHolder> = (0..16).map(|row| holding(row, 12)).collect();
         for (model, sample) in [("narrow", 4usize), ("wide", 16)] {
-            let cap = engine.needs_for(model, Phase::Single).sample as usize;
+            let cap = engine.sample_for(model, Phase::Single) as usize;
             assert_eq!(cap, sample, "{model}");
             let facts = RequestFacts {
                 model,
@@ -7773,7 +7916,7 @@ mod tests {
             assert!(got.trace().drew_first(), "{model}: capped so, it draws");
         }
         let cache_aware = preset("cache_aware");
-        assert_eq!(cache_aware.needs_for("m", Phase::Single).sample, 16);
+        assert_eq!(cache_aware.sample_for("m", Phase::Single), 16);
     }
 
     /// Capped by the engine's summary instead, the rows a host names under
@@ -7814,5 +7957,156 @@ mod tests {
         };
         let decision = drawn(&engine, &facts, &pool_of(8, |_| false));
         panic!("a mean the host wrote answered {decision:?}");
+    }
+
+    /// A sampled `best` counts no refused rows: under a filter that refuses
+    /// half of the pool every decision still draws, and none of its targets
+    /// is a refused row. A pool refused whole is the whole pass's to shed.
+    #[test]
+    fn a_sampled_draw_stands_under_a_filter_that_refuses_half_of_the_pool() {
+        let engine = preset("cache_aware");
+        let holders = [holding(5, 12)];
+        let pool = pool_of(64, |i| i % 2 == 0);
+        for seed in 0..500u64 {
+            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            assert!(got.trace().drew_first(), "seed {seed}");
+            let rows = positions(&got);
+            assert!(rows.iter().all(|row| row % 2 == 1), "seed {seed}: {rows:?}");
+        }
+        let got = drawn(&engine, &naming(1, &holders), &pool_of(64, |_| true));
+        assert!(!got.trace().drew_first());
+        assert!(got.pick().is_none());
+    }
+
+    /// A draw's read of the best scores is the whole pass's, slot for slot:
+    /// ties, scores without an order and every count of rows around the
+    /// count kept. The keys' own read is held to the pass's at every count,
+    /// under the count a draw reads by keys too.
+    #[test]
+    fn the_best_scores_of_a_draw_are_the_best_scores_of_a_pass() {
+        fn bits<const K: usize>(
+            read: impl Fn(&[f32], &mut [(usize, f32); K]) -> usize,
+            scores: &[f32],
+        ) -> ([(usize, u32); K], usize) {
+            let mut top = [(usize::MAX, f32::NEG_INFINITY); K];
+            let len = read(scores, &mut top);
+            (top.map(|(i, score)| (i, score.to_bits())), len)
+        }
+        fn held<const K: usize>(scores: &[f32]) {
+            assert_eq!(
+                bits(top_drawn::<K>, scores),
+                bits(top_pass::<K>, scores),
+                "{scores:?}"
+            );
+            if !scores.iter().any(|score| score.is_nan()) {
+                assert_eq!(
+                    bits(top_keyed::<K>, scores),
+                    bits(top_pass::<K>, scores),
+                    "{scores:?}"
+                );
+            }
+        }
+        let values = [
+            0.0f32,
+            -0.0,
+            0.25,
+            0.5,
+            0.5,
+            0.75,
+            1.0,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..4_000usize {
+            let scores: Vec<f32> = (0..round % 41)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    // Every second list holds no score without an order.
+                    values[(state >> 33) as usize % (values.len() - round % 2)]
+                })
+                .collect();
+            held::<1>(&scores);
+            held::<TRACE_TOP>(&scores);
+            held::<5>(&scores);
+        }
+    }
+
+    /// A draw's trace names the best of its rows as a pass's trace does,
+    /// equal scores among them, and does not count its survivors.
+    #[test]
+    fn a_draws_trace_names_its_best_rows_as_a_passes_trace_does() {
+        let pool = pool_of(40, |_| false);
+        let facts = request(7);
+        // A draw's order, and scores that tie.
+        let kept: Vec<u32> = (0..40u32).rev().step_by(3).collect();
+        let scores: Vec<f32> = kept.iter().map(|&row| (row % 7) as f32 / 8.0).collect();
+        let pass = trace_of(3, &facts, &PoolFacts::default(), &pool, &kept, &scores);
+        let draw = trace_drawn(3, &facts, &PoolFacts::default(), &pool, &kept, &scores);
+        assert_eq!(usize::from(pass.top_len), TRACE_TOP);
+        assert_eq!(draw.survivors, Survivors::NOT_COUNTED);
+        assert_eq!(
+            Trace {
+                survivors: pass.survivors,
+                ..draw
+            },
+            pass
+        );
+    }
+
+    /// A decode decision of a model that also pairs is decided by its own
+    /// profile, and the rows a host names for it are capped by that
+    /// profile's sample ([`Engine::sample_for`]). A decode worker's needs
+    /// carry the pair's decode side too ([`Engine::needs_for`]), whose
+    /// sample is the larger here: a list capped by them stands past the
+    /// cap.
+    #[test]
+    fn a_decode_decision_of_a_model_that_also_pairs_is_capped_by_its_own_profile() {
+        let alone = Binding {
+            model: "mixed".into(),
+            phases: vec![Phase::Decode],
+            ..single_binding()
+        };
+        let pair = Binding {
+            model: "mixed".into(),
+            profile: 1,
+            decode_profile: Some(1),
+            ..pair_binding()
+        };
+        let engine = sampled_under(vec![alone, pair]);
+        assert_eq!(engine.needs_for("mixed", Phase::Decode).sample, 16);
+        assert_eq!(engine.sample_for("mixed", Phase::Decode), 4);
+        assert_eq!(engine.sample_for("nobody", Phase::Decode), 0);
+        let holders: Vec<crate::NamedHolder> = (0..4).map(|row| holding(row, 12)).collect();
+        let facts = RequestFacts {
+            model: "mixed",
+            phase: Phase::Decode,
+            ..naming(1, &holders)
+        };
+        let got = drawn(&engine, &facts, &pool_of(64, |_| false));
+        assert!(
+            got.trace().drew_first(),
+            "capped by its own profile, it draws"
+        );
+    }
+
+    /// The engine asks a draw of a pool of [`DRAW_FROM`] rows or more,
+    /// whatever the sample: under a sample of four a pool of nine to
+    /// fifteen rows, more than twice the sample, is still read whole.
+    #[test]
+    fn a_sample_under_eight_draws_from_sixteen_rows_on() {
+        let engine = two_samples();
+        let holders = [holding(0, 12)];
+        let facts = RequestFacts {
+            model: "narrow",
+            ..naming(1, &holders)
+        };
+        for (rows, drew) in [(9, false), (12, false), (15, false), (16, true)] {
+            let got = drawn(&engine, &facts, &pool_of(rows, |_| false));
+            assert_eq!(got.trace().drew_first(), drew, "{rows} rows");
+        }
     }
 }

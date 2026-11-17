@@ -1287,6 +1287,53 @@ mod tests {
         );
     }
 
+    /// A step that finds the leader standing tells the watches nothing: the
+    /// word of leading is sent at its change alone, so no watch's task wakes
+    /// once a renew period.
+    #[tokio::test]
+    async fn a_step_under_a_standing_leader_tells_the_watches_nothing() {
+        async fn told_as(role: &mut watch::Receiver<bool>, leads: bool) {
+            let reached =
+                timeout(Duration::from_secs(5), role.wait_for(|told| *told == leads)).await;
+            assert!(
+                matches!(reached, Ok(Ok(_))),
+                "the role was not told as {leads}"
+            );
+        }
+        let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+            .expect("the default settings are in order");
+        let (steps, stepped) = watch::channel(Standing::default());
+        let (phase, readiness) = readiness::channel(elector.fence(), stepped);
+        let (_stop, stopped) = watch::channel(false);
+        let (told, mut role) = watch::channel(false);
+        let mut teller = JoinSet::new();
+        teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
+
+        phase.send_replace(Phase::Serving);
+        assert!(matches!(
+            elector.tick(Instant::now()),
+            Ok(Tick::Acquired { .. })
+        ));
+        steps.send_replace(Standing::default());
+        told_as(&mut role, true).await;
+        // Three steps under the standing leader, each taken by the teller:
+        // turns of the runtime and no clock.
+        for _ in 0..3 {
+            steps.send_replace(Standing::default());
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(
+            !role.has_changed().expect("the teller holds the word"),
+            "a step under a standing leader told the word again"
+        );
+        // The teller took those steps: the one after the lead's loss is told.
+        assert!(elector.release().expect("a release"));
+        steps.send_replace(Standing::default());
+        told_as(&mut role, false).await;
+    }
+
     /// A serve whose lead opened with no step of the election since: the
     /// take of a lease with no holder to wait for leads one renew deadline
     /// after its write, between two steps. The fence admits a watch from
@@ -1322,20 +1369,26 @@ mod tests {
             let mut teller = JoinSet::new();
             teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
 
-            // The take, and a renewal just short of its lead's opening that
-            // keeps the fence open most of a renew deadline past it: the
-            // step's telling finds a follower.
+            // The take, and a chain of renewals ahead of the clock, each
+            // just short of the deadline the one before it stamped: the
+            // lead opens one renew deadline after the take's write whatever
+            // was renewed since, and the fence stays open seconds past that
+            // instant, so the read below needs no narrow window. The step's
+            // telling finds a follower.
             phase.send_replace(Phase::Serving);
             let taken = Instant::now();
             assert_eq!(
                 elector.tick(taken).expect("the take"),
                 Tick::Acquired { term: 1 }
             );
-            let renewed = taken + settings.renew_deadline - Duration::from_millis(10);
-            assert_eq!(
-                elector.tick(renewed).expect("the renewal"),
-                Tick::Renewed { term: 1 }
-            );
+            let mut renewed = taken;
+            for _ in 0..10 {
+                renewed += settings.renew_deadline - Duration::from_millis(10);
+                assert_eq!(
+                    elector.tick(renewed).expect("the renewal"),
+                    Tick::Renewed { term: 1 }
+                );
+            }
             steps.send_replace(Standing::default());
             // The lead opens by itself and the fence admits a watch. No step
             // came since: the word the watch finds says that nobody leads.
